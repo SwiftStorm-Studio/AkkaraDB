@@ -44,54 +44,74 @@ allprojects {
 }
 
 subprojects {
-    val akkaraImplementation: Configuration by configurations.creating {
+    val akkaraAPI: Configuration by configurations.creating {
         isTransitive = false
         isCanBeConsumed = false
         isCanBeResolved = true
-        extendsFrom(configurations.getByName("implementation"))
     }
 
     when (name) {
         "akkara-core" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-common"))
-                akkaraImplementation(project(":akkara-format-api"))
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-format-api" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-common"))
+                implementation(project(":akkara-common"))
             }
         }
         "akkara-format-akk" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-common"))
-                akkaraImplementation(project(":akkara-format-api"))
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-format-cbor" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-common"))
-                akkaraImplementation(project(":akkara-format-api"))
-                akkaraImplementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.1")
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
+                akkaraAPI("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.1")
             }
         }
         "akkara-java-api" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-core"))
+                implementation(project(":akkara-core"))
             }
         }
         "akkara-replica" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-core"))
-                akkaraImplementation(project(":akkara-format-api"))
+                implementation(project(":akkara-core"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-wal" -> {
             dependencies {
-                akkaraImplementation(project(":akkara-core"))
-                akkaraImplementation(project(":akkara-format-api"))
+                implementation(project(":akkara-core"))
+                implementation(project(":akkara-format-api"))
             }
+        }
+    }
+
+    afterEvaluate {
+        akkaraAPI.forEach { logger.lifecycle("Shaded API: $it") }
+
+        val artifacts = try {
+            akkaraAPI.resolvedConfiguration.resolvedArtifacts
+        } catch (e: Exception) {
+            logger.warn("Could not resolve shadedAPI in ${project.name}: ${e.message}")
+            emptySet<ResolvedArtifact>()
+        }
+
+        artifacts.forEach { artifact ->
+            val id = artifact.moduleVersion.id
+            val classifierPart = artifact.classifier?.let { ":$it" } ?: ""
+            val notation = "${id.group}:${id.name}:${id.version}$classifierPart"
+            logger.lifecycle("Pack: ${artifact.moduleVersion.id.group}")
+            logger.lifecycle("Name: ${artifact.moduleVersion.id.name}")
+            logger.lifecycle("Automatically adding to api: $notation in ${project.name}")
+            dependencies.add("api", notation)
         }
     }
 
@@ -169,11 +189,11 @@ subprojects {
         group = "ririfa"
         description = "Creates a relocated fat jar containing shadedAPI dependencies"
         archiveClassifier.set("fat")
-        configurations.add(project.configurations.getByName("akkaraImplementation"))
+        configurations.add(project.configurations.getByName("akkaraAPI"))
         from(sourceSets.main.get().output)
 
         doFirst {
-            val akkara = project.configurations.getByName("akkaraImplementation")
+            val akkara = project.configurations.getByName("akkaraAPI")
             val artifacts = try {
                 akkara.resolvedConfiguration.resolvedArtifacts
             } catch (e: Exception) {
@@ -202,8 +222,8 @@ subprojects {
                     return@forEach
                 }
 
-                classPackages.forEach { pkg ->
-                    if (pkg.isBlank()) return@forEach
+                classPackages.forEach cp@{ pkg ->
+                    if (pkg.isBlank()) return@cp
                     val relocated = "net.ririfa.shaded.$moduleName.${pkg.replace('.', '_')}"
                     logger.lifecycle("Relocating $pkg → $relocated")
                     relocate(pkg, relocated)
@@ -250,9 +270,9 @@ subprojects {
                         }
                     }
                     scm {
-                        connection.set("scm:git:git://github.com/ririf4/Yacla.git")
-                        developerConnection.set("scm:git:ssh://github.com/ririf4/Yacla.git")
-                        url.set("https://github.com/ririf4/Yacla")
+                        connection.set("scm:git:git://github.com/SwiftStorm-Studio/AkkaraDB.git")
+                        developerConnection.set("scm:git:ssh://github.com/SwiftStorm-Studio/AkkaraDB.git")
+                        url.set("https://github.com/SwiftStorm-Studio/AkkaraDB")
                     }
                 }
             }
