@@ -43,6 +43,8 @@ allprojects {
     }
 }
 
+
+
 subprojects {
     val akkaraAPI: Configuration by configurations.creating {
         isTransitive = false
@@ -68,13 +70,6 @@ subprojects {
                 implementation(project(":akkara-format-api"))
             }
         }
-        "akkara-format-cbor" -> {
-            dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-api"))
-                akkaraAPI("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.8.1")
-            }
-        }
         "akkara-java-api" -> {
             dependencies {
                 implementation(project(":akkara-core"))
@@ -90,6 +85,19 @@ subprojects {
             dependencies {
                 implementation(project(":akkara-core"))
                 implementation(project(":akkara-format-api"))
+            }
+        }
+        "akkara-test" -> {
+            dependencies {
+                implementation(project(":akkara-core"))
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
+                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-java-api"))
+                implementation(project(":akkara-replica"))
+                implementation(project(":akkara-wal"))
+
+                testImplementation(kotlin("test"))
             }
         }
     }

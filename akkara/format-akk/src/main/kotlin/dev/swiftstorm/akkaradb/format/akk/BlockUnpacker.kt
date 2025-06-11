@@ -1,0 +1,18 @@
+package dev.swiftstorm.akkaradb.format.akk
+
+import java.nio.ByteBuffer
+
+object BlockUnpacker {
+    fun unpack(block: ByteArray): ByteArray? {
+        if (block.all { it == 0.toByte() }) return null
+        val buf = ByteBuffer.wrap(block)
+        val len = buf.int
+        if (len == 0) return null
+        require(len in 1..BlockConst.MAX_PAYLOAD)
+        val payload = ByteArray(len)
+        buf.get(payload)
+        val expected = ByteBuffer.wrap(block, BlockConst.BLOCK_SIZE - 4, 4).int
+        require(expected == BlockPacker.crc(payload)) { "CRC mismatch" }
+        return payload
+    }
+}
