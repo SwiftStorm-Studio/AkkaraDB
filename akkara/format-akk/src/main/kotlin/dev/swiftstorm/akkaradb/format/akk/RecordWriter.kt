@@ -9,7 +9,7 @@ object RecordWriter {
         val out = ByteArrayOutputStream(
             VarInt.size(rec.key.size) +
                     VarInt.size(rec.value.size) +
-                    VarInt.size(8) +
+                    VarInt.size(8) +           // seqNo VarInt
                     rec.key.size + rec.value.size
         )
         VarInt.write(rec.key.size, out)

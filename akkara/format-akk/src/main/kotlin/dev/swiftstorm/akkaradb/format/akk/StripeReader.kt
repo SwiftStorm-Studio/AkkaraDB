@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.format
 
 import dev.swiftstorm.akkaradb.format.akk.BlockConst
 import dev.swiftstorm.akkaradb.format.akk.BlockUnpacker
+import dev.swiftstorm.akkaradb.format.akk.manifest.ManifestIO
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -9,7 +10,7 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
 
 class StripeReader(
-    dir: Path,
+    private val dir: Path,
     private val dataCount: Int,
     private val parityCoder: ParityCoder
 ) {
@@ -48,9 +49,17 @@ class StripeReader(
         return data.requireNoNulls()
     }
 
+    fun stripeCount(): Long {
+        val manifest = ManifestIO.load(dir)
+        return if (manifest.blocksWritten > 0)
+            (manifest.blocksWritten + dataCount - 1) / dataCount
+        else
+            dataCh[0].size() / BlockConst.BLOCK_SIZE
+    }
+
     private fun verify(block: ByteArray): Boolean = try {
         BlockUnpacker.unpack(block); true
-    } catch (e: Exception) { false }
+    } catch (_: Exception) { false }
 
     private fun FileChannel.readFully(
         pos: Long, target: MutableList<ByteArray?>, idx: Int

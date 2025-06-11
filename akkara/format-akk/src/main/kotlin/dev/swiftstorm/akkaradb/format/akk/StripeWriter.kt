@@ -1,5 +1,7 @@
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.format.akk.manifest.Manifest
+import dev.swiftstorm.akkaradb.format.akk.manifest.ManifestIO
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -14,6 +16,7 @@ class StripeWriter(
     private val parityCoder: ParityCoder
 ) : AutoCloseable {
 
+    private val manifest: Manifest = ManifestIO.load(dir)
     private val ring = ArrayBlockingQueue<ByteArray>(dataCount)
     private val dataChannels: List<FileChannel>
     private val parityChannels: List<FileChannel>
@@ -34,6 +37,7 @@ class StripeWriter(
         require(block.size == BlockConst.BLOCK_SIZE)
         ring.put(block)
         if (ring.size == dataCount) flushStripe()
+        manifest.blocksWritten++
     }
 
     private fun flushStripe() {
@@ -53,8 +57,9 @@ class StripeWriter(
     }
 
     override fun close() {
-        // 残ブロック pad
         while (ring.isNotEmpty()) append(ByteArray(BlockConst.BLOCK_SIZE))
         (dataChannels + parityChannels).forEach(FileChannel::close)
+
+        ManifestIO.store(dir, manifest)
     }
 }
