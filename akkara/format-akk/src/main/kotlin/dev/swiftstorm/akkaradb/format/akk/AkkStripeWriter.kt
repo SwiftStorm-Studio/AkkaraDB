@@ -1,8 +1,8 @@
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.format.ParityCoder
 import dev.swiftstorm.akkaradb.format.akk.manifest.Manifest
 import dev.swiftstorm.akkaradb.format.akk.manifest.ManifestIO
-import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -10,11 +10,11 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.concurrent.ArrayBlockingQueue
 
-class StripeWriter(
+class AkkStripeWriter(
     private val dir: Path,
     private val dataCount: Int,
     private val parityCoder: ParityCoder
-) : AutoCloseable {
+): AutoCloseable {
 
     private val manifest: Manifest = ManifestIO.load(dir)
     private val ring = ArrayBlockingQueue<ByteArray>(dataCount)
@@ -38,6 +38,16 @@ class StripeWriter(
         ring.put(block)
         if (ring.size == dataCount) flushStripe()
         manifest.blocksWritten++
+    }
+
+    fun flush() {
+        if (ring.isEmpty()) return
+        val remaining = mutableListOf<ByteArray>()
+        while (ring.isNotEmpty()) remaining += ring.take()
+
+        while (remaining.size < dataCount) remaining += ByteArray(BlockConst.BLOCK_SIZE)
+        remaining.forEach { ring.put(it) }
+        flushStripe()
     }
 
     private fun flushStripe() {

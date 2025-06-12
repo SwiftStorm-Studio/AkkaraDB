@@ -1,48 +1,37 @@
 package dev.swiftstorm.akkaradb.common
 
+import java.nio.charset.StandardCharsets
+
+/**
+ * Immutable key‑value record with a monotonic sequence number.
+ * Key and value are kept as raw byte arrays to avoid redundant copying.
+ */
 data class Record(
     val key: ByteArray,
     val value: ByteArray,
-    val seqNo: Long = 0
+    val seqNo: Long
 ) {
-    companion object {
-        fun recordOf(
-            key: String,
-            value: String,
-            seqNo: Long = 0
-        ): Record {
-            return Record(
-                key = key.toByteArray(Charsets.UTF_8),
-                value = value.toByteArray(Charsets.UTF_8),
-                seqNo = seqNo
-            )
-        }
-    }
+    /** Lazily cached UTF‑8 key string. */
+    val sKey: String by lazy { key.toString(StandardCharsets.UTF_8) }
 
-    inline val sKey  get() = key.toString(Charsets.UTF_8)
-    inline val sValue get() = value.toString(Charsets.UTF_8)
+    /** Lazily cached UTF‑8 value string. */
+    val sValue: String by lazy { value.toString(StandardCharsets.UTF_8) }
 
+    /**
+     * Fast equality: sequence number + key content only.
+     * This is sufficient because (seqNo,key) is globally unique by design.
+     */
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
-        if (javaClass != other?.javaClass) return false
-
-        other as Record
-
+        if (other !is Record) return false
         if (seqNo != other.seqNo) return false
-        if (!key.contentEquals(other.key)) return false
-        if (!value.contentEquals(other.value)) return false
-        if (sKey != other.sKey) return false
-        if (sValue != other.sValue) return false
-
-        return true
+        return key.contentEquals(other.key)
     }
 
-    override fun hashCode(): Int {
-        var result = seqNo.hashCode()
-        result = 31 * result + key.contentHashCode()
-        result = 31 * result + value.contentHashCode()
-        result = 31 * result + sKey.hashCode()
-        result = 31 * result + sValue.hashCode()
-        return result
+    override fun hashCode(): Int = 31 * seqNo.hashCode() + key.contentHashCode()
+
+    companion object {
+        fun of(key: String, value: String, seqNo: Long): Record =
+            Record(key.toByteArray(StandardCharsets.UTF_8), value.toByteArray(StandardCharsets.UTF_8), seqNo)
     }
 }

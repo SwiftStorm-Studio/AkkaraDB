@@ -1,4 +1,4 @@
-package dev.swiftstorm.akkaradb.format.api
+package dev.swiftstorm.akkaradb.format
 
 interface ParityCoder {
     val parityCount: Int

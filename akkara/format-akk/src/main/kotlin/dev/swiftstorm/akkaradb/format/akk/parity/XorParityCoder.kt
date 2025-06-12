@@ -1,6 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk.parity
 
-import dev.swiftstorm.akkaradb.format.api.ParityCoder
+import dev.swiftstorm.akkaradb.format.ParityCoder
 import kotlin.experimental.xor
 
 class XorParityCoder : ParityCoder {

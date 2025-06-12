@@ -1,15 +1,13 @@
-package dev.swiftstorm.akkaradb.format
+package dev.swiftstorm.akkaradb.format.akk
 
-import dev.swiftstorm.akkaradb.format.akk.BlockConst
-import dev.swiftstorm.akkaradb.format.akk.BlockUnpacker
+import dev.swiftstorm.akkaradb.format.ParityCoder
 import dev.swiftstorm.akkaradb.format.akk.manifest.ManifestIO
-import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
 
-class StripeReader(
+class AkkStripeReader(
     private val dir: Path,
     private val dataCount: Int,
     private val parityCoder: ParityCoder
