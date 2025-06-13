@@ -27,8 +27,7 @@ allprojects {
     version = when (name) {
         "akkara-common" -> "0.0.1-SNAPSHOT"
         "akkara-core" -> "0.0.1-SNAPSHOT"
-        "akkara-format-akk" -> "0.0.1-SNAPSHOT"
-        "akkara-format-cbor" -> "0.0.1-SNAPSHOT"
+        "akkara-format" -> "0.0.1-SNAPSHOT"
         "akkara-java-api" -> "0.0.1-SNAPSHOT"
         "akkara-replica" -> "0.0.1-SNAPSHOT"
         "akkara-wal" -> "0.0.1-SNAPSHOT"
@@ -55,10 +54,10 @@ subprojects {
         "akkara-core" -> {
             dependencies {
                 implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-format"))
             }
         }
-        "akkara-format-akk" -> {
+        "akkara-format" -> {
             dependencies {
                 implementation(project(":akkara-common"))
             }
@@ -71,20 +70,20 @@ subprojects {
         "akkara-replica" -> {
             dependencies {
                 implementation(project(":akkara-core"))
-                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-format"))
             }
         }
         "akkara-wal" -> {
             dependencies {
                 implementation(project(":akkara-core"))
-                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-format"))
             }
         }
         "akkara-test" -> {
             dependencies {
                 implementation(project(":akkara-core"))
                 implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-format"))
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
                 implementation(project(":akkara-wal"))
