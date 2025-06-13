@@ -1,15 +1,12 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
-import org.gradle.kotlin.dsl.named
-import org.gradle.kotlin.dsl.withType
 import org.jetbrains.dokka.gradle.tasks.DokkaGeneratePublicationTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import java.net.HttpURLConnection
 import java.net.URI
 import java.text.SimpleDateFormat
-import java.util.Date
+import java.util.*
 import java.util.jar.JarFile
-import kotlin.text.startsWith
 
 plugins {
     alias(libs.plugins.kotlin)
@@ -57,6 +54,7 @@ subprojects {
                 implementation(project(":akkara-format"))
             }
         }
+
         "akkara-format" -> {
             dependencies {
                 implementation(project(":akkara-common"))

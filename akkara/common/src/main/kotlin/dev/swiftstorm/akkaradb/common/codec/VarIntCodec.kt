@@ -73,8 +73,8 @@ object VarIntCodec {
 
     /* ---------- zig-zag helpers ---------- */
 
-    fun zigZagEncodeInt(v: Int): Int  = (v shl 1) xor (v shr 31)
-    fun zigZagDecodeInt(v: Int): Int  = (v ushr 1) xor -(v and 1)
+    fun zigZagEncodeInt(v: Int): Int = (v shl 1) xor (v shr 31)
+    fun zigZagDecodeInt(v: Int): Int = (v ushr 1) xor -(v and 1)
 
     fun zigZagEncodeLong(v: Long): Long = (v shl 1) xor (v shr 63)
     fun zigZagDecodeLong(v: Long): Long = (v ushr 1) xor -(v and 1)
