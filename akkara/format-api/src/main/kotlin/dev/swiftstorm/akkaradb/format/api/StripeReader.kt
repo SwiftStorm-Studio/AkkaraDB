@@ -1,4 +1,4 @@
-package dev.swiftstorm.akkaradb.format
+package dev.swiftstorm.akkaradb.format.api
 
 import java.io.Closeable
 import java.nio.ByteBuffer

@@ -2,7 +2,7 @@ package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
-import dev.swiftstorm.akkaradb.format.RecordReader
+import dev.swiftstorm.akkaradb.format.api.RecordReader
 import java.nio.ByteBuffer
 
 /**

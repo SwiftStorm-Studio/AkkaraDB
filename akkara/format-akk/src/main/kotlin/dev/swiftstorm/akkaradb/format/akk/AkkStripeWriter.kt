@@ -1,7 +1,7 @@
 package dev.swiftstorm.akkaradb.format.akk
 
-import dev.swiftstorm.akkaradb.format.StripeWriter
-import dev.swiftstorm.akkaradb.format.ParityCoder
+import dev.swiftstorm.akkaradb.format.api.ParityCoder
+import dev.swiftstorm.akkaradb.format.api.StripeWriter
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path

@@ -51,13 +51,20 @@ subprojects {
         "akkara-core" -> {
             dependencies {
                 implementation(project(":akkara-common"))
-                implementation(project(":akkara-format"))
+                implementation(project(":akkara-format-api"))
             }
         }
 
-        "akkara-format" -> {
+        "akkara-format-api" -> {
             dependencies {
                 implementation(project(":akkara-common"))
+            }
+        }
+
+        "akkara-format-akk" -> {
+            dependencies {
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-java-api" -> {
@@ -68,20 +75,21 @@ subprojects {
         "akkara-replica" -> {
             dependencies {
                 implementation(project(":akkara-core"))
-                implementation(project(":akkara-format"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-wal" -> {
             dependencies {
                 implementation(project(":akkara-core"))
-                implementation(project(":akkara-format"))
+                implementation(project(":akkara-format-api"))
             }
         }
         "akkara-test" -> {
             dependencies {
                 implementation(project(":akkara-core"))
                 implementation(project(":akkara-common"))
-                implementation(project(":akkara-format"))
+                implementation(project(":akkara-format-api"))
+                implementation(project(":akkara-format-akk"))
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
                 implementation(project(":akkara-wal"))

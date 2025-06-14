@@ -1,4 +1,4 @@
-package dev.swiftstorm.akkaradb.format
+package dev.swiftstorm.akkaradb.format.api
 
 import dev.swiftstorm.akkaradb.common.Record
 import java.nio.ByteBuffer

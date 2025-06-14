@@ -1,4 +1,4 @@
-package dev.swiftstorm.akkaradb.format.akk
+package dev.swiftstorm.akkaradb.common
 
 object BlockConst {
     const val BLOCK_SIZE   = 32 * 1024            // 32 KiB

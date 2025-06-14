@@ -1,9 +1,9 @@
 package dev.swiftstorm.akkaradb.format.akk
 
-import dev.swiftstorm.akkaradb.format.BlockPacker
-import dev.swiftstorm.akkaradb.format.akk.BlockConst.BLOCK_SIZE
-import dev.swiftstorm.akkaradb.format.akk.BlockConst.MAX_RECORD
-import dev.swiftstorm.akkaradb.format.akk.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.BlockConst.MAX_RECORD
+import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
 

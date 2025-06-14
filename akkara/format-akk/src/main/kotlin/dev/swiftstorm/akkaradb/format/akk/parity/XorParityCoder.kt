@@ -2,7 +2,7 @@
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
-import dev.swiftstorm.akkaradb.format.ParityCoder
+import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import kotlin.experimental.xor
 
