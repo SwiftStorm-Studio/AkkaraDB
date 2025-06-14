@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.format.BlockUnpacker
 import dev.swiftstorm.akkaradb.format.akk.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.format.akk.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
@@ -63,10 +64,5 @@ class AkkBlockUnpacker : BlockUnpacker {
             payload.slice().asReadOnlyBuffer()
         }
         return slice
-    }
-
-    /* ---- constants ---- */
-    private companion object {
-        const val PAYLOAD_LIMIT = BLOCK_SIZE - 8   // 4B len + 4B CRC
     }
 }
