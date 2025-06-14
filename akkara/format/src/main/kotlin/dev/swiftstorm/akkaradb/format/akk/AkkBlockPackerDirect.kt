@@ -1,6 +1,9 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.format.BlockPacker
+import dev.swiftstorm.akkaradb.format.akk.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.format.akk.BlockConst.MAX_RECORD
+import dev.swiftstorm.akkaradb.format.akk.BlockConst.PAYLOAD_LIMIT
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
@@ -69,14 +72,5 @@ class AkkBlockPackerDirect : BlockPacker {
         block.flip()
         consumer(block.asReadOnlyBuffer())
         scratch.clear()
-    }
-
-
-    /* ---------- constants ---------- */
-
-    private companion object {
-        const val BLOCK_SIZE   = 32 * 1024            // 32 KiB
-        const val PAYLOAD_LIMIT = BLOCK_SIZE - 8      // length + CRC
-        const val MAX_RECORD    = PAYLOAD_LIMIT
     }
 }
