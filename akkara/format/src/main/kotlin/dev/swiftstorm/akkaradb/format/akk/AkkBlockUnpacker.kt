@@ -10,7 +10,7 @@ import java.util.zip.CRC32
 /**
  * Unpacks a 32-KiB “akk” data block and returns the payload slice.
  *
- * Block layout:  [4B length][payload][zero-padding][4B CRC32]
+ * Block layout:  `[4B length][payload][zero-padding][4B CRC32]`
  *
  * * The caller must pass a buffer whose `position == 0`
  *   and whose `remaining() == 32 KiB`.

@@ -1,5 +1,6 @@
 package dev.swiftstorm.akkaradb.common
 
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 
 /**
@@ -29,10 +30,10 @@ import java.nio.charset.StandardCharsets
  *   them externally and pass the resulting byte arrays here.
  */
 data class Record(
-    val key: ByteArray,
-    val value: ByteArray,
+    val key: ByteBuffer,
+    val value: ByteBuffer,
     val seqNo: Long,
-    val keyHash: Int = key.contentHashCode()
+    val keyHash: Int = key.hash()
 ) {
 
     /**
@@ -45,8 +46,8 @@ data class Record(
      */
     constructor(key: String, value: String, seqNo: Long) :
             this(
-                key.toByteArray(StandardCharsets.UTF_8),
-                value.toByteArray(StandardCharsets.UTF_8),
+                StandardCharsets.UTF_8.encode(key),
+                StandardCharsets.UTF_8.encode(value),
                 seqNo
             )
 
@@ -59,4 +60,20 @@ data class Record(
     /** Hash based on sequence number and cached key hash. */
     override fun hashCode(): Int =
         31 * seqNo.hashCode() + keyHash
+}
+
+fun ByteBuffer.contentEquals(other: ByteBuffer): Boolean {
+    if (this.remaining() != other.remaining()) return false
+    for (i in 0 until this.remaining()) {
+        if (this.get(this.position() + i) != other.get(other.position() + i)) return false
+    }
+    return true
+}
+
+fun ByteBuffer.hash(): Int {
+    var hash = 1
+    for (i in 0 until this.remaining()) {
+        hash = 31 * hash + this.get(this.position() + i)
+    }
+    return hash
 }

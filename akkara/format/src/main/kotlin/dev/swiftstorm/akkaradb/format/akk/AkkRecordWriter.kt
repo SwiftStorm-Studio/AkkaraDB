@@ -18,24 +18,24 @@ import java.nio.ByteBuffer
  */
 object AkkRecordWriter : RecordWriter {
 
-    /* ---------- public API ---------- */
-
     override fun write(record: Record, dest: ByteBuffer): Int {
         val startPos = dest.position()
 
+        val keyBuf = record.key.asReadOnlyBuffer()
+        val valBuf = record.value.asReadOnlyBuffer()
+
         // Header
-        VarIntCodec.writeInt(dest, record.key.size)
-        VarIntCodec.writeInt(dest, record.value.size)
+        VarIntCodec.writeInt(dest, keyBuf.remaining())
+        VarIntCodec.writeInt(dest, valBuf.remaining())
         VarIntCodec.writeLong(dest, VarIntCodec.zigZagEncodeLong(record.seqNo))
 
         // Payload
-        dest.put(record.key)
-        dest.put(record.value)
+        dest.put(keyBuf)
+        dest.put(valBuf)
 
         return dest.position() - startPos
     }
 
     override fun computeMaxSize(record: Record): Int =
-        /* worst-case VarInt/VarLong sizes */
-        5 + 5 + 10 + record.key.size + record.value.size
+        5 + 5 + 10 + record.key.remaining() + record.value.remaining()
 }

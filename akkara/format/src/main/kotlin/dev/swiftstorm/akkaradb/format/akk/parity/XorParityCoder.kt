@@ -1,3 +1,5 @@
+@file:Suppress("DuplicatedCode")
+
 package dev.swiftstorm.akkaradb.format.akk.parity
 
 import dev.swiftstorm.akkaradb.format.ParityCoder

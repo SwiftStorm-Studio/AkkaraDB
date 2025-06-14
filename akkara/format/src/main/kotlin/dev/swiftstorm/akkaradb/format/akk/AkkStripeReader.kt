@@ -1,19 +1,19 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.format.ParityCoder
+import dev.swiftstorm.akkaradb.format.StripeReader
 import dev.swiftstorm.akkaradb.format.akk.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
-import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 
-class AkdFileReader(
+class AkkStripeReader(
     baseDir: Path,
     private val k: Int,
     private val parityCoder: ParityCoder? = null
-) : Closeable {
+) : StripeReader {
 
     private val dataCh = (0 until k).map { Files.newByteChannel(baseDir.resolve("data_$it.akd"), READ) }
     private val parityCh = (0 until (parityCoder?.parityCount ?: 0))
@@ -26,7 +26,7 @@ class AkdFileReader(
      * @throws CorruptedBlockException if a lane is unreadable and
      *         parity recovery is unavailable or fails.
      */
-    fun readStripe(): List<ByteBuffer>? {
+    override fun readStripe(): List<ByteBuffer>? {
         /* 1 — read k data lanes */
         val blocks = ArrayList<ByteBuffer?>(k)
         dataCh.forEach { ch ->
