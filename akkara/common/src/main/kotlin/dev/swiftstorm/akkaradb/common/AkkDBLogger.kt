@@ -1,3 +1,5 @@
+@file:JvmName("AkkDBLogger")
+
 package dev.swiftstorm.akkaradb.common
 
 import org.slf4j.Logger

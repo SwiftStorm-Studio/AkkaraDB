@@ -11,8 +11,8 @@ project(":akkara-test").projectDir = file("akkara/test")
 include("akkara-common")
 project(":akkara-common").projectDir = file("akkara/common")
 
-include("akkara-core")
-project(":akkara-core").projectDir = file("akkara/core")
+include("akkara-engine")
+project(":akkara-engine").projectDir = file("akkara/engine")
 
 include("akkara-format-api")
 project(":akkara-format-api").projectDir = file("akkara/format-api")

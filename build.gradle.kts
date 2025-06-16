@@ -38,8 +38,6 @@ allprojects {
     }
 }
 
-
-
 subprojects {
     val akkaraAPI: Configuration by configurations.creating {
         isTransitive = false
@@ -56,13 +54,6 @@ subprojects {
             }
         }
 
-        "akkara-core" -> {
-            dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-api"))
-            }
-        }
-
         "akkara-format-api" -> {
             dependencies {
                 implementation(project(":akkara-common"))
@@ -75,34 +66,45 @@ subprojects {
                 implementation(project(":akkara-format-api"))
             }
         }
-        "akkara-java-api" -> {
+
+        "akkara-engine" -> {
             dependencies {
-                implementation(project(":akkara-core"))
-            }
-        }
-        "akkara-replica" -> {
-            dependencies {
-                implementation(project(":akkara-core"))
+                implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
             }
         }
+
         "akkara-wal" -> {
             dependencies {
-                implementation(project(":akkara-core"))
-                implementation(project(":akkara-format-api"))
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-engine"))
             }
         }
+
+        "akkara-replica" -> {
+            dependencies {
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-engine"))
+            }
+        }
+
+        "akkara-java-api" -> {
+            dependencies {
+                implementation(project(":akkara-engine"))
+            }
+        }
+
         "akkara-test" -> {
             dependencies {
-                implementation(project(":akkara-core"))
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
                 implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-engine"))
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
                 implementation(project(":akkara-wal"))
 
-                testImplementation(kotlin("test"))
+                implementation(kotlin("test"))
             }
         }
     }
