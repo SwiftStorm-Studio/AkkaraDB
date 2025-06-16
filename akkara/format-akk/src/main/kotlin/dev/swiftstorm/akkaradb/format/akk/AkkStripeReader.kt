@@ -1,6 +1,7 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.Pools           // ★ 追加
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
@@ -20,46 +21,48 @@ class AkkStripeReader(
         .map { Files.newByteChannel(baseDir.resolve("parity_$it.akp"), READ) }
 
     private val unpacker = AkkBlockUnpacker()
+    private val pool = Pools.io()
 
-    /**
-     * @return payloads for one stripe, or `null` when *all* lanes hit EOF.
-     * @throws CorruptedBlockException if a lane is unreadable and
-     *         parity recovery is unavailable or fails.
-     */
     override fun readStripe(): List<ByteBuffer>? {
-        /* 1 — read k data lanes */
-        val blocks = ArrayList<ByteBuffer?>(k)
+        /* 1 ─ read k data lanes */
+        val laneBlocks = ArrayList<ByteBuffer?>(k)
         dataCh.forEach { ch ->
-            val blk = ByteBuffer.allocateDirect(BLOCK_SIZE)
+            val blk = pool.get()
             val n   = ch.read(blk)
-
-            val result: ByteBuffer? = when (n) {
-                BLOCK_SIZE -> { blk.flip(); blk.asReadOnlyBuffer() }  // full block OK
-                -1         -> null                                    // EOF
-                else        -> null                                    // short read ⇒ recover via parity
+            val buf: ByteBuffer? = if (n == BLOCK_SIZE) {
+                blk.flip(); blk                       // full block
+            } else {                                  // EOF or short
+                pool.release(blk); null
             }
-            blocks += result
+            laneBlocks += buf
         }
+        if (laneBlocks.all { it == null }) return null
 
-        if (blocks.all { it == null }) return null   // 完全 EOF
-
-        /* 2 — parity recovery (optional) */
-        if (blocks.any { it == null } && parityCoder != null) {
-            val parityBufs: List<ByteBuffer?> = parityCh.map { ch ->
-                val buf = ByteBuffer.allocateDirect(BLOCK_SIZE)
+        /* 2 ─ parity recovery */
+        if (laneBlocks.any { it == null } && parityCoder != null) {
+            val parityBufs = parityCh.map { ch ->
+                val buf = pool.get()
                 val n   = ch.read(buf)
-                if (n == BLOCK_SIZE) { buf.flip(); buf.asReadOnlyBuffer() } else null
+                if (n == BLOCK_SIZE) {
+                    buf.flip(); buf
+                } else {
+                    pool.release(buf); null
+                }
             }
-
-            val missingIdx = blocks.indexOfFirst { it == null }
-            val recovered  = parityCoder.decode(missingIdx, blocks, parityBufs)
-            blocks[missingIdx] = recovered
+            val miss = laneBlocks.indexOfFirst { it == null }
+            laneBlocks[miss] = parityCoder.decode(miss, laneBlocks, parityBufs)
+            parityBufs.filterNotNull().forEach(pool::release)
         }
 
-        /* 3 — CRC check + slice payload */
-        return blocks.map { blk ->
-            blk ?: throw CorruptedBlockException("Unrecoverable lane $k in stripe")
-        }.map(unpacker::unpack)   // returns payload slice
+        /* 3 ─ CRC check & payload slice */
+        val payloads = laneBlocks.map { blk ->
+            blk ?: throw CorruptedBlockException("Unrecoverable lane in stripe")
+        }.map(unpacker::unpack)                       // read-only slice
+
+        /* 4 ─ release lane buffers back to pool */
+        laneBlocks.filterNotNull().forEach(pool::release)
+
+        return payloads
     }
 
     override fun close() {

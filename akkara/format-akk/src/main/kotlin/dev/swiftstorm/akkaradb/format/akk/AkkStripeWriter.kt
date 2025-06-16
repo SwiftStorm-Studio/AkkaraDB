@@ -1,5 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.logger
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeWriter
 import java.nio.ByteBuffer
@@ -22,7 +23,8 @@ import java.nio.file.StandardOpenOption.*
 class AkkStripeWriter(
     baseDir: Path,
     override val k: Int = 4,
-    private val parityCoder: ParityCoder? = null
+    private val parityCoder: ParityCoder? = null,
+    private val autoFlush: Boolean = false
 ) : StripeWriter {
 
     override val m: Int = parityCoder?.parityCount ?: 0
@@ -59,7 +61,17 @@ class AkkStripeWriter(
     /* ---------- public API ---------- */
 
     override fun addBlock(block: ByteBuffer) {
-        require(queue.size < k) { "Stripe already full; call flush()" }
+        if (queue.size >= k) {
+            when (autoFlush) {
+                true -> run {
+                    flush()
+                    addBlock(block)  // retry with the new empty queue
+                    logger.debug("Stripe flushed, block added to new queue")
+                }
+
+                false -> error("Stripe already full; call flush()")
+            }
+        }
         queue += block.asReadOnlyBuffer()          // keep caller untouched
         if (queue.size == k) writeStripe()
     }

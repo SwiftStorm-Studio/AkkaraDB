@@ -3,48 +3,39 @@ package dev.swiftstorm.akkaradb.format.akk
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BlockConst.MAX_RECORD
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
+import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
 /**
- * Packs variable-size records into fixed 32 KiB blocks.
- *
- * Block layout
- * ```
- * [4B payloadLen][payload...][zero-padding][4B CRC32] = 32 KiB
- * ```
- *
- * * Works with **Direct** or **Heap** `ByteBuffer`s.
- * * Caller supplies a `consumer` that receives a read-only buffer
- *   whenever a full block is ready.
+ * Block packer backed by a global [dev.swiftstorm.akkaradb.common.BufferPool].
  */
-class AkkBlockPackerDirect : BlockPacker {
+class AkkBlockPackerDirect : BlockPacker, Closeable {
 
     override val blockSize: Int = BLOCK_SIZE
 
-    /** Scratch buffer for accumulating TLV records. */
-    private val scratch: ByteBuffer = ByteBuffer.allocateDirect(blockSize)
+    private val pool = Pools.io()
+    private val scratch: ByteBuffer = pool.get()
     private val crc = CRC32()
 
     /* ---------- public API ---------- */
 
     override fun addRecord(record: ByteBuffer, consumer: (ByteBuffer) -> Unit) {
         val len = record.remaining()
-        require(len <= MAX_RECORD) {
-            "Single record ($len B) exceeds block payload limit ($MAX_RECORD B)"
-        }
+        require(len <= MAX_RECORD) { "Record of $len B exceeds $MAX_RECORD B" }
 
-        if (scratch.position() + len > PAYLOAD_LIMIT) {
-            emitBlock(consumer)               // flush full block first
-        }
-        scratch.put(record.duplicate())       // copy bytes into scratch
+        if (scratch.position() + len > PAYLOAD_LIMIT) emitBlock(consumer)
+        scratch.put(record.duplicate())
     }
 
     override fun flush(consumer: (ByteBuffer) -> Unit) {
-        if (scratch.position() > 0) {
-            emitBlock(consumer)
-        }
+        if (scratch.position() > 0) emitBlock(consumer)
+    }
+
+    override fun close() {
+        pool.release(scratch)
     }
 
     /* ---------- internal ---------- */
@@ -53,24 +44,22 @@ class AkkBlockPackerDirect : BlockPacker {
         val payloadLen = scratch.position()
         scratch.flip()
 
-        val block = ByteBuffer.allocateDirect(blockSize)
+        val block = pool.get()
         block.putInt(payloadLen)
         block.put(scratch)
 
-        while (block.position() < PAYLOAD_LIMIT + 4) block.put(0)  // padding
+        while (block.position() < PAYLOAD_LIMIT + 4) block.put(0)
 
-        /* ---- CRC32 without heap copy ---- */
         crc.reset()
-        val dup = block.duplicate()          // preserve original positions
-        dup.limit(4 + payloadLen)            // [length + payload] only
-        dup.position(0)
-        crc.update(dup)                      // JDK 9+ supports this
+        block.duplicate().limit(4 + payloadLen).position(0).let { crc.update(it) }
 
         block.position(PAYLOAD_LIMIT + 4)
         block.putInt(crc.value.toInt())
-
         block.flip()
-        consumer(block.asReadOnlyBuffer())
+
+        consumer(block.asReadOnlyBuffer())                     // caller sees read-only view
+        pool.release(block)
+
         scratch.clear()
     }
 }

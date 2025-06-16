@@ -48,6 +48,14 @@ subprojects {
     }
 
     when (name) {
+        "akkara-common" -> {
+            afterEvaluate {
+                dependencies {
+                    api(libs.slf4j)
+                }
+            }
+        }
+
         "akkara-core" -> {
             dependencies {
                 implementation(project(":akkara-common"))

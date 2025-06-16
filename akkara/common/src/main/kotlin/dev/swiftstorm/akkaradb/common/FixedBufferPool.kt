@@ -10,7 +10,10 @@ class FixedBufferPool(
     private val queue = ArrayDeque<ByteBuffer>(capacity)
 
     override fun get(size: Int): ByteBuffer =
-        synchronized(queue) { queue.removeFirstOrNull() } ?: ByteBuffer.allocateDirect(bufSize)
+        synchronized(queue) {
+            queue.firstOrNull { it.capacity() >= size }?.also { queue.remove(it) }
+        } ?: ByteBuffer.allocateDirect(maxOf(size, bufSize))
+
 
     override fun release(buf: ByteBuffer) {
         buf.clear()
