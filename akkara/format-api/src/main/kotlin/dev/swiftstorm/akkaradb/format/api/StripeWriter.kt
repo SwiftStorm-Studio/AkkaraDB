@@ -40,6 +40,17 @@ interface StripeWriter : AutoCloseable {
      */
     fun flush(): Long
 
+    /**
+     * Restores the internal counter after reopening existing lane files.
+     * Must be called *before* the first addBlock()/flush().
+     *
+     * Default impl allows engines to call it safely even on writers
+     * that don’t care (seek(0) is a no-op).
+     */
+    fun seek(stripeIndex: Long) {
+        require(stripeIndex == 0L) { "seek() not supported by this implementation" }
+    }
+
     /** Closes all lane files and releases resources. */
     override fun close()
 }

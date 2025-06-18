@@ -3,10 +3,14 @@ package dev.swiftstorm.akkaradb.engine
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
+import dev.swiftstorm.akkaradb.format.akk.*
+import dev.swiftstorm.akkaradb.format.akk.parity.XorParityCoder
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
+import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.RecordWriter
 import dev.swiftstorm.akkaradb.format.api.StripeWriter
 import java.nio.ByteBuffer
+import java.nio.file.Path
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -48,20 +52,38 @@ class AkkaraDB private constructor(
     /* -------- Factory -------- */
 
     companion object {
-        /** Build a fully‑wired DB instance with default components. */
         fun open(
+            baseDir: Path,
+            k: Int = 4,
+            parityCoder: ParityCoder = XorParityCoder(),
+            flushThresholdBytes: Long = 64L * 1024 * 1024
+        ): AkkaraDB {
+            val manifest = AkkManifest(baseDir.resolve("manifest.txt"))
+            val stripe = AkkStripeWriter(baseDir, k, parityCoder, true)
+            val packer = AkkBlockPackerDirect
+            val writer = AkkRecordWriter
+
+            return with(
+                stripeWriter = stripe,
+                recordWriter = writer,
+                packer = packer,
+                manifest = manifest,
+                flushThresholdBytes = flushThresholdBytes
+            )
+        }
+
+        fun with(
             stripeWriter: StripeWriter,
             recordWriter: RecordWriter,
             packer: BlockPacker,
             manifest: AkkManifest,
             flushThresholdBytes: Long = 64L * 1024 * 1024
         ): AkkaraDB {
-            lateinit var db: AkkaraDB   // forward ref for lambda
 
             val mem = MemTable(flushThresholdBytes) { records ->
                 records.forEach { rec ->
-                    val maxSize = recordWriter.computeMaxSize(rec)
-                    val tmp = ByteBuffer.allocate(maxSize)
+                    val bufSize = recordWriter.computeMaxSize(rec)
+                    val tmp = ByteBuffer.allocate(bufSize)
                     recordWriter.write(rec, tmp)
                     tmp.flip()
                     packer.addRecord(tmp) { blk -> stripeWriter.addBlock(blk) }
@@ -69,10 +91,30 @@ class AkkaraDB private constructor(
                 packer.flush { blk -> stripeWriter.addBlock(blk) }
             }
 
-            db = AkkaraDB(mem, packer, stripeWriter, recordWriter, manifest).also {
-                manifest.load()               // recover counter on open
+            return AkkaraDB(mem, packer, stripeWriter, recordWriter, manifest).also {
+                manifest.load()
+                stripeWriter.seek(manifest.stripesWritten)
+
+                val reader = AkkStripeReader(
+                    baseDir = (stripeWriter as AkkStripeWriter).baseDir,
+                    k = stripeWriter.k,
+                    parityCoder = stripeWriter.parityCoder
+                )
+                val recReader = AkkRecordReader
+                var stripeId = 0L
+                loop@ while (true) {
+                    val payloads = reader.readStripe() ?: break@loop
+                    for (payload in payloads) {
+                        val dup = payload.duplicate()
+                        while (dup.hasRemaining()) {
+                            val rec = recReader.read(dup)
+                            mem.put(rec)
+                        }
+                    }
+                    stripeId++
+                }
+                reader.close()
             }
-            return db
         }
     }
 }

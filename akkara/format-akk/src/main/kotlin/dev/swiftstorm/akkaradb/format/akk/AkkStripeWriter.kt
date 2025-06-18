@@ -1,5 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.logger
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeWriter
@@ -21,10 +22,10 @@ import java.nio.file.StandardOpenOption.*
  *   the entire stripe in a gather-write loop.
  */
 class AkkStripeWriter(
-    baseDir: Path,
+    val baseDir: Path,
     override val k: Int = 4,
-    private val parityCoder: ParityCoder? = null,
-    private val autoFlush: Boolean = false
+    val parityCoder: ParityCoder? = null,
+    val autoFlush: Boolean = false
 ) : StripeWriter {
 
     override val m: Int = parityCoder?.parityCount ?: 0
@@ -80,6 +81,21 @@ class AkkStripeWriter(
         if (queue.isNotEmpty()) writeStripe()
         (dataLanes + parityLanes).forEach { it.force(true) }
         return stripesWritten
+    }
+
+    override fun seek(stripeIndex: Long) {
+        require(queue.isEmpty()) { "cannot seek while a stripe is buffered" }
+        require(stripeIndex >= 0) { "negative stripe index" }
+
+        val blockSize = BLOCK_SIZE.toLong()
+        val expectedBytes = stripeIndex * blockSize
+        require(dataLanes.all { it.size() == expectedBytes }) {
+            "lane length mismatch: manifest=$stripeIndex, file=${
+                dataLanes.first().size() / blockSize
+            }"
+        }
+
+        stripesWritten = stripeIndex
     }
 
     override fun close() {

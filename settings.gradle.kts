@@ -28,6 +28,3 @@ project(":akkara-replica").projectDir = file("akkara/replica")
 
 include("akkara-cli")
 project(":akkara-cli").projectDir = file("akkara/cli")
-
-include("akkara-wal")
-project(":akkara-wal").projectDir = file("akkara/wal")

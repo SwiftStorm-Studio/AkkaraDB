@@ -71,13 +71,7 @@ subprojects {
             dependencies {
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
-            }
-        }
-
-        "akkara-wal" -> {
-            dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-engine"))
+                implementation(project(":akkara-format-akk"))
             }
         }
 
@@ -102,9 +96,9 @@ subprojects {
                 implementation(project(":akkara-engine"))
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
-                implementation(project(":akkara-wal"))
 
                 implementation(kotlin("test"))
+                implementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
             }
         }
     }

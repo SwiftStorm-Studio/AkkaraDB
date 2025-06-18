@@ -12,7 +12,7 @@ import java.util.zip.CRC32
 /**
  * Block packer backed by a global [dev.swiftstorm.akkaradb.common.BufferPool].
  */
-class AkkBlockPackerDirect : BlockPacker, Closeable {
+object AkkBlockPackerDirect : BlockPacker, Closeable {
 
     override val blockSize: Int = BLOCK_SIZE
 
