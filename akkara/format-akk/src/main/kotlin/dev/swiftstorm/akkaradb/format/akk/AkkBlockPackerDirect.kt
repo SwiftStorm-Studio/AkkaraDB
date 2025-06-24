@@ -3,6 +3,7 @@ package dev.swiftstorm.akkaradb.format.akk
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BlockConst.MAX_RECORD
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import java.io.Closeable
@@ -10,56 +11,53 @@ import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
 /**
- * Block packer backed by a global [dev.swiftstorm.akkaradb.common.BufferPool].
+ * Thread-safe (per-instance) block packer.
+ *
+ * * scratch / CRC / pool Buffer は **インスタンス固有**なので競合なし
+ * * 完成した 32 KiB ブロックは ctor で渡された [onBlockReady] に渡す
  */
-object AkkBlockPackerDirect : BlockPacker, Closeable {
+class AkkBlockPackerDirect(
+    private val onBlockReady: (ByteBuffer) -> Unit,
+    private val pool: BufferPool = Pools.io()
+) : BlockPacker, Closeable {
 
     override val blockSize: Int = BLOCK_SIZE
 
-    private val pool = Pools.io()
+    /* ---- per-instance state ---- */
     private val scratch: ByteBuffer = pool.get()
     private val crc = CRC32()
 
-    /* ---------- public API ---------- */
-
-    override fun addRecord(record: ByteBuffer, consumer: (ByteBuffer) -> Unit) {
-        val len = record.remaining()
-        require(len <= MAX_RECORD) { "Record of $len B exceeds $MAX_RECORD B" }
-
-        if (scratch.position() + len > PAYLOAD_LIMIT) emitBlock(consumer)
+    override fun addRecord(record: ByteBuffer) {
+        require(record.remaining() <= MAX_RECORD) {
+            "Record ${record.remaining()} B exceeds $MAX_RECORD B"
+        }
+        if (scratch.position() + record.remaining() > PAYLOAD_LIMIT) emitBlock()
         scratch.put(record.duplicate())
     }
 
-    override fun flush(consumer: (ByteBuffer) -> Unit) {
-        if (scratch.position() > 0) emitBlock(consumer)
+    override fun flush() {
+        if (scratch.position() > 0) emitBlock()
     }
 
-    override fun close() {
-        pool.release(scratch)
-    }
+    override fun close() = pool.release(scratch)
 
-    /* ---------- internal ---------- */
-
-    private fun emitBlock(consumer: (ByteBuffer) -> Unit) {
+    /* ---- internal ---- */
+    private fun emitBlock() {
         val payloadLen = scratch.position()
         scratch.flip()
 
-        val block = pool.get()
-        block.putInt(payloadLen)
-        block.put(scratch)
-
-        while (block.position() < PAYLOAD_LIMIT + 4) block.put(0)
+        val blk = pool.get()
+        blk.putInt(payloadLen)
+        blk.put(scratch)
+        while (blk.position() < PAYLOAD_LIMIT + 4) blk.put(0)
 
         crc.reset()
-        block.duplicate().limit(4 + payloadLen).position(0).let { crc.update(it) }
+        blk.duplicate().limit(4 + payloadLen).position(0).let(crc::update)
+        blk.position(PAYLOAD_LIMIT + 4).putInt(crc.value.toInt())
+        blk.flip()
 
-        block.position(PAYLOAD_LIMIT + 4)
-        block.putInt(crc.value.toInt())
-        block.flip()
-
-        consumer(block.asReadOnlyBuffer())                     // caller sees read-only view
-        pool.release(block)
-
+        onBlockReady(blk.asReadOnlyBuffer())
+        pool.release(blk)
         scratch.clear()
     }
 }

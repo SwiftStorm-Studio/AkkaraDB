@@ -15,14 +15,3 @@ object Pools {
 
     fun io(): BufferPool = provider()
 }
-
-fun main() {
-
-    val buf = Pools.io().get()
-    try {
-        // use buffer
-    } finally {
-        Pools.io().release(buf)
-    }
-
-}

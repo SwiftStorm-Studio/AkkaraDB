@@ -106,22 +106,14 @@ class AkkStripeWriter(
     /* ---------- internal ---------- */
 
     private fun writeStripe() {
-        /* 1) write data lanes */
-        for ((idx, ch) in dataLanes.withIndex()) {
-            ch.write(queue[idx].duplicate())
-        }
+        val dataDup = queue.map { it.duplicate() }
+        val parityBlocks = parityCoder?.encode(dataDup) ?: emptyList()
 
-        /* 2) parity lanes */
-        if (m > 0) {
-            val dataDup: List<ByteBuffer> = queue.map { it.duplicate() }
-            val parityBlocks: List<ByteBuffer> = parityCoder!!.encode(dataDup)
-
-            parityBlocks.forEachIndexed { idx, buf ->
-                parityLanes[idx].write(buf.duplicate())
-            }
-        }
+        for ((idx, ch) in dataLanes.withIndex()) ch.write(queue[idx].duplicate())
+        for ((idx, ch) in parityLanes.withIndex()) ch.write(parityBlocks[idx].duplicate())
 
         queue.clear()
         stripesWritten++
     }
+
 }

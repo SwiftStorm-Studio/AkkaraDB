@@ -4,35 +4,51 @@ import dev.swiftstorm.akkaradb.common.Record
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentSkipListMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 
-/**
- * In‑memory ordered map that flushes once the estimated size exceeds [thresholdBytes].
- */
 class MemTable(
     private val thresholdBytes: Long,
     private val onFlush: (List<Record>) -> Unit
 ) {
-    private val map = ConcurrentSkipListMap<ByteBuffer, Record>(ByteBufferLexicographicComparator)
-    private val currentBytes = AtomicLong(0)
 
-    fun put(record: Record) {
+    private val map =
+        ConcurrentSkipListMap<ByteBuffer, Record>(ByteBufferLexicographicComparator)
+
+    private val currentBytes = AtomicLong(0)
+    private val highestSeqNo = AtomicLong(0)
+
+    /* ---------- public API ---------- */
+
+    fun put(record: Record) = insert(record, updateSeq = true)
+
+    fun flush() {
+        val entries = map.values.toList()
+        if (entries.isEmpty()) return
+
+        map.clear()
+        currentBytes.set(0)
+
+        onFlush(entries)
+    }
+
+    fun lastSeq(): Long = highestSeqNo.get()
+
+    /* ---------- internal helpers ---------- */
+
+    private fun insert(record: Record, updateSeq: Boolean) {
         val prev = map.put(record.key, record)
+
         currentBytes.addAndGet(sizeOf(record) - (prev?.let(::sizeOf) ?: 0))
+
+        if (updateSeq) {
+            highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
+        }
+
         if (currentBytes.get() >= thresholdBytes) flush()
     }
 
-    fun get(key: ByteBuffer): Record? = map[key]
-
-    fun flush() {
-        if (map.isEmpty()) return
-        val snapshot = map.values.toList()
-        onFlush(snapshot)
-        map.clear()
-        currentBytes.set(0)
-    }
-
-    private fun sizeOf(r: Record): Long =
-        (r.key.remaining() + r.value.remaining() + 16).toLong() // rough estimate
+    private fun sizeOf(record: Record): Long =
+        (record.key.remaining() + record.value.remaining() + java.lang.Long.BYTES).toLong()
 }
 
 /* helpers */

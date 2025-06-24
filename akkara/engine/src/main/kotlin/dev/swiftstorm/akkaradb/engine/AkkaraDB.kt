@@ -1,55 +1,78 @@
 package dev.swiftstorm.akkaradb.engine
 
+import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
-import dev.swiftstorm.akkaradb.format.akk.*
+import dev.swiftstorm.akkaradb.engine.wal.WalWriter
+import dev.swiftstorm.akkaradb.engine.wal.replayWal
+import dev.swiftstorm.akkaradb.format.akk.AkkBlockPackerDirect
+import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
+import dev.swiftstorm.akkaradb.format.akk.AkkRecordWriter
+import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
+import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
 import dev.swiftstorm.akkaradb.format.akk.parity.XorParityCoder
-import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
-import dev.swiftstorm.akkaradb.format.api.RecordWriter
-import dev.swiftstorm.akkaradb.format.api.StripeWriter
-import java.nio.ByteBuffer
 import java.nio.file.Path
 import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 class AkkaraDB private constructor(
     private val memTable: MemTable,
-    private val packer: BlockPacker,
-    private val stripeWriter: StripeWriter,
-    private val recordWriter: RecordWriter,
-    private val manifest: AkkManifest
+    private val packer: AkkBlockPackerDirect,
+    private val stripeWriter: AkkStripeWriter,
+    private val manifest: AkkManifest,
+    private val wal: WalWriter,
+    private val pool: BufferPool = Pools.io()
 ) : AutoCloseable {
 
     private val lock = ReentrantReadWriteLock()
+    private val recordWriter = AkkRecordWriter
 
-    /* -------- API -------- */
+    /* ---------------- public API ---------------- */
 
     fun put(rec: Record) = lock.write {
+        // 1) Encode record using pooled buffer
+        val buf = pool.get(recordWriter.computeMaxSize(rec))
+        recordWriter.write(rec, buf)
+        buf.flip()
+
+        // 2) WAL first
+        wal.append(buf.duplicate())
+
+        // 3) MemTable
         memTable.put(rec)
+
+        // 4) BlockPacker
+        packer.addRecord(buf)
+        pool.release(buf)
     }
 
-    fun get(key: ByteBuffer): ByteBuffer? = lock.read {
-        memTable.get(key)?.value
-        // TODO: SSTable & StripeReader fallback
-    }
-
-    /** Flushes MemTable → disk and fsyncs manifest. */
     fun flush() = lock.write {
+        // Drain MemTable -> packer
         memTable.flush()
-        val stripes = stripeWriter.flush()
-        manifest.advance(stripes)
+        packer.flush()
+
+        // Stripe flush with manifest advance
+        val stripesAfter = try {
+            stripeWriter.flush()
+        } finally {
+            manifest.advance(stripeWriter.stripesWritten)
+        }
+
+        // WAL checkpoint & seal
+        wal.checkpoint(stripesAfter, memTable.lastSeq())
+        wal.sealSegment()
     }
 
     override fun close() {
         flush()
+        wal.close()
         stripeWriter.close()
-        (packer as? AutoCloseable)?.close()
     }
 
-    /* -------- Factory -------- */
+    /* --------------- factory -------------------- */
 
     companion object {
         fun open(
@@ -58,46 +81,50 @@ class AkkaraDB private constructor(
             parityCoder: ParityCoder = XorParityCoder(),
             flushThresholdBytes: Long = 64L * 1024 * 1024
         ): AkkaraDB {
-            val manifest = AkkManifest(baseDir.resolve("manifest.txt"))
-            val stripe = AkkStripeWriter(baseDir, k, parityCoder, true)
-            val packer = AkkBlockPackerDirect
+            /* 1. persistent components */
+            val manifest = AkkManifest(baseDir.resolve("manifest.json"))
+            val stripe = AkkStripeWriter(baseDir, k, parityCoder, autoFlush = true)
+            val wal = WalWriter(baseDir.resolve("wal.log"))
             val writer = AkkRecordWriter
+            val pool = Pools.io()
+
+            /* 2. pipeline components */
+            val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
 
             val mem = MemTable(flushThresholdBytes) { records ->
-                records.forEach { rec ->
-                    val bufSize = writer.computeMaxSize(rec)
-                    val tmp = ByteBuffer.allocate(bufSize)
-                    writer.write(rec, tmp)
-                    tmp.flip()
-                    packer.addRecord(tmp) { blk -> stripe.addBlock(blk) }
+                for (r in records) {
+                    val buf = pool.get(writer.computeMaxSize(r))
+                    writer.write(r, buf)
+                    buf.flip()
+                    packer.addRecord(buf)
+                    pool.release(buf)
                 }
-                packer.flush { blk -> stripe.addBlock(blk) }
+                packer.flush()
             }
 
-            return AkkaraDB(mem, packer, stripe, writer, manifest).also {
-                manifest.load()
-                stripe.seek(manifest.stripesWritten)
+            /* 3. Load manifest & seek StripeWriter */
+            manifest.load()
+            stripe.seek(manifest.stripesWritten)
 
-                val reader = AkkStripeReader(
-                    baseDir = stripe.baseDir,
-                    k = stripe.k,
-                    parityCoder = stripe.parityCoder
-                )
-                val recReader = AkkRecordReader
-                var stripeId = 0L
-                loop@ while (true) {
-                    val payloads = reader.readStripe() ?: break@loop
-                    for (payload in payloads) {
-                        val dup = payload.duplicate()
-                        while (dup.hasRemaining()) {
-                            val rec = recReader.read(dup)
-                            mem.put(rec)
-                        }
-                    }
-                    stripeId++
+            /* 4. WAL replay (durable before crash) */
+            replayWal(baseDir.resolve("wal.log"), mem)
+
+            /* 5. Stripe rescan (data already on disk) */
+            val stripeReader = AkkStripeReader(baseDir, k, parityCoder)
+            val recReader = AkkRecordReader
+            var sid = manifest.stripesWritten
+            while (true) {
+                val payloads = stripeReader.readStripe() ?: break
+                for (p in payloads) {
+                    val dup = p.duplicate()
+                    while (dup.hasRemaining()) mem.put(recReader.read(dup))
                 }
-                reader.close()
+                sid++
             }
+            stripeReader.close()
+
+            /* 6. return ready instance */
+            return AkkaraDB(mem, packer, stripe, manifest, wal, pool)
         }
     }
 }
