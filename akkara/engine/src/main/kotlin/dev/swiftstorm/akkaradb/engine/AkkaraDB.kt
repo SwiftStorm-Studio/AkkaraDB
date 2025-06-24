@@ -63,42 +63,25 @@ class AkkaraDB private constructor(
             val packer = AkkBlockPackerDirect
             val writer = AkkRecordWriter
 
-            return with(
-                stripeWriter = stripe,
-                recordWriter = writer,
-                packer = packer,
-                manifest = manifest,
-                flushThresholdBytes = flushThresholdBytes
-            )
-        }
-
-        fun with(
-            stripeWriter: StripeWriter,
-            recordWriter: RecordWriter,
-            packer: BlockPacker,
-            manifest: AkkManifest,
-            flushThresholdBytes: Long = 64L * 1024 * 1024
-        ): AkkaraDB {
-
             val mem = MemTable(flushThresholdBytes) { records ->
                 records.forEach { rec ->
-                    val bufSize = recordWriter.computeMaxSize(rec)
+                    val bufSize = writer.computeMaxSize(rec)
                     val tmp = ByteBuffer.allocate(bufSize)
-                    recordWriter.write(rec, tmp)
+                    writer.write(rec, tmp)
                     tmp.flip()
-                    packer.addRecord(tmp) { blk -> stripeWriter.addBlock(blk) }
+                    packer.addRecord(tmp) { blk -> stripe.addBlock(blk) }
                 }
-                packer.flush { blk -> stripeWriter.addBlock(blk) }
+                packer.flush { blk -> stripe.addBlock(blk) }
             }
 
-            return AkkaraDB(mem, packer, stripeWriter, recordWriter, manifest).also {
+            return AkkaraDB(mem, packer, stripe, writer, manifest).also {
                 manifest.load()
-                stripeWriter.seek(manifest.stripesWritten)
+                stripe.seek(manifest.stripesWritten)
 
                 val reader = AkkStripeReader(
-                    baseDir = (stripeWriter as AkkStripeWriter).baseDir,
-                    k = stripeWriter.k,
-                    parityCoder = stripeWriter.parityCoder
+                    baseDir = stripe.baseDir,
+                    k = stripe.k,
+                    parityCoder = stripe.parityCoder
                 )
                 val recReader = AkkRecordReader
                 var stripeId = 0L
