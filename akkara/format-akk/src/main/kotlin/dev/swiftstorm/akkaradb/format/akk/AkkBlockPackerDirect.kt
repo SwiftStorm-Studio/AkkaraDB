@@ -10,12 +10,6 @@ import java.io.Closeable
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
-/**
- * Thread-safe (per-instance) block packer.
- *
- * * scratch / CRC / pool Buffer は **インスタンス固有**なので競合なし
- * * 完成した 32 KiB ブロックは ctor で渡された [onBlockReady] に渡す
- */
 class AkkBlockPackerDirect(
     private val onBlockReady: (ByteBuffer) -> Unit,
     private val pool: BufferPool = Pools.io()

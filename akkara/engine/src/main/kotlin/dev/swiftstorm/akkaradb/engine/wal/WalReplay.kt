@@ -17,6 +17,7 @@ fun replayWal(path: Path, mem: MemTable) {
                     val rec = AkkRecordReader.read(r.payload.duplicate())
                     mem.put(rec)
                 }
+
                 WalRecord.Seal -> apply = true
                 is WalRecord.CheckPoint -> apply = false
             }

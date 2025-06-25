@@ -9,8 +9,8 @@ sealed interface WalRecord {
     /* ----------- codec ----------- */
 
     companion object Codec {
-        private const val TAG_ADD        = 1
-        private const val TAG_SEAL       = 2
+        private const val TAG_ADD = 1
+        private const val TAG_SEAL = 2
         private const val TAG_CHECKPOINT = 3
 
         fun readFrom(buf: ByteBuffer): WalRecord {
@@ -23,11 +23,13 @@ sealed interface WalRecord {
                     buf.position(buf.position() + len)
                     Add(payload.asReadOnlyBuffer())
                 }
+
                 TAG_SEAL -> Seal
                 TAG_CHECKPOINT -> CheckPoint(
                     VarIntCodec.readLong(buf),
                     VarIntCodec.readLong(buf)
                 )
+
                 else -> error("Unknown WAL tag=$tag")
             }
         }

@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.Pools           // ★ 追加
+import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
@@ -63,6 +64,24 @@ class AkkStripeReader(
         laneBlocks.filterNotNull().forEach(pool::release)
 
         return payloads
+    }
+
+    fun searchLatestStripe(key: ByteBuffer): Record? {
+        val recReader = AkkRecordReader
+        var found: Record? = null
+        var stripePayloads: List<ByteBuffer>? = readStripe()
+        while (stripePayloads != null) {
+            // 各 lane の payload をスキャン
+            for (payload in stripePayloads) {
+                val dup = payload.duplicate()
+                while (dup.hasRemaining()) {
+                    val rec = recReader.read(dup)
+                    if (rec.key == key) found = rec
+                }
+            }
+            stripePayloads = readStripe()
+        }
+        return found
     }
 
     override fun close() {
