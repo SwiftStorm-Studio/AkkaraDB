@@ -2,6 +2,7 @@
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import kotlin.experimental.xor
@@ -21,24 +22,37 @@ class XorParityCoder : ParityCoder {
     override fun encode(dataBlocks: List<ByteBuffer>): List<ByteBuffer> {
         require(dataBlocks.isNotEmpty()) { "dataBlocks must not be empty" }
         val size = dataBlocks[0].remaining()
-        require(dataBlocks.all { it.remaining() == size }) {
-            "All data blocks must have equal length"
-        }
+        require(dataBlocks.all { it.remaining() == size }) { "All data blocks must have equal length" }
 
-        val parity = ByteBuffer.allocateDirect(size)
+        val pool   = Pools.io()
+        val parity = pool.get(size)
 
-        // initial copy from first block
-        val first = dataBlocks[0].duplicate()
-        parity.put(first).flip()
+        try {
+            val longs = size ushr 3
 
-        // XOR remaining blocks (absolute get/put, no temp array)
-        for (idx in 1 until dataBlocks.size) {
-            val buf = dataBlocks[idx].duplicate()
-            for (pos in 0 until size) {
-                parity.put(pos, parity.get(pos) xor buf.get(pos))
+            parity.put(dataBlocks[0].duplicate()).flip()
+
+            for (idx in 1 until dataBlocks.size) {
+                val blk = dataBlocks[idx].duplicate()
+
+                var i = 0
+                while (i < longs) {
+                    val v = blk.getLong(i * 8)
+                    parity.putLong(i * 8, parity.getLong(i * 8) xor v)
+                    i++
+                }
+                var pos = longs * 8
+                while (pos < size) {
+                    parity.put(pos, (parity.get(pos) xor blk.get(pos)).toByte())
+                    pos++
+                }
             }
+
+            parity.flip()
+            return listOf(parity.asReadOnlyBuffer())
+        } finally {
+            pool.release(parity)
         }
-        return listOf(parity.asReadOnlyBuffer())
     }
 
     /* ---------- decode ---------- */

@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.borrow
 import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
@@ -53,15 +54,20 @@ class SSTableWriter(
     private fun flushBlock() {
         blockBuf.flip()
         val offset = ch.position()
+
         ch.write(blockBuf.duplicate())
 
-        crc32.reset(); crc32.update(blockBuf.duplicate())
-        val crcBuf = ByteBuffer.allocate(4).putInt(crc32.value.toInt())
-        crcBuf.flip(); ch.write(crcBuf)
+        crc32.reset()
+        crc32.update(blockBuf.duplicate())
+        pool.borrow(4) { crcBuf ->
+            crcBuf.clear()
+            crcBuf.putInt(crc32.value.toInt())
+            crcBuf.flip()
+            ch.write(crcBuf)
+        }
 
-        val keyBuf = blockBuf.duplicate()
-        val firstRec = AkkRecordReader.read(keyBuf)
-        index += firstRec.key.asReadOnlyBuffer() to offset
+        val firstKey = AkkRecordReader.read(blockBuf.duplicate()).key.asReadOnlyBuffer()
+        index += firstKey to offset
 
         blockBuf.clear()
     }
@@ -81,13 +87,15 @@ class SSTableWriter(
         }
     }
 
-
     private fun writeFooter(indexOff: Long, bloomOff: Long) {
-        val ftr = ByteBuffer.allocate(20)
-        ftr.putInt(0x414B5353)       // "AKSS" magic
-        ftr.putLong(indexOff)
-        ftr.putLong(bloomOff)
-        ftr.flip(); ch.write(ftr)
+        pool.borrow(20) { ftr ->
+            ftr.clear()
+            ftr.putInt(0x414B5353)   // "AKSS" magic
+            ftr.putLong(indexOff)
+            ftr.putLong(bloomOff)
+            ftr.flip()
+            ch.write(ftr)
+        }
     }
 
     private fun encode(rec: Record): ByteBuffer {

@@ -56,6 +56,7 @@ object VarIntCodec {
             result = result or ((b and 0x7F) shl shift)
             shift += 7
         } while (b and 0x80 != 0)
+        if (shift >= 35) throw IllegalArgumentException("Malformed VarInt")
         return result
     }
 
@@ -68,6 +69,7 @@ object VarIntCodec {
             result = result or ((b and 0x7F).toLong() shl shift)
             shift += 7
         } while (b and 0x80 != 0)
+        if (shift >= 35) throw IllegalArgumentException("Malformed VarInt")
         return result
     }
 

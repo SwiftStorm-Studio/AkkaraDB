@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.common.borrow
 import java.io.Closeable
 import java.nio.BufferOverflowException
 import java.nio.ByteBuffer
@@ -11,7 +12,7 @@ import java.nio.file.StandardOpenOption.*
 
 class WalWriter(
     path: Path,
-    private val pool: BufferPool = Pools.io(),   // 既存の共通プールを利用
+    private val pool: BufferPool = Pools.io(),
     initCap: Int = 32 * 1024
 ) : Closeable {
 
@@ -38,12 +39,17 @@ class WalWriter(
                 r.writeTo(scratch)
                 scratch.flip()
                 while (scratch.hasRemaining()) ch.write(scratch)
-                return                               // success
+                return                                // success
             } catch (_: BufferOverflowException) {
-                // 乗り切らなかった：倍サイズをプールから借り直す
-                val newCap = scratch.capacity() * 2
-                pool.release(scratch)               // 旧バッファ返却
-                scratch = pool.get(newCap)
+                val needed = scratch.capacity() * 2
+                pool.borrow(needed) { tmp ->
+                    r.writeTo(tmp)
+                    tmp.flip()
+                    while (tmp.hasRemaining()) ch.write(tmp)
+                }
+                pool.release(scratch)
+                scratch = pool.get(needed)
+                return
             }
         }
     }

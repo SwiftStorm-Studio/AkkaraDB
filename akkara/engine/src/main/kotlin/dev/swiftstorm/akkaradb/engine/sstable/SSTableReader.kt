@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.borrow
 import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
@@ -44,22 +45,29 @@ class SSTableReader(
     init {
         // ---- 1) footer ----
         require(fileSize >= 20) { "file too small: $path" }
-        val footerBuf = ByteBuffer.allocate(20)
-        ch.read(footerBuf, fileSize - 20); footerBuf.flip()
 
-        require(footerBuf.int == 0x414B5353) { "bad magic in footer: $path" } // 'AKSS'
-        indexOff = footerBuf.long
-        bloomOff = footerBuf.long
+        val (idxOffTmp, bloomOffTmp) = Pools.io().borrow(20) { buf ->
+            ch.read(buf, fileSize - 20); buf.flip()
+
+            require(buf.int == 0x414B5353) { "bad magic in footer: $path" } // 'AKSS'
+            buf.long to buf.long
+        }
+        indexOff  = idxOffTmp
+        bloomOff  = bloomOffTmp
 
         // ---- 2) read bloom ----
         val bloomSize = (fileSize - 20 - bloomOff).toInt()
-        bloom = BloomFilter.readFrom(ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong()), bloomSize)
+        bloom = BloomFilter.readFrom(
+            ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong()),
+            bloomSize
+        )
 
         // ---- 3) read index block ----
         val indexSize = (bloomOff - indexOff).toInt()
         val idxBuf = ch.map(FileChannel.MapMode.READ_ONLY, indexOff, indexSize.toLong())
         indexList = buildIndexList(idxBuf)
     }
+
 
     /* -------------- public API -------------- */
 
@@ -100,13 +108,16 @@ class SSTableReader(
         val list = ArrayList<Pair<ByteBuffer, Long>>()
         while (buf.hasRemaining()) {
             val len = VarIntCodec.readInt(buf)
-            val key = ByteBuffer.allocate(len)
-            buf.get(key.array())
+            val keySlice = buf.slice().apply {
+                limit(len)
+            }.asReadOnlyBuffer()
+            buf.position(buf.position() + len)
             val off = buf.long
-            list += key.asReadOnlyBuffer() to off
+            list += keySlice to off
         }
         return list
     }
+
 
     private fun binarySearchIndex(key: ByteBuffer): Long {
         var lo = 0

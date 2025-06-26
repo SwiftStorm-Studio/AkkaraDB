@@ -1,5 +1,7 @@
 package dev.swiftstorm.akkaradb.engine.util
 
+import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.common.borrow
 import java.nio.ByteBuffer
 import java.nio.channels.ReadableByteChannel
 import java.nio.channels.WritableByteChannel
@@ -9,15 +11,16 @@ import kotlin.math.max
 class BloomFilter private constructor(
     private val bits: Int,
     private val hashCount: Int,
-    internal val bitset: LongArray
+    internal val bitset: LongArray,
 ) {
-
     constructor(expectedEntries: Int, falsePositiveRate: Double = 0.01)
             : this(
         bits = calcBits(expectedEntries, falsePositiveRate),
         hashCount = calcHashCount(expectedEntries, falsePositiveRate),
         bitset = LongArray((calcBits(expectedEntries, falsePositiveRate) + 63) / 64)
     )
+
+    private val pool = Pools.io()
 
     /* ---------- public ops ---------- */
 
@@ -41,20 +44,25 @@ class BloomFilter private constructor(
     /* ---------- (de)serialization ---------- */
 
     fun writeTo(ch: WritableByteChannel) {
-        val buf = ByteBuffer.allocate(bitset.size * 8)
-        bitset.forEach { buf.putLong(it) }
-        buf.flip(); ch.write(buf)
+        pool.borrow(bitset.size * 8) { buf ->
+            buf.clear()
+            bitset.forEach { buf.putLong(it) }
+            buf.flip()
+            ch.write(buf)
+        }
     }
 
     fun byteSize(): Int = bitset.size * 8
 
     companion object {
         /* ---- Channel → BloomFilter ---- */
-        fun readFrom(ch: ReadableByteChannel, size: Int): BloomFilter {
-            val buf = ByteBuffer.allocate(size)
-            ch.read(buf); buf.flip()
-            return readFrom(buf)
-        }
+        fun readFrom(ch: ReadableByteChannel, size: Int): BloomFilter =
+            Pools.io().borrow(size) { tmp ->
+                tmp.clear()
+                ch.read(tmp)          // full read
+                tmp.flip()
+                readFrom(tmp, size)
+            }
 
         /* ---- ByteBuffer → BloomFilter ---- */
         fun readFrom(buf: ByteBuffer, size: Int? = null): BloomFilter {

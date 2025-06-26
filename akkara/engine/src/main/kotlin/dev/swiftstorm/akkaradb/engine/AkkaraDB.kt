@@ -3,6 +3,7 @@ package dev.swiftstorm.akkaradb.engine
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.borrow
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
@@ -53,13 +54,14 @@ class AkkaraDB private constructor(
     }
 
     fun put(rec: Record) = lock.write {
-        val buf = pool.get(recordWriter.computeMaxSize(rec))
-        recordWriter.write(rec, buf); buf.flip()
+        pool.borrow(recordWriter.computeMaxSize(rec)) { buf ->
+            recordWriter.write(rec, buf)
+            buf.flip()
 
-        wal.append(buf.duplicate())   // WAL first
-        memTable.put(rec)             // MemTable
-        packer.addRecord(buf)         // BlockPacker
-        pool.release(buf)
+            wal.append(buf.duplicate())
+            memTable.put(rec)
+            packer.addRecord(buf)
+        }
     }
 
     fun flush() = lock.write {

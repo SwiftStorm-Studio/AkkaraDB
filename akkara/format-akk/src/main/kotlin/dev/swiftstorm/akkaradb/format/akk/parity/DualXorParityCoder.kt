@@ -2,6 +2,7 @@
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import kotlin.experimental.xor
@@ -25,28 +26,44 @@ class DualXorParityCoder : ParityCoder {
     /* ---------- encode ---------- */
 
     override fun encode(dataBlocks: List<ByteBuffer>): List<ByteBuffer> {
-        require(dataBlocks.isNotEmpty()) { "dataBlocks must not be empty" }
+        require(dataBlocks.isNotEmpty())
         val sz = dataBlocks[0].remaining()
-        require(dataBlocks.all { it.remaining() == sz }) {
-            "All data blocks must have equal length"
-        }
+        require(dataBlocks.all { it.remaining() == sz }) { "All data blocks must have equal length" }
 
-        val p = ByteBuffer.allocateDirect(sz)
-        val q = ByteBuffer.allocateDirect(sz)
+        val pool = Pools.io()
+        val p = pool.get(sz)
+        val q = pool.get(sz)
 
-        /* accumulate P & Q directly */
-        dataBlocks.forEachIndexed { idx, src ->
-            val sh = (idx + 1) and 7
-            val dup = src.duplicate()
-            for (pos in 0 until sz) {
-                val b = dup.get(pos)
-                p.put(pos, p.get(pos) xor b)
-                q.put(pos, q.get(pos) xor b.rotateLeft(sh))
+        try {
+            val longs = sz ushr 3
+
+            dataBlocks.forEachIndexed { idx, src ->
+                val sh = ((idx + 1) and 7)
+                val dl = src.duplicate()
+
+                var i = 0
+                while (i < longs) {
+                    val v = dl.getLong(i * 8)
+                    p.putLong(i * 8, p.getLong(i * 8) xor v)
+                    q.putLong(i * 8, q.getLong(i * 8) xor v.rotateLeft(sh))
+                    i++
+                }
+
+                var pos = longs * 8                    // = sz - (sz % 8)
+                while (pos < sz) {
+                    val b = dl.get(pos)
+                    p.put(pos, (p.get(pos) xor b).toByte())
+                    q.put(pos, (q.get(pos) xor b.rotateLeft(sh)).toByte())
+                    pos++
+                }
             }
-        }
 
-        p.flip(); q.flip()
-        return listOf(p.asReadOnlyBuffer(), q.asReadOnlyBuffer())
+            p.flip(); q.flip()
+            return listOf(p.asReadOnlyBuffer(), q.asReadOnlyBuffer())
+        } finally {
+            pool.release(p)
+            pool.release(q)
+        }
     }
 
     /* ---------- decode ---------- */
