@@ -8,7 +8,8 @@ interface BufferPool : AutoCloseable {
     fun release(buf: ByteBuffer)
 
     data class Stats(val hits: Long, val misses: Long, val created: Long)
-    fun stats(): Stats = Stats(0,0,0)
+
+    fun stats(): Stats
 }
 
 inline fun <T> BufferPool.borrow(

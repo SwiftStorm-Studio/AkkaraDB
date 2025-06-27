@@ -24,7 +24,7 @@ class XorParityCoder : ParityCoder {
         val size = dataBlocks[0].remaining()
         require(dataBlocks.all { it.remaining() == size }) { "All data blocks must have equal length" }
 
-        val pool   = Pools.io()
+        val pool = Pools.io()
         val parity = pool.get(size)
 
         try {

@@ -51,12 +51,16 @@ object VarIntCodec {
         var shift = 0
         var result = 0
         var b: Int
-        do {
-            b = buf.get().toInt() and 0xFF
-            result = result or ((b and 0x7F) shl shift)
-            shift += 7
-        } while (b and 0x80 != 0)
-        if (shift >= 35) throw IllegalArgumentException("Malformed VarInt")
+        try {
+            do {
+                b = buf.get().toInt() and 0xFF
+                result = result or ((b and 0x7F) shl shift)
+                shift += 7
+                if (shift >= 35) throw IllegalArgumentException("VarInt too long (overflow)")
+            } while (b and 0x80 != 0)
+        } catch (ex: java.nio.BufferUnderflowException) {
+            throw IllegalArgumentException("VarInt truncated or buffer underflow", ex)
+        }
         return result
     }
 
@@ -64,12 +68,16 @@ object VarIntCodec {
         var shift = 0
         var result = 0L
         var b: Int
-        do {
-            b = buf.get().toInt() and 0xFF
-            result = result or ((b and 0x7F).toLong() shl shift)
-            shift += 7
-        } while (b and 0x80 != 0)
-        if (shift >= 35) throw IllegalArgumentException("Malformed VarInt")
+        try {
+            do {
+                b = buf.get().toInt() and 0xFF
+                result = result or ((b and 0x7F).toLong() shl shift)
+                shift += 7
+                if (shift >= 70) throw IllegalArgumentException("VarLong too long (overflow)")
+            } while (b and 0x80 != 0)
+        } catch (ex: java.nio.BufferUnderflowException) {
+            throw IllegalArgumentException("VarLong truncated or buffer underflow", ex)
+        }
         return result
     }
 

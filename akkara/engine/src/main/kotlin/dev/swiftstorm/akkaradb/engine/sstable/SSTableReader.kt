@@ -52,8 +52,8 @@ class SSTableReader(
             require(buf.int == 0x414B5353) { "bad magic in footer: $path" } // 'AKSS'
             buf.long to buf.long
         }
-        indexOff  = idxOffTmp
-        bloomOff  = bloomOffTmp
+        indexOff = idxOffTmp
+        bloomOff = bloomOffTmp
 
         // ---- 2) read bloom ----
         val bloomSize = (fileSize - 20 - bloomOff).toInt()

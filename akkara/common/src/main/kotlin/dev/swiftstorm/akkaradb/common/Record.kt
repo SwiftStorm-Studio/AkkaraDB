@@ -63,17 +63,22 @@ data class Record(
 }
 
 fun ByteBuffer.contentEquals(other: ByteBuffer): Boolean {
-    if (this.remaining() != other.remaining()) return false
-    for (i in 0 until this.remaining()) {
-        if (this.get(this.position() + i) != other.get(other.position() + i)) return false
+    val pos1 = this.position()
+    val pos2 = other.position()
+    val rem = this.remaining()
+    if (rem != other.remaining()) return false
+    for (i in 0 until rem) {
+        if (this.get(pos1 + i) != other.get(pos2 + i)) return false
     }
     return true
 }
 
 fun ByteBuffer.hash(): Int {
     var hash = 1
-    for (i in 0 until this.remaining()) {
-        hash = 31 * hash + this.get(this.position() + i)
+    val pos = this.position()
+    val rem = this.remaining()
+    for (i in 0 until rem) {
+        hash = 31 * hash + this.get(pos + i)
     }
     return hash
 }
