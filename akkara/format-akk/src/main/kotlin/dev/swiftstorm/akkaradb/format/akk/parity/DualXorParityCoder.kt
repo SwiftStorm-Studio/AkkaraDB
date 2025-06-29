@@ -2,7 +2,9 @@
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
+import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.common.borrow
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import kotlin.experimental.xor
@@ -19,7 +21,9 @@ import kotlin.experimental.xor
  * Recovers any single-lane loss: one data block *or* either parity.
  * All buffers must share identical `remaining()` length.
  */
-class DualXorParityCoder : ParityCoder {
+class DualXorParityCoder(
+    private val pool: BufferPool = Pools.io()
+) : ParityCoder {
 
     override val parityCount: Int = 2      // P and Q
 
@@ -30,40 +34,33 @@ class DualXorParityCoder : ParityCoder {
         val sz = dataBlocks[0].remaining()
         require(dataBlocks.all { it.remaining() == sz }) { "All data blocks must have equal length" }
 
-        val pool = Pools.io()
         val p = pool.get(sz)
         val q = pool.get(sz)
 
-        try {
-            val longs = sz ushr 3
+        val longs = sz ushr 3
+        dataBlocks.forEachIndexed { idx, src ->
+            val sh = (idx + 1) and 7
+            val dl = src.duplicate()
 
-            dataBlocks.forEachIndexed { idx, src ->
-                val sh = ((idx + 1) and 7)
-                val dl = src.duplicate()
-
-                var i = 0
-                while (i < longs) {
-                    val v = dl.getLong(i * 8)
-                    p.putLong(i * 8, p.getLong(i * 8) xor v)
-                    q.putLong(i * 8, q.getLong(i * 8) xor v.rotateLeft(sh))
-                    i++
-                }
-
-                var pos = longs * 8                    // = sz - (sz % 8)
-                while (pos < sz) {
-                    val b = dl.get(pos)
-                    p.put(pos, (p.get(pos) xor b).toByte())
-                    q.put(pos, (q.get(pos) xor b.rotateLeft(sh)).toByte())
-                    pos++
-                }
+            var i = 0
+            while (i < longs) {
+                val v = dl.getLong(i * 8)
+                p.putLong(i * 8, p.getLong(i * 8) xor v)
+                q.putLong(i * 8, q.getLong(i * 8) xor v.rotateLeft(sh))
+                i++
             }
 
-            p.flip(); q.flip()
-            return listOf(p.asReadOnlyBuffer(), q.asReadOnlyBuffer())
-        } finally {
-            pool.release(p)
-            pool.release(q)
+            var pos = longs * 8
+            while (pos < sz) {
+                val b = dl.get(pos)
+                p.put(pos, (p.get(pos) xor b).toByte())
+                q.put(pos, (q.get(pos) xor b.rotateLeft(sh)).toByte())
+                pos++
+            }
         }
+
+        p.flip(); q.flip()
+        return listOf(p.asReadOnlyBuffer(), q.asReadOnlyBuffer())
     }
 
     /* ---------- decode ---------- */
@@ -77,58 +74,73 @@ class DualXorParityCoder : ParityCoder {
             ?: presentData.first { it != null }!!
         val sz = ref.remaining()
 
-        val pCalc = ByteBuffer.allocateDirect(sz)
-        val qCalc = ByteBuffer.allocateDirect(sz)
+        val pCalc = pool.get(sz)
+        val qCalc = pool.get(sz)
 
-        presentData.forEachIndexed { idx, buf ->
-            if (buf != null) {
-                val sh = (idx + 1) and 7
-                val dup = buf.duplicate()
-                for (pos in 0 until sz) {
-                    val b = dup.get(pos)
-                    pCalc.put(pos, pCalc.get(pos) xor b)
-                    qCalc.put(pos, qCalc.get(pos) xor b.rotateLeft(sh))
+        try {
+            presentData.forEachIndexed { idx, buf ->
+                if (buf != null) {
+                    val sh = (idx + 1) and 7
+                    val dup = buf.duplicate()
+                    for (pos in 0 until sz) {
+                        val b = dup.get(pos)
+                        pCalc.put(pos, pCalc.get(pos) xor b)
+                        qCalc.put(pos, qCalc.get(pos) xor b.rotateLeft(sh))
+                    }
                 }
             }
-        }
 
-        return when {
-            /* ---- A. lost data_i ---- */
-            lostIndex < presentData.size -> {
-                val sh = (lostIndex + 1) and 7
-                val pMissing = xorBuffers(pCalc, presentParity[0]!!)
-                val qMissing = xorBuffers(qCalc, presentParity[1]!!)
+            return when {
+                lostIndex < presentData.size -> {
+                    val sh = (lostIndex + 1) and 7
+                    val pMissing = xorBuffers(pCalc, presentParity[0]!!)
+                    val qMissing = xorBuffers(qCalc, presentParity[1]!!)
 
-                val out = ByteBuffer.allocateDirect(sz)
-                for (pos in 0 until sz) {
-                    val recovered = (pMissing.get(pos) xor
-                            qMissing.get(pos).rotateRight(sh))
-                        .rotateRight(8 - sh)
-                    out.put(recovered)
+                    val out = pool.get(sz)
+                    for (pos in 0 until sz) {
+                        val recovered = (pMissing.get(pos) xor
+                                qMissing.get(pos).rotateRight(sh))
+                            .rotateRight(8 - sh)
+                        out.put(pos, recovered)
+                    }
+                    out.flip(); out.asReadOnlyBuffer()
                 }
-                out.flip(); out.asReadOnlyBuffer()
+
+                lostIndex == presentData.size -> {
+                    pCalc.flip()                         // make it ready for read
+                    pool.release(qCalc)
+                    pCalc.asReadOnlyBuffer()
+                }
+
+                else -> {
+                    qCalc.flip()
+                    pool.release(pCalc)
+                    qCalc.asReadOnlyBuffer()
+                }
             }
-
-            /* ---- B. lost P parity ---- */
-            lostIndex == presentData.size -> pCalc.asReadOnlyBuffer()
-
-            /* ---- C. lost Q parity ---- */
-            else -> qCalc.asReadOnlyBuffer()
+        } catch (e: Exception) {
+            pool.release(pCalc)
+            pool.release(qCalc)
+            throw e
         }
     }
 
     /* ---------- helpers ---------- */
 
     /** dst = a xor b (lengths are identical) */
-    private fun xorBuffers(a: ByteBuffer, b: ByteBuffer): ByteBuffer {
-        val sz = a.remaining()
-        val out = ByteBuffer.allocateDirect(sz)
-        val ad = a.duplicate(); val bd = b.duplicate()
-        for (pos in 0 until sz) {
-            out.put(pos, (ad.get(pos) xor bd.get(pos)))
+    private fun xorBuffers(a: ByteBuffer, b: ByteBuffer): ByteBuffer =
+        pool.borrow(a.remaining()) { scratch ->
+            val ad = a.duplicate();
+            val bd = b.duplicate()
+            for (pos in 0 until a.remaining()) {
+                scratch.put(pos, (ad.get(pos) xor bd.get(pos)))
+            }
+            scratch.flip()
+
+            val out = ByteBuffer.allocateDirect(a.remaining())
+            out.put(scratch); out.flip()
+            out.asReadOnlyBuffer()
         }
-        out.flip(); return out
-    }
 
     private fun Byte.rotateLeft(bits: Int): Byte =
         (((this.toInt() and 0xFF) shl bits) or

@@ -1,5 +1,6 @@
 package dev.swiftstorm.akkaradb.common.codec
 
+import java.nio.BufferUnderflowException
 import java.nio.ByteBuffer
 
 /**
@@ -56,9 +57,9 @@ object VarIntCodec {
                 b = buf.get().toInt() and 0xFF
                 result = result or ((b and 0x7F) shl shift)
                 shift += 7
-                if (shift >= 35) throw IllegalArgumentException("VarInt too long (overflow)")
+                if (shift > 35) throw IllegalArgumentException("VarInt too long (overflow)")
             } while (b and 0x80 != 0)
-        } catch (ex: java.nio.BufferUnderflowException) {
+        } catch (ex: BufferUnderflowException) {
             throw IllegalArgumentException("VarInt truncated or buffer underflow", ex)
         }
         return result
@@ -73,9 +74,9 @@ object VarIntCodec {
                 b = buf.get().toInt() and 0xFF
                 result = result or ((b and 0x7F).toLong() shl shift)
                 shift += 7
-                if (shift >= 70) throw IllegalArgumentException("VarLong too long (overflow)")
+                if (shift > 70) throw IllegalArgumentException("VarLong too long (overflow)")
             } while (b and 0x80 != 0)
-        } catch (ex: java.nio.BufferUnderflowException) {
+        } catch (ex: BufferUnderflowException) {
             throw IllegalArgumentException("VarLong truncated or buffer underflow", ex)
         }
         return result

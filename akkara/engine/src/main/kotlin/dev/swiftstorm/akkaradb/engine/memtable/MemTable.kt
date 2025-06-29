@@ -21,7 +21,10 @@ class MemTable(
 
     fun get(key: ByteBuffer): Record? = map[key]
 
-    fun put(record: Record) = insert(record, updateSeq = true)
+    @Synchronized
+    fun put(record: Record) {
+        insert(record, updateSeq = true)
+    }
 
     @Synchronized
     fun flush() {

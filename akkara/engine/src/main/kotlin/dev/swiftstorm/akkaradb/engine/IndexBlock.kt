@@ -42,10 +42,27 @@ class IndexBlock {
             val buf = ByteBuffer.allocate(size)
             ch.read(buf); buf.flip()
             val ib = IndexBlock()
+
             while (buf.hasRemaining()) {
                 val len = VarIntCodec.readInt(buf)
-                val key = ByteBuffer.allocate(len)
-                buf.get(key.array())
+                val keyArr = ByteArray(len)
+                buf.get(keyArr)
+                val key = ByteBuffer.wrap(keyArr).apply { position(len) }  // ← position = limit
+                val off = buf.long
+                ib.add(key, off)
+            }
+            return ib
+        }
+
+        fun readFrom(buf: ByteBuffer, size: Int): IndexBlock {
+            buf.limit(size)
+            val ib = IndexBlock()
+
+            while (buf.hasRemaining()) {
+                val keyLen = VarIntCodec.readInt(buf)
+                val keyArr = ByteArray(keyLen)
+                buf.get(keyArr)
+                val key = ByteBuffer.wrap(keyArr).apply { position(keyLen) }  // pos = limit
                 val off = buf.long
                 ib.add(key, off)
             }

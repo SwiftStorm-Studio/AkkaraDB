@@ -1,6 +1,8 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.logger
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeWriter
@@ -25,7 +27,8 @@ class AkkStripeWriter(
     val baseDir: Path,
     override val k: Int = 4,
     val parityCoder: ParityCoder? = null,
-    val autoFlush: Boolean = false
+    val autoFlush: Boolean = false,
+    val pool: BufferPool = Pools.io()
 ) : StripeWriter {
 
     override val m: Int = parityCoder?.parityCount ?: 0
@@ -107,13 +110,17 @@ class AkkStripeWriter(
 
     private fun writeStripe() {
         val dataDup = queue.map { it.duplicate() }
-        val parityBlocks = parityCoder?.encode(dataDup) ?: emptyList()
+        val parityBufs = parityCoder?.encode(dataDup) ?: emptyList()
 
-        for ((idx, ch) in dataLanes.withIndex()) ch.write(queue[idx].duplicate())
-        for ((idx, ch) in parityLanes.withIndex()) ch.write(parityBlocks[idx].duplicate())
+        // --- 1) write ---
+        dataLanes.forEachIndexed { idx, ch -> ch.write(queue[idx].duplicate()) }
+        parityLanes.forEachIndexed { idx, ch -> ch.write(parityBufs[idx].duplicate()) }
+
+        // --- 2) release ---
+        queue.forEach { pool.release(it) }
+        parityBufs.forEach { pool.release(it) }
 
         queue.clear()
         stripesWritten++
     }
-
 }

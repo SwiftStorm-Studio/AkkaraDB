@@ -2,7 +2,6 @@ package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.common.borrow
 import java.io.Closeable
 import java.nio.BufferOverflowException
 import java.nio.ByteBuffer
@@ -33,26 +32,22 @@ class WalWriter(
     /* ---------- core ---------- */
 
     private fun writeRecord(r: WalRecord) {
-        while (true) {
+        scratch.clear()
+        return try {
+            r.writeTo(scratch)
+            scratch.flip()
+            while (scratch.hasRemaining()) ch.write(scratch)
+        } catch (_: BufferOverflowException) {
+            val needed = (scratch.capacity() * 2).coerceAtLeast(scratch.position() * 2)
+            pool.release(scratch)
+            scratch = pool.get(needed)
             scratch.clear()
-            try {
-                r.writeTo(scratch)
-                scratch.flip()
-                while (scratch.hasRemaining()) ch.write(scratch)
-                return                                // success
-            } catch (_: BufferOverflowException) {
-                val needed = scratch.capacity() * 2
-                pool.borrow(needed) { tmp ->
-                    r.writeTo(tmp)
-                    tmp.flip()
-                    while (tmp.hasRemaining()) ch.write(tmp)
-                }
-                pool.release(scratch)
-                scratch = pool.get(needed)
-                return
-            }
+            r.writeTo(scratch)
+            scratch.flip()
+            while (scratch.hasRemaining()) ch.write(scratch)
         }
     }
+
 
     /* ---------- lifecycle ---------- */
 

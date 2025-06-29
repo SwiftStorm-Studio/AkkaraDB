@@ -25,45 +25,46 @@ class AkkStripeReader(
     private val pool = Pools.io()
 
     override fun readStripe(): List<ByteBuffer>? {
-        /* 1 ─ read k data lanes */
-        val laneBlocks = ArrayList<ByteBuffer?>(k)
-        dataCh.forEach { ch ->
+        /* -------- 1. read data lanes -------- */
+        val laneBlocks = MutableList<ByteBuffer?>(k) { null }
+        for ((idx, ch) in dataCh.withIndex()) {
             val blk = pool.get()
             val n   = ch.read(blk)
-            val buf: ByteBuffer? = if (n == BLOCK_SIZE) {
-                blk.flip(); blk                       // full block
-            } else {                                  // EOF or short
-                pool.release(blk); null
+            if (n == BLOCK_SIZE) {
+                blk.flip(); laneBlocks[idx] = blk
+            } else {                               // EOF or short
+                pool.release(blk)
             }
-            laneBlocks += buf
         }
         if (laneBlocks.all { it == null }) return null
 
-        /* 2 ─ parity recovery */
-        if (laneBlocks.any { it == null } && parityCoder != null) {
-            val parityBufs = parityCh.map { ch ->
-                val buf = pool.get()
-                val n   = ch.read(buf)
-                if (n == BLOCK_SIZE) {
-                    buf.flip(); buf
-                } else {
-                    pool.release(buf); null
+        try {
+            /* -------- 2. parity recovery -------- */
+            if (laneBlocks.any { it == null } && parityCoder != null) {
+                val parityBufs = parityCh.map { ch ->
+                    val buf = pool.get()
+                    val n = ch.read(buf)
+                    if (n == BLOCK_SIZE) {
+                        buf.flip(); buf
+                    } else {
+                        pool.release(buf); null
+                    }
                 }
+                val miss = laneBlocks.indexOfFirst { it == null }
+                laneBlocks[miss] = parityCoder.decode(miss, laneBlocks, parityBufs)
+                parityBufs.filterNotNull().forEach(pool::release)
             }
-            val miss = laneBlocks.indexOfFirst { it == null }
-            laneBlocks[miss] = parityCoder.decode(miss, laneBlocks, parityBufs)
-            parityBufs.filterNotNull().forEach(pool::release)
+
+            /* -------- 3. CRC check & payload slice -------- */
+            val payloads = laneBlocks.map { blk ->
+                blk ?: throw CorruptedBlockException("Unrecoverable lane in stripe")
+            }.map(unpacker::unpack)                       // read-only slice
+
+            return payloads
+        } finally {
+            /* -------- 4. ALWAYS release lane buffers -------- */
+            laneBlocks.filterNotNull().forEach(pool::release)
         }
-
-        /* 3 ─ CRC check & payload slice */
-        val payloads = laneBlocks.map { blk ->
-            blk ?: throw CorruptedBlockException("Unrecoverable lane in stripe")
-        }.map(unpacker::unpack)                       // read-only slice
-
-        /* 4 ─ release lane buffers back to pool */
-        laneBlocks.filterNotNull().forEach(pool::release)
-
-        return payloads
     }
 
     fun searchLatestStripe(key: ByteBuffer): Record? {

@@ -44,12 +44,10 @@ class BloomFilter private constructor(
     /* ---------- (de)serialization ---------- */
 
     fun writeTo(ch: WritableByteChannel) {
-        pool.borrow(bitset.size * 8) { buf ->
-            buf.clear()
-            bitset.forEach { buf.putLong(it) }
-            buf.flip()
-            ch.write(buf)
+        val byteBuf = ByteBuffer.wrap(ByteArray(bitset.size * 8)).also { bb ->
+            bitset.forEachIndexed { i, v -> bb.putLong(i * 8, v) }
         }
+        while (byteBuf.hasRemaining()) ch.write(byteBuf)
     }
 
     fun byteSize(): Int = bitset.size * 8

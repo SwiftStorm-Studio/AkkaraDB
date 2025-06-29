@@ -1,11 +1,11 @@
-package dev.swiftstorm.akkaradb.engine.sstable
+package dev.swiftstorm.akkaradb.engine.sstable   // ← 既存の package 行そのまま
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.borrow
-import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
+import dev.swiftstorm.akkaradb.engine.IndexBlock          // ★ 追加
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
 import java.io.Closeable
@@ -20,7 +20,7 @@ import java.nio.file.StandardOpenOption.READ
  *  data blocks ┐
  *  index block │ ← mmap 読み切り
  *  bloom bits  │
- *  footer 20 B ┘ ('AKSS' magic, indexOff, bloomOff)
+ *  footer 20 B ┘ (“AKSS” magic, indexOff, bloomOff)
  */
 class SSTableReader(
     private val path: Path,
@@ -40,34 +40,34 @@ class SSTableReader(
     /* -------------- in-memory structures -------------- */
 
     private val bloom: BloomFilter
-    private val indexList: List<Pair<ByteBuffer, Long>>
+    private val index: IndexBlock
 
     init {
-        // ---- 1) footer ----
+        /* ---- 1) footer ---- */
         require(fileSize >= 20) { "file too small: $path" }
 
         val (idxOffTmp, bloomOffTmp) = Pools.io().borrow(20) { buf ->
             ch.read(buf, fileSize - 20); buf.flip()
-
-            require(buf.int == 0x414B5353) { "bad magic in footer: $path" } // 'AKSS'
+            require(buf.int == 0x414B5353) { "bad magic footer: $path" } // “AKSS”
             buf.long to buf.long
         }
         indexOff = idxOffTmp
         bloomOff = bloomOffTmp
 
-        // ---- 2) read bloom ----
+        /* ---- 2) bloom ---- */
         val bloomSize = (fileSize - 20 - bloomOff).toInt()
         bloom = BloomFilter.readFrom(
             ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong()),
             bloomSize
         )
 
-        // ---- 3) read index block ----
+        /* ---- 3) index block ---- */
         val indexSize = (bloomOff - indexOff).toInt()
-        val idxBuf = ch.map(FileChannel.MapMode.READ_ONLY, indexOff, indexSize.toLong())
-        indexList = buildIndexList(idxBuf)
+        index = IndexBlock.readFrom(
+            ch.map(FileChannel.MapMode.READ_ONLY, indexOff, indexSize.toLong()),
+            indexSize
+        )
     }
-
 
     /* -------------- public API -------------- */
 
@@ -76,10 +76,11 @@ class SSTableReader(
     fun get(key: ByteBuffer): Record? {
         if (!bloom.mightContain(key)) return null
 
-        val off = binarySearchIndex(key)
+        /* ---- index lookup ---- */
+        val off = index.lookup(key)
         if (off < 0) return null
 
-        // ---- read data block ----
+        /* ---- read data block ---- */
         val blockBuf = pool.get(BLOCK_SIZE + 4)
         blockBuf.clear()
         ch.read(blockBuf, off)
@@ -88,9 +89,8 @@ class SSTableReader(
         val payloadLen = blockBuf.int
         val payloadBuf = blockBuf.slice().apply { limit(payloadLen) }
 
-        val reader = AkkRecordReader
         while (payloadBuf.hasRemaining()) {
-            val rec = reader.read(payloadBuf)
+            val rec = AkkRecordReader.read(payloadBuf)
             if (rec.key == key) {
                 pool.release(blockBuf)
                 return rec
@@ -101,32 +101,4 @@ class SSTableReader(
     }
 
     override fun close() = ch.close()
-
-    /* -------------- helpers -------------- */
-
-    private fun buildIndexList(buf: ByteBuffer): List<Pair<ByteBuffer, Long>> {
-        val list = ArrayList<Pair<ByteBuffer, Long>>()
-        while (buf.hasRemaining()) {
-            val len = VarIntCodec.readInt(buf)
-            val keySlice = buf.slice().apply {
-                limit(len)
-            }.asReadOnlyBuffer()
-            buf.position(buf.position() + len)
-            val off = buf.long
-            list += keySlice to off
-        }
-        return list
-    }
-
-
-    private fun binarySearchIndex(key: ByteBuffer): Long {
-        var lo = 0
-        var hi = indexList.lastIndex
-        while (lo <= hi) {
-            val mid = (lo + hi) ushr 1
-            val cmp = indexList[mid].first.compareTo(key)
-            if (cmp <= 0) lo = mid + 1 else hi = mid - 1
-        }
-        return if (hi >= 0) indexList[hi].second else -1
-    }
 }

@@ -5,7 +5,7 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.borrow
-import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
+import dev.swiftstorm.akkaradb.engine.IndexBlock
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordWriter
@@ -25,7 +25,7 @@ class SSTableWriter(
     private val blockBuf = pool.get(BLOCK_SIZE)
     private val crc32 = CRC32()
 
-    private val index = ArrayList<Pair<ByteBuffer, Long>>()   // firstKey, offset
+    private val index = IndexBlock()
     private lateinit var bloom: BloomFilter
 
     fun write(records: List<Record>) {
@@ -67,24 +67,13 @@ class SSTableWriter(
         }
 
         val firstKey = AkkRecordReader.read(blockBuf.duplicate()).key.asReadOnlyBuffer()
-        index += firstKey to offset
+        index.add(firstKey, offset)
 
         blockBuf.clear()
     }
 
     private fun writeIndex() {
-        val est = index.sumOf { (k, _) -> k.remaining() + 10 }
-        var tmp = pool.get(est.coerceAtLeast(1024))
-        try {
-            index.forEach { (firstKey, off) ->
-                VarIntCodec.writeInt(tmp, firstKey.remaining())
-                tmp.put(firstKey.duplicate())
-                tmp.putLong(off)
-            }
-            tmp.flip(); ch.write(tmp)
-        } finally {
-            pool.release(tmp)
-        }
+        index.writeTo(ch)
     }
 
     private fun writeFooter(indexOff: Long, bloomOff: Long) {
