@@ -1,3 +1,4 @@
+@file:OptIn(ExperimentalStdlibApi::class)
 package dev.swiftstorm.akkaradb.common
 
 import java.nio.ByteBuffer
@@ -13,72 +14,86 @@ import java.nio.charset.StandardCharsets
  * a single authoritative value.
  *
  * ### Fields
- * @property key        Raw UTF-8 key bytes.
- * @property value      Raw UTF-8 value bytes.
+ * @property key        Raw UTF-8 key bytes (read-only buffer, `position == 0`).
+ * @property value      Raw UTF-8 value bytes (read-only buffer, `position == 0`).
  * @property seqNo      Monotonically increasing sequence number
  *                      assigned by the storage layer.
- * @property keyHash    Cached hash of `key` to speed up look-ups
- *                      in skip-lists, ARTs, or hash tables.
- *
- * @author  SwiftStorm - RiriFa
- * @since 0.1.0
- *
+ * @property keyHash    Cached hash of `key` (independent of position)
+ *                      to accelerate look-ups.
  *
  * ### Usage notes
- * * Use the secondary constructor when you have plain `String`s.
- * * If the `key` or `value` may contain non-UTF-8 data, convert
- *   them externally and pass the resulting byte arrays here.
+ * * Prefer the secondary constructor when you have plain `String`s.
+ * * If `key` or `value` may contain non-UTF-8 data, convert them
+ *   externally and pass the resulting byte arrays here.
+ *
+ * @author  SwiftStorm - RiriFa
+ * @since   0.1.0
  */
-data class Record(
+@ConsistentCopyVisibility
+data class Record private constructor(
     val key: ByteBuffer,
     val value: ByteBuffer,
     val seqNo: Long,
-    val keyHash: Int = key.hash()
+    val keyHash: Int,
 ) {
 
-    /**
-     * Convenience constructor for callers that work with UTF-8
-     * strings instead of raw byte arrays.
-     *
-     * @param key   Key string; encoded as UTF-8 internally.
-     * @param value Value string; encoded as UTF-8 internally.
-     * @param seqNo Sequence number for this record.
-     */
+    /* ───────────────── public constructors ───────────────── */
+
+    constructor(rawKey: ByteBuffer, rawValue: ByteBuffer, seqNo: Long) : this(
+        rawKey.asReadOnlyBuffer().rewound(),
+        rawValue.asReadOnlyBuffer().rewound(),
+        seqNo,
+        rawKey.asReadOnlyBuffer().rewound().absHash(),
+    )
+
     constructor(key: String, value: String, seqNo: Long) :
-            this(
-                StandardCharsets.UTF_8.encode(key),
-                StandardCharsets.UTF_8.encode(value),
-                seqNo
-            )
+            this(StandardCharsets.UTF_8.encode(key), StandardCharsets.UTF_8.encode(value), seqNo)
 
-    /** Two records are equal when both `seqNo` and `key` match. */
-    override fun equals(other: Any?): Boolean =
-        other is Record &&
-                seqNo == other.seqNo &&
-                key.contentEquals(other.key)
+    /* ───────────────── equality & hashing ───────────────── */
 
-    /** Hash based on sequence number and cached key hash. */
-    override fun hashCode(): Int =
-        31 * seqNo.hashCode() + keyHash
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is Record) return false
+        if (seqNo != other.seqNo) return false
+        if (keyHash != other.keyHash) return false
+        return key.absEquals(other.key)
+    }
+
+    override fun hashCode(): Int = 31 * seqNo.hashCode() + keyHash
+
+    /* ───────────────── debug output ───────────────── */
+
+    override fun toString(): String =
+        "Record(seq=$seqNo, key=${key.preview()}, value=${value.limit()}B)"
 }
 
-fun ByteBuffer.contentEquals(other: ByteBuffer): Boolean {
-    val pos1 = this.position()
-    val pos2 = other.position()
-    val rem = this.remaining()
-    if (rem != other.remaining()) return false
-    for (i in 0 until rem) {
-        if (this.get(pos1 + i) != other.get(pos2 + i)) return false
+/* ════════════════ helpers ════════════════ */
+
+/** Rewind in-place and return this buffer for fluent usage. */
+private fun ByteBuffer.rewound(): ByteBuffer = apply { rewind() }
+
+/** Compare buffers byte-wise from absolute index 0 (position-independent). */
+private fun ByteBuffer.absEquals(other: ByteBuffer): Boolean {
+    val len = limit()
+    if (len != other.limit()) return false
+    for (i in 0 until len) {
+        if (get(i) != other.get(i)) return false
     }
     return true
 }
 
-fun ByteBuffer.hash(): Int {
-    var hash = 1
-    val pos = this.position()
-    val rem = this.remaining()
-    for (i in 0 until rem) {
-        hash = 31 * hash + this.get(pos + i)
+/** Compute a 31-based hash from absolute index 0 (position-independent). */
+private fun ByteBuffer.absHash(): Int {
+    var h = 1
+    for (i in 0 until limit()) {
+        h = 31 * h + (get(i).toInt() and 0xFF)
     }
-    return hash
+    return h
 }
+
+/** Short preview for log output: UTF-8 string if small, otherwise “{n}B”. */
+private fun ByteBuffer.preview(max: Int = 16): String =
+    if (limit() <= max)
+        StandardCharsets.UTF_8.decode(duplicate().rewound()).toString()
+    else
+        "${limit()}B"
