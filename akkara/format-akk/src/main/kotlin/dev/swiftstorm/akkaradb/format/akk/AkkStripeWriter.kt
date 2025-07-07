@@ -3,7 +3,6 @@ package dev.swiftstorm.akkaradb.format.akk
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.common.logger
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeWriter
 import java.nio.ByteBuffer
@@ -70,7 +69,7 @@ class AkkStripeWriter(
                 true -> run {
                     flush()
                     addBlock(block)  // retry with the new empty queue
-                    logger.debug("Stripe flushed, block added to new queue")
+                    println("Stripe flushed, block added to new queue")
                 }
 
                 false -> error("Stripe already full; call flush()")
