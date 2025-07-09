@@ -29,7 +29,7 @@ class SSTableWriter(
     private lateinit var bloom: BloomFilter
 
     fun write(records: List<Record>) {
-        require(records.isNotEmpty())
+        require(records.isNotEmpty()) { "records must not be empty" }
         bloom = BloomFilter(records.size)
 
         for (rec in records) {
@@ -42,7 +42,7 @@ class SSTableWriter(
         if (blockBuf.position() > 0) flushBlock()
 
         val indexOff = ch.position()
-        writeIndex()
+        index.writeTo(ch)
 
         val bloomOff = ch.position()
         bloom.writeTo(ch)
@@ -51,35 +51,38 @@ class SSTableWriter(
         ch.force(true)
     }
 
+    /* ───────── internal ───────── */
+
     private fun flushBlock() {
         blockBuf.flip()
         val offset = ch.position()
 
+        // 1) payload length + data
+        pool.borrow(4) { lenBuf ->
+            lenBuf.clear().putInt(blockBuf.remaining()).flip()
+            ch.write(lenBuf)
+        }
         ch.write(blockBuf.duplicate())
 
+        // 2) CRC32 of payload
         crc32.reset()
         crc32.update(blockBuf.duplicate())
         pool.borrow(4) { crcBuf ->
-            crcBuf.clear()
-            crcBuf.putInt(crc32.value.toInt())
-            crcBuf.flip()
+            crcBuf.clear().putInt(crc32.value.toInt()).flip()
             ch.write(crcBuf)
         }
 
+        // 3) index entry (only first record)
         val firstKey = AkkRecordReader.read(blockBuf.duplicate()).key.asReadOnlyBuffer()
         index.add(firstKey, offset)
 
         blockBuf.clear()
     }
 
-    private fun writeIndex() {
-        index.writeTo(ch)
-    }
-
     private fun writeFooter(indexOff: Long, bloomOff: Long) {
         pool.borrow(20) { ftr ->
             ftr.clear()
-            ftr.putInt(0x414B5353)   // "AKSS" magic
+            ftr.putInt(0x414B5353)   // "AKSS"
             ftr.putLong(indexOff)
             ftr.putLong(bloomOff)
             ftr.flip()
@@ -87,11 +90,10 @@ class SSTableWriter(
         }
     }
 
-    private fun encode(rec: Record): ByteBuffer {
-        val buf = pool.get(AkkRecordWriter.computeMaxSize(rec))
-        AkkRecordWriter.write(rec, buf); buf.flip()
-        return buf
-    }
+    private fun encode(rec: Record): ByteBuffer =
+        pool.get(AkkRecordWriter.computeMaxSize(rec)).also {
+            AkkRecordWriter.write(rec, it); it.flip()
+        }
 
     override fun close() {
         pool.release(blockBuf)

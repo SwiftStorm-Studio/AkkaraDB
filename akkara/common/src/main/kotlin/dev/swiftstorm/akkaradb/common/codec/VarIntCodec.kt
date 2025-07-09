@@ -10,7 +10,7 @@ object VarIntCodec {
 
     /* ───────── constants ───────── */
 
-    private const val MAX_VARINT_SIZE_INT  = 5
+    private const val MAX_VARINT_SIZE_INT = 5
     private const val MAX_VARINT_SIZE_LONG = 10
 
     /* ───────── write ───────── */
@@ -129,9 +129,15 @@ object VarIntCodec {
 
     /* ───────── zig-zag ───────── */
 
-    @JvmStatic fun zigZagEncodeInt(v: Int): Int   = (v shl 1) xor (v shr 31)
-    @JvmStatic fun zigZagDecodeInt(v: Int): Int   = (v ushr 1) xor -(v and 1)
+    @JvmStatic
+    fun zigZagEncodeInt(v: Int): Int = (v shl 1) xor (v shr 31)
 
-    @JvmStatic fun zigZagEncodeLong(v: Long): Long = (v shl 1) xor (v shr 63)
-    @JvmStatic fun zigZagDecodeLong(v: Long): Long = (v ushr 1) xor -(v and 1)
+    @JvmStatic
+    fun zigZagDecodeInt(v: Int): Int = (v ushr 1) xor -(v and 1)
+
+    @JvmStatic
+    fun zigZagEncodeLong(v: Long): Long = (v shl 1) xor (v shr 63)
+
+    @JvmStatic
+    fun zigZagDecodeLong(v: Long): Long = (v ushr 1) xor -(v and 1)
 }

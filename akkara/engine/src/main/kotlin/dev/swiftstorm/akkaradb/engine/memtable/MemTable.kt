@@ -6,24 +6,33 @@ import java.util.concurrent.ConcurrentSkipListMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
+/**
+ * In-memory write buffer (LSM Level-0).
+ *
+ *
+ * @param thresholdBytes Threshold in bytes for flushing the MemTable to disk.
+ * @param onFlush Flush handler. Called when the MemTable is flushed.
+ */
 class MemTable(
     private val thresholdBytes: Long,
     private val onFlush: (List<Record>) -> Unit
 ) {
 
-    private val map =
-        ConcurrentSkipListMap<ByteBuffer, Record>(FastByteBufferComparator)
+    private val map = ConcurrentSkipListMap<ByteBuffer, Record>(FastByteBufferComparator)
 
     private val currentBytes = AtomicLong(0)
     private val highestSeqNo = AtomicLong(0)
 
-    /* ---------- public API ---------- */
+    /* ───────── public API ───────── */
 
+    /** Lock-free read (Snapshot semantics) */
     fun get(key: ByteBuffer): Record? = map[key]
 
     @Synchronized
     fun put(record: Record) {
         insert(record, updateSeq = true)
+
+        if (currentBytes.get() >= thresholdBytes) flush()
     }
 
     @Synchronized
@@ -39,43 +48,32 @@ class MemTable(
 
     fun lastSeq(): Long = highestSeqNo.get()
 
-    /* ---------- internal helpers ---------- */
+    /* ───────── internal helpers ───────── */
 
     private fun insert(record: Record, updateSeq: Boolean) {
-        val key = record.key.slice().asReadOnlyBuffer()
-        val prev = map.put(key, record)
+        val keyCopy = record.key.slice().asReadOnlyBuffer()
+        val prev = map.put(keyCopy, record)
 
-        currentBytes.addAndGet(sizeOf(record) - (prev?.let(::sizeOf) ?: 0))
+        currentBytes.addAndGet(sizeOf(record) - (prev?.let(::sizeOf) ?: 0L))
 
-        if (updateSeq) {
-            highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
-        }
-
-        if (currentBytes.get() >= thresholdBytes) flush()
+        if (updateSeq) highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
     }
 
-    private fun sizeOf(record: Record): Long {
-        val key = record.key
-        val value = record.value
-        return (key.remaining() + value.remaining() + Long.SIZE_BYTES).toLong()
-    }
+    private fun sizeOf(r: Record): Long =
+        (r.key.remaining() + r.value.remaining() + Long.SIZE_BYTES).toLong()
 }
 
-/* helpers */
+/* ───────── comparator ───────── */
+
+
 object FastByteBufferComparator : Comparator<ByteBuffer> {
     override fun compare(a: ByteBuffer, b: ByteBuffer): Int {
-        val apos = a.position()
-        val bpos = b.position()
-        val aRem = a.remaining()
-        val bRem = b.remaining()
-
         val mismatch = a.mismatch(b)
-        if (mismatch != -1) {
-            val ba = a.get(apos + mismatch).toInt() and 0xFF
-            val bb = b.get(bpos + mismatch).toInt() and 0xFF
-            return ba - bb
-        }
+        if (mismatch == -1)
+            return a.remaining().compareTo(b.remaining())
 
-        return aRem - bRem
+        val aa = a.get(a.position() + mismatch).toInt() and 0xFF
+        val bb = b.get(b.position() + mismatch).toInt() and 0xFF
+        return aa.compareTo(bb)
     }
 }

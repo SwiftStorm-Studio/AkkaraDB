@@ -5,17 +5,24 @@ import java.nio.ByteBuffer
 import java.nio.channels.ReadableByteChannel
 import java.nio.channels.WritableByteChannel
 
+/**
+ * Flat index: (firstKey, data-block offset) * N
+ *
+ * * firstKey = raw key bytes (position = 0)
+ * * offset   = absolute file offset of the data-block
+ */
 class IndexBlock {
     private val keys = ArrayList<ByteBuffer>()
     private val offsets = ArrayList<Long>()
 
     fun add(firstKey: ByteBuffer, offset: Long) {
-        keys += firstKey.asReadOnlyBuffer()
+        keys += firstKey.asReadOnlyBuffer().apply { rewind() }
         offsets += offset
     }
 
+    /** Returns offset of the last block whose firstKey ≤ key, or -1 if none. */
     fun lookup(key: ByteBuffer): Long {
-        var lo = 0;
+        var lo = 0
         var hi = keys.lastIndex
         while (lo <= hi) {
             val mid = (lo + hi) ushr 1
@@ -25,10 +32,11 @@ class IndexBlock {
         return if (hi >= 0) offsets[hi] else -1
     }
 
-    /* ---- (de)serialization ---- */
+    /* ───────── (de)serialization ───────── */
 
     fun writeTo(ch: WritableByteChannel) {
-        val buf = ByteBuffer.allocate(keys.sumOf { it.remaining() + 10 }) // rough
+        val capacity = keys.sumOf { VarIntCodec.encodedSize(it.remaining()) + it.remaining() + Long.SIZE_BYTES }
+        val buf = ByteBuffer.allocate(capacity)
         keys.zip(offsets).forEach { (k, off) ->
             VarIntCodec.writeInt(buf, k.remaining())
             buf.put(k.duplicate())
@@ -38,31 +46,18 @@ class IndexBlock {
     }
 
     companion object {
-        fun readFrom(ch: ReadableByteChannel, size: Int): IndexBlock {
-            val buf = ByteBuffer.allocate(size)
-            ch.read(buf); buf.flip()
-            val ib = IndexBlock()
+        fun readFrom(ch: ReadableByteChannel, size: Int): IndexBlock =
+            ByteBuffer.allocate(size).also { ch.read(it); it.flip() }
+                .let { readFrom(it, size) }
 
-            while (buf.hasRemaining()) {
+        fun readFrom(buf: ByteBuffer, size: Int): IndexBlock {
+            val ib = IndexBlock()
+            val end = buf.position() + size
+            while (buf.position() < end) {
                 val len = VarIntCodec.readInt(buf)
                 val keyArr = ByteArray(len)
                 buf.get(keyArr)
-                val key = ByteBuffer.wrap(keyArr).apply { position(len) }  // ← position = limit
-                val off = buf.long
-                ib.add(key, off)
-            }
-            return ib
-        }
-
-        fun readFrom(buf: ByteBuffer, size: Int): IndexBlock {
-            buf.limit(size)
-            val ib = IndexBlock()
-
-            while (buf.hasRemaining()) {
-                val keyLen = VarIntCodec.readInt(buf)
-                val keyArr = ByteArray(keyLen)
-                buf.get(keyArr)
-                val key = ByteBuffer.wrap(keyArr).apply { position(keyLen) }  // pos = limit
+                val key = ByteBuffer.wrap(keyArr)               // pos=0, limit=len
                 val off = buf.long
                 ib.add(key, off)
             }

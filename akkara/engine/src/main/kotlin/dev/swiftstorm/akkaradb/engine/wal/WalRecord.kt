@@ -6,7 +6,7 @@ import java.nio.ByteBuffer
 sealed interface WalRecord {
     fun writeTo(buf: ByteBuffer)
 
-    /* ----------- codec ----------- */
+    /* --------------- codec --------------- */
 
     companion object Codec {
         private const val TAG_ADD = 1
@@ -18,8 +18,7 @@ sealed interface WalRecord {
             return when (tag) {
                 TAG_ADD -> {
                     val len = VarIntCodec.readInt(buf)
-                    val payload = buf.slice()
-                        .apply { limit(len) }
+                    val payload = buf.slice().apply { limit(len) }
                     buf.position(buf.position() + len)
                     Add(payload.asReadOnlyBuffer())
                 }
@@ -35,8 +34,9 @@ sealed interface WalRecord {
         }
     }
 
-    /* ----------- concrete types ----------- */
+    /* ------------- concrete types ------------- */
 
+    /** MemTable entry (encoded AkkRecord payload). */
     data class Add(val payload: ByteBuffer) : WalRecord {
         override fun writeTo(buf: ByteBuffer) {
             VarIntCodec.writeInt(buf, TAG_ADD)
@@ -45,13 +45,14 @@ sealed interface WalRecord {
         }
     }
 
+    /** Segment boundary (all previous records are durable). */
     data object Seal : WalRecord {
         override fun writeTo(buf: ByteBuffer) {
-            VarIntCodec.writeInt(buf, TAG_SEAL)
-            VarIntCodec.writeInt(buf, 0)
+            VarIntCodec.writeInt(buf, TAG_SEAL)        // ← tag のみ
         }
     }
 
+    /** Check-point: {stripeIdx, lastSeqNo}. */
     data class CheckPoint(val stripeIdx: Long, val seqNo: Long) : WalRecord {
         override fun writeTo(buf: ByteBuffer) {
             VarIntCodec.writeInt(buf, TAG_CHECKPOINT)

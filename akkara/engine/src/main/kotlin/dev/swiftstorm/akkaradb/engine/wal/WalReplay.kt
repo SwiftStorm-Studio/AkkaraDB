@@ -3,11 +3,13 @@ package dev.swiftstorm.akkaradb.engine.wal
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
 import java.nio.channels.FileChannel
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 
 fun replayWal(path: Path, mem: MemTable) {
-    if (!java.nio.file.Files.exists(path)) return
+    if (!Files.exists(path)) return
+
     FileChannel.open(path, READ).use { ch ->
         val buf = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size())
         var apply = true
@@ -18,8 +20,8 @@ fun replayWal(path: Path, mem: MemTable) {
                     mem.put(rec)
                 }
 
-                WalRecord.Seal -> apply = true
-                is WalRecord.CheckPoint -> apply = false
+                WalRecord.Seal -> apply = false   // ← skip after Seal
+                is WalRecord.CheckPoint -> apply = true // ← resume after checkpoint
             }
         }
     }
