@@ -15,7 +15,7 @@ class WalWriter(
     initCap: Int = 32 * 1024
 ) : Closeable {
 
-    private val ch = FileChannel.open(path, WRITE, CREATE, APPEND, DSYNC)
+    private val ch = FileChannel.open(path, WRITE, CREATE, APPEND)
 
     /** Reusable scratch buffer (Direct) */
     private var scratch: ByteBuffer = pool.get(initCap)

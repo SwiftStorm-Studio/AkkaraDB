@@ -79,6 +79,7 @@ class FixedBufferPool(
     /* ───────────────── helpers ───────────────── */
 
     private fun roundPow2(v: Int): Int {
+        require(v > 0)
         if (v <= 1) return 1
         return Integer.highestOneBit(v - 1) shl 1
     }
