@@ -7,33 +7,24 @@ import java.util.concurrent.atomic.AtomicReference
  * Global access to shared [BufferPool] instances.
  */
 object Pools {
-
-    // ————————————————— default —————————————————
-    private val defaultPool by lazy {
+    private val defaultSupplier = {
         FixedBufferPool(
-            capacity = System.getProperty(
-                "akkaradb.pool.capacity"
-            )?.toInt() ?: 128,
+            capacity   = System.getProperty("akkaradb.pool.capacity")?.toInt() ?: 128,
             bucketBase = BLOCK_SIZE
         )
     }
+    private val supplierRef = AtomicReference<() -> BufferPool>(defaultSupplier)
 
-    private val providerRef = AtomicReference<() -> BufferPool> { defaultPool }
+    private val TL = ThreadLocal.withInitial { supplierRef.get().invoke() }
 
-    fun io(): BufferPool = providerRef.get().invoke()
+    fun io(): BufferPool = TL.get()
 
-    fun nio(capacity: Int = 128, bucketBase: Int = BLOCK_SIZE): BufferPool =
+    fun nio(capacity: Int = 128,
+            bucketBase: Int = BLOCK_SIZE): BufferPool =
         FixedBufferPool(capacity, bucketBase)
 
-    @Synchronized
-    fun setProvider(newPool: () -> BufferPool) {
-        val p1 = newPool()
-        val p2 = newPool()
-        require(p1 === p2) {
-            "provider must return the SAME BufferPool instance on each call"
-        }
-
-        val old = providerRef.getAndSet(newPool)()
-        if (old !== p1) old.close()
+    fun setProvider(newSupplier: () -> BufferPool) {
+        supplierRef.set(newSupplier)
+        TL.remove()
     }
 }

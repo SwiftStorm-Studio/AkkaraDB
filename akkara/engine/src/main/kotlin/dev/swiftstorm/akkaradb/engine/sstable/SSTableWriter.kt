@@ -14,7 +14,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
-import java.util.zip.CRC32
+import java.util.zip.CRC32C
 
 class SSTableWriter(
     private val path: Path,
@@ -23,7 +23,7 @@ class SSTableWriter(
 
     private val ch = FileChannel.open(path, CREATE, WRITE, DSYNC)
     private val blockBuf = pool.get(BLOCK_SIZE)
-    private val crc32 = CRC32()
+    private val crc32 = CRC32C()
 
     private val index = IndexBlock()
     private lateinit var bloom: BloomFilter
