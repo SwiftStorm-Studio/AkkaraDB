@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.AtomicReference
 object Pools {
     private val defaultSupplier = {
         FixedBufferPool(
-            capacity   = System.getProperty("akkaradb.pool.capacity")?.toInt() ?: 128,
+            capacity = System.getProperty("akkaradb.pool.capacity")?.toInt() ?: 128,
             bucketBase = BLOCK_SIZE
         )
     }
@@ -19,8 +19,10 @@ object Pools {
 
     fun io(): BufferPool = TL.get()
 
-    fun nio(capacity: Int = 128,
-            bucketBase: Int = BLOCK_SIZE): BufferPool =
+    fun nio(
+        capacity: Int = 128,
+        bucketBase: Int = BLOCK_SIZE
+    ): BufferPool =
         FixedBufferPool(capacity, bucketBase)
 
     fun setProvider(newSupplier: () -> BufferPool) {

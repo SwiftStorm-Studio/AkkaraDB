@@ -5,7 +5,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.format.api.BlockUnpacker
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
 import java.nio.ByteBuffer
-import java.util.zip.CRC32
+import java.util.zip.CRC32C
 
 /**
  * Unpacks a 32-KiB “akk” data block and returns the payload slice.
@@ -19,7 +19,7 @@ import java.util.zip.CRC32
  */
 class AkkBlockUnpacker : BlockUnpacker {
 
-    private val crc = CRC32()
+    private val crc = CRC32C()
 
     override fun unpack(block: ByteBuffer): ByteBuffer {
         require(block.remaining() == BLOCK_SIZE) {

@@ -25,64 +25,65 @@ class AkkStripeReader(
     private val pool = Pools.io()
 
     override fun readStripe(): List<ByteBuffer>? {
-        /* -------- 1. read data lanes -------- */
+        /* 1. read data lanes */
         val laneBlocks = MutableList<ByteBuffer?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
             val blk = pool.get()
             val n   = ch.read(blk)
             if (n == BLOCK_SIZE) {
                 blk.flip(); laneBlocks[idx] = blk
-            } else {                               // EOF or short
-                pool.release(blk)
+            } else {
+                pool.release(blk) // EOF
             }
         }
         if (laneBlocks.all { it == null }) return null
 
-        try {
-            /* -------- 2. parity recovery -------- */
-            if (laneBlocks.any { it == null } && parityCoder != null) {
-                val parityBufs = parityCh.map { ch ->
-                    val buf = pool.get()
-                    val n = ch.read(buf)
-                    if (n == BLOCK_SIZE) {
-                        buf.flip(); buf
-                    } else {
-                        pool.release(buf); null
-                    }
+        /* 2. parity recovery (optional) */
+        if (laneBlocks.any { it == null } && parityCoder != null) {
+            val parityBufs = parityCh.map { ch ->
+                val buf = pool.get();
+                val n = ch.read(buf)
+                if (n == BLOCK_SIZE) {
+                    buf.flip(); buf
+                } else {
+                    pool.release(buf); null
                 }
-                val miss = laneBlocks.indexOfFirst { it == null }
-                laneBlocks[miss] = parityCoder.decode(miss, laneBlocks, parityBufs)
-                parityBufs.filterNotNull().forEach(pool::release)
             }
-
-            /* -------- 3. CRC check & payload slice -------- */
-            val payloads = laneBlocks.map { blk ->
-                blk ?: throw CorruptedBlockException("Unrecoverable lane in stripe")
-            }.map(unpacker::unpack)                       // read-only slice
-
-            return payloads
-        } finally {
-            /* -------- 4. ALWAYS release lane buffers -------- */
-            laneBlocks.filterNotNull().forEach(pool::release)
+            val miss = laneBlocks.indexOfFirst { it == null }
+            laneBlocks[miss] = parityCoder.decode(miss, laneBlocks, parityBufs)
+            parityBufs.filterNotNull().forEach(pool::release)
         }
+
+        /* 3. CRC & unpack */
+        val payloads = laneBlocks.map { blk ->
+            blk ?: throw CorruptedBlockException("Unrecoverable lane in stripe")
+        }.map(unpacker::unpack)   // read‑only slice (shares backing array)
+
+        return payloads
     }
 
     fun searchLatestStripe(key: ByteBuffer): Record? {
-        val recReader = AkkRecordReader
-        var found: Record? = null
+        val rr = AkkRecordReader
         var stripePayloads: List<ByteBuffer>? = readStripe()
         while (stripePayloads != null) {
-            // 各 lane の payload をスキャン
+            var found: Record? = null
             for (payload in stripePayloads) {
                 val dup = payload.duplicate()
                 while (dup.hasRemaining()) {
-                    val rec = recReader.read(dup)
-                    if (rec.key == key) found = rec
+                    val rec = rr.read(dup)
+                    if (rec.key == key) {
+                        found = rec; break
+                    }
                 }
+                if (found != null) break
             }
+            // 🔋 release buffers now that we no longer need them
+            stripePayloads.forEach(pool::release)
+
+            if (found != null) return found
             stripePayloads = readStripe()
         }
-        return found
+        return null
     }
 
     override fun close() {

@@ -5,6 +5,7 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.borrow
+import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
 import dev.swiftstorm.akkaradb.engine.IndexBlock
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
@@ -55,28 +56,58 @@ class SSTableWriter(
 
     private fun flushBlock() {
         blockBuf.flip()
-        val offset = ch.position()
+        val firstRecDup = blockBuf.duplicate()
 
-        // 1) payload length + data
+        // 0) Build mini‑index over blockBuf
+        val idxTmp = buildMiniIndex(blockBuf.duplicate())     // returns read‑only dup
+
+        // 1) Assemble payload = [miniIndex][data]
+        val payload = pool.get(idxTmp.remaining() + blockBuf.remaining())
+        payload.put(idxTmp).put(blockBuf).flip()
+
+        val offset = ch.position()            // ← absolute file offset of this block
+
+        // 2) Write [len][payload][crc]
         pool.borrow(4) { lenBuf ->
-            lenBuf.clear().putInt(blockBuf.remaining()).flip()
+            lenBuf.clear().putInt(payload.remaining()).flip()
             ch.write(lenBuf)
         }
-        ch.write(blockBuf.duplicate())
+        ch.write(payload.duplicate())
 
-        // 2) CRC32 of payload
-        crc32.reset()
-        crc32.update(blockBuf.duplicate())
-        pool.borrow(4) { crcBuf ->
-            crcBuf.clear().putInt(crc32.value.toInt()).flip()
-            ch.write(crcBuf)
+        crc32.reset(); crc32.update(payload.duplicate())
+        pool.borrow(4) { cBuf ->
+            cBuf.clear().putInt(crc32.value.toInt()).flip()
+            ch.write(cBuf)
         }
 
-        // 3) index entry (only first record)
-        val firstKey = AkkRecordReader.read(blockBuf.duplicate()).key.asReadOnlyBuffer()
+        // 3) outer index – first key of the block
+        val firstKey = AkkRecordReader.read(firstRecDup).key.asReadOnlyBuffer()
         index.add(firstKey, offset)
 
+        // 4) cleanup
+        pool.release(payload)
         blockBuf.clear()
+    }
+
+    /** Builds a VarInt‑encoded mini‑index and returns a read‑only buffer. */
+    private fun buildMiniIndex(data: ByteBuffer): ByteBuffer {
+        val offsets = ArrayList<Int>(128)
+        var prev = 0
+        while (data.hasRemaining()) {
+            offsets += prev
+            AkkRecordReader.read(data)          // advance position
+            prev = data.position()
+        }
+        // encode: [count][delta1][delta2]… – delta from previous
+        val cap = offsets.sumOf { VarIntCodec.encodedSize(it) } + VarIntCodec.encodedSize(offsets.size)
+        val buf = ByteBuffer.allocate(cap)
+        VarIntCodec.writeInt(buf, offsets.size)
+        var prevOff = 0
+        for (abs in offsets) {
+            VarIntCodec.writeInt(buf, abs - prevOff)
+            prevOff = abs
+        }
+        return buf.flip().asReadOnlyBuffer()
     }
 
     private fun writeFooter(indexOff: Long, bloomOff: Long) {
@@ -85,8 +116,7 @@ class SSTableWriter(
             ftr.putInt(0x414B5353)   // "AKSS"
             ftr.putLong(indexOff)
             ftr.putLong(bloomOff)
-            ftr.flip()
-            ch.write(ftr)
+            ftr.flip(); ch.write(ftr)
         }
     }
 

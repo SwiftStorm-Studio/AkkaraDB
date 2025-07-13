@@ -8,7 +8,7 @@ import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import java.io.Closeable
 import java.nio.ByteBuffer
-import java.util.zip.CRC32
+import java.util.zip.CRC32C
 
 class AkkBlockPackerDirect(
     private val onBlockReady: (ByteBuffer) -> Unit,
@@ -19,7 +19,7 @@ class AkkBlockPackerDirect(
 
     /* ---- per-instance state ---- */
     private val scratch: ByteBuffer = pool.get()
-    private val crc = CRC32()
+    private val crc = CRC32C()
 
     override fun addRecord(record: ByteBuffer) {
         require(record.remaining() <= MAX_RECORD) {
@@ -40,18 +40,30 @@ class AkkBlockPackerDirect(
         val payloadLen = scratch.position()
         scratch.flip()
 
+        // 1. allocate a fresh 32KiB block from the pool
         val blk = pool.get()
+
+        // 2. [len][payload]--------------------------------------
         blk.putInt(payloadLen)
         blk.put(scratch)
+
+        // 3. zero‑pad up to PAYLOAD_LIMIT (32KiB − 4) for deterministic checksum
         while (blk.position() < PAYLOAD_LIMIT + 4) blk.put(0)
 
+        // 4. CRC32C on the first (4+payloadLen) bytes
         crc.reset()
-        blk.duplicate().limit(4 + payloadLen).position(0).let(crc::update)
+        val dup = blk.duplicate()
+        dup.limit(4 + payloadLen).position(0)
+        crc.update(dup)
         blk.position(PAYLOAD_LIMIT + 4).putInt(crc.value.toInt())
         blk.flip()
 
-        onBlockReady(blk.asReadOnlyBuffer())
-        pool.release(blk)
-        scratch.clear()
+        // 5. HAND‑OFF — Duplicate as read‑only for downstream; keep the original
+        //    so we control its lifecycle.
+        val ro = blk.asReadOnlyBuffer()
+        onBlockReady(ro)        // StripeWriter.addBlock(ro)
+
+        scratch.clear()         // ready for next pack cycle
     }
+
 }

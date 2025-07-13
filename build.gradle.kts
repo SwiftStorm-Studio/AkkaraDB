@@ -64,6 +64,9 @@ subprojects {
             dependencies {
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
+                implementation(platform("io.netty:netty-bom:4.2.2.Final"))
+
+                implementation("io.netty:netty-transport-classes-io_uring")
             }
         }
 
