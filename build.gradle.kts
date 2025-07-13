@@ -12,6 +12,7 @@ plugins {
     alias(libs.plugins.kotlin)
     alias(libs.plugins.dokka)
     alias(libs.plugins.shadow)
+    alias(libs.plugins.kotlin.serialization)
     `maven-publish`
 }
 
@@ -19,6 +20,7 @@ allprojects {
     apply(plugin = "kotlin")
     apply(plugin = "org.jetbrains.dokka")
     apply(plugin = "maven-publish")
+    apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
 
     group = "dev.swiftstorm"
     version = when (name) {
@@ -75,6 +77,12 @@ subprojects {
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
                 implementation(project(":akkara-format-akk"))
+
+                implementation(kotlin("reflect"))
+                implementation(kotlin("serialization"))
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.9.0")
             }
         }
 
