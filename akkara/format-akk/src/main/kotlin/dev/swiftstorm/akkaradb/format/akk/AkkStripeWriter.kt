@@ -13,9 +13,9 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
 
 class AkkStripeWriter(
-    private val baseDir: Path,
-    private val k: Int,
-    private val parityCoder: ParityCoder? = null,
+    val baseDir: Path,
+    val k: Int,
+    val parityCoder: ParityCoder? = null,
     private val autoFlush: Boolean = true,
 ) : Closeable {
 

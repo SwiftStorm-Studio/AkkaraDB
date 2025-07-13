@@ -144,12 +144,10 @@ class AkkaraDB private constructor(
         memTable.flush()
         packer.flush()
 
-        val stripesAfter = try {
-            stripeWriter.flush()
-        } finally {
-            manifest.advance(stripeWriter.stripesWritten)
-        }
+        stripeWriter.flush()
+        val stripesAfter = stripeWriter.stripesWritten
 
+        manifest.advance(stripesAfter)
         wal.checkpoint(stripesAfter, memTable.lastSeq())
         wal.sealSegment()
     }
