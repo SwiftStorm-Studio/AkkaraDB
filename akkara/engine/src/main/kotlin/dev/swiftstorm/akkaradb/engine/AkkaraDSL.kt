@@ -13,18 +13,14 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.reflect.KClass
-import kotlin.reflect.KMutableProperty1
 import kotlin.reflect.full.memberProperties
 import kotlin.reflect.full.primaryConstructor
-import kotlin.reflect.jvm.isAccessible
 
 object AkkDSL {
 
-    /* ───────── Packed (high‑performance) ───────── */
-
     /**
-     * Opens/creates a packed table with CBOR encoding.
-     * Requires the <strong>@Serializable</strong> plugin on [T].
+     * Opens or creates a PackedTable using CBOR encoding.
+     * Requires that [T] is a Kotlin data class with @Serializable and a `var id: String` field.
      */
     inline fun <reified T : Any> openPacked(
         baseDir: Path,
@@ -37,41 +33,25 @@ object AkkDSL {
             format
         )
 
-    /** Wrap an existing AkkaraDB instance as <em>packed</em> table. */
+    /**
+     * Wrap an existing AkkaraDB instance with PackedTable.
+     */
     inline fun <reified T : Any> AkkaraDB.packed(
         format: BinaryFormat = Cbor
     ): PackedTable<T> = PackedTable(this, T::class, serializer(), format)
-
-    /* ───────── Field (string) – kept for compatibility ───────── */
-
-    @Deprecated("Use openPacked() unless you need per‑field keys.")
-    inline fun <reified T : Any> openFields(baseDir: Path): FieldTable<T> =
-        FieldTable(AkkaraDB.open(baseDir), T::class)
-
-    @Deprecated("Use packed() unless you need per‑field keys.")
-    inline fun <reified T : Any> AkkaraDB.fields(): FieldTable<T> =
-        FieldTable(this, T::class)
 }
-
-/* ======================================================================= */
-/*  ⚡  PACKED TABLE – CBOR‑backed, single‑record I/O                       */
-/* ======================================================================= */
 
 class PackedTable<T : Any>(
     private val db: AkkaraDB,
-    private val kClass: KClass<T>,
+    val kClass: KClass<T>,
     private val serializer: KSerializer<T>,
     private val format: BinaryFormat = Cbor,
 ) {
     private val ns = kClass.qualifiedName ?: kClass.simpleName!!
     private val seq = AtomicLong(0)
 
-    /* ---------- helpers ---------- */
-
     private fun keyBuf(id: String): ByteBuffer =
         StandardCharsets.UTF_8.encode("$ns:$id")
-
-    /* ---------- CRUD ---------- */
 
     fun put(id: String, entity: T) {
         val bytes = format.encodeToByteArray(serializer, entity)
@@ -83,7 +63,7 @@ class PackedTable<T : Any>(
         format.decodeFromByteArray(serializer, arr)
     }
 
-    inline fun update(id: String, mutator: T.() -> Unit): Boolean {
+    fun update(id: String, mutator: T.() -> Unit): Boolean {
         val obj = get(id) ?: return false
         mutator(obj)
         put(id, obj)
@@ -93,72 +73,25 @@ class PackedTable<T : Any>(
     fun delete(id: String) {
         db.put(Record(keyBuf(id), ByteBuffer.allocate(0), seq.incrementAndGet()))
     }
-}
 
-/* ======================================================================= */
-/*  💤  FIELD TABLE – Legacy UTF‑8 per‑field storage (less performant)      */
-/* ======================================================================= */
-
-class FieldTable<T : Any>(
-    private val db: AkkaraDB,
-    val kClass: KClass<T>,
-) {
-    private val ns = kClass.qualifiedName ?: kClass.simpleName!!
-    private val seq = AtomicLong(0)
-
-    /* ---------- CRUD ---------- */
-
-    fun put(id: String, entity: T) = kClass.memberProperties.forEach { prop ->
-        val key = keyStr(id, prop.name)
-        val value = prop.get(entity)?.toString() ?: "null"
-        db.put(Record(key, value, seq.incrementAndGet()))
-    }
-
-    inline fun put(id: String, builder: T.() -> Unit) {
-        val ctor = kClass.primaryConstructor ?: error("Data class must have primary constructor")
+    /**
+     * Entity builder style update.
+     * Requires data class [T] to have var `id: String` field to be used as primary key.
+     */
+    inline fun update(block: T.() -> Unit): Boolean {
+        val ctor = kClass.primaryConstructor ?: error("${kClass.simpleName} must have a primary constructor")
         val instance = ctor.callBy(emptyMap())
-        builder(instance)
+        instance.block()
+
+        val idProp = kClass.memberProperties.firstOrNull { it.name == "id" }
+            ?: error("data class ${kClass.simpleName} must contain an 'id' property")
+        val id = idProp.get(instance) as? String
+            ?: error("'id' must be non-null String")
+
+        val existing = get(id)
+        if (existing == instance) return false
+
         put(id, instance)
-    }
-
-    fun get(id: String): T? {
-        val snapshot = HashMap<String, String>()
-        for (prop in kClass.memberProperties) {
-            val buf = StandardCharsets.UTF_8.encode(keyStr(id, prop.name))
-            val bytes = db.get(buf) ?: return null
-            snapshot[prop.name] = StandardCharsets.UTF_8.decode(bytes.duplicate()).toString()
-        }
-        return hydrate(snapshot)
-    }
-
-    inline fun update(id: String, mutator: T.() -> Unit): Boolean {
-        val current = get(id) ?: return false
-        mutator(current)
-        put(id, current)
         return true
-    }
-
-    fun delete(id: String) = kClass.memberProperties.forEach { prop ->
-        db.put(Record(keyStr(id, prop.name), "", seq.incrementAndGet()))
-    }
-
-    /* ---------- helpers ---------- */
-
-    private fun keyStr(id: String, field: String) = "$ns:$id:$field"
-
-    /** Build new instance from <field → rawString>. */
-    private fun hydrate(src: Map<String, String>): T {
-        val ctor = kClass.primaryConstructor ?: error("Data class must have primary constructor")
-        val args = HashMap<kotlin.reflect.KParameter, Any?>()
-        for (p in ctor.parameters) src[p.name]?.let { args[p] = it }
-        val obj = ctor.callBy(args)
-        for (prop in kClass.memberProperties) {
-            if (prop !is KMutableProperty1) continue
-            src[prop.name]?.let { raw ->
-                prop.isAccessible = true
-                prop.setter.call(obj, raw)
-            }
-        }
-        return obj
     }
 }
