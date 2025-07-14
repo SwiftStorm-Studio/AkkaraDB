@@ -29,6 +29,8 @@ class SSTableWriter(
     private val index = IndexBlock()
     private lateinit var bloom: BloomFilter
 
+    /* ---------- public ---------- */
+
     fun write(records: List<Record>) {
         require(records.isNotEmpty()) { "records must not be empty" }
         bloom = BloomFilter(records.size)
@@ -52,55 +54,43 @@ class SSTableWriter(
         ch.force(true)
     }
 
-    /* ───────── internal ───────── */
+    /* ---------- internal ---------- */
 
     private fun flushBlock() {
         blockBuf.flip()
+
         val firstRecDup = blockBuf.duplicate()
+        val miniIdx = buildMiniIndex(blockBuf.duplicate())   // heap buffer
 
-        // 0) Build mini‑index over blockBuf
-        val idxTmp = buildMiniIndex(blockBuf.duplicate())     // returns read‑only dup
+        val payload = pool.get(miniIdx.remaining() + blockBuf.remaining())
+        payload.put(miniIdx).put(blockBuf).flip()
 
-        // 1) Assemble payload = [miniIndex][data]
-        val payload = pool.get(idxTmp.remaining() + blockBuf.remaining())
-        payload.put(idxTmp).put(blockBuf).flip()
+        val offset = ch.position()
 
-        val offset = ch.position()            // ← absolute file offset of this block
-
-        // 2) Write [len][payload][crc]
-        pool.borrow(4) { lenBuf ->
-            lenBuf.clear().putInt(payload.remaining()).flip()
-            ch.write(lenBuf)
-        }
-        ch.write(payload.duplicate())
-
+        val lenBuf = ByteBuffer.allocate(Integer.BYTES).putInt(payload.remaining()).flip() as ByteBuffer
         crc32.reset(); crc32.update(payload.duplicate())
-        pool.borrow(4) { cBuf ->
-            cBuf.clear().putInt(crc32.value.toInt()).flip()
-            ch.write(cBuf)
-        }
+        val crcBuf = ByteBuffer.allocate(Integer.BYTES).putInt(crc32.value.toInt()).flip() as ByteBuffer
 
-        // 3) outer index – first key of the block
+        ch.write(arrayOf(lenBuf, payload, crcBuf))
+
         val firstKey = AkkRecordReader.read(firstRecDup).key.asReadOnlyBuffer()
         index.add(firstKey, offset)
 
-        // 4) cleanup
         pool.release(payload)
         blockBuf.clear()
     }
 
-    /** Builds a VarInt‑encoded mini‑index and returns a read‑only buffer. */
     private fun buildMiniIndex(data: ByteBuffer): ByteBuffer {
         val offsets = ArrayList<Int>(128)
         var prev = 0
         while (data.hasRemaining()) {
             offsets += prev
-            AkkRecordReader.read(data)          // advance position
+            AkkRecordReader.read(data)          // advance
             prev = data.position()
         }
-        // encode: [count][delta1][delta2]… – delta from previous
-        val cap = offsets.sumOf { VarIntCodec.encodedSize(it) } + VarIntCodec.encodedSize(offsets.size)
-        val buf = ByteBuffer.allocate(cap)
+        val capacity = offsets.sumOf { VarIntCodec.encodedSize(it) } +
+                VarIntCodec.encodedSize(offsets.size)
+        val buf = ByteBuffer.allocate(capacity)
         VarIntCodec.writeInt(buf, offsets.size)
         var prevOff = 0
         for (abs in offsets) {
@@ -110,20 +100,26 @@ class SSTableWriter(
         return buf.flip().asReadOnlyBuffer()
     }
 
-    private fun writeFooter(indexOff: Long, bloomOff: Long) {
-        pool.borrow(20) { ftr ->
-            ftr.clear()
-            ftr.putInt(0x414B5353)   // "AKSS"
-            ftr.putLong(indexOff)
-            ftr.putLong(bloomOff)
-            ftr.flip(); ch.write(ftr)
+    private fun writeFooter(indexOff: Long, bloomOff: Long) =
+        pool.borrow(20) { footer ->
+            footer.clear()
+            footer.putInt(0x414B5353)          // "AKSS"
+            footer.putLong(indexOff)
+            footer.putLong(bloomOff)
+            footer.flip(); ch.write(footer)
         }
+
+    private fun encode(rec: Record): ByteBuffer {
+        val buf = pool.get(AkkRecordWriter.computeMaxSize(rec))
+        AkkRecordWriter.write(rec, buf)
+        buf.flip()
+        require(buf.remaining() <= BLOCK_SIZE) {
+            "Single record (${buf.remaining()} B) exceeds block size ($BLOCK_SIZE B)"
+        }
+        return buf
     }
 
-    private fun encode(rec: Record): ByteBuffer =
-        pool.get(AkkRecordWriter.computeMaxSize(rec)).also {
-            AkkRecordWriter.write(rec, it); it.flip()
-        }
+    /* ---------- lifecycle ---------- */
 
     override fun close() {
         pool.release(blockBuf)

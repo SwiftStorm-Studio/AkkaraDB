@@ -24,12 +24,13 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkara-common" -> "0.0.1-SNAPSHOT"
-        "akkara-core" -> "0.0.1-SNAPSHOT"
-        "akkara-format" -> "0.0.1-SNAPSHOT"
+        "akkara-cli" -> "0.0.1-SNAPSHOT"
+        "akkara-common" -> "0.0.1+alpha.1"
+        "akkara-engine" -> "0.0.1+alpha.1"
+        "akkara-format-api" -> "0.0.1+alpha.1"
+        "akkara-format-akk" -> "0.0.1+alpha.1"
         "akkara-java-api" -> "0.0.1-SNAPSHOT"
         "akkara-replica" -> "0.0.1-SNAPSHOT"
-        "akkara-wal" -> "0.0.1-SNAPSHOT"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
