@@ -12,17 +12,35 @@ fun replayWal(path: Path, mem: MemTable) {
 
     FileChannel.open(path, READ).use { ch ->
         val buf = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size())
-        var apply = true
+        var state = SegState.APPLY
+
         while (buf.hasRemaining()) {
-            when (val r = WalRecord.readFrom(buf)) {
-                is WalRecord.Add -> if (apply) {
-                    val rec = AkkRecordReader.read(r.payload.duplicate())
-                    mem.put(rec)
+            when (val rec = WalRecord.readFrom(buf)) {
+                is WalRecord.Add -> {
+                    if (state == SegState.SEALED) {
+                        error("WAL corrupted: Add encountered after Seal but before CheckPoint @ pos=${buf.position()}")
+                    }
+                    // apply
+                    val kv = AkkRecordReader.read(rec.payload.asReadOnlyBuffer())
+                    mem.put(kv)
                 }
 
-                WalRecord.Seal -> apply = false   // ← skip after Seal
-                is WalRecord.CheckPoint -> apply = true // ← resume after checkpoint
+                WalRecord.Seal -> {
+                    if (state == SegState.SEALED) {
+                        error("WAL corrupted: consecutive Seal records @ pos=${buf.position()}")
+                    }
+                    state = SegState.SEALED
+                }
+
+                is WalRecord.CheckPoint -> {
+                    if (state != SegState.SEALED) {
+                        error("WAL corrupted: CheckPoint without preceding Seal @ pos=${buf.position()}")
+                    }
+                    state = SegState.APPLY
+                }
             }
         }
     }
 }
+
+enum class SegState { APPLY, SEALED }
