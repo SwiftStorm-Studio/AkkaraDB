@@ -102,12 +102,15 @@ class AkkaraDB private constructor(
 
         /* ---------- 5.b) on‑miss: slow stripe scan (lock‑free) ---------- */
         AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
-            // Traverse stripes from newest → oldest. Start with durable counter.
-            var sid = manifest.stripesWritten - 1
-            while (sid >= 0) {
+            val total = manifest.stripesWritten
+            var idx = 0L                       // 0 = oldest stripe, increases as we advance
+            val rr = AkkRecordReader
+            while (true) {
                 val payloads = reader.readStripe() ?: break
+                val sid = total - 1 - idx      // translate to newest‑first numbering
+                idx++
+
                 val recs = ArrayList<Record>()
-                val rr = AkkRecordReader
                 for (p in payloads) {
                     val dup = p.duplicate()
                     while (dup.hasRemaining()) {
@@ -121,7 +124,6 @@ class AkkaraDB private constructor(
                 }
                 // even if key not found, remember stripe to accelerate future hits
                 stripeCache.put(sid, recs)
-                sid--
             }
         }
         return null      // not found anywhere

@@ -13,32 +13,28 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.reflect.KClass
-import kotlin.reflect.full.memberProperties
 import kotlin.reflect.full.primaryConstructor
 
 object AkkDSL {
 
-    /**
-     * Opens or creates a PackedTable using CBOR encoding.
-     * Requires that [T] is a Kotlin data class with @Serializable and a `var id: String` field.
-     */
+    /* ───────── factory helpers ───────── */
+
     inline fun <reified T : Any> openPacked(
         baseDir: Path,
-        format: BinaryFormat = Cbor
-    ): PackedTable<T> =
-        PackedTable(
-            AkkaraDB.open(baseDir),
-            T::class,
-            serializer(),
-            format
-        )
+        format: BinaryFormat = Cbor,
+        seqSeed: Long? = null,
+    ): PackedTable<T> = PackedTable(
+        AkkaraDB.open(baseDir),
+        T::class,
+        serializer(),
+        format,
+        seqSeed
+    )
 
-    /**
-     * Wrap an existing AkkaraDB instance with PackedTable.
-     */
     inline fun <reified T : Any> AkkaraDB.packed(
-        format: BinaryFormat = Cbor
-    ): PackedTable<T> = PackedTable(this, T::class, serializer(), format)
+        format: BinaryFormat = Cbor,
+        seqSeed: Long? = null,
+    ): PackedTable<T> = PackedTable(this, T::class, serializer(), format, seqSeed)
 }
 
 class PackedTable<T : Any>(
@@ -46,52 +42,78 @@ class PackedTable<T : Any>(
     val kClass: KClass<T>,
     private val serializer: KSerializer<T>,
     private val format: BinaryFormat = Cbor,
+    seqSeed: Long? = null,
 ) {
-    private val ns = kClass.qualifiedName ?: kClass.simpleName!!
-    private val seq = AtomicLong(0)
+    /* ───────── namespace & seq ───────── */
 
-    private fun keyBuf(id: String): ByteBuffer =
-        StandardCharsets.UTF_8.encode("$ns:$id")
+    private val nsBytes = "${kClass.qualifiedName ?: kClass.simpleName!!}:".toByteArray(StandardCharsets.UTF_8)
+
+    private val seq = AtomicLong(seqSeed ?: db.bestEffortLastSeq())
+
+    /* ───────── internal constants ───────── */
+
+    private val TOMBSTONE: ByteBuffer = ByteBuffer.allocate(0).asReadOnlyBuffer()
+
+    /* ───────── key helpers ───────── */
+
+    private fun keyBuf(id: String): ByteBuffer {
+        val idBytes = id.toByteArray(StandardCharsets.UTF_8)
+        val buf = ByteBuffer.allocateDirect(nsBytes.size + idBytes.size)
+        buf.put(nsBytes).put(idBytes).flip()
+        return buf
+    }
+
+    /* ───────── CRUD ───────── */
 
     fun put(id: String, entity: T) {
         val bytes = format.encodeToByteArray(serializer, entity)
+        require(bytes.isNotEmpty()) { "Entity encodes to 0 bytes; disallowed because it conflicts with tombstone." }
         db.put(Record(keyBuf(id), ByteBuffer.wrap(bytes), seq.incrementAndGet()))
     }
 
     fun get(id: String): T? = db.get(keyBuf(id))?.let { buf ->
+        if (buf.remaining() == 0) return null              // tombstone or non‑existent
         val arr = ByteArray(buf.remaining()).also { buf.get(it) }
         format.decodeFromByteArray(serializer, arr)
     }
 
-    fun update(id: String, mutator: T.() -> Unit): Boolean {
-        val obj = get(id) ?: return false
-        mutator(obj)
-        put(id, obj)
-        return true
-    }
-
     fun delete(id: String) {
-        db.put(Record(keyBuf(id), ByteBuffer.allocate(0), seq.incrementAndGet()))
+        db.put(Record(keyBuf(id), TOMBSTONE, seq.incrementAndGet()))
     }
 
-    /**
-     * Entity builder style update.
-     * Requires data class [T] to have var `id: String` field to be used as primary key.
-     */
-    inline fun update(block: T.() -> Unit): Boolean {
-        val ctor = kClass.primaryConstructor ?: error("${kClass.simpleName} must have a primary constructor")
-        val instance = ctor.callBy(emptyMap())
-        instance.block()
+    /* ───────── Higher‑order helpers ───────── */
 
-        val idProp = kClass.memberProperties.firstOrNull { it.name == "id" }
-            ?: error("data class ${kClass.simpleName} must contain an 'id' property")
-        val id = idProp.get(instance) as? String
-            ?: error("'id' must be non-null String")
+    fun update(id: String, mutator: T.() -> Unit): Boolean {
+        while (true) {
+            val old = get(id) ?: return false
+            val copy = old.deepCopy()
+            mutator(copy)
+            if (copy == old) return false
+            put(id, copy)
+            return true
+        }
+    }
 
-        val existing = get(id)
-        if (existing == instance) return false
+    inline fun build(id: String, builder: T.() -> Unit): T {
+        val inst = allocateViaPrimaryCtor() ?: error("${kClass.simpleName} has no default constructor")
+        inst.builder()
+        put(id, inst)
+        return inst
+    }
 
-        put(id, instance)
-        return true
+    /* ───────── internals ───────── */
+
+    private fun T.deepCopy(): T =
+        format.decodeFromByteArray(serializer, format.encodeToByteArray(serializer, this))
+
+    fun allocateViaPrimaryCtor(): T? {
+        val ctor = kClass.primaryConstructor ?: return null
+        if (ctor.parameters.any { !it.isOptional && !it.type.isMarkedNullable }) return null
+        return ctor.callBy(emptyMap())
     }
 }
+
+/* ───────── extension ───────── */
+
+private fun AkkaraDB.bestEffortLastSeq(): Long =
+    runCatching { javaClass.getMethod("lastSeq").invoke(this) as? Long ?: 0L }.getOrElse { 0L }

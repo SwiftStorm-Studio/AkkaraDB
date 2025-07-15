@@ -127,7 +127,7 @@ class MemTable(
      * Inserts/overwrites the record and returns the delta in byte size.
      */
     private fun insert(record: Record): Long {
-        val keyCopy = record.key.slice().asReadOnlyBuffer()
+        val keyCopy = record.key.duplicate().apply { rewind() }.asReadOnlyBuffer()
         val map = mapRef.get()
         val prev = map.put(keyCopy, record)
 
