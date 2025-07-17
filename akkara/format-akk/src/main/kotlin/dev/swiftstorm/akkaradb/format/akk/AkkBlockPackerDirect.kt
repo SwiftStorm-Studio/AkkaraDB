@@ -40,30 +40,20 @@ class AkkBlockPackerDirect(
         val payloadLen = scratch.position()
         scratch.flip()
 
-        // 1. allocate a fresh 32KiB block from the pool
-        val blk = pool.get()
-
-        // 2. [len][payload]--------------------------------------
+        val blk = pool.get()             // 32 KiB direct buffer
         blk.putInt(payloadLen)
         blk.put(scratch)
-
-        // 3. zero‑pad up to PAYLOAD_LIMIT (32KiB − 4) for deterministic checksum
-        while (blk.position() < PAYLOAD_LIMIT + 4) blk.put(0)
-
-        // 4. CRC32C on the first (4+payloadLen) bytes
+        blk.position(PAYLOAD_LIMIT + 4)  // skip padding
         crc.reset()
-        val dup = blk.duplicate()
-        dup.limit(4 + payloadLen).position(0)
-        crc.update(dup)
-        blk.position(PAYLOAD_LIMIT + 4).putInt(crc.value.toInt())
+        blk.duplicate()
+            .limit(4 + payloadLen)
+            .position(0)
+            .let(crc::update)
+        blk.putInt(crc.value.toInt())
         blk.flip()
 
-        // 5. HAND‑OFF — Duplicate as read‑only for downstream; keep the original
-        //    so we control its lifecycle.
-        val ro = blk.asReadOnlyBuffer()
-        onBlockReady(ro)        // StripeWriter.addBlock(ro)
+        onBlockReady(blk)
 
-        scratch.clear()         // ready for next pack cycle
+        scratch.clear()
     }
-
 }

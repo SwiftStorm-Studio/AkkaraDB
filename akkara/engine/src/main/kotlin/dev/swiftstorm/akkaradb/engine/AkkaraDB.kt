@@ -89,45 +89,27 @@ class AkkaraDB private constructor(
      * of the critical section, greatly reducing read/write contention.
      */
     fun get(key: ByteBuffer): ByteBuffer? {
-        /* ---------- fast path with shared read‑lock ---------- */
-        val fast = lock.read {
+        /* ---------- 1. mem / SST hit ---------- */
+        lock.read {
             memTable.get(key)?.value ?: level0.firstNotNullOfOrNull { sst ->
                 if (!sst.mightContain(key)) null else sst.get(key)?.value
             }
-        }
-        if (fast != null) return fast
+        }?.let { return it }
 
-        /* ---------- 5.a) cached stripe lookup (lock‑free) ---------- */
+        /* ---------- 2. stripe cache ---------- */
         stripeCache.find(key)?.let { return it }
 
-        /* ---------- 5.b) on‑miss: slow stripe scan (lock‑free) ---------- */
+        /* ---------- 3. slow stripe scan ---------- */
         AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
-            val total = manifest.stripesWritten
-            var idx = 0L                       // 0 = oldest stripe, increases as we advance
-            val rr = AkkRecordReader
-            while (true) {
-                val payloads = reader.readStripe() ?: break
-                val sid = total - 1 - idx      // translate to newest‑first numbering
-                idx++
-
-                val recs = ArrayList<Record>()
-                for (p in payloads) {
-                    val dup = p.duplicate()
-                    while (dup.hasRemaining()) {
-                        val r = rr.read(dup)
-                        recs.add(r)
-                        if (r.key.compareTo(key) == 0) {
-                            stripeCache.put(sid, recs)
-                            return r.value
-                        }
-                    }
-                }
-                // even if key not found, remember stripe to accelerate future hits
-                stripeCache.put(sid, recs)
+            val hit = reader.searchLatestStripe(key, manifest.stripesWritten - 1)
+            if (hit != null) {
+                stripeCache.put(hit.stripeId, hit.blocks)
+                return hit.record.value
             }
         }
-        return null      // not found anywhere
+        return null
     }
+
 
     /* ───────── write‑path ───────── */
 

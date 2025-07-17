@@ -1,6 +1,8 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import io.netty.channel.unix.FileDescriptor
 import io.netty.channel.uring.IoUring
@@ -17,6 +19,7 @@ class AkkStripeWriter(
     val k: Int,
     val parityCoder: ParityCoder? = null,
     private val autoFlush: Boolean = true,
+    private val pool: BufferPool = Pools.io()
 ) : Closeable {
 
     /* ───────── backend selection ───────── */
@@ -35,19 +38,31 @@ class AkkStripeWriter(
 
     /* ───────── write‑path ───────── */
     fun addBlock(block: ByteBuffer) {
-        require(block.remaining() == BLOCK_SIZE) { "block must be exactly 32 KiB" }
-        dataCh[laneIdx].write(block.duplicate())
-        laneIdx++
+        require(block.remaining() == BLOCK_SIZE)
 
-        if (laneIdx == k) {
-            // parity encode
-            parityCoder?.let { coder ->
-                val parityBlks = coder.encode(dataCh.map { it.lastWritten!! })
-                for (i in parityCh.indices) parityCh[i].write(parityBlks[i])
+        try {
+            /* 1. write data lane */
+            dataCh[laneIdx].write(block.duplicate())
+            laneIdx++
+
+            if (laneIdx == k) {
+                parityCoder?.let { coder ->
+                    val parity = coder.encode(dataCh.map { it.lastWritten!! })
+                    parity.forEachIndexed { i, buf ->
+                        parityCh[i].write(buf.duplicate())
+                        pool.release(buf)
+                    }
+                }
+                dataCh.forEach { writer ->
+                    writer.lastWritten?.let(pool::release)
+                    writer.lastWritten = null
+                }
+                laneIdx = 0
+                stripesWritten_++
+                if (autoFlush) flush()
             }
-            laneIdx = 0
-            stripesWritten_++
-            if (autoFlush) flush()
+        } finally {
+            pool.release(block)
         }
     }
 

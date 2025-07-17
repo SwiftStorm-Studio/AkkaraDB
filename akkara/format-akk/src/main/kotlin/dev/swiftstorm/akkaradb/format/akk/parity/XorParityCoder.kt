@@ -41,9 +41,7 @@ class XorParityCoder(
         }
         parityBuf.flip()
 
-        val ro = parityBuf.asReadOnlyBuffer()
-        pool.release(parityBuf)
-        return listOf(ro)
+        return listOf(parityBuf.asReadOnlyBuffer())
     }
 
     /* ───────── decode ───────── */
