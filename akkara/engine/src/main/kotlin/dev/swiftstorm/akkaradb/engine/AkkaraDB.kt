@@ -6,6 +6,7 @@ import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.borrow
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
+import dev.swiftstorm.akkaradb.engine.sstable.Compactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
@@ -35,43 +36,35 @@ class AkkaraDB private constructor(
     private val stripeWriter: AkkStripeWriter,
     private val manifest: AkkManifest,
     private val wal: WalWriter,
+    private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>,
     private val pool: BufferPool = Pools.io(),
-    private val level0: ConcurrentLinkedDeque<SSTableReader>
+    private val compactor: Compactor
 ) : AutoCloseable {
 
     /* ───────── synchronisation ───────── */
-
     private val lock = ReentrantReadWriteLock()
     private val recordWriter = AkkRecordWriter
 
-    /* ───────── 5) Stripe LRU Cache ───────── */
-
+    /* ───────── Stripe LRU Cache ───────── */
     /**
-     * Holds a fully‑decoded list of [Record]s per stripe. Only <em>[capacity]</em>
-     * most‑recent stripes are kept (LRU eviction). All operations are
-     * <em>O(1)</em> or <em>O(stripeSize)</em> on cache hit and are internally
-     * synchronised.
+     * A simple LRU cache for the latest <em>k</em> stripes, where each stripe
+     * is a list of [Record]s. The cache is used to speed up single‑key lookups
+     * by avoiding expensive stripe scans.
      */
     private class StripeCache(private val capacity: Int) {
         private val cache = object : LinkedHashMap<Long, List<Record>>(capacity, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, List<Record>>): Boolean = size > capacity
         }
-
         @Synchronized
         fun put(sid: Long, recs: List<Record>) {
             cache[sid] = recs
         }
 
         @Synchronized
-        fun find(key: ByteBuffer): ByteBuffer? {
-            for (recs in cache.values) {
-                val hit = recs.firstOrNull { it.key.compareTo(key) == 0 }
-                if (hit != null) return hit.value
-            }
-            return null
+        fun find(key: ByteBuffer): ByteBuffer? = cache.values.firstNotNullOfOrNull { recs ->
+            recs.firstOrNull { it.key.compareTo(key) == 0 }?.value
         }
     }
-
     private val stripeCache = StripeCache(capacity = 8)
 
     /* ───────── public API ───────── */
@@ -89,17 +82,22 @@ class AkkaraDB private constructor(
      * of the critical section, greatly reducing read/write contention.
      */
     fun get(key: ByteBuffer): ByteBuffer? {
-        /* ---------- 1. mem / SST hit ---------- */
+        // 1) MemTable / SST hit
         lock.read {
-            memTable.get(key)?.value ?: level0.firstNotNullOfOrNull { sst ->
-                if (!sst.mightContain(key)) null else sst.get(key)?.value
+            memTable.get(key)?.value ?: run {
+                for (deque in levels) {
+                    deque.firstNotNullOfOrNull { sst ->
+                        if (!sst.mightContain(key)) null else sst.get(key)?.value
+                    }?.let { return it }
+                }
+                null
             }
         }?.let { return it }
 
-        /* ---------- 2. stripe cache ---------- */
+        // 2) Stripe cache
         stripeCache.find(key)?.let { return it }
 
-        /* ---------- 3. slow stripe scan ---------- */
+        // 3) Stripe scan fallback
         AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
             val hit = reader.searchLatestStripe(key, manifest.stripesWritten - 1)
             if (hit != null) {
@@ -110,14 +108,10 @@ class AkkaraDB private constructor(
         return null
     }
 
-
     /* ───────── write‑path ───────── */
-
     fun put(rec: Record) = lock.write {
         pool.borrow(recordWriter.computeMaxSize(rec)) { buf ->
-            recordWriter.write(rec, buf)
-            buf.flip()
-
+            recordWriter.write(rec, buf); buf.flip()
             wal.append(buf.duplicate())
             memTable.put(rec)
             packer.addRecord(buf)
@@ -127,24 +121,19 @@ class AkkaraDB private constructor(
     fun flush() = lock.write {
         memTable.flush()
         packer.flush()
-
         stripeWriter.flush()
-        val stripesAfter = stripeWriter.stripesWritten
-
-        manifest.advance(stripesAfter)
-        wal.checkpoint(stripesAfter, memTable.lastSeq())
+        manifest.advance(stripeWriter.stripesWritten)
+        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
         wal.sealSegment()
+        compactor.maybeCompact()
     }
 
     override fun close() {
-        flush()
-        wal.close()
-        stripeWriter.close()
-        level0.forEach(SSTableReader::close)
+        flush(); wal.close(); stripeWriter.close()
+        levels.forEach { deque -> deque.forEach(SSTableReader::close) }
     }
 
     /* --------------- factory --------------- */
-
     companion object {
         fun open(
             baseDir: Path,
@@ -152,52 +141,49 @@ class AkkaraDB private constructor(
             parityCoder: ParityCoder = XorParityCoder(),
             flushThresholdBytes: Long = 64L * 1024 * 1024,
         ): AkkaraDB {
-            /* ---------- persistent components ---------- */
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
             val stripe = AkkStripeWriter(baseDir, k, parityCoder, autoFlush = true)
             val wal = WalWriter(baseDir.resolve("wal.log"))
             val pool = Pools.io()
-            val level0 = ConcurrentLinkedDeque<SSTableReader>()
 
-            /* ---------- pipeline components ---------- */
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
+            val levels = ArrayList<ConcurrentLinkedDeque<SSTableReader>>().apply {
+                add(ConcurrentLinkedDeque()) // L0
+            }
 
             val mem = MemTable(flushThresholdBytes, { records ->
                 if (records.isNotEmpty()) {
                     val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
                     SSTableWriter(sstPath, pool).use { it.write(records.sortedBy { it.key }) }
-                    level0.addFirst(SSTableReader(sstPath, pool))
+                    levels[0].addFirst(SSTableReader(sstPath, pool))
                 }
-
-                // also fan‑out to stripe packer (durability duplication is fine)
+                // fan‑out to stripe
                 for (r in records) {
                     val buf = pool.get(AkkRecordWriter.computeMaxSize(r))
-                    AkkRecordWriter.write(r, buf); buf.flip()
-                    packer.addRecord(buf); pool.release(buf)
+                    AkkRecordWriter.write(r, buf); buf.flip(); packer.addRecord(buf); pool.release(buf)
                 }
                 packer.flush()
             })
 
-            /* ---------- startup recovery ---------- */
-            manifest.load()
-            stripe.seek(manifest.stripesWritten)
-
-            replayWal(baseDir.resolve("wal.log"), mem)   // durable before crash
+            /* ---- startup recovery ---- */
+            manifest.load(); stripe.seek(manifest.stripesWritten)
+            replayWal(baseDir.resolve("wal.log"), mem)
 
             AkkStripeReader(baseDir, k, parityCoder).use { reader ->
-                var sid = manifest.stripesWritten
                 val rr = AkkRecordReader
-                while (true) {
-                    val payloads = reader.readStripe() ?: break
-                    for (p in payloads) {
-                        val dup = p.duplicate()
-                        while (dup.hasRemaining()) mem.put(rr.read(dup))
+                repeat(manifest.stripesWritten.toInt()) { sid ->
+                    val payloads = reader.readStripe() ?: return@repeat
+                    payloads.forEach { p ->
+                        val dup = p.duplicate(); while (dup.hasRemaining()) mem.put(rr.read(dup))
                     }
-                    sid++
                 }
             }
 
-            return AkkaraDB(mem, packer, stripe, manifest, wal, pool, level0)
+            val compactor = Compactor(levels, baseDir, pool = pool).also { compactor ->
+                compactor.maybeCompact()
+            }
+
+            return AkkaraDB(mem, packer, stripe, manifest, wal, levels, pool, compactor)
         }
     }
 }

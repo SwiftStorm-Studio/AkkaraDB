@@ -19,13 +19,13 @@ import java.nio.file.StandardOpenOption.READ
 import java.util.zip.CRC32C
 
 class SSTableReader(
-    path: Path,
+    val path: Path,
     private val pool: BufferPool = Pools.io(),
 ) : Closeable {
 
     /* ───────── file handles ───────── */
 
-    private val ch: FileChannel = FileChannel.open(path, READ)
+    internal val ch: FileChannel = FileChannel.open(path, READ)
     private val fileSize: Long = ch.size()
 
     /* ───────── table meta (footer) ───────── */
@@ -112,7 +112,7 @@ class SSTableReader(
 
     /* ───────── helpers ───────── */
 
-    private fun miniIndexFor(blockOff: Long, payload: ByteBuffer): IntArray {
+    internal fun miniIndexFor(blockOff: Long, payload: ByteBuffer): IntArray {
         synchronized(miniCache) {
             miniCache[blockOff]?.get()?.let { return it }
         }
@@ -130,4 +130,49 @@ class SSTableReader(
     }
 
     override fun close() = ch.close()
+}
+
+fun SSTableReader.iterator(): Iterator<Record> = sequence {
+    val blockOffsets = getBlockOffsets()
+    for (off in blockOffsets) {
+        val block = readBlock(off)
+        yieldAll(block)
+    }
+}.iterator()
+
+private fun SSTableReader.getBlockOffsets(): List<Long> {
+    val f = this::class.java.getDeclaredField("index")
+    f.isAccessible = true
+    val index = f.get(this) as IndexBlock
+
+    val keysField = index.javaClass.getDeclaredField("offsets")
+    keysField.isAccessible = true
+    @Suppress("UNCHECKED_CAST")
+    return (keysField.get(index) as List<Long>).toList()
+}
+
+private fun SSTableReader.readBlock(offset: Long): List<Record> {
+    val hdr = ByteBuffer.allocate(4)
+    ch.read(hdr, offset)
+    hdr.flip()
+    val len = hdr.int
+    val total = 4 + len + 4
+    val buf = ch.map(FileChannel.MapMode.READ_ONLY, offset, total.toLong()).order(ByteOrder.BIG_ENDIAN)
+
+    val payload = buf.slice().apply { position(4); limit(4 + len) }
+    val storedCrc = buf.getInt(4 + len)
+
+    val crc32 = java.util.zip.CRC32C().apply { update(payload.duplicate()) }
+    require(crc32.value.toInt() == storedCrc) { "CRC mismatch at $offset" }
+
+    val recs = mutableListOf<Record>()
+    val dup = payload.duplicate()
+    val mini = miniIndexFor(offset, dup)
+    val dataStart = dup.position() + VarIntCodec.encodedSize(mini.size) + mini.sumOf { VarIntCodec.encodedSize(it) }
+    for (rel in mini) {
+        val pos = dataStart + rel
+        dup.position(pos)
+        recs += AkkRecordReader.read(dup)
+    }
+    return recs
 }
