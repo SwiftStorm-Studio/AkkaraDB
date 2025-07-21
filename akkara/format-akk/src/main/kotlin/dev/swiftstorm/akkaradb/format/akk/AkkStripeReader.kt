@@ -75,8 +75,13 @@ class AkkStripeReader(
                     pool.release(buf); null
                 }
             }
-            val missIdx = laneBlocks.indexOfFirst { it == null }
-            laneBlocks[missIdx] = parityCoder.decode(missIdx, laneBlocks, tmp)
+
+            for (missIdx in laneBlocks.indices) {
+                if (laneBlocks[missIdx] == null) {
+                    laneBlocks[missIdx] = parityCoder.decode(missIdx, laneBlocks, tmp)
+                }
+            }
+
             tmp
         } else {
             emptyList()

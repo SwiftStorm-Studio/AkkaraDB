@@ -26,21 +26,28 @@ class FixedBufferPool(
 
     /* ───────────────── public API ───────────────── */
 
+    /**
+     * Borrow a buffer of at least `size` bytes.
+     * Race‑safe: retained counter is decremented **inside** the same mutex that
+     * removes the buffer, guaranteeing we never dip below 0.
+     */
     override fun get(size: Int): ByteBuffer {
         val rounded = roundPow2(maxOf(size, bucketBase))
 
         val bucketEntry = buckets.ceilingEntry(rounded)
         if (bucketEntry != null && bucketEntry.key <= rounded * 4) {
             val deque = bucketEntry.value
-            val buf = synchronized(deque) { deque.removeFirstOrNull() }
-            if (buf != null) {
-                retained.decrementAndGet()
-                hits.increment()
-                return buf.clear()
+            synchronized(deque) {
+                val buf = deque.removeFirstOrNull()
+                if (buf != null) {
+                    retained.decrementAndGet()   // safe: paired with release() increment
+                    hits.increment()
+                    return buf.clear()
+                }
             }
         }
 
-        // cache miss → fresh direct buffer
+        // cache miss → fresh direct buffer (retained remains unchanged)
         misses.increment()
         created.increment()
         return ByteBuffer.allocateDirect(rounded)
@@ -49,7 +56,9 @@ class FixedBufferPool(
     override fun release(buf: ByteBuffer) {
         buf.clear()
 
-        if (retained.get() >= capacity) {
+        // Reserve a slot; roll back if over capacity
+        if (retained.incrementAndGet() > capacity) {
+            retained.decrementAndGet()
             dropped.increment()
             return
         }
@@ -57,7 +66,6 @@ class FixedBufferPool(
         val rounded = roundPow2(maxOf(buf.capacity(), bucketBase))
         val deque = buckets.computeIfAbsent(rounded) { ArrayDeque() }
         synchronized(deque) { deque.addLast(buf) }
-        retained.incrementAndGet()
     }
 
     override fun stats(): BufferPool.Stats = BufferPool.Stats(

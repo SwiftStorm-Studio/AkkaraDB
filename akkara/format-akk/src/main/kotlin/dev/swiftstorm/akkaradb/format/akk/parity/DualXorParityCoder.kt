@@ -6,19 +6,6 @@ import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import kotlin.experimental.xor
 
-/**
- * <h2>Dual XOR Parity</h2>
- *
- * Generates two XOR parities so that any <em>two</em> missing lanes among
- * <code>k&nbsp;+&nbsp;2</code> can be reconstructed in <code>O(k·blockSize)</code>.
- * This is a more advanced form of parity coding, similar to RAID‑6.
- *
- * Implementation notes:
- * * Uses a <strong>thread‑local</strong> [BufferPool] to amortise direct‑buffer
- *   allocations.
- * * All intermediate buffers are released in <code>finally</code> blocks.
- * * Returned parity / decode buffers are <em>read‑only</em>; caller owns release.
- */
 class DualXorParityCoder(
     private val pool: BufferPool = Pools.io()
 ) : ParityCoder {
@@ -31,25 +18,26 @@ class DualXorParityCoder(
         val size = dataBlocks[0].remaining()
         require(dataBlocks.all { it.remaining() == size }) { "all blocks must have equal size" }
 
+        // P = Σ block_i,   Q = Σ rotate(block_i, i)
         val p = pool.get(size)
         val q = pool.get(size)
+        // buffers come cleared; ensure correct limit
+        p.limit(size); q.limit(size)
 
-        p.put(dataBlocks[0].duplicate())
-        for (i in 1 until dataBlocks.size) {
-            val src = dataBlocks[i].duplicate()
+        for ((i, data) in dataBlocks.withIndex()) {
+            val src = data.duplicate()
             for (pos in 0 until size) {
                 val b = src.get(pos)
                 p.put(pos, p.get(pos) xor b)
+
                 val rot = (pos + i) % size
                 q.put(rot, q.get(rot) xor b)
             }
         }
         p.flip(); q.flip()
 
-        val roP = p.asReadOnlyBuffer()
-        val roQ = q.asReadOnlyBuffer()
-        pool.release(p); pool.release(q)
-        return listOf(roP, roQ)
+        // ❗️ Caller must release returned buffers.
+        return listOf(p.asReadOnlyBuffer(), q.asReadOnlyBuffer())
     }
 
     /* ───────── decode ───────── */
@@ -58,11 +46,18 @@ class DualXorParityCoder(
         presentData: List<ByteBuffer?>,
         parity: List<ByteBuffer?>
     ): ByteBuffer {
+        require(parityCount == parity.size) { "parity size mismatch" }
         val size = parity.filterNotNull().first().remaining()
 
+        // ─── Case 1: Lost block is DATA ──────────────────────────────
         if (lostIndex < presentData.size) {
             val rec = pool.get(size)
-            rec.put(parity[0]!!.duplicate())
+            rec.limit(size)
+            // Start with P parity block
+            val p = parity[0]!!.duplicate()
+            rec.put(p)
+
+            // XOR all present data blocks (except the lost one)
             for ((idx, blk) in presentData.withIndex()) {
                 if (idx == lostIndex || blk == null) continue
                 val dup = blk.duplicate()
@@ -71,20 +66,24 @@ class DualXorParityCoder(
                 }
             }
             rec.flip()
-            val ro = rec.asReadOnlyBuffer()
-            pool.release(rec)
-            return ro
+            return rec.asReadOnlyBuffer()  // caller releases
         }
 
-        val restoreP = (lostIndex == presentData.size)
-        val parityBuf = pool.get(size)
+        // ─── Case 2: Lost block is P or Q parity ────────────────────
+        val restoreP = (lostIndex == presentData.size) // true if P is lost, else Q
+        val out = pool.get(size)
+        out.limit(size)
 
         if (restoreP) {
-            parityBuf.put(presentData.filterNotNull().first().duplicate())
-            for (blk in presentData.drop(1).filterNotNull()) {
+            // P  = Σ block_i
+            // Initialize with first present data block
+            val first = presentData.first { it != null }!!.duplicate()
+            out.put(first)
+            for (blk in presentData.dropWhile { it == null }.drop(1)) {
+                if (blk == null) continue
                 val dup = blk.duplicate()
                 for (pos in 0 until size) {
-                    parityBuf.put(pos, parityBuf.get(pos) xor dup.get(pos))
+                    out.put(pos, out.get(pos) xor dup.get(pos))
                 }
             }
         } else {
@@ -94,13 +93,12 @@ class DualXorParityCoder(
                 val dup = blk.duplicate()
                 for (pos in 0 until size) {
                     val rot = (pos + i) % size
-                    parityBuf.put(rot, parityBuf.get(rot) xor dup.get(pos))
+                    out.put(rot, out.get(rot) xor dup.get(pos))
                 }
             }
         }
-        parityBuf.flip()
-        val ro = parityBuf.asReadOnlyBuffer()
-        pool.release(parityBuf)
-        return ro
+
+        out.flip()
+        return out.asReadOnlyBuffer() // caller releases
     }
 }

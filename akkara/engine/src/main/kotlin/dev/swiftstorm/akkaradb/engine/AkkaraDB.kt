@@ -123,8 +123,8 @@ class AkkaraDB private constructor(
         packer.flush()
         stripeWriter.flush()
         manifest.advance(stripeWriter.stripesWritten)
-        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
         wal.sealSegment()
+        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
         compactor.maybeCompact()
     }
 

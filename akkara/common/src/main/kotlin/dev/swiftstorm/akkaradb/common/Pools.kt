@@ -25,8 +25,23 @@ object Pools {
     ): BufferPool =
         FixedBufferPool(capacity, bucketBase)
 
+    /**
+     * Swap the global [BufferPool] provider.
+     *
+     * - Closes the existing Thread‑Local pool instance (avoids FD/native‑mem leaks).
+     * - Atomically installs the new supplier.
+     * - Clears the ThreadLocal so the next access lazily instantiates
+     *   a pool from the new supplier.
+     */
     fun setProvider(newSupplier: () -> BufferPool) {
+        // 1) Close current pool bound to this thread, if any
+        TL.get().let { (it as? AutoCloseable)?.close() }
+
+        // 2) Swap supplier atomically
         supplierRef.set(newSupplier)
+
+        // 3) Remove ThreadLocal to force re‑creation with the new supplier
         TL.remove()
     }
+
 }
