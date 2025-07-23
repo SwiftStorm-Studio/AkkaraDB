@@ -45,7 +45,7 @@ object AkkDSL {
  * Type‑safe wrapper around AkkaraDB that provides CRUD / UPSERT helpers for a single entity type [T].
  */
 class PackedTable<T : Any>(
-    private val db: AkkaraDB,
+    val db: AkkaraDB,
     private val kClass: KClass<T>,
     private val serializer: KSerializer<T>,
     private val format: BinaryFormat = Cbor,

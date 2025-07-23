@@ -21,13 +21,18 @@ object AkkRecordWriter : RecordWriter {
     override fun write(record: Record, dest: ByteBuffer): Int {
         val startPos = dest.position()
 
-        val keyBuf = record.key.asReadOnlyBuffer()
-        val valBuf = record.value.asReadOnlyBuffer()
+        val keyBuf = record.key.duplicate().apply { position(0); limit(record.key.remaining()) }.asReadOnlyBuffer()
+        val valBuf = record.value.duplicate().apply { position(0); limit(record.value.remaining()) }.asReadOnlyBuffer()
 
         // Header
         VarIntCodec.writeInt(dest, keyBuf.remaining())
         VarIntCodec.writeInt(dest, valBuf.remaining())
         VarIntCodec.writeLong(dest, VarIntCodec.zigZagEncodeLong(record.seqNo))
+
+        println(
+            "[WRITE] keyLen=${record.key.remaining()} valueLen=${record.value.remaining()} total=${dest.remaining()} B " +
+                    "seqNo=${record.seqNo} key=${keyBuf.remaining()} B value=${valBuf.remaining()} B"
+        )
 
         // Payload
         dest.put(keyBuf)

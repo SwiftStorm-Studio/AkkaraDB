@@ -48,7 +48,6 @@ class AkkManifest(private val path: Path) {
         Files.move(
             tmp,
             path,
-            StandardCopyOption.ATOMIC_MOVE,
             StandardCopyOption.REPLACE_EXISTING
         )
     }

@@ -159,8 +159,15 @@ class AkkaraDB private constructor(
                 }
                 // fan‑out to stripe
                 for (r in records) {
-                    val buf = pool.get(AkkRecordWriter.computeMaxSize(r))
-                    AkkRecordWriter.write(r, buf); buf.flip(); packer.addRecord(buf); pool.release(buf)
+                    val need = AkkRecordWriter.computeMaxSize(r)
+                    println("---- key=${r.key.remaining()}, value=${r.value.remaining()}, need=$need")
+                    pool.borrow(need) { tmp ->
+                        val written = AkkRecordWriter.write(r, tmp)
+                        println("    actually written = $written, buffer cap=${tmp.capacity()}, rem=${tmp.remaining()}")
+                        tmp.flip()
+                        val recView = tmp.slice()
+                        packer.addRecord(recView)
+                    }
                 }
                 packer.flush()
             })

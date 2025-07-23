@@ -150,6 +150,12 @@ object FastByteBufferComparator : Comparator<ByteBuffer> {
         if (mismatch == -1)
             return a.remaining().compareTo(b.remaining())
 
+        val aLen = a.remaining()
+        val bLen = b.remaining()
+
+        if (mismatch >= aLen || mismatch >= bLen)
+            return aLen.compareTo(bLen)
+
         val aa = a.get(a.position() + mismatch).toInt() and 0xFF
         val bb = b.get(b.position() + mismatch).toInt() and 0xFF
         return aa.compareTo(bb)

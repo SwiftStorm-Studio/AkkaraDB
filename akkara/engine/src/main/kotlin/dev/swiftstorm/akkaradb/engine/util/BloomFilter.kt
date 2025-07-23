@@ -34,6 +34,7 @@ class BloomFilter private constructor(
         }
     }
 
+    // TODO: java.lang.ArithmeticException
     fun mightContain(key: ByteBuffer): Boolean {
         val (h1, h2) = hash(key)
         for (i in 0 until hashCount) {

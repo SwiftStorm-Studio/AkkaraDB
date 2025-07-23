@@ -64,7 +64,6 @@ object VarIntCodec {
                 val b = buf.get().toInt() and 0xFF
                 result = result or ((b and 0x7F) shl shift)
 
-                // 最終バイト (continuation=0)
                 if (b and 0x80 == 0) return result
 
                 shift += 7

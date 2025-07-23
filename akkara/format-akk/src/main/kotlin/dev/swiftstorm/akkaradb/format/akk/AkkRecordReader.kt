@@ -19,6 +19,7 @@ object AkkRecordReader : RecordReader {
 
         /* ----------- key slice ----------- */
         val keySlice = buf.slice().apply {
+            require(kLen <= capacity()) { "kLen=$kLen > slice.capacity=${capacity()} (データ破損?)" }
             limit(kLen)               // slice: position=0, limit=kLen
         }.asReadOnlyBuffer()
         buf.position(buf.position() + kLen)   // advance parent buffer

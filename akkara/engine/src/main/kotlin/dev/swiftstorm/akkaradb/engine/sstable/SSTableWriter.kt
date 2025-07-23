@@ -40,16 +40,21 @@ class SSTableWriter(
         for (rec in records) {
             val encoded = encode(rec)
             if (blockBuf.remaining() < encoded.remaining()) {
+                blockBuf.flip()
                 flushBlock(firstKeyInBlock!!)
+                blockBuf.clear()
                 firstKeyInBlock = null
             }
             if (firstKeyInBlock == null) firstKeyInBlock = rec.key
 
-            blockBuf.put(encoded)
+            blockBuf.put(encoded.duplicate())
             bloom.add(rec.key)
             pool.release(encoded)
         }
-        if (blockBuf.position() > 0) flushBlock(firstKeyInBlock!!)
+        if (blockBuf.position() > 0) {
+            blockBuf.flip()
+            flushBlock(firstKeyInBlock!!)
+        }
 
         /* ---- append index + bloom + footer ---- */
         val indexOff = ch.position()
@@ -63,19 +68,22 @@ class SSTableWriter(
     /* ───────── internal ───────── */
 
     private fun flushBlock(firstKey: ByteBuffer) {
-        blockBuf.flip()
-
-        // build mini-index (delta varint) + payload concat
         val miniIdx = buildMiniIndex(blockBuf.duplicate())
-        val payload = pool.get(miniIdx.remaining() + blockBuf.remaining())
+
+        val idxSize = miniIdx.remaining()
+
+        val payloadSize = idxSize + blockBuf.remaining()
+        val payload = pool.get(payloadSize)
+
         payload.put(miniIdx).put(blockBuf).flip()
 
         val offset = ch.position()
 
-        // scatter-gather: [len][payload][crc]
-        val lenBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(payload.remaining()).flip() as ByteBuffer
+        val lenBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt(payload.remaining()).flip() as ByteBuffer
         crc32.reset(); crc32.update(payload.duplicate())
-        val crcBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(crc32.value.toInt()).flip() as ByteBuffer
+        val crcBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+            .putInt(crc32.value.toInt()).flip() as ByteBuffer
         ch.write(arrayOf(lenBuf, payload, crcBuf))
 
         index.add(firstKey.asReadOnlyBuffer(), offset)
@@ -86,22 +94,32 @@ class SSTableWriter(
 
     private fun buildMiniIndex(data: ByteBuffer): ByteBuffer {
         val offsets = ArrayList<Int>(128)
-        var prev = 0
+        println("Remaining in block: ${data.remaining()} bytes")
         while (data.hasRemaining()) {
-            offsets += prev
-            AkkRecordReader.read(data)
-            prev = data.position()
+            val startPos = data.position()
+            try {
+                offsets += startPos
+                AkkRecordReader.read(data)
+            } catch (e: Exception) {
+                println("MiniIndex read error: ${e.message} at $startPos, remaining=${data.remaining()}")
+                break
+            }
+            if (data.position() <= startPos) {
+                println("MiniIndex: position didn't advance at $startPos, break")
+                break
+            }
         }
-        val capacity = VarIntCodec.encodedSize(offsets.size) +
-                offsets.sumOf { VarIntCodec.encodedSize(it) }
-        val buf = ByteBuffer.allocate(capacity)
+
+
+        val buf = ByteBuffer.allocate(5 * (offsets.size + 1))
+
         VarIntCodec.writeInt(buf, offsets.size)
         var last = 0
         for (abs in offsets) {
             VarIntCodec.writeInt(buf, abs - last)
             last = abs
         }
-        return buf.flip().asReadOnlyBuffer()
+        return buf.flip()
     }
 
     private fun writeFooter(indexOff: Long, bloomOff: Long) =
@@ -115,7 +133,7 @@ class SSTableWriter(
 
     private fun encode(rec: Record): ByteBuffer =
         pool.borrow(AkkRecordWriter.computeMaxSize(rec)) { buf ->
-            AkkRecordWriter.write(rec, buf); buf.flip(); buf.asReadOnlyBuffer()
+            AkkRecordWriter.write(rec, buf); buf.flip(); buf.slice()
         }
 
     /* ───────── lifecycle ───────── */

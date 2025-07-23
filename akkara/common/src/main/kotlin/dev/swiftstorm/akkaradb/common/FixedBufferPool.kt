@@ -33,28 +33,36 @@ class FixedBufferPool(
      */
     override fun get(size: Int): ByteBuffer {
         val rounded = roundPow2(maxOf(size, bucketBase))
-
-        val bucketEntry = buckets.ceilingEntry(rounded)
-        if (bucketEntry != null && bucketEntry.key <= rounded * 4) {
-            val deque = bucketEntry.value
+        val entry = buckets.ceilingEntry(rounded)
+        if (entry != null && entry.key >= rounded) {
+            val deque = entry.value
             synchronized(deque) {
                 val buf = deque.removeFirstOrNull()
-                if (buf != null) {
-                    retained.decrementAndGet()   // safe: paired with release() increment
+                if (buf != null && buf.capacity() >= rounded) {
+                    retained.decrementAndGet()
                     hits.increment()
                     return buf.clear()
                 }
             }
         }
-
-        // cache miss → fresh direct buffer (retained remains unchanged)
         misses.increment()
         created.increment()
         return ByteBuffer.allocateDirect(rounded)
     }
 
+    /**
+     * Release a buffer back to the pool.
+     * If the buffer is read-only, a new direct buffer is allocated to avoid
+     * modifying the original.
+     * If the pool is at capacity, the buffer is dropped.
+     */
     override fun release(buf: ByteBuffer) {
-        buf.clear()
+        val toPool = if (buf.isReadOnly) {
+            ByteBuffer.allocateDirect(buf.capacity())
+        } else {
+            buf
+        }
+        toPool.clear()
 
         // Reserve a slot; roll back if over capacity
         if (retained.incrementAndGet() > capacity) {
@@ -63,9 +71,9 @@ class FixedBufferPool(
             return
         }
 
-        val rounded = roundPow2(maxOf(buf.capacity(), bucketBase))
+        val rounded = roundPow2(maxOf(toPool.capacity(), bucketBase))
         val deque = buckets.computeIfAbsent(rounded) { ArrayDeque() }
-        synchronized(deque) { deque.addLast(buf) }
+        synchronized(deque) { deque.addLast(toPool) }
     }
 
     override fun stats(): BufferPool.Stats = BufferPool.Stats(
