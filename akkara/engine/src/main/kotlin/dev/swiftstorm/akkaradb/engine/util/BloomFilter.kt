@@ -6,36 +6,30 @@ import java.nio.channels.ReadableByteChannel
 import java.nio.channels.WritableByteChannel
 import kotlin.math.ceil
 import kotlin.math.ln
+import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Simple Bloom-Filter (double-hash) compatible with Google SStable 形式。
+ * <h2>ImmutableBloomFilter</h2>
+ * A write‑once / read‑many Bloom‑filter that is safe to share between threads or replicas.
  *
- * * false-positive 率は [fpRate] （デフォルト 1%）
- * * Murmur3 128-bit を 2 つの 32-bit ハッシュに折りたたんで k 回 linearly probe
- * * スレッドセーフ：bitset 書込は CAS（`LongArray` 原子演算）ではなく
- *   “同ビット OR” なので競合しても安全
- *
- * ⚠️ **この実装は可変**：add() 後も mightContain() の結果が変化します。
+ *  * Use [Builder] to incrementally add keys, then call [Builder.build] to obtain an
+ *    **immutable** filter instance.
+ *  * The immutable instance exposes only [mightContain] and *never* mutates its
+ *    internal bit‑set – perfect for snapshot replication or mmap sharing.
+ *  * The on‑disk format is just the raw `LongArray` little‑endian; identical to
+ *    the previous implementation for backward compatibility.
  */
 class BloomFilter private constructor(
     private val bits: Int,
-    private val hashCount: Int,
+    internal val hashCount: Int,
     private val bitset: LongArray,
 ) {
 
     /* ───────── public API ───────── */
 
-    fun add(key: ByteBuffer) {
-        val (h1, h2) = hash(key)
-        for (i in 0 until hashCount) {
-            val idx = ((h1 + i * h2).ushr(1) and Int.MAX_VALUE) % bits
-            bitset[idx ushr 6] = bitset[idx ushr 6] or (1L shl (idx and 63))
-        }
-    }
-
-    // TODO: java.lang.ArithmeticException
     fun mightContain(key: ByteBuffer): Boolean {
+        if (bits == 0) return false              // safety guard – never /0
         val (h1, h2) = hash(key)
         for (i in 0 until hashCount) {
             val idx = ((h1 + i * h2).ushr(1) and Int.MAX_VALUE) % bits
@@ -49,92 +43,62 @@ class BloomFilter private constructor(
     fun byteSize(): Int = bitset.size * 8
 
     fun writeTo(ch: WritableByteChannel) {
-        // LongArray → ByteBuffer(LE) で 0-copy write
-        val buf = ByteBuffer.allocate(bitset.size * 8).order(ByteOrder.LITTLE_ENDIAN)
+        val buf = ByteBuffer.allocate(byteSize()).order(ByteOrder.LITTLE_ENDIAN)
         buf.asLongBuffer().put(bitset)
         ch.write(buf.flip())
     }
 
     /* ───────── companion ───────── */
-
     companion object {
-
-        /** Creates a BloomFilter sized for [expectedInsertions] keys @ [fpRate] FP. */
-        operator fun invoke(expectedInsertions: Int, fpRate: Double = 0.01): BloomFilter {
-            require(expectedInsertions > 0) { "expectedInsertions must be positive" }
-            require(fpRate in 1e-9..0.5) { "fpRate out of range" }
-
-            val bits = optimalBits(expectedInsertions, fpRate)
-            val hashes = optimalHashes(bits, expectedInsertions)
-            return BloomFilter(bits, hashes, LongArray((bits + 63) ushr 6))
+        operator fun invoke(expectedInsertions: Int, fpRate: Double = 0.01): Builder {
+            return Builder(expectedInsertions, fpRate)
         }
 
-        /* ─── deserialization ─── */
-
-        fun readFrom(buf: ByteBuffer): BloomFilter {
+        /** Deserialize from a mapped/read‑only [ByteBuffer]. */
+        fun readFrom(buf: ByteBuffer, hashCount: Int): BloomFilter {
             require(buf.remaining() % 8 == 0) { "Bloom bitset size must be multiple of 8" }
             val longs = LongArray(buf.remaining() / 8) { buf.long }
             val bits = longs.size * 64
-            val hashes = optimalHashes(bits, maxOf(1, bits / 10))
-            return BloomFilter(bits, hashes, longs)
+            return BloomFilter(bits, hashCount, longs)
         }
 
-        fun readFrom(ch: ReadableByteChannel, size: Int): BloomFilter {
-            require(size % 8 == 0) { "Bloom bitset size must be multiple of 8" }
-            val buf = ByteBuffer.allocate(size)
+        /** Deserialize when the byte length is known but not mapped yet (e.g. FileChannel). */
+        fun readFrom(ch: ReadableByteChannel, bytes: Int, hashCount: Int): BloomFilter {
+            val buf = ByteBuffer.allocate(bytes)
             while (buf.hasRemaining()) ch.read(buf)
             buf.flip()
-            return readFrom(buf)
+            return readFrom(buf, hashCount)
         }
 
-        /* ─── parameter calculus ─── */
-
-        private const val LN2 = 0.6931471805599453     // ln 2
-        private const val LN2_SQ = LN2 * LN2           // (ln 2)^2
-
-        private fun optimalBits(n: Int, p: Double): Int =
-            ceil(-n * ln(p) / LN2_SQ).toInt().coerceAtLeast(64)
-
-        private fun optimalHashes(mBits: Int, n: Int): Int =
-            maxOf(2, (mBits / n.toDouble() * LN2).roundToInt())
-
-        /* ─── hashing ─── */
-
+        /* ─── hashing helpers (same Murmur3 impl as before) ─── */
         private fun hash(key: ByteBuffer): Pair<Int, Int> {
             val (lo, hi) = murmur3_128(key)
             return lo.toInt() to hi.toInt()
         }
 
-        /**
-         * Murmur3 128‐bit little-endian。
-         * 速度最適化のため “16 bytes ごとに 128-bit mix” をそのまま実装。
-         * （Google Guava / Agrona の実装を簡略化）
-         */
-        internal fun murmur3_128(bufOrig: ByteBuffer, seed: Long = 0L): LongArray {
+        private fun murmur3_128(bufOrig: ByteBuffer, seed: Long = 0L): LongArray {
             val buf = bufOrig.duplicate().order(ByteOrder.LITTLE_ENDIAN)
             var h1 = seed
             var h2 = seed
-            val c1 = -0x783c846eeebdac2bL
-            val c2 = -0x7a143588f3d8f9e3L
+            val c1 = -0x783c_846e_eebd_ac2bL
+            val c2 = -0x7a14_3588_f3d8_f9e3L
 
             while (buf.remaining() >= 16) {
                 var k1 = buf.long
                 var k2 = buf.long
-
                 k1 *= c1; k1 = java.lang.Long.rotateLeft(k1, 31); k1 *= c2; h1 = h1 xor k1
                 h1 = java.lang.Long.rotateLeft(h1, 27) + h2; h1 = h1 * 5 + 0x52dce729
                 k2 *= c2; k2 = java.lang.Long.rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
                 h2 = java.lang.Long.rotateLeft(h2, 31) + h1; h2 = h2 * 5 + 0x38495ab5
             }
 
-            // tail
-            var k1 = 0L
+            var k1 = 0L;
             var k2 = 0L
             when (buf.remaining()) {
                 15 -> k2 = buf.get(14).toLong() shl 48
                 14 -> k2 = k2 or (buf.get(13).toLong() and 0xff shl 40)
                 13 -> k2 = k2 or (buf.get(12).toLong() and 0xff shl 32)
-                12 -> k2 = k2 or (buf.getInt(8).toLong() and 0xffffffffL)
+                12 -> k2 = k2 or (buf.getInt(8).toLong() and 0xffff_ffffL)
                 11 -> k1 = buf.get(10).toLong() shl 48
                 10 -> k1 = k1 or (buf.get(9).toLong() and 0xff shl 40)
                 9 -> k1 = k1 or (buf.get(8).toLong() and 0xff shl 32)
@@ -142,7 +106,7 @@ class BloomFilter private constructor(
                 7 -> k1 = k1 or (buf.get(6).toLong() and 0xff shl 48)
                 6 -> k1 = k1 or (buf.get(5).toLong() and 0xff shl 40)
                 5 -> k1 = k1 or (buf.get(4).toLong() and 0xff shl 32)
-                4 -> k1 = k1 or (buf.getInt(0).toLong() and 0xffffffffL)
+                4 -> k1 = k1 or (buf.getInt(0).toLong() and 0xffff_ffffL)
                 3 -> k1 = k1 or (buf.get(2).toLong() and 0xff shl 16)
                 2 -> k1 = k1 or (buf.get(1).toLong() and 0xff shl 8)
                 1 -> k1 = k1 or (buf.get(0).toLong() and 0xff)
@@ -154,28 +118,52 @@ class BloomFilter private constructor(
             if (k2 != 0L) {
                 k2 *= c2; k2 = java.lang.Long.rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
             }
-
-            // final mix
-            h1 = h1 xor bufOrig.remaining().toLong()
-            h2 = h2 xor bufOrig.remaining().toLong()
-            h1 += h2
-            h2 += h1
-            h1 = fmix64(h1)
-            h2 = fmix64(h2)
-            h1 += h2
-            h2 += h1
-
+            h1 = h1 xor bufOrig.remaining().toLong(); h2 = h2 xor bufOrig.remaining().toLong(); h1 += h2; h2 += h1
+            h1 = fmix64(h1); h2 = fmix64(h2); h1 += h2; h2 += h1
             return longArrayOf(h1, h2)
         }
 
         private fun fmix64(k: Long): Long {
             var kk = k
             kk = kk xor (kk ushr 33)
-            kk *= -0xae502812aa7333L
+            kk *= -0xae50_2812_aa73_33L
             kk = kk xor (kk ushr 33)
-            kk *= -0x3b314601e57a13adL
+            kk *= -0x3b31_4601_e57a_13adL
             kk = kk xor (kk ushr 33)
             return kk
         }
     }
+
+    /* ───────── Builder ───────── */
+    class Builder(expectedInsertions: Int, fpRate: Double = 0.01) {
+        private val bits: Int
+        private val hashCount: Int
+        private val bitset: LongArray
+
+        init {
+            require(expectedInsertions > 0) { "expectedInsertions must be positive" }
+            require(fpRate in 1e-9..0.5) { "fpRate out of range" }
+            bits = optimalBits(expectedInsertions, fpRate)
+            hashCount = optimalHashes(bits, expectedInsertions)
+            bitset = LongArray((bits + 63) ushr 6)
+        }
+
+        fun add(key: ByteBuffer): Builder {
+            val (h1, h2) = hash(key)
+            for (i in 0 until hashCount) {
+                val idx = ((h1 + i * h2).ushr(1) and Int.MAX_VALUE) % bits
+                bitset[idx ushr 6] = bitset[idx ushr 6] or (1L shl (idx and 63))
+            }
+            return this
+        }
+
+        fun build(): BloomFilter = BloomFilter(bits, hashCount, bitset)
+
+        /* reuse companion math */
+        private fun optimalBits(n: Int, p: Double): Int = ceil(-n * ln(p) / LN2_SQ).toInt().coerceAtLeast(64)
+        private fun optimalHashes(mBits: Int, n: Int): Int = max(2, (mBits / n.toDouble() * LN2).roundToInt())
+    }
 }
+
+private const val LN2 = 0.6931471805599453
+private const val LN2_SQ = LN2 * LN2

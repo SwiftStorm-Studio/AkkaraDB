@@ -34,13 +34,15 @@ class SSTableWriter(
 
     fun write(records: List<Record>) {
         require(records.isNotEmpty()) { "records must not be empty" }
-        bloom = BloomFilter(records.size)
+        val bloomBuilder = BloomFilter.Builder(records.size)
 
         var firstKeyInBlock: ByteBuffer? = null
         for (rec in records) {
             val encoded = encode(rec)
+            println("encode: rec=${rec}, encoded.position=${encoded.position()}, encoded.limit=${encoded.limit()}, size=${encoded.remaining()}")
             if (blockBuf.remaining() < encoded.remaining()) {
                 blockBuf.flip()
+                println("flushBlock: blockBuf position=${blockBuf.position()}, limit=${blockBuf.limit()}, capacity=${blockBuf.capacity()}")
                 flushBlock(firstKeyInBlock!!)
                 blockBuf.clear()
                 firstKeyInBlock = null
@@ -48,11 +50,15 @@ class SSTableWriter(
             if (firstKeyInBlock == null) firstKeyInBlock = rec.key
 
             blockBuf.put(encoded.duplicate())
-            bloom.add(rec.key)
+            bloomBuilder.add(rec.key)
             pool.release(encoded)
         }
+
+        val bloom = bloomBuilder.build()
+
         if (blockBuf.position() > 0) {
             blockBuf.flip()
+            println("flushBlock: blockBuf position=${blockBuf.position()}, limit=${blockBuf.limit()}, capacity=${blockBuf.capacity()}")
             flushBlock(firstKeyInBlock!!)
         }
 
@@ -60,7 +66,11 @@ class SSTableWriter(
         val indexOff = ch.position()
         index.writeTo(ch)
         val bloomOff = ch.position()
+
         bloom.writeTo(ch)
+        val hashCountBuf = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN).putInt(bloom.hashCount).flip() as ByteBuffer
+        ch.write(hashCountBuf)
+
         writeFooter(indexOff, bloomOff)
         ch.force(true)
     }
@@ -94,9 +104,9 @@ class SSTableWriter(
 
     private fun buildMiniIndex(data: ByteBuffer): ByteBuffer {
         val offsets = ArrayList<Int>(128)
-        println("Remaining in block: ${data.remaining()} bytes")
         while (data.hasRemaining()) {
             val startPos = data.position()
+            println("MiniIndex: startPos=$startPos, data.position=${data.position()}, data.limit=${data.limit()}")
             try {
                 offsets += startPos
                 AkkRecordReader.read(data)

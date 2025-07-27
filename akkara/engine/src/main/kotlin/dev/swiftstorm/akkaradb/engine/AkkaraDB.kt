@@ -18,7 +18,6 @@ import java.nio.ByteBuffer
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.locks.ReentrantReadWriteLock
-import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 /**
@@ -70,39 +69,40 @@ class AkkaraDB private constructor(
     /* ───────── public API ───────── */
 
     /**
-     * Single‑key lookup with three‑tier resolution:
-     * <ol>
-     *     <li>MemTable (lock‑free)</li>
-     *     <li>Level‑0 SSTables (bloom → index → block scan)</li>
-     *     <li>Latest stripes (append‑only segment) – heavy fallback</li>
-     * </ol>
+     * Returns the value for the given key, or `null` if not found.
      *
-     * The global [lock] is <strong>only</strong> held for the fast in‑memory
-     * tiers. Stripe scanning as well as cache population is executed <em>outside</em>
-     * of the critical section, greatly reducing read/write contention.
+     * <h3>Read‑path</h3>
+     * 1. MemTable / SST hit (in L0 or L1+)
+     * 2. Stripe cache hit
+     * 3. Stripe scan fallback (expensive, but only if not in cache)
      */
     fun get(key: ByteBuffer): ByteBuffer? {
-        // 1) MemTable / SST hit
-        lock.read {
-            memTable.get(key)?.value ?: run {
-                for (deque in levels) {
-                    deque.firstNotNullOfOrNull { sst ->
-                        if (!sst.mightContain(key)) null else sst.get(key)?.value
-                    }?.let { return it }
+        // 1. MemTable
+        memTable.get(key)?.value?.let { v ->
+            return if (v.remaining() == 0) null
+            else v
+        }
+        for (deque in levels) {
+            deque.firstNotNullOfOrNull { sst ->
+                if (!sst.mightContain(key)) null
+                else sst.get(key)?.value?.let { sv ->
+                    if (sv.remaining() == 0) return null
+                    else sv
                 }
-                null
-            }
-        }?.let { return it }
-
-        // 2) Stripe cache
-        stripeCache.find(key)?.let { return it }
-
-        // 3) Stripe scan fallback
+            }?.let { return it }
+        }
+        // 3. Stripe cache
+        stripeCache.find(key)?.let { v ->
+            return if (v.remaining() == 0) null
+            else v
+        }
+        // 4. Stripe scan fallback
         AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
             val hit = reader.searchLatestStripe(key, manifest.stripesWritten - 1)
             if (hit != null) {
                 stripeCache.put(hit.stripeId, hit.blocks)
-                return hit.record.value
+                return if (hit.record.value.remaining() == 0) null
+                else hit.record.value
             }
         }
         return null
@@ -120,8 +120,6 @@ class AkkaraDB private constructor(
 
     fun flush() = lock.write {
         memTable.flush()
-        packer.flush()
-        stripeWriter.flush()
         manifest.advance(stripeWriter.stripesWritten)
         wal.sealSegment()
         wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
@@ -151,26 +149,34 @@ class AkkaraDB private constructor(
                 add(ConcurrentLinkedDeque()) // L0
             }
 
-            val mem = MemTable(flushThresholdBytes, { records ->
-                if (records.isNotEmpty()) {
-                    val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
-                    SSTableWriter(sstPath, pool).use { it.write(records.sortedBy { it.key }) }
-                    levels[0].addFirst(SSTableReader(sstPath, pool))
-                }
-                // fan‑out to stripe
-                for (r in records) {
-                    val need = AkkRecordWriter.computeMaxSize(r)
-                    println("---- key=${r.key.remaining()}, value=${r.value.remaining()}, need=$need")
-                    pool.borrow(need) { tmp ->
-                        val written = AkkRecordWriter.write(r, tmp)
-                        println("    actually written = $written, buffer cap=${tmp.capacity()}, rem=${tmp.remaining()}")
-                        tmp.flip()
-                        val recView = tmp.slice()
-                        packer.addRecord(recView)
+            val mem = MemTable(
+                flushThresholdBytes,
+
+                onFlush = { records ->
+                    if (records.isNotEmpty()) {
+                        val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
+                        SSTableWriter(sstPath, pool).use { it.write(records.sortedBy { it.key }) }
+                        levels[0].addFirst(SSTableReader(sstPath, pool))
                     }
-                }
-                packer.flush()
-            })
+                    val kStripe = k
+                    var i = 0
+                    while (i + kStripe <= records.size) {
+                        val batch = records.subList(i, i + kStripe)
+                        for (r in batch) {
+                            val need = AkkRecordWriter.computeMaxSize(r)
+                            pool.borrow(need) { tmp ->
+                                AkkRecordWriter.write(r, tmp)
+                                tmp.flip()
+                                val recView = tmp.slice()
+                                packer.addRecord(recView)
+                            }
+                        }
+                        packer.flush()
+                        i += kStripe
+                    }
+                }, onEvict = { records ->
+
+                })
 
             /* ---- startup recovery ---- */
             manifest.load(); stripe.seek(manifest.stripesWritten)

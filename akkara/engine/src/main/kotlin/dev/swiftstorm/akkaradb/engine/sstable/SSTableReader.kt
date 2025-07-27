@@ -57,8 +57,13 @@ class SSTableReader(
         indexOff = idxTmp; bloomOff = bloomTmp
 
         /* 2) ----- bloom ----- */
-        val bloomSize = (fileSize - 20 - bloomOff).toInt()
-        bloom = BloomFilter.readFrom(ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong()))
+        val bloomSize = (fileSize - 20 - bloomOff - 4).toInt()
+        val bloomBuf = ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong())
+        val hashCountBuf = ch.map(FileChannel.MapMode.READ_ONLY, bloomOff + bloomSize, 4)
+        hashCountBuf.order(ByteOrder.BIG_ENDIAN)
+        val hashCount = hashCountBuf.int
+
+        bloom = BloomFilter.readFrom(bloomBuf, hashCount)
 
         /* 3) ----- outer index ----- */
         val indexSize = (bloomOff - indexOff).toInt()

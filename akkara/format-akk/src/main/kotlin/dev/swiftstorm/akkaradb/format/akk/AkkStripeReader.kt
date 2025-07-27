@@ -112,13 +112,10 @@ class AkkStripeReader(
 
             val recs = ArrayList<Record>()
             for (p in payloads) {
-                val dup = p.duplicate()
-                while (dup.hasRemaining()) {
-                    val r = rr.read(dup)
-                    recs.add(r)
-                    if (r.key.compareTo(key) == 0) {
-                        return StripeHit(r, stripeId, recs)
-                    }
+                val r = rr.read(p.duplicate())
+                recs.add(r)
+                if (r.key.compareTo(key) == 0) {
+                    return StripeHit(r, stripeId, recs)
                 }
             }
             // NOTE: caller did not find the key in this stripe → it will be GC‑collected;

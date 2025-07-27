@@ -25,7 +25,8 @@ class AkkBlockPackerDirect(
         require(record.remaining() <= MAX_RECORD) {
             "Record ${record.remaining()} B exceeds $MAX_RECORD B"
         }
-        if (scratch.position() + record.remaining() > PAYLOAD_LIMIT) emitBlock()
+        if (scratch.position() + 4 + record.remaining() > PAYLOAD_LIMIT) emitBlock()
+        scratch.putInt(record.remaining())
         scratch.put(record.duplicate())
     }
 

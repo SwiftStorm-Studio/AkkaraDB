@@ -29,11 +29,6 @@ object AkkRecordWriter : RecordWriter {
         VarIntCodec.writeInt(dest, valBuf.remaining())
         VarIntCodec.writeLong(dest, VarIntCodec.zigZagEncodeLong(record.seqNo))
 
-        println(
-            "[WRITE] keyLen=${record.key.remaining()} valueLen=${record.value.remaining()} total=${dest.remaining()} B " +
-                    "seqNo=${record.seqNo} key=${keyBuf.remaining()} B value=${valBuf.remaining()} B"
-        )
-
         // Payload
         dest.put(keyBuf)
         dest.put(valBuf)
