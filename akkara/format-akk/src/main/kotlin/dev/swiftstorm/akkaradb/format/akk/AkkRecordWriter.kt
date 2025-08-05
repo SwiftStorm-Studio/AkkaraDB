@@ -18,6 +18,13 @@ import java.nio.ByteBuffer
  */
 object AkkRecordWriter : RecordWriter {
 
+    /**
+     * Writes a [Record] to the given [dest] ByteBuffer in the AkkaraDB format.
+     *
+     * @param record The record to write.
+     * @param dest The destination ByteBuffer to write to.
+     * @return The number of bytes written.
+     */
     override fun write(record: Record, dest: ByteBuffer): Int {
         val startPos = dest.position()
 

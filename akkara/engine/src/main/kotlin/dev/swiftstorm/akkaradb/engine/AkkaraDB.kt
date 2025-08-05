@@ -77,32 +77,52 @@ class AkkaraDB private constructor(
      * 3. Stripe scan fallback (expensive, but only if not in cache)
      */
     fun get(key: ByteBuffer): ByteBuffer? {
-        // 1. MemTable
+        // 1. MemTable hit
         memTable.get(key)?.value?.let { v ->
             return if (v.remaining() == 0) null
             else v
         }
+
+        // 2. SSTables in levels
         for (deque in levels) {
             deque.firstNotNullOfOrNull { sst ->
                 if (!sst.mightContain(key)) null
                 else sst.get(key)?.value?.let { sv ->
-                    if (sv.remaining() == 0) return null
-                    else sv
+                    if (sv.remaining() != 0) {
+                        memTable.put(Record(key.duplicate().rewind(), sv.duplicate().rewind(), memTable.nextSeq()))
+                        return sv
+                    } else {
+                        memTable.put(Record(key.duplicate().rewind(), sv.duplicate().rewind(), memTable.nextSeq()))
+                        return null
+                    }
                 }
             }?.let { return it }
         }
+
         // 3. Stripe cache
         stripeCache.find(key)?.let { v ->
-            return if (v.remaining() == 0) null
-            else v
+            if (v.remaining() != 0) {
+                memTable.put(Record(key.duplicate().rewind(), v.duplicate().rewind(), memTable.nextSeq()))
+                return v
+            } else {
+                memTable.put(Record(key.duplicate().rewind(), v.duplicate().rewind(), memTable.nextSeq()))
+                return null
+            }
         }
+
         // 4. Stripe scan fallback
         AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
             val hit = reader.searchLatestStripe(key, manifest.stripesWritten - 1)
             if (hit != null) {
                 stripeCache.put(hit.stripeId, hit.blocks)
-                return if (hit.record.value.remaining() == 0) null
-                else hit.record.value
+                val v = hit.record.value
+                if (v.remaining() != 0) {
+                    memTable.put(Record(key.duplicate().rewind(), v.duplicate().rewind(), memTable.nextSeq()))
+                    return v
+                } else {
+                    memTable.put(Record(key.duplicate().rewind(), v.duplicate().rewind(), memTable.nextSeq()))
+                    return null
+                }
             }
         }
         return null
@@ -111,11 +131,11 @@ class AkkaraDB private constructor(
     /* ───────── write‑path ───────── */
     fun put(rec: Record) = lock.write {
         pool.borrow(recordWriter.computeMaxSize(rec)) { buf ->
-            recordWriter.write(rec, buf); buf.flip()
+            recordWriter.write(rec, buf)
+            buf.flip()
             wal.append(buf.duplicate())
-            memTable.put(rec)
-            packer.addRecord(buf)
         }
+        memTable.put(rec)
     }
 
     fun flush() = lock.write {

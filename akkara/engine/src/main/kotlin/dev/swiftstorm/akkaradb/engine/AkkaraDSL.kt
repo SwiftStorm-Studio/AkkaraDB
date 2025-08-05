@@ -2,12 +2,17 @@
 
 package dev.swiftstorm.akkaradb.engine
 
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.borrow
 import kotlinx.serialization.BinaryFormat
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.cbor.Cbor
 import kotlinx.serialization.serializer
+import net.ririfa.binpack.AdapterResolver
+import net.ririfa.binpack.BinPack
+import net.ririfa.binpack.BinPackBufferPool
 import org.objenesis.ObjenesisStd
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
@@ -54,8 +59,9 @@ class PackedTable<T : Any>(
 
     /* ───────── namespace & seq ───────── */
 
-    private val nsBytes: ByteArray =
-        "${kClass.qualifiedName ?: kClass.simpleName!!}:".toByteArray(StandardCharsets.UTF_8)
+    private val nsBuf: ByteBuffer by lazy {
+        StandardCharsets.UTF_8.encode("${kClass.qualifiedName ?: kClass.simpleName!!}:").asReadOnlyBuffer()
+    }
 
     private val seq = AtomicLong(seqSeed ?: db.bestEffortLastSeq())
 
@@ -70,29 +76,49 @@ class PackedTable<T : Any>(
      * Allocates a *heap* ByteBuffer for the logical key and returns it as read‑only.
      */
     private fun keyBuf(id: String): ByteBuffer {
-        val idBytes = id.toByteArray(StandardCharsets.UTF_8)
-        val buf = ByteBuffer.allocate(nsBytes.size + idBytes.size)
-        buf.put(nsBytes).put(idBytes).flip()
-        return buf.asReadOnlyBuffer()
+        if (!id.isASCII()) {
+            throw IllegalArgumentException("ID must be ASCII: $id")
+        }
+
+        val rNsBuf = nsBuf.duplicate().rewind()
+
+        val charset = StandardCharsets.UTF_8
+        val idBuf = charset.encode(id)
+        val totalLen = rNsBuf.remaining() + idBuf.remaining()
+
+        Pools.io().borrow(totalLen) { buf ->
+            buf.put(rNsBuf).put(idBuf)
+            buf.flip()
+            return buf.asReadOnlyBuffer()
+        }
     }
 
     /* ───────── CRUD ───────── */
 
     /**
      * Inserts or overwrites the entity under [id].
-     * INSERT ... ON CONFLICT DO UPDATE SET ...
-     **/
+     * INSERT ... ON CONFLICT DO UPDATE SET .**/
     fun put(id: String, entity: T) {
-        val bytes = format.encodeToByteArray(serializer, entity)
-        require(bytes.isNotEmpty()) { "Entity encodes to 0 bytes; would collide with tombstone" }
-        db.put(Record(keyBuf(id), ByteBuffer.wrap(bytes), seq.incrementAndGet()))
+        if (!id.isASCII()) {
+            throw IllegalArgumentException("ID must be ASCII: $id")
+        }
+
+        val encoded = BinPack.encode(kClass, entity)
+        val key = keyBuf(id)
+        val seqNum = seq.incrementAndGet()
+
+        try {
+            db.put(Record(key, encoded, seqNum))
+        } finally {
+            BinPackBufferPool.recycle(encoded) // return the buffer to the pool
+        }
     }
 
     /** Retrieves the entity stored under [id], or `null` if absent or tombstoned. */
     fun get(id: String): T? = db.get(keyBuf(id))?.let { buf ->
-        if (buf.remaining() == 0) return null          // tombstone
-        val arr = ByteArray(buf.remaining()).also { buf.get(it) }
-        format.decodeFromByteArray(serializer, arr)
+        if (buf.remaining() == 0) return null
+
+        BinPack.decode(kClass, buf)
     }
 
     /** Writes a tombstone for [id] (logical delete). */
@@ -149,11 +175,29 @@ class PackedTable<T : Any>(
 
     /* ───────── internals ───────── */
 
-    private fun T.deepCopy(): T =
-        format.decodeFromByteArray(serializer, format.encodeToByteArray(serializer, this))
+    private fun T.deepCopy(): T {
+        val adapter = AdapterResolver.getAdapterForClass(kClass)
+        return adapter.copy(this)
+    }
 }
 
 /* ───────── extension ───────── */
 
 private fun AkkaraDB.bestEffortLastSeq(): Long =
     runCatching { javaClass.getMethod("lastSeq").invoke(this) as? Long ?: 0L }.getOrElse { 0L }
+
+fun String.isASCII(): Boolean = all { it.code <= 127 }
+
+fun <T : Any> BinPack.encode(kClass: KClass<T>, value: T): ByteBuffer {
+    val adapter = AdapterResolver.getAdapterForClass(kClass)
+    val size = adapter.estimateSize(value)
+    val buffer = BinPackBufferPool.borrow(size)
+    adapter.write(value, buffer)
+    buffer.flip()
+    return buffer
+}
+
+fun <T : Any> BinPack.decode(kClass: KClass<T>, buffer: ByteBuffer): T {
+    val adapter = AdapterResolver.getAdapterForClass(kClass)
+    return adapter.read(buffer)
+}

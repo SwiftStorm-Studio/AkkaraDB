@@ -87,7 +87,18 @@ class MemTable(
         }
     }
 
+    /**
+     * Returns the highest sequence number currently in the MemTable.
+     * This is useful for tracking the latest record added.
+     */
     fun lastSeq(): Long = highestSeqNo.get()
+
+    /**
+     * Returns the next sequence number to be used for a new record.
+     * This is typically used when inserting a new record to ensure
+     * it has a unique sequence number.
+     */
+    fun nextSeq(): Long = highestSeqNo.updateAndGet { it + 1 }
 
     override fun close() {
         try {
