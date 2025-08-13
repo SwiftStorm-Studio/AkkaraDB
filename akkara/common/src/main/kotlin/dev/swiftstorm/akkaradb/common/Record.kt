@@ -3,32 +3,48 @@ package dev.swiftstorm.akkaradb.common
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import kotlin.experimental.or
 
 /**
- * Immutable key–value pair inside AkkaraDB.
+ * Represents a record with a key, value, sequence number, key hash, and flags.
+ * This class is immutable and provides utility methods for working with records.
  *
- *  * Identity = (seqNo, key)
- *  * value は equals/hashCode 非対象
+ * @property key The read-only key of the record (position=0).
+ * @property value The read-only value of the record (position=0).
+ * @property seqNo The sequence number of the record.
+ * @property keyHash The pre-computed hash of the key.
+ * @property flags Packed flags for the record (e.g., bit0=tombstone).
  */
 @ConsistentCopyVisibility
 data class Record private constructor(
-    val key: ByteBuffer,   // read-only, position=0
+    val key: ByteBuffer,     // read-only, position=0
     val value: ByteBuffer,   // read-only, position=0
     val seqNo: Long,
     val keyHash: Int,        // pre-computed hash of key
+    val flags: Byte = 0,     // packed flags (bit0=tombstone)
 ) {
 
     /* ────────────── public ctors ────────────── */
 
-    constructor(rawKey: ByteBuffer, rawValue: ByteBuffer, seqNo: Long) : this(
+    constructor(rawKey: ByteBuffer, rawValue: ByteBuffer, seqNo: Long, flags: Byte = 0) : this(
         rawKey.readOnly0(),
         rawValue.readOnly0(),
         seqNo,
-        rawKey.readOnly0().contentHash()
+        rawKey.readOnly0().contentHash(),
+        flags
     )
 
-    constructor(key: String, value: String, seqNo: Long) :
-            this(StandardCharsets.UTF_8.encode(key), StandardCharsets.UTF_8.encode(value), seqNo)
+    constructor(key: String, value: String, seqNo: Long, flags: Byte = 0) :
+            this(StandardCharsets.UTF_8.encode(key), StandardCharsets.UTF_8.encode(value), seqNo, flags)
+
+    /* ────────────── flags helpers ────────────── */
+
+    val isTombstone: Boolean
+        get() = (flags.toInt() and FLAG_TOMBSTONE.toInt()) != 0
+
+    fun withFlags(newFlags: Byte): Record = copy(flags = newFlags)
+
+    fun asTombstone(): Record = copy(flags = (flags or FLAG_TOMBSTONE))
 
     /* ────────────── equality / hash ────────────── */
 
@@ -44,8 +60,15 @@ data class Record private constructor(
 
     /* ────────────── debug ────────────── */
 
-    override fun toString(): String =
-        "Record(seq=$seqNo, key=${key.previewUtf8()}, value=${value.limit()}B)"
+    override fun toString(): String {
+        val tomb = if (isTombstone) ", tombstone" else ""
+        return "Record(seq=$seqNo, key=${key.previewUtf8()}, value=${value.limit()}B$tomb)"
+    }
+
+    companion object {
+        /** bit0 = tombstone */
+        const val FLAG_TOMBSTONE: Byte = 0x01
+    }
 }
 
 /* ════════════ private helpers ════════════ */

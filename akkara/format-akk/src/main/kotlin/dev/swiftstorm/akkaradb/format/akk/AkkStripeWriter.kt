@@ -1,3 +1,5 @@
+@file:Suppress("PrivatePropertyName")
+
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
@@ -5,36 +7,35 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import io.netty.channel.unix.FileDescriptor
-import io.netty.channel.uring.IoUring
 import java.io.Closeable
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption.*
 
 class AkkStripeWriter(
     val baseDir: Path,
     val k: Int,
     val parityCoder: ParityCoder? = null,
     private val autoFlush: Boolean = true,
-    private val pool: BufferPool = Pools.io()
+    private val pool: BufferPool = Pools.io(),
+    // --- group commit controls ---
+    private val fsyncBatchN: Int = 32,
+    private val fsyncIntervalMicros: Long = 500
 ) : Closeable {
 
-    /* ───────── backend selection ───────── */
-    private val useFdWriter = IoUring.isAvailable()
-
-    /* ───────── lane writers ───────── */
-    private val dataCh = Array<FileWriter>(k) { idx -> openWriter(baseDir.resolve("data_$idx.akd")) }
-    private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> openWriter(baseDir.resolve("parity_$idx.akp")) }
-
-    private fun openWriter(path: Path): FileWriter = if (useFdWriter) FdWriter(path) else NioWriter(path)
+    /* ───────── lane writers (FdWriter only) ───────── */
+    private val dataCh = Array<FileWriter>(k) { idx -> FdWriter(baseDir.resolve("data_$idx.akd")) }
+    private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> FdWriter(baseDir.resolve("parity_$idx.akp")) }
 
     /* ───────── state ───────── */
     private var laneIdx = 0
     private var stripesWritten_ = 0L
     val stripesWritten: Long get() = stripesWritten_
+
+    private var stripesSinceLastFlush = 0
+    private var lastFlushAtNanos: Long = System.nanoTime()
 
     /* ───────── write‑path ───────── */
     fun addBlock(block: ByteBuffer) {
@@ -46,6 +47,7 @@ class AkkStripeWriter(
             laneIdx++
 
             if (laneIdx == k) {
+                // 2. parity
                 parityCoder?.let { coder ->
                     val parity = coder.encode(dataCh.map { it.lastWritten!! })
                     parity.forEachIndexed { i, buf ->
@@ -53,13 +55,22 @@ class AkkStripeWriter(
                         pool.release(buf)
                     }
                 }
+                // 3. release per‑lane cached buffers
                 dataCh.forEach { writer ->
                     writer.lastWritten?.let(pool::release)
                     writer.lastWritten = null
                 }
                 laneIdx = 0
                 stripesWritten_++
-                if (autoFlush) flush()
+
+                // 4. group commit policy: N stripes or T µs
+                stripesSinceLastFlush++
+                val now = System.nanoTime()
+                val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
+                val dueByCount = stripesSinceLastFlush >= fsyncBatchN
+                if (autoFlush && (dueByCount || dueByTime)) {
+                    flush()
+                }
             }
         } finally {
             pool.release(block)
@@ -70,6 +81,8 @@ class AkkStripeWriter(
     fun flush() {
         dataCh.forEach(FileWriter::flush)
         parityCh.forEach(FileWriter::flush)
+        stripesSinceLastFlush = 0
+        lastFlushAtNanos = System.nanoTime()
     }
 
     /** Re‑positions all writers to <code>stripe×BLOCK_SIZE</code>. */
@@ -94,27 +107,6 @@ class AkkStripeWriter(
         fun seek(pos: Long)
     }
 
-    /** Fallback writer based on classic NIO<code>FileChannel</code>. */
-    private class NioWriter(path: Path) : FileWriter {
-        private val ch = FileChannel.open(path, CREATE, WRITE, DSYNC)
-        override var lastWritten: ByteBuffer? = null
-        override fun write(buf: ByteBuffer) {
-            lastWritten = buf; ch.write(buf)
-        }
-
-        override fun flush() {
-            ch.force(true)
-        }
-
-        override fun seek(pos: Long) {
-            ch.position(pos)
-        }
-
-        override fun close() {
-            ch.close()
-        }
-    }
-
     /**
      * Direct file writer backed by Netty-native `io.netty.channel.unix.FileDescriptor`
      * for data-path writes, plus a single long-lived `RandomAccessFile`
@@ -122,7 +114,7 @@ class AkkStripeWriter(
      *
      *  * **write()** – zero-copy into the kernel page-cache via `fd.write()`.
      *  * **flush()** – one `fd.sync()` (`fsync(2)`) on the companion JDK
-     *    descriptor; no per-call open/close, so latency stays ≈ 3–4 µs.
+     *    descriptor; no per-call open/close, so latency stays low.
      */
     private class FdWriter(path: Path) : FileWriter {
 

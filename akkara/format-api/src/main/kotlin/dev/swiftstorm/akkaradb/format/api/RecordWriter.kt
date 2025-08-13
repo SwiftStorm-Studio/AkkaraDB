@@ -21,18 +21,6 @@ interface RecordWriter {
     fun write(record: Record, dest: ByteBuffer): Int
 
     /**
-     * Convenience helper that allocates a new byte array, writes the
-     * record, and returns the encoded slice.
-     */
-    fun toByteArray(record: Record): ByteArray = ByteBuffer
-        .allocate(computeMaxSize(record))
-        .also { write(record, it) }
-        .flip()
-        .let { buf ->
-            ByteArray(buf.remaining()).also { buf.get(it) }
-        }
-
-    /**
      * Calculates an upper bound on the encoded size of [record].
      * Implementations should be fast (<50 ns) and side-effect free.
      */

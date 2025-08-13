@@ -1,22 +1,30 @@
 package dev.swiftstorm.akkaradb.engine
 
-import dev.swiftstorm.akkaradb.common.codec.VarIntCodec
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.channels.ReadableByteChannel
 import java.nio.channels.WritableByteChannel
 
 /**
  * Flat index: (firstKey, data-block offset) * N
  *
- * * firstKey = raw key bytes (position = 0)
- * * offset   = absolute file offset of the data-block
+ * Binary layout (little-endian):
+ *   repeat N times {
+ *     [keyLen: u16][key bytes][offset: s64]
+ *   }
+ *
+ * Notes
+ *  - `firstKey` is stored as raw bytes (position = 0 on add())
+ *  - `offset` is the absolute file offset of the data block
  */
 class IndexBlock {
     private val keys = ArrayList<ByteBuffer>()
     private val offsets = ArrayList<Long>()
 
     fun add(firstKey: ByteBuffer, offset: Long) {
-        keys += firstKey.asReadOnlyBuffer().apply { rewind() }
+        val ro = firstKey.asReadOnlyBuffer().apply { rewind() }
+        require(ro.remaining() <= 0xFFFF) { "key too long for u16: ${ro.remaining()} bytes" }
+        keys += ro
         offsets += offset
     }
 
@@ -35,10 +43,10 @@ class IndexBlock {
     /* ───────── (de)serialization ───────── */
 
     fun writeTo(ch: WritableByteChannel) {
-        val capacity = keys.sumOf { VarIntCodec.encodedSize(it.remaining()) + it.remaining() + Long.SIZE_BYTES }
-        val buf = ByteBuffer.allocate(capacity)
+        val capacity = keys.sumOf { 2 /*u16*/ + it.remaining() + Long.SIZE_BYTES }
+        val buf = ByteBuffer.allocate(capacity).order(ByteOrder.LITTLE_ENDIAN)
         keys.zip(offsets).forEach { (k, off) ->
-            VarIntCodec.writeInt(buf, k.remaining())
+            buf.putShort(k.remaining().toShort())
             buf.put(k.duplicate())
             buf.putLong(off)
         }
@@ -52,12 +60,17 @@ class IndexBlock {
 
         fun readFrom(buf: ByteBuffer, size: Int): IndexBlock {
             val ib = IndexBlock()
+            buf.order(ByteOrder.LITTLE_ENDIAN)
             val end = buf.position() + size
             while (buf.position() < end) {
-                val len = VarIntCodec.readInt(buf)
-                val keyArr = ByteArray(len)
+                require(end - buf.position() >= 2) { "truncated keyLen" }
+                val kLen = buf.short.toInt() and 0xFFFF
+                require(kLen >= 0 && end - buf.position() >= kLen + 8) { "invalid kLen=$kLen or truncated entry" }
+
+                val keyArr = ByteArray(kLen)
                 buf.get(keyArr)
-                val key = ByteBuffer.wrap(keyArr)               // pos=0, limit=len
+                val key = ByteBuffer.wrap(keyArr) // pos=0, limit=kLen
+
                 val off = buf.long
                 ib.add(key, off)
             }

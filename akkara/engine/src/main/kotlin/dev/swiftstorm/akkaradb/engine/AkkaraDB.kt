@@ -31,7 +31,6 @@ import kotlin.concurrent.write
  */
 class AkkaraDB private constructor(
     private val memTable: MemTable,
-    private val packer: AkkBlockPackerDirect,
     private val stripeWriter: AkkStripeWriter,
     private val manifest: AkkManifest,
     private val wal: WalWriter,
@@ -139,10 +138,10 @@ class AkkaraDB private constructor(
     }
 
     fun flush() = lock.write {
-        memTable.flush()
-        manifest.advance(stripeWriter.stripesWritten)
         wal.sealSegment()
         wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
+        memTable.flush()
+        manifest.advance(stripeWriter.stripesWritten)
         compactor.maybeCompact()
     }
 
@@ -163,60 +162,91 @@ class AkkaraDB private constructor(
             val stripe = AkkStripeWriter(baseDir, k, parityCoder, autoFlush = true)
             val wal = WalWriter(baseDir.resolve("wal.log"))
             val pool = Pools.io()
-
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
-            val levels = ArrayList<ConcurrentLinkedDeque<SSTableReader>>().apply {
-                add(ConcurrentLinkedDeque()) // L0
-            }
+
+            val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>> =
+                loadExistingSstLevels(baseDir, pool)
+
+            if (levels.isEmpty()) levels += ConcurrentLinkedDeque<SSTableReader>()
 
             val mem = MemTable(
                 flushThresholdBytes,
-
                 onFlush = { records ->
                     if (records.isNotEmpty()) {
                         val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
                         SSTableWriter(sstPath, pool).use { it.write(records.sortedBy { it.key }) }
                         levels[0].addFirst(SSTableReader(sstPath, pool))
                     }
+
                     val kStripe = k
-                    var i = 0
-                    while (i + kStripe <= records.size) {
-                        val batch = records.subList(i, i + kStripe)
-                        for (r in batch) {
-                            val need = AkkRecordWriter.computeMaxSize(r)
-                            pool.borrow(need) { tmp ->
-                                AkkRecordWriter.write(r, tmp)
-                                tmp.flip()
-                                val recView = tmp.slice()
-                                packer.addRecord(recView)
+                    if (records.size >= kStripe) {
+                        var i = 0
+                        while (i + kStripe <= records.size) {
+                            val batch = records.subList(i, i + kStripe)
+                            for (r in batch) {
+                                val need = AkkRecordWriter.computeMaxSize(r)
+                                pool.borrow(need) { tmp ->
+                                    AkkRecordWriter.write(r, tmp)
+                                    tmp.flip()
+                                    packer.addRecord(tmp.slice())
+                                }
                             }
+                            packer.flush()
+                            i += kStripe
                         }
-                        packer.flush()
-                        i += kStripe
                     }
-                }, onEvict = { records ->
-
-                })
-
-            /* ---- startup recovery ---- */
-            manifest.load(); stripe.seek(manifest.stripesWritten)
-            replayWal(baseDir.resolve("wal.log"), mem)
-
-            AkkStripeReader(baseDir, k, parityCoder).use { reader ->
-                val rr = AkkRecordReader
-                repeat(manifest.stripesWritten.toInt()) { sid ->
-                    val payloads = reader.readStripe() ?: return@repeat
-                    payloads.forEach { p ->
-                        val dup = p.duplicate(); while (dup.hasRemaining()) mem.put(rr.read(dup))
+                },
+                onEvict = { records ->
+                    for (r in records) {
+                        val need = AkkRecordWriter.computeMaxSize(r)
+                        pool.borrow(need) { tmp ->
+                            AkkRecordWriter.write(r, tmp)
+                            tmp.flip()
+                            packer.addRecord(tmp.slice())
+                        }
                     }
                 }
+            )
+
+            // 3) 起動時リカバリ
+            manifest.load()
+            stripe.seek(manifest.stripesWritten)
+
+            // WAL だけ適用（CheckPoint起点にしたければ WalReplay を拡張）
+            replayWal(baseDir.resolve("wal.log"), mem)
+
+            val compactor = Compactor(levels, baseDir, pool = pool).also { it.maybeCompact() }
+
+            return AkkaraDB(mem, stripe, manifest, wal, levels, pool, compactor)
+        }
+
+        private fun loadExistingSstLevels(
+            baseDir: Path,
+            pool: BufferPool
+        ): MutableList<ConcurrentLinkedDeque<SSTableReader>> {
+            val levels = ArrayList<ConcurrentLinkedDeque<SSTableReader>>()
+            val l0 = ConcurrentLinkedDeque<SSTableReader>()
+            val l1 = ConcurrentLinkedDeque<SSTableReader>()
+
+            java.nio.file.Files.list(baseDir).use { stream ->
+                stream.filter { p -> p.fileName.toString().endsWith(".aksst") && p.fileName.toString().startsWith("sst_") }
+                    .sorted(Comparator.comparingLong<Path> { p ->
+                        java.nio.file.Files.getLastModifiedTime(p).toMillis()
+                    }.reversed())
+                    .forEach { p -> l0.addFirst(SSTableReader(p, pool)) }
             }
 
-            val compactor = Compactor(levels, baseDir, pool = pool).also { compactor ->
-                compactor.maybeCompact()
+            java.nio.file.Files.list(baseDir).use { stream ->
+                stream.filter { p -> p.fileName.toString().endsWith(".aksst") && p.fileName.toString().startsWith("sst_compact_") }
+                    .sorted(Comparator.comparingLong<Path> { p ->
+                        java.nio.file.Files.getLastModifiedTime(p).toMillis()
+                    }.reversed())
+                    .forEach { p -> l1.addFirst(SSTableReader(p, pool)) }
             }
 
-            return AkkaraDB(mem, packer, stripe, manifest, wal, levels, pool, compactor)
+            levels += l0
+            if (l1.isNotEmpty()) levels += l1
+            return levels
         }
     }
 }

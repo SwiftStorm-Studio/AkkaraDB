@@ -121,6 +121,10 @@ subprojects {
     }
 
     afterEvaluate {
+        dependencies {
+            implementation(libs.kotlin.stdlib)
+        }
+
         akkaraAPI.forEach { logger.lifecycle("Shaded API: $it") }
 
         val artifacts = try {

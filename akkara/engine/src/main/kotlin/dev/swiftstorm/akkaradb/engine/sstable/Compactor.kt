@@ -8,6 +8,10 @@ import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
 
+/**
+ * Levelled compactor (L0 -> L1) using the latest SSTableReader iterator
+ * and flags-based tombstone handling.
+ */
 class Compactor(
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>, // shared from AkkaraDB
     private val baseDir: Path,
@@ -25,7 +29,7 @@ class Compactor(
         if (inputs.isEmpty()) return
 
         // output path & merge
-        val outPath = baseDir.resolve("sst_compact_${System.nanoTime()}.aksst")
+        val outPath = baseDir.resolve("sst_compact_${'$'}{System.nanoTime()}.aksst")
         val merged = mergeSstables(inputs, outPath)
 
         // L1 deque (create if absent)
@@ -53,7 +57,7 @@ class Compactor(
         while (heap.isNotEmpty()) {
             val (rec, idx) = heap.poll()
 
-            // deep-copy key bytes
+            // deep-copy key bytes for map identity
             val keyBytes = ByteArray(rec.key.remaining()).also {
                 rec.key.duplicate().get(it)
             }
@@ -67,18 +71,18 @@ class Compactor(
         }
 
         val finalRecords = latest.values
-            .filter { it.value.remaining() > 0 }     // tombstone drop
-            .sortedBy { it.key }                     // key asc
+            .asSequence()
+            .filter { !it.isTombstone }            // flags-based tombstone drop
+            .sortedBy { it.key }                   // key asc
+            .toList()
 
         SSTableWriter(out, pool).use { it.write(finalRecords) }
         return SSTableReader(out, pool)
     }
 }
 
+/** Byte-array key wrapper for HashMap identity during merge. */
 data class Key(private val bytes: ByteArray) {
-    override fun equals(other: Any?): Boolean =
-        other is Key && bytes.contentEquals(other.bytes)
-
-    override fun hashCode(): Int =
-        bytes.contentHashCode()
+    override fun equals(other: Any?): Boolean = other is Key && bytes.contentEquals(other.bytes)
+    override fun hashCode(): Int = bytes.contentHashCode()
 }

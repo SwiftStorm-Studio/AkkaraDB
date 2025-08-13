@@ -66,6 +66,10 @@ class MemTable(
         }
     }
 
+    /**
+     * Flushes the MemTable to disk if the flush is pending or if there are
+     * any records currently in the MemTable.
+     */
     fun flush() {
         if (flushPending.compareAndSet(false, true) || currentBytes.get() > 0) {
             flushInternal()
