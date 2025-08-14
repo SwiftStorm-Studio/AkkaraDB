@@ -7,20 +7,24 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
-import java.util.concurrent.locks.LockSupport
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Write‑Ahead Log writer with **group commit (N or T)**.
+ * Write‑Ahead Log writer with a dedicated flusher thread implementing
+ * true "group commit (N or T)" and **durable-before-ACK** semantics.
  *
- * Semantics:
- *  • `append()` returns only after the WAL bytes are **durably** on disk.
- *    Durability is achieved by `FileChannel.force(true)` executed on the
- *    current group when either:
- *      – the group has accumulated ≥ [groupCommitN] appends, or
- *      – the oldest record in the group has waited ≥ [groupCommitMicros].
- *  • `sealSegment()` / `checkpoint(...)` always force immediately.
+ * Key points:
+ *  - Callers enqueue records; a flusher writes them and calls force(true) once per group.
+ *  - No fake Seal is written for barriers. We use an in‑memory Barrier command
+ *    so WalReplay's state machine (Seal -> CheckPoint) stays valid.
+ *  - sealSegment(): enqueues a real Seal record and waits for durability.
+ *  - checkpoint(): enqueues {Seal, CheckPoint} in order and waits.
  *
- * Thread‑safety: not thread‑safe (use from a single writer thread).
+ * Thread safety: public APIs are safe to call from multiple threads.
+ * Encoding: fixed‑length LE as defined in WalRecord.
  */
 class WalWriter(
     path: Path,
@@ -32,98 +36,161 @@ class WalWriter(
 
     companion object {
         private const val MAX_RECORD_BYTES = 1 shl 20 // 1 MiB
-        private const val NANOS_PER_MICRO: Long = 1_000
     }
 
     private val ch = FileChannel.open(path, WRITE, CREATE, APPEND)
 
-    /** Reusable scratch buffer (direct). */
+    /** Scratch buffer for encoding a single record (owned by flusher thread). */
     private var scratch: ByteBuffer = pool.get(initCap)
 
-    // ---- group commit state ----
-    private var groupCount: Int = 0
-    private var groupStartNanos: Long = 0L
+    /* ------------ command queue (writes + control barriers) ------------ */
 
-    /* ---------- public API ---------- */
+    private sealed interface Cmd {
+        val done: CompletableFuture<Void>
+    }
 
-    /** Append a KV payload (already Akk-encoded) and durably commit per group policy. */
-    fun append(record: ByteBuffer) =
-        writeRecord(WalRecord.Add(record.asReadOnlyBuffer()), forceNow = false)
+    private data class Write(val rec: WalRecord, override val done: CompletableFuture<Void>) : Cmd
+    private data class Barrier(override val done: CompletableFuture<Void>) : Cmd
 
-    /** Mark end of segment; forces immediately. */
-    fun sealSegment() =
-        writeRecord(WalRecord.Seal, forceNow = true)
+    private val q = LinkedBlockingQueue<Cmd>()
+    private val running = AtomicBoolean(true)
+    private val flusher = Thread(this::flushLoop, "WalFlusher").apply {
+        isDaemon = true; start()
+    }
 
-    /** Write a checkpoint {stripeIdx, seqNo}; forces immediately. */
-    fun checkpoint(stripeIdx: Long, seqNo: Long) =
-        writeRecord(WalRecord.CheckPoint(stripeIdx, seqNo), forceNow = true)
+    /* --------------------------- public API --------------------------- */
 
-    /* ---------- core ---------- */
+    /** Append an Akk‑encoded KV payload and wait until it is durably on disk. */
+    fun append(record: ByteBuffer) {
+        enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer())).join()
+    }
 
-    private fun writeRecord(r: WalRecord, forceNow: Boolean) {
-        val estimated = r.estimateSize()
-        require(estimated <= MAX_RECORD_BYTES) {
-            "WAL record too large: $estimated bytes (limit ${MAX_RECORD_BYTES}B)"
+    /** Mark end of segment; write a real Seal and ensure durability. */
+    fun sealSegment() {
+        enqueueWrite(WalRecord.Seal).join()
+    }
+
+    /**
+     * Write a checkpoint {stripeIdx, seqNo} with the required ordering:
+     * real Seal followed by CheckPoint, then force durability.
+     */
+    fun checkpoint(stripeIdx: Long, seqNo: Long) {
+        val f1 = enqueueWrite(WalRecord.Seal)
+        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
+        // Ensure both are durably committed (single group fsync if batched)
+        CompletableFuture.allOf(f1, f2).join()
+    }
+
+    /* --------------------------- internals ---------------------------- */
+
+    private fun enqueueWrite(r: WalRecord): CompletableFuture<Void> {
+        val est = r.estimateSize()
+        require(est <= MAX_RECORD_BYTES) { "WAL record too large: $est bytes" }
+        return CompletableFuture<Void>().also { q.put(Write(r, it)) }
+    }
+
+    /** Inserts a control barrier (no on‑disk record) and waits for fsync. */
+    @Suppress("unused")
+    private fun barrier(): CompletableFuture<Void> =
+        CompletableFuture<Void>().also { q.put(Barrier(it)) }
+
+    private fun flushLoop() {
+        val batch = ArrayList<Write>(groupCommitN)
+        fun flushBatch() {
+            if (batch.isEmpty()) return
+            writeBatch(batch)
+            ch.force(true)
+            batch.forEach { it.done.complete(null) }
+            batch.clear()
         }
 
-        // ensure scratch capacity
-        if (scratch.capacity() < estimated) {
-            pool.release(scratch)
-            var newCap = scratch.capacity()
-            while (newCap < estimated) newCap = newCap * 2
-            scratch = pool.get(newCap)
+        // Main loop
+        while (running.get() || !q.isEmpty()) {
+            try {
+                // wait up to T µs for first command
+                val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS) ?: continue
+                when (first) {
+                    is Barrier -> {              // flush what we have (if any), then ack barrier
+                        flushBatch()
+                        first.done.complete(null)
+                        continue
+                    }
+
+                    is Write -> batch += first
+                }
+
+                // drain more until N or a Barrier arrives (without blocking)
+                while (batch.size < groupCommitN) {
+                    val next = q.poll() ?: break
+                    when (next) {
+                        is Write -> batch += next
+                        is Barrier -> {
+                            // flush everything before the barrier, then ack it
+                            flushBatch()
+                            next.done.complete(null)
+                        }
+                    }
+                }
+
+                // time boundary or count boundary reached → flush once
+                flushBatch()
+            } catch (t: Throwable) {
+                // complete exceptionally and keep running (best-effort resiliency)
+                while (true) {
+                    val c = batch.removeLastOrNull() ?: break
+                    c.done.completeExceptionally(t)
+                }
+            }
         }
 
-        // encode + write
-        scratch.clear()
-        r.writeTo(scratch)
-        scratch.flip()
-        while (scratch.hasRemaining()) ch.write(scratch)
+        // Drain remaining writes on shutdown
+        while (q.poll()?.let {
+                when (it) {
+                    is Write -> {
+                        writeBatch(listOf(it)); ch.force(true); it.done.complete(null); true
+                    }
 
-        if (forceNow) {
-            // immediate durability barrier (and reset group)
-            ch.force(true)
-            groupCount = 0
-            groupStartNanos = 0L
-            return
-        }
-
-        // group commit path: N or T µs from first record in group
-        val now = System.nanoTime()
-        if (groupCount == 0) groupStartNanos = now
-        groupCount++
-
-        val dueByCount = groupCount >= groupCommitN
-        val dueByTime = (now - groupStartNanos) >= groupCommitMicros * NANOS_PER_MICRO
-
-        if (dueByCount || dueByTime) {
-            ch.force(true)
-            groupCount = 0
-            groupStartNanos = 0L
-        } else {
-            // Bound the ACK latency by waiting until the time window elapses,
-            // then force() the group so the caller observes durability.
-            val nanosLeft = groupCommitMicros * NANOS_PER_MICRO - (now - groupStartNanos)
-            if (nanosLeft > 0) LockSupport.parkNanos(nanosLeft)
-            ch.force(true)
-            groupCount = 0
-            groupStartNanos = 0L
+                    is Barrier -> {
+                        ch.force(true); it.done.complete(null); true
+                    }
+                }
+            } == true) { /* keep draining */
         }
     }
 
-    /* ---------- lifecycle ---------- */
+    private fun writeBatch(batch: List<Write>) {
+        for (p in batch) {
+            val est = p.rec.estimateSize()
+            if (scratch.capacity() < est) {
+                pool.release(scratch)
+                var newCap = scratch.capacity()
+                while (newCap < est) newCap = newCap * 2
+                scratch = pool.get(newCap)
+            }
+            scratch.clear()
+            p.rec.writeTo(scratch)
+            scratch.flip()
+            while (scratch.hasRemaining()) ch.write(scratch)
+        }
+    }
+
+    /* --------------------------- lifecycle ---------------------------- */
 
     override fun close() {
-        // If a group is open, force it before closing to avoid silent loss
-        if (groupCount > 0) ch.force(true)
+        running.set(false)
+        flusher.join()
+        // final fsync for safety
+        ch.force(true)
         pool.release(scratch)
         ch.close()
     }
 }
 
+/* -------- size estimator aligned with the current WalRecord encoding -------- */
+// WalWriter.kt の末尾（置き換え）
 private fun WalRecord.estimateSize(): Int =
     when (this) {
-        is WalRecord.Seal -> 1 // tag only
-        is WalRecord.CheckPoint -> 1 + 10 + 10 // tag + VarLong×2
-        is WalRecord.Add -> 1 + 5 + payload.remaining() // tag + VarInt(len) + data
+        is WalRecord.Seal -> 1                    // [tag]
+        is WalRecord.CheckPoint -> 1 + 8 + 8      // [tag][u64][u64]
+        is WalRecord.Add -> 1 + 4 + payload.remaining() + 4 // [tag][u32][payload][crc]
     }

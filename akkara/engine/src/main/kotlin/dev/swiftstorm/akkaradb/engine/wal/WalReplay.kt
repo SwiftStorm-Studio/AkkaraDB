@@ -7,6 +7,15 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 
+/**
+ * Replays a WAL file into the given MemTable.
+ *
+ * Rules:
+ *  - Records are applied in order.
+ *  - A Seal must be followed by a CheckPoint before further Add records.
+ *  - A torn/truncated tail (e.g., crash mid-record) is treated as EOF
+ *    and replay stops cleanly without throwing.
+ */
 fun replayWal(path: Path, mem: MemTable) {
     if (!Files.exists(path)) return
 
@@ -15,12 +24,22 @@ fun replayWal(path: Path, mem: MemTable) {
         var state = SegState.APPLY
 
         while (buf.hasRemaining()) {
-            when (val rec = WalRecord.readFrom(buf)) {
+            val pos = buf.position()
+            val rec = try {
+                WalRecord.readFrom(buf) // validates lengths; ADD also validates CRC32C
+            } catch (_: Throwable) {
+                // Treat a torn/truncated tail as EOF and stop replay.
+                // We rewind to the start of the bad record for clarity and exit.
+                buf.position(pos)
+                break
+            }
+
+            when (rec) {
                 is WalRecord.Add -> {
                     if (state == SegState.SEALED) {
                         error("WAL corrupted: Add encountered after Seal but before CheckPoint @ pos=${buf.position()}")
                     }
-                    // apply
+                    // Apply to memtable
                     val kv = AkkRecordReader.read(rec.payload.asReadOnlyBuffer())
                     mem.put(kv)
                 }

@@ -22,7 +22,7 @@ import java.util.zip.CRC32C
  *  - Block payload = [MiniIndex][Concatenated Records]
  *  - MiniIndex     = [count:u16][offset:u32]×count   (LE)
  *  - Block on disk = [len:u32 BE][ payload ][crc:u32 BE]
- *  - Outer index   = repeat { [keyLen:u16][key][blockOff:i64] } (LE)
+ *  - Outer index   = repeat { [key:FIXED(32B)][blockOff:i64] } (LE)
  *  - Footer        = ["AKSS":u32][indexOff:u64][bloomOff:u64]
  */
 class SSTableWriter(

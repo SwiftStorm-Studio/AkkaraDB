@@ -11,8 +11,11 @@ import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
 import dev.swiftstorm.akkaradb.engine.wal.replayWal
-import dev.swiftstorm.akkaradb.format.akk.*
-import dev.swiftstorm.akkaradb.format.akk.parity.XorParityCoder
+import dev.swiftstorm.akkaradb.format.akk.AkkBlockPackerDirect
+import dev.swiftstorm.akkaradb.format.akk.AkkRecordWriter
+import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
+import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
+import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
 import java.nio.file.Path
@@ -155,7 +158,8 @@ class AkkaraDB private constructor(
         fun open(
             baseDir: Path,
             k: Int = 4,
-            parityCoder: ParityCoder = XorParityCoder(),
+            m: Int = 2,
+            parityCoder: ParityCoder = RSParityCoder(m),
             flushThresholdBytes: Long = 64L * 1024 * 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
