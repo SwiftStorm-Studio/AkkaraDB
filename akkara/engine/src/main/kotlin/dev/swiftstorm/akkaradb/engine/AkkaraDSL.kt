@@ -2,9 +2,7 @@
 
 package dev.swiftstorm.akkaradb.engine
 
-import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
-import dev.swiftstorm.akkaradb.common.borrow
 import kotlinx.serialization.BinaryFormat
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
@@ -63,7 +61,7 @@ class PackedTable<T : Any>(
         StandardCharsets.UTF_8.encode("${kClass.qualifiedName ?: kClass.simpleName!!}:").asReadOnlyBuffer()
     }
 
-    private val seq = AtomicLong(seqSeed ?: db.bestEffortLastSeq())
+    private val seq = AtomicLong(seqSeed ?: db.lastSeq())
 
     /* ───────── constants ───────── */
 
@@ -74,24 +72,20 @@ class PackedTable<T : Any>(
 
     /**
      * Allocates a *heap* ByteBuffer for the logical key and returns it as read‑only.
+     *
+     * @throws IllegalArgumentException if [id] is not ASCII.
      */
+    // AkkaraDSL.kt -> PackedTable.keyBuf()
     private fun keyBuf(id: String): ByteBuffer {
-        if (!id.isASCII()) {
-            throw IllegalArgumentException("ID must be ASCII: $id")
-        }
-
-        val rNsBuf = nsBuf.duplicate().rewind()
-
-        val charset = StandardCharsets.UTF_8
-        val idBuf = charset.encode(id)
-        val totalLen = rNsBuf.remaining() + idBuf.remaining()
-
-        Pools.io().borrow(totalLen) { buf ->
-            buf.put(rNsBuf).put(idBuf)
-            buf.flip()
-            return buf.asReadOnlyBuffer()
-        }
+        if (!id.isASCII()) error("ID must be ASCII: $id")
+        val rNsBuf = nsBuf.duplicate().apply { rewind() }
+        val idBuf = StandardCharsets.UTF_8.encode(id)
+        val out = ByteBuffer.allocate(rNsBuf.remaining() + idBuf.remaining())
+        out.put(rNsBuf).put(idBuf)
+        out.flip()
+        return out.asReadOnlyBuffer()
     }
+
 
     /* ───────── CRUD ───────── */
 
@@ -182,9 +176,6 @@ class PackedTable<T : Any>(
 }
 
 /* ───────── extension ───────── */
-
-private fun AkkaraDB.bestEffortLastSeq(): Long =
-    runCatching { javaClass.getMethod("lastSeq").invoke(this) as? Long ?: 0L }.getOrElse { 0L }
 
 fun String.isASCII(): Boolean = all { it.code <= 127 }
 

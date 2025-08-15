@@ -31,16 +31,19 @@ class MemTable(
     }
 ) : AutoCloseable {
     /* ---- LRU-Ordered map ---- */
-    private val lruMap = object : LinkedHashMap<ByteBuffer, Record>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBuffer, Record>): Boolean {
-            if (maxEntries != null && size > maxEntries) {
-                onEvict?.invoke(listOf(eldest.value))
-                return true
+    private fun newLruMap(): LinkedHashMap<ByteBuffer, Record> =
+        object : LinkedHashMap<ByteBuffer, Record>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBuffer, Record>): Boolean {
+                if (maxEntries != null && size > maxEntries) {
+                    onEvict?.invoke(listOf(eldest.value))
+                    return true
+                }
+                return false
             }
-            return false
         }
-    }
-    private val mapRef = AtomicReference(lruMap)
+
+    private val lruMap: LinkedHashMap<ByteBuffer, Record> = newLruMap()
+    private val mapRef = AtomicReference<LinkedHashMap<ByteBuffer, Record>>(lruMap)
 
     private val currentBytes = AtomicLong(0)
     private val highestSeqNo = AtomicLong(0)
@@ -113,14 +116,16 @@ class MemTable(
     }
 
     private fun flushInternal() {
-        val snapshot: List<Record>
-        lock.read { snapshot = mapRef.get().values.toList() }
+        val oldMap = mapRef.getAndSet(newLruMap())
+        if (oldMap.isEmpty()) return
+
+        val toFlush = ArrayList<Record>(oldMap.size)
+        toFlush.addAll(oldMap.values)
+
         try {
-            if (snapshot.isNotEmpty()) {
-                onFlush(snapshot)
-            }
-        } finally {
-            flushPending.set(false)
+            onFlush.invoke(toFlush)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 

@@ -22,7 +22,8 @@ class AkkStripeWriter(
     private val pool: BufferPool = Pools.io(),
     // --- group commit controls ---
     private val fsyncBatchN: Int = 32,
-    private val fsyncIntervalMicros: Long = 500
+    private val fsyncIntervalMicros: Long = 500,
+    private val onCommit: ((Long) -> Unit)? = null
 ) : Closeable {
 
     /* ───────── lane writers (FdWriter only) ───────── */
@@ -83,6 +84,7 @@ class AkkStripeWriter(
         parityCh.forEach(FileWriter::flush)
         stripesSinceLastFlush = 0
         lastFlushAtNanos = System.nanoTime()
+        onCommit?.invoke(stripesWritten_)
     }
 
     /** Re‑positions all writers to <code>stripe×BLOCK_SIZE</code>. */
@@ -91,6 +93,13 @@ class AkkStripeWriter(
         dataCh.forEach { it.seek(off) }
         parityCh.forEach { it.seek(off) }
         stripesWritten_ = stripes
+    }
+
+    fun truncateTo(stripes: Long) {
+        val off = stripes * BLOCK_SIZE.toLong()
+        dataCh.forEach { (it as FileWriterEx).truncate(off) }
+        parityCh.forEach { (it as FileWriterEx).truncate(off) }
+        seek(stripes)
     }
 
     override fun close() {
@@ -107,6 +116,10 @@ class AkkStripeWriter(
         fun seek(pos: Long)
     }
 
+    private interface FileWriterEx : FileWriter {
+        fun truncate(size: Long)
+    }
+
     /**
      * Direct file writer backed by Netty-native `io.netty.channel.unix.FileDescriptor`
      * for data-path writes, plus a single long-lived `RandomAccessFile`
@@ -116,7 +129,7 @@ class AkkStripeWriter(
      *  * **flush()** – one `fd.sync()` (`fsync(2)`) on the companion JDK
      *    descriptor; no per-call open/close, so latency stays low.
      */
-    private class FdWriter(path: Path) : FileWriter {
+    private class FdWriter(path: Path) : FileWriterEx {
 
         /** Native descriptor used for all pwrite(2) operations. */
         private val fd: FileDescriptor = FileDescriptor.from(path.toString())
@@ -158,6 +171,11 @@ class AkkStripeWriter(
             flush()
             fd.close()
             ch.close()                   // closes `raf` implicitly
+        }
+
+        override fun truncate(size: Long) {
+            ch.truncate(size)
+            seek(size)
         }
     }
 }
