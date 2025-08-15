@@ -16,7 +16,7 @@ Design goals: predictable P99, minimal dependencies, crash-safe on a single node
 * **SSTable**: fixed-format blocks (`[len][payload][crc]`), mini-index per block, bloom & outer index always-resident.
 * **Compaction**: L0 → L1, tombstone TTL (planned), newest-seq wins per key.
 * **Manifest**: append-only events (`StripeCommit`, `SSTSeal`, `Checkpoint`) for recovery and bookkeeping.
-* **Parity (optional)**: m=1 XOR, m=2 DualXor, m≥3 Reed–Solomon.
+* **Parity (optional)** – Reed–Solomon (RS) coding for any number of parity lanes (m ≥ 1), supporting recovery from up to m simultaneous lane losses.
 
 > Status: pre-alpha. APIs and file formats may change.
 
