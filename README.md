@@ -5,9 +5,9 @@ Design goals: predictable P99, minimal dependencies, crash-safe on a single node
 
 ## Why
 
-* **Latency first**: P99 reads 10–50 µs (≈1M keys, page-cache hits), writes ≤200 µs (WAL + group commit).
-* **Simple & robust**: append-only data path, fsync batching, manifest-based recovery.
-* **Zero external deps**: pure JDK + Kotlin.
+* **Low-latency by design** – P99 reads: 10–50 µs, writes: ≤200 µs with WAL + group commit.
+* **Robust storage engine** – Append-only writes, batched fsync, manifest-based recovery.
+* **Minimal external deps** – Core runs on pure JDK + Kotlin; only optional logging (SLF4J) and the built-in BinPack module.
 
 ## Features (current)
 
