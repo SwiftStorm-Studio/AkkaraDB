@@ -4,5 +4,10 @@ import java.io.Closeable
 import java.nio.ByteBuffer
 
 interface StripeReader : Closeable {
-    fun readStripe(): List<ByteBuffer>?
+    data class Stripe(
+        val payloads: List<ByteBuffer>,
+        val laneBlocks: List<ByteBuffer>
+    )
+
+    fun readStripe(): Stripe?
 }

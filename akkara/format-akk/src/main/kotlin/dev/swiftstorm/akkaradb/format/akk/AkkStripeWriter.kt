@@ -42,39 +42,37 @@ class AkkStripeWriter(
     fun addBlock(block: ByteBuffer) {
         require(block.remaining() == BLOCK_SIZE)
 
-        try {
-            /* 1. write data lane */
-            dataCh[laneIdx].write(block.duplicate())
-            laneIdx++
+        /* 1. write data lane but retain original buffer until stripe commit */
+        val writer = dataCh[laneIdx]
+        writer.write(block.duplicate())
+        writer.lastWritten = block
+        laneIdx++
 
-            if (laneIdx == k) {
-                // 2. parity
-                parityCoder?.let { coder ->
-                    val parity = coder.encode(dataCh.map { it.lastWritten!! })
-                    parity.forEachIndexed { i, buf ->
-                        parityCh[i].write(buf.duplicate())
-                        pool.release(buf)
-                    }
-                }
-                // 3. release per‑lane cached buffers
-                dataCh.forEach { writer ->
-                    writer.lastWritten?.let(pool::release)
-                    writer.lastWritten = null
-                }
-                laneIdx = 0
-                stripesWritten_++
-
-                // 4. group commit policy: N stripes or T µs
-                stripesSinceLastFlush++
-                val now = System.nanoTime()
-                val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
-                val dueByCount = stripesSinceLastFlush >= fsyncBatchN
-                if (autoFlush && (dueByCount || dueByTime)) {
-                    flush()
+        if (laneIdx == k) {
+            // 2. parity
+            parityCoder?.let { coder ->
+                val parity = coder.encode(dataCh.map { it.lastWritten!! })
+                parity.forEachIndexed { i, buf ->
+                    parityCh[i].write(buf.duplicate())
+                    pool.release(buf)
                 }
             }
-        } finally {
-            pool.release(block)
+            // 3. release per‑lane cached buffers
+            dataCh.forEach { w ->
+                w.lastWritten?.let(pool::release)
+                w.lastWritten = null
+            }
+            laneIdx = 0
+            stripesWritten_++
+
+            // 4. group commit policy: N stripes or T µs
+            stripesSinceLastFlush++
+            val now = System.nanoTime()
+            val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
+            val dueByCount = stripesSinceLastFlush >= fsyncBatchN
+            if (autoFlush && (dueByCount || dueByTime)) {
+                flush()
+            }
         }
     }
 

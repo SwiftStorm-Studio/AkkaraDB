@@ -41,10 +41,10 @@ class AkkStripeReader(
     private val pool = Pools.io()
 
     /**
-     * Reads <b>one</b> stripe and returns a list of record‑payload slices
-     * (may be empty if no records in stripe). Returns `null` on EOF.
+     * Reads <b>one</b> stripe and returns its payload slices along with the
+     * backing lane blocks. Returns `null` on EOF.
      */
-    override fun readStripe(): List<ByteBuffer>? {
+    override fun readStripe(): StripeReader.Stripe? {
         /* 1. read data lanes */
         val laneBlocks = MutableList<ByteBuffer?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
@@ -94,7 +94,7 @@ class AkkStripeReader(
         val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
         val payloads = nonNullBlocks.flatMap(unpacker::unpack)
 
-        return payloads
+        return StripeReader.Stripe(payloads, nonNullBlocks)
     }
 
     /**
@@ -106,20 +106,26 @@ class AkkStripeReader(
         val rr = AkkRecordReader
 
         while (true) {
-            val payloads = readStripe() ?: break
+            val stripe = readStripe() ?: break
             val stripeId = untilStripe - idx  // newest‑first numbering
             idx++
 
             val recs = ArrayList<Record>()
-            for (p in payloads) {
+            var hit: Record? = null
+            for (p in stripe.payloads) {
                 val r = rr.read(p.duplicate())
-                recs.add(r)
-                if (r.key.compareTo(key) == 0) {
-                    return StripeHit(r, stripeId, recs)
+                val copy = deepCopy(r)
+                recs.add(copy)
+                if (hit == null && copy.key.compareTo(key) == 0) {
+                    hit = copy
                 }
             }
-            // NOTE: caller did not find the key in this stripe → it will be GC‑collected;
-            // lane blocks are still in pool for potential reuse.
+            // release lane blocks regardless of hit
+            stripe.laneBlocks.forEach(pool::release)
+
+            if (hit != null) {
+                return StripeHit(hit, stripeId, recs)
+            }
         }
         return null
     }
@@ -129,4 +135,15 @@ class AkkStripeReader(
     }
 
     data class StripeHit(val record: Record, val stripeId: Long, val blocks: List<Record>)
+
+    private fun deepCopy(r: Record): Record {
+        fun copyBuf(src: ByteBuffer): ByteBuffer {
+            val dup = src.duplicate().apply { rewind() }
+            val out = ByteBuffer.allocate(dup.remaining())
+            out.put(dup)
+            out.flip()
+            return out.asReadOnlyBuffer()
+        }
+        return Record(copyBuf(r.key), copyBuf(r.value), r.seqNo, r.flags)
+    }
 }
