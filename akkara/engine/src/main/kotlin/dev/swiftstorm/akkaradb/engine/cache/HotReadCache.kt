@@ -13,7 +13,11 @@ class HotReadCache(private val maxBytes: Long) {
 
     private val map = object : LinkedHashMap<ByteBuffer, Entry>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBuffer, Entry>): Boolean {
-            return currentBytes > maxBytes
+            if (currentBytes > maxBytes) {
+                currentBytes -= eldest.value.size
+                return true
+            }
+            return false
         }
     }
 

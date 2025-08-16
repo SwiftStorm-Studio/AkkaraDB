@@ -35,6 +35,7 @@ class MemTable(
         object : LinkedHashMap<ByteBuffer, Record>(16, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBuffer, Record>): Boolean {
                 if (maxEntries != null && size > maxEntries) {
+                    currentBytes.addAndGet(-this@MemTable.sizeOf(eldest.value))
                     onEvict?.invoke(listOf(eldest.value))
                     return true
                 }
@@ -83,13 +84,16 @@ class MemTable(
         lock.write {
             val map = mapRef.get()
             val evicted = mutableListOf<Record>()
+            var bytesFreed = 0L
             repeat(n) {
                 val eldest = map.entries.iterator().takeIf { it.hasNext() }?.next()
                 if (eldest != null) {
                     evicted += eldest.value
+                    bytesFreed += sizeOf(eldest.value)
                     map.remove(eldest.key)
                 }
             }
+            if (bytesFreed > 0) currentBytes.addAndGet(-bytesFreed)
             if (evicted.isNotEmpty()) onEvict?.invoke(evicted)
         }
     }
@@ -117,6 +121,9 @@ class MemTable(
 
     private fun flushInternal() {
         val oldMap = mapRef.getAndSet(newLruMap())
+        val bytesFlushed = oldMap.values.sumOf { sizeOf(it) }
+        currentBytes.addAndGet(-bytesFlushed)
+        flushPending.set(false)
         if (oldMap.isEmpty()) return
 
         val toFlush = ArrayList<Record>(oldMap.size)
