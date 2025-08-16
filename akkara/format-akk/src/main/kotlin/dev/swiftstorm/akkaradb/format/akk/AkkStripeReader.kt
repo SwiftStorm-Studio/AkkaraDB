@@ -5,6 +5,7 @@ import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
+import dev.swiftstorm.akkaradb.format.api.StripeReader.Stripe
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
 import java.nio.ByteBuffer
 import java.nio.file.Files
@@ -14,22 +15,15 @@ import java.nio.file.StandardOpenOption.READ
 /**
  * Reader for a *stripe* in the append‑only segment.
  *
- * <h3>Ownership &amp; Lifetime</h3>
- *  * The returned payload slices and subsequently decoded [Record]s **share the
- *    same backing memory** as the original 32&nbsp;KiB lane blocks. Therefore the
- *    caller is responsible for releasing those lane blocks <b>after</b> it has
- *    parsed everything it needs from the payloads. In typical usage this means:
- *      1. Call [readStripe] → iterate payloads → parse records
- *      2. Immediately `pool.release(block)` every element of the list returned
- *         by `laneBlocks` (not exposed here – track them yourself if needed)
- *
- * The reader itself only releases <em>parity</em> buffers internally after decode.
+ * Ownership & Lifetime:
+ *  * The returned [Stripe] holds both payload slices and the backing lane blocks.
+ *  * Caller **must** call [Stripe.close] after use to release buffers back to the pool.
  */
 class AkkStripeReader(
     baseDir: Path,
     private val k: Int,
     private val parityCoder: ParityCoder? = null,
-) : StripeReader {
+) : StripeReader, AutoCloseable {
 
     /* ───────── file handles ───────── */
     private val dataCh = (0 until k).map { Files.newByteChannel(baseDir.resolve("data_$it.akd"), READ) }
@@ -41,22 +35,22 @@ class AkkStripeReader(
     private val pool = Pools.io()
 
     /**
-     * Reads <b>one</b> stripe and returns a list of record‑payload slices
-     * (may be empty if no records in stripe). Returns `null` on EOF.
+     * Reads one stripe and returns a [Stripe] with payload slices and lane blocks.
+     * Returns `null` on EOF.
      */
-    override fun readStripe(): List<ByteBuffer>? {
+    override fun readStripe(): StripeReader.Stripe? {
         /* 1. read data lanes */
         val laneBlocks = MutableList<ByteBuffer?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
             val blk = pool.get()
             val n = ch.read(blk)
             if (n == BLOCK_SIZE) {
-                blk.flip(); laneBlocks[idx] = blk  // full 32 KiB block
+                blk.flip(); laneBlocks[idx] = blk
             } else {
-                pool.release(blk)                 // EOF or partial → discard
+                pool.release(blk) // EOF or partial → discard
             }
         }
-        if (laneBlocks.all { it == null }) return null   // true EOF
+        if (laneBlocks.all { it == null }) return null // true EOF
 
         /* 2. optional parity recovery */
         val missingCnt = laneBlocks.count { it == null }
@@ -87,39 +81,40 @@ class AkkStripeReader(
             emptyList()
         }
 
-        // release parity buffers immediately – their data has been copied/consumed
+        // release parity buffers immediately
         parityBufs.forEach { it?.let(pool::release) }
 
-        /* 3. split each 32 KiB block into their record‑payload slices */
+        /* 3. unpack payloads */
         val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
         val payloads = nonNullBlocks.flatMap(unpacker::unpack)
 
-        return payloads
+        return StripeReader.Stripe(payloads, nonNullBlocks, pool)
     }
 
     /**
-     * Scans stripes <em>newest‑first</em> until the given [key] is found or we hit
-     * EOF. Returns a [StripeHit] with decoded records for caching.
+     * Scans stripes newest‑first until [key] is found or EOF.
      */
     fun searchLatestStripe(key: ByteBuffer, untilStripe: Long): StripeHit? {
         var idx = 0L
         val rr = AkkRecordReader
 
         while (true) {
-            val payloads = readStripe() ?: break
-            val stripeId = untilStripe - idx  // newest‑first numbering
-            idx++
+            val stripe = readStripe() ?: break
+            stripe.use { // AutoCloseable → release lane blocks after use
+                val stripeId = untilStripe - idx
+                idx++
 
-            val recs = ArrayList<Record>()
-            for (p in payloads) {
-                val r = rr.read(p.duplicate())
-                recs.add(r)
-                if (r.key.compareTo(key) == 0) {
-                    return StripeHit(r, stripeId, recs)
+                val recs = ArrayList<Record>()
+                var hit: Record? = null
+                for (p in stripe.payloads) {
+                    val r = rr.read(p.duplicate())
+                    recs.add(r)
+                    if (hit == null && r.key.compareTo(key) == 0) {
+                        hit = r
+                    }
                 }
+                if (hit != null) return StripeHit(hit, stripeId, recs)
             }
-            // NOTE: caller did not find the key in this stripe → it will be GC‑collected;
-            // lane blocks are still in pool for potential reuse.
         }
         return null
     }

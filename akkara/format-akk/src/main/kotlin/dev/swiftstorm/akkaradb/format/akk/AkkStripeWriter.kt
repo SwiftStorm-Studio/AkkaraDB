@@ -1,12 +1,9 @@
-@file:Suppress("PrivatePropertyName")
-
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
-import io.netty.channel.unix.FileDescriptor
 import java.io.Closeable
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -26,7 +23,7 @@ class AkkStripeWriter(
     private val onCommit: ((Long) -> Unit)? = null
 ) : Closeable {
 
-    /* ───────── lane writers (FdWriter only) ───────── */
+    /* ───────── lane writers ───────── */
     private val dataCh = Array<FileWriter>(k) { idx -> FdWriter(baseDir.resolve("data_$idx.akd")) }
     private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> FdWriter(baseDir.resolve("parity_$idx.akp")) }
 
@@ -42,39 +39,37 @@ class AkkStripeWriter(
     fun addBlock(block: ByteBuffer) {
         require(block.remaining() == BLOCK_SIZE)
 
-        try {
-            /* 1. write data lane */
-            dataCh[laneIdx].write(block.duplicate())
-            laneIdx++
+        val writer = dataCh[laneIdx]
+        writer.write(block)
+        writer.lastWritten = block
+        laneIdx++
 
-            if (laneIdx == k) {
-                // 2. parity
-                parityCoder?.let { coder ->
-                    val parity = coder.encode(dataCh.map { it.lastWritten!! })
-                    parity.forEachIndexed { i, buf ->
-                        parityCh[i].write(buf.duplicate())
-                        pool.release(buf)
-                    }
-                }
-                // 3. release per‑lane cached buffers
-                dataCh.forEach { writer ->
-                    writer.lastWritten?.let(pool::release)
-                    writer.lastWritten = null
-                }
-                laneIdx = 0
-                stripesWritten_++
-
-                // 4. group commit policy: N stripes or T µs
-                stripesSinceLastFlush++
-                val now = System.nanoTime()
-                val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
-                val dueByCount = stripesSinceLastFlush >= fsyncBatchN
-                if (autoFlush && (dueByCount || dueByTime)) {
-                    flush()
+        if (laneIdx == k) {
+            // 2. parity
+            parityCoder?.let { coder ->
+                val parity = coder.encode(dataCh.map { it.lastWritten!! })
+                parity.forEachIndexed { i, buf ->
+                    parityCh[i].write(buf)
+                    pool.release(buf)
                 }
             }
-        } finally {
-            pool.release(block)
+
+            // 3. release per‑lane cached buffers
+            dataCh.forEach { w ->
+                w.lastWritten?.let(pool::release)
+                w.lastWritten = null
+            }
+            laneIdx = 0
+            stripesWritten_++
+
+            // 4. group commit policy: N stripes or T µs
+            stripesSinceLastFlush++
+            val now = System.nanoTime()
+            val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
+            val dueByCount = stripesSinceLastFlush >= fsyncBatchN
+            if (autoFlush && (dueByCount || dueByTime)) {
+                flush()
+            }
         }
     }
 
@@ -132,7 +127,7 @@ class AkkStripeWriter(
     private class FdWriter(path: Path) : FileWriterEx {
 
         /** Native descriptor used for all pwrite(2) operations. */
-        private val fd: FileDescriptor = FileDescriptor.from(path.toString())
+        private val fd: io.netty.channel.unix.FileDescriptor = io.netty.channel.unix.FileDescriptor.from(path.toString())
 
         /** JDK-level handle kept solely for durable flushes. */
         private val raf = RandomAccessFile(path.toFile(), "rw")
