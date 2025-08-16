@@ -12,11 +12,11 @@ import java.util.concurrent.ConcurrentLinkedDeque
 /**
  * Levelled compactor (L0 -> L1).
  *
- * ポイント:
- *  - k-way マージを「同一キーをその場で束ねる」方式で実装（配列コピー/HashMap不要）
- *  - 最新 seq のみ採用、tombstone は drop
- *  - 出力はキー昇順でそのまま SST へ書き出し（後ソート不要）
- *  - Compact 完了時に manifest へ SSTSeal(level=1) と checkpoint("compact") を記録
+ * Highlights:
+ *  - Implements a k-way merge that groups identical keys in place (no array copies or HashMap).
+ *  - Retains only the newest sequence for each key and drops tombstones.
+ *  - Emits records in ascending key order directly to the SST (no post-merge sorting).
+ *  - On completion records `SSTSeal(level=1)` and `checkpoint("compact")` in the manifest.
  */
 class Compactor(
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>, // shared from AkkaraDB
@@ -43,12 +43,12 @@ class Compactor(
         while (levels.size <= 1) levels += ConcurrentLinkedDeque<SSTableReader>()
         levels[1].addFirst(merged)
 
-        // Manifest: L1 SST 封印 + checkpoint
+        // Manifest: record the new L1 SST and checkpoint
         manifest.sstSeal(
             level = 1,
             file = outPath.fileName.toString(),
             entries = outEntries.toLong(),
-            firstKeyHex = null,   // 爆速優先: 変換省略（必要なら後で付ける）
+            firstKeyHex = null,   // fast-path: omit first/last key conversion for now
             lastKeyHex = null
         )
         manifest.checkpoint("compact")
@@ -65,10 +65,11 @@ class Compactor(
     private data class Entry(val rec: Record, val src: Int)
 
     /**
-     * 複数 SST をキー昇順でストリーミング結合し、同一キー群から最大 seq の1件のみ採用。
-     * tombstone は drop。出力は自然にキー昇順になる。
+     * Stream-merge multiple SSTs in ascending key order, selecting only the
+     * highest sequence number per key group. Tombstones are dropped and the
+     * output naturally remains sorted.
      *
-     * @return Pair(生成した SSTableReader, 出力件数)
+     * @return Pair(generated SSTableReader, number of records output)
      */
     private fun mergeSstables(src: List<SSTableReader>, out: Path): Pair<SSTableReader, Int> {
         val heap = PriorityQueue<Entry> { a, b ->
