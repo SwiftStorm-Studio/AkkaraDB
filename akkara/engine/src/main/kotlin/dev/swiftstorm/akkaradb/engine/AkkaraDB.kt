@@ -139,6 +139,7 @@ class AkkaraDB private constructor(
 
     fun flush() = lock.write {
         wal.sealSegment()
+        stripeWriter.flush()
         wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
         memTable.flush()
         compactor.maybeCompact()
@@ -147,6 +148,7 @@ class AkkaraDB private constructor(
             stripe = stripeWriter.stripesWritten,
             lastSeq = memTable.lastSeq()
         )
+        wal.truncate()
     }
 
     fun lastSeq(): Long = memTable.lastSeq()
@@ -171,6 +173,7 @@ class AkkaraDB private constructor(
             flushThresholdBytes: Long = 64L * 1024 * 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
+            manifest.load()
             val stripe = AkkStripeWriter(
                 baseDir,
                 k,
@@ -241,10 +244,15 @@ class AkkaraDB private constructor(
                 }
             )
 
-            manifest.load()
             stripe.truncateTo(manifest.stripesWritten)
 
-            replayWal(baseDir.resolve("wal.log"), mem)
+            val cp = manifest.lastCheckpoint
+            replayWal(
+                baseDir.resolve("wal.log"),
+                mem,
+                cp?.stripe ?: 0L,
+                cp?.lastSeq ?: Long.MIN_VALUE
+            )
 
             val compactor = Compactor(levels, baseDir, manifest, pool = pool).also { it.maybeCompact() }
 
@@ -267,36 +275,6 @@ class AkkaraDB private constructor(
             }
             if (lv[0].isEmpty()) lv[0] = ConcurrentLinkedDeque()
             return lv
-        }
-
-
-        private fun loadExistingSstLevels(
-            baseDir: Path,
-            pool: BufferPool
-        ): MutableList<ConcurrentLinkedDeque<SSTableReader>> {
-            val levels = ArrayList<ConcurrentLinkedDeque<SSTableReader>>()
-            val l0 = ConcurrentLinkedDeque<SSTableReader>()
-            val l1 = ConcurrentLinkedDeque<SSTableReader>()
-
-            java.nio.file.Files.list(baseDir).use { stream ->
-                stream.filter { p -> p.fileName.toString().endsWith(".aksst") && p.fileName.toString().startsWith("sst_") }
-                    .sorted(Comparator.comparingLong<Path> { p ->
-                        java.nio.file.Files.getLastModifiedTime(p).toMillis()
-                    }.reversed())
-                    .forEach { p -> l0.addFirst(SSTableReader(p, pool)) }
-            }
-
-            java.nio.file.Files.list(baseDir).use { stream ->
-                stream.filter { p -> p.fileName.toString().endsWith(".aksst") && p.fileName.toString().startsWith("sst_compact_") }
-                    .sorted(Comparator.comparingLong<Path> { p ->
-                        java.nio.file.Files.getLastModifiedTime(p).toMillis()
-                    }.reversed())
-                    .forEach { p -> l1.addFirst(SSTableReader(p, pool)) }
-            }
-
-            levels += l0
-            if (l1.isNotEmpty()) levels += l1
-            return levels
         }
 
         private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {

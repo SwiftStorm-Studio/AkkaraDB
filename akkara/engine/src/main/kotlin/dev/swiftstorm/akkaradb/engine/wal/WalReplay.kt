@@ -16,30 +16,45 @@ import java.nio.file.StandardOpenOption.READ
  *  - A torn/truncated tail (e.g., crash mid-record) is treated as EOF
  *    and replay stops cleanly without throwing.
  */
-fun replayWal(path: Path, mem: MemTable) {
+fun replayWal(path: Path, mem: MemTable, startStripe: Long = 0, startSeq: Long = Long.MIN_VALUE) {
     if (!Files.exists(path)) return
 
     FileChannel.open(path, READ).use { ch ->
         val buf = ch.map(FileChannel.MapMode.READ_ONLY, 0, ch.size())
         var state = SegState.APPLY
+        var offset = 0
 
+        // First pass: locate offset after last checkpoint >= startStripe/startSeq
         while (buf.hasRemaining()) {
             val pos = buf.position()
-            val rec = try {
-                WalRecord.readFrom(buf) // validates lengths; ADD also validates CRC32C
-            } catch (_: Throwable) {
-                // Treat a torn/truncated tail as EOF and stop replay.
-                // We rewind to the start of the bad record for clarity and exit.
-                buf.position(pos)
-                break
+            val rec = try { WalRecord.readFrom(buf) } catch (_: Throwable) { buf.position(pos); break }
+            when (rec) {
+                WalRecord.Seal -> state = SegState.SEALED
+                is WalRecord.CheckPoint -> {
+                    if (state != SegState.SEALED) {
+                        error("WAL corrupted: CheckPoint without preceding Seal @ pos=${buf.position()}")
+                    }
+                    state = SegState.APPLY
+                    if (rec.stripeIdx > startStripe || (rec.stripeIdx == startStripe && rec.seqNo >= startSeq)) {
+                        offset = buf.position()
+                    }
+                }
+                else -> {}
             }
+        }
 
+        buf.position(offset)
+        state = SegState.APPLY
+
+        // Second pass: apply remaining records
+        while (buf.hasRemaining()) {
+            val pos = buf.position()
+            val rec = try { WalRecord.readFrom(buf) } catch (_: Throwable) { buf.position(pos); break }
             when (rec) {
                 is WalRecord.Add -> {
                     if (state == SegState.SEALED) {
                         error("WAL corrupted: Add encountered after Seal but before CheckPoint @ pos=${buf.position()}")
                     }
-                    // Apply to memtable
                     val kv = AkkRecordReader.read(rec.payload.asReadOnlyBuffer())
                     mem.put(kv)
                 }

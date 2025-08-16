@@ -43,6 +43,8 @@ class WalWriter(
     /** Scratch buffer for encoding a single record (owned by flusher thread). */
     private var scratch: ByteBuffer = pool.get(initCap)
 
+    private val writeLock = Any()
+
     /* ------------ command queue (writes + control barriers) ------------ */
 
     private sealed interface Cmd {
@@ -62,12 +64,16 @@ class WalWriter(
 
     /** Append an Akk‑encoded KV payload and wait until it is durably on disk. */
     fun append(record: ByteBuffer) {
-        enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer())).join()
+        synchronized(writeLock) {
+            enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer())).join()
+        }
     }
 
     /** Mark end of segment; write a real Seal and ensure durability. */
     fun sealSegment() {
-        enqueueWrite(WalRecord.Seal).join()
+        synchronized(writeLock) {
+            enqueueWrite(WalRecord.Seal).join()
+        }
     }
 
     /**
@@ -75,10 +81,22 @@ class WalWriter(
      * real Seal followed by CheckPoint, then force durability.
      */
     fun checkpoint(stripeIdx: Long, seqNo: Long) {
-        val f1 = enqueueWrite(WalRecord.Seal)
-        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
-        // Ensure both are durably committed (single group fsync if batched)
-        CompletableFuture.allOf(f1, f2).join()
+        synchronized(writeLock) {
+            barrier().join()
+            val f1 = enqueueWrite(WalRecord.Seal)
+            val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
+            CompletableFuture.allOf(f1, f2).join()
+        }
+    }
+
+    /** Truncate WAL after a successful checkpoint. */
+    fun truncate() {
+        synchronized(writeLock) {
+            barrier().join()
+            ch.truncate(0)
+            ch.force(true)
+            ch.position(0)
+        }
     }
 
     /* --------------------------- internals ---------------------------- */
@@ -90,7 +108,6 @@ class WalWriter(
     }
 
     /** Inserts a control barrier (no on‑disk record) and waits for fsync. */
-    @Suppress("unused")
     private fun barrier(): CompletableFuture<Void> =
         CompletableFuture<Void>().also { q.put(Barrier(it)) }
 
@@ -187,7 +204,6 @@ class WalWriter(
 }
 
 /* -------- size estimator aligned with the current WalRecord encoding -------- */
-// WalWriter.kt の末尾（置き換え）
 private fun WalRecord.estimateSize(): Int =
     when (this) {
         is WalRecord.Seal -> 1                    // [tag]
