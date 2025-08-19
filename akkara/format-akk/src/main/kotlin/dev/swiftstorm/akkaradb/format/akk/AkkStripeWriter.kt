@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
+import io.netty.channel.unix.FileDescriptor
 import java.io.Closeable
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -127,7 +128,7 @@ class AkkStripeWriter(
     private class FdWriter(path: Path) : FileWriterEx {
 
         /** Native descriptor used for all pwrite(2) operations. */
-        private val fd: io.netty.channel.unix.FileDescriptor = io.netty.channel.unix.FileDescriptor.from(path.toString())
+        private val fd: FileDescriptor = FileDescriptor.from(path.toString())
 
         /** JDK-level handle kept solely for durable flushes. */
         private val raf = RandomAccessFile(path.toFile(), "rw")

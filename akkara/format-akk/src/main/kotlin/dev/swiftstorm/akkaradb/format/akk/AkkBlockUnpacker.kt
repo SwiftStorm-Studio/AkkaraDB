@@ -6,86 +6,84 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.zip.CRC32C
 
 /**
- * Split a 32 KiB *block* produced by [AkkBlockPackerDirect] into
- * its individual record-payload slices.
+ * Split a 32 KiB block produced by [AkkBlockPackerDirect] into
+ * individual record-payload slices (read-only views).
  *
- * *Input layout*
- * ```
- * [4B len] [payload bytes ……………] [0-padding …] [4B CRC32C]
- *  ^                               ^
- *  |                               +-- PAYLOAD_LIMIT + 4
- *  +-- BLOCK header
- * ```
+ * Portable on-disk layout (endianness fixed to BIG_ENDIAN):
+ *   [0..3]     payloadLen: Int
+ *   [4..4+N)   payload bytes (sequence of records: [u32 len][bytes])
+ *   [..]       zero padding up to PAYLOAD_LIMIT (ignored on read)
+ *   [end-4..]  crc32c over bytes [0 .. 4+payloadLen)
  *
- * *Output*
- *  – Each record is returned as a **read-only slice** that shares the same
- *    backing memory with the original block. The caller remains responsible
- *    for releasing the original `block` back to the [BufferPool] *after*
- *    it is sure the upper layers no longer access those slices.
- *
- * Memory-safety: **The block is released immediately if a corruption
- * is detected (length/CRC mismatch); otherwise ownership stays with the
- * caller.**
+ * Ownership: the caller retains ownership of the backing block buffer and is
+ * responsible for releasing it back to the [BufferPool] after consumers stop
+ * using the returned slices. This unpacker only releases the block on error.
  */
 class AkkBlockUnpacker(
     private val pool: BufferPool = Pools.io()
 ) {
-
     private val crc = CRC32C()
 
     fun unpack(block: ByteBuffer): List<ByteBuffer> {
-        try {
-            /* -------- 1. header -------- */
-            if (block.remaining() != BLOCK_SIZE)
-                throw CorruptedBlockException("block size != 32 KiB (was ${block.remaining()})")
+        // Never mutate the caller's buffer directly
+        val base = block.duplicate().order(ByteOrder.BIG_ENDIAN)
 
-            val payloadLen = block.getInt(0)
-            if (payloadLen < 0 || payloadLen > PAYLOAD_LIMIT)
-                throw CorruptedBlockException("payloadLen=$payloadLen out of bounds")
+        /* -------- 1) basic structure checks -------- */
+        if (base.capacity() != BLOCK_SIZE) {
+            pool.release(block)
+            throw CorruptedBlockException("block capacity != $BLOCK_SIZE (was ${base.capacity()})")
+        }
 
-            /* -------- 2. CRC check -------- */
-            crc.reset()
-            val dup = block.duplicate()
-            dup.limit(4 + payloadLen).position(0)   // [len][payload]
-            crc.update(dup)
+        val payloadLen = base.getInt(0)
+        if (payloadLen < 0 || payloadLen > PAYLOAD_LIMIT) {
+            pool.release(block)
+            throw CorruptedBlockException("payloadLen=$payloadLen out of bounds [0,$PAYLOAD_LIMIT]")
+        }
 
-            val storedCrc = block.getInt(PAYLOAD_LIMIT + 4)
-            if (crc.value.toInt() != storedCrc)
-                throw CorruptedBlockException("CRC mismatch (calc=${crc.value} stored=$storedCrc)")
+        /* -------- 2) CRC32C over [0 .. 4+payloadLen) -------- */
+        crc.reset()
+        val crcRegion = base.duplicate().apply {
+            position(0); limit(4 + payloadLen)
+        }
+        crc.update(crcRegion)
 
-            /* -------- 3. slice payload area -------- */
-            val payloadArea = block.duplicate()
-                .position(4)                 // skip len
-                .limit(4 + payloadLen)
-                .slice()
-                .asReadOnlyBuffer()
+        val storedCrc = base.getInt(PAYLOAD_LIMIT + 4)
+        if (crc.value.toInt() != storedCrc) {
+            pool.release(block)
+            throw CorruptedBlockException("CRC mismatch (calc=${crc.value} stored=$storedCrc)")
+        }
 
-            /* -------- 4. split into records -------- */
-            val records = ArrayList<ByteBuffer>(16)
-            var pos = 0
-            while (pos < payloadLen) {
-                val recLen = payloadArea.getInt(pos)
-                if (recLen <= 0 || pos + 4 + recLen > payloadLen)
-                    throw CorruptedBlockException("record length out of range (recLen=$recLen pos=$pos)")
+        /* -------- 3) slice payload area (read-only) -------- */
+        val payloadView = base.duplicate().apply {
+            position(4); limit(4 + payloadLen)
+        }.slice().order(ByteOrder.BIG_ENDIAN).asReadOnlyBuffer()
 
-                val rec = payloadArea.duplicate()
-                    .position(pos + 4)
-                    .limit(pos + 4 + recLen)
-                    .slice()
-                    .asReadOnlyBuffer()
-
-                records += rec
-                pos += 4 + recLen
+        /* -------- 4) split into length-prefixed records -------- */
+        val records = ArrayList<ByteBuffer>(16)
+        var pos = 0
+        while (pos < payloadLen) {
+            if (pos + 4 > payloadLen) {
+                pool.release(block)
+                throw CorruptedBlockException("truncated record header at pos=$pos")
+            }
+            val recLen = payloadView.getInt(pos)
+            if (recLen <= 0 || pos + 4 + recLen > payloadLen) {
+                pool.release(block)
+                throw CorruptedBlockException("record length out of range (recLen=$recLen pos=$pos)")
             }
 
-            return records
-        } catch (ex: Exception) {
-            /* On any corruption, immediately recycle the buffer */
-            pool.release(block)
-            throw ex
+            val rec = payloadView.duplicate().apply {
+                position(pos + 4); limit(pos + 4 + recLen)
+            }.slice().asReadOnlyBuffer()
+
+            records += rec
+            pos += 4 + recLen
         }
+
+        return records
     }
 }

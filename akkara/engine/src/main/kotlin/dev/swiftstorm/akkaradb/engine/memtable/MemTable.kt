@@ -53,6 +53,8 @@ class MemTable(
 
     fun get(key: ByteBuffer): Record? = lock.read { mapRef.get()[key] }
 
+    fun getAll(): List<Record> = lock.read { mapRef.get().values.toList() }
+
     fun put(record: Record) {
         val triggerFlush = lock.write {
             val keyCopy = record.key.duplicate().apply { rewind() }.asReadOnlyBuffer()
@@ -136,5 +138,32 @@ class MemTable(
         }
     }
 
+    fun iterator(from: ByteBuffer? = null, toExclusive: ByteBuffer? = null): Iterator<Record> {
+        val snapshot: List<Record> = lock.read { mapRef.get().values.toList() }
+
+        val filteredSorted = snapshot.asSequence()
+            .filter { r ->
+                val k = r.key.duplicate().apply { rewind() }
+                val geFrom = from?.let { cmp(k, it) >= 0 } ?: true
+                val ltTo = toExclusive?.let { cmp(k, it) < 0 } ?: true
+                geFrom && ltTo
+            }
+            .sortedWith { a, b -> cmp(a.key, b.key) }
+            .toList()
+
+        return filteredSorted.iterator()
+    }
+
     private fun sizeOf(r: Record): Long = (r.key.remaining() + r.value.remaining() + Long.SIZE_BYTES).toLong()
+
+    private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {
+        val aa = a.duplicate().apply { rewind() }
+        val bb = b.duplicate().apply { rewind() }
+        while (aa.hasRemaining() && bb.hasRemaining()) {
+            val x = aa.get().toInt() and 0xFF
+            val y = bb.get().toInt() and 0xFF
+            if (x != y) return x - y
+        }
+        return aa.remaining() - bb.remaining()
+    }
 }

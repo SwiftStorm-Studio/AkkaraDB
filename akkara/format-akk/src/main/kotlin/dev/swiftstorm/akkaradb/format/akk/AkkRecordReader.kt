@@ -1,7 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.Record
-import dev.swiftstorm.akkaradb.format.api.RecordReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -13,35 +12,44 @@ import java.nio.ByteOrder
  *
  * The buffer's position must point to the start of a record.
  */
-object AkkRecordReader : RecordReader {
-
+object AkkRecordReader {
+    // Header layout: [u16 keyLen][u32 valueLen][u64 seqNo][u8 flags]
     private const val HEADER_SIZE = 2 + 4 + 8 + 1
 
-    override fun read(buf: ByteBuffer): Record {
-        // Ensure we have at least a header
-        require(buf.remaining() >= HEADER_SIZE) { "buffer underflow: need $HEADER_SIZE bytes for header, have ${buf.remaining()}" }
+    /**
+     * Decode a Record from a buffer.
+     * The buffer is not mutated (uses duplicate + slice).
+     *
+     * @param buf source buffer containing one encoded record
+     * @return parsed Record with key/value slices (read-only views)
+     */
+    fun read(buf: ByteBuffer): Record {
+        val leBuf = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
-        buf.order(ByteOrder.LITTLE_ENDIAN)
+        require(leBuf.remaining() >= HEADER_SIZE) {
+            "Buffer too small for record header"
+        }
 
-        // ---- header ----
-        val kLen = (buf.short.toInt() and 0xFFFF)
-        val vLen = buf.int
-        val seq = buf.long
-        val flags = buf.get()
+        val kLen = leBuf.short.toInt() and 0xFFFF
+        val vLen = leBuf.int
+        require(kLen >= 0 && vLen >= 0) {
+            "Negative length (k=$kLen, v=$vLen)"
+        }
 
-        require(kLen >= 0) { "negative kLen $kLen" }
-        require(vLen >= 0) { "negative vLen $vLen" }
+        val seqNo = leBuf.long
+        val flags = leBuf.get()
 
-        // ---- key slice ----
-        require(buf.remaining() >= kLen) { "truncated key: need $kLen, have ${buf.remaining()}" }
-        val keySlice = buf.slice().apply { limit(kLen) }.asReadOnlyBuffer()
-        buf.position(buf.position() + kLen)
+        require(leBuf.remaining() >= kLen + vLen) {
+            "Buffer too small for record payload (k=$kLen, v=$vLen)"
+        }
 
-        // ---- value slice ----
-        require(buf.remaining() >= vLen) { "truncated value: need $vLen, have ${buf.remaining()}" }
-        val valueSlice = buf.slice().apply { limit(vLen) }.asReadOnlyBuffer()
-        buf.position(buf.position() + vLen)
+        // Slice key/value without copying
+        val keySlice = leBuf.slice(0, kLen).asReadOnlyBuffer()
+        leBuf.position(leBuf.position() + kLen)
 
-        return Record(keySlice, valueSlice, seq, flags = flags)
+        val valSlice = leBuf.slice(0, vLen).asReadOnlyBuffer()
+
+        // Use public constructor (which computes keyHash)
+        return Record(keySlice, valSlice, seqNo, flags)
     }
 }

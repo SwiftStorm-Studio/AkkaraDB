@@ -79,7 +79,7 @@ subprojects {
                 implementation(project(":akkara-format-api"))
                 implementation(project(":akkara-format-akk"))
 
-                implementation("net.ririfa:binpack:0.2.0")
+                implementation("net.ririfa:binpack:0.3.2")
 
                 implementation("org.objenesis:objenesis:3.4")
                 implementation(kotlin("reflect"))
@@ -111,6 +111,8 @@ subprojects {
                 implementation(project(":akkara-engine"))
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
+
+                implementation("net.ririfa:binpack:0.3.2")
 
                 implementation(kotlin("test"))
                 implementation(kotlin("serialization"))

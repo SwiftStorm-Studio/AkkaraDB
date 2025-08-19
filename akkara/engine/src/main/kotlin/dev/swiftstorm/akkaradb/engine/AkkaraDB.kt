@@ -83,7 +83,7 @@ class AkkaraDB private constructor(
      * 3. Stripe cache hit
      * 4. Stripe scan fallback
      */
-    fun get(key: ByteBuffer): ByteBuffer? {
+    fun getV(key: ByteBuffer): ByteBuffer? {
         fun roDup(bb: ByteBuffer) = bb.duplicate().apply { rewind() }
 
         val k = roDup(key)
@@ -127,6 +127,80 @@ class AkkaraDB private constructor(
         return null
     }
 
+    fun get(key: ByteBuffer): Record? {
+        val v = getV(key) ?: return null
+        return Record(key, v, memTable.lastSeq())
+    }
+
+    fun scan(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
+        val its = ArrayList<PeekingIter>()
+        // ---- MemTable
+        memTable.iterator(opts.from, opts.toExclusive).let { its += PeekingIter(it) }
+        // ---- SSTables
+        for (level in levels) {
+            for (sst in level) {
+                its += PeekingIter(sst.iterator(opts.from, opts.toExclusive))
+            }
+        }
+
+        val heap = PriorityQueue<PeekingIter> { a, b ->
+            cmp(a.peekKey(), b.peekKey())
+        }
+        its.filter { it.hasNext() }.forEach(heap::add)
+
+        var emitted = 0
+        var lastKey: ByteBuffer? = null
+
+        while (heap.isNotEmpty()) {
+            val head = heap.poll()
+            val key = head.peekKey()
+
+            if (opts.prefix != null) {
+                val pfx = opts.prefix.duplicate().apply { rewind() }
+                val kdup = key.duplicate().apply { rewind() }
+                if (!startsWith(kdup, pfx)) {
+                    continue
+                }
+            }
+
+            var best: Record? = null
+            fun consider(r: Record) {
+                if (best == null || r.seqNo > best!!.seqNo) best = r
+            }
+
+            consider(head.next())
+            if (head.hasNext()) heap.add(head)
+
+            val tmp = ArrayList<PeekingIter>()
+            while (heap.isNotEmpty() && cmp(heap.peek().peekKey(), key) == 0) {
+                val it = heap.poll()
+                consider(it.next())
+                if (it.hasNext()) tmp += it
+            }
+            tmp.forEach(heap::add)
+
+            val chosen = best!!
+            val isTomb = chosen.isTombstone
+
+            if (opts.toExclusive != null && cmp(key, opts.toExclusive) >= 0) break
+
+            if (opts.prefix != null && !startsWith(key.duplicate().apply { rewind() }, opts.prefix.duplicate().apply { rewind() })) {
+                continue
+            }
+
+            if (!opts.includeTombstone && isTomb) {
+                continue
+            } else {
+                if (lastKey == null || cmp(lastKey, key) != 0) {
+                    yield(chosen)
+                    emitted++
+                    lastKey = key.duplicate().apply { rewind() }
+                    if (opts.limit != null && emitted >= opts.limit) break
+                }
+            }
+        }
+    }
+
     /* ───────── write‑path ───────── */
     fun put(rec: Record) = lock.write {
         pool.borrow(recordWriter.computeMaxSize(rec)) { buf ->
@@ -152,6 +226,8 @@ class AkkaraDB private constructor(
     }
 
     fun lastSeq(): Long = memTable.lastSeq()
+
+    fun nextSeq(): Long = memTable.nextSeq()
 
     override fun close() {
         flush(); wal.close(); stripeWriter.close()
@@ -293,6 +369,45 @@ class AkkaraDB private constructor(
             val arr = ByteArray(dup.remaining())
             dup.get(arr)
             return BASE64_TL.get().encodeToString(arr)
+        }
+    }
+
+    private fun startsWith(key: ByteBuffer, prefix: ByteBuffer): Boolean {
+        if (key.remaining() < prefix.remaining()) return false
+        val k = key.duplicate()
+        val p = prefix.duplicate()
+        while (p.hasRemaining()) {
+            if ((k.get().toInt() and 0xFF) != (p.get().toInt() and 0xFF)) return false
+        }
+        return true
+    }
+
+    data class ScanOptions(
+        val from: ByteBuffer? = null,
+        val toExclusive: ByteBuffer? = null,
+        val prefix: ByteBuffer? = null,
+        val limit: Int? = null,
+        val includeTombstone: Boolean = false
+    )
+
+    private class PeekingIter(it: Iterator<Record>) : Iterator<Record> {
+        private var next: Record? = null
+        private val src = it
+
+        init {
+            advance()
+        }
+
+        private fun advance() {
+            next = if (src.hasNext()) src.next() else null
+        }
+
+        fun peekKey(): ByteBuffer = next!!.key.duplicate().apply { rewind() }
+        override fun hasNext(): Boolean = next != null
+        override fun next(): Record {
+            val r = next ?: throw NoSuchElementException()
+            advance()
+            return r
         }
     }
 }

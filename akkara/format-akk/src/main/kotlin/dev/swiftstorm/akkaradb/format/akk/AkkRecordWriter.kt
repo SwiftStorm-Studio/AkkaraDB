@@ -1,7 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.Record
-import dev.swiftstorm.akkaradb.format.api.RecordWriter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
@@ -16,47 +15,51 @@ import java.nio.ByteOrder
  *  - `flags` is a raw u8 as stored in [Record.flags].
  *  - The caller must ensure `dest` has enough remaining space.
  */
-object AkkRecordWriter : RecordWriter {
+object AkkRecordWriter {
+    // Header layout: [u16 keyLen][u32 valueLen][u64 seqNo][u8 flags]
+    private const val HEADER_SIZE = 2 + 4 + 8 + 1
 
-    private const val HEADER_SIZE = 2 + 4 + 8 + 1   // = 15 bytes
-    private const val U16_MAX = 0xFFFF
+    /**
+     * Encode a record into the destination buffer.
+     * The record’s key/value buffers are duplicated as read-only views,
+     * so original buffer positions remain untouched.
+     *
+     * @param record source Record
+     * @param dest destination buffer (must have enough remaining space)
+     */
+    fun write(record: Record, dest: ByteBuffer) {
+        val kLen = record.key.remaining()
+        val vLen = record.value.remaining()
 
-    override fun write(record: Record, dest: ByteBuffer): Int {
-        val startPos = dest.position()
+        require(kLen <= 0xFFFF) { "Key too long ($kLen > 65535)" }
+        require(vLen >= 0) { "Negative value length" }
+        require(dest.remaining() >= HEADER_SIZE + kLen + vLen) {
+            "Destination too small for record"
+        }
 
-        // Create stable, read‑only views of key/value
-        val keyBuf = record.key.duplicate().apply { position(0); limit(record.key.remaining()) }.asReadOnlyBuffer()
-        val valBuf = record.value.duplicate().apply { position(0); limit(record.value.remaining()) }.asReadOnlyBuffer()
+        val leDest = dest.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
-        val kLen = keyBuf.remaining()
-        val vLen = valBuf.remaining()
+        // Write header
+        leDest.putShort(kLen.toShort())
+        leDest.putInt(vLen)
+        leDest.putLong(record.seqNo)  // Note: raw bits preserved, signed Long
+        leDest.put(record.flags.toByte())
 
-        require(kLen <= U16_MAX) { "key length $kLen exceeds u16 limit ($U16_MAX)" }
-        // vLen is u32; ByteBuffer.putInt covers 0..2^31-1 for positive values; negative would wrap.
-        // We just guard non‑negative and leave >2GiB to the caller/environment limits.
-        require(vLen >= 0) { "value length must be non‑negative" }
+        // Copy payloads
+        val keyBuf = record.key.asReadOnlyBuffer().rewind()
+        val valBuf = record.value.asReadOnlyBuffer().rewind()
 
-        // Ensure capacity (optional but helpful for early error)
-        val needed = HEADER_SIZE + kLen + vLen
-        require(dest.remaining() >= needed) { "buffer too small: need $needed, have ${dest.remaining()}" }
+        leDest.put(keyBuf)
+        leDest.put(valBuf)
 
-        // Write header in Little‑Endian
-        dest.order(ByteOrder.LITTLE_ENDIAN)
-        dest.putShort(kLen.toShort())        // u16
-        dest.putInt(vLen)                    // u32 (non‑negative int)
-        dest.putLong(record.seqNo)           // u64 LE (signed in JVM, raw bits preserved)
-        dest.put(record.flags)               // u8
-
-        // Write payload
-        dest.put(keyBuf)
-        dest.put(valBuf)
-
-        return dest.position() - startPos
+        // Advance original dest as well
+        dest.position(dest.position() + HEADER_SIZE + kLen + vLen)
     }
 
-    override fun computeMaxSize(record: Record): Int {
-        val k = record.key.remaining()
-        val v = record.value.remaining()
-        return HEADER_SIZE + k + v
+    /**
+     * Compute the maximum buffer size required to store this record.
+     */
+    fun computeMaxSize(record: Record): Int {
+        return HEADER_SIZE + record.key.remaining() + record.value.remaining()
     }
 }

@@ -38,7 +38,7 @@ class AkkStripeReader(
      * Reads one stripe and returns a [Stripe] with payload slices and lane blocks.
      * Returns `null` on EOF.
      */
-    override fun readStripe(): StripeReader.Stripe? {
+    override fun readStripe(): Stripe? {
         /* 1. read data lanes */
         val laneBlocks = MutableList<ByteBuffer?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
@@ -91,37 +91,37 @@ class AkkStripeReader(
         return StripeReader.Stripe(payloads, nonNullBlocks, pool)
     }
 
-    /**
-     * Scans stripes newest‑first until [key] is found or EOF.
-     */
-    fun searchLatestStripe(key: ByteBuffer, untilStripe: Long): StripeHit? {
-        var idx = 0L
-        val rr = AkkRecordReader
-
-        while (true) {
-            val stripe = readStripe() ?: break
-            stripe.use { // AutoCloseable → release lane blocks after use
-                val stripeId = untilStripe - idx
-                idx++
-
-                val recs = ArrayList<Record>()
-                var hit: Record? = null
-                for (p in stripe.payloads) {
-                    val r = rr.read(p.duplicate())
-                    recs.add(r)
-                    if (hit == null && r.key.compareTo(key) == 0) {
-                        hit = r
-                    }
-                }
-                if (hit != null) return StripeHit(hit, stripeId, recs)
-            }
-        }
-        return null
-    }
-
     override fun close() {
         (dataCh + parityCh).forEach { it.close() }
     }
 
-    data class StripeHit(val record: Record, val stripeId: Long, val blocks: List<Record>)
+    // 型を拡張
+    data class StripeHit(
+        val record: Record,
+        val stripeId: Long,
+        val blocks: List<Record>,
+        val stripe: Stripe
+    ) : AutoCloseable {
+        override fun close() = stripe.close()
+    }
+
+    fun searchLatestStripe(key: ByteBuffer, untilStripe: Long): StripeHit? {
+        var idx = 0L
+        val rr = AkkRecordReader
+        while (true) {
+            val stripe = readStripe() ?: break
+            val stripeId = untilStripe - idx; idx++
+            val recs = ArrayList<Record>()
+            var hit: Record? = null
+            for (p in stripe.payloads) {
+                val r = rr.read(p.duplicate())
+                recs.add(r)
+                if (hit == null && r.key.compareTo(key) == 0) hit = r
+            }
+            if (hit != null) return StripeHit(hit, stripeId, recs, stripe)
+            stripe.close()
+        }
+        return null
+    }
+
 }

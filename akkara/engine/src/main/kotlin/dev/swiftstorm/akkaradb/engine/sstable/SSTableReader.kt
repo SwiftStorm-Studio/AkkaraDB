@@ -157,6 +157,121 @@ class SSTableReader(
         }
     }
 
+    fun iterator(
+        from: ByteBuffer? = null,
+        toExclusive: ByteBuffer? = null
+    ): Iterator<Record> = object : Iterator<Record> {
+        var idxPos = 0                   // outer index entry
+        var recPosInBlock = 0            // record index inside current block
+        var dataStart = 0
+        var offsets: IntArray = IntArray(0)
+        var payload: ByteBuffer? = null
+        var blockOff: Long = -1
+        var finished = false
+        val rr = AkkRecordReader
+
+        private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {
+            val aa = a.duplicate().apply { rewind() }
+            val bb = b.duplicate().apply { rewind() }
+            while (aa.hasRemaining() && bb.hasRemaining()) {
+                val x = aa.get().toInt() and 0xFF
+                val y = bb.get().toInt() and 0xFF
+                if (x != y) return x - y
+            }
+            return aa.remaining() - bb.remaining()
+        }
+
+        private fun loadNextBlock(): Boolean {
+            payload = null
+            while (true) {
+                if (idxPos >= index.countEntries()) return false
+
+                blockOff = index.offsetAt(idxPos)
+                idxPos++
+
+                // ---- read block header + payload, verify CRC ----
+                val len = pool.borrow(4) { hdr ->
+                    hdr.clear(); ch.read(hdr, blockOff); hdr.flip(); hdr.int
+                }
+                if (len !in 0..BLOCK_SIZE) continue
+                val total = 4 + len + 4
+                val mapped = ch.map(FileChannel.MapMode.READ_ONLY, blockOff, total.toLong())
+                    .order(ByteOrder.BIG_ENDIAN)
+                val p = mapped.slice().apply { position(4); limit(4 + len) }
+                val stored = mapped.getInt(4 + len)
+                crc32TL.get().run { reset(); update(p.duplicate()); if (value.toInt() != stored) error("CRC mismatch @$blockOff") }
+
+                val mi = p.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+                val count = mi.short.toInt() and 0xFFFF
+                if (count == 0) {
+                    payload = null; continue
+                }
+
+                offsets = IntArray(count) { mi.int }
+                dataStart = p.position() + 2 + 4 * count
+                payload = p
+
+                recPosInBlock = 0
+                if (from != null) {
+                    recPosInBlock = lowerBoundInBlock(from)
+                    if (recPosInBlock >= offsets.size) {
+                        payload = null
+                        continue
+                    }
+                }
+                return true
+            }
+        }
+
+        private fun lowerBoundInBlock(from: ByteBuffer): Int {
+            val p = payload ?: return 0
+            var lo = 0
+            var hi = offsets.size
+            while (lo < hi) {
+                val mid = (lo + hi) ushr 1
+                val recPos = dataStart + offsets[mid]
+                val recBuf = p.duplicate().order(ByteOrder.LITTLE_ENDIAN).apply { position(recPos) }
+                val r = rr.read(recBuf)
+                val c = cmp(r.key, from)
+                if (c < 0) lo = mid + 1 else hi = mid
+            }
+            return lo
+        }
+
+        override fun hasNext(): Boolean {
+            if (finished) return false
+
+            while (payload == null || recPosInBlock >= offsets.size) {
+                if (!loadNextBlock()) {
+                    finished = true; return false
+                }
+            }
+
+            if (toExclusive != null) {
+                val p = payload!!
+                val recPos = dataStart + offsets[recPosInBlock]
+                val recBuf = p.duplicate().order(ByteOrder.LITTLE_ENDIAN).apply { position(recPos) }
+                val r = rr.read(recBuf)
+                if (cmp(r.key, toExclusive) >= 0) {
+                    finished = true
+                    return false
+                }
+            }
+            return true
+        }
+
+        override fun next(): Record {
+            if (!hasNext()) throw NoSuchElementException()
+            val p = payload!!
+            val recPos = dataStart + offsets[recPosInBlock++]
+            val recBuf = p.duplicate().order(ByteOrder.LITTLE_ENDIAN).apply { position(recPos) }
+            val r = rr.read(recBuf)
+
+            if (toExclusive != null && cmp(r.key, toExclusive) >= 0) finished = true
+            return r
+        }
+    }
+
     private fun miniIndexFor(blockOff: Long, payload: ByteBuffer): IntArray {
         synchronized(miniCache) { miniCache[blockOff]?.get()?.let { return it } }
         val mi = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
