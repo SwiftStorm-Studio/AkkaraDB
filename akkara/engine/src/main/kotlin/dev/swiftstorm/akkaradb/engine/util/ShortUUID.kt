@@ -131,7 +131,7 @@ fun UUID.toShortUUID(): ShortUUID = ShortUUID(this)
  * Converts a ShortUUID to a UUID.
  * @return The UUID representation of the ShortUUID.
  */
-fun ShortUUID.toUUID(): UUID = UUID.fromString(toUUIDString())
+fun ShortUUID.toUUID(): UUID = this.uuid
 
 /**
  * Converts a ByteBuffer (16 bytes) to a ShortUUID.

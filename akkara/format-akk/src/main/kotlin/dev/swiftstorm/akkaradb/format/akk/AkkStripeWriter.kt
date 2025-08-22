@@ -25,8 +25,8 @@ class AkkStripeWriter(
 ) : Closeable {
 
     /* ───────── lane writers ───────── */
-    private val dataCh = Array<FileWriter>(k) { idx -> FdWriter(baseDir.resolve("data_$idx.akd")) }
-    private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> FdWriter(baseDir.resolve("parity_$idx.akp")) }
+    private val dataCh = Array<FileWriter>(k) { idx -> makeWriter(baseDir.resolve("data_$idx.akd")) }
+    private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> makeWriter(baseDir.resolve("parity_$idx.akp")) }
 
     /* ───────── state ───────── */
     private var laneIdx = 0
@@ -104,6 +104,29 @@ class AkkStripeWriter(
         parityCh.forEach(FileWriter::close)
     }
 
+    private fun makeWriter(path: Path): FileWriter {
+        val force = System.getProperty("akkaradb.writer")?.lowercase()
+        if (isWindows()) {
+            if (force == "fd") {
+                /** **/
+            }
+            return JdkAggWriter(path, pool)
+        }
+
+        return when (force) {
+            "fd" -> FdWriter(path)
+            "jdk" -> JdkAggWriter(path, pool)
+            else -> try {
+                FdWriter(path)
+            } catch (_: Throwable) {
+                JdkAggWriter(path, pool)
+            }
+        }
+    }
+
+    private fun isWindows(): Boolean =
+        System.getProperty("os.name")?.startsWith("Windows", ignoreCase = true) == true
+
     /* ───────── writer interfaces ───────── */
     private interface FileWriter : Closeable {
         var lastWritten: ByteBuffer?
@@ -173,5 +196,104 @@ class AkkStripeWriter(
             ch.truncate(size)
             seek(size)
         }
+    }
+
+    /**
+     * Portable fast path: JDK FileChannel with 1MiB lane aggregation and fdatasync batching.
+     *
+     * Strategy:
+     * - append into a lane-local 1MiB DirectByteBuffer (32KiB×32)
+     * - when full, do a single write() at the current lane position
+     * - force(false) only on group‑commit boundaries (outer flush())
+     */
+    private class JdkAggWriter(
+        path: Path,
+        private val pool: BufferPool,
+        laneBufferSize: Int = BLOCK_SIZE * 32, // 1 MiB per lane
+        private val preallocStep: Long = 64L * 1024 * 1024 // 64 MiB coarse prealloc (best-effort)
+    ) : FileWriterEx {
+        private val raf = RandomAccessFile(path.toFile(), "rw")
+        private val ch: FileChannel = raf.channel
+        private var pos: Long = ch.size()
+        private var preallocLimit: Long = roundUp(pos, preallocStep)
+
+        // lane-local aggregation buffer (Direct)
+        private val agg: ByteBuffer = pool.get(laneBufferSize)
+
+        override var lastWritten: ByteBuffer? = null
+
+        override fun write(buf: ByteBuffer) {
+            lastWritten = buf
+            val cap = agg.capacity()
+            val need = buf.remaining()
+
+            if (need >= cap) {
+                flushLane()
+                writeDirect(buf)
+                return
+            }
+            if (agg.remaining() < need) {
+                flushLane()
+            }
+            agg.put(buf)
+        }
+
+        override fun flush() {
+            flushLane()
+            ch.force(false)
+        }
+
+        override fun seek(newPos: Long) {
+            flushLane()
+            pos = newPos
+        }
+
+        override fun truncate(size: Long) {
+            flushLane()
+            ch.truncate(size)
+            pos = size
+            preallocLimit = roundUp(size, preallocStep)
+        }
+
+        override fun close() {
+            try {
+                flush()
+            } finally {
+                ch.close(); raf.close()
+                pool.release(agg)
+            }
+        }
+
+        private fun writeDirect(src: ByteBuffer) {
+            ensurePreallocated(pos + src.remaining())
+            var rem = src.remaining()
+            while (rem > 0) {
+                val n = ch.write(src, pos)
+                if (n <= 0) throw IOException("short write ($n) @pos=$pos (direct)")
+                pos += n
+                rem -= n
+            }
+        }
+
+        private fun flushLane() {
+            if (agg.position() == 0) return
+            ensurePreallocated(pos + agg.position())
+            agg.flip()
+            while (agg.hasRemaining()) {
+                val n = ch.write(agg, pos)
+                if (n <= 0) throw IOException("short write ($n) @pos=$pos")
+                pos += n
+            }
+            agg.clear()
+        }
+
+        private fun ensurePreallocated(requiredEnd: Long) {
+            if (requiredEnd <= preallocLimit) return
+            val newLimit = roundUp(requiredEnd + preallocStep, preallocStep)
+            raf.setLength(newLimit)
+            preallocLimit = newLimit
+        }
+
+        private fun roundUp(v: Long, step: Long): Long = ((v + step - 1) / step) * step
     }
 }

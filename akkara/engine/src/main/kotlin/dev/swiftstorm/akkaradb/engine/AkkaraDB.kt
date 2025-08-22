@@ -38,7 +38,7 @@ class AkkaraDB private constructor(
     private val memTable: MemTable,
     private val stripeWriter: AkkStripeWriter,
     private val manifest: AkkManifest,
-    private val wal: WalWriter,
+    val wal: WalWriter,
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>,
     private val pool: BufferPool = Pools.io(),
     private val compactor: Compactor
@@ -132,7 +132,7 @@ class AkkaraDB private constructor(
         return Record(key, v, memTable.lastSeq())
     }
 
-    fun scan(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
+    fun getAll(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
         val its = ArrayList<PeekingIter>()
         // ---- MemTable
         memTable.iterator(opts.from, opts.toExclusive).let { its += PeekingIter(it) }

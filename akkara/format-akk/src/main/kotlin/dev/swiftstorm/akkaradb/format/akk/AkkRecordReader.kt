@@ -13,43 +13,36 @@ import java.nio.ByteOrder
  * The buffer's position must point to the start of a record.
  */
 object AkkRecordReader {
-    // Header layout: [u16 keyLen][u32 valueLen][u64 seqNo][u8 flags]
-    private const val HEADER_SIZE = 2 + 4 + 8 + 1
-
-    /**
-     * Decode a Record from a buffer.
-     * The buffer is not mutated (uses duplicate + slice).
-     *
-     * @param buf source buffer containing one encoded record
-     * @return parsed Record with key/value slices (read-only views)
-     */
     fun read(buf: ByteBuffer): Record {
-        val leBuf = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val le = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val start = le.position()
 
-        require(leBuf.remaining() >= HEADER_SIZE) {
-            "Buffer too small for record header"
+        val kLen = le.short.toInt() and 0xFFFF
+        val vLen = le.int
+        val seq = le.long
+        val flags = le.get()
+
+        val kPos = le.position()
+        val keyRO = run {
+            val tmp = le.duplicate()
+            tmp.limit(kPos + kLen)
+            tmp.position(kPos)
+            tmp.slice()
         }
+        le.position(kPos + kLen)
 
-        val kLen = leBuf.short.toInt() and 0xFFFF
-        val vLen = leBuf.int
-        require(kLen >= 0 && vLen >= 0) {
-            "Negative length (k=$kLen, v=$vLen)"
+        val vPos = le.position()
+        val valRO = run {
+            val tmp = le.duplicate()
+            tmp.limit(vPos + vLen)
+            tmp.position(vPos)
+            tmp.slice()
         }
+        le.position(vPos + vLen)
 
-        val seqNo = leBuf.long
-        val flags = leBuf.get()
+        val consumed = le.position() - start
+        buf.position(buf.position() + consumed)
 
-        require(leBuf.remaining() >= kLen + vLen) {
-            "Buffer too small for record payload (k=$kLen, v=$vLen)"
-        }
-
-        // Slice key/value without copying
-        val keySlice = leBuf.slice(0, kLen).asReadOnlyBuffer()
-        leBuf.position(leBuf.position() + kLen)
-
-        val valSlice = leBuf.slice(0, vLen).asReadOnlyBuffer()
-
-        // Use public constructor (which computes keyHash)
-        return Record(keySlice, valSlice, seqNo, flags)
+        return Record(keyRO, valRO, seq, flags)
     }
 }

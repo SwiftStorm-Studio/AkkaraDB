@@ -13,11 +13,11 @@ import java.util.zip.CRC32C
  * Split a 32 KiB block produced by [AkkBlockPackerDirect] into
  * individual record-payload slices (read-only views).
  *
- * Portable on-disk layout (endianness fixed to BIG_ENDIAN):
- *   [0..3]     payloadLen: Int
- *   [4..4+N)   payload bytes (sequence of records: [u32 len][bytes])
- *   [..]       zero padding up to PAYLOAD_LIMIT (ignored on read)
- *   [end-4..]  crc32c over bytes [0 .. 4+payloadLen)
+ * Portable on-disk layout (endianness fixed to LITTLE_ENDIAN):
+ *   [0..3]       payloadLen: Int
+ *   [4..4+N)     payload bytes (sequence of records: [u32 len][bytes])
+ *   [..]         zero padding up to PAYLOAD_LIMIT (ignored on read)
+ *   [end-4..]    crc32c over bytes [0 .. 4+payloadLen)
  *
  * Ownership: the caller retains ownership of the backing block buffer and is
  * responsible for releasing it back to the [BufferPool] after consumers stop
@@ -30,7 +30,7 @@ class AkkBlockUnpacker(
 
     fun unpack(block: ByteBuffer): List<ByteBuffer> {
         // Never mutate the caller's buffer directly
-        val base = block.duplicate().order(ByteOrder.BIG_ENDIAN)
+        val base = block.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
         /* -------- 1) basic structure checks -------- */
         if (base.capacity() != BLOCK_SIZE) {
@@ -51,7 +51,7 @@ class AkkBlockUnpacker(
         }
         crc.update(crcRegion)
 
-        val storedCrc = base.getInt(PAYLOAD_LIMIT + 4)
+        val storedCrc = base.getInt(PAYLOAD_LIMIT + 4) // LEで格納/読取
         if (crc.value.toInt() != storedCrc) {
             pool.release(block)
             throw CorruptedBlockException("CRC mismatch (calc=${crc.value} stored=$storedCrc)")
@@ -60,7 +60,7 @@ class AkkBlockUnpacker(
         /* -------- 3) slice payload area (read-only) -------- */
         val payloadView = base.duplicate().apply {
             position(4); limit(4 + payloadLen)
-        }.slice().order(ByteOrder.BIG_ENDIAN).asReadOnlyBuffer()
+        }.slice().asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
 
         /* -------- 4) split into length-prefixed records -------- */
         val records = ArrayList<ByteBuffer>(16)
@@ -70,7 +70,7 @@ class AkkBlockUnpacker(
                 pool.release(block)
                 throw CorruptedBlockException("truncated record header at pos=$pos")
             }
-            val recLen = payloadView.getInt(pos)
+            val recLen = payloadView.getInt(pos) // LE
             if (recLen <= 0 || pos + 4 + recLen > payloadLen) {
                 pool.release(block)
                 throw CorruptedBlockException("record length out of range (recLen=$recLen pos=$pos)")

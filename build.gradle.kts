@@ -1,4 +1,3 @@
-import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 import org.jetbrains.dokka.gradle.tasks.DokkaGeneratePublicationTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
@@ -6,7 +5,6 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.jar.JarFile
 
 plugins {
     alias(libs.plugins.kotlin)
@@ -42,17 +40,12 @@ allprojects {
 }
 
 subprojects {
-    val akkaraAPI: Configuration by configurations.creating {
-        isTransitive = false
-        isCanBeConsumed = false
-        isCanBeResolved = true
-    }
-
     when (name) {
         "akkara-common" -> {
             afterEvaluate {
                 dependencies {
-                    api(libs.slf4j)
+                    compileOnly(libs.slf4j)
+                    implementation(kotlin("reflect"))
                 }
             }
         }
@@ -78,8 +71,6 @@ subprojects {
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
                 implementation(project(":akkara-format-akk"))
-
-                implementation("net.ririfa:binpack:0.3.2")
 
                 implementation("org.objenesis:objenesis:3.4")
                 implementation(kotlin("reflect"))
@@ -112,38 +103,11 @@ subprojects {
                 implementation(project(":akkara-java-api"))
                 implementation(project(":akkara-replica"))
 
-                implementation("net.ririfa:binpack:0.3.2")
-
                 implementation(kotlin("test"))
                 implementation(kotlin("serialization"))
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0")
                 implementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
             }
-        }
-    }
-
-    afterEvaluate {
-        dependencies {
-            implementation(libs.kotlin.stdlib)
-        }
-
-        akkaraAPI.forEach { logger.lifecycle("Shaded API: $it") }
-
-        val artifacts = try {
-            akkaraAPI.resolvedConfiguration.resolvedArtifacts
-        } catch (e: Exception) {
-            logger.warn("Could not resolve shadedAPI in ${project.name}: ${e.message}")
-            emptySet<ResolvedArtifact>()
-        }
-
-        artifacts.forEach { artifact ->
-            val id = artifact.moduleVersion.id
-            val classifierPart = artifact.classifier?.let { ":$it" } ?: ""
-            val notation = "${id.group}:${id.name}:${id.version}$classifierPart"
-            logger.lifecycle("Pack: ${artifact.moduleVersion.id.group}")
-            logger.lifecycle("Name: ${artifact.moduleVersion.id.name}")
-            logger.lifecycle("Automatically adding to api: $notation in ${project.name}")
-            dependencies.add("api", notation)
         }
     }
 
@@ -216,53 +180,13 @@ subprojects {
         from(sourceSets.main.get().output)
     }
 
-    tasks.register<ShadowJar>("relocatedFatJar") {
-        dependsOn("classes")
-        group = "ririfa"
-        description = "Creates a relocated fat jar containing shadedAPI dependencies"
-        archiveClassifier.set("fat")
-        configurations.add(project.configurations.getByName("akkaraAPI"))
-        from(sourceSets.main.get().output)
-
-        doFirst {
-            val akkara = project.configurations.getByName("akkaraAPI")
-            val artifacts = try {
-                akkara.resolvedConfiguration.resolvedArtifacts
-            } catch (e: Exception) {
-                logger.warn("Could not resolve shadedAPI: ${e.message}")
-                emptySet<ResolvedArtifact>()
-            }
-
-            artifacts.forEach { artifact ->
-                val moduleName = artifact.moduleVersion.id.name.replace("-", "_")
-                val jarFile = artifact.file
-
-                val classPackages = JarFile(jarFile).use { jar ->
-                    jar.entries().asSequence()
-                        .filter { it.name.endsWith(".class") && !it.name.startsWith("META-INF") }
-                        .mapNotNull { entry ->
-                            entry.name
-                                .replace('/', '.')
-                                .removeSuffix(".class")
-                                .substringBeforeLast('.', "")
-                        }
-                        .toSet()
-                }
-
-                if (classPackages.any { it.startsWith("net.ririfa") }) {
-                    logger.lifecycle("Skipping relocation for ${artifact.moduleVersion.id} (self package detected)")
-                    return@forEach
-                }
-
-                classPackages.forEach cp@{ pkg ->
-                    if (pkg.isBlank()) return@cp
-                    val relocated = "net.ririfa.shaded.$moduleName.${pkg.replace('.', '_')}"
-                    logger.lifecycle("Relocating $pkg → $relocated")
-                    relocate(pkg, relocated)
-                }
-            }
-        }
-    }
+//    tasks.register<ShadowJar>("relocatedFatJar") {
+//        dependsOn("classes")
+//        group = "ririfa"
+//        description = "Creates a relocated fat jar containing shadedAPI dependencies"
+//        archiveClassifier.set("fat")
+//        from(sourceSets.main.get().output)
+//    }
 
     tasks.register<Jar>("dokkaHtmlJar") {
         group = "dokka"
@@ -280,7 +204,7 @@ subprojects {
                 version = project.version.toString()
 
                 artifact(tasks.named<Jar>("plainJar"))
-                artifact(tasks.named<ShadowJar>("relocatedFatJar"))
+//                artifact(tasks.named<ShadowJar>("relocatedFatJar"))
                 artifact(tasks.named<Jar>("sourcesJar"))
                 artifact(tasks.named<Jar>("dokkaHtmlJar"))
 

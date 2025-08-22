@@ -46,19 +46,24 @@ class AkkManifest(private val path: Path) {
             val lenBuf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
             while (true) {
                 lenBuf.clear()
-                if (ch.read(lenBuf) != 4) break
+                if (!readFully(ch, lenBuf)) break
                 lenBuf.flip()
                 val len = lenBuf.int
                 if (len <= 0) break
+
                 val recBuf = ByteBuffer.allocate(len + 4).order(ByteOrder.LITTLE_ENDIAN)
-                if (ch.read(recBuf) != len + 4) break
+                if (!readFully(ch, recBuf)) break
                 recBuf.flip()
+
                 val data = ByteArray(len)
                 recBuf.get(data)
                 val storedCrc = recBuf.int
                 val crc = CRC32C().apply { update(data) }.value.toInt()
                 if (crc != storedCrc) break
-                val line = String(data, UTF_8).trim()
+
+                var line = String(data, UTF_8)
+                if (line.isNotEmpty() && line[0] == '\uFEFF') line = line.substring(1)
+                line = line.trim()
                 if (line.isNotEmpty()) applyEventLine(line)
             }
         }
@@ -73,26 +78,42 @@ class AkkManifest(private val path: Path) {
 
     @Synchronized
     fun sstSeal(level: Int, file: String, entries: Long, firstKeyHex: String?, lastKeyHex: String?) {
-        val e = SstSealEvent(level, file, entries, firstKeyHex, lastKeyHex, now())
+        val ts = now()
+        val e = SstSealEvent(level, file, entries, firstKeyHex, lastKeyHex, ts)
+
         append(buildString {
-            append("""{"type":"SSTSeal","level":$level,"file":"${esc(file)}","entries":$entries,"""")
-            firstKeyHex?.let { append(""""firstKeyHex":"${esc(it)}","""") }
-            lastKeyHex?.let { append(""""lastKeyHex":"${esc(it)}","""") }
-            append(""""ts":${e.ts}}""")
+            append("{")
+            append("\"type\":\"SSTSeal\",")
+            append("\"level\":").append(level).append(",")
+            append("\"file\":\"").append(esc(file)).append("\",")
+            append("\"entries\":").append(entries).append(",")
+
+            if (firstKeyHex != null) {
+                append("\"firstKeyHex\":\"").append(esc(firstKeyHex)).append("\",")
+            }
+            if (lastKeyHex != null) {
+                append("\"lastKeyHex\":\"").append(esc(lastKeyHex)).append("\",")
+            }
+
+            append("\"ts\":").append(ts).append("}")
         })
+
         sstSeals += e
         lastSstSeal = e
     }
 
     @Synchronized
     fun checkpoint(name: String? = null, stripe: Long? = null, lastSeq: Long? = null) {
+        val ts = now()
         append(buildString {
-            append("""{"type":"Checkpoint",""")
-            name?.let { append(""""name":"${esc(it)}",""") }
-            stripe?.let { append(""""stripe":$it,""") }
-            lastSeq?.let { append(""""lastSeq":$it,""") }
-            append(""""ts":${now()}}""")
+            append("{")
+            append("\"type\":\"Checkpoint\",")
+            if (name != null) append("\"name\":\"").append(esc(name)).append("\",")
+            if (stripe != null) append("\"stripe\":").append(stripe).append(",")
+            if (lastSeq != null) append("\"lastSeq\":").append(lastSeq).append(",")
+            append("\"ts\":").append(ts).append("}")
         })
+        lastCheckpoint = CheckpointEvent(name, stripe, lastSeq, ts)
     }
 
     private fun append(line: String) {
@@ -110,27 +131,27 @@ class AkkManifest(private val path: Path) {
         }
     }
 
-    private fun applyEventLine(line: String) {
+    private fun applyEventLine(line0: String) {
+        val i = line0.indexOf('{')
+        val line = if (i >= 0) line0.substring(i).trim() else line0.trim()
         when (extract(line, "type")) {
             "StripeCommit" -> {
                 extract(line, "after")?.toLongOrNull()?.let {
                     if (it >= stripesWritten) stripesWritten = it
                 }
             }
-
             "SSTSeal" -> {
                 val e = SstSealEvent(
-                    level = extract(line, "level")!!.toInt(),
-                    file = extract(line, "file")!!,
-                    entries = extract(line, "entries")!!.toLong(),
+                    level = requireInt(line, "level"),
+                    file = requireString(line, "file"),
+                    entries = requireLong(line, "entries"),
                     firstKeyHex = extract(line, "firstKeyHex"),
                     lastKeyHex = extract(line, "lastKeyHex"),
-                    ts = extract(line, "ts")!!.toLong()
+                    ts = requireLong(line, "ts")
                 )
                 sstSeals += e
                 lastSstSeal = e
             }
-
             "Checkpoint" -> {
                 lastCheckpoint = CheckpointEvent(
                     name = extract(line, "name"),
@@ -142,15 +163,53 @@ class AkkManifest(private val path: Path) {
         }
     }
 
-    private fun extract(json: String, key: String): String? =
-        Regex(""""${Regex.escape(key)}"\s*:\s*("?)(.*?)\1""")
-            .find(json)?.groupValues?.getOrNull(2)
+    private fun extract(json: String, key: String): String? {
+        val pattern =
+            """"${Regex.escape(key)}"\s*:\s*(?:
+            "((?:\\.|[^"\\])*)"
+          | ([^,\}\s][^,\}]*)
+        )"""
+                .replace("\n", "")
+                .replace(Regex("""\s+#.*?(?=["|(|\[])"""), "")
 
-    private fun esc(s: String) = s.replace("\\", "\\\\")
+        val re = Regex(pattern)
+        val m = re.find(json) ?: return null
+        val s = m.groups[1]?.value ?: m.groups[2]?.value ?: return null
+        return s
+    }
+
+    private fun requireInt(line: String, key: String): Int {
+        val raw = extract(line, key)?.trim()
+            ?: error("manifest parse error: missing $key :: $line")
+        return raw.toIntOrNull()
+            ?: error("manifest parse error: key=$key not int :: $line")
+    }
+
+    private fun requireLong(line: String, key: String): Long {
+        val raw = extract(line, key)?.trim()
+            ?: error("manifest parse error: missing $key :: $line")
+        return raw.toLongOrNull()
+            ?: error("manifest parse error: key=$key not long :: $line")
+    }
+
+    private fun requireString(line: String, key: String): String =
+        extract(line, key)?.trim()
+            ?: error("manifest parse error: key=$key (string) :: $line")
+
+    private fun esc(s: String) = s
+        .replace("\\", "\\\\")
         .replace("\"", "\\\"")
         .replace("\n", "\\n")
         .replace("\r", "\\r")
         .replace("\t", "\\t")
+
+    private fun readFully(ch: FileChannel, buf: ByteBuffer): Boolean {
+        while (buf.hasRemaining()) {
+            val n = ch.read(buf)
+            if (n < 0) return false
+        }
+        return true
+    }
 
     private fun now() = System.currentTimeMillis()
 }

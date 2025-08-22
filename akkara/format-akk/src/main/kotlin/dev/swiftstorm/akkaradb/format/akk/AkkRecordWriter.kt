@@ -27,7 +27,7 @@ object AkkRecordWriter {
      * @param record source Record
      * @param dest destination buffer (must have enough remaining space)
      */
-    fun write(record: Record, dest: ByteBuffer) {
+    fun write(record: Record, dest: ByteBuffer): Int {
         val kLen = record.key.remaining()
         val vLen = record.value.remaining()
 
@@ -39,21 +39,21 @@ object AkkRecordWriter {
 
         val leDest = dest.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
-        // Write header
+        // header
         leDest.putShort(kLen.toShort())
         leDest.putInt(vLen)
-        leDest.putLong(record.seqNo)  // Note: raw bits preserved, signed Long
-        leDest.put(record.flags.toByte())
+        leDest.putLong(record.seqNo)
+        leDest.put(record.flags)
 
-        // Copy payloads
-        val keyBuf = record.key.asReadOnlyBuffer().rewind()
-        val valBuf = record.value.asReadOnlyBuffer().rewind()
+        val keySlice = record.key.duplicate().slice()
+        val valSlice = record.value.duplicate().slice()
 
-        leDest.put(keyBuf)
-        leDest.put(valBuf)
+        leDest.put(keySlice)
+        leDest.put(valSlice)
 
-        // Advance original dest as well
-        dest.position(dest.position() + HEADER_SIZE + kLen + vLen)
+        val written = HEADER_SIZE + kLen + vLen
+        dest.position(dest.position() + written)
+        return written
     }
 
     /**

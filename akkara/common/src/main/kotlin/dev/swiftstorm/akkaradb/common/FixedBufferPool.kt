@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.common
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentSkipListMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.LongAdder
@@ -41,13 +42,13 @@ class FixedBufferPool(
                 if (buf != null && buf.capacity() >= rounded) {
                     retained.decrementAndGet()
                     hits.increment()
-                    return buf.clear()
+                    return buf.clear().order(ByteOrder.LITTLE_ENDIAN)
                 }
             }
         }
         misses.increment()
         created.increment()
-        return ByteBuffer.allocateDirect(rounded)
+        return ByteBuffer.allocateDirect(rounded).order(ByteOrder.LITTLE_ENDIAN)
     }
 
     /**

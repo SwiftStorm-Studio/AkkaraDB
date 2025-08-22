@@ -27,8 +27,8 @@ data class Record private constructor(
     /* ────────────── public ctors ────────────── */
 
     constructor(rawKey: ByteBuffer, rawValue: ByteBuffer, seqNo: Long, flags: Byte = 0) : this(
-        rawKey.readOnly0(),
-        rawValue.readOnly0(),
+        rawKey.clone().readOnly0(),
+        rawValue.clone().readOnly0(),
         seqNo,
         rawKey.readOnly0().contentHash(),
         flags
@@ -74,6 +74,18 @@ data class Record private constructor(
 /* ════════════ private helpers ════════════ */
 private fun ByteBuffer.readOnly0(): ByteBuffer =
     asReadOnlyBuffer().apply { rewind() }
+
+private fun ByteBuffer.clone(): ByteBuffer {
+    val src = this.duplicate()
+    src.clear()
+    src.position(this.position())
+    src.limit(this.limit())
+
+    val dst = Pools.io().get(src.remaining())
+    dst.put(src)
+    dst.flip()
+    return dst
+}
 
 private fun ByteBuffer.contentEquals(other: ByteBuffer): Boolean =
     limit() == other.limit() && mismatch(other) == -1

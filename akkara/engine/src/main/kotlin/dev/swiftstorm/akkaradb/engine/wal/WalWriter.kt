@@ -13,18 +13,15 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Write‑Ahead Log writer with a dedicated flusher thread implementing
+ * Write-Ahead Log writer with a dedicated flusher thread implementing
  * true "group commit (N or T)" and **durable-before-ACK** semantics.
  *
- * Key points:
- *  - Callers enqueue records; a flusher writes them and calls force(true) once per group.
- *  - No fake Seal is written for barriers. We use an in‑memory Barrier command
- *    so WalReplay's state machine (Seal -> CheckPoint) stays valid.
- *  - sealSegment(): enqueues a real Seal record and waits for durability.
- *  - checkpoint(): enqueues {Seal, CheckPoint} in order and waits.
+ * Fast mode support:
+ *  - beginFastMode(): fsync をバリアまで遅延（flushBatch では fsync しない）
+ *  - endFastMode():   必ず Barrier + fsync を入れてから通常(Durable)へ戻す
  *
  * Thread safety: public APIs are safe to call from multiple threads.
- * Encoding: fixed‑length LE as defined in WalRecord.
+ * Encoding: fixed-length LE as defined in WalRecord.
  */
 class WalWriter(
     path: Path,
@@ -50,7 +47,6 @@ class WalWriter(
     private sealed interface Cmd {
         val done: CompletableFuture<Void>
     }
-
     private data class Write(val rec: WalRecord, override val done: CompletableFuture<Void>) : Cmd
     private data class Barrier(override val done: CompletableFuture<Void>) : Cmd
 
@@ -60,13 +56,35 @@ class WalWriter(
         isDaemon = true; start()
     }
 
+    /* ------------------------ Fast/Durable switch ----------------------- */
+
+    /**
+     * Fast mode: fsync is delayed until the next barrier.
+     * Durable mode: fsync after every write (default).
+     * Fast mode is useful for bulk inserts, but not for correctness.
+     */
+    private val forceDurable = AtomicBoolean(true)
+
+    fun beginFastMode() {
+        forceDurable.set(false)
+    }
+
+    fun endFastMode() {
+        barrier().join()
+        forceDurable.set(true)
+    }
+
     /* --------------------------- public API --------------------------- */
 
-    /** Append an Akk‑encoded KV payload and wait until it is durably on disk. */
-    fun append(record: ByteBuffer) {
-        synchronized(writeLock) {
-            enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer())).join()
-        }
+    /**
+     * Append an Akk-encoded KV payload.
+     * @param durable true: fsync after write (default)
+     *                false: fsync is delayed until the next barrier
+     *                (useful for bulk inserts, but not for correctness)
+     */
+    fun append(record: ByteBuffer, durable: Boolean = true) {
+        val f = enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer()))
+        if (durable) f.join()
     }
 
     /** Mark end of segment; write a real Seal and ensure durability. */
@@ -94,7 +112,7 @@ class WalWriter(
         synchronized(writeLock) {
             barrier().join()
             ch.truncate(0)
-            ch.force(true)
+            ch.force(false)
             ch.position(0)
         }
     }
@@ -107,16 +125,17 @@ class WalWriter(
         return CompletableFuture<Void>().also { q.put(Write(r, it)) }
     }
 
-    /** Inserts a control barrier (no on‑disk record) and waits for fsync. */
+    /** Inserts a control barrier (no on-disk record) and waits for fsync at the barrier point. */
     private fun barrier(): CompletableFuture<Void> =
         CompletableFuture<Void>().also { q.put(Barrier(it)) }
 
     private fun flushLoop() {
         val batch = ArrayList<Write>(groupCommitN)
+
         fun flushBatch() {
             if (batch.isEmpty()) return
             writeBatch(batch)
-            ch.force(true)
+            if (forceDurable.get()) ch.force(false)
             batch.forEach { it.done.complete(null) }
             batch.clear()
         }
@@ -127,12 +146,12 @@ class WalWriter(
                 // wait up to T µs for first command
                 val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS) ?: continue
                 when (first) {
-                    is Barrier -> {              // flush what we have (if any), then ack barrier
+                    is Barrier -> {
                         flushBatch()
+                        ch.force(false)
                         first.done.complete(null)
                         continue
                     }
-
                     is Write -> batch += first
                 }
 
@@ -142,8 +161,8 @@ class WalWriter(
                     when (next) {
                         is Write -> batch += next
                         is Barrier -> {
-                            // flush everything before the barrier, then ack it
                             flushBatch()
+                            ch.force(false) // バリアは必ず fsync
                             next.done.complete(null)
                         }
                     }
@@ -164,11 +183,15 @@ class WalWriter(
         while (q.poll()?.let {
                 when (it) {
                     is Write -> {
-                        writeBatch(listOf(it)); ch.force(true); it.done.complete(null); true
+                        writeBatch(listOf(it))
+                        ch.force(false)
+                        it.done.complete(null)
+                        true
                     }
-
                     is Barrier -> {
-                        ch.force(true); it.done.complete(null); true
+                        ch.force(false)
+                        it.done.complete(null)
+                        true
                     }
                 }
             } == true) { /* keep draining */
@@ -197,7 +220,7 @@ class WalWriter(
         running.set(false)
         flusher.join()
         // final fsync for safety
-        ch.force(true)
+        ch.force(false)
         pool.release(scratch)
         ch.close()
     }

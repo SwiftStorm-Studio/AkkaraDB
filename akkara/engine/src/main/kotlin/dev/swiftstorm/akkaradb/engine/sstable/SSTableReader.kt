@@ -11,6 +11,7 @@ import java.io.Closeable
 import java.lang.ref.SoftReference
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
@@ -18,7 +19,7 @@ import java.util.zip.CRC32C
 
 /**
  * SSTable reader with **fixed-length outer index entries**:
- *  - Footer:  [magic:u32][indexOff:u64][bloomOff:u64] (20 bytes, magic="AKSS")
+ *  - Footer:  [magic:u32 BE="AKSS"][indexOff:u64 LE][bloomOff:u64 LE]  (20 bytes)
  *  - Index:   repeat { [key:FIXED(32B)][off:i64] } (little-endian)
  *  - Block:   [len:u32 BE][ payload ][crc:u32 BE]
  *  - MiniIdx: [count:u16][offset:u32]×count (little-endian)
@@ -43,24 +44,44 @@ class SSTableReader(
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, SoftReference<IntArray>>): Boolean = size > 512
     }
 
-    init {
-        require(fileSize >= 20) { "file too small: $path" }
-        val (idxTmp, bloomTmp) = pool.borrow(20) { f ->
-            ch.read(f, fileSize - 20); f.flip()
-            require(f.int == 0x414B5353) { "bad footer magic" }
-            f.long to f.long
-        }
-        indexOff = idxTmp; bloomOff = bloomTmp
+    companion object {
+        private const val FOOTER_SIZE = 20
+        private const val MAGIC = 0x414B5353 // "AKSS" (BE)
+    }
 
-        val bloomSize = (fileSize - 20 - bloomOff - 4).toInt()
-        val bloomBuf = ch.map(FileChannel.MapMode.READ_ONLY, bloomOff, bloomSize.toLong())
-        val hashCountBuf = ch.map(FileChannel.MapMode.READ_ONLY, bloomOff + bloomSize, 4)
-        hashCountBuf.order(ByteOrder.BIG_ENDIAN)
-        val hashCount = hashCountBuf.int
+    init {
+        require(fileSize >= FOOTER_SIZE) { "file too small: $path size=$fileSize" }
+
+        // ---- footer (magic:BE, offsets:LE) ----
+        val (idxTmp, bloomTmp) = readFooter(ch)
+        indexOff = idxTmp
+        bloomOff = bloomTmp
+
+        // ---- basic range checks ----
+        val footerPos = fileSize - FOOTER_SIZE
+        require(indexOff in 0 until fileSize) { "indexOff out of range: $indexOff / size=$fileSize" }
+        require(bloomOff in 0..footerPos) { "bloomOff out of range: $bloomOff / tail=$footerPos" }
+        require(indexOff <= bloomOff) { "indexOff($indexOff) > bloomOff($bloomOff)" }
+
+        // ---- bloom: [bits...][hashCount:u32 BE/LE?] just before footer ----
+        val bloomSize = (footerPos - bloomOff - 4).toInt()
+        require(bloomSize >= 0) { "negative bloomSize: $bloomSize (bloomOff=$bloomOff footerPos=$footerPos)" }
+
+        val bloomBuf = mapRO(ch, bloomOff, bloomSize.toLong(), ByteOrder.BIG_ENDIAN) // order irrelevant for bitset
+        val hcBuf = mapRO(ch, bloomOff + bloomSize, 4, ByteOrder.BIG_ENDIAN)
+        var hashCount = hcBuf.int
+        if (hashCount <= 0 || hashCount > 1 shl 20) { // sanity
+            // fallback: try LE if writer側がLEだった場合に備える
+            hashCount = hcBuf.duplicate().order(ByteOrder.LITTLE_ENDIAN).int
+        }
+        require(hashCount > 0) { "invalid bloom hashCount: $hashCount" }
         bloom = BloomFilter.readFrom(bloomBuf, hashCount)
 
+        // ---- index ----
         val indexSize = (bloomOff - indexOff).toInt()
-        val indexBuf = ch.map(FileChannel.MapMode.READ_ONLY, indexOff, indexSize.toLong()).order(ByteOrder.LITTLE_ENDIAN)
+        require(indexSize >= 0) { "negative indexSize: $indexSize" }
+        require(indexSize % OuterIndex.ENTRY_SIZE == 0) { "outer index not aligned: size=$indexSize" }
+        val indexBuf = mapRO(ch, indexOff, indexSize.toLong(), ByteOrder.LITTLE_ENDIAN)
         index = OuterIndex(indexBuf)
     }
 
@@ -70,16 +91,24 @@ class SSTableReader(
         if (!bloom.mightContain(key)) return null
         val off = index.lookup(key) ?: return null
 
+        // header(len:BE)
+        require(off >= 0 && off + 4 <= fileSize) { "block header out of file: off=$off size=$fileSize" }
         val len = pool.borrow(4) { hdr ->
             hdr.clear(); ch.read(hdr, off); hdr.flip(); hdr.int
         }
-        require(len in 0..BLOCK_SIZE)
+        require(len in 0..BLOCK_SIZE) { "bad block len=$len at off=$off" }
         val total = 4 + len + 4
-        val mapped = ch.map(FileChannel.MapMode.READ_ONLY, off, total.toLong()).order(ByteOrder.BIG_ENDIAN)
+        require(off + total <= fileSize) { "block exceeds file: off=$off total=$total size=$fileSize" }
+
+        val mapped = mapRO(ch, off, total.toLong(), ByteOrder.BIG_ENDIAN)
 
         val payload = mapped.slice().apply { position(4); limit(4 + len) }
         val storedCrc = mapped.getInt(4 + len)
-        crc32TL.get().run { reset(); update(payload.duplicate()); if (value.toInt() != storedCrc) error("CRC mismatch @$off") }
+        crc32TL.get().run {
+            reset()
+            update(payload.duplicate())
+            if (value.toInt() != storedCrc) error("CRC mismatch @$off")
+        }
 
         val offsets = miniIndexFor(off, payload)
         val dataStart = payload.position() + 2 + offsets.size * 4
@@ -102,38 +131,39 @@ class SSTableReader(
     }
 
     override fun iterator(): Iterator<Record> = object : Iterator<Record> {
-        var idxPos = 0                     // entry index in outer index
-        var recPosInBlock = 0              // record index inside current block
+        var idxPos = 0
+        var recPosInBlock = 0
         var dataStart = 0
         var offsets: IntArray = IntArray(0)
         var payload: ByteBuffer? = null
         var blockOff: Long = -1
 
         private fun loadNextBlock(): Boolean {
-            // release reference to previous payload; underlying mmap stays alive
             payload = null
             if (idxPos >= index.countEntries()) return false
 
             blockOff = index.offsetAt(idxPos)
             idxPos++
 
-            // read block header and payload, verify CRC
+            require(blockOff >= 0 && blockOff + 4 <= fileSize) { "block header OOB: off=$blockOff size=$fileSize" }
             val len = pool.borrow(4) { hdr ->
                 hdr.clear(); ch.read(hdr, blockOff); hdr.flip(); hdr.int
             }
             if (len !in 0..BLOCK_SIZE) return false
             val total = 4 + len + 4
-            val mapped = ch.map(FileChannel.MapMode.READ_ONLY, blockOff, total.toLong()).order(ByteOrder.BIG_ENDIAN)
+            if (blockOff + total > fileSize) return false
+
+            val mapped = mapRO(ch, blockOff, total.toLong(), ByteOrder.BIG_ENDIAN)
             val p = mapped.slice().apply { position(4); limit(4 + len) }
             val stored = mapped.getInt(4 + len)
-            crc32TL.get().run { reset(); update(p.duplicate()); if (value.toInt() != stored) error("CRC mismatch @$blockOff") }
+            crc32TL.get().run {
+                reset(); update(p.duplicate()); if (value.toInt() != stored) error("CRC mismatch @$blockOff")
+            }
 
-            // mini-index
             val mi = p.duplicate().order(ByteOrder.LITTLE_ENDIAN)
             val count = mi.short.toInt() and 0xFFFF
             offsets = IntArray(count) { mi.int }
             dataStart = p.position() + 2 + 4 * count
-
             recPosInBlock = 0
             payload = p
             return count > 0
@@ -161,8 +191,8 @@ class SSTableReader(
         from: ByteBuffer? = null,
         toExclusive: ByteBuffer? = null
     ): Iterator<Record> = object : Iterator<Record> {
-        var idxPos = 0                   // outer index entry
-        var recPosInBlock = 0            // record index inside current block
+        var idxPos = 0
+        var recPosInBlock = 0
         var dataStart = 0
         var offsets: IntArray = IntArray(0)
         var payload: ByteBuffer? = null
@@ -189,14 +219,15 @@ class SSTableReader(
                 blockOff = index.offsetAt(idxPos)
                 idxPos++
 
-                // ---- read block header + payload, verify CRC ----
+                if (!(blockOff >= 0 && blockOff + 4 <= fileSize)) continue
                 val len = pool.borrow(4) { hdr ->
                     hdr.clear(); ch.read(hdr, blockOff); hdr.flip(); hdr.int
                 }
                 if (len !in 0..BLOCK_SIZE) continue
                 val total = 4 + len + 4
-                val mapped = ch.map(FileChannel.MapMode.READ_ONLY, blockOff, total.toLong())
-                    .order(ByteOrder.BIG_ENDIAN)
+                if (blockOff + total > fileSize) continue
+
+                val mapped = mapRO(ch, blockOff, total.toLong(), ByteOrder.BIG_ENDIAN)
                 val p = mapped.slice().apply { position(4); limit(4 + len) }
                 val stored = mapped.getInt(4 + len)
                 crc32TL.get().run { reset(); update(p.duplicate()); if (value.toInt() != stored) error("CRC mismatch @$blockOff") }
@@ -253,8 +284,7 @@ class SSTableReader(
                 val recBuf = p.duplicate().order(ByteOrder.LITTLE_ENDIAN).apply { position(recPos) }
                 val r = rr.read(recBuf)
                 if (cmp(r.key, toExclusive) >= 0) {
-                    finished = true
-                    return false
+                    finished = true; return false
                 }
             }
             return true
@@ -266,7 +296,6 @@ class SSTableReader(
             val recPos = dataStart + offsets[recPosInBlock++]
             val recBuf = p.duplicate().order(ByteOrder.LITTLE_ENDIAN).apply { position(recPos) }
             val r = rr.read(recBuf)
-
             if (toExclusive != null && cmp(r.key, toExclusive) >= 0) finished = true
             return r
         }
@@ -321,5 +350,41 @@ class SSTableReader(
             const val FIXED_KEY_SIZE = 32
             const val ENTRY_SIZE = FIXED_KEY_SIZE + 8
         }
+    }
+
+    // ---------------- helpers ----------------
+
+    private fun readFooter(ch: FileChannel): Pair<Long, Long> {
+        val size = ch.size()
+        val f = ByteBuffer.allocate(FOOTER_SIZE)
+        ch.read(f, size - FOOTER_SIZE)
+        f.flip()
+
+        // magic (BE)
+        val be = f.duplicate().order(ByteOrder.BIG_ENDIAN)
+        require(be.int == MAGIC) { "bad footer magic" }
+
+        // offsets (LE)
+        val le = f.order(ByteOrder.LITTLE_ENDIAN)
+        le.int // consume magic as LE view (ignored)
+        val idx = le.long
+        val bloom = le.long
+        return idx to bloom
+    }
+
+    private fun mapRO(
+        ch: FileChannel,
+        pos: Long,
+        len: Long,
+        order: ByteOrder
+    ): MappedByteBuffer {
+        val size = ch.size()
+        require(pos >= 0) { "map pos < 0 : $pos" }
+        require(len >= 0) { "map len < 0 : $len" }
+        require(pos + len <= size) { "map range overflow: pos=$pos len=$len size=$size" }
+
+        val mbb = ch.map(FileChannel.MapMode.READ_ONLY, pos, len)
+        mbb.order(order)
+        return mbb
     }
 }
