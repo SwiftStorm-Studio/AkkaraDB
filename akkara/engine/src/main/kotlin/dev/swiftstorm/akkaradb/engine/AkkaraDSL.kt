@@ -7,6 +7,8 @@ import dev.swiftstorm.akkaradb.common.internal.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPack
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPackBufferPool
 import dev.swiftstorm.akkaradb.engine.util.ShortUUID
+import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
+import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import org.objenesis.ObjenesisStd
 import java.io.Closeable
 import java.nio.ByteBuffer
@@ -23,11 +25,27 @@ import kotlin.reflect.jvm.isAccessible
  */
 object AkkDSL {
     /* ───────── factory helpers ───────── */
-    inline fun <reified T : Any> open(baseDir: Path): PackedTable<T> =
-        PackedTable(
-            AkkaraDB.open(baseDir),
+    inline fun <reified T : Any> open(
+        baseDir: Path,
+        configure: AkkDSLCfgBuilder.() -> Unit = {}
+    ): PackedTable<T> {
+        val cfg = AkkDSLCfgBuilder(baseDir).apply(configure).build()
+        return PackedTable(
+            AkkaraDB.open(
+                baseDir,
+                cfg.k,
+                cfg.m,
+                cfg.parityCoder,
+                cfg.flushThreshold,
+                cfg.walCfg.path,
+                cfg.walCfg.groupCommitN,
+                cfg.walCfg.groupCommitMicros,
+                cfg.walCfg.initCap,
+                cfg.metaCacheCap
+            ),
             T::class
         )
+    }
 
     inline fun <reified T : Any> AkkaraDB.open(): PackedTable<T> =
         PackedTable(
@@ -37,6 +55,74 @@ object AkkDSL {
 
     inline fun <T : Any> PackedTable<T>.close() {
         db.close()
+    }
+}
+
+data class AkkDSLCfg(
+    val baseDir: Path,
+    val k: Int = 4,
+    val m: Int = 2,
+    val parityCoder: ParityCoder = RSParityCoder(m),
+    val flushThreshold: Long = 32 * 1024 * 1024,
+    val metaCacheCap: Int = 1024,
+    val walCfg: WalCfg = WalCfg(baseDir.resolve("wal"))
+)
+
+data class WalCfg(
+    val path: Path,
+    val groupCommitN: Int = 32,
+    val groupCommitMicros: Long = 500,
+    val initCap: Int = 32 * 1024
+)
+
+class AkkDSLCfgBuilder(private val baseDir: Path) {
+    var k: Int = 4
+    var m: Int = 2
+    var parityCoder: ParityCoder? = null
+    var flushThreshold: Long = 32 * 1024 * 1024
+    var metaCacheCap: Int = 1024
+
+    private val walBuilder = WalCfgBuilder(baseDir.resolve("wal.log"))
+
+    fun wal(block: WalCfgBuilder.() -> Unit) {
+        walBuilder.apply(block)
+    }
+
+    fun build(): AkkDSLCfg {
+        require(k >= 1) { "k must be >= 1" }
+        require(m >= 1) { "m must be >= 1" }
+        require(flushThreshold > 0) { "flushThreshold must be > 0" }
+
+        val pc = parityCoder ?: RSParityCoder(m)
+
+        return AkkDSLCfg(
+            baseDir = baseDir,
+            k = k,
+            m = m,
+            parityCoder = pc,
+            flushThreshold = flushThreshold,
+            walCfg = walBuilder.build()
+        )
+    }
+}
+
+class WalCfgBuilder(defaultPath: Path) {
+    var path: Path = defaultPath
+    var groupCommitN: Int = 32
+    var groupCommitMicros: Long = 500
+    var initCap: Int = 32 * 1024
+
+    fun build(): WalCfg {
+        require(groupCommitN >= 1) { "groupCommitN must be >= 1" }
+        require(groupCommitMicros >= 0) { "groupCommitMicros must be >= 0" }
+        require(initCap > 0) { "initCap must be > 0" }
+
+        return WalCfg(
+            path = path,
+            groupCommitN = groupCommitN,
+            groupCommitMicros = groupCommitMicros,
+            initCap = initCap
+        )
     }
 }
 
@@ -103,11 +189,8 @@ class PackedTable<T : Any>(
         val encoded = BinPack.encode(kClass, entity)
         val key = keyBuf(id, uuid)
         val seqNum = db.nextSeq()
-        try {
-            db.put(Record(key, encoded, seqNum))
-        } finally {
-            BinPackBufferPool.release(encoded)
-        }
+
+        db.put(Record(key, encoded, seqNum))
     }
 
     fun get(id: String, uuid: ShortUUID): T? {

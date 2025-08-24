@@ -4,12 +4,12 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.borrow
-import dev.swiftstorm.akkaradb.engine.cache.HotReadCache
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.engine.sstable.Compactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
+import dev.swiftstorm.akkaradb.engine.util.ReaderPool
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
 import dev.swiftstorm.akkaradb.engine.wal.replayWal
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockPackerDirect
@@ -19,6 +19,7 @@ import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
 import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
@@ -41,36 +42,33 @@ class AkkaraDB private constructor(
     val wal: WalWriter,
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>,
     private val pool: BufferPool = Pools.io(),
-    private val compactor: Compactor
+    private val compactor: Compactor,
+    private val metaCacheCap: Int = 1024,
 ) : AutoCloseable {
 
-    private val readCache = HotReadCache(64L * 1024 * 1024)
+    private val metaCache = object : LinkedHashMap<ByteBufferKey, KeyMeta>(metaCacheCap, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBufferKey, KeyMeta>) =
+            size > metaCacheCap
+    }
+
+    private val readerPool = ReaderPool(
+        factory = { AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder) },
+        max = Runtime.getRuntime().availableProcessors().coerceAtMost(8)
+    )
+
+    @Synchronized
+    private fun metaGet(k: ByteBuffer): KeyMeta? = metaCache[ByteBufferKey.of(k)]
+
+    @Synchronized
+    private fun metaPut(k: ByteBuffer, m: KeyMeta) {
+        metaCache[ByteBufferKey.of(k)] = m.copy(
+            value = m.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        )
+    }
 
     /* ───────── synchronisation ───────── */
     private val lock = ReentrantReadWriteLock()
     private val recordWriter = AkkRecordWriter
-
-    /* ───────── Stripe LRU Cache ───────── */
-    /**
-     * A simple LRU cache for the latest <em>k</em> stripes, where each stripe
-     * is a list of [Record]s. The cache is used to speed up single‑key lookups
-     * by avoiding expensive stripe scans.
-     */
-    private class StripeCache(private val capacity: Int) {
-        private val cache = object : LinkedHashMap<Long, List<Record>>(capacity, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, List<Record>>): Boolean = size > capacity
-        }
-        @Synchronized
-        fun put(sid: Long, recs: List<Record>) {
-            cache[sid] = recs
-        }
-
-        @Synchronized
-        fun find(key: ByteBuffer): ByteBuffer? = cache.values.firstNotNullOfOrNull { recs ->
-            recs.firstOrNull { it.key.compareTo(key) == 0 }?.value
-        }
-    }
-    private val stripeCache = StripeCache(capacity = 8)
 
     /* ───────── public API ───────── */
 
@@ -83,54 +81,13 @@ class AkkaraDB private constructor(
      * 3. Stripe cache hit
      * 4. Stripe scan fallback
      */
-    fun getV(key: ByteBuffer): ByteBuffer? {
-        fun roDup(bb: ByteBuffer) = bb.duplicate().apply { rewind() }
-
-        val k = roDup(key)
-
-        memTable.get(k)?.value?.let { v ->
-            return if (v.remaining() == 0) null else v
+    fun getV(key: ByteBuffer): ByteBuffer? =
+        getRecordLatest(key)?.let { rec ->
+            val v = rec.value
+            if (v.remaining() == 0 || rec.isTombstone) null else v
         }
 
-        readCache.get(k)?.let { v ->
-            return if (v.remaining() == 0) null else v
-        }
-
-        // 2. SSTables（Bloom → Index → data）
-        for (deque in levels) {
-            deque.firstNotNullOfOrNull { sst ->
-                if (!sst.mightContain(k)) return@firstNotNullOfOrNull null
-                val rec = sst.get(k) ?: return@firstNotNullOfOrNull null
-                val sv = rec.value
-                readCache.put(k, sv)
-                return@firstNotNullOfOrNull if (sv.remaining() != 0) sv else null
-            }?.let { return it }
-        }
-
-        // 3. Stripe cache
-        stripeCache.find(k)?.let { v ->
-            readCache.put(k, v)
-            return if (v.remaining() != 0) v else null
-        }
-
-        // 4. Stripe scan fallback (expensive)
-        AkkStripeReader(stripeWriter.baseDir, stripeWriter.k, stripeWriter.parityCoder).use { reader ->
-            val hit = reader.searchLatestStripe(k, manifest.stripesWritten - 1)
-            if (hit != null) {
-                stripeCache.put(hit.stripeId, hit.blocks)
-                val v = hit.record.value
-                readCache.put(k, v)
-                return if (v.remaining() != 0) v else null
-            }
-        }
-
-        return null
-    }
-
-    fun get(key: ByteBuffer): Record? {
-        val v = getV(key) ?: return null
-        return Record(key, v, memTable.lastSeq())
-    }
+    fun get(key: ByteBuffer): Record? = getRecordLatest(key)
 
     fun getAll(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
         val its = ArrayList<PeekingIter>()
@@ -202,15 +159,37 @@ class AkkaraDB private constructor(
     }
 
     /* ───────── write‑path ───────── */
-    fun put(rec: Record) = lock.write {
-        pool.borrow(recordWriter.computeMaxSize(rec)) { buf ->
-            recordWriter.write(rec, buf)
+    fun put(rec: Record) {
+        val kStore = rec.key.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val vStore = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val recStore = Record(kStore, vStore, rec.seqNo, flags = rec.flags)
+
+        val kWal = kStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val vWal = vStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val recWal = Record(kWal, vWal, rec.seqNo, flags = rec.flags)
+
+        pool.borrow(recordWriter.computeMaxSize(recWal)) { buf ->
+            recordWriter.write(recWal, buf)
             buf.flip()
-            wal.append(buf.duplicate())
+            wal.append(buf.duplicate(), wal.forceDurable.get())
         }
-        memTable.put(rec)
+
+        val accepted = lock.write { memTable.put(recStore) }
+
+        if (accepted) {
+            val k = kStore.duplicate().apply { rewind() }
+            val v = vStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
+            metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, v))
+        }
     }
 
+    /**
+     * Flushes MemTable to SSTable, seals current WAL segment,
+     * checkpoints StripeWriter and Manifest, and maybe compacts SSTables.
+     *
+     * This method acquires the global write‑lock, blocking all other
+     * operations until it completes.
+     */
     fun flush() = lock.write {
         wal.sealSegment()
         stripeWriter.flush()
@@ -230,7 +209,7 @@ class AkkaraDB private constructor(
     fun nextSeq(): Long = memTable.nextSeq()
 
     override fun close() {
-        flush(); wal.close(); stripeWriter.close()
+        flush(); wal.close(); stripeWriter.close(); readerPool.close()
         levels.forEach { deque -> deque.forEach(SSTableReader::close) }
     }
 
@@ -247,6 +226,11 @@ class AkkaraDB private constructor(
             parityCoder: ParityCoder = RSParityCoder(m),
             // 64 * 1024 * 1024 = 64 MiB
             flushThresholdBytes: Long = 64L * 1024 * 1024,
+            walPath: Path = baseDir.resolve("wal.log"),
+            walGroupCommitN: Int = 32,
+            walGroupCommitMicros: Long = 500,
+            walInitCap: Int = 32 * 1024,
+            metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
             manifest.load()
@@ -257,7 +241,12 @@ class AkkaraDB private constructor(
                 autoFlush = true,
                 onCommit = { committed -> manifest.advance(committed) }
             )
-            val wal = WalWriter(baseDir.resolve("wal.log"))
+            val wal = WalWriter(
+                path = walPath,
+                groupCommitN = walGroupCommitN,
+                groupCommitMicros = walGroupCommitMicros,
+                initCap = walInitCap
+            )
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
 
@@ -268,31 +257,32 @@ class AkkaraDB private constructor(
             val mem = MemTable(
                 flushThresholdBytes,
                 onFlush = { records ->
-                    if (records.isNotEmpty()) {
-                        val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
-
-                        val sorted = records.sortedWith { r1, r2 -> cmp(r1.key, r2.key) }
-                        SSTableWriter(sstPath, pool).use { it.write(sorted) }
-
-                        val firstKey = sorted.firstOrNull()?.key?.base64()
-                        val lastKey = sorted.lastOrNull()?.key?.base64()
-
-                        manifest.sstSeal(
-                            level = 0,
-                            file = sstPath.fileName.toString(),
-                            entries = sorted.size.toLong(),
-                            firstKeyHex = firstKey,
-                            lastKeyHex = lastKey
-                        )
-
-                        levels[0].addFirst(SSTableReader(sstPath, pool))
+                    if (records.isEmpty()) {
+                        manifest.checkpoint("memFlush-empty")
+                        return@MemTable
                     }
 
+                    val sorted = records.sortedWith { a, b -> cmp(a.key, b.key) }
+
+                    val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
+                    SSTableWriter(sstPath, pool).use { it.write(sorted) }
+
+                    val firstKey = sorted.firstOrNull()?.key?.base64()
+                    val lastKey = sorted.lastOrNull()?.key?.base64()
+                    manifest.sstSeal(
+                        level = 0,
+                        file = sstPath.fileName.toString(),
+                        entries = sorted.size.toLong(),
+                        firstKeyHex = firstKey,
+                        lastKeyHex = lastKey
+                    )
+                    levels[0].addFirst(SSTableReader(sstPath, pool))
+
                     val kStripe = k
-                    if (records.size >= kStripe) {
+                    if (sorted.size >= kStripe) {
                         var i = 0
-                        while (i + kStripe <= records.size) {
-                            val batch = records.subList(i, i + kStripe)
+                        while (i + kStripe <= sorted.size) {
+                            val batch = sorted.subList(i, i + kStripe)
                             for (r in batch) {
                                 val need = AkkRecordWriter.computeMaxSize(r)
                                 pool.borrow(need) { tmp ->
@@ -324,7 +314,7 @@ class AkkaraDB private constructor(
 
             val cp = manifest.lastCheckpoint
             replayWal(
-                baseDir.resolve("wal.log"),
+                walPath,
                 mem,
                 cp?.stripe ?: 0L,
                 cp?.lastSeq ?: Long.MIN_VALUE
@@ -332,7 +322,7 @@ class AkkaraDB private constructor(
 
             val compactor = Compactor(levels, baseDir, manifest, pool = pool).also { it.maybeCompact() }
 
-            return AkkaraDB(mem, stripe, manifest, wal, levels, pool, compactor)
+            return AkkaraDB(mem, stripe, manifest, wal, levels, pool, compactor, metaCacheCap)
         }
 
         private fun buildLevelsFromManifest(
@@ -373,13 +363,40 @@ class AkkaraDB private constructor(
     }
 
     private fun startsWith(key: ByteBuffer, prefix: ByteBuffer): Boolean {
-        if (key.remaining() < prefix.remaining()) return false
-        val k = key.duplicate()
-        val p = prefix.duplicate()
-        while (p.hasRemaining()) {
-            if ((k.get().toInt() and 0xFF) != (p.get().toInt() and 0xFF)) return false
+        val k = BufView(key)
+        val p = BufView(prefix)
+
+        val pRem = p.rem()
+        if (pRem == 0) return true
+        if (k.rem() < pRem) return false
+
+        // Fast path: 両方ヒープ（配列持ち）なら Arrays.mismatch で一発比較（JDK 9+）
+        if (key.hasArray() && prefix.hasArray()) {
+            val ka = key.array()
+            val pa = prefix.array()
+            val kOff = key.arrayOffset() + k.pos
+            val pOff = prefix.arrayOffset() + p.pos
+            // mismatch(...) は -1 を返すと「差異なし」
+            return java.util.Arrays.mismatch(ka, kOff, kOff + pRem, pa, pOff, pOff + pRem) == -1
+        }
+
+        // Fallback: どの ByteBuffer でも動く絶対 index 比較
+        // （符号は equality には無関係なので &0xFF は不要）
+        var i = 0
+        val kPos = k.pos
+        val pPos = p.pos
+        while (i < pRem) {
+            if (key.get(kPos + i) != prefix.get(pPos + i)) return false
+            i++
         }
         return true
+    }
+
+    @JvmInline
+    private value class BufView(val buf: ByteBuffer) {
+        val pos: Int get() = buf.position()
+        val lim: Int get() = buf.limit()
+        fun rem(): Int = lim - pos
     }
 
     data class ScanOptions(
@@ -409,5 +426,65 @@ class AkkaraDB private constructor(
             advance()
             return r
         }
+    }
+
+    private data class KeyMeta(
+        val seqNo: Long,
+        val isTombstone: Boolean,
+        val value: ByteBuffer
+    )
+
+    private data class ByteBufferKey(val bb: ByteBuffer, private val hash: Int) {
+        override fun hashCode(): Int = hash
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            return other is ByteBufferKey && cmp(bb, other.bb) == 0
+        }
+
+        companion object {
+            fun of(src: ByteBuffer): ByteBufferKey {
+                val dup = src.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+                var h = 1
+                while (dup.hasRemaining()) h = 31 * h + (dup.get().toInt() and 0xFF)
+                dup.rewind()
+                return ByteBufferKey(dup, h)
+            }
+        }
+    }
+
+    private fun getRecordLatest(key: ByteBuffer): Record? {
+        val k = key.duplicate().apply { rewind() }.asReadOnlyBuffer()
+
+        memTable.get(k)?.let { rec ->
+            val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
+            return rec
+        }
+
+        metaGet(k)?.let { return Record(k, it.value.duplicate().apply { rewind() }.order(ByteOrder.LITTLE_ENDIAN), it.seqNo) }
+
+        for (deque in levels) {
+            val rec = deque.firstNotNullOfOrNull { sst ->
+                if (!sst.mightContain(k)) null else sst.get(k)
+            }
+            if (rec != null) {
+                val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+                metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
+                return rec
+            }
+        }
+
+        readerPool.withResource { reader ->
+            val lastStripe = manifest.stripesWritten - 1
+            if (lastStripe >= 0) {
+                val hit = reader.searchLatestStripe(k, lastStripe) ?: return@withResource null
+                val rec = hit.record
+                val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+                metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
+                return rec
+            }
+        }
+
+        return null
     }
 }

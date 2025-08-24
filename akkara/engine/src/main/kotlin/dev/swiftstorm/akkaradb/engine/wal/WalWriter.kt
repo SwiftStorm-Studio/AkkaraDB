@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import java.io.Closeable
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
@@ -17,8 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * true "group commit (N or T)" and **durable-before-ACK** semantics.
  *
  * Fast mode support:
- *  - beginFastMode(): fsync をバリアまで遅延（flushBatch では fsync しない）
- *  - endFastMode():   必ず Barrier + fsync を入れてから通常(Durable)へ戻す
+ *  - beginFastMode(): delay fsync until the next barrier
+ *  - endFastMode():   ensure durability at the next barrier, then return to durable mode
  *
  * Thread safety: public APIs are safe to call from multiple threads.
  * Encoding: fixed-length LE as defined in WalRecord.
@@ -37,10 +38,7 @@ class WalWriter(
 
     private val ch = FileChannel.open(path, WRITE, CREATE, APPEND)
 
-    /** Scratch buffer for encoding a single record (owned by flusher thread). */
     private var scratch: ByteBuffer = pool.get(initCap)
-
-    private val writeLock = Any()
 
     /* ------------ command queue (writes + control barriers) ------------ */
 
@@ -60,16 +58,16 @@ class WalWriter(
 
     /**
      * Fast mode: fsync is delayed until the next barrier.
-     * Durable mode: fsync after every write (default).
-     * Fast mode is useful for bulk inserts, but not for correctness.
+     * Durable mode: fsync after every batch (default).
      */
-    private val forceDurable = AtomicBoolean(true)
+    val forceDurable = AtomicBoolean(true)
 
     fun beginFastMode() {
         forceDurable.set(false)
     }
 
     fun endFastMode() {
+        // Ensure all prior writes reach durable storage before returning to durable mode
         barrier().join()
         forceDurable.set(true)
     }
@@ -78,43 +76,51 @@ class WalWriter(
 
     /**
      * Append an Akk-encoded KV payload.
-     * @param durable true: fsync after write (default)
-     *                false: fsync is delayed until the next barrier
-     *                (useful for bulk inserts, but not for correctness)
+     * @param durable true: wait until enqueued writes reach durability (Durable-ACK)
+     *                false: return after enqueue (Fast-ACK; durability is deferred to a barrier)
      */
     fun append(record: ByteBuffer, durable: Boolean = true) {
-        val f = enqueueWrite(WalRecord.Add(record.asReadOnlyBuffer()))
+        val payload: ByteBuffer =
+            if (durable) {
+                record.duplicate().apply { rewind() }.asReadOnlyBuffer()
+            } else {
+                val src = record.duplicate().apply { rewind() }.order(ByteOrder.LITTLE_ENDIAN)
+                val owned = ByteBuffer.allocate(src.remaining())
+                owned.put(src)
+                owned.flip()
+                owned.asReadOnlyBuffer()
+            }
+
+        val f = enqueueWrite(WalRecord.Add(payload))
         if (durable) f.join()
     }
 
-    /** Mark end of segment; write a real Seal and ensure durability. */
+    /** Mark end of segment; write a real Seal and ensure durability regardless of mode. */
     fun sealSegment() {
-        synchronized(writeLock) {
-            enqueueWrite(WalRecord.Seal).join()
-        }
+        enqueueWrite(WalRecord.Seal).join()
+        barrier().join() // ensure durable even in Fast mode
     }
 
     /**
-     * Write a checkpoint {stripeIdx, seqNo} with the required ordering:
-     * real Seal followed by CheckPoint, then force durability.
+     * Write a checkpoint {stripeIdx, seqNo} with strict ordering:
+     *  (1) barrier (durable up to now)
+     *  (2) Seal + CheckPoint
+     *  (3) barrier (durable including Seal+CP)
      */
     fun checkpoint(stripeIdx: Long, seqNo: Long) {
-        synchronized(writeLock) {
-            barrier().join()
-            val f1 = enqueueWrite(WalRecord.Seal)
-            val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
-            CompletableFuture.allOf(f1, f2).join()
-        }
+        barrier().join()
+        val f1 = enqueueWrite(WalRecord.Seal)
+        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
+        CompletableFuture.allOf(f1, f2).join()
+        barrier().join()
     }
 
     /** Truncate WAL after a successful checkpoint. */
     fun truncate() {
-        synchronized(writeLock) {
-            barrier().join()
-            ch.truncate(0)
-            ch.force(false)
-            ch.position(0)
-        }
+        barrier().join()
+        ch.truncate(0)
+        ch.force(false)
+        ch.position(0)
     }
 
     /* --------------------------- internals ---------------------------- */
@@ -122,48 +128,94 @@ class WalWriter(
     private fun enqueueWrite(r: WalRecord): CompletableFuture<Void> {
         val est = r.estimateSize()
         require(est <= MAX_RECORD_BYTES) { "WAL record too large: $est bytes" }
-        return CompletableFuture<Void>().also { q.put(Write(r, it)) }
+
+        val f = CompletableFuture<Void>()
+        if (!running.get()) {
+            f.completeExceptionally(IllegalStateException("WAL writer is closed"))
+            return f
+        }
+        try {
+            q.put(Write(r, f))
+        } catch (ie: InterruptedException) {
+            f.completeExceptionally(ie)
+            Thread.currentThread().interrupt()
+        }
+        return f
     }
 
     /** Inserts a control barrier (no on-disk record) and waits for fsync at the barrier point. */
-    private fun barrier(): CompletableFuture<Void> =
-        CompletableFuture<Void>().also { q.put(Barrier(it)) }
+    private fun barrier(): CompletableFuture<Void> {
+        val f = CompletableFuture<Void>()
+        if (!running.get()) {
+            f.completeExceptionally(IllegalStateException("WAL writer is closed"))
+            return f
+        }
+        try {
+            q.put(Barrier(f))
+        } catch (ie: InterruptedException) {
+            f.completeExceptionally(ie)
+            Thread.currentThread().interrupt()
+        }
+        return f
+    }
 
     private fun flushLoop() {
         val batch = ArrayList<Write>(groupCommitN)
 
         fun flushBatch() {
             if (batch.isEmpty()) return
-            writeBatch(batch)
-            if (forceDurable.get()) ch.force(false)
-            batch.forEach { it.done.complete(null) }
-            batch.clear()
+            try {
+                writeBatch(batch)
+                if (forceDurable.get()) ch.force(false)
+                batch.forEach { it.done.complete(null) }
+            } catch (t: Throwable) {
+                batch.forEach { it.done.completeExceptionally(t) }
+            } finally {
+                batch.clear()
+            }
         }
 
         // Main loop
         while (running.get() || !q.isEmpty()) {
             try {
-                // wait up to T µs for first command
+                // wait up to T µs for first command (start of a batch window)
                 val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS) ?: continue
                 when (first) {
                     is Barrier -> {
+                        // close any open batch first
                         flushBatch()
-                        ch.force(false)
-                        first.done.complete(null)
+                        try {
+                            ch.force(false)
+                            first.done.complete(null)
+                        } catch (t: Throwable) {
+                            first.done.completeExceptionally(t)
+                        }
                         continue
                     }
                     is Write -> batch += first
                 }
 
-                // drain more until N or a Barrier arrives (without blocking)
+                // From the first write, wait until deadline (T) while filling up to N
+                val deadlineNanos =
+                    System.nanoTime() + TimeUnit.MICROSECONDS.toNanos(groupCommitMicros)
+
                 while (batch.size < groupCommitN) {
-                    val next = q.poll() ?: break
+                    val remain = deadlineNanos - System.nanoTime()
+                    if (remain <= 0) break
+                    val next = q.poll(remain, TimeUnit.NANOSECONDS) ?: break
                     when (next) {
                         is Write -> batch += next
                         is Barrier -> {
+                            // finalize current batch before honoring the barrier
                             flushBatch()
-                            ch.force(false) // バリアは必ず fsync
-                            next.done.complete(null)
+                            try {
+                                ch.force(false)
+                                next.done.complete(null)
+                            } catch (t: Throwable) {
+                                next.done.completeExceptionally(t)
+                            }
+                            // barrier defines a hard boundary; end this cycle
+                            break
                         }
                     }
                 }
@@ -171,58 +223,83 @@ class WalWriter(
                 // time boundary or count boundary reached → flush once
                 flushBatch()
             } catch (t: Throwable) {
-                // complete exceptionally and keep running (best-effort resiliency)
-                while (true) {
-                    val c = batch.removeLastOrNull() ?: break
-                    c.done.completeExceptionally(t)
+                // As a last resort, fail any collected but unflushed writes
+                if (batch.isNotEmpty()) {
+                    batch.forEach { it.done.completeExceptionally(t) }
+                    batch.clear()
                 }
+                // keep running (best-effort resiliency)
             }
         }
 
-        // Drain remaining writes on shutdown
-        while (q.poll()?.let {
-                when (it) {
-                    is Write -> {
-                        writeBatch(listOf(it))
+        // Drain remaining commands on shutdown
+        while (true) {
+            val cmd = q.poll() ?: break
+            when (cmd) {
+                is Write -> {
+                    try {
+                        writeBatch(listOf(cmd))
                         ch.force(false)
-                        it.done.complete(null)
-                        true
-                    }
-                    is Barrier -> {
-                        ch.force(false)
-                        it.done.complete(null)
-                        true
+                        cmd.done.complete(null)
+                    } catch (t: Throwable) {
+                        cmd.done.completeExceptionally(t)
                     }
                 }
-            } == true) { /* keep draining */
+
+                is Barrier -> {
+                    try {
+                        ch.force(false)
+                        cmd.done.complete(null)
+                    } catch (t: Throwable) {
+                        cmd.done.completeExceptionally(t)
+                    }
+                }
+            }
         }
     }
 
     private fun writeBatch(batch: List<Write>) {
+        var total = 0
+        for (p in batch) total += p.rec.estimateSize()
+
+        if (scratch.capacity() < total) {
+            pool.release(scratch)
+            var newCap = scratch.capacity()
+            while (newCap < total) newCap = newCap * 2
+            scratch = pool.get(newCap)
+        }
+
+        scratch.clear()
         for (p in batch) {
-            val est = p.rec.estimateSize()
-            if (scratch.capacity() < est) {
-                pool.release(scratch)
-                var newCap = scratch.capacity()
-                while (newCap < est) newCap = newCap * 2
-                scratch = pool.get(newCap)
-            }
-            scratch.clear()
             p.rec.writeTo(scratch)
-            scratch.flip()
-            while (scratch.hasRemaining()) ch.write(scratch)
+        }
+        scratch.flip()
+
+        while (scratch.hasRemaining()) {
+            ch.write(scratch)
         }
     }
 
     /* --------------------------- lifecycle ---------------------------- */
 
     override fun close() {
+        // signal stop and make sure flusher reaches a barrier and exits
         running.set(false)
+        try {
+            // Wake flusher and force it to close the current window cleanly
+            barrier().join()
+        } catch (_: Throwable) {
+            // ignore; we'll still attempt to join and close
+        }
         flusher.join()
+
         // final fsync for safety
-        ch.force(false)
-        pool.release(scratch)
-        ch.close()
+        try {
+            ch.force(false)
+        } finally {
+            pool.release(scratch)
+            ch.close()
+        }
     }
 }
 

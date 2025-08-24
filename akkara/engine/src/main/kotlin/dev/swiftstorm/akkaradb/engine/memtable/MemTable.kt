@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.engine.memtable
 
 import dev.swiftstorm.akkaradb.common.Record
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -12,14 +13,15 @@ import kotlin.concurrent.read
 import kotlin.concurrent.write
 import kotlin.math.max
 
-/* * MemTable is an in-memory key-value store that uses a LinkedHashMap to maintain
- * LRU order of entries. It supports automatic flushing to disk when a size threshold
- * is reached, and can evict the oldest entries if a maximum entry count is set.
+/**
+ * A thread-safe in-memory table for storing and managing `Record` objects.
+ * Supports LRU eviction, flushing, and iteration over records.
  *
- * @param thresholdBytes The size in bytes at which the MemTable will trigger a flush.
- * @param onFlush Callback invoked with the records to flush when the threshold is reached.
- * @param onEvict Optional callback invoked with evicted records when eviction occurs.
- * @param maxEntries Optional maximum number of entries before eviction is triggered.
+ * @property thresholdBytes The maximum size in bytes before triggering a flush.
+ * @property onFlush Callback invoked when the table is flushed.
+ * @property onEvict Optional callback invoked when records are evicted.
+ * @property maxEntries Optional maximum number of entries allowed in the table.
+ * @property executor Executor service used for asynchronous flushing.
  */
 class MemTable(
     private val thresholdBytes: Long,
@@ -30,6 +32,7 @@ class MemTable(
         Thread(r, "memtable-flush").apply { isDaemon = true }
     }
 ) : AutoCloseable {
+
     /* ---- LRU-Ordered map ---- */
     private fun newLruMap(): LinkedHashMap<ByteBuffer, Record> =
         object : LinkedHashMap<ByteBuffer, Record>(16, 0.75f, true) {
@@ -43,74 +46,96 @@ class MemTable(
             }
         }
 
-    private val lruMap: LinkedHashMap<ByteBuffer, Record> = newLruMap()
-    private val mapRef = AtomicReference<LinkedHashMap<ByteBuffer, Record>>(lruMap)
+    private val mapRef = AtomicReference<LinkedHashMap<ByteBuffer, Record>>(newLruMap())
 
     private val currentBytes = AtomicLong(0)
     private val highestSeqNo = AtomicLong(0)
+
     private val flushPending = AtomicBoolean(false)
+
     private val lock = ReentrantReadWriteLock()
 
+    /**
+     * Retrieves a record by its key.
+     *
+     * @param key The key of the record to retrieve.
+     * @return The record associated with the key, or `null` if not found.
+     */
     fun get(key: ByteBuffer): Record? = lock.read { mapRef.get()[key] }
 
+    /**
+     * Retrieves all records in the table.
+     *
+     * @return A list of all records.
+     */
     fun getAll(): List<Record> = lock.read { mapRef.get().values.toList() }
 
-    fun put(record: Record) {
-        val triggerFlush = lock.write {
-            val keyCopy = record.key.duplicate().apply { rewind() }.asReadOnlyBuffer()
+    /**
+     * Inserts or updates a record in the table.
+     * Triggers a flush if the size exceeds the threshold.
+     *
+     * @param record The record to insert or update.
+     */
+    fun put(record: Record): Boolean {
+        var shouldFlush = false
+        val accepted = lock.write {
+            val keyCopy = record.key.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            val valCopy = record.value.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
             val map = mapRef.get()
-            val prev = map.put(keyCopy, record)
+            val prev = map[keyCopy]
+            if (prev != null && record.seqNo < prev.seqNo) return@write false
+
+            map[keyCopy] = Record(keyCopy, valCopy, record.seqNo, flags = if (record.isTombstone) Record.FLAG_TOMBSTONE else 0)
+
             if (record.seqNo > highestSeqNo.get()) {
                 highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
             }
-            val delta = sizeOf(record) - (prev?.let { sizeOf(it) } ?: 0L)
+            val delta = sizeOf(map[keyCopy]!!) - (prev?.let { sizeOf(it) } ?: 0L)
             val sizeAfter = currentBytes.addAndGet(delta)
-            sizeAfter >= thresholdBytes
+            shouldFlush = sizeAfter >= thresholdBytes
+            true
         }
-        if (triggerFlush && flushPending.compareAndSet(false, true)) {
+        if (shouldFlush && flushPending.compareAndSet(false, true)) {
             executor.execute(::flushInternal)
         }
+        return accepted
     }
 
-    /**
-     * Flushes the MemTable to disk if the flush is pending or if there are
-     * any records currently in the MemTable.
-     */
+
     fun flush() {
         if (flushPending.compareAndSet(false, true) || currentBytes.get() > 0) {
             flushInternal()
         }
     }
 
+    /**
+     * Evicts the oldest `n` records from the table.
+     *
+     * @param n The number of records to evict (default is 1).
+     */
     fun evictOldest(n: Int = 1) {
         lock.write {
             val map = mapRef.get()
-            val evicted = mutableListOf<Record>()
+            val it = map.entries.iterator()
+            val evicted = ArrayList<Record>(n)
             var bytesFreed = 0L
-            repeat(n) {
-                val eldest = map.entries.iterator().takeIf { it.hasNext() }?.next()
-                if (eldest != null) {
-                    evicted += eldest.value
-                    bytesFreed += sizeOf(eldest.value)
-                    map.remove(eldest.key)
-                }
+
+            var i = 0
+            while (i < n && it.hasNext()) {
+                val e = it.next()
+                evicted += e.value
+                bytesFreed += sizeOf(e.value)
+                it.remove()
+                i++
             }
+
             if (bytesFreed > 0) currentBytes.addAndGet(-bytesFreed)
             if (evicted.isNotEmpty()) onEvict?.invoke(evicted)
         }
     }
 
-    /**
-     * Returns the highest sequence number currently in the MemTable.
-     * This is useful for tracking the latest record added.
-     */
     fun lastSeq(): Long = highestSeqNo.get()
 
-    /**
-     * Returns the next sequence number to be used for a new record.
-     * This is typically used when inserting a new record to ensure
-     * it has a unique sequence number.
-     */
     fun nextSeq(): Long = highestSeqNo.updateAndGet { it + 1 }
 
     override fun close() {
@@ -122,19 +147,27 @@ class MemTable(
     }
 
     private fun flushInternal() {
-        val oldMap = mapRef.getAndSet(newLruMap())
-        val bytesFlushed = oldMap.values.sumOf { sizeOf(it) }
-        currentBytes.addAndGet(-bytesFlushed)
-        flushPending.set(false)
-        if (oldMap.isEmpty()) return
+        var toFlush: List<Record>? = null
+        var bytesFlushed = 0L
 
-        val toFlush = ArrayList<Record>(oldMap.size)
-        toFlush.addAll(oldMap.values)
+        lock.write {
+            val oldMap = mapRef.getAndSet(newLruMap())
+            if (oldMap.isNotEmpty()) {
+                toFlush = ArrayList(oldMap.values)
+                bytesFlushed = oldMap.values.sumOf { sizeOf(it) }
+            } else {
+                flushPending.set(false)
+                return
+            }
+        }
+        currentBytes.addAndGet(-bytesFlushed)
 
         try {
-            onFlush.invoke(toFlush)
+            onFlush.invoke(toFlush!!)
         } catch (e: Exception) {
             e.printStackTrace()
+        } finally {
+            flushPending.set(false)
         }
     }
 
@@ -154,7 +187,8 @@ class MemTable(
         return filteredSorted.iterator()
     }
 
-    private fun sizeOf(r: Record): Long = (r.key.remaining() + r.value.remaining() + Long.SIZE_BYTES).toLong()
+    private fun sizeOf(r: Record): Long =
+        (r.key.remaining() + r.value.remaining() + Long.SIZE_BYTES).toLong()
 
     private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {
         val aa = a.duplicate().apply { rewind() }
