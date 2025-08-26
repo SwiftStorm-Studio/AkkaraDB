@@ -3,10 +3,10 @@
 package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.ShortUUID
 import dev.swiftstorm.akkaradb.common.internal.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPack
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPackBufferPool
-import dev.swiftstorm.akkaradb.engine.util.ShortUUID
 import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import org.objenesis.ObjenesisStd
@@ -167,7 +167,7 @@ class PackedTable<T : Any>(
         val out = ByteBuffer.allocate(rNs.remaining() + idBuf.remaining() + 1 + uuidBuf.remaining())
         out.put(rNs).put(idBuf).put(SEP.code.toByte()).put(uuidBuf)
         out.flip()
-        return out.asReadOnlyBuffer()
+        return out.asReadOnlyBuffer() // LITTLE_ENDIAN
     }
 
     private fun prefixBuf(id: String): ByteBuffer {
@@ -186,8 +186,8 @@ class PackedTable<T : Any>(
     /* ───────── CRUD ───────── */
 
     fun put(id: String, uuid: ShortUUID, entity: T) {
-        val encoded = BinPack.encode(kClass, entity)
-        val key = keyBuf(id, uuid)
+        val encoded = BinPack.encode(kClass, entity) // LITTLE_ENDIAN
+        val key = keyBuf(id, uuid) // read-only, LITTLE_ENDIAN
         val seqNum = db.nextSeq()
 
         db.put(Record(key, encoded, seqNum))
@@ -288,7 +288,7 @@ fun String.isASCII(): Boolean = all { it.code <= 127 }
 fun <T : Any> BinPack.encode(kClass: KClass<T>, value: T): ByteBuffer {
     val adapter = AdapterResolver.getAdapterForClass(kClass)
     val size = adapter.estimateSize(value)
-    val buffer = BinPackBufferPool.get(size)
+    val buffer = BinPackBufferPool.get(size) // LITTLE_ENDIAN
     adapter.write(value, buffer)
     buffer.flip()
     return buffer
