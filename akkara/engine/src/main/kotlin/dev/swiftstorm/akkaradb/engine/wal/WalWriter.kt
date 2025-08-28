@@ -1,10 +1,9 @@
 package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import java.io.Closeable
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.*
@@ -38,14 +37,20 @@ class WalWriter(
 
     private val ch = FileChannel.open(path, WRITE, CREATE, APPEND)
 
-    private var scratch: ByteBuffer = pool.get(initCap)
+    private var scratch: ByteBufferL = pool.get(initCap)
 
     /* ------------ command queue (writes + control barriers) ------------ */
 
     private sealed interface Cmd {
         val done: CompletableFuture<Void>
     }
-    private data class Write(val rec: WalRecord, override val done: CompletableFuture<Void>) : Cmd
+
+    private data class Write(
+        val rec: WalRecord,
+        val durable: Boolean,
+        override val done: CompletableFuture<Void>
+    ) : Cmd
+
     private data class Barrier(override val done: CompletableFuture<Void>) : Cmd
 
     private val q = LinkedBlockingQueue<Cmd>()
@@ -79,25 +84,23 @@ class WalWriter(
      * @param durable true: wait until enqueued writes reach durability (Durable-ACK)
      *                false: return after enqueue (Fast-ACK; durability is deferred to a barrier)
      */
-    fun append(record: ByteBuffer, durable: Boolean = true) {
-        val payload: ByteBuffer =
+    fun append(record: ByteBufferL, durable: Boolean = true) {
+        val payload: ByteBufferL =
             if (durable) {
-                record.duplicate().apply { rewind() }.asReadOnlyBuffer()
+                record.duplicate().apply { rewind() }.asReadOnly()
             } else {
-                val src = record.duplicate().apply { rewind() }.order(ByteOrder.LITTLE_ENDIAN)
-                val owned = ByteBuffer.allocate(src.remaining())
-                owned.put(src)
-                owned.flip()
-                owned.asReadOnlyBuffer()
+                val src = record.duplicate().apply { rewind() }
+                val owned = ByteBufferL.allocate(src.remaining)
+                owned.put(src.asReadOnlyByteBuffer()).flip().asReadOnly()
             }
 
-        val f = enqueueWrite(WalRecord.Add(payload))
+        val f = enqueueWrite(WalRecord.Add(payload), durable)
         if (durable) f.join()
     }
 
     /** Mark end of segment; write a real Seal and ensure durability regardless of mode. */
     fun sealSegment() {
-        enqueueWrite(WalRecord.Seal).join()
+        enqueueWrite(WalRecord.Seal, durable = false).join()
         barrier().join() // ensure durable even in Fast mode
     }
 
@@ -109,8 +112,8 @@ class WalWriter(
      */
     fun checkpoint(stripeIdx: Long, seqNo: Long) {
         barrier().join()
-        val f1 = enqueueWrite(WalRecord.Seal)
-        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo))
+        val f1 = enqueueWrite(WalRecord.Seal, durable = false)
+        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo), durable = false)
         CompletableFuture.allOf(f1, f2).join()
         barrier().join()
     }
@@ -125,7 +128,7 @@ class WalWriter(
 
     /* --------------------------- internals ---------------------------- */
 
-    private fun enqueueWrite(r: WalRecord): CompletableFuture<Void> {
+    private fun enqueueWrite(r: WalRecord, durable: Boolean): CompletableFuture<Void> {
         val est = r.estimateSize()
         require(est <= MAX_RECORD_BYTES) { "WAL record too large: $est bytes" }
 
@@ -135,7 +138,7 @@ class WalWriter(
             return f
         }
         try {
-            q.put(Write(r, f))
+            q.put(Write(r, durable, f))
         } catch (ie: InterruptedException) {
             f.completeExceptionally(ie)
             Thread.currentThread().interrupt()
@@ -166,7 +169,8 @@ class WalWriter(
             if (batch.isEmpty()) return
             try {
                 writeBatch(batch)
-                if (forceDurable.get()) ch.force(false)
+                val needForce = forceDurable.get() || batch.any { it.durable }
+                if (needForce) ch.force(false)
                 batch.forEach { it.done.complete(null) }
             } catch (t: Throwable) {
                 batch.forEach { it.done.completeExceptionally(t) }
@@ -262,9 +266,9 @@ class WalWriter(
         var total = 0
         for (p in batch) total += p.rec.estimateSize()
 
-        if (scratch.capacity() < total) {
+        if (scratch.capacity < total) {
             pool.release(scratch)
-            var newCap = scratch.capacity()
+            var newCap = scratch.capacity
             while (newCap < total) newCap = newCap * 2
             scratch = pool.get(newCap)
         }
@@ -275,8 +279,20 @@ class WalWriter(
         }
         scratch.flip()
 
-        while (scratch.hasRemaining()) {
-            ch.write(scratch)
+        run {
+            val bb = scratch.toMutableByteBuffer()
+            var wrote = 0
+            while (bb.hasRemaining()) {
+                val n = ch.write(bb)
+                if (n <= 0) {
+                    Thread.onSpinWait()
+                    continue
+                }
+                wrote += n
+            }
+            if (wrote > 0) {
+                scratch.advance(wrote) // pos を limit まで進める
+            }
         }
     }
 
@@ -306,7 +322,7 @@ class WalWriter(
 /* -------- size estimator aligned with the current WalRecord encoding -------- */
 private fun WalRecord.estimateSize(): Int =
     when (this) {
-        is WalRecord.Seal -> 1                    // [tag]
-        is WalRecord.CheckPoint -> 1 + 8 + 8      // [tag][u64][u64]
-        is WalRecord.Add -> 1 + 4 + payload.remaining() + 4 // [tag][u32][payload][crc]
+        is WalRecord.Seal -> 1                           // [tag]
+        is WalRecord.CheckPoint -> 1 + 8 + 8             // [tag][u64][u64]
+        is WalRecord.Add -> 1 + 4 + payload.remaining + 4 // [tag][u32][payload][crc]
     }

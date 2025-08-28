@@ -1,5 +1,7 @@
 package dev.swiftstorm.akkaradb.engine.util
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
+import java.lang.Long.rotateLeft
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.ReadableByteChannel
@@ -28,7 +30,7 @@ class BloomFilter private constructor(
 
     /* ───────── public API ───────── */
 
-    fun mightContain(key: ByteBuffer): Boolean {
+    fun mightContain(key: ByteBufferL): Boolean {
         if (bits == 0) return false              // safety guard – never /0
         val (h1, h2) = hash(key)
         for (i in 0 until hashCount) {
@@ -71,30 +73,30 @@ class BloomFilter private constructor(
         }
 
         /* ─── hashing helpers (same Murmur3 impl as before) ─── */
-        private fun hash(key: ByteBuffer): Pair<Int, Int> {
+        private fun hash(key: ByteBufferL): Pair<Int, Int> {
             val (lo, hi) = murmur3_128(key)
             return lo.toInt() to hi.toInt()
         }
 
-        private fun murmur3_128(bufOrig: ByteBuffer, seed: Long = 0L): LongArray {
-            val buf = bufOrig.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        private fun murmur3_128(bufOrig: ByteBufferL, seed: Long = 0L): LongArray {
+            val buf = bufOrig.duplicate()
             var h1 = seed
             var h2 = seed
             val c1 = -0x783c_846e_eebd_ac2bL
             val c2 = -0x7a14_3588_f3d8_f9e3L
 
-            while (buf.remaining() >= 16) {
+            while (buf.remaining >= 16) {
                 var k1 = buf.long
                 var k2 = buf.long
-                k1 *= c1; k1 = java.lang.Long.rotateLeft(k1, 31); k1 *= c2; h1 = h1 xor k1
-                h1 = java.lang.Long.rotateLeft(h1, 27) + h2; h1 = h1 * 5 + 0x52dce729
-                k2 *= c2; k2 = java.lang.Long.rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
-                h2 = java.lang.Long.rotateLeft(h2, 31) + h1; h2 = h2 * 5 + 0x38495ab5
+                k1 *= c1; k1 = rotateLeft(k1, 31); k1 *= c2; h1 = h1 xor k1
+                h1 = rotateLeft(h1, 27) + h2; h1 = h1 * 5 + 0x52dce729
+                k2 *= c2; k2 = rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
+                h2 = rotateLeft(h2, 31) + h1; h2 = h2 * 5 + 0x38495ab5
             }
 
-            var k1 = 0L;
+            var k1 = 0L
             var k2 = 0L
-            when (buf.remaining()) {
+            when (buf.remaining) {
                 15 -> k2 = buf.get(14).toLong() shl 48
                 14 -> k2 = k2 or (buf.get(13).toLong() and 0xff shl 40)
                 13 -> k2 = k2 or (buf.get(12).toLong() and 0xff shl 32)
@@ -113,12 +115,12 @@ class BloomFilter private constructor(
                 0 -> Unit
             }
             if (k1 != 0L) {
-                k1 *= c1; k1 = java.lang.Long.rotateLeft(k1, 31); k1 *= c2; h1 = h1 xor k1
+                k1 *= c1; k1 = rotateLeft(k1, 31); k1 *= c2; h1 = h1 xor k1
             }
             if (k2 != 0L) {
-                k2 *= c2; k2 = java.lang.Long.rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
+                k2 *= c2; k2 = rotateLeft(k2, 33); k2 *= c1; h2 = h2 xor k2
             }
-            h1 = h1 xor bufOrig.remaining().toLong(); h2 = h2 xor bufOrig.remaining().toLong(); h1 += h2; h2 += h1
+            h1 = h1 xor bufOrig.remaining.toLong(); h2 = h2 xor bufOrig.remaining.toLong(); h1 += h2; h2 += h1
             h1 = fmix64(h1); h2 = fmix64(h2); h1 += h2; h2 += h1
             return longArrayOf(h1, h2)
         }
@@ -148,7 +150,7 @@ class BloomFilter private constructor(
             bitset = LongArray((bits + 63) ushr 6)
         }
 
-        fun add(key: ByteBuffer): Builder {
+        fun add(key: ByteBufferL): Builder {
             val (h1, h2) = hash(key)
             for (i in 0 until hashCount) {
                 val idx = ((h1 + i * h2).ushr(1) and Int.MAX_VALUE) % bits

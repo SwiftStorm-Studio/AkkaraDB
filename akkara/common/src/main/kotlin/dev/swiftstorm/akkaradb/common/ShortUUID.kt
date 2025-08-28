@@ -7,7 +7,7 @@ import java.util.*
  * Utility class for handling UUIDs and their shorter string representations.
  *
  * NOTE:
- * - This implementation serializes UUIDs in **little-endian** order via LByteBuffer.
+ * - This implementation serializes UUIDs in **little-endian** order via ByteBufferL.
  * - Short-string (Base64URL) values will differ from any former BIG_ENDIAN implementation.
  */
 @Suppress("unused", "MemberVisibilityCanBePrivate")
@@ -49,10 +49,10 @@ class ShortUUID internal constructor(
         fun fromShortString(shortString: String): ShortUUID {
             require(isValidShortString(shortString)) { "Invalid short string for UUID" }
             val bytes = Base64.getUrlDecoder().decode(shortString)
-            // Use LByteBuffer to read little-endian longs
-            val le = LByteBuffer.wrap(ByteBuffer.wrap(bytes))
-            val high = le.getLong() // LITTLE_ENDIAN due to LByteBuffer
-            val low = le.getLong()
+            // Use ByteBufferL to read little-endian longs
+            val le = ByteBufferL.wrap(ByteBuffer.wrap(bytes))
+            val high = le.long // LITTLE_ENDIAN due to ByteBufferL
+            val low = le.long
             return ShortUUID(UUID(high, low))
         }
 
@@ -87,12 +87,12 @@ class ShortUUID internal constructor(
 
     /**
      * Short string (Base64 URL-safe without padding) using **little-endian** encoding
-     * via LByteBuffer.
+     * via ByteBufferL.
      *
      * If you need legacy BIG_ENDIAN output, use `toShortStringBE()`.
      */
     fun toShortString(): String {
-        val le = LByteBuffer.allocate(16)
+        val le = ByteBufferL.allocate(16)
         le.putLong(uuid.mostSignificantBits) // writes as LITTLE_ENDIAN
         le.putLong(uuid.leastSignificantBits)
         val bytes = le.arrayOrCopy() // see helper extension below
@@ -104,7 +104,7 @@ class ShortUUID internal constructor(
      * Position = 0, Limit = 16.
      */
     fun toByteBuffer(): ByteBuffer {
-        val le = LByteBuffer.allocate(16)
+        val le = ByteBufferL.allocate(16)
         le.putLong(uuid.mostSignificantBits)
         le.putLong(uuid.leastSignificantBits)
         le.flip()
@@ -114,7 +114,7 @@ class ShortUUID internal constructor(
 
     @Deprecated("ByteArray is slow. Use toByteBuffer() instead.", ReplaceWith("toByteBuffer()"))
     fun toByteArray(): ByteArray {
-        val le = LByteBuffer.allocate(16)
+        val le = ByteBufferL.allocate(16)
         le.putLong(uuid.mostSignificantBits)
         le.putLong(uuid.leastSignificantBits)
         return le.arrayOrCopy()
@@ -147,14 +147,14 @@ fun ShortUUID.toUUID(): UUID = this.uuid
  */
 fun ByteBuffer.toShortUUID(): ShortUUID {
     require(remaining() == 16) { "ByteBuffer must have exactly 16 bytes for UUID" }
-    val le = LByteBuffer.wrap(this) // duplicates + sets LITTLE_ENDIAN
-    val high = le.getLong()
-    val low = le.getLong()
+    val le = ByteBufferL.wrap(this) // duplicates + sets LITTLE_ENDIAN
+    val high = le.long
+    val low = le.long
     return ShortUUID(UUID(high, low))
 }
 
 /* ============================== Helpers ============================== */
-private fun LByteBuffer.arrayOrCopy(): ByteArray {
+private fun ByteBufferL.arrayOrCopy(): ByteArray {
     return if (this.hasArray()) this.array()
     else {
         val dup = this.duplicate()

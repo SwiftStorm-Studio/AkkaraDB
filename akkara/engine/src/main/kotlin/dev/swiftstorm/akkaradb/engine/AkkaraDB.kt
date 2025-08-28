@@ -1,9 +1,6 @@
 package dev.swiftstorm.akkaradb.engine
 
-import dev.swiftstorm.akkaradb.common.BufferPool
-import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.common.Record
-import dev.swiftstorm.akkaradb.common.borrow
+import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.engine.sstable.Compactor
@@ -18,8 +15,7 @@ import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
 import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
 import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
@@ -57,12 +53,12 @@ class AkkaraDB private constructor(
     )
 
     @Synchronized
-    private fun metaGet(k: ByteBuffer): KeyMeta? = metaCache[ByteBufferKey.of(k)]
+    private fun metaGet(k: ByteBufferL): KeyMeta? = metaCache[ByteBufferKey.of(k)]
 
     @Synchronized
-    private fun metaPut(k: ByteBuffer, m: KeyMeta) {
+    private fun metaPut(k: ByteBufferL, m: KeyMeta) {
         metaCache[ByteBufferKey.of(k)] = m.copy(
-            value = m.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+            value = m.value.duplicate().apply { rewind() }.asReadOnly()
         )
     }
 
@@ -81,13 +77,13 @@ class AkkaraDB private constructor(
      * 3. Stripe cache hit
      * 4. Stripe scan fallback
      */
-    fun getV(key: ByteBuffer): ByteBuffer? =
+    fun getV(key: ByteBufferL): ByteBufferL? =
         getRecordLatest(key)?.let { rec ->
             val v = rec.value
-            if (v.remaining() == 0 || rec.isTombstone) null else v
+            if (v.remaining == 0 || rec.isTombstone) null else v
         }
 
-    fun get(key: ByteBuffer): Record? = getRecordLatest(key)
+    fun get(key: ByteBufferL): Record? = getRecordLatest(key)
 
     fun getAll(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
         val its = ArrayList<PeekingIter>()
@@ -106,7 +102,7 @@ class AkkaraDB private constructor(
         its.filter { it.hasNext() }.forEach(heap::add)
 
         var emitted = 0
-        var lastKey: ByteBuffer? = null
+        var lastKey: ByteBufferL? = null
 
         while (heap.isNotEmpty()) {
             val head = heap.poll()
@@ -160,12 +156,12 @@ class AkkaraDB private constructor(
 
     /* ───────── write‑path ───────── */
     fun put(rec: Record) {
-        val kStore = rec.key.duplicate().apply { rewind() }.asReadOnlyBuffer()
-        val vStore = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val kStore = rec.key.duplicate().apply { rewind() }.asReadOnly()
+        val vStore = rec.value.duplicate().apply { rewind() }.asReadOnly()
         val recStore = Record(kStore, vStore, rec.seqNo, flags = rec.flags)
 
-        val kWal = kStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
-        val vWal = vStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
+        val kWal = kStore.duplicate().apply { rewind() }.asReadOnly()
+        val vWal = vStore.duplicate().apply { rewind() }.asReadOnly()
         val recWal = Record(kWal, vWal, rec.seqNo, flags = rec.flags)
 
         pool.borrow(recordWriter.computeMaxSize(recWal)) { buf ->
@@ -178,7 +174,7 @@ class AkkaraDB private constructor(
 
         if (accepted) {
             val k = kStore.duplicate().apply { rewind() }
-            val v = vStore.duplicate().apply { rewind() }.asReadOnlyBuffer()
+            val v = vStore.duplicate().apply { rewind() }.asReadOnly()
             metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, v))
         }
     }
@@ -343,66 +339,34 @@ class AkkaraDB private constructor(
             return lv
         }
 
-        private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {
-            val aa = a.duplicate().apply { rewind() }
-            val bb = b.duplicate().apply { rewind() }
-            while (aa.hasRemaining() && bb.hasRemaining()) {
-                val x = aa.get().toInt() and 0xFF
-                val y = bb.get().toInt() and 0xFF
-                if (x != y) return x - y
-            }
-            return aa.remaining() - bb.remaining()
-        }
+        private fun cmp(a: ByteBufferL, b: ByteBufferL): Int = a.compareTo(b)
 
-        fun ByteBuffer.base64(): String {
-            val dup = duplicate().apply { rewind() }
-            val arr = ByteArray(dup.remaining())
-            dup.get(arr)
-            return BASE64_TL.get().encodeToString(arr)
+        fun ByteBufferL.base64(): String {
+            val enc = BASE64_TL.get()
+            val src = this.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
+            val out = enc.encode(src)
+            out.flip()
+            return StandardCharsets.ISO_8859_1.decode(out).toString()
         }
     }
 
-    private fun startsWith(key: ByteBuffer, prefix: ByteBuffer): Boolean {
-        val k = BufView(key)
-        val p = BufView(prefix)
+    private fun startsWith(key: ByteBufferL, prefix: ByteBufferL): Boolean {
+        val k = key.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
+        val p = prefix.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
+        val n = p.remaining()
+        if (n == 0) return true
+        if (k.remaining() < n) return false
 
-        val pRem = p.rem()
-        if (pRem == 0) return true
-        if (k.rem() < pRem) return false
-
-        // Fast path: 両方ヒープ（配列持ち）なら Arrays.mismatch で一発比較（JDK 9+）
-        if (key.hasArray() && prefix.hasArray()) {
-            val ka = key.array()
-            val pa = prefix.array()
-            val kOff = key.arrayOffset() + k.pos
-            val pOff = prefix.arrayOffset() + p.pos
-            // mismatch(...) は -1 を返すと「差異なし」
-            return java.util.Arrays.mismatch(ka, kOff, kOff + pRem, pa, pOff, pOff + pRem) == -1
-        }
-
-        // Fallback: どの ByteBuffer でも動く絶対 index 比較
-        // （符号は equality には無関係なので &0xFF は不要）
-        var i = 0
-        val kPos = k.pos
-        val pPos = p.pos
-        while (i < pRem) {
-            if (key.get(kPos + i) != prefix.get(pPos + i)) return false
-            i++
-        }
-        return true
-    }
-
-    @JvmInline
-    private value class BufView(val buf: ByteBuffer) {
-        val pos: Int get() = buf.position()
-        val lim: Int get() = buf.limit()
-        fun rem(): Int = lim - pos
+        val ks = k.duplicate().apply { limit(position() + n) }.slice()
+        val ps = p.slice()
+        val mm = ks.mismatch(ps)
+        return mm == -1
     }
 
     data class ScanOptions(
-        val from: ByteBuffer? = null,
-        val toExclusive: ByteBuffer? = null,
-        val prefix: ByteBuffer? = null,
+        val from: ByteBufferL? = null,
+        val toExclusive: ByteBufferL? = null,
+        val prefix: ByteBufferL? = null,
         val limit: Int? = null,
         val includeTombstone: Boolean = false
     )
@@ -419,7 +383,7 @@ class AkkaraDB private constructor(
             next = if (src.hasNext()) src.next() else null
         }
 
-        fun peekKey(): ByteBuffer = next!!.key.duplicate().apply { rewind() }
+        fun peekKey(): ByteBufferL = next!!.key.duplicate().apply { rewind() }
         override fun hasNext(): Boolean = next != null
         override fun next(): Record {
             val r = next ?: throw NoSuchElementException()
@@ -431,19 +395,19 @@ class AkkaraDB private constructor(
     private data class KeyMeta(
         val seqNo: Long,
         val isTombstone: Boolean,
-        val value: ByteBuffer
+        val value: ByteBufferL
     )
 
-    private data class ByteBufferKey(val bb: ByteBuffer, private val hash: Int) {
+    private data class ByteBufferKey(val bb: ByteBufferL, private val hash: Int) {
         override fun hashCode(): Int = hash
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
-            return other is ByteBufferKey && cmp(bb, other.bb) == 0
+            return other is ByteBufferKey && bb.compareTo(other.bb) == 0
         }
 
         companion object {
-            fun of(src: ByteBuffer): ByteBufferKey {
-                val dup = src.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            fun of(src: ByteBufferL): ByteBufferKey {
+                val dup = src.duplicate().apply { rewind() }.asReadOnly()
                 var h = 1
                 while (dup.hasRemaining()) h = 31 * h + (dup.get().toInt() and 0xFF)
                 dup.rewind()
@@ -452,23 +416,23 @@ class AkkaraDB private constructor(
         }
     }
 
-    private fun getRecordLatest(key: ByteBuffer): Record? {
-        val k = key.duplicate().apply { rewind() }.asReadOnlyBuffer()
+    private fun getRecordLatest(key: ByteBufferL): Record? {
+        val k = key.duplicate().apply { rewind() }.asReadOnly()
 
         memTable.get(k)?.let { rec ->
-            val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
             metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
             return rec
         }
 
-        metaGet(k)?.let { return Record(k, it.value.duplicate().apply { rewind() }.order(ByteOrder.LITTLE_ENDIAN), it.seqNo) }
+        metaGet(k)?.let { return Record(k, it.value.duplicate().apply { rewind() }, it.seqNo) }
 
         for (deque in levels) {
             val rec = deque.firstNotNullOfOrNull { sst ->
                 if (!sst.mightContain(k)) null else sst.get(k)
             }
             if (rec != null) {
-                val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+                val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
                 metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
                 return rec
             }
@@ -479,7 +443,7 @@ class AkkaraDB private constructor(
             if (lastStripe >= 0) {
                 val hit = reader.searchLatestStripe(k, lastStripe) ?: return@withResource null
                 val rec = hit.record
-                val vv = rec.value.duplicate().apply { rewind() }.asReadOnlyBuffer()
+                val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
                 metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
                 return rec
             }

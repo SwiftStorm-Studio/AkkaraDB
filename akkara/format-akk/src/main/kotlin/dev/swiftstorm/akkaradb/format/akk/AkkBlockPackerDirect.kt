@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BlockConst.MAX_RECORD
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import java.io.Closeable
@@ -13,60 +14,61 @@ import java.util.zip.CRC32C
 import kotlin.math.min
 
 /**
- * Block packer that assembles fixed-size 32 KiB blocks.
+ * Block packer that assembles fixed-size 32 KiB blocks (ALL Little-Endian).
  *
- * Block layout (endianness fixed to LITTLE_ENDIAN):
- *   [0..3]       payloadLen: Int (bytes in payload area)
- *   [4..4+N)     payload bytes (sequence of [u32 len][bytes] records)
- *   [..]         zero padding up to PAYLOAD_LIMIT (for determinism/portability)
- *   [end-4..end) crc32c over bytes [0 .. 4+payloadLen)
+ * Block layout:
+ *   [0..3]         payloadLen: u32 LE (bytes in payload area)
+ *   [4..4+N)       payload bytes (sequence of [u32 LE len][bytes] records)
+ *   [4+N..4+LIM)   zero padding up to PAYLOAD_LIMIT (determinism/portability)
+ *   [end-4..end)   crc32c(u32 LE) over bytes [0 .. 4+payloadLen)
  *
- * Caller passes each record via [addRecord]; when the payload area would overflow,
- * the current block is emitted to [onBlockReady].
+ * Ownership: onBlockReady receives a pooled ByteBufferL (size=BLOCK_SIZE).
+ * It MUST consume and release it.
  */
 class AkkBlockPackerDirect(
-    private val onBlockReady: (ByteBuffer) -> Unit,
+    private val onBlockReady: (ByteBufferL) -> Unit,
     private val pool: BufferPool = Pools.io()
 ) : BlockPacker, Closeable {
 
     override val blockSize: Int = BLOCK_SIZE
 
-    private val scratch: ByteBuffer = pool.get()
+    private val scratch: ByteBufferL = pool.get(PAYLOAD_LIMIT)
     private val crc = CRC32C()
-    private val zeroPadChunk = ZERO_PAD_CHUNK
 
-    override fun addRecord(record: ByteBuffer) {
-        val recLen = record.remaining()
+    override fun addRecord(record: ByteBufferL) {
+        val recLen = record.remaining
         require(recLen <= MAX_RECORD) { "Record $recLen B exceeds $MAX_RECORD B" }
 
-        if (scratch.position() + 4 + recLen > PAYLOAD_LIMIT) emitBlock()
+        if (scratch.position + 4 + recLen > PAYLOAD_LIMIT) emitBlock()
 
-        // [u32 recLen][rec bytes] を LE で
+        // [u32 recLen][rec bytes]
         scratch.putInt(recLen)
-        scratch.put(record.duplicate())
+        scratch.put(record.asReadOnlyByteBuffer().slice())
     }
 
     override fun flush() {
-        if (scratch.position() > 0) emitBlock()
+        if (scratch.position > 0) emitBlock()
     }
 
     override fun close() = pool.release(scratch)
 
     /* ---- internal ---- */
     private fun emitBlock() {
-        val payloadLen = scratch.position()
+        require(BLOCK_SIZE == 4 + PAYLOAD_LIMIT + 4) {
+            "BLOCK_SIZE ($BLOCK_SIZE) must equal 4 + PAYLOAD_LIMIT ($PAYLOAD_LIMIT) + 4"
+        }
+
+        val payloadLen = scratch.position
         scratch.flip()
 
-        // 32 KiB block, LE 明示
-        val blk = pool.get()
+        val blk = pool.get(BLOCK_SIZE)
         blk.clear()
-        blk.order(ByteOrder.LITTLE_ENDIAN)
 
         // [0..3] payloadLen
         blk.putInt(payloadLen)
 
         // [4..4+N) payload
-        blk.put(scratch)
+        blk.put(scratch.asReadOnlyByteBuffer())
 
         // zero padding to fixed size payload area
         var pad = PAYLOAD_LIMIT - payloadLen
@@ -78,25 +80,26 @@ class AkkBlockPackerDirect(
             blk.put(dup)
             pad -= n
         }
-        // position == 4 + PAYLOAD_LIMIT
 
         // CRC32C over [0 .. 4+payloadLen)
         crc.reset()
-        val crcRegion = blk.duplicate().apply {
+        val crcRegion = blk.asReadOnlyByteBuffer().duplicate().apply {
             position(0); limit(4 + payloadLen)
         }
         crc.update(crcRegion)
-
         blk.putInt(crc.value.toInt())
 
         blk.flip()
-        onBlockReady(blk)
+        onBlockReady(blk) // NOTE: release responsibility is on the callback
 
         scratch.clear()
     }
 
     companion object {
         private val ZERO_PAD_CHUNK: ByteBuffer =
-            ByteBuffer.allocateDirect(4096).order(ByteOrder.LITTLE_ENDIAN).apply { clear() }.asReadOnlyBuffer()
+            ByteBuffer.allocateDirect(4096)
+                .order(ByteOrder.LITTLE_ENDIAN) // MAKE SURE LE
+                .apply { clear() }
+                .asReadOnlyBuffer()
     }
 }

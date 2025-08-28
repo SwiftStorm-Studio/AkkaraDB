@@ -1,11 +1,12 @@
+@file:Suppress("NOTHING_TO_INLINE")
+
 package dev.swiftstorm.akkaradb.format.akk.parity
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 /**
  * Reed–Solomon parity coder over GF(2^8) with a Vandermonde generator matrix.
@@ -59,13 +60,13 @@ class RSParityCoder(
 
     /* ---------------- Encoding ---------------- */
 
-    override fun encode(dataBlocks: List<ByteBuffer>): List<ByteBuffer> {
+    override fun encode(dataBlocks: List<ByteBufferL>): List<ByteBufferL> {
         require(dataBlocks.isNotEmpty())
         val k = dataBlocks.size
-        val blks = dataBlocks.map { it.duplicate().apply { order(ByteOrder.BIG_ENDIAN) } }
-        blks.forEach { require(it.remaining() == BLOCK_SIZE) { "block must be 32 KiB" } }
+        val blks = dataBlocks.map { it.duplicate() }
+        blks.forEach { require(it.remaining == BLOCK_SIZE) { "block must be 32 KiB" } }
 
-        val parity = ArrayList<ByteBuffer>(parityCount)
+        val parity = ArrayList<ByteBufferL>(parityCount)
         // allocate parity buffers from pool so writer can release them
         repeat(parityCount) { parity += pool.get(BLOCK_SIZE) }
         parity.forEach { it.clear() }
@@ -96,14 +97,14 @@ class RSParityCoder(
 
     /* ---------------- Decoding (up to m erasures) ---------------- */
 
-    override fun decode(missingIndex: Int, lanes: List<ByteBuffer?>, parity: List<ByteBuffer?>): ByteBuffer {
-        val k = lanes.size
-        require(parity.size == parityCount) { "expected $parityCount parity blocks, got ${parity.size}" }
-        val missing = lanes.withIndex().filter { it.value == null }.map { it.index }
+    override fun decode(lostIndex: Int, presentData: List<ByteBufferL?>, presentParity: List<ByteBufferL?>): ByteBufferL {
+        val k = presentData.size
+        require(presentParity.size == parityCount) { "expected $parityCount parity blocks, got ${presentParity.size}" }
+        val missing = presentData.withIndex().filter { it.value == null }.map { it.index }
         require(missing.isNotEmpty()) { "nothing to decode" }
         require(missing.size <= parityCount) { "too many erasures: ${missing.size} > m=$parityCount" }
-        require(missing.contains(missingIndex))
-        parity.forEach { p -> require(p == null || p.remaining() == BLOCK_SIZE) }
+        require(missing.contains(lostIndex))
+        presentParity.forEach { p -> require(p == null || p.remaining == BLOCK_SIZE) }
 
         // Build coefficient matrix A (m x e) and RHS syndromes S (m vectors)
         val e = missing.size
@@ -131,11 +132,11 @@ class RSParityCoder(
             val S = IntArray(e)
             for (r in 0 until e) {
                 var s = 0
-                val p = parity[r] ?: error("missing required parity block r=$r for e=$e")
+                val p = presentParity[r] ?: error("missing required parity block r=$r for e=$e")
                 var accumKnown = 0
                 for (i in knownIdx) {
                     val a = if (i == 0) 1 else exp[((r + 1) * (log[exp[i]])) % 255]
-                    val d = lanes[i]!!.get(pos).toInt() and 0xFF
+                    val d = presentData[i]!!.get(pos).toInt() and 0xFF
                     accumKnown = gfAdd(accumKnown, gfMul(a, d))
                 }
                 val pr = p.get(pos).toInt() and 0xFF
@@ -152,7 +153,7 @@ class RSParityCoder(
             for (t in 0 until e) recovered[t].put(pos, X[t].toByte())
         }
         for (t in 0 until e) recovered[t].position(BLOCK_SIZE).flip()
-        val idxInMissing = missing.indexOf(missingIndex)
+        val idxInMissing = missing.indexOf(lostIndex)
         return recovered[idxInMissing]
     }
 

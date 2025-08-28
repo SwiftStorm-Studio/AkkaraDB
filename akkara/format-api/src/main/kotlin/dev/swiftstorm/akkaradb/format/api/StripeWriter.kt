@@ -1,6 +1,6 @@
 package dev.swiftstorm.akkaradb.format.api
 
-import java.nio.ByteBuffer
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 
 /**
  * Writes fixed-size blocks into one or more lane files
@@ -30,7 +30,7 @@ interface StripeWriter : AutoCloseable {
      * @throws IllegalStateException if more than [k] blocks are added
      *         to the current stripe.
      */
-    fun addBlock(block: ByteBuffer)
+    fun addBlock(block: ByteBufferL)
 
     /**
      * Forces buffered blocks to disk (data and parity) and returns

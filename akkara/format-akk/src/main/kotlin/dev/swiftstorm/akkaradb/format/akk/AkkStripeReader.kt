@@ -1,13 +1,14 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.compareTo
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
 import dev.swiftstorm.akkaradb.format.api.StripeReader.Stripe
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
-import java.nio.ByteBuffer
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
@@ -40,14 +41,20 @@ class AkkStripeReader(
      */
     override fun readStripe(): Stripe? {
         /* 1. read data lanes */
-        val laneBlocks = MutableList<ByteBuffer?>(k) { null }
+        val laneBlocks = MutableList<ByteBufferL?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
-            val blk = pool.get()
-            val n = ch.read(blk)
-            if (n == BLOCK_SIZE) {
+            val blk = pool.get(BLOCK_SIZE)
+            val bb = blk.toMutableByteBuffer()
+            var read = 0
+            while (read < BLOCK_SIZE) {
+                val n = ch.read(bb)
+                if (n < 0) break
+                read += n
+            }
+            if (read == BLOCK_SIZE) {
                 blk.flip(); laneBlocks[idx] = blk
             } else {
-                pool.release(blk) // EOF or partial → discard
+                pool.release(blk) // EOF/部分読み → 破棄
             }
         }
         if (laneBlocks.all { it == null }) return null // true EOF
@@ -59,10 +66,10 @@ class AkkStripeReader(
                     "${parityCoder?.parityCount ?: 0} parity lanes configured"
         }
 
-        val parityBufs: List<ByteBuffer?> = if (missingCnt > 0 && parityCoder != null) {
+        val parityBufs: List<ByteBufferL?> = if (missingCnt > 0 && parityCoder != null) {
             val tmp = parityCh.map { ch ->
                 val buf = pool.get()
-                val n = ch.read(buf)
+                val n = ch.read(buf.toMutableByteBuffer())
                 if (n == BLOCK_SIZE) {
                     buf.flip(); buf
                 } else {
@@ -88,14 +95,13 @@ class AkkStripeReader(
         val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
         val payloads = nonNullBlocks.flatMap(unpacker::unpack)
 
-        return StripeReader.Stripe(payloads, nonNullBlocks, pool)
+        return Stripe(payloads, nonNullBlocks, pool)
     }
 
     override fun close() {
         (dataCh + parityCh).forEach { it.close() }
     }
 
-    // 型を拡張
     data class StripeHit(
         val record: Record,
         val stripeId: Long,
@@ -105,7 +111,7 @@ class AkkStripeReader(
         override fun close() = stripe.close()
     }
 
-    fun searchLatestStripe(key: ByteBuffer, untilStripe: Long): StripeHit? {
+    fun searchLatestStripe(key: ByteBufferL, untilStripe: Long): StripeHit? {
         var idx = 0L
         val rr = AkkRecordReader
         while (true) {

@@ -3,6 +3,7 @@ package dev.swiftstorm.akkaradb.engine.sstable
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.common.Record
+import dev.swiftstorm.akkaradb.common.compareTo
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import java.nio.file.Files
 import java.nio.file.Path
@@ -13,10 +14,13 @@ import java.util.concurrent.ConcurrentLinkedDeque
  * Levelled compactor (L0 -> L1).
  *
  * Highlights:
- *  - Implements a k-way merge that groups identical keys in place (no array copies or HashMap).
- *  - Retains only the newest sequence for each key and drops tombstones.
- *  - Emits records in ascending key order directly to the SST (no post-merge sorting).
- *  - On completion records `SSTSeal(level=1)` and `checkpoint("compact")` in the manifest.
+ *  - k-way マージで同一キーをその場でグルーピング（配列コピーやHashMapなし）
+ *  - 各キーグループから最新 seqNo のみを採用、tombstone は落とす
+ *  - 昇順キーで直接 SST に吐く（後ソート不要）
+ *  - 完了後、manifest に SSTSeal(level=1) と checkpoint("compact") を記録
+ *
+ * ※ すべてのI/Oは下位の SSTableReader/Writer 側で Little-Endian に統一済み。
+ *    本クラスはキー比較のみ行い、compareTo は ByteBufferL の unsigned lex 実装を使用。
  */
 class Compactor(
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>, // shared from AkkaraDB
@@ -73,7 +77,7 @@ class Compactor(
      */
     private fun mergeSstables(src: List<SSTableReader>, out: Path): Pair<SSTableReader, Int> {
         val heap = PriorityQueue<Entry> { a, b ->
-            val kc = a.rec.key.compareTo(b.rec.key)
+            val kc = a.rec.key.compareTo(b.rec.key)          // unsigned lex
             if (kc != 0) kc else b.rec.seqNo.compareTo(a.rec.seqNo)
         }
 

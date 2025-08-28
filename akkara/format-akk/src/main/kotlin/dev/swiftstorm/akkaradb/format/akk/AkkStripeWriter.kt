@@ -2,19 +2,20 @@ package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
+import dev.swiftstorm.akkaradb.format.api.StripeWriter
 import io.netty.channel.unix.FileDescriptor
 import java.io.Closeable
 import java.io.IOException
 import java.io.RandomAccessFile
-import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
 
 class AkkStripeWriter(
     val baseDir: Path,
-    val k: Int,
+    override val k: Int,
     val parityCoder: ParityCoder? = null,
     private val autoFlush: Boolean = true,
     private val pool: BufferPool = Pools.io(),
@@ -22,23 +23,25 @@ class AkkStripeWriter(
     private val fsyncBatchN: Int = 32,
     private val fsyncIntervalMicros: Long = 500,
     private val onCommit: ((Long) -> Unit)? = null
-) : Closeable {
+) : Closeable, StripeWriter {
 
     /* ───────── lane writers ───────── */
     private val dataCh = Array<FileWriter>(k) { idx -> makeWriter(baseDir.resolve("data_$idx.akd")) }
     private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> makeWriter(baseDir.resolve("parity_$idx.akp")) }
 
+    override val m: Int get() = parityCh.size
+
     /* ───────── state ───────── */
     private var laneIdx = 0
     private var stripesWritten_ = 0L
-    val stripesWritten: Long get() = stripesWritten_
+    override val stripesWritten: Long get() = stripesWritten_
 
     private var stripesSinceLastFlush = 0
     private var lastFlushAtNanos: Long = System.nanoTime()
 
-    /* ───────── write‑path ───────── */
-    fun addBlock(block: ByteBuffer) {
-        require(block.remaining() == BLOCK_SIZE)
+    /* ───────── write-path (ByteBufferL) ───────── */
+    override fun addBlock(block: ByteBufferL) {
+        require(block.remaining == BLOCK_SIZE) { "block size must be $BLOCK_SIZE, got ${block.remaining}" }
 
         val writer = dataCh[laneIdx]
         writer.write(block)
@@ -48,14 +51,14 @@ class AkkStripeWriter(
         if (laneIdx == k) {
             // 2. parity
             parityCoder?.let { coder ->
-                val parity = coder.encode(dataCh.map { it.lastWritten!! })
-                parity.forEachIndexed { i, buf ->
+                val parityBlocks: List<ByteBufferL> = coder.encode(dataCh.map { it.lastWritten!! })
+                parityBlocks.forEachIndexed { i, buf ->
                     parityCh[i].write(buf)
                     pool.release(buf)
                 }
             }
 
-            // 3. release per‑lane cached buffers
+            // 3. release per-lane cached buffers
             dataCh.forEach { w ->
                 w.lastWritten?.let(pool::release)
                 w.lastWritten = null
@@ -75,20 +78,21 @@ class AkkStripeWriter(
     }
 
     /** Force fsync on every lane (blocking). */
-    fun flush() {
+    override fun flush(): Long {
         dataCh.forEach(FileWriter::flush)
         parityCh.forEach(FileWriter::flush)
         stripesSinceLastFlush = 0
         lastFlushAtNanos = System.nanoTime()
         onCommit?.invoke(stripesWritten_)
+        return stripesWritten_
     }
 
-    /** Re‑positions all writers to <code>stripe×BLOCK_SIZE</code>. */
-    fun seek(stripes: Long) {
-        val off = stripes * BLOCK_SIZE.toLong()
+    /** Re-positions all writers to `stripes×BLOCK_SIZE`. */
+    override fun seek(stripeIndex: Long) {
+        val off = stripeIndex * BLOCK_SIZE.toLong()
         dataCh.forEach { it.seek(off) }
         parityCh.forEach { it.seek(off) }
-        stripesWritten_ = stripes
+        stripesWritten_ = stripeIndex
     }
 
     fun truncateTo(stripes: Long) {
@@ -104,12 +108,12 @@ class AkkStripeWriter(
         parityCh.forEach(FileWriter::close)
     }
 
+    /* ───────── writer factory ───────── */
+
     private fun makeWriter(path: Path): FileWriter {
         val force = System.getProperty("akkaradb.writer")?.lowercase()
         if (isWindows()) {
-            if (force == "fd") {
-                /** **/
-            }
+            // Windows では Netty FD パスは使わない
             return JdkAggWriter(path, pool)
         }
 
@@ -127,10 +131,10 @@ class AkkStripeWriter(
     private fun isWindows(): Boolean =
         System.getProperty("os.name")?.startsWith("Windows", ignoreCase = true) == true
 
-    /* ───────── writer interfaces ───────── */
+    /* ───────── writer interfaces (ByteBufferL) ───────── */
     private interface FileWriter : Closeable {
-        var lastWritten: ByteBuffer?
-        fun write(buf: ByteBuffer)
+        var lastWritten: ByteBufferL?
+        fun write(buf: ByteBufferL)
         fun flush()
         fun seek(pos: Long)
     }
@@ -144,9 +148,8 @@ class AkkStripeWriter(
      * for data-path writes, plus a single long-lived `RandomAccessFile`
      * (and its `java.nio.channels.FileChannel`) to issue the fsync.
      *
-     *  * **write()** – zero-copy into the kernel page-cache via `fd.write()`.
-     *  * **flush()** – one `fd.sync()` (`fsync(2)`) on the companion JDK
-     *    descriptor; no per-call open/close, so latency stays low.
+     *  * write() – zero-copy into the kernel page-cache via `fd.write()`.
+     *  * flush() – one `fd.sync()` (`fsync(2)`) on the companion JDK descriptor.
      */
     private class FdWriter(path: Path) : FileWriterEx {
 
@@ -161,35 +164,38 @@ class AkkStripeWriter(
         /** Current write offset (pwrite position). */
         private var offset: Long = ch.size()
 
-        override var lastWritten: ByteBuffer? = null
+        override var lastWritten: ByteBufferL? = null
 
-        override fun write(buf: ByteBuffer) {
+        override fun write(buf: ByteBufferL) {
             lastWritten = buf
-            val len = buf.remaining()
+            val len = buf.remaining
             var written = 0
+            val bb = buf.toMutableByteBuffer() // view; positionは buf と同期しない
+            val start = bb.position()
             while (written < len) {
-                val n = fd.write(buf, buf.position() + written, buf.limit())
+                val n = fd.write(bb, start + written, start + len) // (buffer, pos, limit)
                 if (n <= 0) throw IOException("short pwrite ($n) @offset=$offset")
                 written += n
             }
+            buf.advance(len) // ByteBufferL 側の position を同期
             offset += len
         }
 
         /** fsync via `FileDescriptor.sync()` – no extra FD churn. */
         override fun flush() {
-            jdkFd.sync()                 // translates to fsync(2)
+            jdkFd.sync() // fsync(2)
         }
 
         /** Adjust both native and JDK descriptors to the new position. */
         override fun seek(pos: Long) {
             offset = pos
-            ch.position(pos)             // keep them in sync
+            ch.position(pos) // keep them in sync
         }
 
         override fun close() {
             flush()
             fd.close()
-            ch.close()                   // closes `raf` implicitly
+            ch.close() // closes `raf` implicitly
         }
 
         override fun truncate(size: Long) {
@@ -202,9 +208,9 @@ class AkkStripeWriter(
      * Portable fast path: JDK FileChannel with 1MiB lane aggregation and fdatasync batching.
      *
      * Strategy:
-     * - append into a lane-local 1MiB DirectByteBuffer (32KiB×32)
+     * - append into a lane-local 1MiB buffer (32KiB×32)
      * - when full, do a single write() at the current lane position
-     * - force(false) only on group‑commit boundaries (outer flush())
+     * - force(false) only on group-commit boundaries (outer flush())
      */
     private class JdkAggWriter(
         path: Path,
@@ -217,25 +223,25 @@ class AkkStripeWriter(
         private var pos: Long = ch.size()
         private var preallocLimit: Long = roundUp(pos, preallocStep)
 
-        // lane-local aggregation buffer (Direct)
-        private val agg: ByteBuffer = pool.get(laneBufferSize)
+        // lane-local aggregation buffer
+        private val agg: ByteBufferL = pool.get(laneBufferSize)
 
-        override var lastWritten: ByteBuffer? = null
+        override var lastWritten: ByteBufferL? = null
 
-        override fun write(buf: ByteBuffer) {
+        override fun write(buf: ByteBufferL) {
             lastWritten = buf
-            val cap = agg.capacity()
-            val need = buf.remaining()
+            val cap = agg.capacity
+            val need = buf.remaining
 
             if (need >= cap) {
                 flushLane()
                 writeDirect(buf)
                 return
             }
-            if (agg.remaining() < need) {
+            if (agg.remaining < need) {
                 flushLane()
             }
-            agg.put(buf)
+            agg.put(buf.asReadOnlyByteBuffer()) // copy into lane agg
         }
 
         override fun flush() {
@@ -243,9 +249,9 @@ class AkkStripeWriter(
             ch.force(false)
         }
 
-        override fun seek(newPos: Long) {
+        override fun seek(pos: Long) {
             flushLane()
-            pos = newPos
+            this@JdkAggWriter.pos = pos
         }
 
         override fun truncate(size: Long) {
@@ -264,23 +270,26 @@ class AkkStripeWriter(
             }
         }
 
-        private fun writeDirect(src: ByteBuffer) {
-            ensurePreallocated(pos + src.remaining())
-            var rem = src.remaining()
+        private fun writeDirect(src: ByteBufferL) {
+            ensurePreallocated(pos + src.remaining)
+            val bb = src.toMutableByteBuffer()
+            var rem = bb.remaining()
             while (rem > 0) {
-                val n = ch.write(src, pos)
+                val n = ch.write(bb, pos)
                 if (n <= 0) throw IOException("short write ($n) @pos=$pos (direct)")
                 pos += n
                 rem -= n
             }
+            src.advance(src.remaining) // src はすべて消費
         }
 
         private fun flushLane() {
-            if (agg.position() == 0) return
-            ensurePreallocated(pos + agg.position())
+            if (agg.position == 0) return
+            ensurePreallocated(pos + agg.position)
             agg.flip()
-            while (agg.hasRemaining()) {
-                val n = ch.write(agg, pos)
+            val bb = agg.toMutableByteBuffer()
+            while (bb.hasRemaining()) {
+                val n = ch.write(bb, pos)
                 if (n <= 0) throw IOException("short write ($n) @pos=$pos")
                 pos += n
             }

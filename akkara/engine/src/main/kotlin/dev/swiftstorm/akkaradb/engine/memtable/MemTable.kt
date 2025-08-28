@@ -1,8 +1,8 @@
 package dev.swiftstorm.akkaradb.engine.memtable
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Record
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import dev.swiftstorm.akkaradb.common.compareTo
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -14,14 +14,9 @@ import kotlin.concurrent.write
 import kotlin.math.max
 
 /**
- * A thread-safe in-memory table for storing and managing `Record` objects.
- * Supports LRU eviction, flushing, and iteration over records.
- *
- * @property thresholdBytes The maximum size in bytes before triggering a flush.
- * @property onFlush Callback invoked when the table is flushed.
- * @property onEvict Optional callback invoked when records are evicted.
- * @property maxEntries Optional maximum number of entries allowed in the table.
- * @property executor Executor service used for asynchronous flushing.
+ * Thread-safe in-memory table with LRU eviction, flush, and range iteration.
+ * - Key equality is by **content** (unsigned-lex compare for ordering only).
+ * - Stored buffers are canonicalized to RO views (pos=0..limit).
  */
 class MemTable(
     private val thresholdBytes: Long,
@@ -33,10 +28,10 @@ class MemTable(
     }
 ) : AutoCloseable {
 
-    /* ---- LRU-Ordered map ---- */
-    private fun newLruMap(): LinkedHashMap<ByteBuffer, Record> =
-        object : LinkedHashMap<ByteBuffer, Record>(16, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ByteBuffer, Record>): Boolean {
+    /* ---- LRU-Ordered map (content-based key) ---- */
+    private fun newLruMap(): LinkedHashMap<Key, Record> =
+        object : LinkedHashMap<Key, Record>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, Record>): Boolean {
                 if (maxEntries != null && size > maxEntries) {
                     currentBytes.addAndGet(-this@MemTable.sizeOf(eldest.value))
                     onEvict?.invoke(listOf(eldest.value))
@@ -46,51 +41,48 @@ class MemTable(
             }
         }
 
-    private val mapRef = AtomicReference<LinkedHashMap<ByteBuffer, Record>>(newLruMap())
+    private val mapRef = AtomicReference<LinkedHashMap<Key, Record>>(newLruMap())
 
     private val currentBytes = AtomicLong(0)
     private val highestSeqNo = AtomicLong(0)
-
     private val flushPending = AtomicBoolean(false)
-
     private val lock = ReentrantReadWriteLock()
 
-    /**
-     * Retrieves a record by its key.
-     *
-     * @param key The key of the record to retrieve.
-     * @return The record associated with the key, or `null` if not found.
-     */
-    fun get(key: ByteBuffer): Record? = lock.read { mapRef.get()[key] }
+    /** O(1) lookup by content-equal key. */
+    fun get(key: ByteBufferL): Record? = lock.read {
+        mapRef.get()[wrapKey(key)]
+    }
 
-    /**
-     * Retrieves all records in the table.
-     *
-     * @return A list of all records.
-     */
+    /** Snapshot of all records (copy). */
     fun getAll(): List<Record> = lock.read { mapRef.get().values.toList() }
 
     /**
-     * Inserts or updates a record in the table.
-     * Triggers a flush if the size exceeds the threshold.
-     *
-     * @param record The record to insert or update.
+     * Insert or update. If an existing key exists and its seqNo is newer, reject.
+     * Triggers async flush when size exceeds threshold.
      */
     fun put(record: Record): Boolean {
         var shouldFlush = false
         val accepted = lock.write {
-            val keyCopy = record.key.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
-            val valCopy = record.value.duplicate().apply { rewind() }.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+            // Canonicalize buffers (RO, pos=0) for storage
+            val keyRO = record.key.duplicate().apply { rewind() }.asReadOnly()
+            val valRO = record.value.duplicate().apply { rewind() }.asReadOnly()
+            val k = wrapKey(keyRO)
+
             val map = mapRef.get()
-            val prev = map[keyCopy]
+            val prev = map[k]
             if (prev != null && record.seqNo < prev.seqNo) return@write false
 
-            map[keyCopy] = Record(keyCopy, valCopy, record.seqNo, flags = if (record.isTombstone) Record.FLAG_TOMBSTONE else 0)
+            val stored = Record(
+                keyRO, valRO, record.seqNo,
+                flags = if (record.isTombstone) Record.FLAG_TOMBSTONE else 0
+            )
+
+            map[k] = stored
 
             if (record.seqNo > highestSeqNo.get()) {
                 highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
             }
-            val delta = sizeOf(map[keyCopy]!!) - (prev?.let { sizeOf(it) } ?: 0L)
+            val delta = sizeOf(stored) - (prev?.let { sizeOf(it) } ?: 0L)
             val sizeAfter = currentBytes.addAndGet(delta)
             shouldFlush = sizeAfter >= thresholdBytes
             true
@@ -101,18 +93,13 @@ class MemTable(
         return accepted
     }
 
-
     fun flush() {
         if (flushPending.compareAndSet(false, true) || currentBytes.get() > 0) {
             flushInternal()
         }
     }
 
-    /**
-     * Evicts the oldest `n` records from the table.
-     *
-     * @param n The number of records to evict (default is 1).
-     */
+    /** Evict oldest n (access-order) entries. */
     fun evictOldest(n: Int = 1) {
         lock.write {
             val map = mapRef.get()
@@ -135,7 +122,6 @@ class MemTable(
     }
 
     fun lastSeq(): Long = highestSeqNo.get()
-
     fun nextSeq(): Long = highestSeqNo.updateAndGet { it + 1 }
 
     override fun close() {
@@ -146,6 +132,7 @@ class MemTable(
         }
     }
 
+    /* ---- flush internals ---- */
     private fun flushInternal() {
         var toFlush: List<Record>? = null
         var bytesFlushed = 0L
@@ -171,33 +158,64 @@ class MemTable(
         }
     }
 
-    fun iterator(from: ByteBuffer? = null, toExclusive: ByteBuffer? = null): Iterator<Record> {
+    /* ---- iteration with range filter (unsigned lex) ---- */
+    fun iterator(from: ByteBufferL? = null, toExclusive: ByteBufferL? = null): Iterator<Record> {
         val snapshot: List<Record> = lock.read { mapRef.get().values.toList() }
 
         val filteredSorted = snapshot.asSequence()
             .filter { r ->
                 val k = r.key.duplicate().apply { rewind() }
-                val geFrom = from?.let { cmp(k, it) >= 0 } ?: true
-                val ltTo = toExclusive?.let { cmp(k, it) < 0 } ?: true
+                val geFrom = from?.let { k >= it } ?: true
+                val ltTo = toExclusive?.let { k < it } ?: true
                 geFrom && ltTo
             }
-            .sortedWith { a, b -> cmp(a.key, b.key) }
+            .sortedWith { a, b -> a.key.compareTo(b.key) } // unsigned lex
             .toList()
 
         return filteredSorted.iterator()
     }
 
-    private fun sizeOf(r: Record): Long =
-        (r.key.remaining() + r.value.remaining() + Long.SIZE_BYTES).toLong()
+    /* ---- helpers ---- */
 
-    private fun cmp(a: ByteBuffer, b: ByteBuffer): Int {
-        val aa = a.duplicate().apply { rewind() }
-        val bb = b.duplicate().apply { rewind() }
-        while (aa.hasRemaining() && bb.hasRemaining()) {
-            val x = aa.get().toInt() and 0xFF
-            val y = bb.get().toInt() and 0xFF
-            if (x != y) return x - y
+    private fun sizeOf(r: Record): Long =
+        (r.key.remaining + r.value.remaining + Long.SIZE_BYTES).toLong()
+
+    /** Canonical RO view (pos=0..limit). */
+    private fun canonicalRO(b: ByteBufferL): ByteBufferL =
+        b.duplicate().apply { rewind() }.asReadOnly()
+
+    /** Content hash compatible with RO canonical view. */
+    private fun contentHash(b: ByteBufferL): Int =
+        b.asReadOnlyByteBuffer().duplicate().apply { rewind() }.hashCode()
+
+    /** Content-equal comparison without consuming positions. */
+    private fun contentEquals(a: ByteBufferL, b: ByteBufferL): Boolean {
+        val aa = a.asReadOnlyByteBuffer().slice()
+        val bb = b.asReadOnlyByteBuffer().slice()
+        if (aa.remaining() != bb.remaining()) return false
+        val mm = aa.mismatch(bb)
+        return mm == -1
+    }
+
+    /** Wrap a key buffer into a content-hashed key object (canonicalized). */
+    private fun wrapKey(key: ByteBufferL): Key {
+        val ro = canonicalRO(key)
+        return Key(ro, contentHash(ro))
+    }
+
+    /** Content-based key for the LRU map (hash precomputed). */
+    private data class Key(val ro: ByteBufferL, val hash: Int) {
+        override fun hashCode(): Int = hash
+        override fun equals(other: Any?): Boolean =
+            other is Key && contentEquals(ro, other.ro)
+
+        // static helper to avoid capturing outer
+        private fun contentEquals(a: ByteBufferL, b: ByteBufferL): Boolean {
+            val aa = a.asReadOnlyByteBuffer().slice()
+            val bb = b.asReadOnlyByteBuffer().slice()
+            if (aa.remaining() != bb.remaining()) return false
+            val mm = aa.mismatch(bb)
+            return mm == -1
         }
-        return aa.remaining() - bb.remaining()
     }
 }

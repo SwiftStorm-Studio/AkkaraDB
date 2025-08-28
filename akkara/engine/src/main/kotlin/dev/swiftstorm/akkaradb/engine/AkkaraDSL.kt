@@ -1,7 +1,8 @@
-@file:Suppress("unused")
+@file:Suppress("unused", "NOTHING_TO_INLINE")
 
 package dev.swiftstorm.akkaradb.engine
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.ShortUUID
 import dev.swiftstorm.akkaradb.common.internal.binpack.AdapterResolver
@@ -11,8 +12,6 @@ import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import org.objenesis.ObjenesisStd
 import java.io.Closeable
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
 import kotlin.reflect.KClass
@@ -140,10 +139,12 @@ class PackedTable<T : Any>(
 
     /* ───────── namespace & seq ───────── */
 
-    private val nsBuf: ByteBuffer by lazy {
-        StandardCharsets.US_ASCII
+    private val nsBuf: ByteBufferL by lazy {
+        ByteBufferL.wrap(
+            StandardCharsets.US_ASCII
             .encode("${kClass.qualifiedName ?: kClass.simpleName!!}:")
             .asReadOnlyBuffer()
+        )
     }
 
     /* ───────── constants ───────── */
@@ -152,32 +153,32 @@ class PackedTable<T : Any>(
 
     companion object {
         private const val SEP: Char = 0x1F.toChar() // ASCII 0x1F (Unit Separator)
-        private val EMPTY: ByteBuffer = ByteBuffer.allocate(0).asReadOnlyBuffer() // 0B empty buffer
+        private val EMPTY: ByteBufferL = ByteBufferL.allocate(0).asReadOnly() // 0B empty buffer
     }
 
     /* ───────── key helpers ───────── */
 
-    private fun keyBuf(id: String, uuid: ShortUUID): ByteBuffer {
+    private fun keyBuf(id: String, uuid: ShortUUID): ByteBufferL {
         require(id.isAsciiNoSep()) { "ID must be ASCII and must not contain 0x1F: $id" }
 
         val rNs = nsBuf.duplicate().apply { rewind() }
         val idBuf = StandardCharsets.US_ASCII.encode(id)
-        val uuidBuf = uuid.toByteBuffer()                       // 16B
+        val uuidBuf = uuid.toByteBuffer().duplicate().apply { rewind() } // 16B
 
-        val out = ByteBuffer.allocate(rNs.remaining() + idBuf.remaining() + 1 + uuidBuf.remaining())
+        val out = ByteBufferL.allocate(rNs.remaining + idBuf.remaining() + 1 + uuidBuf.remaining())
         out.put(rNs).put(idBuf).put(SEP.code.toByte()).put(uuidBuf)
         out.flip()
-        return out.asReadOnlyBuffer() // LITTLE_ENDIAN
+        return out.asReadOnly() // LITTLE_ENDIAN
     }
 
-    private fun prefixBuf(id: String): ByteBuffer {
+    private fun prefixBuf(id: String): ByteBufferL {
         require(id.isAsciiNoSep())
         val rNs = nsBuf.duplicate().apply { rewind() }
         val idBuf = StandardCharsets.US_ASCII.encode(id)
-        val out = ByteBuffer.allocate(rNs.remaining() + idBuf.remaining())
+        val out = ByteBufferL.allocate(rNs.remaining + idBuf.remaining())
         out.put(rNs).put(idBuf)
         out.flip()
-        return out.asReadOnlyBuffer()
+        return out.asReadOnly() // LITTLE_ENDIAN
     }
 
     private fun String.isAsciiNoSep() =
@@ -285,19 +286,19 @@ class PackedTable<T : Any>(
 
 fun String.isASCII(): Boolean = all { it.code <= 127 }
 
-fun <T : Any> BinPack.encode(kClass: KClass<T>, value: T): ByteBuffer {
+fun <T : Any> BinPack.encode(kClass: KClass<T>, value: T): ByteBufferL {
     val adapter = AdapterResolver.getAdapterForClass(kClass)
     val size = adapter.estimateSize(value)
     val buffer = BinPackBufferPool.get(size) // LITTLE_ENDIAN
     adapter.write(value, buffer)
     buffer.flip()
-    return buffer
+    return ByteBufferL.wrap(buffer).asReadOnly()
 }
 
-fun <T : Any> BinPack.decode(kClass: KClass<T>, buffer: ByteBuffer): T {
-    buffer.order(ByteOrder.LITTLE_ENDIAN)
+fun <T : Any> BinPack.decode(kClass: KClass<T>, buffer: ByteBufferL): T {
     val adapter = AdapterResolver.getAdapterForClass(kClass)
-    return adapter.read(buffer)
+    val src = buffer.asReadOnlyByteBuffer().slice()
+    return adapter.read(src)
 }
 
 /* ───────── Annotations ───────── */

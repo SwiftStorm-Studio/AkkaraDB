@@ -1,7 +1,7 @@
 package dev.swiftstorm.akkaradb.format.api
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Record
-import java.nio.ByteBuffer
 
 /**
  * Serialises a [Record] into a binary representation understood by the
@@ -11,14 +11,14 @@ import java.nio.ByteBuffer
 interface RecordWriter {
 
     /**
-     * Encodes [record] into the provided [ByteBuffer].
+     * Encodes [record] into the provided [ByteBufferL].
      *
      * @param record The logical record to encode.
      * @param dest   Destination buffer positioned at the write offset.
      * @return Number of bytes written.
      * @throws java.nio.BufferOverflowException if the buffer is too small.
      */
-    fun write(record: Record, dest: ByteBuffer): Int
+    fun write(record: Record, dest: ByteBufferL): Int
 
     /**
      * Calculates an upper bound on the encoded size of [record].

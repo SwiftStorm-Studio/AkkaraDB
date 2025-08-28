@@ -1,11 +1,10 @@
 package dev.swiftstorm.akkaradb.common
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
-import java.nio.ByteBuffer
 
 interface BufferPool : AutoCloseable {
-    fun get(size: Int = BLOCK_SIZE): ByteBuffer
-    fun release(buf: ByteBuffer)
+    fun get(size: Int = BLOCK_SIZE): ByteBufferL
+    fun release(buf: ByteBufferL)
 
     data class Stats(
         val hits: Long,
@@ -23,7 +22,7 @@ interface BufferPool : AutoCloseable {
 
 inline fun <T> BufferPool.borrow(
     size: Int = BLOCK_SIZE,
-    block: (ByteBuffer) -> T
+    block: (ByteBufferL) -> T
 ): T {
     val buf = get(size)
     try {

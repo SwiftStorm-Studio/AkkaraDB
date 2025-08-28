@@ -1,5 +1,6 @@
 package dev.swiftstorm.akkaradb.engine.wal
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
 import java.nio.channels.FileChannel
@@ -27,7 +28,11 @@ fun replayWal(path: Path, mem: MemTable, startStripe: Long = 0, startSeq: Long =
         // First pass: locate offset after last checkpoint >= startStripe/startSeq
         while (buf.hasRemaining()) {
             val pos = buf.position()
-            val rec = try { WalRecord.readFrom(buf) } catch (_: Throwable) { buf.position(pos); break }
+            val rec = try {
+                WalRecord.readFrom(ByteBufferL.wrap(buf))
+            } catch (_: Throwable) {
+                buf.position(pos); break
+            }
             when (rec) {
                 WalRecord.Seal -> state = SegState.SEALED
                 is WalRecord.CheckPoint -> {
@@ -49,13 +54,17 @@ fun replayWal(path: Path, mem: MemTable, startStripe: Long = 0, startSeq: Long =
         // Second pass: apply remaining records
         while (buf.hasRemaining()) {
             val pos = buf.position()
-            val rec = try { WalRecord.readFrom(buf) } catch (_: Throwable) { buf.position(pos); break }
+            val rec = try {
+                WalRecord.readFrom(ByteBufferL.wrap(buf))
+            } catch (_: Throwable) {
+                buf.position(pos); break
+            }
             when (rec) {
                 is WalRecord.Add -> {
                     if (state == SegState.SEALED) {
                         error("WAL corrupted: Add encountered after Seal but before CheckPoint @ pos=${buf.position()}")
                     }
-                    val kv = AkkRecordReader.read(rec.payload.asReadOnlyBuffer())
+                    val kv = AkkRecordReader.read(rec.payload.asReadOnly())
                     mem.put(kv)
                 }
 

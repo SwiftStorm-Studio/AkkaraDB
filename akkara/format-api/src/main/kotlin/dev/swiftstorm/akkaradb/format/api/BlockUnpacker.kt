@@ -1,6 +1,6 @@
 package dev.swiftstorm.akkaradb.format.api
 
-import java.nio.ByteBuffer
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 
 /**
  * Parses a fixed-size block (32 KiB) and validates the CRC32.
@@ -13,5 +13,5 @@ import java.nio.ByteBuffer
 interface BlockUnpacker {
 
     /** @throws dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException if CRC mismatch or len invalid. */
-    fun unpack(block: ByteBuffer): ByteBuffer
+    fun unpack(block: ByteBufferL): List<ByteBufferL>
 }

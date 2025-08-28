@@ -1,8 +1,10 @@
+@file:Suppress("DuplicatedCode", "KDocUnresolvedReference")
+
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Record
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import dev.swiftstorm.akkaradb.format.api.RecordReader
 
 /**
  * Fixed-length TLV decoder.
@@ -12,17 +14,17 @@ import java.nio.ByteOrder
  *
  * The buffer's position must point to the start of a record.
  */
-object AkkRecordReader {
-    fun read(buf: ByteBuffer): Record {
-        val le = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-        val start = le.position()
+object AkkRecordReader : RecordReader {
+    override fun read(buf: ByteBufferL): Record {
+        val le = buf.duplicate() // .order(ByteOrder.LITTLE_ENDIAN)
+        val start = le.position
 
         val kLen = le.short.toInt() and 0xFFFF
         val vLen = le.int
         val seq = le.long
         val flags = le.get()
 
-        val kPos = le.position()
+        val kPos = le.position
         val keyRO = run {
             val tmp = le.duplicate()
             tmp.limit(kPos + kLen)
@@ -31,7 +33,7 @@ object AkkRecordReader {
         }
         le.position(kPos + kLen)
 
-        val vPos = le.position()
+        val vPos = le.position
         val valRO = run {
             val tmp = le.duplicate()
             tmp.limit(vPos + vLen)
@@ -40,8 +42,8 @@ object AkkRecordReader {
         }
         le.position(vPos + vLen)
 
-        val consumed = le.position() - start
-        buf.position(buf.position() + consumed)
+        val consumed = le.position - start
+        buf.position(buf.position + consumed)
 
         return Record(keyRO, valRO, seq, flags)
     }

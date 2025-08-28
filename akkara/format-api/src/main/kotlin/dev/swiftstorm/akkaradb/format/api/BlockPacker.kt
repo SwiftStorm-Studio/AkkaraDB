@@ -1,6 +1,6 @@
 package dev.swiftstorm.akkaradb.format.api
 
-import java.nio.ByteBuffer
+import dev.swiftstorm.akkaradb.common.ByteBufferL
 
 /**
  * Packs a contiguous list of record bytes into fixed-size blocks
@@ -11,7 +11,7 @@ interface BlockPacker {
     /** Size of a single block in bytes. */
     val blockSize: Int
 
-    fun addRecord(record: ByteBuffer)
+    fun addRecord(record: ByteBufferL)
 
     fun flush()
 }
