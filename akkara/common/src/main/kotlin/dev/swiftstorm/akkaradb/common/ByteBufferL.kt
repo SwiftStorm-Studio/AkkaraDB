@@ -565,3 +565,11 @@ inline fun <R> ByteBufferL.withPosition(pos: Int, block: (ByteBufferL) -> R): R 
         position(saved)
     }
 }
+
+fun ByteBufferL.hexHead(n: Int = 32): String {
+    val ro = this.asReadOnlyByteBuffer().slice()
+    val m = min(n, ro.remaining())
+    val tmp = ByteArray(m)
+    ro.get(tmp)
+    return tmp.joinToString(" ") { "%02X".format(it) }
+}

@@ -25,14 +25,14 @@ object AdapterResolver {
             val cls = type.classifier as? KClass<*>
                 ?: error("Unsupported type: $type")
 
-            // 1. Nullable
+            // 1) Nullable
             if (type.isMarkedNullable) {
                 val nonNullType = type.withNullability(false)
                 val inner = getAdapterForType(nonNullType) as TypeAdapter<Any>
                 return@getOrPut NullableAdapter(inner)
             }
 
-            // 2. Primitive / Built-in
+            // 2) Primitive / Built-in
             when (cls) {
                 Int::class -> return@getOrPut IntAdapter
                 Long::class -> return@getOrPut LongAdapter
@@ -54,11 +54,11 @@ object AdapterResolver {
                 Date::class -> return@getOrPut DateAdapter
                 ByteBuffer::class -> return@getOrPut ByteBufferAdapter
 
-                else -> { /* continue to next checks */
+                else -> { /* fallthrough */
                 }
             }
 
-            // 3. Enum
+            // 3) Enum
             if (cls.java.isEnum) {
                 @Suppress("UNCHECKED_CAST")
                 val enumClass = cls.java as Class<out Enum<*>>
@@ -73,19 +73,21 @@ object AdapterResolver {
                 ) as TypeAdapter<Any>
             }
 
-
-            // 4. List<T>
+            // 4) List<T>
             if (cls == List::class) {
                 val elementType = type.arguments.firstOrNull()?.type
-                    ?: error("List<T> must have type argument")
+                    ?: error("List<T> must have a type argument")
                 val elementAdapter = getAdapterForType(elementType)
                 @Suppress("UNCHECKED_CAST")
                 return@getOrPut ListAdapter(elementAdapter as TypeAdapter<Any>)
             }
 
-            // 5. Map<K, V>
+            // 5) Map<K,V>
             if (cls == Map::class) {
-                val (keyType, valueType) = type.arguments.mapNotNull { it.type }
+                val keyType = type.arguments.getOrNull(0)?.type
+                    ?: error("Map<K,V> must have a key type")
+                val valueType = type.arguments.getOrNull(1)?.type
+                    ?: error("Map<K,V> must have a value type")
                 val keyAdapter = getAdapterForType(keyType)
                 val valueAdapter = getAdapterForType(valueType)
                 @Suppress("UNCHECKED_CAST")
@@ -95,13 +97,13 @@ object AdapterResolver {
                 )
             }
 
-            // 6. data class
+            // 6) data class
             if (cls.isData) {
                 @Suppress("UNCHECKED_CAST")
                 return@getOrPut generateCompositeAdapter(cls as KClass<Any>)
             }
 
-            // 7. record class
+            // 7) record class
             if (cls.java.isRecord) {
                 @Suppress("UNCHECKED_CAST")
                 return@getOrPut generateCompositeAdapter(cls as KClass<Any>)
@@ -120,12 +122,19 @@ object AdapterResolver {
         val constructor = kClass.primaryConstructor
             ?: error("Class ${kClass.simpleName} has no primary constructor")
 
-        val propertyAdapters = constructor.parameters.mapIndexed { index, param ->
-            val prop = kClass.memberProperties.find { it.name == param.name }
-                ?: error("No matching property for constructor parameter '${param.name}'")
+        val propsByName = kClass.memberProperties.associateBy { it.name }
+        val sortedParams = constructor.parameters
+            .map { p ->
+                val name = p.name ?: error("Unnamed constructor parameter in ${kClass.qualifiedName}")
+                val prop = propsByName[name]
+                    ?: error("No matching property for constructor parameter '$name'")
+                Triple(name, p, prop)
+            }
+            .sortedBy { it.first }
 
+        val propertyAdapters = sortedParams.map { (_, param, prop) ->
             val adapter = getAdapterForType(param.type)
-
+            @Suppress("UNCHECKED_CAST")
             PropertyAdapter(prop, param, adapter as TypeAdapter<Any?>)
         }
 

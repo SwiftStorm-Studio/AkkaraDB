@@ -46,6 +46,7 @@ subprojects {
                 dependencies {
                     compileOnly(libs.slf4j)
                     implementation(kotlin("reflect"))
+                    implementation("org.objenesis:objenesis:3.4")
                 }
             }
         }
@@ -73,6 +74,7 @@ subprojects {
                 implementation(project(":akkara-format-akk"))
 
                 implementation("org.objenesis:objenesis:3.4")
+
                 implementation(kotlin("reflect"))
                 implementation(kotlin("serialization"))
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0")

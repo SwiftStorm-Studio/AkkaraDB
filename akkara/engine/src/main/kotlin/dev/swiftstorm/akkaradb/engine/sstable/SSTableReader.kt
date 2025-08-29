@@ -1,3 +1,5 @@
+@file:Suppress("DuplicatedCode")
+
 package dev.swiftstorm.akkaradb.engine.sstable
 
 import dev.swiftstorm.akkaradb.common.*
@@ -5,7 +7,10 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.engine.util.BloomFilter
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordReader
 import java.io.Closeable
+import java.io.EOFException
 import java.lang.ref.SoftReference
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Path
@@ -229,10 +234,8 @@ class SSTableReader(
                 dataStart = p.position + 2 + 4 * count
                 payload = p
 
-                // from下限に対して、このブロック内での lower_bound を求める
                 recPosInBlock = if (from == null) 0 else lowerBoundInBlock(from)
                 if (recPosInBlock >= offsets.size) {
-                    // このブロックは範囲外（すべて smaller）
                     payload = null
                     continue
                 }
@@ -267,7 +270,7 @@ class SSTableReader(
             val recPos = dataStart + offsets[recPosInBlock++]
             val recBuf = p.duplicate().apply { position(recPos) }
             val r = rr.read(recBuf)
-            if (toExclusive != null && r.key.compareTo(toExclusive) >= 0) finished = true
+            if (toExclusive != null && r.key >= toExclusive) finished = true
             return r
         }
     }
@@ -308,7 +311,6 @@ class SSTableReader(
             val kSlice = buf.duplicate().apply {
                 position(pos); limit(pos + FIXED_KEY_SIZE)
             }
-            // unsigned lex（提示の compareTo 実装に準拠）
             return kSlice.compareTo(key)
         }
 
@@ -328,15 +330,18 @@ class SSTableReader(
 
     private fun readFooter(ch: FileChannel): Pair<Long, Long> {
         val size = ch.size()
-        val f = ByteBufferL.allocate(FOOTER_SIZE)
-        ch.read(f.toMutableByteBuffer(), size - FOOTER_SIZE)
-        f.flip()
+        require(size >= FOOTER_SIZE) { "file too small: $size" }
 
-        // magic / offsets (ALL LE)
-        val magic = f.int
+        val f = ByteBufferL.allocate(FOOTER_SIZE)
+        val bb = f.toMutableByteBuffer()
+        bb.clear()
+        ch.readFully(bb, size - FOOTER_SIZE)
+
+        bb.flip()
+        val magic = bb.int
         require(magic == MAGIC_LE) { "bad footer magic: 0x${magic.toUInt().toString(16)}" }
-        val idx = f.long
-        val bloom = f.long
+        val idx = bb.long
+        val bloom = bb.long
         return idx to bloom
     }
 
@@ -351,7 +356,7 @@ class SSTableReader(
         require(pos + len <= size) { "map range overflow: pos=$pos len=$len size=$size" }
 
         return ch.map(FileChannel.MapMode.READ_ONLY, pos, len).apply {
-            order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            order(ByteOrder.LITTLE_ENDIAN)
         }
     }
 
@@ -369,4 +374,14 @@ class SSTableReader(
             tmp.flip()
             tmp.int
         }
+
+    private fun FileChannel.readFully(dst: ByteBuffer, position: Long) {
+        var pos = position
+        while (dst.hasRemaining()) {
+            val n = this.read(dst, pos)
+            if (n < 0) throw EOFException("Unexpected EOF while reading at pos=$pos")
+            pos += n
+        }
+    }
+
 }

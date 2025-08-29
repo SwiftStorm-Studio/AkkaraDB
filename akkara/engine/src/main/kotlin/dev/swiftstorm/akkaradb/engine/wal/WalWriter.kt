@@ -2,7 +2,6 @@ package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.Pools
 import java.io.Closeable
 import java.nio.channels.FileChannel
 import java.nio.file.Path
@@ -25,10 +24,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class WalWriter(
     path: Path,
-    private val pool: BufferPool = Pools.io(),
-    initCap: Int = 32 * 1024,
-    private val groupCommitN: Int = 32,
-    private val groupCommitMicros: Long = 500
+    private val pool: BufferPool,
+    initCap: Int,
+    private val groupCommitN: Int,
+    private val groupCommitMicros: Long
 ) : Closeable {
 
     companion object {

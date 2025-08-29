@@ -40,7 +40,8 @@ object AkkDSL {
                 cfg.walCfg.groupCommitN,
                 cfg.walCfg.groupCommitMicros,
                 cfg.walCfg.initCap,
-                cfg.metaCacheCap
+                cfg.walCfg.fastMode,
+                cfg.metaCacheCap,
             ),
             T::class
         )
@@ -71,7 +72,8 @@ data class WalCfg(
     val path: Path,
     val groupCommitN: Int = 32,
     val groupCommitMicros: Long = 500,
-    val initCap: Int = 32 * 1024
+    val initCap: Int = 32 * 1024,
+    val fastMode: Boolean = false
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -110,6 +112,7 @@ class WalCfgBuilder(defaultPath: Path) {
     var groupCommitN: Int = 32
     var groupCommitMicros: Long = 500
     var initCap: Int = 32 * 1024
+    var fastMode = false
 
     fun build(): WalCfg {
         require(groupCommitN >= 1) { "groupCommitN must be >= 1" }
@@ -120,7 +123,8 @@ class WalCfgBuilder(defaultPath: Path) {
             path = path,
             groupCommitN = groupCommitN,
             groupCommitMicros = groupCommitMicros,
-            initCap = initCap
+            initCap = initCap,
+            fastMode = fastMode
         )
     }
 }
@@ -297,7 +301,7 @@ fun <T : Any> BinPack.encode(kClass: KClass<T>, value: T): ByteBufferL {
 
 fun <T : Any> BinPack.decode(kClass: KClass<T>, buffer: ByteBufferL): T {
     val adapter = AdapterResolver.getAdapterForClass(kClass)
-    val src = buffer.asReadOnlyByteBuffer().slice()
+    val src = buffer.rewind().duplicate().asReadOnlyByteBuffer()
     return adapter.read(src)
 }
 

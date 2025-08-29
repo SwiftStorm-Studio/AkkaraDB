@@ -43,9 +43,7 @@ class SSTableWriter(
 
         var firstKeyInBlock: ByteBufferL? = null
         for (rec in records) {
-            val encoded = encode(rec) // AkkRecordWriter: payload for a single record (LE)
-
-            // ブロックに入らないならフラッシュ
+            val encoded = encode(rec)
             if (blockBuf.remaining < encoded.remaining) {
                 blockBuf.flip()
                 flushBlock(firstKeyInBlock!!)
@@ -54,7 +52,6 @@ class SSTableWriter(
             }
             if (firstKeyInBlock == null) firstKeyInBlock = rec.key
 
-            // レコード連結
             blockBuf.put(encoded.asReadOnlyByteBuffer())
             bloomBuilder.add(rec.key)
             pool.release(encoded)
@@ -62,7 +59,6 @@ class SSTableWriter(
 
         val bloom = bloomBuilder.build()
 
-        // 末尾ブロック
         if (blockBuf.position > 0) {
             blockBuf.flip()
             flushBlock(firstKeyInBlock!!)
@@ -162,12 +158,13 @@ class SSTableWriter(
         }
     }
 
-    private fun encode(rec: Record): ByteBufferL =
-        pool.borrow(AkkRecordWriter.computeMaxSize(rec)) { buf ->
-            AkkRecordWriter.write(rec, buf)
-            buf.flip()
-            buf.slice()
-        }
+    private fun encode(rec: Record): ByteBufferL {
+        val cap = AkkRecordWriter.computeMaxSize(rec)
+        val buf = pool.get(cap)
+        AkkRecordWriter.write(rec, buf)
+        buf.flip()
+        return buf
+    }
 
     /* ───────── lifecycle ───────── */
 
