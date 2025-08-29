@@ -10,6 +10,8 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 
 /**
  * Write-Ahead Log writer with a dedicated flusher thread implementing
@@ -19,6 +21,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  - beginFastMode(): delay fsync until the next barrier
  *  - endFastMode():   ensure durability at the next barrier, then return to durable mode
  *
+ * Extended fast mode (background force):
+ *  - Even in fast mode, periodically forces (fsync) by time or bytes thresholds
+ *    to cap data-loss window and avoid long exit latency.
+ *
  * Thread safety: public APIs are safe to call from multiple threads.
  * Encoding: fixed-length LE as defined in WalRecord.
  */
@@ -27,7 +33,9 @@ class WalWriter(
     private val pool: BufferPool,
     initCap: Int,
     private val groupCommitN: Int,
-    private val groupCommitMicros: Long
+    private val groupCommitMicros: Long,
+    private val fastForceMicros: Long,      // force at least every 5ms when active/idle
+    private val fastForceBytes: Long    // force every ~1MiB written
 ) : Closeable {
 
     companion object {
@@ -47,10 +55,14 @@ class WalWriter(
     private data class Write(
         val rec: WalRecord,
         val durable: Boolean,
-        override val done: CompletableFuture<Void>
+        override val done: CompletableFuture<Void>,
+        val lsn: Long
     ) : Cmd
 
-    private data class Barrier(override val done: CompletableFuture<Void>) : Cmd
+    private data class Barrier(
+        override val done: CompletableFuture<Void>,
+        val captureLsn: Long
+    ) : Cmd
 
     private val q = LinkedBlockingQueue<Cmd>()
     private val running = AtomicBoolean(true)
@@ -61,7 +73,7 @@ class WalWriter(
     /* ------------------------ Fast/Durable switch ----------------------- */
 
     /**
-     * Fast mode: fsync is delayed until the next barrier.
+     * Fast mode: fsync is delayed until background/threshold force or next barrier.
      * Durable mode: fsync after every batch (default).
      */
     val forceDurable = AtomicBoolean(true)
@@ -76,12 +88,37 @@ class WalWriter(
         forceDurable.set(true)
     }
 
+    /* --------------------------- LSN & background force --------------------------- */
+
+    private val nextLsn = AtomicLong(1L)
+    @Volatile
+    private var lastFlushedLsn: Long = 0L
+    @Volatile
+    private var lastForcedLsn: Long = 0L
+
+    @Volatile
+    private var bytesSinceLastForce: Long = 0L
+    @Volatile
+    private var lastForceNano: Long = System.nanoTime()
+
+    private fun needBackgroundForce(nowNano: Long): Boolean {
+        if (bytesSinceLastForce >= fastForceBytes) return true
+        val elapsed = nowNano - lastForceNano
+        return elapsed >= TimeUnit.MICROSECONDS.toNanos(fastForceMicros)
+    }
+
+    private fun markForced() {
+        lastForcedLsn = lastFlushedLsn
+        bytesSinceLastForce = 0L
+        lastForceNano = System.nanoTime()
+    }
+
     /* --------------------------- public API --------------------------- */
 
     /**
      * Append an Akk-encoded KV payload.
      * @param durable true: wait until enqueued writes reach durability (Durable-ACK)
-     *                false: return after enqueue (Fast-ACK; durability is deferred to a barrier)
+     *                false: return after enqueue (Fast-ACK; durability is deferred to bg force/barrier)
      */
     fun append(record: ByteBufferL, durable: Boolean = true) {
         val payload: ByteBufferL =
@@ -137,7 +174,8 @@ class WalWriter(
             return f
         }
         try {
-            q.put(Write(r, durable, f))
+            val lsn = nextLsn.getAndIncrement()
+            q.put(Write(r, durable, f, lsn))
         } catch (ie: InterruptedException) {
             f.completeExceptionally(ie)
             Thread.currentThread().interrupt()
@@ -153,7 +191,8 @@ class WalWriter(
             return f
         }
         try {
-            q.put(Barrier(f))
+            val cap = nextLsn.get() - 1 // capture current high-water LSN
+            q.put(Barrier(f, cap))
         } catch (ie: InterruptedException) {
             f.completeExceptionally(ie)
             Thread.currentThread().interrupt()
@@ -164,12 +203,20 @@ class WalWriter(
     private fun flushLoop() {
         val batch = ArrayList<Write>(groupCommitN)
 
+        fun doForce() {
+            ch.force(false)
+            markForced()
+        }
+
         fun flushBatch() {
             if (batch.isEmpty()) return
             try {
                 writeBatch(batch)
-                val needForce = forceDurable.get() || batch.any { it.durable }
-                if (needForce) ch.force(false)
+                val needForceDurable = forceDurable.get() || batch.any { it.durable }
+                val needForceBackground = !forceDurable.get() && needBackgroundForce(System.nanoTime())
+                if (needForceDurable || needForceBackground) {
+                    doForce()
+                }
                 batch.forEach { it.done.complete(null) }
             } catch (t: Throwable) {
                 batch.forEach { it.done.completeExceptionally(t) }
@@ -182,17 +229,23 @@ class WalWriter(
         while (running.get() || !q.isEmpty()) {
             try {
                 // wait up to T µs for first command (start of a batch window)
-                val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS) ?: continue
+                val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS)
+                if (first == null) {
+                    // idle tick: in fast mode we still enforce time-threshold forcing
+                    if (!forceDurable.get() && bytesSinceLastForce > 0 && needBackgroundForce(System.nanoTime())) {
+                        doForce()
+                    }
+                    continue
+                }
                 when (first) {
                     is Barrier -> {
                         // close any open batch first
                         flushBatch()
-                        try {
-                            ch.force(false)
-                            first.done.complete(null)
-                        } catch (t: Throwable) {
-                            first.done.completeExceptionally(t)
+                        // honor barrier: ensure durability up to captured LSN
+                        if (lastForcedLsn < first.captureLsn || !forceDurable.get()) {
+                            doForce()
                         }
+                        first.done.complete(null)
                         continue
                     }
                     is Write -> batch += first
@@ -211,12 +264,10 @@ class WalWriter(
                         is Barrier -> {
                             // finalize current batch before honoring the barrier
                             flushBatch()
-                            try {
-                                ch.force(false)
-                                next.done.complete(null)
-                            } catch (t: Throwable) {
-                                next.done.completeExceptionally(t)
+                            if (lastForcedLsn < next.captureLsn || !forceDurable.get()) {
+                                doForce()
                             }
+                            next.done.complete(null)
                             // barrier defines a hard boundary; end this cycle
                             break
                         }
@@ -242,7 +293,7 @@ class WalWriter(
                 is Write -> {
                     try {
                         writeBatch(listOf(cmd))
-                        ch.force(false)
+                        doForce()
                         cmd.done.complete(null)
                     } catch (t: Throwable) {
                         cmd.done.completeExceptionally(t)
@@ -251,7 +302,7 @@ class WalWriter(
 
                 is Barrier -> {
                     try {
-                        ch.force(false)
+                        doForce()
                         cmd.done.complete(null)
                     } catch (t: Throwable) {
                         cmd.done.completeExceptionally(t)
@@ -263,7 +314,11 @@ class WalWriter(
 
     private fun writeBatch(batch: List<Write>) {
         var total = 0
-        for (p in batch) total += p.rec.estimateSize()
+        var maxLsn = 0L
+        for (p in batch) {
+            total += p.rec.estimateSize()
+            maxLsn = max(maxLsn, p.lsn)
+        }
 
         if (scratch.capacity < total) {
             pool.release(scratch)
@@ -290,9 +345,12 @@ class WalWriter(
                 wrote += n
             }
             if (wrote > 0) {
-                scratch.advance(wrote) // pos を limit まで進める
+                scratch.advance(wrote) // pos -> limit
+                bytesSinceLastForce += wrote
             }
         }
+
+        lastFlushedLsn = max(lastFlushedLsn, maxLsn)
     }
 
     /* --------------------------- lifecycle ---------------------------- */
@@ -321,7 +379,7 @@ class WalWriter(
 /* -------- size estimator aligned with the current WalRecord encoding -------- */
 private fun WalRecord.estimateSize(): Int =
     when (this) {
-        is WalRecord.Seal -> 1                           // [tag]
-        is WalRecord.CheckPoint -> 1 + 8 + 8             // [tag][u64][u64]
+        is WalRecord.Seal -> 1                            // [tag]
+        is WalRecord.CheckPoint -> 1 + 8 + 8              // [tag][u64][u64]
         is WalRecord.Add -> 1 + 4 + payload.remaining + 4 // [tag][u32][payload][crc]
     }

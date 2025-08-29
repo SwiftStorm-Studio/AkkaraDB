@@ -227,6 +227,8 @@ class AkkaraDB private constructor(
             walGroupCommitMicros: Long = 5_000,
             walInitCap: Int = 32 * 1024,
             walFastMode: Boolean = false,
+            walForceMicros: Long = 20_000L,
+            walForceBytes: Long = 8L shl 20,
             metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
@@ -243,7 +245,9 @@ class AkkaraDB private constructor(
                 pool = Pools.io(),
                 groupCommitN = walGroupCommitN,
                 groupCommitMicros = walGroupCommitMicros,
-                initCap = walInitCap
+                initCap = walInitCap,
+                fastForceMicros = walForceMicros,
+                fastForceBytes = walForceBytes
             ).also { it.forceDurable.set(!walFastMode) }
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })

@@ -41,6 +41,8 @@ object AkkDSL {
                 cfg.walCfg.groupCommitMicros,
                 cfg.walCfg.initCap,
                 cfg.walCfg.fastMode,
+                cfg.walCfg.fastForceMicros,
+                cfg.walCfg.fastForceBytes,
                 cfg.metaCacheCap,
             ),
             T::class
@@ -73,7 +75,9 @@ data class WalCfg(
     val groupCommitN: Int = 32,
     val groupCommitMicros: Long = 500,
     val initCap: Int = 32 * 1024,
-    val fastMode: Boolean = false
+    val fastMode: Boolean = false,
+    val fastForceMicros: Long = 5_000, // 5ms
+    val fastForceBytes: Long = 1 shl 20 // 1MiB
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -113,6 +117,8 @@ class WalCfgBuilder(defaultPath: Path) {
     var groupCommitMicros: Long = 500
     var initCap: Int = 32 * 1024
     var fastMode = false
+    var fastForceMicros: Long = 5_000 // 5ms
+    var fastForceBytes: Long = 1 shl 20 // 1MiB
 
     fun build(): WalCfg {
         require(groupCommitN >= 1) { "groupCommitN must be >= 1" }
@@ -124,7 +130,9 @@ class WalCfgBuilder(defaultPath: Path) {
             groupCommitN = groupCommitN,
             groupCommitMicros = groupCommitMicros,
             initCap = initCap,
-            fastMode = fastMode
+            fastMode = fastMode,
+            fastForceMicros = fastForceMicros,
+            fastForceBytes = fastForceBytes
         )
     }
 }
