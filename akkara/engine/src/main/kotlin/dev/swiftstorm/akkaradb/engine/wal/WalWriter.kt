@@ -1,385 +1,235 @@
 package dev.swiftstorm.akkaradb.engine.wal
 
-import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.engine.wal.WalReplay.SEG_REGEX
 import java.io.Closeable
+import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption.*
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import kotlin.math.max
+import kotlin.io.path.name
+import kotlin.io.path.notExists
 
 /**
- * Write-Ahead Log writer with a dedicated flusher thread implementing
- * true "group commit (N or T)" and **durable-before-ACK** semantics.
+ * Segmented WAL writer with explicit Seal → rotate, CheckPoint, and prune.
  *
- * Fast mode support:
- *  - beginFastMode(): delay fsync until the next barrier
- *  - endFastMode():   ensure durability at the next barrier, then return to durable mode
- *
- * Extended fast mode (background force):
- *  - Even in fast mode, periodically forces (fsync) by time or bytes thresholds
- *    to cap data-loss window and avoid long exit latency.
- *
- * Thread safety: public APIs are safe to call from multiple threads.
- * Encoding: fixed-length LE as defined in WalRecord.
+ * Public API:
+ *  - append(payload)
+ *  - sealSegment()
+ *  - checkpoint(stripesWritten, lastSeq)
+ *  - pruneObsoleteSegments()
+ *  - close()
  */
 class WalWriter(
-    path: Path,
-    private val pool: BufferPool,
-    initCap: Int,
-    private val groupCommitN: Int,
-    private val groupCommitMicros: Long,
-    private val fastForceMicros: Long,      // force at least every 5ms when active/idle
-    private val fastForceBytes: Long    // force every ~1MiB written
+    private val dir: Path,
+    private val filePrefix: String,
+    private val enableLog: Boolean,
 ) : Closeable {
 
-    companion object {
-        private const val MAX_RECORD_BYTES = 1 shl 20 // 1 MiB
+    private object Tag {
+        const val ADD: Byte = 0x01
+        const val SEAL: Byte = 0x02
+        const val CHECKPOINT: Byte = 0x03
     }
 
-    private val ch = FileChannel.open(path, WRITE, CREATE, APPEND)
-
-    private var scratch: ByteBufferL = pool.get(initCap)
-
-    /* ------------ command queue (writes + control barriers) ------------ */
-
-    private sealed interface Cmd {
-        val done: CompletableFuture<Void>
+    private object Hdr {
+        const val TAG: Int = 1
+        const val LSN: Int = 8
+        const val LEN: Int = 4           // for ADD payload length
+        const val CKPT_BODY: Int = 16    // stripesWritten(8) + lastSeq(8)
     }
 
-    private data class Write(
-        val rec: WalRecord,
-        val durable: Boolean,
-        override val done: CompletableFuture<Void>,
-        val lsn: Long
-    ) : Cmd
-
-    private data class Barrier(
-        override val done: CompletableFuture<Void>,
-        val captureLsn: Long
-    ) : Cmd
-
-    private val q = LinkedBlockingQueue<Cmd>()
     private val running = AtomicBoolean(true)
-    private val flusher = Thread(this::flushLoop, "WalFlusher").apply {
-        isDaemon = true; start()
+    private val nextLsn = AtomicLong(0)
+
+    private var currentSegIdx: Int
+    private var lastCheckpointSegIdx: Int? = null
+
+    private var ch: FileChannel
+    private var segPath: Path
+
+    private val writeLock = Any()
+    private val io = Pools.io()
+
+    init {
+        if (dir.notExists()) Files.createDirectories(dir)
+        currentSegIdx = scanLatestSegmentIndex(dir, filePrefix) + 1
+        segPath = segmentPath(currentSegIdx)
+        ch = openChannel(segPath)
+        lg { "open: segment=${segPath.name}" }
     }
 
-    /* ------------------------ Fast/Durable switch ----------------------- */
+    /** Append a single ADD record. Copies payload into an owned buffer and writes it. */
+    fun append(payload: ByteBufferL): Long {
+        check(running.get()) { "WalWriter is closed" }
 
-    /**
-     * Fast mode: fsync is delayed until background/threshold force or next barrier.
-     * Durable mode: fsync after every batch (default).
-     */
-    val forceDurable = AtomicBoolean(true)
+        val lsn = nextLsn.incrementAndGet()
+        val len = payload.remaining
+        val total = Hdr.TAG + Hdr.LSN + Hdr.LEN + len
 
-    fun beginFastMode() {
-        forceDurable.set(false)
-    }
-
-    fun endFastMode() {
-        // Ensure all prior writes reach durable storage before returning to durable mode
-        barrier().join()
-        forceDurable.set(true)
-    }
-
-    /* --------------------------- LSN & background force --------------------------- */
-
-    private val nextLsn = AtomicLong(1L)
-    @Volatile
-    private var lastFlushedLsn: Long = 0L
-    @Volatile
-    private var lastForcedLsn: Long = 0L
-
-    @Volatile
-    private var bytesSinceLastForce: Long = 0L
-    @Volatile
-    private var lastForceNano: Long = System.nanoTime()
-
-    private fun needBackgroundForce(nowNano: Long): Boolean {
-        if (bytesSinceLastForce >= fastForceBytes) return true
-        val elapsed = nowNano - lastForceNano
-        return elapsed >= TimeUnit.MICROSECONDS.toNanos(fastForceMicros)
-    }
-
-    private fun markForced() {
-        lastForcedLsn = lastFlushedLsn
-        bytesSinceLastForce = 0L
-        lastForceNano = System.nanoTime()
-    }
-
-    /* --------------------------- public API --------------------------- */
-
-    /**
-     * Append an Akk-encoded KV payload.
-     * @param durable true: wait until enqueued writes reach durability (Durable-ACK)
-     *                false: return after enqueue (Fast-ACK; durability is deferred to bg force/barrier)
-     */
-    fun append(record: ByteBufferL, durable: Boolean = true) {
-        val payload: ByteBufferL =
-            if (durable) {
-                record.duplicate().apply { rewind() }.asReadOnly()
-            } else {
-                val src = record.duplicate().apply { rewind() }
-                val owned = ByteBufferL.allocate(src.remaining)
-                owned.put(src.asReadOnlyByteBuffer()).flip().asReadOnly()
-            }
-
-        val f = enqueueWrite(WalRecord.Add(payload), durable)
-        if (durable) f.join()
-    }
-
-    /** Mark end of segment; write a real Seal and ensure durability regardless of mode. */
-    fun sealSegment() {
-        enqueueWrite(WalRecord.Seal, durable = false).join()
-        barrier().join() // ensure durable even in Fast mode
-    }
-
-    /**
-     * Write a checkpoint {stripeIdx, seqNo} with strict ordering:
-     *  (1) barrier (durable up to now)
-     *  (2) Seal + CheckPoint
-     *  (3) barrier (durable including Seal+CP)
-     */
-    fun checkpoint(stripeIdx: Long, seqNo: Long) {
-        barrier().join()
-        val f1 = enqueueWrite(WalRecord.Seal, durable = false)
-        val f2 = enqueueWrite(WalRecord.CheckPoint(stripeIdx, seqNo), durable = false)
-        CompletableFuture.allOf(f1, f2).join()
-        barrier().join()
-    }
-
-    /** Truncate WAL after a successful checkpoint. */
-    fun truncate() {
-        barrier().join()
-        ch.truncate(0)
-        ch.force(false)
-        ch.position(0)
-    }
-
-    /* --------------------------- internals ---------------------------- */
-
-    private fun enqueueWrite(r: WalRecord, durable: Boolean): CompletableFuture<Void> {
-        val est = r.estimateSize()
-        require(est <= MAX_RECORD_BYTES) { "WAL record too large: $est bytes" }
-
-        val f = CompletableFuture<Void>()
-        if (!running.get()) {
-            f.completeExceptionally(IllegalStateException("WAL writer is closed"))
-            return f
-        }
+        val buf = io.get(total)
         try {
-            val lsn = nextLsn.getAndIncrement()
-            q.put(Write(r, durable, f, lsn))
-        } catch (ie: InterruptedException) {
-            f.completeExceptionally(ie)
-            Thread.currentThread().interrupt()
-        }
-        return f
-    }
+            buf.put(Tag.ADD)
+            buf.putLong(lsn)
+            buf.putInt(len)
+            // copy payload contents into owned buffer
+            buf.put(payload.asReadOnly())
+            buf.flip()
 
-    /** Inserts a control barrier (no on-disk record) and waits for fsync at the barrier point. */
-    private fun barrier(): CompletableFuture<Void> {
-        val f = CompletableFuture<Void>()
-        if (!running.get()) {
-            f.completeExceptionally(IllegalStateException("WAL writer is closed"))
-            return f
-        }
-        try {
-            val cap = nextLsn.get() - 1 // capture current high-water LSN
-            q.put(Barrier(f, cap))
-        } catch (ie: InterruptedException) {
-            f.completeExceptionally(ie)
-            Thread.currentThread().interrupt()
-        }
-        return f
-    }
-
-    private fun flushLoop() {
-        val batch = ArrayList<Write>(groupCommitN)
-
-        fun doForce() {
-            ch.force(false)
-            markForced()
-        }
-
-        fun flushBatch() {
-            if (batch.isEmpty()) return
-            try {
-                writeBatch(batch)
-                val needForceDurable = forceDurable.get() || batch.any { it.durable }
-                val needForceBackground = !forceDurable.get() && needBackgroundForce(System.nanoTime())
-                if (needForceDurable || needForceBackground) {
-                    doForce()
-                }
-                batch.forEach { it.done.complete(null) }
-            } catch (t: Throwable) {
-                batch.forEach { it.done.completeExceptionally(t) }
-            } finally {
-                batch.clear()
+            synchronized(writeLock) {
+                writeFully(buf)
             }
+        } finally {
+            io.release(buf)
         }
+        return lsn
+    }
 
-        // Main loop
-        while (running.get() || !q.isEmpty()) {
-            try {
-                // wait up to T µs for first command (start of a batch window)
-                val first = q.poll(groupCommitMicros, TimeUnit.MICROSECONDS)
-                if (first == null) {
-                    // idle tick: in fast mode we still enforce time-threshold forcing
-                    if (!forceDurable.get() && bytesSinceLastForce > 0 && needBackgroundForce(System.nanoTime())) {
-                        doForce()
-                    }
-                    continue
-                }
-                when (first) {
-                    is Barrier -> {
-                        // close any open batch first
-                        flushBatch()
-                        // honor barrier: ensure durability up to captured LSN
-                        if (lastForcedLsn < first.captureLsn || !forceDurable.get()) {
-                            doForce()
-                        }
-                        first.done.complete(null)
-                        continue
-                    }
-                    is Write -> batch += first
-                }
+    /** Write SEAL (fsync) then rotate to next segment. */
+    fun sealSegment(): Long {
+        check(running.get()) { "WalWriter is closed" }
 
-                // From the first write, wait until deadline (T) while filling up to N
-                val deadlineNanos =
-                    System.nanoTime() + TimeUnit.MICROSECONDS.toNanos(groupCommitMicros)
+        val lsn = nextLsn.incrementAndGet()
+        val buf = io.get(Hdr.TAG + Hdr.LSN)
+        try {
+            buf.put(Tag.SEAL)
+            buf.putLong(lsn)
+            buf.flip()
+            synchronized(writeLock) {
+                writeFully(buf)
+                force()
+                // rotate()
+            }
+        } finally {
+            io.release(buf)
+        }
+        lg { "control: Seal lsn=$lsn (rotated to ${segPath.name})" }
+        return lsn
+    }
 
-                while (batch.size < groupCommitN) {
-                    val remain = deadlineNanos - System.nanoTime()
-                    if (remain <= 0) break
-                    val next = q.poll(remain, TimeUnit.NANOSECONDS) ?: break
-                    when (next) {
-                        is Write -> batch += next
-                        is Barrier -> {
-                            // finalize current batch before honoring the barrier
-                            flushBatch()
-                            if (lastForcedLsn < next.captureLsn || !forceDurable.get()) {
-                                doForce()
-                            }
-                            next.done.complete(null)
-                            // barrier defines a hard boundary; end this cycle
-                            break
+    /**
+     * Write CHECKPOINT to the *current* segment and fsync.
+     * After success, this segment becomes the pruning boundary.
+     */
+    fun checkpoint(stripesWritten: Long, lastSeq: Long): Long {
+        check(running.get()) { "WalWriter is closed" }
+
+        val lsn = nextLsn.incrementAndGet()
+        val buf = io.get(Hdr.TAG + Hdr.LSN + Hdr.CKPT_BODY)
+        try {
+            buf.put(Tag.CHECKPOINT)
+            buf.putLong(lsn)
+            buf.putLong(stripesWritten)
+            buf.putLong(lastSeq)
+            buf.flip()
+            synchronized(writeLock) {
+                writeFully(buf)
+                force()
+                lastCheckpointSegIdx = currentSegIdx
+            }
+        } finally {
+            io.release(buf)
+        }
+        lg { "control: CheckPoint lsn=$lsn stripes=$stripesWritten lastSeq=$lastSeq seg=${segPath.name}" }
+        return lsn
+    }
+
+    /** Delete WAL segments older than the last checkpointed segment. */
+    fun pruneObsoleteSegments() {
+        val keepFrom = lastCheckpointSegIdx ?: return
+        synchronized(writeLock) {
+            Files.list(dir).use { stream ->
+                stream.filter { p -> p.fileName.toString().startsWith(prefix()) && p != segPath }
+                    .forEach { p ->
+                        val idx = parseSegmentIndex(p.fileName.toString())
+                        if (idx != null && idx < keepFrom) {
+                            runCatching { Files.deleteIfExists(p) }
+                                .onSuccess { lg { "prune: deleted ${p.name}" } }
+                                .onFailure { e -> lg { "prune: failed ${p.name} : ${e.message}" } }
                         }
                     }
-                }
-
-                // time boundary or count boundary reached → flush once
-                flushBatch()
-            } catch (t: Throwable) {
-                // As a last resort, fail any collected but unflushed writes
-                if (batch.isNotEmpty()) {
-                    batch.forEach { it.done.completeExceptionally(t) }
-                    batch.clear()
-                }
-                // keep running (best-effort resiliency)
-            }
-        }
-
-        // Drain remaining commands on shutdown
-        while (true) {
-            val cmd = q.poll() ?: break
-            when (cmd) {
-                is Write -> {
-                    try {
-                        writeBatch(listOf(cmd))
-                        doForce()
-                        cmd.done.complete(null)
-                    } catch (t: Throwable) {
-                        cmd.done.completeExceptionally(t)
-                    }
-                }
-
-                is Barrier -> {
-                    try {
-                        doForce()
-                        cmd.done.complete(null)
-                    } catch (t: Throwable) {
-                        cmd.done.completeExceptionally(t)
-                    }
-                }
             }
         }
     }
-
-    private fun writeBatch(batch: List<Write>) {
-        var total = 0
-        var maxLsn = 0L
-        for (p in batch) {
-            total += p.rec.estimateSize()
-            maxLsn = max(maxLsn, p.lsn)
-        }
-
-        if (scratch.capacity < total) {
-            pool.release(scratch)
-            var newCap = scratch.capacity
-            while (newCap < total) newCap = newCap * 2
-            scratch = pool.get(newCap)
-        }
-
-        scratch.clear()
-        for (p in batch) {
-            p.rec.writeTo(scratch)
-        }
-        scratch.flip()
-
-        run {
-            val bb = scratch.toMutableByteBuffer()
-            var wrote = 0
-            while (bb.hasRemaining()) {
-                val n = ch.write(bb)
-                if (n <= 0) {
-                    Thread.onSpinWait()
-                    continue
-                }
-                wrote += n
-            }
-            if (wrote > 0) {
-                scratch.advance(wrote) // pos -> limit
-                bytesSinceLastForce += wrote
-            }
-        }
-
-        lastFlushedLsn = max(lastFlushedLsn, maxLsn)
-    }
-
-    /* --------------------------- lifecycle ---------------------------- */
 
     override fun close() {
-        // signal stop and make sure flusher reaches a barrier and exits
-        running.set(false)
-        try {
-            // Wake flusher and force it to close the current window cleanly
-            barrier().join()
-        } catch (_: Throwable) {
-            // ignore; we'll still attempt to join and close
+        if (!running.getAndSet(false)) return
+        synchronized(writeLock) {
+            try {
+                force()
+            } catch (_: Throwable) {
+                // ignore
+            } finally {
+                runCatching { ch.close() }
+                lg { "close: segment=${segPath.name}" }
+            }
         }
-        flusher.join()
+    }
 
-        // final fsync for safety
+    // ─────────────── internals ───────────────
+
+    private fun writeFully(buf: ByteBufferL) {
+        try {
+            while (buf.hasRemaining()) ch.write(buf.toMutableByteBuffer())
+        } catch (e: IOException) {
+            throw e
+        }
+    }
+
+    private fun force() {
         try {
             ch.force(false)
-        } finally {
-            pool.release(scratch)
-            ch.close()
+        } catch (e: IOException) {
+            throw e
         }
     }
-}
 
-/* -------- size estimator aligned with the current WalRecord encoding -------- */
-private fun WalRecord.estimateSize(): Int =
-    when (this) {
-        is WalRecord.Seal -> 1                            // [tag]
-        is WalRecord.CheckPoint -> 1 + 8 + 8              // [tag][u64][u64]
-        is WalRecord.Add -> 1 + 4 + payload.remaining + 4 // [tag][u32][payload][crc]
+    private fun rotate() {
+        runCatching { ch.force(false) }
+        runCatching { ch.close() }
+        currentSegIdx += 1
+        segPath = segmentPath(currentSegIdx)
+        ch = openChannel(segPath)
     }
+
+    private fun openChannel(path: Path): FileChannel {
+        if (path.parent != null && path.parent.notExists()) Files.createDirectories(path.parent)
+        return FileChannel.open(
+            path,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.APPEND
+        )
+    }
+
+    private fun segmentPath(idx: Int): Path =
+        dir.resolve("${prefix()}_${idx.toString().padStart(6, '0')}.log")
+
+    private fun prefix() = filePrefix
+
+    private fun scanLatestSegmentIndex(dir: Path, prefix: String): Int {
+        if (dir.notExists()) return 0
+        var maxIdx = 0
+        Files.list(dir).use { stream ->
+            stream.filter { p -> p.fileName.toString().startsWith(prefix) && p.fileName.toString().endsWith(".log") }
+                .forEach { p ->
+                    parseSegmentIndex(p.fileName.toString())?.let { idx ->
+                        if (idx > maxIdx) maxIdx = idx
+                    }
+                }
+        }
+        return maxIdx
+    }
+
+    private fun parseSegmentIndex(name: String): Int? =
+        SEG_REGEX.matchEntire(name)?.groupValues?.get(1)?.toIntOrNull()
+
+    private inline fun lg(crossinline msg: () -> String) {
+        if (!enableLog) return
+        println("[WAL] ${msg()}")
+    }
+}

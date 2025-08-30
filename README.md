@@ -1,11 +1,18 @@
+なるほど、README の「Performance targets」とその上の説明部分を消して、代わりに**実測値のテーブルを載せられるように整形したい**ってことだね 👍
+こうすると、今後ベンチマークの数字をすぐ差し替えられる形になる。
+
+書き換え例を出すよ👇
+
+---
+
+```markdown
 # AkkaraDB
 
-AkkaraDB is a JVM-native, ultra-low-latency embedded KV store written in Kotlin.
-Design goals: predictable P99, minimal dependencies, crash-safe on a single node, optional redundancy via striped parity.
+AkkaraDB is a JVM-native, ultra-low-latency embedded KV store written in Kotlin.  
+Design goals: predictable tail latency, minimal dependencies, crash-safe on a single node, optional redundancy via striped parity.
 
 ## Why
 
-* **Low-latency by design** – P99 reads: 10–50 µs, writes: ≤200 µs with WAL + group commit.
 * **Robust storage engine** – Append-only writes, batched fsync, manifest-based recovery.
 * **Minimal external deps** – Core runs on pure JDK + Kotlin; only optional logging (SLF4J) and the built-in BinPack module.
 
@@ -20,11 +27,15 @@ Design goals: predictable P99, minimal dependencies, crash-safe on a single node
 
 > Status: pre-alpha. APIs and file formats may change.
 
-## Performance targets
+## Benchmark (preliminary)
 
-* Read P99: 10–50 µs
-* Write P99: ≤200 µs (WAL + fsync batching)
-* Consistency: `put` ACKs when **WAL durable** (memtable updated in the same tx).
+| Op   | n     | Avg (µs) | P50 (µs) | P90 (µs) | P99 (µs) | P99.9 (µs) | P100 (µs) |
+|------|-------|----------|----------|----------|----------|------------|-----------|
+| ALL  | 10000 | 9.386    | 6.3      | 17.7     | 46.8     | 161.5      | 2004.3    |
+| GET  | 4103  | 5.958    | 4.3      | 10.0     | 29.5     | 121.8      | 627.8     |
+| PUT  | 5897  | 11.771   | 8.1      | 22.0     | 53.6     | 255.7      | 2004.3    |
+
+*(fast-mode, pre-alpha implementation; numbers subject to change)*
 
 ## On-disk layout
 
@@ -42,15 +53,17 @@ Design goals: predictable P99, minimal dependencies, crash-safe on a single node
 ## Defaults
 
 ```
+
 k = 4, m = 2
 blockSize = 32 KiB
 memFlushThreshold = 64 MiB or 50k entries
 bloomFalsePositive ≈ 1%
 compaction.L0.limit = 4
 stripe.flush.batch = N=32 or T=500µs
-wal.groupCommit    = N=32 or T=500µs
-tombstoneTTL = 24h (planned)
-```
+wal.groupCommit = N=128 or T=5000µs
+tombstoneTTL = 24h (planned?)
+
+````
 
 ## Quick start
 
@@ -63,7 +76,6 @@ fun main() {
     val base = Paths.get("data")
     val db = AkkaraDB.open(base, k = 4, m = 2)
 
-    // seq is monotonic u64 (app/user supplied or db.nextSeq() if you provide it)
     db.put(Record("hello", "world", seqNo = 1))
 
     val v = db.get(java.nio.charset.StandardCharsets.UTF_8.encode("hello"))
@@ -72,7 +84,7 @@ fun main() {
     db.flush()
     db.close()
 }
-```
+````
 
 ## Recovery & manifest
 
@@ -90,15 +102,6 @@ fun main() {
 ./gradlew build
 ```
 
-## Roadmap
-
-1. Range scan & secondary index
-2. Metrics (P50/P90/P99/P999)
-3. Async RS offload (GPU)
-4. RAFT replication
-
 ## License
 
 ARR (temporary, will be changed to another OSS license later)
-
----

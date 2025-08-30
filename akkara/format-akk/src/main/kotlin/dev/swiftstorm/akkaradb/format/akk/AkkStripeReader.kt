@@ -40,62 +40,68 @@ class AkkStripeReader(
      * Returns `null` on EOF.
      */
     override fun readStripe(): Stripe? {
-        /* 1. read data lanes */
+        /* 1. read data lanes (must fill 32KiB each) */
         val laneBlocks = MutableList<ByteBufferL?>(k) { null }
         for ((idx, ch) in dataCh.withIndex()) {
             val blk = pool.get(BLOCK_SIZE)
-            val bb = blk.toMutableByteBuffer()
-            var read = 0
-            while (read < BLOCK_SIZE) {
-                val n = ch.read(bb)
-                if (n < 0) break
-                read += n
-            }
-            if (read == BLOCK_SIZE) {
-                blk.flip(); laneBlocks[idx] = blk
+            if (readFullBlock(ch, blk)) {
+                laneBlocks[idx] = blk
             } else {
-                pool.release(blk) // EOF/部分読み → 破棄
+                pool.release(blk) // EOF / partial read → discard
             }
         }
         if (laneBlocks.all { it == null }) return null // true EOF
 
         /* 2. optional parity recovery */
         val missingCnt = laneBlocks.count { it == null }
-        require(missingCnt <= (parityCoder?.parityCount ?: 0)) {
-            "Unrecoverable stripe – $missingCnt lanes missing but only " +
-                    "${parityCoder?.parityCount ?: 0} parity lanes configured"
+        val pCount = parityCoder?.parityCount ?: 0
+        require(missingCnt <= pCount) {
+            "Unrecoverable stripe – $missingCnt lanes missing but only $pCount parity lanes configured"
         }
 
-        val parityBufs: List<ByteBufferL?> = if (missingCnt > 0 && parityCoder != null) {
-            val tmp = parityCh.map { ch ->
-                val buf = pool.get()
-                val n = ch.read(buf.toMutableByteBuffer())
-                if (n == BLOCK_SIZE) {
-                    buf.flip(); buf
-                } else {
-                    pool.release(buf); null
+        val parityBufs: List<ByteBufferL?> =
+            if (missingCnt > 0 && parityCoder != null) {
+                // read parity lanes fully (may yield null on partial/EOF)
+                val tmp = parityCh.map { ch ->
+                    val buf = pool.get(BLOCK_SIZE)
+                    if (readFullBlock(ch, buf)) buf else run { pool.release(buf); null }
                 }
+
+                // recover each missing data lane using available parity
+                for (missIdx in laneBlocks.indices) {
+                    if (laneBlocks[missIdx] == null) {
+                        laneBlocks[missIdx] = parityCoder.decode(missIdx, laneBlocks, tmp)
+                    }
+                }
+                tmp
+            } else {
+                emptyList()
             }
 
-            for (missIdx in laneBlocks.indices) {
-                if (laneBlocks[missIdx] == null) {
-                    laneBlocks[missIdx] = parityCoder.decode(missIdx, laneBlocks, tmp)
-                }
-            }
-
-            tmp
-        } else {
-            emptyList()
-        }
-
-        // release parity buffers immediately
+        // parity bufs are no longer needed after recovery
         parityBufs.forEach { it?.let(pool::release) }
 
-        /* 3. unpack payloads */
+        /* 3. unpack payloads (all blocks must be present here) */
         val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
         val payloads = nonNullBlocks.flatMap(unpacker::unpack)
 
         return Stripe(payloads, nonNullBlocks, pool)
+    }
+
+    /** Read exactly BLOCK_SIZE bytes into [blk]. Returns true on success (and flips), false otherwise. */
+    private fun readFullBlock(ch: java.nio.channels.ReadableByteChannel, blk: ByteBufferL): Boolean {
+        val bb = blk.toMutableByteBuffer()
+        bb.clear() // position=0, limit=capacity
+        var read = 0
+        while (read < BLOCK_SIZE) {
+            val n = ch.read(bb)
+            if (n < 0) break
+            if (n == 0) continue
+            read += n
+        }
+        return if (read == BLOCK_SIZE) {
+            blk.flip(); true
+        } else false
     }
 
     override fun close() {

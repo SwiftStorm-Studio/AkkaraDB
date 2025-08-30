@@ -10,18 +10,6 @@ import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
 
-/**
- * Levelled compactor (L0 -> L1).
- *
- * Highlights:
- *  - k-way マージで同一キーをその場でグルーピング（配列コピーやHashMapなし）
- *  - 各キーグループから最新 seqNo のみを採用、tombstone は落とす
- *  - 昇順キーで直接 SST に吐く（後ソート不要）
- *  - 完了後、manifest に SSTSeal(level=1) と checkpoint("compact") を記録
- *
- * ※ すべてのI/Oは下位の SSTableReader/Writer 側で Little-Endian に統一済み。
- *    本クラスはキー比較のみ行い、compareTo は ByteBufferL の unsigned lex 実装を使用。
- */
 class Compactor(
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>, // shared from AkkaraDB
     private val baseDir: Path,

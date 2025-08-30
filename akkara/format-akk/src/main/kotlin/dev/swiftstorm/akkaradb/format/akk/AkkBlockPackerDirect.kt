@@ -1,7 +1,6 @@
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
-import dev.swiftstorm.akkaradb.common.BlockConst.MAX_RECORD
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
@@ -37,13 +36,19 @@ class AkkBlockPackerDirect(
 
     override fun addRecord(record: ByteBufferL) {
         val recLen = record.remaining
-        require(recLen <= MAX_RECORD) { "Record $recLen B exceeds $MAX_RECORD B" }
+        val need = 4 + recLen // u32 len + rec bytes
 
-        if (scratch.position + 4 + recLen > PAYLOAD_LIMIT) emitBlock()
+        require(need <= PAYLOAD_LIMIT) {
+            "Encoded record ($need B) exceeds payload limit $PAYLOAD_LIMIT"
+        }
+
+        if (scratch.position + need > PAYLOAD_LIMIT) {
+            emitBlock()
+        }
 
         // [u32 recLen][rec bytes]
         scratch.putInt(recLen)
-        scratch.put(record.asReadOnlyByteBuffer().slice())
+        scratch.put(record.slice().asReadOnlyByteBuffer())
     }
 
     override fun flush() {

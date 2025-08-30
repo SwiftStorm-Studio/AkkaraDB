@@ -79,7 +79,7 @@ value class ByteBufferL private constructor(
          */
         fun allocate(
             capacity: Int,
-            direct: Boolean = false,
+            direct: Boolean = true,
             allocator: ByteBufferAllocator = ByteBufferAllocator.Default
         ): ByteBufferL {
             require(capacity >= 0) { "capacity < 0: $capacity" }

@@ -7,8 +7,8 @@ import dev.swiftstorm.akkaradb.engine.sstable.Compactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
 import dev.swiftstorm.akkaradb.engine.util.ReaderPool
+import dev.swiftstorm.akkaradb.engine.wal.WalReplay
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
-import dev.swiftstorm.akkaradb.engine.wal.replayWal
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockPackerDirect
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordWriter
 import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
@@ -20,6 +20,7 @@ import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 /**
@@ -167,11 +168,30 @@ class AkkaraDB private constructor(
         pool.borrow(recordWriter.computeMaxSize(recWal)) { buf ->
             recordWriter.write(recWal, buf)
             buf.flip()
-            wal.append(buf.duplicate(), wal.forceDurable.get())
+            wal.append(buf.duplicate())
         }
 
         val accepted = lock.write { memTable.put(recStore) }
 
+        if (accepted) {
+            val k = kStore.duplicate().apply { rewind() }
+            val v = vStore.duplicate().apply { rewind() }.asReadOnly()
+            metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, v))
+        }
+    }
+
+    /**
+     * Puts the record into MemTable without writing to WAL.
+     * Use with caution: this method is not crash-safe.
+     * For debugging and testing only.
+     */
+    @PublishedApi
+    internal fun putUnsafeNoWal(rec: Record) {
+        val kStore = rec.key.duplicate().apply { rewind() }.asReadOnly()
+        val vStore = rec.value.duplicate().apply { rewind() }.asReadOnly()
+        val recStore = Record(kStore, vStore, rec.seqNo, flags = rec.flags)
+
+        val accepted = lock.write { memTable.put(recStore) }
         if (accepted) {
             val k = kStore.duplicate().apply { rewind() }
             val v = vStore.duplicate().apply { rewind() }.asReadOnly()
@@ -188,16 +208,13 @@ class AkkaraDB private constructor(
      */
     fun flush() = lock.write {
         wal.sealSegment()
-        stripeWriter.flush()
-        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
         memTable.flush()
+        stripeWriter.flush()
+        manifest.checkpoint("flush", stripeWriter.stripesWritten, memTable.lastSeq())
+        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
+
         compactor.maybeCompact()
-        manifest.checkpoint(
-            name = "flush",
-            stripe = stripeWriter.stripesWritten,
-            lastSeq = memTable.lastSeq()
-        )
-        wal.truncate()
+        wal.pruneObsoleteSegments()
     }
 
     fun lastSeq(): Long = memTable.lastSeq()
@@ -220,15 +237,11 @@ class AkkaraDB private constructor(
             k: Int = 4,
             m: Int = 2,
             parityCoder: ParityCoder = RSParityCoder(m),
-            // 64 * 1024 * 1024 = 64 MiB
-            flushThresholdBytes: Long = 64L * 1024 * 1024,
-            walPath: Path = baseDir.resolve("wal.log"),
-            walGroupCommitN: Int = 128,
-            walGroupCommitMicros: Long = 5_000,
-            walInitCap: Int = 32 * 1024,
-            walFastMode: Boolean = false,
-            walForceMicros: Long = 20_000L,
-            walForceBytes: Long = 8L shl 20,
+            // 32 * 1024 * 1024 = 32 MiB
+            flushThresholdBytes: Long = 32L * 1024 * 1024,
+            walDir: Path = baseDir.resolve("wal"),
+            walFilePrefix: String = "wal",
+            walEnableLog: Boolean = true,
             metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
@@ -240,15 +253,7 @@ class AkkaraDB private constructor(
                 autoFlush = true,
                 onCommit = { committed -> manifest.advance(committed) }
             )
-            val wal = WalWriter(
-                path = walPath,
-                pool = Pools.io(),
-                groupCommitN = walGroupCommitN,
-                groupCommitMicros = walGroupCommitMicros,
-                initCap = walInitCap,
-                fastForceMicros = walForceMicros,
-                fastForceBytes = walForceBytes
-            ).also { it.forceDurable.set(!walFastMode) }
+            val wal = WalWriter(dir = walDir, filePrefix = walFilePrefix, enableLog = walEnableLog)
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
 
@@ -264,39 +269,35 @@ class AkkaraDB private constructor(
                         return@MemTable
                     }
 
-                    val sorted = records.sortedWith { a, b -> cmp(a.key, b.key) }
+                    records.sortWith { a, b -> cmp(a.key, b.key) }
 
                     val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
-                    SSTableWriter(sstPath, pool).use { it.write(sorted) }
+                    SSTableWriter(sstPath, pool).use { it.write(records) }
 
-                    val firstKey = sorted.firstOrNull()?.key?.base64()
-                    val lastKey = sorted.lastOrNull()?.key?.base64()
+                    if (records.size >= k) {
+                        for (r in records) {
+                            val need = AkkRecordWriter.computeMaxSize(r)
+                            pool.borrow(need) { tmp ->
+                                AkkRecordWriter.write(r, tmp)
+                                tmp.flip()
+                                val safe = ByteBufferL.allocate(tmp.remaining)
+                                safe.put(tmp); safe.flip()
+                                packer.addRecord(safe)
+                            }
+                        }
+                        packer.flush()
+                    }
+
+                    val firstKey = records.first().key.base64()
+                    val lastKey = records.last().key.base64()
                     manifest.sstSeal(
                         level = 0,
                         file = sstPath.fileName.toString(),
-                        entries = sorted.size.toLong(),
+                        entries = records.size.toLong(),
                         firstKeyHex = firstKey,
                         lastKeyHex = lastKey
                     )
                     levels[0].addFirst(SSTableReader(sstPath, pool))
-
-                    val kStripe = k
-                    if (sorted.size >= kStripe) {
-                        var i = 0
-                        while (i + kStripe <= sorted.size) {
-                            val batch = sorted.subList(i, i + kStripe)
-                            for (r in batch) {
-                                val need = AkkRecordWriter.computeMaxSize(r)
-                                pool.borrow(need) { tmp ->
-                                    AkkRecordWriter.write(r, tmp)
-                                    tmp.flip()
-                                    packer.addRecord(tmp.slice())
-                                }
-                            }
-                            packer.flush()
-                            i += kStripe
-                        }
-                    }
 
                     manifest.checkpoint("memFlush")
                 },
@@ -315,8 +316,8 @@ class AkkaraDB private constructor(
             stripe.truncateTo(manifest.stripesWritten)
 
             val cp = manifest.lastCheckpoint
-            replayWal(
-                walPath,
+            WalReplay.replay(
+                walDir,
                 mem,
                 cp?.stripe ?: 0L,
                 cp?.lastSeq ?: Long.MIN_VALUE
@@ -433,14 +434,16 @@ class AkkaraDB private constructor(
 
         metaGet(k)?.let { return Record(k, it.value.duplicate().apply { rewind() }, it.seqNo) }
 
-        for (deque in levels) {
-            val rec = deque.firstNotNullOfOrNull { sst ->
-                if (!sst.mightContain(k)) null else sst.get(k)
-            }
-            if (rec != null) {
-                val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
-                metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
-                return rec
+        lock.read {
+            for (deque in levels) {
+                val rec = deque.firstNotNullOfOrNull { sst ->
+                    if (!sst.mightContain(k)) null else sst.get(k)
+                }
+                if (rec != null) {
+                    val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
+                    metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))
+                    return rec
+                }
             }
         }
 

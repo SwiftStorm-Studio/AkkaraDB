@@ -36,13 +36,9 @@ object AkkDSL {
                 cfg.m,
                 cfg.parityCoder,
                 cfg.flushThreshold,
-                cfg.walCfg.path,
-                cfg.walCfg.groupCommitN,
-                cfg.walCfg.groupCommitMicros,
-                cfg.walCfg.initCap,
-                cfg.walCfg.fastMode,
-                cfg.walCfg.fastForceMicros,
-                cfg.walCfg.fastForceBytes,
+                cfg.walCfg.dir,
+                cfg.walCfg.filePrefix,
+                cfg.walCfg.enableLog,
                 cfg.metaCacheCap,
             ),
             T::class
@@ -71,13 +67,9 @@ data class AkkDSLCfg(
 )
 
 data class WalCfg(
-    val path: Path,
-    val groupCommitN: Int = 32,
-    val groupCommitMicros: Long = 500,
-    val initCap: Int = 32 * 1024,
-    val fastMode: Boolean = false,
-    val fastForceMicros: Long = 5_000, // 5ms
-    val fastForceBytes: Long = 1 shl 20 // 1MiB
+    val dir: Path,
+    val filePrefix: String = "wal",
+    val enableLog: Boolean = true,
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -87,7 +79,7 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
     var flushThreshold: Long = 32 * 1024 * 1024
     var metaCacheCap: Int = 1024
 
-    private val walBuilder = WalCfgBuilder(baseDir.resolve("wal.log"))
+    private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
 
     fun wal(block: WalCfgBuilder.() -> Unit) {
         walBuilder.apply(block)
@@ -112,27 +104,15 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
 }
 
 class WalCfgBuilder(defaultPath: Path) {
-    var path: Path = defaultPath
-    var groupCommitN: Int = 32
-    var groupCommitMicros: Long = 500
-    var initCap: Int = 32 * 1024
-    var fastMode = false
-    var fastForceMicros: Long = 5_000 // 5ms
-    var fastForceBytes: Long = 1 shl 20 // 1MiB
+    var dir: Path = defaultPath
+    var filePrefix: String = "wal"
+    var enableLog: Boolean = true
 
     fun build(): WalCfg {
-        require(groupCommitN >= 1) { "groupCommitN must be >= 1" }
-        require(groupCommitMicros >= 0) { "groupCommitMicros must be >= 0" }
-        require(initCap > 0) { "initCap must be > 0" }
-
         return WalCfg(
-            path = path,
-            groupCommitN = groupCommitN,
-            groupCommitMicros = groupCommitMicros,
-            initCap = initCap,
-            fastMode = fastMode,
-            fastForceMicros = fastForceMicros,
-            fastForceBytes = fastForceBytes
+            dir = dir,
+            filePrefix = filePrefix,
+            enableLog = enableLog
         )
     }
 }
@@ -269,6 +249,25 @@ class PackedTable<T : Any>(
         val adapter = AdapterResolver.getAdapterForClass(kClass)
         return adapter.copy(this)
     }
+
+    fun putUnsafeNoWal(id: String, uuid: ShortUUID, entity: T) {
+        val encoded = BinPack.encode(kClass, entity)
+        val key = keyBuf(id, uuid)
+        val seqNum = db.nextSeq()
+        db.putUnsafeNoWal(Record(key, encoded, seqNum))
+    }
+
+    fun deleteUnsafeNoWal(id: String, uuid: ShortUUID) {
+        val seqNum = db.nextSeq()
+        val tomb = Record(keyBuf(id, uuid), Companion.EMPTY, seqNum).asTombstone()
+        db.putUnsafeNoWal(tomb)
+    }
+
+    fun putUnsafeNoWal(uuid: ShortUUID, entity: T) =
+        putUnsafeNoWal("default", uuid, entity)
+
+    fun deleteUnsafeNoWal(uuid: ShortUUID) =
+        deleteUnsafeNoWal("default", uuid)
 
     /* ───────── overloads ───────── */
 

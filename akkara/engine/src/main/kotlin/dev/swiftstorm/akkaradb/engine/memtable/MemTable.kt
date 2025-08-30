@@ -20,7 +20,7 @@ import kotlin.math.max
  */
 class MemTable(
     private val thresholdBytes: Long,
-    private val onFlush: (List<Record>) -> Unit,
+    private val onFlush: (MutableList<Record>) -> Unit,
     private val onEvict: ((List<Record>) -> Unit)? = null,
     private val maxEntries: Int? = null,
     private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
@@ -94,8 +94,11 @@ class MemTable(
     }
 
     fun flush() {
-        if (flushPending.compareAndSet(false, true) || currentBytes.get() > 0) {
+        if (!flushPending.compareAndSet(false, true)) return
+        try {
             flushInternal()
+        } finally {
+            flushPending.set(false)
         }
     }
 
@@ -134,27 +137,19 @@ class MemTable(
 
     /* ---- flush internals ---- */
     private fun flushInternal() {
-        var toFlush: List<Record>? = null
-        var bytesFlushed = 0L
-
-        lock.write {
-            val oldMap = mapRef.getAndSet(newLruMap())
-            if (oldMap.isNotEmpty()) {
-                toFlush = ArrayList(oldMap.values)
-                bytesFlushed = oldMap.values.sumOf { sizeOf(it) }
-            } else {
-                flushPending.set(false)
-                return
-            }
+        val toFlush: MutableList<Record> = lock.write {
+            val old = mapRef.getAndSet(newLruMap())
+            if (old.isEmpty()) return
+            ArrayList(old.values)
         }
+
+        val bytesFlushed = toFlush.sumOf { sizeOf(it) }
         currentBytes.addAndGet(-bytesFlushed)
 
         try {
-            onFlush.invoke(toFlush!!)
+            onFlush.invoke(toFlush)
         } catch (e: Exception) {
             e.printStackTrace()
-        } finally {
-            flushPending.set(false)
         }
     }
 
