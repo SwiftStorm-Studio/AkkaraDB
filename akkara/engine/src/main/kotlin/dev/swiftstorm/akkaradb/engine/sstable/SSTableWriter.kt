@@ -27,7 +27,6 @@ class SSTableWriter(
 
     private val ch = FileChannel.open(path, CREATE, WRITE, TRUNCATE_EXISTING, DSYNC)
 
-    // 作業用ブロックバッファ（LE固定の ByteBufferL）
     private val blockBuf: ByteBufferL = pool.get(BLOCK_SIZE)
 
     private val crc32 = CRC32C()
@@ -42,17 +41,26 @@ class SSTableWriter(
         val bloomBuilder = BloomFilter.Builder(records.size)
 
         var firstKeyInBlock: ByteBufferL? = null
+        var blockRecordCount = 0
+
         for (rec in records) {
             val encoded = encode(rec)
-            if (blockBuf.remaining < encoded.remaining) {
+
+            val estimatedMiniIdxSize = 2 + 4 * (blockRecordCount + 1)
+            val projectedUsed = estimatedMiniIdxSize + blockBuf.position + encoded.remaining
+
+            if (projectedUsed > BLOCK_SIZE) {
                 blockBuf.flip()
                 flushBlock(firstKeyInBlock!!)
                 blockBuf.clear()
+                blockRecordCount = 0
                 firstKeyInBlock = null
             }
-            if (firstKeyInBlock == null) firstKeyInBlock = rec.key
 
+            if (firstKeyInBlock == null) firstKeyInBlock = rec.key
             blockBuf.put(encoded.asReadOnlyByteBuffer())
+            blockRecordCount++
+
             bloomBuilder.add(rec.key)
             pool.release(encoded)
         }
@@ -66,10 +74,9 @@ class SSTableWriter(
 
         /* ---- append index + bloom + footer (ALL LE) ---- */
         val indexOff = ch.position()
-        index.writeTo(ch) // IndexBlock 側で offset は i64 LE で書く想定
+        index.writeTo(ch)
 
         val bloomOff = ch.position()
-        // bloom bits はエンディアン非依存のビット列、直後に hashCount:u32 LE を書く
         bloom.writeTo(ch)
         pool.borrow(4) { b ->
             b.clear()
@@ -85,28 +92,33 @@ class SSTableWriter(
     /* ───────── internal ───────── */
 
     private fun flushBlock(firstKey: ByteBufferL) {
-        // MiniIndex を作り、[MiniIndex][Records] を payload にまとめる
         val miniIdx = buildMiniIndex(blockBuf.duplicate())
-        val payloadSize = miniIdx.remaining + blockBuf.remaining
-        val payload = pool.get(payloadSize)
+
+        val used = miniIdx.remaining + blockBuf.remaining
+        require(used <= BLOCK_SIZE) {
+            "payload too large: $used > $BLOCK_SIZE (miniIdx=${miniIdx.remaining}, rec=${blockBuf.remaining})"
+        }
+
+        val payload = pool.get(BLOCK_SIZE)
         payload.put(miniIdx.asReadOnlyByteBuffer())
         payload.put(blockBuf.asReadOnlyByteBuffer())
+
+        while (payload.hasRemaining()) {
+            payload.put(0)
+        }
         payload.flip()
 
         val offset = ch.position()
 
-        // Write [len:u32 LE][payload][crc:u32 LE]
         pool.borrow(8) { hdrCrc ->
             hdrCrc.clear()
-            hdrCrc.putInt(payload.remaining) // len (LE)
+            hdrCrc.putInt(BLOCK_SIZE)
 
             crc32.reset()
-            crc32.update(payload.asReadOnlyByteBuffer().slice()) // CRC over payload only
-            hdrCrc.putInt(crc32.value.toInt()) // crc (LE)
+            crc32.update(payload.asReadOnlyByteBuffer().slice())
+            hdrCrc.putInt(crc32.value.toInt())
             hdrCrc.flip()
 
-            // 2つの write：先に len、次に payload、本体が終わったら crc
-            //（gather-write の arrayWrite も可能だが、LE固定のため明示的に書く）
             val lenBB = hdrCrc.asReadOnlyByteBuffer().slice().apply { limit(4) }
             val crcBB = hdrCrc.asReadOnlyByteBuffer().slice().apply { position(4); limit(8) }
 
@@ -115,8 +127,6 @@ class SSTableWriter(
             ch.write(crcBB)
         }
 
-        // 外部インデックスに (先頭キー, ブロック先頭オフセット) を追加
-        // IndexBlock の API が ByteBuffer を受けるなら ByteBuffer へ変換
         index.add(firstKey.asReadOnlyByteBuffer(), offset)
 
         pool.release(payload)
@@ -154,7 +164,7 @@ class SSTableWriter(
             f.putLong(indexOff)
             f.putLong(bloomOff)
             f.flip()
-            ch.write(f.toMutableByteBuffer())
+            ch.write(f.asReadOnlyByteBuffer())
         }
     }
 

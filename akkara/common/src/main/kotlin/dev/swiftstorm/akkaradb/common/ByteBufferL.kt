@@ -557,6 +557,8 @@ inline fun ByteBufferL.align(boundary: Int): ByteBufferL {
     return this
 }
 
+fun ByteBufferL.getByteBuffer(): ByteBuffer = b
+
 inline fun <R> ByteBufferL.withPosition(pos: Int, block: (ByteBufferL) -> R): R {
     val saved = position
     try {
@@ -566,10 +568,11 @@ inline fun <R> ByteBufferL.withPosition(pos: Int, block: (ByteBufferL) -> R): R 
     }
 }
 
-fun ByteBufferL.hexHead(n: Int = 32): String {
-    val ro = this.asReadOnlyByteBuffer().slice()
-    val m = min(n, ro.remaining())
-    val tmp = ByteArray(m)
-    ro.get(tmp)
-    return tmp.joinToString(" ") { "%02X".format(it) }
+fun ByteBufferL.debugHex(): String {
+    val bb = this.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
+    val sb = StringBuilder()
+    while (bb.hasRemaining()) {
+        sb.append(String.format("%02X ", bb.get()))
+    }
+    return sb.toString()
 }

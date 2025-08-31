@@ -12,6 +12,7 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
 import java.nio.file.Path
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 class AkkStripeWriter(
     val baseDir: Path,
@@ -39,73 +40,119 @@ class AkkStripeWriter(
     private var stripesSinceLastFlush = 0
     private var lastFlushAtNanos: Long = System.nanoTime()
 
+    private val gate = ReentrantReadWriteLock()
+
+    @Volatile
+    private var closing = false
+    @Volatile
+    private var closed = false
+
     /* ───────── write-path (ByteBufferL) ───────── */
     override fun addBlock(block: ByteBufferL) {
-        require(block.remaining == BLOCK_SIZE) { "block size must be $BLOCK_SIZE, got ${block.remaining}" }
+        if (closing) throw IllegalStateException("StripeWriter is closing")
 
-        val writer = dataCh[laneIdx]
-        writer.write(block)
-        writer.lastWritten = block
-        laneIdx++
+        gate.readLock().lock()
 
-        if (laneIdx == k) {
-            // 2. parity
-            parityCoder?.let { coder ->
-                val parityBlocks: List<ByteBufferL> = coder.encode(dataCh.map { it.lastWritten!! })
-                parityBlocks.forEachIndexed { i, buf ->
-                    parityCh[i].write(buf)
-                    pool.release(buf)
+        try {
+            check(!closed) { "StripeWriter is closed" }
+
+            require(block.remaining == BLOCK_SIZE) { "block size must be $BLOCK_SIZE, got ${block.remaining}" }
+
+            val writer = dataCh[laneIdx]
+            writer.write(block)
+            writer.lastWritten = block
+            laneIdx++
+
+            if (laneIdx == k) {
+                // 2. parity
+                parityCoder?.let { coder ->
+                    val parityBlocks: List<ByteBufferL> = coder.encode(dataCh.map { it.lastWritten!! })
+                    parityBlocks.forEachIndexed { i, buf ->
+                        parityCh[i].write(buf)
+                        pool.release(buf)
+                    }
+                }
+
+                // 3. release per-lane cached buffers
+                dataCh.forEach { w ->
+                    w.lastWritten?.let(pool::release)
+                    w.lastWritten = null
+                }
+                laneIdx = 0
+                stripesWritten_++
+
+                // 4. group commit policy: N stripes or T µs
+                stripesSinceLastFlush++
+                val now = System.nanoTime()
+                val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
+                val dueByCount = stripesSinceLastFlush >= fsyncBatchN
+                if (autoFlush && (dueByCount || dueByTime)) {
+                    flush()
                 }
             }
-
-            // 3. release per-lane cached buffers
-            dataCh.forEach { w ->
-                w.lastWritten?.let(pool::release)
-                w.lastWritten = null
-            }
-            laneIdx = 0
-            stripesWritten_++
-
-            // 4. group commit policy: N stripes or T µs
-            stripesSinceLastFlush++
-            val now = System.nanoTime()
-            val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
-            val dueByCount = stripesSinceLastFlush >= fsyncBatchN
-            if (autoFlush && (dueByCount || dueByTime)) {
-                flush()
-            }
+        } finally {
+            gate.readLock().unlock()
         }
     }
 
     /** Force fsync on every lane (blocking). */
     override fun flush(): Long {
-        dataCh.forEach(FileWriter::flush)
-        parityCh.forEach(FileWriter::flush)
-        stripesSinceLastFlush = 0
-        lastFlushAtNanos = System.nanoTime()
-        onCommit?.invoke(stripesWritten_)
-        return stripesWritten_
+        gate.readLock().lock()
+        try {
+            if (closed) return stripesWritten
+
+            dataCh.forEach(FileWriter::flush)
+            parityCh.forEach(FileWriter::flush)
+            stripesSinceLastFlush = 0
+            lastFlushAtNanos = System.nanoTime()
+            onCommit?.invoke(stripesWritten_)
+            return stripesWritten_
+        } finally {
+            gate.readLock().unlock()
+        }
     }
 
     /** Re-positions all writers to `stripes×BLOCK_SIZE`. */
     override fun seek(stripeIndex: Long) {
-        val off = stripeIndex * BLOCK_SIZE.toLong()
-        dataCh.forEach { it.seek(off) }
-        parityCh.forEach { it.seek(off) }
-        stripesWritten_ = stripeIndex
+        gate.readLock().lock()
+        try {
+            val off = stripeIndex * BLOCK_SIZE.toLong()
+            dataCh.forEach { it.seek(off) }
+            parityCh.forEach { it.seek(off) }
+            stripesWritten_ = stripeIndex
+        } finally {
+            gate.readLock().unlock()
+        }
     }
 
     fun truncateTo(stripes: Long) {
-        val off = stripes * BLOCK_SIZE.toLong()
-        dataCh.forEach { (it as FileWriterEx).truncate(off) }
-        parityCh.forEach { (it as FileWriterEx).truncate(off) }
-        seek(stripes)
+        gate.readLock().lock()
+        try {
+            val off = stripes * BLOCK_SIZE.toLong()
+            dataCh.forEach { (it as FileWriterEx).truncate(off) }
+            parityCh.forEach { (it as FileWriterEx).truncate(off) }
+            seek(stripes)
+        } finally {
+            gate.readLock().unlock()
+        }
     }
 
     override fun close() {
-        flush()
-        dataCh.forEach(FileWriter::close)
-        parityCh.forEach(FileWriter::close)
+        closing = true
+        gate.writeLock().lock()   // ← 新規 add/flush を遮断し、進行中の readLock が抜けるのを待つ
+        try {
+            if (!closed) {
+                try {
+                    flush()
+                } catch (_: Throwable) { /* best-effort */
+                }
+                dataCh.forEach { it.close() }
+                parityCh.forEach { it.close() }
+                closed = true
+            }
+        } finally {
+            gate.writeLock().unlock()
+        }
     }
 
     /* ───────── writer factory ───────── */
@@ -280,7 +327,7 @@ class AkkStripeWriter(
                 pos += n
                 rem -= n
             }
-            src.advance(src.remaining) // src はすべて消費
+            src.advance(src.remaining)
         }
 
         private fun flushLane() {

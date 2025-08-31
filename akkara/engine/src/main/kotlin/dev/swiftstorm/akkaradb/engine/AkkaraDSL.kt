@@ -69,7 +69,7 @@ data class AkkDSLCfg(
 data class WalCfg(
     val dir: Path,
     val filePrefix: String = "wal",
-    val enableLog: Boolean = true,
+    val enableLog: Boolean = false
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -106,7 +106,7 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
 class WalCfgBuilder(defaultPath: Path) {
     var dir: Path = defaultPath
     var filePrefix: String = "wal"
-    var enableLog: Boolean = true
+    var enableLog: Boolean = false
 
     fun build(): WalCfg {
         return WalCfg(

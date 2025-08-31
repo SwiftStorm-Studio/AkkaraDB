@@ -5,6 +5,7 @@ import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.compareTo
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -23,7 +24,7 @@ class MemTable(
     private val onFlush: (MutableList<Record>) -> Unit,
     private val onEvict: ((List<Record>) -> Unit)? = null,
     private val maxEntries: Int? = null,
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+    internal val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "memtable-flush").apply { isDaemon = true }
     }
 ) : AutoCloseable {
@@ -47,6 +48,7 @@ class MemTable(
     private val highestSeqNo = AtomicLong(0)
     private val flushPending = AtomicBoolean(false)
     private val lock = ReentrantReadWriteLock()
+    private val closed = AtomicBoolean(false)
 
     /** O(1) lookup by content-equal key. */
     fun get(key: ByteBufferL): Record? = lock.read {
@@ -62,6 +64,7 @@ class MemTable(
      */
     fun put(record: Record): Boolean {
         var shouldFlush = false
+        if (closed.get()) return false
         val accepted = lock.write {
             // Canonicalize buffers (RO, pos=0) for storage
             val keyRO = record.key.duplicate().apply { rewind() }.asReadOnly()
@@ -128,26 +131,33 @@ class MemTable(
     fun nextSeq(): Long = highestSeqNo.updateAndGet { it + 1 }
 
     override fun close() {
-        try {
-            flush()
-        } finally {
-            executor.shutdown()
+        closed.set(true)
+        flush()
+        executor.shutdown()
+
+        if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+            println("MemTable executor: flush still running (60s+). Waiting longer...")
+
+            if (!executor.awaitTermination(120, TimeUnit.SECONDS)) {
+                println("MemTable executor: force shutdown after 180s timeout")
+                executor.shutdownNow()
+            }
         }
     }
 
     /* ---- flush internals ---- */
     private fun flushInternal() {
-        val toFlush: MutableList<Record> = lock.write {
+        val toFlush: MutableList<Record>? = lock.write {
             val old = mapRef.getAndSet(newLruMap())
-            if (old.isEmpty()) return
+            if (old.isEmpty()) return@write null
             ArrayList(old.values)
-        }
+        } ?: return
 
-        val bytesFlushed = toFlush.sumOf { sizeOf(it) }
-        currentBytes.addAndGet(-bytesFlushed)
+        val bytesFlushed = toFlush?.sumOf { sizeOf(it) }
+        bytesFlushed?.let { currentBytes.addAndGet(-it) }
 
         try {
-            onFlush.invoke(toFlush)
+            toFlush?.let { onFlush.invoke(it) }
         } catch (e: Exception) {
             e.printStackTrace()
         }

@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import kotlin.system.measureNanoTime
 
 /**
  * Main entry‑point of AkkaraDB.
@@ -65,8 +66,6 @@ class AkkaraDB private constructor(
 
     /* ───────── synchronisation ───────── */
     private val lock = ReentrantReadWriteLock()
-    private val recordWriter = AkkRecordWriter
-
     /* ───────── public API ───────── */
 
     /**
@@ -86,97 +85,22 @@ class AkkaraDB private constructor(
 
     fun get(key: ByteBufferL): Record? = getRecordLatest(key)
 
-    fun getAll(opts: ScanOptions = ScanOptions()): Sequence<Record> = sequence {
-        val its = ArrayList<PeekingIter>()
-        // ---- MemTable
-        memTable.iterator(opts.from, opts.toExclusive).let { its += PeekingIter(it) }
-        // ---- SSTables
-        for (level in levels) {
-            for (sst in level) {
-                its += PeekingIter(sst.iterator(opts.from, opts.toExclusive))
-            }
-        }
-
-        val heap = PriorityQueue<PeekingIter> { a, b ->
-            cmp(a.peekKey(), b.peekKey())
-        }
-        its.filter { it.hasNext() }.forEach(heap::add)
-
-        var emitted = 0
-        var lastKey: ByteBufferL? = null
-
-        while (heap.isNotEmpty()) {
-            val head = heap.poll()
-            val key = head.peekKey()
-
-            if (opts.prefix != null) {
-                val pfx = opts.prefix.duplicate().apply { rewind() }
-                val kdup = key.duplicate().apply { rewind() }
-                if (!startsWith(kdup, pfx)) {
-                    continue
-                }
-            }
-
-            var best: Record? = null
-            fun consider(r: Record) {
-                if (best == null || r.seqNo > best!!.seqNo) best = r
-            }
-
-            consider(head.next())
-            if (head.hasNext()) heap.add(head)
-
-            val tmp = ArrayList<PeekingIter>()
-            while (heap.isNotEmpty() && cmp(heap.peek().peekKey(), key) == 0) {
-                val it = heap.poll()
-                consider(it.next())
-                if (it.hasNext()) tmp += it
-            }
-            tmp.forEach(heap::add)
-
-            val chosen = best!!
-            val isTomb = chosen.isTombstone
-
-            if (opts.toExclusive != null && cmp(key, opts.toExclusive) >= 0) break
-
-            if (opts.prefix != null && !startsWith(key.duplicate().apply { rewind() }, opts.prefix.duplicate().apply { rewind() })) {
-                continue
-            }
-
-            if (!opts.includeTombstone && isTomb) {
-                continue
-            } else {
-                if (lastKey == null || cmp(lastKey, key) != 0) {
-                    yield(chosen)
-                    emitted++
-                    lastKey = key.duplicate().apply { rewind() }
-                    if (opts.limit != null && emitted >= opts.limit) break
-                }
-            }
-        }
-    }
-
     /* ───────── write‑path ───────── */
     fun put(rec: Record) {
-        val kStore = rec.key.duplicate().apply { rewind() }.asReadOnly()
-        val vStore = rec.value.duplicate().apply { rewind() }.asReadOnly()
-        val recStore = Record(kStore, vStore, rec.seqNo, flags = rec.flags)
+        val k = rec.key.rewind().asReadOnly()
+        val v = rec.value.rewind().asReadOnly()
+        val stored = Record(k, v, rec.seqNo, flags = rec.flags)
 
-        val kWal = kStore.duplicate().apply { rewind() }.asReadOnly()
-        val vWal = vStore.duplicate().apply { rewind() }.asReadOnly()
-        val recWal = Record(kWal, vWal, rec.seqNo, flags = rec.flags)
-
-        pool.borrow(recordWriter.computeMaxSize(recWal)) { buf ->
-            recordWriter.write(recWal, buf)
-            buf.flip()
-            wal.append(buf.duplicate())
+        pool.borrow(AkkRecordWriter.computeMaxSize(stored)) { tmp ->
+            AkkRecordWriter.write(stored, tmp)
+            tmp.flip()
+            wal.append(tmp.asReadOnly())
         }
 
-        val accepted = lock.write { memTable.put(recStore) }
+        val accepted = lock.write { memTable.put(stored) }
 
         if (accepted) {
-            val k = kStore.duplicate().apply { rewind() }
-            val v = vStore.duplicate().apply { rewind() }.asReadOnly()
-            metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, v))
+            metaPut(k.duplicate(), KeyMeta(rec.seqNo, rec.isTombstone, v))
         }
     }
 
@@ -207,14 +131,36 @@ class AkkaraDB private constructor(
      * operations until it completes.
      */
     fun flush() = lock.write {
-        wal.sealSegment()
-        memTable.flush()
-        stripeWriter.flush()
-        manifest.checkpoint("flush", stripeWriter.stripesWritten, memTable.lastSeq())
-        wal.checkpoint(stripeWriter.stripesWritten, memTable.lastSeq())
+        val t0 = System.nanoTime()
 
-        compactor.maybeCompact()
-        wal.pruneObsoleteSegments()
+        val tSeal = measureNanoTime { wal.sealSegment() }
+        val tMemFlush = measureNanoTime { memTable.flush() }
+        val tStripe = measureNanoTime { stripeWriter.flush() }
+
+        val lastSeq = memTable.lastSeq()
+        val stripes = stripeWriter.stripesWritten
+
+        val tManifest = measureNanoTime { manifest.checkpoint("flush", stripes, lastSeq) }
+        val tWalCkpt = measureNanoTime { wal.checkpoint(stripes, lastSeq) }
+
+        val tCompact = measureNanoTime { compactor.maybeCompact() }
+        val tPrune = measureNanoTime { wal.pruneObsoleteSegments() }
+
+        val total = System.nanoTime() - t0
+
+        fun Long.us(): Double = this / 1_000.0
+
+        println(
+            "flush timings [µs] " +
+                    "seal=${tSeal.us()}, " +
+                    "memFlush=${tMemFlush.us()}, " +
+                    "stripeFlush=${tStripe.us()}, " +
+                    "manifest=${tManifest.us()}, " +
+                    "walCkpt=${tWalCkpt.us()}, " +
+                    "compact=${tCompact.us()}, " +
+                    "prune=${tPrune.us()}, " +
+                    "total=${total.us()}"
+        )
     }
 
     fun lastSeq(): Long = memTable.lastSeq()
@@ -222,7 +168,8 @@ class AkkaraDB private constructor(
     fun nextSeq(): Long = memTable.nextSeq()
 
     override fun close() {
-        flush(); wal.close(); stripeWriter.close(); readerPool.close()
+        flush()
+        memTable.close(); wal.close(); stripeWriter.close(); readerPool.close()
         levels.forEach { deque -> deque.forEach(SSTableReader::close) }
     }
 
@@ -241,7 +188,7 @@ class AkkaraDB private constructor(
             flushThresholdBytes: Long = 32L * 1024 * 1024,
             walDir: Path = baseDir.resolve("wal"),
             walFilePrefix: String = "wal",
-            walEnableLog: Boolean = true,
+            walEnableLog: Boolean = false,
             metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
@@ -300,6 +247,8 @@ class AkkaraDB private constructor(
                     levels[0].addFirst(SSTableReader(sstPath, pool))
 
                     manifest.checkpoint("memFlush")
+
+                    checkNotNull(levels[0].first().get(records.first().key)) { "SST get() failed just after flush!" }
                 },
                 onEvict = { records ->
                     for (r in records) {
@@ -357,48 +306,6 @@ class AkkaraDB private constructor(
         }
     }
 
-    private fun startsWith(key: ByteBufferL, prefix: ByteBufferL): Boolean {
-        val k = key.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
-        val p = prefix.duplicate().apply { rewind() }.asReadOnlyByteBuffer()
-        val n = p.remaining()
-        if (n == 0) return true
-        if (k.remaining() < n) return false
-
-        val ks = k.duplicate().apply { limit(position() + n) }.slice()
-        val ps = p.slice()
-        val mm = ks.mismatch(ps)
-        return mm == -1
-    }
-
-    data class ScanOptions(
-        val from: ByteBufferL? = null,
-        val toExclusive: ByteBufferL? = null,
-        val prefix: ByteBufferL? = null,
-        val limit: Int? = null,
-        val includeTombstone: Boolean = false
-    )
-
-    private class PeekingIter(it: Iterator<Record>) : Iterator<Record> {
-        private var next: Record? = null
-        private val src = it
-
-        init {
-            advance()
-        }
-
-        private fun advance() {
-            next = if (src.hasNext()) src.next() else null
-        }
-
-        fun peekKey(): ByteBufferL = next!!.key.duplicate().apply { rewind() }
-        override fun hasNext(): Boolean = next != null
-        override fun next(): Record {
-            val r = next ?: throw NoSuchElementException()
-            advance()
-            return r
-        }
-    }
-
     private data class KeyMeta(
         val seqNo: Long,
         val isTombstone: Boolean,
@@ -436,9 +343,7 @@ class AkkaraDB private constructor(
 
         lock.read {
             for (deque in levels) {
-                val rec = deque.firstNotNullOfOrNull { sst ->
-                    if (!sst.mightContain(k)) null else sst.get(k)
-                }
+                val rec = deque.firstNotNullOfOrNull { sst -> sst.get(k) }
                 if (rec != null) {
                     val vv = rec.value.duplicate().apply { rewind() }.asReadOnly()
                     metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, vv))

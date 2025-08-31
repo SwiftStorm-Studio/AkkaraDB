@@ -67,6 +67,8 @@ class WalWriter(
     fun append(payload: ByteBufferL): Long {
         check(running.get()) { "WalWriter is closed" }
 
+        lg { "append: lsn=${nextLsn.get() + 1} len=${payload.remaining}" }
+
         val lsn = nextLsn.incrementAndGet()
         val len = payload.remaining
         val total = Hdr.TAG + Hdr.LSN + Hdr.LEN + len
@@ -79,7 +81,6 @@ class WalWriter(
             // copy payload contents into owned buffer
             buf.put(payload.asReadOnly())
             buf.flip()
-
             synchronized(writeLock) {
                 writeFully(buf)
             }
@@ -173,10 +174,10 @@ class WalWriter(
     // ─────────────── internals ───────────────
 
     private fun writeFully(buf: ByteBufferL) {
-        try {
-            while (buf.hasRemaining()) ch.write(buf.toMutableByteBuffer())
-        } catch (e: IOException) {
-            throw e
+        val view = buf.asReadOnlyByteBuffer()
+        while (view.hasRemaining()) {
+            val n = ch.write(view)
+            if (n == 0) Thread.onSpinWait()
         }
     }
 

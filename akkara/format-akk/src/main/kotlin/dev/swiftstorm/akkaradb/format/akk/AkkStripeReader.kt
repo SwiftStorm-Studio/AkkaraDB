@@ -1,14 +1,12 @@
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
-import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.common.Record
-import dev.swiftstorm.akkaradb.common.compareTo
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
 import dev.swiftstorm.akkaradb.format.api.StripeReader.Stripe
 import dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException
+import java.nio.channels.ReadableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
@@ -89,8 +87,8 @@ class AkkStripeReader(
     }
 
     /** Read exactly BLOCK_SIZE bytes into [blk]. Returns true on success (and flips), false otherwise. */
-    private fun readFullBlock(ch: java.nio.channels.ReadableByteChannel, blk: ByteBufferL): Boolean {
-        val bb = blk.toMutableByteBuffer()
+    private fun readFullBlock(ch: ReadableByteChannel, blk: ByteBufferL): Boolean {
+        val bb = blk.getByteBuffer()
         bb.clear() // position=0, limit=capacity
         var read = 0
         while (read < BLOCK_SIZE) {
