@@ -62,9 +62,8 @@ value class ByteBufferL private constructor(
          * @return an [ByteBufferL] whose underlying buffer is a LE-ordered duplicate of [buf]
          */
         fun wrap(buf: ByteBuffer): ByteBufferL {
-            val v = buf.duplicate()
-            v.order(ByteOrder.LITTLE_ENDIAN)
-            return ByteBufferL(v)
+            buf.order(ByteOrder.LITTLE_ENDIAN)
+            return ByteBufferL(buf)
         }
 
         /**

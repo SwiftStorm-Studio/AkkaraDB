@@ -49,7 +49,7 @@ class FixedBufferPool(
                 dq.removeFirstOrNull()?.let { buf ->
                     retained.decrementAndGet()
                     hits.increment()
-                    val view = ByteBufferL.wrap(buf.clear().order(ByteOrder.LITTLE_ENDIAN))
+                    val view = ByteBufferL.wrap(buf.clear())
                     synchronized(leasedLock) { leased.add(view.b) }
                     return view
                 }
@@ -63,7 +63,7 @@ class FixedBufferPool(
                     if (buf.capacity() >= rounded) {
                         retained.decrementAndGet()
                         hits.increment()
-                        val view = ByteBufferL.wrap(buf.clear().order(ByteOrder.LITTLE_ENDIAN))
+                        val view = ByteBufferL.wrap(buf.clear())
                         synchronized(leasedLock) { leased.add(view.b) }
                         return view
                     }
@@ -75,7 +75,7 @@ class FixedBufferPool(
         misses.increment()
         created.increment()
         val bb = if (normalizeToDirect) ByteBuffer.allocateDirect(rounded) else ByteBuffer.allocate(rounded)
-        bb.order(ByteOrder.LITTLE_ENDIAN).clear()
+        bb.clear()
         val view = ByteBufferL.wrap(bb)
         synchronized(leasedLock) { leased.add(view.b) }
         return view
@@ -94,7 +94,7 @@ class FixedBufferPool(
             synchronized(leasedLock) { leased.remove(buf.b) }
         }
 
-        var pooled = buf.toMutableByteBuffer()
+        var pooled = buf.b
         if ((normalizeToDirect && !pooled.isDirect) || pooled.isReadOnly) {
             created.increment()
             pooled = ByteBuffer.allocateDirect(pooled.capacity())

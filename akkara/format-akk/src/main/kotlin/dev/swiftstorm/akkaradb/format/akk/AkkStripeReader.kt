@@ -129,7 +129,7 @@ class AkkStripeReader(
                 if (hit == null && r.key.compareTo(key) == 0) hit = r
             }
             if (hit != null) return StripeHit(hit, stripeId, recs, stripe)
-            stripe.close()
+            //stripe.close()
         }
         return null
     }

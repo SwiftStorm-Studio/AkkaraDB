@@ -47,7 +47,13 @@ class AkkBlockUnpacker(
             throw CorruptedBlockException("failed to read payloadLen")
         }
 
-        if (payloadLen < 0 || payloadLen > PAYLOAD_LIMIT) {
+        if (payloadLen == 0) {
+            // treat pure padding block as empty → just skip
+            pool.release(block)
+            return emptyList()
+        }
+
+        if (payloadLen > PAYLOAD_LIMIT) {
             pool.release(block)
             throw CorruptedBlockException("payloadLen=$payloadLen out of bounds [0,$PAYLOAD_LIMIT]")
         }
