@@ -1,13 +1,3 @@
-なるほど、README の「Performance targets」とその上の説明部分を消して、代わりに**実測値のテーブルを載せられるように整形したい**ってことだね 👍
-こうすると、今後ベンチマークの数字をすぐ差し替えられる形になる。
-
-書き換え例を出すよ👇
-
----
-
-```markdown
-# AkkaraDB
-
 AkkaraDB is a JVM-native, ultra-low-latency embedded KV store written in Kotlin.  
 Design goals: predictable tail latency, minimal dependencies, crash-safe on a single node, optional redundancy via striped parity.
 
