@@ -189,6 +189,8 @@ class AkkaraDB private constructor(
             walFilePrefix: String = "wal",
             walEnableLog: Boolean = false,
             walFastMode: Boolean = false,
+            walFsyncBatchN: Int = 512,
+            walFsyncIntervalMicros: Long = 5_000_000L, // 5 sec
             metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
@@ -200,7 +202,14 @@ class AkkaraDB private constructor(
                 autoFlush = true,
                 onCommit = { committed -> manifest.advance(committed) }
             )
-            val wal = WalWriter(dir = walDir, filePrefix = walFilePrefix, enableLog = walEnableLog, fastMode = walFastMode)
+            val wal = WalWriter(
+                dir = walDir,
+                filePrefix = walFilePrefix,
+                enableLog = walEnableLog,
+                fastMode = walFastMode,
+                fsyncBatchN = walFsyncBatchN,
+                fsyncIntervalMicros = walFsyncIntervalMicros
+            )
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
 

@@ -29,8 +29,8 @@ class WalWriter(
     private val filePrefix: String,
     private val enableLog: Boolean,
     private val fastMode: Boolean,
-    private val fsyncBatchN: Int = 1024,          // fastMode: batch size
-    private val fsyncIntervalMicros: Long = 5000 // fastMode: flush interval
+    private val fsyncBatchN: Int,          // fastMode: batch size
+    private val fsyncIntervalMicros: Long // fastMode: flush interval
 ) : Closeable {
 
     private object Tag {
@@ -177,17 +177,10 @@ class WalWriter(
 
     override fun close() {
         if (!running.getAndSet(false)) return
-        flusherThread?.interrupt()
+        queue.put {} // ダミーで unblock
         flusherThread?.join()
-
-        synchronized(writeLock) {
-            try {
-                force()
-            } catch (_: Throwable) {
-            }
-            runCatching { ch.close() }
-            lg { "close: segment=${segPath.name}" }
-        }
+        synchronized(writeLock) { force() }
+        ch.close()
     }
 
     // ─────────── internals ───────────
