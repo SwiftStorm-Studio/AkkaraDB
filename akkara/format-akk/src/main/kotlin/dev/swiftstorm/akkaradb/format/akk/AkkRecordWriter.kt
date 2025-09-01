@@ -34,22 +34,20 @@ object AkkRecordWriter : RecordWriter {
         require(kLen in 0..0xFFFF) { "Key too long ($kLen > 65535)" }
         require(vLen >= 0) { "Negative value length" }
         require(dest.remaining >= HEADER_SIZE + kLen + vLen) {
-            "Destination too small for record"
+            "Destination too small for record (need=${HEADER_SIZE + kLen + vLen}, have=${dest.remaining})"
         }
 
-        val out = dest.duplicate()
+        // write header
+        dest.putShort(kLen.toUShort().toShort())
+        dest.putInt(vLen)
+        dest.putLong(record.seqNo)
+        dest.put(record.flags)
 
-        out.putShort(kLen.toUShort().toShort())
-        out.putInt(vLen)
-        out.putLong(record.seqNo)
-        out.put(record.flags)
+        // write key + value (no slice/duplicate needed)
+        dest.put(record.key.asReadOnlyByteBuffer())
+        dest.put(record.value.asReadOnlyByteBuffer())
 
-        out.putAll(record.key.slice())
-        out.putAll(record.value.slice())
-
-        val written = HEADER_SIZE + kLen + vLen
-        dest.position(dest.position + written)
-        return written
+        return HEADER_SIZE + kLen + vLen
     }
 
     /**

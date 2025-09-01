@@ -87,20 +87,19 @@ class AkkaraDB private constructor(
 
     /* ───────── write‑path ───────── */
     fun put(rec: Record) {
-        val k = rec.key.rewind().asReadOnly()
-        val v = rec.value.rewind().asReadOnly()
-        val stored = Record(k, v, rec.seqNo, flags = rec.flags)
+        val k = rec.key.duplicate()
+        val v = rec.value.duplicate()
 
-        pool.borrow(AkkRecordWriter.computeMaxSize(stored)) { tmp ->
-            AkkRecordWriter.write(stored, tmp)
+        pool.borrow(AkkRecordWriter.computeMaxSize(rec)) { tmp ->
+            AkkRecordWriter.write(rec, tmp)
             tmp.flip()
-            wal.append(tmp.asReadOnly())
+            wal.append(tmp)
         }
 
-        val accepted = lock.write { memTable.put(stored) }
+        val accepted = lock.write { memTable.put(rec) }
 
         if (accepted) {
-            metaPut(k.duplicate(), KeyMeta(rec.seqNo, rec.isTombstone, v))
+            metaPut(k, KeyMeta(rec.seqNo, rec.isTombstone, v))
         }
     }
 
@@ -189,6 +188,7 @@ class AkkaraDB private constructor(
             walDir: Path = baseDir.resolve("wal"),
             walFilePrefix: String = "wal",
             walEnableLog: Boolean = false,
+            walFastMode: Boolean = false,
             metaCacheCap: Int = 1024,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
@@ -200,7 +200,7 @@ class AkkaraDB private constructor(
                 autoFlush = true,
                 onCommit = { committed -> manifest.advance(committed) }
             )
-            val wal = WalWriter(dir = walDir, filePrefix = walFilePrefix, enableLog = walEnableLog)
+            val wal = WalWriter(dir = walDir, filePrefix = walFilePrefix, enableLog = walEnableLog, fastMode = walFastMode)
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
 

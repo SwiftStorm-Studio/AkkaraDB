@@ -39,6 +39,7 @@ object AkkDSL {
                 cfg.walCfg.dir,
                 cfg.walCfg.filePrefix,
                 cfg.walCfg.enableLog,
+                cfg.walCfg.fastMode,
                 cfg.metaCacheCap,
             ),
             T::class
@@ -69,7 +70,8 @@ data class AkkDSLCfg(
 data class WalCfg(
     val dir: Path,
     val filePrefix: String = "wal",
-    val enableLog: Boolean = false
+    val enableLog: Boolean = false,
+    val fastMode: Boolean = false
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -107,12 +109,14 @@ class WalCfgBuilder(defaultPath: Path) {
     var dir: Path = defaultPath
     var filePrefix: String = "wal"
     var enableLog: Boolean = false
+    var fastMode: Boolean = false
 
     fun build(): WalCfg {
         return WalCfg(
             dir = dir,
             filePrefix = filePrefix,
-            enableLog = enableLog
+            enableLog = enableLog,
+            fastMode = fastMode
         )
     }
 }

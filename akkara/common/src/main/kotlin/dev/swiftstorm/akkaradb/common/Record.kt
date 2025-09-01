@@ -1,7 +1,6 @@
 @file:OptIn(ExperimentalStdlibApi::class)
 package dev.swiftstorm.akkaradb.common
 
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import kotlin.experimental.or
 
@@ -33,13 +32,13 @@ data class Record private constructor(
         flags = flags
     )
 
-    constructor(key: String, value: String, seqNo: Long, flags: Byte = 0) : this(
-        encodeUtf8ToPooledLE(key).readOnly0().rewind(),
-        encodeUtf8ToPooledLE(value).readOnly0().rewind(),
-        seqNo,
-        encodeUtf8ToPooledLE(key).readOnly0().contentHashL(),
-        flags
-    )
+//    constructor(key: String, value: String, seqNo: Long, flags: Byte = 0) : this(
+//        encodeUtf8ToPooledLE(key).readOnly0().rewind(),
+//        encodeUtf8ToPooledLE(value).readOnly0().rewind(),
+//        seqNo,
+//        encodeUtf8ToPooledLE(key).readOnly0().contentHashL(),
+//        flags
+//    )
 
     /* ────────────── flags helpers ────────────── */
 
@@ -77,28 +76,27 @@ data class Record private constructor(
 
 /* ════════════ private helpers (ByteBuffer/ByteBufferL) ════════════ */
 
-private fun ByteBuffer.cloneToPooledLE(): ByteBufferL {
-    val src = this.duplicate()
-    val winPos = src.position()
-    val winLim = src.limit()
-    val len = winLim - winPos
-    val dst = Pools.io().get(len)          // BufferPool.get(): ByteBufferL
-    val srcWin = src.duplicate().limit(winPos + len)
-    dst.put(srcWin)                         // ByteBufferL.put(ByteBuffer)
-    return dst.flip()                       // pos=0, limit=len
-}
-
-private fun ByteBuffer.readOnlyLE0(): ByteBufferL =
-    ByteBufferL.wrap(this.asReadOnlyBuffer()).rewind()
-
-private fun ByteBufferL.readOnly0(): ByteBufferL = this.asReadOnly()
-
 private fun ByteBufferL.normalizeForRecord(): ByteBufferL =
     this.slice().asReadOnly()
 
-private fun ByteBufferL.hashOfRemaining(): Int {
-    val dup = this.asReadOnlyByteBuffer().duplicate()
-    return dup.slice().hashCode()
+fun ByteBufferL.hashOfRemaining(): Int {
+    val bb = this.asReadOnlyByteBuffer().slice()
+    val len = bb.remaining()
+    if (len == 0) return 0
+
+    var h = len
+
+    h = 31 * h + (bb.get(0).toInt() and 0xFF)
+    h = 31 * h + (bb.get(len / 2).toInt() and 0xFF)
+    h = 31 * h + (bb.get(len - 1).toInt() and 0xFF)
+
+    var i = 8
+    while (i < len && i < 128) {
+        h = 31 * h + (bb.get(i).toInt() and 0xFF)
+        i *= 2
+    }
+
+    return h
 }
 
 private fun ByteBufferL.contentEqualsL(other: ByteBufferL): Boolean {
@@ -108,21 +106,9 @@ private fun ByteBufferL.contentEqualsL(other: ByteBufferL): Boolean {
     return a.mismatch(b) == -1
 }
 
-private fun ByteBufferL.contentHashL(): Int {
-    val dup = this.asReadOnlyByteBuffer().duplicate().apply { rewind() }
-    return dup.hashCode()
-}
-
 private fun ByteBufferL.previewUtf8L(max: Int = 16): String {
     return if (limit <= max) {
         val tmp = this.asReadOnlyByteBuffer().duplicate().apply { rewind() }
         StandardCharsets.UTF_8.decode(tmp).toString()
     } else "${limit}B"
-}
-
-private fun encodeUtf8ToPooledLE(s: String): ByteBufferL {
-    val bytes = s.encodeToByteArray()
-    val dst = Pools.io().get(bytes.size)
-    dst.put(bytes)
-    return dst.flip()
 }
