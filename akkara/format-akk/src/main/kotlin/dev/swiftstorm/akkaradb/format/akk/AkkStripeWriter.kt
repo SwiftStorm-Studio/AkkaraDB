@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
@@ -12,8 +31,14 @@ import java.io.IOException
 import java.io.RandomAccessFile
 import java.nio.channels.FileChannel
 import java.nio.file.Path
-import java.util.concurrent.locks.ReentrantReadWriteLock
 
+/**
+ * Append-only stripe writer: writes fixed-size 32 KiB blocks into
+ * [k] data lanes plus [m] parity lanes at the same logical offset.
+ *
+ * Thread-safety: not intended for concurrent writers.
+ * One thread must own the writer instance at all times.
+ */
 class AkkStripeWriter(
     val baseDir: Path,
     override val k: Int,
@@ -40,129 +65,92 @@ class AkkStripeWriter(
     private var stripesSinceLastFlush = 0
     private var lastFlushAtNanos: Long = System.nanoTime()
 
-    private val gate = ReentrantReadWriteLock()
-
-    @Volatile
-    private var closing = false
     @Volatile
     private var closed = false
 
     /* ───────── write-path (ByteBufferL) ───────── */
     override fun addBlock(block: ByteBufferL) {
-        if (closing) throw IllegalStateException("StripeWriter is closing")
+        check(!closed) { "StripeWriter is closed" }
+        require(block.remaining == BLOCK_SIZE) {
+            "block size must be $BLOCK_SIZE, got ${block.remaining}"
+        }
 
-        gate.readLock().lock()
+        val writer = dataCh[laneIdx]
+        writer.write(block)
+        writer.lastWritten = block
+        laneIdx++
 
-        try {
-            check(!closed) { "StripeWriter is closed" }
-
-            require(block.remaining == BLOCK_SIZE) { "block size must be $BLOCK_SIZE, got ${block.remaining}" }
-
-            val writer = dataCh[laneIdx]
-            writer.write(block)
-            writer.lastWritten = block
-            laneIdx++
-
-            if (laneIdx == k) {
-                // 2. parity
-                parityCoder?.let { coder ->
-                    val parityBlocks: List<ByteBufferL> = coder.encode(dataCh.map { it.lastWritten!! })
-                    parityBlocks.forEachIndexed { i, buf ->
-                        parityCh[i].write(buf)
-                        pool.release(buf)
-                    }
-                }
-
-                // 3. release per-lane cached buffers
-                dataCh.forEach { w ->
-                    w.lastWritten?.let(pool::release)
-                    w.lastWritten = null
-                }
-                laneIdx = 0
-                stripesWritten_++
-
-                // 4. group commit policy: N stripes or T µs
-                stripesSinceLastFlush++
-                val now = System.nanoTime()
-                val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
-                val dueByCount = stripesSinceLastFlush >= fsyncBatchN
-                if (autoFlush && (dueByCount || dueByTime)) {
-                    flush()
+        if (laneIdx == k) {
+            // 1. generate parity if configured
+            parityCoder?.let { coder ->
+                val parityBlocks = coder.encode(dataCh.map { it.lastWritten!! })
+                parityBlocks.forEachIndexed { i, buf ->
+                    parityCh[i].write(buf)
+                    pool.release(buf)
                 }
             }
-        } finally {
-            gate.readLock().unlock()
+
+            // 2. release cached data buffers
+            dataCh.forEach { w ->
+                w.lastWritten?.let(pool::release)
+                w.lastWritten = null
+            }
+            laneIdx = 0
+            stripesWritten_++
+
+            // 3. group commit trigger
+            stripesSinceLastFlush++
+            val now = System.nanoTime()
+            val dueByTime = (now - lastFlushAtNanos) >= (fsyncIntervalMicros * 1_000)
+            val dueByCount = stripesSinceLastFlush >= fsyncBatchN
+            if (autoFlush && (dueByCount || dueByTime)) {
+                flush()
+            }
         }
     }
 
     /** Force fsync on every lane (blocking). */
     override fun flush(): Long {
-        gate.readLock().lock()
-        try {
-            if (closed) return stripesWritten
-
-            dataCh.forEach(FileWriter::flush)
-            parityCh.forEach(FileWriter::flush)
-            stripesSinceLastFlush = 0
-            lastFlushAtNanos = System.nanoTime()
-            onCommit?.invoke(stripesWritten_)
-            return stripesWritten_
-        } finally {
-            gate.readLock().unlock()
-        }
+        if (closed) return stripesWritten
+        dataCh.forEach(FileWriter::flush)
+        parityCh.forEach(FileWriter::flush)
+        stripesSinceLastFlush = 0
+        lastFlushAtNanos = System.nanoTime()
+        onCommit?.invoke(stripesWritten_)
+        return stripesWritten_
     }
 
     /** Re-positions all writers to `stripes×BLOCK_SIZE`. */
     override fun seek(stripeIndex: Long) {
-        gate.readLock().lock()
-        try {
-            val off = stripeIndex * BLOCK_SIZE.toLong()
-            dataCh.forEach { it.seek(off) }
-            parityCh.forEach { it.seek(off) }
-            stripesWritten_ = stripeIndex
-        } finally {
-            gate.readLock().unlock()
-        }
+        val off = stripeIndex * BLOCK_SIZE.toLong()
+        dataCh.forEach { it.seek(off) }
+        parityCh.forEach { it.seek(off) }
+        stripesWritten_ = stripeIndex
     }
 
     fun truncateTo(stripes: Long) {
-        gate.readLock().lock()
-        try {
-            val off = stripes * BLOCK_SIZE.toLong()
-            dataCh.forEach { (it as FileWriterEx).truncate(off) }
-            parityCh.forEach { (it as FileWriterEx).truncate(off) }
-            seek(stripes)
-        } finally {
-            gate.readLock().unlock()
-        }
+        val off = stripes * BLOCK_SIZE.toLong()
+        dataCh.forEach { (it as FileWriterEx).truncate(off) }
+        parityCh.forEach { (it as FileWriterEx).truncate(off) }
+        seek(stripes)
     }
 
     override fun close() {
-        closing = true
-        gate.writeLock().lock()   // ← 新規 add/flush を遮断し、進行中の readLock が抜けるのを待つ
+        if (closed) return
         try {
-            if (!closed) {
-                try {
-                    flush()
-                } catch (_: Throwable) { /* best-effort */
-                }
-                dataCh.forEach { it.close() }
-                parityCh.forEach { it.close() }
-                closed = true
-            }
-        } finally {
-            gate.writeLock().unlock()
+            flush()
+        } catch (_: Throwable) {
+            // best-effort
         }
+        dataCh.forEach { it.close() }
+        parityCh.forEach { it.close() }
+        closed = true
     }
 
     /* ───────── writer factory ───────── */
-
     private fun makeWriter(path: Path): FileWriter {
         val force = System.getProperty("akkaradb.writer")?.lowercase()
-        if (isWindows()) {
-            // Windows では Netty FD パスは使わない
-            return JdkAggWriter(path, pool)
-        }
+        if (isWindows()) return JdkAggWriter(path, pool)
 
         return when (force) {
             "fd" -> FdWriter(path)
@@ -191,24 +179,15 @@ class AkkStripeWriter(
     }
 
     /**
-     * Direct file writer backed by Netty-native `io.netty.channel.unix.FileDescriptor`
-     * for data-path writes, plus a single long-lived `RandomAccessFile`
-     * (and its `java.nio.channels.FileChannel`) to issue the fsync.
-     *
-     *  * write() – zero-copy into the kernel page-cache via `fd.write()`.
-     *  * flush() – one `fd.sync()` (`fsync(2)`) on the companion JDK descriptor.
+     * Direct file writer backed by Netty-native FileDescriptor (Linux only).
+     * - write(): zero-copy pwrite() into page cache.
+     * - flush(): fsync(2) via JDK descriptor.
      */
     private class FdWriter(path: Path) : FileWriterEx {
-
-        /** Native descriptor used for all pwrite(2) operations. */
         private val fd: FileDescriptor = FileDescriptor.from(path.toString())
-
-        /** JDK-level handle kept solely for durable flushes. */
         private val raf = RandomAccessFile(path.toFile(), "rw")
         private val jdkFd: java.io.FileDescriptor = raf.fd
         private val ch: FileChannel = raf.channel
-
-        /** Current write offset (pwrite position). */
         private var offset: Long = ch.size()
 
         override var lastWritten: ByteBufferL? = null
@@ -217,115 +196,90 @@ class AkkStripeWriter(
             lastWritten = buf
             val len = buf.remaining
             var written = 0
-            val bb = buf.toMutableByteBuffer() // view; positionは buf と同期しない
+            val bb = buf.toMutableByteBuffer()
             val start = bb.position()
             while (written < len) {
-                val n = fd.write(bb, start + written, start + len) // (buffer, pos, limit)
+                val n = fd.write(bb, start + written, start + len)
                 if (n <= 0) throw IOException("short pwrite ($n) @offset=$offset")
                 written += n
             }
-            buf.advance(len) // ByteBufferL 側の position を同期
+            buf.advance(len)
             offset += len
         }
 
-        /** fsync via `FileDescriptor.sync()` – no extra FD churn. */
-        override fun flush() {
-            jdkFd.sync() // fsync(2)
-        }
-
-        /** Adjust both native and JDK descriptors to the new position. */
+        override fun flush() = jdkFd.sync()
         override fun seek(pos: Long) {
-            offset = pos
-            ch.position(pos) // keep them in sync
-        }
-
-        override fun close() {
-            flush()
-            fd.close()
-            ch.close() // closes `raf` implicitly
+            offset = pos; ch.position(pos)
         }
 
         override fun truncate(size: Long) {
-            ch.truncate(size)
-            seek(size)
-        }
-    }
-
-    /**
-     * Portable fast path: JDK FileChannel with 1MiB lane aggregation and fdatasync batching.
-     *
-     * Strategy:
-     * - append into a lane-local 1MiB buffer (32KiB×32)
-     * - when full, do a single write() at the current lane position
-     * - force(false) only on group-commit boundaries (outer flush())
-     */
-    private class JdkAggWriter(
-        path: Path,
-        private val pool: BufferPool,
-        laneBufferSize: Int = BLOCK_SIZE * 32, // 1 MiB per lane
-        private val preallocStep: Long = 64L * 1024 * 1024 // 64 MiB coarse prealloc (best-effort)
-    ) : FileWriterEx {
-        private val raf = RandomAccessFile(path.toFile(), "rw")
-        private val ch: FileChannel = raf.channel
-        private var pos: Long = ch.size()
-        private var preallocLimit: Long = roundUp(pos, preallocStep)
-
-        // lane-local aggregation buffer
-        private val agg: ByteBufferL = pool.get(laneBufferSize)
-
-        override var lastWritten: ByteBufferL? = null
-
-        override fun write(buf: ByteBufferL) {
-            lastWritten = buf
-            val cap = agg.capacity
-            val need = buf.remaining
-
-            if (need >= cap) {
-                flushLane()
-                writeDirect(buf)
-                return
-            }
-            if (agg.remaining < need) {
-                flushLane()
-            }
-            agg.put(buf.asReadOnlyByteBuffer()) // copy into lane agg
-        }
-
-        override fun flush() {
-            flushLane()
-            ch.force(false)
-        }
-
-        override fun seek(pos: Long) {
-            flushLane()
-            this@JdkAggWriter.pos = pos
-        }
-
-        override fun truncate(size: Long) {
-            flushLane()
-            ch.truncate(size)
-            pos = size
-            preallocLimit = roundUp(size, preallocStep)
+            ch.truncate(size); seek(size)
         }
 
         override fun close() {
             try {
                 flush()
             } finally {
-                ch.close(); raf.close()
-                pool.release(agg)
+                fd.close(); ch.close()
+            }
+        }
+    }
+
+    /**
+     * Portable JDK writer: aggregates into 1MiB lane buffer and calls fdatasync
+     * at group-commit boundaries.
+     */
+    private class JdkAggWriter(
+        path: Path,
+        private val pool: BufferPool,
+        laneBufferSize: Int = BLOCK_SIZE * 32,
+        private val preallocStep: Long = 64L * 1024 * 1024
+    ) : FileWriterEx {
+        private val raf = RandomAccessFile(path.toFile(), "rw")
+        private val ch: FileChannel = raf.channel
+        private var pos: Long = ch.size()
+        private var preallocLimit: Long = roundUp(pos, preallocStep)
+        private val agg: ByteBufferL = pool.get(laneBufferSize)
+
+        override var lastWritten: ByteBufferL? = null
+
+        override fun write(buf: ByteBufferL) {
+            lastWritten = buf
+            val need = buf.remaining
+            if (need >= agg.capacity) {
+                flushLane(); writeDirect(buf); return
+            }
+            if (agg.remaining < need) flushLane()
+            agg.put(buf.asReadOnlyByteBuffer())
+        }
+
+        override fun flush() {
+            flushLane(); ch.force(false)
+        }
+
+        override fun seek(pos: Long) {
+            flushLane(); this@JdkAggWriter.pos = pos
+        }
+
+        override fun truncate(size: Long) {
+            flushLane(); ch.truncate(size); pos = size; preallocLimit = roundUp(size, preallocStep)
+        }
+
+        override fun close() {
+            try {
+                flush()
+            } finally {
+                ch.close(); raf.close(); pool.release(agg)
             }
         }
 
         private fun writeDirect(src: ByteBufferL) {
             ensurePreallocated(pos + src.remaining)
             val bb = src.toMutableByteBuffer()
-            var rem = bb.remaining()
-            while (rem > 0) {
+            while (bb.hasRemaining()) {
                 val n = ch.write(bb, pos)
                 if (n <= 0) throw IOException("short write ($n) @pos=$pos (direct)")
                 pos += n
-                rem -= n
             }
             src.advance(src.remaining)
         }

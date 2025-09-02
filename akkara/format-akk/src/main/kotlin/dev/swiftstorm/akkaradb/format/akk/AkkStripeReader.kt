@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.*
@@ -38,63 +57,69 @@ class AkkStripeReader(
      * Returns `null` on EOF.
      */
     override fun readStripe(): Stripe? {
-        /* 1. read data lanes (must fill 32KiB each) */
         val laneBlocks = MutableList<ByteBufferL?>(k) { null }
-        for ((idx, ch) in dataCh.withIndex()) {
-            val blk = pool.get(BLOCK_SIZE)
-            if (readFullBlock(ch, blk)) {
-                laneBlocks[idx] = blk
-            } else {
-                pool.release(blk) // EOF / partial read → discard
+        val parityBufs = ArrayList<ByteBufferL?>(parityCoder?.parityCount ?: 0)
+
+        try {
+            // 1) data lanes
+            for ((idx, ch) in dataCh.withIndex()) {
+                val blk = pool.get(BLOCK_SIZE)
+                if (readFullBlock(ch, blk)) laneBlocks[idx] = blk
+                else pool.release(blk) // EOF/partial
             }
-        }
-        if (laneBlocks.all { it == null }) return null // true EOF
+            if (laneBlocks.all { it == null }) return null // true EOF
 
-        /* 2. optional parity recovery */
-        val missingCnt = laneBlocks.count { it == null }
-        val pCount = parityCoder?.parityCount ?: 0
-        require(missingCnt <= pCount) {
-            "Unrecoverable stripe – $missingCnt lanes missing but only $pCount parity lanes configured"
-        }
+            // 2) parity
+            val missingCnt = laneBlocks.count { it == null }
+            val pCount = parityCoder?.parityCount ?: 0
+            if (missingCnt > pCount) {
+                laneBlocks.forEach { it?.let(pool::release) }
+                throw IllegalStateException("Unrecoverable stripe – $missingCnt lanes missing but only $pCount parity lanes")
+            }
 
-        val parityBufs: List<ByteBufferL?> =
             if (missingCnt > 0 && parityCoder != null) {
-                // read parity lanes fully (may yield null on partial/EOF)
-                val tmp = parityCh.map { ch ->
+                for (pch in parityCh) {
                     val buf = pool.get(BLOCK_SIZE)
-                    if (readFullBlock(ch, buf)) buf else run { pool.release(buf); null }
-                }
-
-                // recover each missing data lane using available parity
-                for (missIdx in laneBlocks.indices) {
-                    if (laneBlocks[missIdx] == null) {
-                        laneBlocks[missIdx] = parityCoder.decode(missIdx, laneBlocks, tmp)
+                    if (readFullBlock(pch, buf)) parityBufs += buf
+                    else {
+                        pool.release(buf); parityBufs += null
                     }
                 }
-                tmp
-            } else {
-                emptyList()
+                for (i in laneBlocks.indices) {
+                    if (laneBlocks[i] == null) {
+                        laneBlocks[i] = parityCoder.decode(i, laneBlocks, parityBufs)
+                    }
+                }
             }
 
-        // parity bufs are no longer needed after recovery
-        parityBufs.forEach { it?.let(pool::release) }
+            parityBufs.forEach { it?.let(pool::release) }
 
-        /* 3. unpack payloads (all blocks must be present here) */
-        val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
-        val payloads = nonNullBlocks.flatMap(unpacker::unpack)
+            val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
+            val payloads = nonNullBlocks.flatMap(unpacker::unpack)
+            return Stripe(payloads, nonNullBlocks, pool)
 
-        return Stripe(payloads, nonNullBlocks, pool)
+        } catch (e: Exception) {
+            laneBlocks.forEach { it?.let(pool::release) }
+            parityBufs.forEach { it?.let(pool::release) }
+            throw e
+        }
     }
 
     /** Read exactly BLOCK_SIZE bytes into [blk]. Returns true on success (and flips), false otherwise. */
     private fun readFullBlock(ch: ReadableByteChannel, blk: ByteBufferL): Boolean {
         val bb = blk.getByteBuffer()
-        bb.clear() // position=0, limit=capacity
+        bb.clear()
         var read = 0
+        var zeroStreak = 0
         while (read < BLOCK_SIZE) {
             val n = ch.read(bb)
             if (n < 0) break
-            if (n == 0) continue
+            if (n == 0) {
+                if (++zeroStreak >= 3) break
+                Thread.onSpinWait() // JDK9+
+                continue
+            }
+            zeroStreak = 0
             read += n
         }
         return if (read == BLOCK_SIZE) {
@@ -109,7 +134,7 @@ class AkkStripeReader(
     data class StripeHit(
         val record: Record,
         val stripeId: Long,
-        val blocks: List<Record>,
+        val records: List<Record>,
         val stripe: Stripe
     ) : AutoCloseable {
         override fun close() = stripe.close()
@@ -120,18 +145,21 @@ class AkkStripeReader(
         val rr = AkkRecordReader
         while (true) {
             val stripe = readStripe() ?: break
-            val stripeId = untilStripe - idx; idx++
-            val recs = ArrayList<Record>()
             var hit: Record? = null
+            val recs = ArrayList<Record>()
             for (p in stripe.payloads) {
                 val r = rr.read(p.duplicate())
-                recs.add(r)
+                recs += r
                 if (hit == null && r.key.compareTo(key) == 0) hit = r
             }
-            if (hit != null) return StripeHit(hit, stripeId, recs, stripe)
-            //stripe.close()
+            if (hit != null) {
+                val stripeId = untilStripe - idx
+                return StripeHit(hit, stripeId, recs, stripe)
+            } else {
+                // Caller will automatically release the stripe buffers
+            }
+            idx++
         }
         return null
     }
-
 }

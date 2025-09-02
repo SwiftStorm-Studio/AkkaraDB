@@ -104,4 +104,4 @@ fun main() {
 
 ## License
 
-ARR (temporary, will be changed to another OSS license later)
+GNU Lesser General Public License v3.0 (LGPL-3.0)

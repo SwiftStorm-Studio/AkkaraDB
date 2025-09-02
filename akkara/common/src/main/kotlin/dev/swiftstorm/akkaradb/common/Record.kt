@@ -84,8 +84,7 @@ fun ByteBufferL.hashOfRemaining(): Int {
     val len = bb.remaining()
     if (len == 0) return 0
 
-    var h = len
-
+    var h = len.toLong()
     h = 31 * h + (bb.get(0).toInt() and 0xFF)
     h = 31 * h + (bb.get(len / 2).toInt() and 0xFF)
     h = 31 * h + (bb.get(len - 1).toInt() and 0xFF)
@@ -93,10 +92,17 @@ fun ByteBufferL.hashOfRemaining(): Int {
     var i = 8
     while (i < len && i < 128) {
         h = 31 * h + (bb.get(i).toInt() and 0xFF)
-        i *= 2
+        i = i shl 1
     }
 
-    return h
+    h = h xor (h ushr 16)
+    h *= 0x7feb352dL
+    h = h xor (h ushr 15)
+    h *= 0x846ca68bL
+    h = h xor (h ushr 16)
+
+    val r = h.toInt()
+    return if (r != 0) r else 1
 }
 
 private fun ByteBufferL.contentEqualsL(other: ByteBufferL): Boolean {

@@ -14,7 +14,7 @@ import kotlin.math.max
 
 /**
  * Sharded MemTable for scalability.
- * - Keys are distributed across shards using (keyHash & (shardCount-1)).
+ * - Keys are distributed across shards using (key.hashOfRemaining() % shardCount).
  * - Each shard maintains its own lock, LRU, and flush boundary.
  */
 class MemTable(
@@ -29,7 +29,8 @@ class MemTable(
 ) : AutoCloseable {
 
     private val shards = Array(shardCount) { idx ->
-        Shard(idx, thresholdBytes / shardCount, onFlush, onEvict, maxEntries)
+        val per = max(1L, thresholdBytes / shardCount)   // ★
+        Shard(idx, per, onFlush, onEvict, maxEntries)
     }
 
     private val closed = AtomicBoolean(false)
@@ -64,7 +65,7 @@ class MemTable(
 
     override fun close() {
         closed.set(true)
-        flush()
+        shards.forEach { it.flush() }
         executor.shutdown()
     }
 
@@ -114,13 +115,18 @@ class MemTable(
                 true
             }
             if (shouldFlush && flushPending.compareAndSet(false, true)) {
-                executor.execute(::flushInternal)
+                executor.execute {
+                    try {
+                        flushInternal()
+                    } finally {
+                        flushPending.set(false)
+                    }
+                }
             }
             return accepted
         }
 
         fun flush() {
-            if (!flushPending.compareAndSet(false, true)) return
             try {
                 flushInternal()
             } finally {
@@ -152,14 +158,16 @@ class MemTable(
             val toFlush: MutableList<Record>? = lock.write {
                 if (map.isEmpty()) return@write null
                 val list = ArrayList(map.values)
+                val freed = list.sumOf { sizeOf(it) }
                 map.clear()
+                currentBytes.addAndGet(-freed)
                 list
             }
             toFlush?.let {
-                currentBytes.addAndGet(-it.sumOf { r -> sizeOf(r) })
                 try {
                     onFlush(it)
                 } catch (e: Exception) {
+                    System.err.println("MemTable.Shard#$id onFlush failed: size=${it.size}")
                     e.printStackTrace()
                 }
             }
@@ -168,8 +176,11 @@ class MemTable(
         private fun sizeOf(r: Record): Long =
             (r.key.remaining + r.value.remaining + Long.SIZE_BYTES).toLong()
 
-        private fun wrapKey(key: ByteBufferL): Key =
-            Key(key.asReadOnly(), key.hashCode())
+        private fun wrapKey(key: ByteBufferL): Key {
+            val ro = key.asReadOnly()
+            val canon = ro.slice(0, ro.remaining)
+            return Key(canon, canon.hashOfRemaining())
+        }
     }
 
     private data class Key(val ro: ByteBufferL, val hash: Int) {
