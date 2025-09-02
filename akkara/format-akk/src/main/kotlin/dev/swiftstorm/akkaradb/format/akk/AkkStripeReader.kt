@@ -31,7 +31,7 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
 
 /**
- * Reader for a *stripe* in the append‑only segment.
+ * Reader for a *stripe* in the append-only segment.
  *
  * Ownership & Lifetime:
  *  * The returned [Stripe] holds both payload slices and the backing lane blocks.
@@ -69,12 +69,11 @@ class AkkStripeReader(
             }
             if (laneBlocks.all { it == null }) return null // true EOF
 
-            // 2) parity
             val missingCnt = laneBlocks.count { it == null }
             val pCount = parityCoder?.parityCount ?: 0
             if (missingCnt > pCount) {
                 laneBlocks.forEach { it?.let(pool::release) }
-                throw IllegalStateException("Unrecoverable stripe – $missingCnt lanes missing but only $pCount parity lanes")
+                throw CorruptedBlockException("Unrecoverable stripe – missing=$missingCnt, parity=$pCount")
             }
 
             if (missingCnt > 0 && parityCoder != null) {
@@ -85,6 +84,7 @@ class AkkStripeReader(
                         pool.release(buf); parityBufs += null
                     }
                 }
+                // 復旧
                 for (i in laneBlocks.indices) {
                     if (laneBlocks[i] == null) {
                         laneBlocks[i] = parityCoder.decode(i, laneBlocks, parityBufs)
@@ -95,7 +95,10 @@ class AkkStripeReader(
             parityBufs.forEach { it?.let(pool::release) }
 
             val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
-            val payloads = nonNullBlocks.flatMap(unpacker::unpack)
+            val payloads = ArrayList<ByteBufferL>(64)
+            for (blk in nonNullBlocks) {
+                unpacker.unpackInto(blk, payloads)
+            }
             return Stripe(payloads, nonNullBlocks, pool)
 
         } catch (e: Exception) {

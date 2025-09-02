@@ -11,54 +11,47 @@ import java.nio.ByteOrder
 import java.util.zip.CRC32C
 
 /**
- * Split a 32 KiB block produced by [AkkBlockPackerDirect] into
- * individual record-payload slices (read-only ByteBufferL views).
+ * 32KiB固定ブロック（AkkBlockPackerDirect生成物）を
+ * 長さプレフィックス付きの payload 切り身に展開する。
  *
- * On-disk layout (ALL LITTLE_ENDIAN):
- *   [0..3]       payloadLen: u32 LE
- *   [4..4+N)     payload bytes (sequence of [u32 LE len][bytes])
- *   [..]         zero padding up to PAYLOAD_LIMIT (ignored on read)
- *   [end-4..]    crc32c (u32 LE) over bytes [0 .. 4+payloadLen)
+ * On-disk (LE):
+ *  [0..3]     payloadLen (u32 LE)
+ *  [4..4+N)   payload bytes ([u32 len][bytes]…)
+ *  [..]       zero padding up to PAYLOAD_LIMIT
+ *  [end-4..]  crc32c(u32 LE) over [0 .. 4+payloadLen)
  *
- * Ownership: the caller retains ownership of the backing block buffer and is
- * responsible for releasing it back to the [BufferPool] after consumers stop
- * using the returned slices. This unpacker only releases the block on error.
+ * 所有権: 正常時は **呼び出し側が block を保持**（Stripeがclose時にpoolへ返却）。
+ * エラー時のみ当クラスが block を pool へ返却する。
  */
 class AkkBlockUnpacker(
     private val pool: BufferPool = Pools.io()
 ) : BlockUnpacker {
+
     private val crc = CRC32C()
 
-    /** Unpack one fixed-size block into record payload slices (RO/LE, pos=0..limit). */
-    override fun unpack(block: ByteBufferL): List<ByteBufferL> {
-        // Never mutate the caller's buffer directly
-        val base = block.asReadOnlyByteBuffer() // LE is guaranteed by ByteBufferL
+    override fun unpackInto(block: ByteBufferL, out: MutableList<ByteBufferL>): Int {
+        val base = block.asReadOnlyByteBuffer()
 
-        /* -------- 1) basic structure checks -------- */
         if (block.capacity != BLOCK_SIZE) {
             pool.release(block)
             throw CorruptedBlockException("block capacity != $BLOCK_SIZE (was ${block.capacity})")
         }
 
         val payloadLen = try {
-            base.getInt(0) // absolute read, LE
+            base.getInt(0) // absolute, LE
         } catch (t: Throwable) {
             pool.release(block)
             throw CorruptedBlockException("failed to read payloadLen")
         }
 
         if (payloadLen == 0) {
-            // treat pure padding block as empty → just skip
+            return 0
+        }
+        if (payloadLen < 0 || payloadLen > PAYLOAD_LIMIT) {
             pool.release(block)
-            return emptyList()
+            throw CorruptedBlockException("payloadLen=$payloadLen out of bounds [1,$PAYLOAD_LIMIT]")
         }
 
-        if (payloadLen > PAYLOAD_LIMIT) {
-            pool.release(block)
-            throw CorruptedBlockException("payloadLen=$payloadLen out of bounds [0,$PAYLOAD_LIMIT]")
-        }
-
-        /* -------- 2) CRC32C over [0 .. 4+payloadLen) -------- */
         val calcCrc = try {
             crc.reset()
             val crcRegion = base.duplicate().apply {
@@ -72,7 +65,7 @@ class AkkBlockUnpacker(
         }
 
         val storedCrc = try {
-            base.getInt(PAYLOAD_LIMIT + 4) // at block end, LE
+            base.getInt(PAYLOAD_LIMIT + 4) // end-4（block末尾）に格納
         } catch (t: Throwable) {
             pool.release(block)
             throw CorruptedBlockException("failed to read stored CRC")
@@ -83,13 +76,11 @@ class AkkBlockUnpacker(
             throw CorruptedBlockException("CRC mismatch (calc=$calcCrc stored=$storedCrc)")
         }
 
-        /* -------- 3) slice payload area (read-only, LE) -------- */
         val payloadView = base.duplicate().apply {
             position(4); limit(4 + payloadLen)
         }.slice().asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
 
-        /* -------- 4) split into length-prefixed records -------- */
-        val out = ArrayList<ByteBufferL>(16)
+        val startSize = out.size
         var pos = 0
         while (pos < payloadLen) {
             if (pos + 4 > payloadLen) {
@@ -97,20 +88,24 @@ class AkkBlockUnpacker(
                 throw CorruptedBlockException("truncated record header at pos=$pos")
             }
             val recLen = payloadView.getInt(pos) // LE
-            if (recLen <= 0 || pos + 4 + recLen > payloadLen) {
+            val end = pos + 4 + recLen
+            if (recLen <= 0 || end > payloadLen) {
                 pool.release(block)
                 throw CorruptedBlockException("record length out of range (recLen=$recLen pos=$pos)")
             }
 
-            // Make a 0..recLen RO/LE view and wrap it as ByteBufferL
             val recBB = payloadView.duplicate().apply {
-                position(pos + 4); limit(pos + 4 + recLen)
+                position(pos + 4); limit(end)
             }.slice().asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
 
-            out += ByteBufferL.wrap(recBB).asReadOnly()
-            pos += 4 + recLen
+            out.add(ByteBufferL.wrap(recBB).asReadOnly())
+            pos = end
         }
 
-        return out
+        return out.size - startSize
+    }
+
+    private companion object {
+        private val TL_OUT = ThreadLocal.withInitial { ArrayList<ByteBufferL>(32) }
     }
 }

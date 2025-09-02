@@ -32,5 +32,5 @@ import dev.swiftstorm.akkaradb.common.ByteBufferL
 interface BlockUnpacker {
 
     /** @throws dev.swiftstorm.akkaradb.format.exception.CorruptedBlockException if CRC mismatch or len invalid. */
-    fun unpack(block: ByteBufferL): List<ByteBufferL>
+    fun unpackInto(block: ByteBufferL, out: MutableList<ByteBufferL>): Int
 }
