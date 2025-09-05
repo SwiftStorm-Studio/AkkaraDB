@@ -40,6 +40,8 @@ object AkkDSL {
                 cfg.walCfg.filePrefix,
                 cfg.walCfg.enableLog,
                 cfg.walCfg.fastMode,
+                cfg.walCfg.queueCap,
+                cfg.walCfg.backoffNanos,
                 cfg.metaCacheCap,
             ),
             T::class
@@ -71,7 +73,9 @@ data class WalCfg(
     val dir: Path,
     val filePrefix: String = "wal",
     val enableLog: Boolean = false,
-    val fastMode: Boolean = false
+    val fastMode: Boolean = false,
+    val queueCap: Int = 8192,
+    val backoffNanos: Long = 1_000_000L
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {

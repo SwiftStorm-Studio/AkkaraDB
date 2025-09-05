@@ -12,6 +12,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 import kotlin.concurrent.thread
 import kotlin.io.path.name
 import kotlin.io.path.notExists
@@ -23,14 +24,19 @@ import kotlin.io.path.notExists
  *  - Durable mode (fastMode=false): fsync after every append (Durable-before-ACK).
  *  - Fast mode (fastMode=true): append enqueues write, fsync performed by flusher thread
  *    on time/size thresholds (ACK-before-fsync).
+ *
+ * fsync tuning:
+ *  - If both fsyncBatchN and fsyncIntervalMicros are null (closeOnlyFsync), fsync is executed only at close().
  */
 class WalWriter(
     private val dir: Path,
     private val filePrefix: String,
     private val enableLog: Boolean,
     private val fastMode: Boolean,
-    private val fsyncBatchN: Int,          // fastMode: batch size
-    private val fsyncIntervalMicros: Long // fastMode: flush interval
+    private val fsyncBatchN: Int?,           // fastMode: batch size (null => closeOnlyFsync)
+    private val fsyncIntervalMicros: Long?,  // fastMode: interval in µs (null => closeOnlyFsync)
+    private val queueCapacity: Int,   // fastMode: op queue capacity (backpressure)
+    private val backoffNanos: Long // append-side retry backoff when queue is full (1ms)
 ) : Closeable {
 
     private object Tag {
@@ -58,11 +64,18 @@ class WalWriter(
     private val writeLock = Any()
     private val io = Pools.io()
 
-    // fast mode用
-    private val queue = LinkedBlockingQueue<() -> Unit>()
+    // bounded queue to provide gentle backpressure on bursts
+    private val queue = if (fastMode) LinkedBlockingQueue<() -> Unit>(queueCapacity) else null
     private val flusherThread: Thread?
+    private val closeOnlyFsync = fastMode && fsyncBatchN == null && fsyncIntervalMicros == null
 
     init {
+        // Parameter guards
+        require(!fastMode || fsyncBatchN == null || fsyncBatchN > 0) { "fsyncBatchN must be > 0" }
+        require(!fastMode || fsyncIntervalMicros == null || fsyncIntervalMicros > 0) { "fsyncIntervalMicros must be > 0" }
+        require(!fastMode || queueCapacity > 0) { "queueCapacity must be > 0" }
+        require(backoffNanos >= 0) { "backoffNanos must be >= 0" }
+
         if (dir.notExists()) Files.createDirectories(dir)
         currentSegIdx = scanLatestSegmentIndex(dir, filePrefix) + 1
         segPath = segmentPath(currentSegIdx)
@@ -89,10 +102,21 @@ class WalWriter(
         buf.flip()
 
         if (fastMode) {
-            // enqueue without fsync
-            queue.put {
+            // Enqueue without fsync; bounded queue with light backpressure.
+            val op: () -> Unit = {
                 synchronized(writeLock) { writeFully(buf) }
                 io.release(buf)
+            }
+            // offer with light retry until accepted or writer is closed
+            while (running.get() && !(queue!!.offer(op))) {
+                // optional short timeout-based offer; uncomment if preferred over parkNanos:
+                // if (queue.offer(op, 200, TimeUnit.MICROSECONDS)) break
+                LockSupport.parkNanos(backoffNanos)
+            }
+            if (!running.get()) {
+                // writer closed while waiting; ensure buffer is released
+                io.release(buf)
+                throw IllegalStateException("WalWriter is closed")
             }
         } else {
             try {
@@ -109,7 +133,7 @@ class WalWriter(
         return lsn
     }
 
-    /** Write SEAL + fsync + rotate segment. */
+    /** Write SEAL + (optional fsync) + rotate segment. */
     fun sealSegment(): Long {
         check(running.get()) { "WalWriter is closed" }
         val lsn = nextLsn.incrementAndGet()
@@ -119,18 +143,17 @@ class WalWriter(
         val op = {
             synchronized(writeLock) {
                 writeFully(buf)
-                force()
+                if (!closeOnlyFsync) force()
                 rotate()
             }
             io.release(buf)
             lg { "control: Seal lsn=$lsn (rotated to ${segPath.name})" }
         }
-        if (fastMode) queue.put(op) else op()
-
+        if (fastMode) enqueueOrBackpressure(op) else op()
         return lsn
     }
 
-    /** Write CHECKPOINT (fsync) to current segment. */
+    /** Write CHECKPOINT (optional fsync) to current segment. */
     fun checkpoint(stripesWritten: Long, lastSeq: Long): Long {
         check(running.get()) { "WalWriter is closed" }
         val lsn = nextLsn.incrementAndGet()
@@ -144,13 +167,13 @@ class WalWriter(
         val op = {
             synchronized(writeLock) {
                 writeFully(buf)
-                force()
+                if (!closeOnlyFsync) force()
                 lastCheckpointSegIdx = currentSegIdx
             }
             io.release(buf)
             lg { "control: CheckPoint lsn=$lsn stripes=$stripesWritten lastSeq=$lastSeq seg=${segPath.name}" }
         }
-        if (fastMode) queue.put(op) else op()
+        if (fastMode) enqueueOrBackpressure(op) else op()
 
         return lsn
     }
@@ -177,13 +200,21 @@ class WalWriter(
 
     override fun close() {
         if (!running.getAndSet(false)) return
-        queue.put {} // ダミーで unblock
+        if (fastMode) queue?.offer { } // non-blocking unblock (okay if it fails; poll has a timeout)
         flusherThread?.join()
-        synchronized(writeLock) { force() }
-        ch.close()
+        synchronized(writeLock) { runCatching { force() } }
+        runCatching { ch.close() }
     }
 
     // ─────────── internals ───────────
+
+    private fun enqueueOrBackpressure(op: () -> Unit) {
+        // shared helper for fastMode ops (bounded queue with light backpressure)
+        while (running.get() && !(queue!!.offer(op))) {
+            LockSupport.parkNanos(backoffNanos)
+        }
+        if (!running.get()) throw IllegalStateException("WalWriter is closed")
+    }
 
     private fun writeFully(buf: ByteBufferL) {
         val view = buf.asReadOnlyByteBuffer()
@@ -196,7 +227,7 @@ class WalWriter(
     private fun force() = ch.force(false)
 
     private fun rotate() {
-        runCatching { ch.force(false) }
+        if (!closeOnlyFsync) runCatching { ch.force(false) }
         runCatching { ch.close() }
         currentSegIdx += 1
         segPath = segmentPath(currentSegIdx)
@@ -218,7 +249,8 @@ class WalWriter(
         var maxIdx = 0
         Files.list(dir).use { stream ->
             stream.filter { p ->
-                p.fileName.toString().startsWith(prefix) && p.fileName.toString().endsWith(".log")
+                val n = p.fileName.toString()
+                n.startsWith(prefix) && n.endsWith(".log")
             }.forEach { p ->
                 parseSegmentIndex(p.fileName.toString())?.let { idx ->
                     if (idx > maxIdx) maxIdx = idx
@@ -237,28 +269,51 @@ class WalWriter(
 
     // fast mode flusher thread
     private fun flusherLoop() {
-        val ops = ArrayList<() -> Unit>(fsyncBatchN)
+        val cap = (fsyncBatchN ?: 64).coerceAtLeast(1)
+        val ops = ArrayList<() -> Unit>(cap)
+
         var lastFsync = System.nanoTime()
-        while (running.get() && !Thread.interrupted()) {
+        while ((running.get() || !(queue?.isEmpty() ?: true)) && !Thread.interrupted()) {
             try {
-                val op = queue.poll(fsyncIntervalMicros, TimeUnit.MICROSECONDS)
+                val timeoutUs = (fsyncIntervalMicros ?: 1000L).coerceAtLeast(1L)
+                val op = queue!!.poll(timeoutUs, TimeUnit.MICROSECONDS)
                 if (op != null) ops.add(op)
-                if (ops.size >= fsyncBatchN ||
-                    (System.nanoTime() - lastFsync) >= fsyncIntervalMicros * 1000
-                ) {
+
+                if (closeOnlyFsync) {
                     if (ops.isNotEmpty()) {
                         ops.forEach { it() }
-                        synchronized(writeLock) { force() }
                         ops.clear()
-                        lastFsync = System.nanoTime()
                     }
+                    continue
                 }
-            } catch (ie: InterruptedException) {
+
+                val hitBatch = fsyncBatchN != null && ops.size >= fsyncBatchN
+                val hitInterval = fsyncIntervalMicros != null &&
+                        (System.nanoTime() - lastFsync) >= fsyncIntervalMicros * 1000
+
+                if (ops.isNotEmpty() && (hitBatch || hitInterval)) {
+                    ops.forEach { it() }
+                    synchronized(writeLock) { force() }
+                    ops.clear()
+                    lastFsync = System.nanoTime()
+                }
+            } catch (_: InterruptedException) {
                 break
             }
         }
-        // drain残り
-        ops.forEach { it() }
-        synchronized(writeLock) { runCatching { force() } }
+
+        // Drain everything left (including things queued during the last iteration)
+        if (ops.isNotEmpty()) {
+            ops.forEach { it() }
+            ops.clear()
+        }
+        while (true) {
+            val op = queue!!.poll() ?: break
+            op()
+        }
+
+        if (!closeOnlyFsync) {
+            synchronized(writeLock) { runCatching { force() } }
+        }
     }
 }
