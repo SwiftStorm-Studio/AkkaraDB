@@ -46,8 +46,20 @@ class RSErrorCorrectingParityCoder(
         log[0] = 0 // guard
     }
 
+    private val mulLUT: ByteArray = ByteArray(256 * 256).also { lut ->
+        var idx = 0
+        for (a in 0..255) {
+            for (b in 0..255) {
+                lut[idx++] = gfMulExpLog(a, b).toByte()
+            }
+        }
+    }
+
     private inline fun gfAdd(a: Int, b: Int): Int = a xor b
-    private inline fun gfMul(a: Int, b: Int): Int {
+
+    private inline fun gfMul(a: Int, b: Int): Int = mulLUT[(a shl 8) or b].toInt() and 0xFF
+
+    private inline fun gfMulExpLog(a: Int, b: Int): Int {
         if (a == 0 || b == 0) return 0
         return exp[log[a] + log[b]]
     }
@@ -59,7 +71,22 @@ class RSErrorCorrectingParityCoder(
 
     private inline fun gfPowAlpha(ei: Int): Int = exp[ei % 255] // α^ei
 
-    /* ---------------- Encode (erasure-onlyと同等) ---------------- */
+    @Volatile
+    private var cachedK: Int = -1
+
+    /** coeff[j][i] = α^{(j+1)·i} */
+    @Volatile
+    private var coeff: Array<IntArray>? = null
+
+    private fun ensureCoeff(k: Int) {
+        val curr = coeff
+        if (curr != null && cachedK == k) return
+        val newCoeff = Array(parityCount) { j -> IntArray(k) { i -> if (i == 0) 1 else gfPowAlpha((j + 1) * i) } }
+        coeff = newCoeff
+        cachedK = k
+    }
+
+    /* ---------------- Encode (SAXPY + LUT; 改善 #1) ---------------- */
 
     override fun encode(dataBlocks: List<ByteBufferL>): List<ByteBufferL> {
         require(dataBlocks.isNotEmpty())
@@ -67,29 +94,39 @@ class RSErrorCorrectingParityCoder(
         val blks = dataBlocks.map { it.duplicate() }
         blks.forEach { require(it.remaining == BLOCK_SIZE) { "block must be 32 KiB" } }
 
-        // RS の制約
         require(k + parityCount <= 255) { "RS(8) requires n=k+m ≤ 255; got k=$k, m=$parityCount" }
 
         val parity = ArrayList<ByteBufferL>(parityCount)
         repeat(parityCount) { parity += pool.get(BLOCK_SIZE) }
         parity.forEach { it.clear() }
 
-        // a(j,i) = α^{(j+1) * i}
-        val coeff = Array(parityCount) { j ->
-            IntArray(k) { i -> if (i == 0) 1 else gfPowAlpha((j + 1) * i) }
-        }
+        ensureCoeff(k)
+        val c = coeff!!
 
-        for (pos in 0 until BLOCK_SIZE) {
-            val dataBytes = IntArray(k) { idx -> blks[idx].get(pos).toInt() and 0xFF }
+        // SAXPY: for i in data lanes → for j in parity lanes
+        for (i in 0 until k) {
+            val src = blks[i].duplicate()
             for (j in 0 until parityCount) {
-                val row = coeff[j]
-                var acc = 0
-                for (i in 0 until k) acc = gfAdd(acc, gfMul(row[i], dataBytes[i]))
-                parity[j].put(pos, acc.toByte())
+                saxpy(parity[j], src, c[j][i])
             }
         }
+
         parity.forEach { it.limit(BLOCK_SIZE).position(0) }
         return parity
+    }
+
+    /** P_j ← P_j ⊕ (a · D_i) */
+    private inline fun saxpy(dst: ByteBufferL, src: ByteBufferL, a: Int) {
+        val N = BLOCK_SIZE
+        val lutBase = a shl 8
+        var p = 0
+        while (p < N) {
+            val s = src.get(p).toInt() and 0xFF
+            val m = mulLUT[lutBase or s].toInt() and 0xFF
+            val d = dst.get(p).toInt() and 0xFF
+            dst.put(p, (d xor m).toByte())
+            p++
+        }
     }
 
     /* ---------------- Decode with errors (+ optional erasures) ---------------- */
@@ -102,7 +139,7 @@ class RSErrorCorrectingParityCoder(
      * Recover all missing data blocks. Tolerates up to floor((m - s)/2) errors mixed in present blocks,
      * provided 2*t + s ≤ m. knownErasures are indices in 0..k-1 for missing data lanes (optional hint).
      *
-     * @return list of recovered ByteBufferL for each null entry in presentData, in the same order as indices
+     * @return list of recovered (index to buffer) pairs for each null entry in presentData, in the same order as indices
      */
     fun decodeWithErrors(
         presentData: List<ByteBufferL?>,
@@ -120,221 +157,216 @@ class RSErrorCorrectingParityCoder(
         presentParity.forEach { p -> require(p == null || p.remaining == BLOCK_SIZE) { "bad parity size" } }
         presentData.forEach { d -> require(d == null || d.remaining == BLOCK_SIZE) { "bad data size" } }
 
-        // 出力（欠損データそれぞれのバッファ）
         val out = missingIdx.map { it to pool.get(BLOCK_SIZE).apply { clear() } }.toMutableList()
 
-        // 1バイト位置ごとに n = k+m のシンボル列を作って復号
         val n = k + m
         val erasuresSet = (knownErasures?.toMutableSet() ?: mutableSetOf())
-        // 既知の「データ側欠損」は knownErasures と missingIdx を統合
-        erasuresSet.addAll(missingIdx)
+        missingIdx.forEach { erasuresSet.add(it) }
+
+        val parityAlive = presentParity.withIndex().filter { it.value != null }.map { it.index }
+        require(parityAlive.size >= 1) { "no parity available" }
+
+        val c = IntArray(n)       // codeword symbols at this position
+        val isKnown = BooleanArray(n)
+        val S = IntArray(m)       // syndromes
+        var sigma = IntArray(m + 1)
+        val tmp = IntArray(m + 1)
 
         for (pos in 0 until BLOCK_SIZE) {
-            // codeword symbols c[0..n-1]：前半 k がデータ、後半 m がパリティ
-            val c = IntArray(n)
-            val isKnown = BooleanArray(n)
+            // c[0..k-1] = data, c[k..n-1] = parity
             for (i in 0 until k) {
-                val bb = presentData[i]
-                if (bb != null) {
-                    c[i] = bb.get(pos).toInt() and 0xFF
-                    isKnown[i] = true
-                }
+                val b = if (presentData[i] != null) presentData[i]!!.get(pos).toInt() and 0xFF else 0
+                c[i] = b
+                isKnown[i] = presentData[i] != null
             }
             for (j in 0 until m) {
-                val pb = presentParity[j]
-                if (pb != null) {
-                    c[k + j] = pb.get(pos).toInt() and 0xFF
-                    isKnown[k + j] = true
-                }
+                val pbuf = presentParity[j]
+                val b = if (pbuf != null) pbuf.get(pos).toInt() and 0xFF else 0
+                c[k + j] = b
+                isKnown[k + j] = pbuf != null
             }
 
-            // --- Syndrome S_1..S_m を計算（評価点 α^i） ---
-            // S_r = Σ_{i=0..n-1} c_i * (α^{i})^r = Σ c_i * α^{i*r}, r=1..m
-            val S = IntArray(m)
-            for (r in 1..m) {
-                var sr = 0
-                // 既知/未知問わず、その時点の値 c_i で計算（未知は 0 と同義）
-                for (i in 0 until n) {
+            val erasures = erasuresSet.toIntArray()
+            // syndromes S_r = c(alpha^{r+1})
+            for (r in 0 until m) {
+                var acc = 0
+                var xPow = 1 // alpha^{(r+1)*0}
+                val a = r + 1
+                // data part
+                for (i in 0 until k) {
                     val ci = c[i]
-                    if (ci != 0) {
-                        val pow = if (i == 0) 1 else gfPowAlpha(i * r)
-                        sr = gfAdd(sr, gfMul(ci, pow))
-                    }
+                    if (ci != 0) acc = gfAdd(acc, gfMul(ci, xPow))
+                    xPow = gfMul(xPow, gfPowAlpha(a))
                 }
-                S[r - 1] = sr
-            }
-            val allZero = S.all { it == 0 }
-            if (allZero && missingIdx.isEmpty()) {
-                // 何もすることがない
-            }
-
-            // --- Erasures の扱い：erasure locator Γ(x) として初期化 ---
-            // erasure 位置は “評価点 α^i” の逆数が根になる（慣例に合わせ α^{-i} を用いる）
-            val erasures = erasuresSet.filter { it in 0 until k } // データ側を優先
-            val s = erasures.size
-
-            // 訂正可能性チェック（上界。実際の t はBMで決まる）
-            // ここで落とすより、BM失敗で検出でも良い。
-            // require(s <= m) { "too many erasures: s=$s > m=$m" }
-
-            // Γ(x) = ∏ (1 - x * α^{i_e})
-            var Lambda = intArrayOf(1) // 誤り＋消失 locator Λ(x) の初期値に Γ(x) を掛ける
-            for (ie in erasures) {
-                val aie = if (ie == 0) 1 else gfPowAlpha(ie) // α^{ie}
-                Lambda = polyMul(Lambda, intArrayOf(1, aie)) // (1 + aie*x) ただし GF(2^8) では + が xor
+                // parity part (evaluation points continue)
+                for (j in 0 until m) {
+                    val cj = c[k + j]
+                    if (cj != 0) acc = gfAdd(acc, gfMul(cj, xPow))
+                    xPow = gfMul(xPow, gfPowAlpha(a))
+                }
+                S[r] = acc
             }
 
-            // BM（Berlekamp–Massey）で Λ(x) を拡張（未知エラー分を学習）
-            // 通常BM初期値：Λ=1。ここでは erasure 初期化を反映。
-            val (sigma, omega) = berlekampMasseyWithErasures(S, Lambda)
+            var allZero = true
+            for (r in 0 until m) if (S[r] != 0) {
+                allZero = false; break
+            }
+            if (allZero) continue
 
-            // Chien 検索：Λ(α^{-i}) = 0 となる i を全探索
-            val errorLocs = chienSearch(sigma, n)
-            // 位置のうち、データ側の欠損は out に書く対象、パリティ側／データ既知側はその場で修正に使う
+            // Berlekamp–Massey (with erasure init)
+            val erasureLocPoly = makeErasureLocatorPoly(erasures)
+            val erasureEval = polyEvalSyndromes(erasureLocPoly, S)
+            var L = 0
+            var B = IntArray(1) { 1 }
+            var b = 1
+            sigma.fill(0); sigma[0] = 1
+            sigma = polyMulInplace(sigma, erasureLocPoly, tmp)
 
-            // Forney の式で誤差値を算出し、c を修正
-            val errVals = forneyValues(sigma, omega, errorLocs)
+            for (r in 0 until m) {
+                // discrepancy
+                val d = polyDiscrepancy(sigma, S, r)
+                if (d == 0) {
+                    // shift B
+                    B = polyShift(B)
+                    continue
+                }
+                val T = sigma.copyOf()
+                val scale = gfMul(d, gfInv(b))
+                sigma = polyAdd(sigma, polyScale(B, scale, tmp))
+                if (2 * L <= r) {
+                    L = r + 1 - L
+                    B = T
+                    b = d
+                }
+                B = polyShift(B)
+            }
+
+            // Chien search for error locations among n symbols
+            val errorLocs = mutableListOf<Int>()
+            for (i in 0 until n) {
+                val xInv = if (i == 0) 1 else gfPowAlpha(255 - (i % 255))
+                if (polyEval(sigma, xInv) == 0) errorLocs.add(i)
+            }
+            // too many
+            require(errorLocs.size <= m) { "too many errors: ${errorLocs.size} > m=$m" }
+
+            // Forney error magnitudes
+            val errVals = computeErrorMagnitudes(S, sigma, errorLocs.toIntArray())
+            // Apply corrections into c[]
             for (idx in errorLocs.indices) {
                 val i = errorLocs[idx]
-                val ev = errVals[idx]
-                c[i] = gfAdd(c[i], ev) // 差分を足す（=XOR）
+                c[i] = gfAdd(c[i], errVals[idx])
             }
 
-            // 欠損データの書き戻し
-            for ((listIndex, di) in missingIdx.withIndex()) {
-                val v = c[di]
-                out[listIndex].second.put(pos, v.toByte())
+            for (t in out.indices) {
+                val dataIndex = out[t].first
+                val symbol = c[dataIndex]
+                out[t].second.put(pos, symbol.toByte())
             }
         }
 
-        // 仕上げ
+        // 完了
         out.forEach { it.second.limit(BLOCK_SIZE).position(0) }
         return out
     }
 
-    /* ---------------- Polynomials & Decoding core ---------------- */
+    /* ---------------- poly helpers (BM/Forney) ---------------- */
+
+    private fun makeErasureLocatorPoly(erasures: IntArray?): IntArray {
+        if (erasures == null || erasures.isEmpty()) return intArrayOf(1)
+        // Γ(x) = Π (1 - x * alpha^{i})
+        var poly = intArrayOf(1)
+        for (e in erasures) {
+            val aPow = if (e == 0) 1 else gfPowAlpha(e % 255)
+            val term = intArrayOf(1, aPow) // 1 + (alpha^e) x
+            poly = polyMul(poly, term)
+        }
+        return poly
+    }
+
+    private fun polyEvalSyndromes(poly: IntArray, S: IntArray): IntArray {
+        val out = IntArray(S.size)
+        for (r in S.indices) out[r] = polyEval(poly, gfPowAlpha(r + 1))
+        return out
+    }
+
+    private fun polyEval(poly: IntArray, x: Int): Int {
+        var acc = 0
+        for (i in poly.indices.reversed()) acc = gfAdd(gfMul(acc, x), poly[i])
+        return acc
+    }
+
+    private fun polyDiscrepancy(sigma: IntArray, S: IntArray, r: Int): Int {
+        var acc = 0
+        for (i in 0..min(r, sigma.lastIndex)) acc = gfAdd(acc, gfMul(sigma[i], S[r - i]))
+        return acc
+    }
+
+    private fun polyShift(a: IntArray): IntArray {
+        val out = IntArray(a.size + 1)
+        for (i in a.indices) out[i + 1] = a[i]
+        return out
+    }
 
     private fun polyAdd(a: IntArray, b: IntArray): IntArray {
         val n = maxOf(a.size, b.size)
-        val r = IntArray(n)
+        val out = IntArray(n)
         for (i in 0 until n) {
-            val ai = if (i >= n - a.size) a[i - (n - a.size)] else 0
-            val bi = if (i >= n - b.size) b[i - (n - b.size)] else 0
-            r[i] = ai xor bi
+            val ai = if (i < a.size) a[i] else 0
+            val bi = if (i < b.size) b[i] else 0
+            out[i] = gfAdd(ai, bi)
         }
-        return r.trimLeadingZeros()
+        return out
+    }
+
+    private fun polyScale(a: IntArray, s: Int, tmp: IntArray): IntArray {
+        val out = if (a.size <= tmp.size) tmp else IntArray(a.size)
+        for (i in a.indices) out[i] = gfMul(a[i], s)
+        return out.copyOf(a.size)
     }
 
     private fun polyMul(a: IntArray, b: IntArray): IntArray {
-        val r = IntArray(a.size + b.size - 1)
+        val out = IntArray(a.size + b.size - 1)
         for (i in a.indices) {
-            if (a[i] == 0) continue
+            val ai = a[i]
+            if (ai == 0) continue
             for (j in b.indices) {
-                if (b[j] == 0) continue
-                r[i + j] = gfAdd(r[i + j], gfMul(a[i], b[j]))
+                if (b[j] != 0) out[i + j] = gfAdd(out[i + j], gfMul(ai, b[j]))
             }
         }
-        return r.trimLeadingZeros()
+        return out
     }
 
-    private fun polyScale(a: IntArray, s: Int): IntArray {
-        if (s == 0) return intArrayOf(0)
-        val r = IntArray(a.size)
-        for (i in a.indices) r[i] = gfMul(a[i], s)
-        return r
-    }
-
-    private fun polyEval(a: IntArray, x: Int): Int {
-        var y = 0
-        for (coef in a) {
-            y = gfMul(y, x)
-            y = gfAdd(y, coef)
-        }
-        return y
-    }
-
-    private fun IntArray.trimLeadingZeros(): IntArray {
-        var i = 0
-        while (i < size - 1 && this[i] == 0) i++
-        return copyOfRange(i, size)
-    }
-
-    /**
-     * Berlekamp–Massey with erasure initialization.
-     * Given syndromes S and initial erasure locator Γ(x), compute:
-     *   - σ(x): error+erasure locator
-     *   - ω(x): error evaluator (ω = S(x) * σ(x) mod x^m)
-     */
-    private fun berlekampMasseyWithErasures(S: IntArray, erasureLocator: IntArray): Pair<IntArray, IntArray> {
-        val m = S.size
-        var sigma = erasureLocator.copyOf()
-        var B = intArrayOf(1)
-        var L = erasureLocator.size - 1 // current degree
-        var b = 1
-        var k = 0
-
-        // Precompute S(x) as poly with S[0] as x^{m-1} coefficient（表現は流派がある。ここではBMの慣例に合わせる）
-        // ここでは逐次方式：BM反復で S[k] を使う
-
-        for (n in 0 until m) {
-            // discrepancy d = S[n] + Σ_{i=1..L} sigma[i]*S[n - i]
-            var d = S[n]
-            for (i in 1..L) {
-                if (i >= sigma.size) break
-                d = gfAdd(d, gfMul(sigma[i], S[n - i]))
-            }
-            if (d != 0) {
-                val T = sigma.copyOf()
-                // sigma = sigma ⊕ d * b^{-1} * x^{k} * B
-                val factor = gfMul(d, gfInv(b))
-                val shiftB = IntArray(B.size + k) { idx -> if (idx < k) 0 else B[idx - k] }
-                sigma = polyAdd(sigma, polyScale(shiftB, factor))
-                if (2 * L <= n) {
-                    L = n + 1 - L
-                    B = T
-                    b = d
-                    k = 1
-                } else {
-                    k++
-                }
-            } else {
-                k++
+    private fun polyMulInplace(a: IntArray, b: IntArray, tmp: IntArray): IntArray {
+        val out = tmp
+        java.util.Arrays.fill(out, 0)
+        val n = a.size + b.size - 1
+        for (i in a.indices) {
+            val ai = a[i]
+            if (ai == 0) continue
+            for (j in b.indices) {
+                if (b[j] != 0) out[i + j] = gfAdd(out[i + j], gfMul(ai, b[j]))
             }
         }
-
-        // ω(x) = (S(x) * σ(x)) mod x^m
-        // S(x) は S[0] が x^{m-1} の係数とみなす多項式：ここは簡易的に“高位→低位”の並びで扱う
-        // 実装簡素化のため、畳み込みして上位 m-1 次までを残す
-        val SPoly = S.copyOf() // ここでは x^{m-1}..x^0 として扱う（係数順に注意）
-        val omegaFull = IntArray(SPoly.size + sigma.size - 1)
-        for (i in SPoly.indices) for (j in sigma.indices) {
-            omegaFull[i + j] = gfAdd(omegaFull[i + j], gfMul(SPoly[i], sigma[j]))
-        }
-        val omega = omegaFull.copyOf(min(omegaFull.size, m)) // mod x^m
-
-        return Pair(sigma.trimLeadingZeros(), omega.trimLeadingZeros())
+        return out.copyOf(n)
     }
 
-    /** Chien search: find indices i in 0..n-1 such that sigma(alpha^{-i}) == 0 */
-    private fun chienSearch(sigma: IntArray, n: Int): IntArray {
-        val roots = ArrayList<Int>()
-        for (i in 0 until n) {
-            // 評価点は α^{-i}
-            val xInv = if (i == 0) 1 else gfPowAlpha(255 - (i % 255))
-            if (polyEval(sigma, xInv) == 0) roots += i
+    private fun computeErrorMagnitudes(S: IntArray, sigma: IntArray, errorLocs: IntArray): IntArray {
+        // ω(x) = [S(x) * σ(x)] mod x^m
+        val omega = IntArray(parityCount)
+        for (i in omega.indices) {
+            var acc = 0
+            for (j in 0..i) {
+                val s = if (j < S.size) S[j] else 0
+                val sig = if (i - j < sigma.size) sigma[i - j] else 0
+                if (s != 0 && sig != 0) acc = gfAdd(acc, gfMul(s, sig))
+            }
+            omega[i] = acc
         }
-        return roots.toIntArray()
-    }
 
-    /**
-     * Forney's formula to compute error magnitudes at given error locations.
-     * errVal(i) = - Ω(x_i^{-1}) / (Λ'(x_i^{-1}))
-     */
-    private fun forneyValues(sigma: IntArray, omega: IntArray, errorLocs: IntArray): IntArray {
-        // σ'(x) : formal derivative
-        val sigmaPrime = IntArray(maxOf(1, sigma.size - 1))
+        // σ'(x): σ(x) の formal derivative（GF(2^8) は特別扱い）
+        val sigmaPrime = IntArray(sigma.size - 1)
         for (i in 1 until sigma.size) {
-            // derivative in GF(2^8): only odd powers survive（偶数項は消える）
             if (i % 2 == 1) sigmaPrime[i - 1] = sigma[i]
         }
         val out = IntArray(errorLocs.size)

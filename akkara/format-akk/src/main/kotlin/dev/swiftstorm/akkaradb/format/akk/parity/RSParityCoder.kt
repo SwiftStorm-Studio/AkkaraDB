@@ -14,12 +14,7 @@ import dev.swiftstorm.akkaradb.format.api.ParityCoder
  * Supports any parityCount m ≥ 1. Works with an arbitrary number of data lanes k ≥ 1.
  *
  * Parity j (0-based) is computed as: P_j = Σ_i a(j,i) · D_i
- * where a(j,i) = α^{(j+1)·i} and α is the primitive element of GF(256).
- *
- * Decoding handles up to m erasures simultaneously. Given a list of lane blocks
- * with some elements null (erasures) and a list of m parity blocks, it solves the
- * linear system to recover the requested missing lane. Other missing lanes are
- * also reconstructed internally, but only the requested one is returned.
+ * where a(j,i) = α^{(j+1)·i} and α is a primitive element of GF(256) with poly 0x11D.
  */
 class RSParityCoder(
     override val parityCount: Int,
@@ -43,14 +38,27 @@ class RSParityCoder(
             if (x and 0x100 != 0) x = x xor 0x11D
         }
         for (i in 255 until 512) exp[i] = exp[i - 255]
-        log[0] = 0 // unused; guard
+        log[0] = 0 // guard
+    }
+
+    private val mulLUT: ByteArray = ByteArray(256 * 256).also { lut ->
+        var idx = 0
+        for (a in 0..255) {
+            for (b in 0..255) {
+                lut[idx++] = gfMulExpLog(a, b).toByte()
+            }
+        }
     }
 
     private inline fun gfAdd(a: Int, b: Int): Int = a xor b
+
     private inline fun gfMul(a: Int, b: Int): Int {
+        return mulLUT[(a shl 8) or b].toInt() and 0xFF
+    }
+
+    private inline fun gfMulExpLog(a: Int, b: Int): Int {
         if (a == 0 || b == 0) return 0
-        val r = exp[log[a] + log[b]]
-        return r
+        return exp[log[a] + log[b]]
     }
 
     private inline fun gfInv(a: Int): Int {
@@ -58,7 +66,26 @@ class RSParityCoder(
         return exp[255 - log[a]]
     }
 
-    /* ---------------- Encoding ---------------- */
+    /* ---------------- 係数キャッシュ（改善 #3） ---------------- */
+
+    @Volatile
+    private var cachedK: Int = -1
+
+    /** coeff[j][i] = a(j,i) = α^{(j+1)·i} */
+    @Volatile
+    private var coeff: Array<IntArray>? = null
+
+    private fun ensureCoeff(k: Int) {
+        val curr = coeff
+        if (curr != null && cachedK == k) return
+        val newCoeff = Array(parityCount) { j ->
+            IntArray(k) { i -> coeffA(j, i) }
+        }
+        coeff = newCoeff
+        cachedK = k
+    }
+
+    /* ---------------- Encoding (SAXPY; 改善 #1) ---------------- */
 
     override fun encode(dataBlocks: List<ByteBufferL>): List<ByteBufferL> {
         require(dataBlocks.isNotEmpty())
@@ -72,20 +99,31 @@ class RSParityCoder(
         repeat(parityCount) { parity += pool.get(BLOCK_SIZE) }
         parity.forEach { it.clear() }
 
-        // a(j,i) = α^{(j+1) * i}
-        val coeff = Array(parityCount) { j -> IntArray(k) { i -> coeffA(j, i) } }
+        ensureCoeff(k)
+        val c = coeff!! // non-null after ensure
 
-        for (pos in 0 until BLOCK_SIZE) {
-            val dataBytes = IntArray(k) { idx -> blks[idx].get(pos).toInt() and 0xFF }
+        for (i in 0 until k) {
+            val src = blks[i].duplicate()
             for (j in 0 until parityCount) {
-                val row = coeff[j]
-                var acc = 0
-                for (i in 0 until k) acc = gfAdd(acc, gfMul(row[i], dataBytes[i]))
-                parity[j].put(pos, acc.toByte())
+                saxpy(parity[j], src, c[j][i])
             }
         }
+
         parity.forEach { it.limit(BLOCK_SIZE).position(0) }
         return parity
+    }
+
+    private inline fun saxpy(dst: ByteBufferL, src: ByteBufferL, a: Int) {
+        val N = BLOCK_SIZE
+        val lutBase = a shl 8
+        var p = 0
+        while (p < N) {
+            val s = src.get(p).toInt() and 0xFF
+            val m = mulLUT[lutBase or s].toInt() and 0xFF
+            val d = dst.get(p).toInt() and 0xFF
+            dst.put(p, (d xor m).toByte())
+            p++
+        }
     }
 
     /* ---------------- Decoding (up to m erasures) ---------------- */
@@ -114,14 +152,17 @@ class RSParityCoder(
 
         val availParityRows = presentParity.withIndex().filter { it.value != null }.map { it.index }
         require(availParityRows.size >= e) {
-            "not enough parity rows: have=${availParityRows.size}, need=$e; missing=$missing"
+            "need at least e=$e parity rows, but only ${availParityRows.size} are available"
         }
-        val J = availParityRows.take(e)
+        val J = IntArray(e) { availParityRows[it] }
 
-        val M = Array(e) { r ->
-            IntArray(e) { t ->
-                val i = missing[t]
-                coeffA(J[r], i)
+        // M[r][c] = a(J[r], knownIdx[c])
+        val M = Array(e) { IntArray(e) }
+        for (r in 0 until e) {
+            val jrow = J[r]
+            for (c in 0 until e) {
+                val i = knownIdx[c]
+                M[r][c] = coeffA(jrow, i)
             }
         }
         val inv = invertMatrix(M)
@@ -144,6 +185,7 @@ class RSParityCoder(
                 S[r] = gfAdd(pr, accumKnown)
             }
 
+            // D_missing = inv(M) · S
             for (t in 0 until e) {
                 var v = 0
                 for (c in 0 until e) v = gfAdd(v, gfMul(inv[t][c], S[c]))
@@ -151,37 +193,41 @@ class RSParityCoder(
             }
         }
 
-        for (t in 0 until e) recovered[t].limit(BLOCK_SIZE).position(0)
-        val idxInMissing = missing.indexOf(lostIndex)
-        return recovered[idxInMissing]
+        val which = missing.indexOf(lostIndex)
+        val out = recovered[which]
+        out.limit(BLOCK_SIZE).position(0)
+        return out
     }
 
-    /* ---------------- GF helpers ---------------- */
+    /* ---------------- Small GF helpers ---------------- */
 
-    private fun invertMatrix(src: Array<IntArray>): Array<IntArray> {
-        val n = src.size
-        val a = Array(n) { IntArray(n) }
-        val inv = Array(n) { IntArray(n) }
-        for (i in 0 until n) {
-            for (j in 0 until n) a[i][j] = src[i][j]
-            inv[i][i] = 1
-        }
-        // Gauss–Jordan
+    // Gauss–Jordan elimination for small dense matrix over GF(256)
+    private fun invertMatrix(a0: Array<IntArray>): Array<IntArray> {
+        val n = a0.size
+        val a = Array(n) { r -> a0[r].clone() }
+        val inv = Array(n) { r -> IntArray(n).apply { this[r] = 1 } }
+
         var row = 0
         for (col in 0 until n) {
-            var pivot = -1
-            for (r in row until n) if (a[r][col] != 0) {
-                pivot = r; break
-            }
-            require(pivot != -1) { "singular matrix in RS decode" }
+            // pivot search
+            var pivot = row
+            while (pivot < n && a[pivot][col] == 0) pivot++
+            if (pivot == n) continue // singular;
+
+            // swap
             if (pivot != row) {
                 val tmp = a[pivot]; a[pivot] = a[row]; a[row] = tmp
                 val tmp2 = inv[pivot]; inv[pivot] = inv[row]; inv[row] = tmp2
             }
+
+            // normalize
             val invPivot = gfInv(a[row][col])
             for (c in 0 until n) {
-                a[row][c] = gfMul(a[row][c], invPivot); inv[row][c] = gfMul(inv[row][c], invPivot)
+                a[row][c] = gfMul(a[row][c], invPivot)
+                inv[row][c] = gfMul(inv[row][c], invPivot)
             }
+
+            // eliminate others
             for (r in 0 until n) if (r != row && a[r][col] != 0) {
                 val factor = a[r][col]
                 for (c in 0 until n) {
