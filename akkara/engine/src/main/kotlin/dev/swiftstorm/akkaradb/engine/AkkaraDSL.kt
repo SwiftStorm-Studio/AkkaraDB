@@ -40,6 +40,8 @@ object AkkDSL {
                 cfg.walCfg.filePrefix,
                 cfg.walCfg.enableLog,
                 cfg.walCfg.fastMode,
+                cfg.walCfg.fsyncBatchN,
+                cfg.walCfg.fsyncIntervalMicros,
                 cfg.walCfg.queueCap,
                 cfg.walCfg.backoffNanos,
                 cfg.metaCacheCap,
@@ -74,6 +76,8 @@ data class WalCfg(
     val filePrefix: String = "wal",
     val enableLog: Boolean = false,
     val fastMode: Boolean = false,
+    val fsyncBatchN: Int = 32,
+    val fsyncIntervalMicros: Long = 4_000L,
     val queueCap: Int = 8192,
     val backoffNanos: Long = 1_000_000L
 )
@@ -114,13 +118,21 @@ class WalCfgBuilder(defaultPath: Path) {
     var filePrefix: String = "wal"
     var enableLog: Boolean = false
     var fastMode: Boolean = false
+    var fsyncBatchN: Int = 32
+    var fsyncIntervalMicros: Long = 4_000L
+    var queueCap: Int = 8192
+    var backoffNanos: Long = 1_000_000L
 
     fun build(): WalCfg {
         return WalCfg(
             dir = dir,
             filePrefix = filePrefix,
             enableLog = enableLog,
-            fastMode = fastMode
+            fastMode = fastMode,
+            fsyncBatchN = fsyncBatchN,
+            fsyncIntervalMicros = fsyncIntervalMicros,
+            queueCap = queueCap,
+            backoffNanos = backoffNanos
         )
     }
 }

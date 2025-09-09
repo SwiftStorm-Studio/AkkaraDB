@@ -84,7 +84,6 @@ class AkkStripeReader(
                         pool.release(buf); parityBufs += null
                     }
                 }
-                // 復旧
                 for (i in laneBlocks.indices) {
                     if (laneBlocks[i] == null) {
                         laneBlocks[i] = parityCoder.decode(i, laneBlocks, parityBufs)

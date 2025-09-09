@@ -1,4 +1,4 @@
-@file:Suppress("NOTHING_TO_INLINE")
+@file:Suppress("NOTHING_TO_INLINE", "DuplicatedCode", "LocalVariableName")
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
@@ -63,96 +63,95 @@ class RSParityCoder(
     override fun encode(dataBlocks: List<ByteBufferL>): List<ByteBufferL> {
         require(dataBlocks.isNotEmpty())
         val k = dataBlocks.size
+        require(k + parityCount <= 255) { "RS(8) requires n=k+m ≤ 255; got k=$k, m=$parityCount" }
+
         val blks = dataBlocks.map { it.duplicate() }
         blks.forEach { require(it.remaining == BLOCK_SIZE) { "block must be 32 KiB" } }
 
         val parity = ArrayList<ByteBufferL>(parityCount)
-        // allocate parity buffers from pool so writer can release them
         repeat(parityCount) { parity += pool.get(BLOCK_SIZE) }
         parity.forEach { it.clear() }
 
-        val coeff = Array(parityCount) { j ->
-            IntArray(k) { i ->
-                // a(j,i) = α^{(j+1)*i}
-                if (i == 0) 1 else exp[((j + 1) * (log[exp[i]])) % 255] // exp[i] = α^i
-            }
-        }
-        // Alternative simpler Vandermonde: a(j,i) = (i+1)^j
-        // val coeff = Array(parityCount){ j -> IntArray(k){ i -> gfPow(i+1,j) } }
+        // a(j,i) = α^{(j+1) * i}
+        val coeff = Array(parityCount) { j -> IntArray(k) { i -> coeffA(j, i) } }
 
-        // Compute parity byte-wise
         for (pos in 0 until BLOCK_SIZE) {
-            val dataBytes = IntArray(k)
-            for (i in 0 until k) dataBytes[i] = blks[i].get(pos).toInt() and 0xFF
+            val dataBytes = IntArray(k) { idx -> blks[idx].get(pos).toInt() and 0xFF }
             for (j in 0 until parityCount) {
-                var acc = 0
                 val row = coeff[j]
+                var acc = 0
                 for (i in 0 until k) acc = gfAdd(acc, gfMul(row[i], dataBytes[i]))
                 parity[j].put(pos, acc.toByte())
             }
         }
-        parity.forEach { it.position(BLOCK_SIZE); it.flip() }
+        parity.forEach { it.limit(BLOCK_SIZE).position(0) }
         return parity
     }
 
     /* ---------------- Decoding (up to m erasures) ---------------- */
 
-    override fun decode(lostIndex: Int, presentData: List<ByteBufferL?>, presentParity: List<ByteBufferL?>): ByteBufferL {
+    override fun decode(
+        lostIndex: Int,
+        presentData: List<ByteBufferL?>,
+        presentParity: List<ByteBufferL?>
+    ): ByteBufferL {
         val k = presentData.size
-        require(presentParity.size == parityCount) { "expected $parityCount parity blocks, got ${presentParity.size}" }
+        val m = parityCount
+        require(presentParity.size == m) { "expected $m parity blocks, got ${presentParity.size}" }
+        require(k + m <= 255) { "RS(8) requires n=k+m ≤ 255; got k=$k, m=$m" }
+
         val missing = presentData.withIndex().filter { it.value == null }.map { it.index }
         require(missing.isNotEmpty()) { "nothing to decode" }
-        require(missing.size <= parityCount) { "too many erasures: ${missing.size} > m=$parityCount" }
-        require(missing.contains(lostIndex))
-        presentParity.forEach { p -> require(p == null || p.remaining == BLOCK_SIZE) }
+        require(missing.size <= m) { "too many erasures: ${missing.size} > m=$m" }
+        require(lostIndex in missing) { "lostIndex=$lostIndex not in missing=$missing" }
 
-        // Build coefficient matrix A (m x e) and RHS syndromes S (m vectors)
+        presentData.forEach { d -> require(d == null || d.remaining == BLOCK_SIZE) { "bad data size" } }
+        presentParity.forEach { p -> require(p == null || p.remaining == BLOCK_SIZE) { "bad parity size" } }
+
         val e = missing.size
-        val A = Array(parityCount) { IntArray(e) }
-        for (j in 0 until parityCount) {
-            for (t in 0 until e) {
+        val missingSet = missing.toHashSet()
+        val knownIdx = (0 until k).filter { it !in missingSet }
+
+        val availParityRows = presentParity.withIndex().filter { it.value != null }.map { it.index }
+        require(availParityRows.size >= e) {
+            "not enough parity rows: have=${availParityRows.size}, need=$e; missing=$missing"
+        }
+        val J = availParityRows.take(e)
+
+        val M = Array(e) { r ->
+            IntArray(e) { t ->
                 val i = missing[t]
-                A[j][t] = if (i == 0) 1 else exp[((j + 1) * (log[exp[i]])) % 255]
+                coeffA(J[r], i)
             }
         }
-        // Precompute contributions of known data for each parity row
-        val knownIdx = (0 until k).filter { it !in missing.toSet() }
-
-        // Invert A_e (take top e rows for a square system). Use Gaussian elimination in GF(256).
-        val M = Array(e) { IntArray(e) }
-        for (r in 0 until e) for (c in 0 until e) M[r][c] = A[r][c]
         val inv = invertMatrix(M)
 
-        // Prepare output buffers for all missing blocks (compute all, return requested)
-        val recovered = Array(e) { pool.get(BLOCK_SIZE) }
-        for (t in 0 until e) recovered[t].clear()
+        val recovered = Array(e) { pool.get(BLOCK_SIZE).apply { clear() } }
 
         for (pos in 0 until BLOCK_SIZE) {
-            // Syndromes S_r = P_r - Σ_i a(r,i)*D_i
+            // S_r = P_{J[r]} ⊕ Σ_{i∈known} a(J[r], i)·D_i
             val S = IntArray(e)
             for (r in 0 until e) {
-                var s = 0
-                val p = presentParity[r] ?: error("missing required parity block r=$r for e=$e")
+                val jrow = J[r]
+                val p = presentParity[jrow]!!
                 var accumKnown = 0
                 for (i in knownIdx) {
-                    val a = if (i == 0) 1 else exp[((r + 1) * (log[exp[i]])) % 255]
+                    val a = coeffA(jrow, i)
                     val d = presentData[i]!!.get(pos).toInt() and 0xFF
                     accumKnown = gfAdd(accumKnown, gfMul(a, d))
                 }
                 val pr = p.get(pos).toInt() and 0xFF
-                s = gfAdd(pr, accumKnown) // since P = A·D, moving known terms to RHS
-                S[r] = s
+                S[r] = gfAdd(pr, accumKnown)
             }
-            // Solve X = inv * S
-            val X = IntArray(e)
-            for (r in 0 until e) {
+
+            for (t in 0 until e) {
                 var v = 0
-                for (c in 0 until e) v = gfAdd(v, gfMul(inv[r][c], S[c]))
-                X[r] = v
+                for (c in 0 until e) v = gfAdd(v, gfMul(inv[t][c], S[c]))
+                recovered[t].put(pos, v.toByte())
             }
-            for (t in 0 until e) recovered[t].put(pos, X[t].toByte())
         }
-        for (t in 0 until e) recovered[t].position(BLOCK_SIZE).flip()
+
+        for (t in 0 until e) recovered[t].limit(BLOCK_SIZE).position(0)
         val idxInMissing = missing.indexOf(lostIndex)
         return recovered[idxInMissing]
     }
@@ -193,5 +192,9 @@ class RSParityCoder(
             row++
         }
         return inv
+    }
+
+    private inline fun coeffA(row: Int, i: Int): Int {
+        return if (i == 0) 1 else exp[((row + 1) * i) % 255]
     }
 }

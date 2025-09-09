@@ -45,6 +45,8 @@ data class Record private constructor(
     val isTombstone: Boolean
         get() = (flags.toInt() and FLAG_TOMBSTONE.toInt()) != 0
 
+    val approxSizeBytes: Int = key.limit + if (isTombstone) 0 else value.limit
+
     fun withFlags(newFlags: Byte): Record = copy(flags = newFlags)
 
     fun asTombstone(): Record = copy(flags = (flags or FLAG_TOMBSTONE))

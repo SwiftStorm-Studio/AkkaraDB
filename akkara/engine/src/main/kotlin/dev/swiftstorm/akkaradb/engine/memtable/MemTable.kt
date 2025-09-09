@@ -3,45 +3,65 @@ package dev.swiftstorm.akkaradb.engine.memtable
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.hashOfRemaining
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
-import kotlin.math.max
 
 /**
- * Sharded MemTable for scalability.
- * - Keys are distributed across shards using (key.hashOfRemaining() % shardCount).
- * - Each shard maintains its own lock, LRU, and flush boundary.
+ * Sharded MemTable with *seal & swap* and a single flusher thread.
+ *
+ * Goals:
+ * - Flush work never blocks the hot path (put/get).
+ * - O(1) seal: swap active map under write lock, then copy outside lock.
+ * - I/O is serialized via a single flusher to improve write coalescing.
+ * - Optional hysteresis to avoid flush storms.
  */
 class MemTable(
-    private val thresholdBytes: Long,
-    private val onFlush: (MutableList<Record>) -> Unit,
-    private val onEvict: ((List<Record>) -> Unit)? = null,
-    private val maxEntries: Int? = null,
-    private val shardCount: Int = Runtime.getRuntime().availableProcessors(),
-    internal val executor: ExecutorService = Executors.newFixedThreadPool(
-        Runtime.getRuntime().availableProcessors()
-    ) { r -> Thread(r, "memtable-flush").apply { isDaemon = true } }
-) : AutoCloseable {
-
-    private val shards = Array(shardCount) { idx ->
-        val per = max(1L, thresholdBytes / shardCount)   // ★
-        Shard(idx, per, onFlush, onEvict, maxEntries)
-    }
-
+    private val shardCount: Int,
+    /** target soft threshold per-shard in bytes */
+    private val thresholdBytesPerShard: Long,
+    /** called by flusher thread with a sealed batch */
+    private val onFlush: (List<Record>) -> Unit,
+    threadName: String = "akkaradb-mem-flusher"
+) {
     private val closed = AtomicBoolean(false)
+    private val flusher: Flusher
+    private val shards: Array<Shard>
 
-    fun get(key: ByteBufferL): Record? {
-        val h = key.hashOfRemaining()
-        val shardIdx = Math.floorMod(h, shardCount)
-        return shards[shardIdx].get(key)
+    init {
+        require(shardCount >= 1)
+        val q = MpscQueue<List<Record>>()
+        this.flusher = Flusher(q, onFlush, threadName)
+        this.shards = Array(shardCount) { idx ->
+            Shard(
+                shardId = idx,
+                queue = q,
+                softThresholdBytes = thresholdBytesPerShard
+            )
+        }
+        flusher.start()
     }
 
-    fun getAll(): List<Record> = shards.flatMap { it.getAll() }
+    fun close() {
+        if (closed.compareAndSet(false, true)) {
+            // request final flush of all shards
+            shards.forEach { it.forceSealAndEnqueueIfNotEmpty() }
+            flusher.stopAndDrain()
+        }
+    }
+
+    fun size(): Int = shards.sumOf { it.size() }
+
+    fun getAll(): List<Record> =
+        shards.flatMap { it.snapshotAll() }
+
+    fun get(key: ByteBufferL, keyHash: Int = key.hashOfRemaining()): Record? {
+        if (closed.get()) return null
+        val idx = Math.floorMod(keyHash, shardCount)
+        return shards[idx].get(key, keyHash)
+    }
 
     fun put(record: Record): Boolean {
         if (closed.get()) return false
@@ -49,150 +69,188 @@ class MemTable(
         return shards[shardIdx].put(record)
     }
 
+    /** Hint to flush; non-blocking. */
     fun flush() {
-        shards.forEach { it.flush() }
+        shards.forEach { it.maybeSealAndEnqueue() }
     }
 
     fun evictOldest(n: Int = 1) {
         shards.forEach { it.evictOldest(n) }
     }
 
-    fun lastSeq(): Long = shards.maxOf { it.lastSeq() }
-    fun nextSeq(): Long {
-        val s = shards.maxOf { it.lastSeq() }
-        return max(s + 1, 1)
-    }
-
-    override fun close() {
-        closed.set(true)
-        shards.forEach { it.flush() }
-        executor.shutdown()
-    }
-
-    /* ────────── Shard class ────────── */
-    private inner class Shard(
-        val id: Int,
-        private val thresholdBytes: Long,
-        private val onFlush: (MutableList<Record>) -> Unit,
-        private val onEvict: ((List<Record>) -> Unit)?,
-        private val maxEntries: Int?
+    // ---------------------------------------------------------------------
+    // Shard
+    // ---------------------------------------------------------------------
+    private class Shard(
+        private val shardId: Int,
+        private val queue: MpscQueue<List<Record>>, // N:1 to flusher
+        private val softThresholdBytes: Long,
     ) {
-        private fun newLruMap(): LinkedHashMap<Key, Record> =
-            object : LinkedHashMap<Key, Record>(16, 0.75f, true) {
-                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, Record>): Boolean {
-                    if (maxEntries != null && size > maxEntries) {
-                        currentBytes.addAndGet(-sizeOf(eldest.value))
-                        onEvict?.invoke(listOf(eldest.value))
-                        return true
-                    }
-                    return false
-                }
-            }
-
         private val lock = ReentrantReadWriteLock()
-        private val map = newLruMap()
-        private val currentBytes = AtomicLong(0)
-        private val highestSeqNo = AtomicLong(0)
+
+        /** next flush trigger; updated with hysteresis after each flush. */
+        private var nextFlushAt = softThresholdBytes
+
+        /** Active map (LRU-ish by access order). */
+        private var active: LinkedHashMap<Key, Record> = newLruMap()
+
+        /**
+         * Memory accounting for current active map; only mutated under write lock.
+         * Keeping AtomicLong out of hot path.
+         */
+        private var currentBytes: Long = 0
+
+        /** prevent duplicate enqueue while a sealed batch from this shard is pending. */
         private val flushPending = AtomicBoolean(false)
 
-        fun get(key: ByteBufferL): Record? = lock.read { map[wrapKey(key)] }
+        fun size(): Int = lock.read { active.size }
 
-        fun getAll(): List<Record> = lock.read { map.values.toList() }
+        fun snapshotAll(): List<Record> = lock.read { ArrayList(active.values) }
 
-        fun put(record: Record): Boolean {
-            var shouldFlush = false
-            val accepted = lock.write {
-                val k = wrapKey(record.key)
-                val prev = map[k]
-                if (prev != null && record.seqNo < prev.seqNo) return@write false
-                map[k] = record
-                if (record.seqNo > highestSeqNo.get()) {
-                    highestSeqNo.updateAndGet { old -> max(old, record.seqNo) }
-                }
-                val delta = sizeOf(record) - (prev?.let { sizeOf(it) } ?: 0L)
-                val sizeAfter = currentBytes.addAndGet(delta)
-                shouldFlush = sizeAfter >= thresholdBytes
-                true
-            }
-            if (shouldFlush && flushPending.compareAndSet(false, true)) {
-                executor.execute {
-                    try {
-                        flushInternal()
-                    } finally {
-                        flushPending.set(false)
-                    }
-                }
-            }
-            return accepted
+        fun get(key: ByteBufferL, keyHash: Int): Record? = lock.read {
+            active[Key(key, keyHash)]
         }
 
-        fun flush() {
-            try {
-                flushInternal()
-            } finally {
+        fun put(r: Record): Boolean {
+            var needSeal = false
+            lock.write {
+                val k = Key(r.key, r.keyHash)
+                val prev = active.put(k, r)
+                if (prev != null) {
+                    currentBytes -= sizeOf(prev)
+                }
+                currentBytes += sizeOf(r)
+                // soft trigger only; actual enqueue happens outside lock
+                if (currentBytes >= nextFlushAt && flushPending.compareAndSet(false, true)) {
+                    needSeal = true
+                }
+            }
+            if (needSeal) sealAndEnqueue()
+            return true
+        }
+
+        fun evictOldest(n: Int) {
+            lock.write {
+                repeat(n.coerceAtMost(active.size)) {
+                    val it = active.entries.iterator()
+                    if (!it.hasNext()) return
+                    val e = it.next()
+                    currentBytes -= sizeOf(e.value)
+                    it.remove()
+                }
+            }
+        }
+
+        fun maybeSealAndEnqueue() {
+            if (flushPending.compareAndSet(false, true)) {
+                sealAndEnqueue()
+            }
+        }
+
+        fun forceSealAndEnqueueIfNotEmpty() {
+            var has = false
+            lock.read { has = active.isNotEmpty() }
+            if (has && flushPending.compareAndSet(false, true)) {
+                sealAndEnqueue()
+            }
+        }
+
+        private fun sealAndEnqueue() {
+            // 1) swap map under write lock (O(1))
+            val sealed: LinkedHashMap<Key, Record>
+            lock.write {
+                if (active.isEmpty()) {
+                    flushPending.set(false)
+                    return
+                }
+                sealed = active
+                active = newLruMap()
+                currentBytes = 0L
+                // Hysteresis: next time trigger a bit earlier to coalesce bursts
+                nextFlushAt = (softThresholdBytes * 0.8).toLong().coerceAtLeast(softThresholdBytes / 2)
+            }
+            // 2) Copy values to an array list OUTSIDE the lock
+            val batch = ArrayList<Record>(sealed.size)
+            for (e in sealed.values) batch.add(e)
+            // 3) enqueue for the single flusher; if rejected, mark as not pending so future calls can retry
+            if (!queue.offer(batch)) {
+                // very unlikely with our unbounded MPSC, but keep safety
                 flushPending.set(false)
             }
         }
 
-        fun evictOldest(n: Int = 1) {
-            lock.write {
-                val it = map.entries.iterator()
-                val evicted = ArrayList<Record>(n)
-                var bytesFreed = 0L
-                var i = 0
-                while (i < n && it.hasNext()) {
-                    val e = it.next()
-                    evicted += e.value
-                    bytesFreed += sizeOf(e.value)
-                    it.remove()
-                    i++
-                }
-                if (bytesFreed > 0) currentBytes.addAndGet(-bytesFreed)
-                if (evicted.isNotEmpty()) onEvict?.invoke(evicted)
-            }
-        }
+        private fun sizeOf(r: Record): Long = r.approxSizeBytes.toLong()
 
-        fun lastSeq(): Long = highestSeqNo.get()
-
-        private fun flushInternal() {
-            val toFlush: MutableList<Record>? = lock.write {
-                if (map.isEmpty()) return@write null
-                val list = ArrayList(map.values)
-                val freed = list.sumOf { sizeOf(it) }
-                map.clear()
-                currentBytes.addAndGet(-freed)
-                list
-            }
-            toFlush?.let {
-                try {
-                    onFlush(it)
-                } catch (e: Exception) {
-                    System.err.println("MemTable.Shard#$id onFlush failed: size=${it.size}")
-                    e.printStackTrace()
+        private fun newLruMap(): LinkedHashMap<Key, Record> =
+            object : LinkedHashMap<Key, Record>(128, 0.75f, /*accessOrder*/ true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, Record>?): Boolean {
+                    return false // manual eviction
                 }
             }
-        }
 
-        private fun sizeOf(r: Record): Long =
-            (r.key.remaining + r.value.remaining + Long.SIZE_BYTES).toLong()
+        private data class Key(val ro: ByteBufferL, val hash: Int) {
+            override fun hashCode(): Int = hash
+            override fun equals(other: Any?): Boolean =
+                other is Key && contentEquals(ro, other.ro)
 
-        private fun wrapKey(key: ByteBufferL): Key {
-            val ro = key.asReadOnly()
-            val canon = ro.slice(0, ro.remaining)
-            return Key(canon, canon.hashOfRemaining())
+            private fun contentEquals(a: ByteBufferL, b: ByteBufferL): Boolean {
+                val aa = a.asReadOnlyByteBuffer().slice()
+                val bb = b.asReadOnlyByteBuffer().slice()
+                if (aa.remaining() != bb.remaining()) return false
+                return aa.mismatch(bb) == -1
+            }
         }
     }
 
-    private data class Key(val ro: ByteBufferL, val hash: Int) {
-        override fun hashCode(): Int = hash
-        override fun equals(other: Any?): Boolean =
-            other is Key && contentEquals(ro, other.ro)
+    // ---------------------------------------------------------------------
+    // Flusher (single thread)
+    // ---------------------------------------------------------------------
+    private class Flusher(
+        private val queue: MpscQueue<List<Record>>,
+        private val sink: (List<Record>) -> Unit,
+        threadName: String
+    ) {
+        private val running = AtomicBoolean(true)
+        private val thread: Thread = Thread({ runLoop() }, threadName).apply { isDaemon = true }
 
-        private fun contentEquals(a: ByteBufferL, b: ByteBufferL): Boolean {
-            val aa = a.asReadOnlyByteBuffer().slice()
-            val bb = b.asReadOnlyByteBuffer().slice()
-            if (aa.remaining() != bb.remaining()) return false
-            return aa.mismatch(bb) == -1
+        fun start() = thread.start()
+
+        fun stopAndDrain() {
+            running.set(false)
+            thread.join()
+            // drain any leftovers (best-effort, single-threaded now)
+            while (true) {
+                val b = queue.poll() ?: break
+                try {
+                    sink(b)
+                } catch (_: Throwable) {
+                }
+            }
         }
+
+        private fun runLoop() {
+            while (running.get()) {
+                val batch = queue.poll()
+                if (batch != null) {
+                    try {
+                        sink(batch)
+                    } catch (_: Throwable) {
+                    }
+                } else {
+                    // small park to reduce CPU when idle
+                    Thread.onSpinWait()
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Minimal unbounded MPSC queue (backed by ConcurrentLinkedQueue)
+    // If JCTools is available, replace with MpscArrayQueue for lower overhead.
+    // ---------------------------------------------------------------------
+    private class MpscQueue<T> {
+        private val q = ConcurrentLinkedQueue<T>()
+        fun offer(v: T): Boolean = q.offer(v)
+        fun poll(): T? = q.poll()
     }
 }
