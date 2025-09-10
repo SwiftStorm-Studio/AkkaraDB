@@ -21,6 +21,9 @@ package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.format.akk.parity.RSErrorCorrectingParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.StripeReader
 import dev.swiftstorm.akkaradb.format.api.StripeReader.Stripe
@@ -29,6 +32,7 @@ import java.nio.channels.ReadableByteChannel
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.READ
+import java.util.zip.CRC32C
 
 /**
  * Reader for a *stripe* in the append-only segment.
@@ -51,6 +55,7 @@ class AkkStripeReader(
     /* ───────── helpers ───────── */
     private val unpacker = AkkBlockUnpacker()
     private val pool = Pools.io()
+    private val crc32c = CRC32C()
 
     /**
      * Reads one stripe and returns a [Stripe] with payload slices and lane blocks.
@@ -69,13 +74,15 @@ class AkkStripeReader(
             }
             if (laneBlocks.all { it == null }) return null // true EOF
 
-            val missingCnt = laneBlocks.count { it == null }
+            val missingIdx = laneBlocks.withIndex().filter { it.value == null }.map { it.index }
+            val missingCnt = missingIdx.size
             val pCount = parityCoder?.parityCount ?: 0
             if (missingCnt > pCount) {
                 laneBlocks.forEach { it?.let(pool::release) }
                 throw CorruptedBlockException("Unrecoverable stripe – missing=$missingCnt, parity=$pCount")
             }
 
+            // 2) recover if needed
             if (missingCnt > 0 && parityCoder != null) {
                 for (pch in parityCh) {
                     val buf = pool.get(BLOCK_SIZE)
@@ -84,15 +91,52 @@ class AkkStripeReader(
                         pool.release(buf); parityBufs += null
                     }
                 }
-                for (i in laneBlocks.indices) {
-                    if (laneBlocks[i] == null) {
-                        laneBlocks[i] = parityCoder.decode(i, laneBlocks, parityBufs)
+
+                val erasureOnly = laneBlocks.asSequence()
+                    .filterNotNull()
+                    .all { verifyDataBlockCrc(it) }
+
+                when (val coder = parityCoder) {
+                    is RSParityCoder -> {
+                        if (!erasureOnly) {
+                            laneBlocks.forEach { it?.let(pool::release) }
+                            parityBufs.forEach { it?.let(pool::release) }
+                            throw CorruptedBlockException(
+                                "Non-erasure corruption detected. RSParityCoder cannot correct unknown-position errors."
+                            )
+                        }
+                        val recovered = coder.decodeAllErasures(laneBlocks, parityBufs)
+                        for ((idx, buf) in recovered) laneBlocks[idx] = buf
+                    }
+
+                    is RSErrorCorrectingParityCoder -> {
+                        val recovered = coder.decodeWithErrors(
+                            presentData = laneBlocks,
+                            presentParity = parityBufs,
+                            knownErasures = missingIdx.toIntArray()
+                        )
+                        for ((idx, buf) in recovered) laneBlocks[idx] = buf
+                    }
+
+                    else -> {
+                        if (!erasureOnly) {
+                            laneBlocks.forEach { it?.let(pool::release) }
+                            parityBufs.forEach { it?.let(pool::release) }
+                            throw CorruptedBlockException("Non-erasure corruption detected; unknown coder cannot correct errors.")
+                        }
+                        for (i in laneBlocks.indices) {
+                            if (laneBlocks[i] == null) {
+                                laneBlocks[i] = parityCoder.decode(i, laneBlocks, parityBufs)
+                            }
+                        }
                     }
                 }
             }
 
+            // 3) cleanup parity buffers
             parityBufs.forEach { it?.let(pool::release) }
 
+            // 4) unpack payloads
             val nonNullBlocks = laneBlocks.map { it ?: throw CorruptedBlockException("Corrupted stripe: unrecoverable lane") }
             val payloads = ArrayList<ByteBufferL>(64)
             for (blk in nonNullBlocks) {
@@ -127,6 +171,24 @@ class AkkStripeReader(
         return if (read == BLOCK_SIZE) {
             blk.flip(); true
         } else false
+    }
+
+    private fun verifyDataBlockCrc(block: ByteBufferL): Boolean {
+        return try {
+            if (block.capacity != BLOCK_SIZE) return false
+            val base = block.asReadOnlyByteBuffer()
+            val payloadLen = base.getInt(0) // LE
+            if (payloadLen < 0 || payloadLen > PAYLOAD_LIMIT) return false
+
+            crc32c.reset()
+            val region = base.duplicate().apply { position(0); limit(4 + payloadLen) }
+            crc32c.update(region)
+            val calc = crc32c.value.toInt()
+            val stored = base.getInt(PAYLOAD_LIMIT + 4) // end-4
+            calc == stored
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun close() {

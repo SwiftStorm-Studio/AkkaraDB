@@ -199,6 +199,73 @@ class RSParityCoder(
         return out
     }
 
+    fun decodeAllErasures(
+        presentData: List<ByteBufferL?>,
+        presentParity: List<ByteBufferL?>
+    ): List<Pair<Int, ByteBufferL>> {
+        val k = presentData.size
+        val m = parityCount
+        require(presentParity.size == m) { "expected $m parity blocks, got ${presentParity.size}" }
+        require(k + m <= 255) { "RS(8) requires n=k+m ≤ 255; got k=$k, m=$m" }
+
+        val missing = presentData.withIndex().filter { it.value == null }.map { it.index }
+        require(missing.isNotEmpty()) { "nothing to decode" }
+        require(missing.size <= m) { "too many erasures: ${missing.size} > m=$m" }
+
+        presentData.forEach { d -> require(d == null || d.remaining == BLOCK_SIZE) { "bad data size" } }
+        presentParity.forEach { p -> require(p == null || p.remaining == BLOCK_SIZE) { "bad parity size" } }
+
+        val e = missing.size
+        val missingSet = missing.toHashSet()
+        val knownIdx = (0 until k).filter { it !in missingSet }
+
+        val availParityRows = presentParity.withIndex().filter { it.value != null }.map { it.index }
+        require(availParityRows.size >= e) { "need at least e=$e parity rows, but only ${availParityRows.size} are available" }
+        val J = IntArray(e) { availParityRows[it] }
+
+        // a(J[r], knownIdx[c])
+        val M = Array(e) { IntArray(e) }
+        for (r in 0 until e) {
+            val jrow = J[r]
+            for (c in 0 until e) {
+                val i = knownIdx[c]
+                M[r][c] = coeffA(jrow, i)
+            }
+        }
+        val inv = invertMatrix(M)
+
+        val recovered = Array(e) { Pools.io().get(BLOCK_SIZE).apply { clear() } }
+
+        for (pos in 0 until BLOCK_SIZE) {
+            val S = IntArray(e)
+            for (r in 0 until e) {
+                val jrow = J[r]
+                val p = presentParity[jrow]!!
+                var accumKnown = 0
+                for (i in knownIdx) {
+                    val a = coeffA(jrow, i)
+                    val d = presentData[i]!!.get(pos).toInt() and 0xFF
+                    accumKnown = accumKnown xor (mulLUT[(a shl 8) or d].toInt() and 0xFF)
+                }
+                val pr = p.get(pos).toInt() and 0xFF
+                S[r] = pr xor accumKnown
+            }
+            for (t in 0 until e) {
+                var v = 0
+                for (c in 0 until e) {
+                    val ic = inv[t][c]
+                    if (ic != 0) v = v xor (mulLUT[(ic shl 8) or S[c]].toInt() and 0xFF)
+                }
+                recovered[t].put(pos, v.toByte())
+            }
+        }
+
+        return missing.indices.map { idx ->
+            recovered[idx].limit(BLOCK_SIZE).position(0)
+            missing[idx] to recovered[idx]
+        }
+    }
+
     /* ---------------- Small GF helpers ---------------- */
 
     // Gauss–Jordan elimination for small dense matrix over GF(256)
