@@ -5,6 +5,7 @@ import dev.swiftstorm.akkaradb.common.Record
 import dev.swiftstorm.akkaradb.common.hashOfRemaining
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -19,20 +20,22 @@ import kotlin.concurrent.write
  * - Optional hysteresis to avoid flush storms.
  */
 class MemTable(
-    private val shardCount: Int,
+    private val shardCount: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(2),
     /** target soft threshold per-shard in bytes */
     private val thresholdBytesPerShard: Long,
     /** called by flusher thread with a sealed batch */
-    private val onFlush: (List<Record>) -> Unit,
+    private val onFlush: (MutableList<Record>) -> Unit,
     threadName: String = "akkaradb-mem-flusher"
 ) {
     private val closed = AtomicBoolean(false)
     private val flusher: Flusher
     private val shards: Array<Shard>
 
+    private val seqGen = AtomicLong()
+
     init {
         require(shardCount >= 1)
-        val q = MpscQueue<List<Record>>()
+        val q = MpscQueue<MutableList<Record>>()
         this.flusher = Flusher(q, onFlush, threadName)
         this.shards = Array(shardCount) { idx ->
             Shard(
@@ -69,6 +72,10 @@ class MemTable(
         return shards[shardIdx].put(record)
     }
 
+    fun lastSeq(): Long = seqGen.get()
+
+    fun nextSeq(): Long = seqGen.incrementAndGet()
+
     /** Hint to flush; non-blocking. */
     fun flush() {
         shards.forEach { it.maybeSealAndEnqueue() }
@@ -83,7 +90,7 @@ class MemTable(
     // ---------------------------------------------------------------------
     private class Shard(
         private val shardId: Int,
-        private val queue: MpscQueue<List<Record>>, // N:1 to flusher
+        private val queue: MpscQueue<MutableList<Record>>, // N:1 to flusher
         private val softThresholdBytes: Long,
     ) {
         private val lock = ReentrantReadWriteLock()
@@ -206,8 +213,8 @@ class MemTable(
     // Flusher (single thread)
     // ---------------------------------------------------------------------
     private class Flusher(
-        private val queue: MpscQueue<List<Record>>,
-        private val sink: (List<Record>) -> Unit,
+        private val queue: MpscQueue<MutableList<Record>>,
+        private val sink: (MutableList<Record>) -> Unit,
         threadName: String
     ) {
         private val running = AtomicBoolean(true)

@@ -109,6 +109,7 @@ class AkkaraDB private constructor(
      * For debugging and testing only.
      */
     @PublishedApi
+    @Deprecated("unsafe: does not write to WAL", level = DeprecationLevel.WARNING)
     internal fun putUnsafeNoWal(rec: Record) {
         val kStore = rec.key.duplicate().apply { rewind() }.asReadOnly()
         val vStore = rec.value.duplicate().apply { rewind() }.asReadOnly()
@@ -222,7 +223,7 @@ class AkkaraDB private constructor(
             if (levels.isEmpty()) levels += ConcurrentLinkedDeque<SSTableReader>()
 
             val mem = MemTable(
-                flushThresholdBytes,
+                thresholdBytesPerShard = flushThresholdBytes,
                 onFlush = { records ->
                     if (records.isEmpty()) {
                         manifest.checkpoint("memFlush-empty")
@@ -262,16 +263,6 @@ class AkkaraDB private constructor(
                     manifest.checkpoint("memFlush")
 
                     checkNotNull(levels[0].first().get(records.first().key)) { "SST get() failed just after flush!" }
-                },
-                onEvict = { records ->
-                    for (r in records) {
-                        val need = AkkRecordWriter.computeMaxSize(r)
-                        pool.borrow(need) { tmp ->
-                            AkkRecordWriter.write(r, tmp)
-                            tmp.flip()
-                            packer.addRecord(tmp.slice())
-                        }
-                    }
                 }
             )
 
