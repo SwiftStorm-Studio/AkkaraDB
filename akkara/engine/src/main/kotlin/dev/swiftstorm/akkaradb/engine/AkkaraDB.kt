@@ -1,3 +1,5 @@
+@file:Suppress("ReplaceCallWithBinaryOperator")
+
 package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.*
@@ -84,6 +86,74 @@ class AkkaraDB private constructor(
         }
 
     fun get(key: ByteBufferL): Record? = getRecordLatest(key)
+
+    fun scanRange(
+        startKeyInclusive: ByteBufferL,
+        endKeyExclusive: ByteBufferL? = null,
+        limit: Long? = null
+    ): Sequence<Record> = sequence {
+        val memSnapshot = memTable.getAll()
+            .asSequence()
+            .filter { r ->
+                val geStart = r.key.compareTo(startKeyInclusive) >= 0
+                val ltEnd = endKeyExclusive?.let { r.key.compareTo(it) < 0 } ?: true
+                geStart && ltEnd
+            }
+            .sortedWith { a, b -> a.key.compareTo(b.key) } // unsigned lex
+            .iterator()
+
+        val iters = ArrayList<Iterator<Record>>()
+        iters += memSnapshot
+        lock.read {
+            for (dq in levels) for (sst in dq) {
+                iters += sst.scanRange(startKeyInclusive, endKeyExclusive)
+            }
+        }
+
+        data class Entry(val rec: Record, val src: Int)
+
+        val heap = PriorityQueue<Entry> { a, b ->
+            val kc = a.rec.key.compareTo(b.rec.key)
+            if (kc != 0) kc else b.rec.seqNo.compareTo(a.rec.seqNo)
+        }
+
+        val heads = ArrayList<Record?>(iters.size).apply { repeat(iters.size) { add(null) } }
+        for (i in iters.indices) if (iters[i].hasNext()) {
+            val r = iters[i].next()
+            heads[i] = r
+            heap += Entry(r, i)
+        }
+
+        var emitted = 0L
+        while (heap.isNotEmpty()) {
+            val first = heap.poll()
+            val curKey = first.rec.key
+
+            var best = first.rec
+            fun pushNextFromSrc(src: Int) {
+                if (iters[src].hasNext()) {
+                    val nr = iters[src].next()
+                    heads[src] = nr
+                    heap += Entry(nr, src)
+                } else {
+                    heads[src] = null
+                }
+            }
+            pushNextFromSrc(first.src)
+
+            while (heap.isNotEmpty() && heap.peek().rec.key.compareTo(curKey) == 0) {
+                val e = heap.poll()
+                if (e.rec.seqNo > best.seqNo) best = e.rec
+                pushNextFromSrc(e.src)
+            }
+
+            if (!best.isTombstone) {
+                yield(best)
+                emitted++
+                if (limit != null && emitted >= limit) return@sequence
+            }
+        }
+    }
 
     /* ───────── write‑path ───────── */
     fun put(rec: Record) {

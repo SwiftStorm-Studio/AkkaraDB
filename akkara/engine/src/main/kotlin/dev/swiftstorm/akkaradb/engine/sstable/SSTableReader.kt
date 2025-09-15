@@ -1,4 +1,4 @@
-@file:Suppress("DuplicatedCode")
+@file:Suppress("DuplicatedCode", "ReplaceCallWithBinaryOperator")
 
 package dev.swiftstorm.akkaradb.engine.sstable
 
@@ -120,6 +120,117 @@ class SSTableReader(
         return null
     }
 
+    fun scanRange(
+        startInclusive: ByteBufferL,
+        endExclusive: ByteBufferL? = null
+    ): Iterator<Record> = object : Iterator<Record> {
+        var idxPos: Int
+        var recPosInBlock = 0
+        var dataStart = 0
+        var offsets: IntArray = IntArray(0)
+        var payload: ByteBufferL? = null
+        var blockOff: Long = -1
+        var initialized = false
+
+        init {
+            val lb = index.lowerBound(startInclusive)
+            idxPos = (lb - 1).coerceAtLeast(0)
+        }
+
+        private fun loadBlockAt(off: Long): Boolean {
+            val len = readIntLE(ch, off)
+            if (len != BLOCK_SIZE) return false
+            val total = 4 + BLOCK_SIZE + 4
+            if (off + total > fileSize) return false
+
+            val mapped = mapRO(ch, off, total.toLong())
+            val p = ByteBufferL.wrap(mapped.slice().apply { position(4); limit(4 + BLOCK_SIZE) })
+            val stored = mapped.getInt(4 + BLOCK_SIZE)
+            crc32TL.get().run {
+                reset()
+                update(p.asReadOnlyByteBuffer().slice())
+                if (value.toInt() != stored) error("CRC mismatch @$off")
+            }
+            payload = p
+            offsets = miniIndexFor(off, p)
+            dataStart = p.position + 2 + 4 * offsets.size
+            recPosInBlock = 0
+            return true
+        }
+
+        private fun loadNextBlock(): Boolean {
+            payload = null
+            if (idxPos >= index.countEntries()) return false
+            blockOff = index.offsetAt(idxPos++)
+            return loadBlockAt(blockOff)
+        }
+
+        private fun seekWithinBlockToStart(): Boolean {
+            val p = payload ?: return false
+            var lo = 0
+            var hi = offsets.size - 1
+            var ans = offsets.size
+            while (lo <= hi) {
+                val mid = (lo + hi) ushr 1
+                val recPos = dataStart + offsets[mid]
+                val recBuf = p.duplicate().apply { position(recPos) }
+                val rec = AkkRecordReader.read(recBuf)
+                val cmp = rec.key.compareTo(startInclusive)
+                if (cmp < 0) lo = mid + 1 else {
+                    ans = mid; hi = mid - 1
+                }
+            }
+            recPosInBlock = ans
+            return recPosInBlock < offsets.size
+        }
+
+        private fun ensureInitialized(): Boolean {
+            if (initialized) return true
+            initialized = true
+
+            if (!loadNextBlock()) return false
+
+            if (!seekWithinBlockToStart()) {
+                while (loadNextBlock()) {
+                    if (seekWithinBlockToStart()) break
+                }
+            }
+            return payload != null
+        }
+
+        override fun hasNext(): Boolean {
+            if (!ensureInitialized()) return false
+
+            if (endExclusive != null && payload != null && recPosInBlock < offsets.size) {
+                val p = payload!!
+                val recPos = dataStart + offsets[recPosInBlock]
+                val recBuf = p.duplicate().apply { position(recPos) }
+                val next = AkkRecordReader.read(recBuf)
+                if (next.key >= endExclusive) return false
+            }
+
+            if (payload != null && recPosInBlock < offsets.size) return true
+
+            while (loadNextBlock()) {
+                recPosInBlock = 0
+                if (offsets.isNotEmpty()) return true
+            }
+            return false
+        }
+
+        override fun next(): Record {
+            if (!hasNext()) throw NoSuchElementException()
+            val p = payload!!
+            val recPos = dataStart + offsets[recPosInBlock++]
+            val recBuf = p.duplicate().apply { position(recPos) }
+            val r = AkkRecordReader.read(recBuf)
+            if (endExclusive != null && r.key.compareTo(endExclusive) >= 0) {
+                throw NoSuchElementException()
+            }
+            return r
+        }
+    }
+
     override fun iterator(): Iterator<Record> = object : Iterator<Record> {
         var idxPos = 0
         var recPosInBlock = 0
@@ -212,6 +323,20 @@ class SSTableReader(
             val pos = idx * ENTRY_SIZE + FIXED_KEY_SIZE
             val d = buf.duplicate().apply { position(pos) }
             return d.long
+        }
+
+        fun lowerBound(target: ByteBufferL): Int {
+            var lo = 0
+            var hi = countEntries() - 1
+            var ans = countEntries()
+            while (lo <= hi) {
+                val mid = (lo + hi) ushr 1
+                val cmp = compareKeyAt(mid, target)
+                if (cmp < 0) lo = mid + 1 else {
+                    ans = mid; hi = mid - 1
+                }
+            }
+            return ans
         }
 
         companion object {

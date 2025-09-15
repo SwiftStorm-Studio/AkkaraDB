@@ -142,7 +142,7 @@ class WalCfgBuilder(defaultPath: Path) {
  */
 class PackedTable<T : Any>(
     val db: AkkaraDB,
-    private val kClass: KClass<T>
+    internal val kClass: KClass<T>
 ) : Closeable {
 
     override fun close() {
@@ -170,7 +170,7 @@ class PackedTable<T : Any>(
 
     /* ───────── key helpers ───────── */
 
-    private fun keyBuf(id: String, uuid: ShortUUID): ByteBufferL {
+    internal fun keyBuf(id: String, uuid: ShortUUID): ByteBufferL {
         require(id.isAsciiNoSep()) { "ID must be ASCII and must not contain 0x1F: $id" }
 
         val rNs = nsBuf.duplicate().apply { rewind() }
@@ -183,7 +183,7 @@ class PackedTable<T : Any>(
         return out.asReadOnly() // LITTLE_ENDIAN
     }
 
-    private fun prefixBuf(id: String): ByteBufferL {
+    internal fun prefixBuf(id: String): ByteBufferL {
         require(id.isAsciiNoSep())
         val rNs = nsBuf.duplicate().apply { rewind() }
         val idBuf = StandardCharsets.US_ASCII.encode(id)
