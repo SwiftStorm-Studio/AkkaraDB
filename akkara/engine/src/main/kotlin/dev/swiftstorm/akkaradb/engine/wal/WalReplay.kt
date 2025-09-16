@@ -82,13 +82,15 @@ object WalReplay {
                     break
                 }
                 when (rec) {
-                    WalRecord.Seal -> {
+                    is WalRecord.Seal -> {
                         if (state == SegState.SEALED) error("WAL corrupted: consecutive Seal @ pos=$pos")
                         state = SegState.SEALED
                     }
 
                     is WalRecord.CheckPoint -> {
-                        if (state != SegState.SEALED) error("WAL corrupted: CheckPoint without Seal @ pos=$pos")
+                        if (state != SegState.SEALED) {
+                            if (pos != 0) error("WAL corrupted: CheckPoint without Seal @ pos=$pos")
+                        }
                         state = SegState.APPLY
                         if (rec.stripeIdx > startStripe || (rec.stripeIdx == startStripe && rec.seqNo >= startSeq)) {
                             safeOffset = buf.position()
@@ -121,7 +123,7 @@ object WalReplay {
                         applied++
                     }
 
-                    WalRecord.Seal -> {
+                    is WalRecord.Seal -> {
                         if (state == SegState.SEALED) error("WAL corrupted: consecutive Seal @ pos=$pos")
                         state = SegState.SEALED
                     }

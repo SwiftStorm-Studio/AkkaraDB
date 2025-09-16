@@ -8,7 +8,7 @@ import dev.swiftstorm.akkaradb.common.ShortUUID
 import dev.swiftstorm.akkaradb.common.internal.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPack
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPackBufferPool
-import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.RSErrorCorrectingParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import org.objenesis.ObjenesisStd
 import java.io.Closeable
@@ -32,18 +32,18 @@ object AkkDSL {
         return PackedTable(
             AkkaraDB.open(
                 baseDir,
-                cfg.k,
-                cfg.m,
-                cfg.parityCoder,
-                cfg.flushThreshold,
-                cfg.walCfg.dir,
-                cfg.walCfg.filePrefix,
-                cfg.walCfg.enableLog,
-                cfg.walCfg.fastMode,
-                cfg.walCfg.fsyncBatchN,
-                cfg.walCfg.fsyncIntervalMicros,
-                cfg.walCfg.queueCap,
-                cfg.walCfg.backoffNanos,
+                cfg.stripe.k,
+                cfg.stripe.autoFlush,
+                cfg.stripe.parityCoder,
+                cfg.stripe.flushThreshold,
+                cfg.wal.dir,
+                cfg.wal.filePrefix,
+                cfg.wal.enableLog,
+                cfg.wal.fastMode,
+                cfg.wal.fsyncBatchN,
+                cfg.wal.fsyncIntervalMicros,
+                cfg.wal.queueCap,
+                cfg.wal.backoffNanos,
                 cfg.metaCacheCap,
             ),
             T::class
@@ -55,61 +55,106 @@ object AkkDSL {
             this,
             T::class
         )
-
-    inline fun <T : Any> PackedTable<T>.close() {
-        db.close()
-    }
 }
 
-data class AkkDSLCfg(
-    val baseDir: Path,
+data class StripeCfg(
     val k: Int = 4,
     val m: Int = 2,
-    val parityCoder: ParityCoder = RSParityCoder(m),
-    val flushThreshold: Long = 32 * 1024 * 1024,
-    val metaCacheCap: Int = 1024,
-    val walCfg: WalCfg = WalCfg(baseDir.resolve("wal"))
+    val autoFlush: Boolean = true,
+    val parityCoder: ParityCoder = RSErrorCorrectingParityCoder(m),
+    val flushThreshold: Long = 128L * 1024 * 1024
 )
 
 data class WalCfg(
     val dir: Path,
     val filePrefix: String = "wal",
     val enableLog: Boolean = false,
-    val fastMode: Boolean = false,
-    val fsyncBatchN: Int = 32,
-    val fsyncIntervalMicros: Long = 4_000L,
-    val queueCap: Int = 8192,
-    val backoffNanos: Long = 1_000_000L
+    val fastMode: Boolean = true,
+    val fsyncBatchN: Int = 64,
+    val fsyncIntervalMicros: Long = 8_000,
+    val queueCap: Int = 16_384,
+    val backoffNanos: Long = 500_000
 )
 
-class AkkDSLCfgBuilder(private val baseDir: Path) {
+data class AkkDSLCfg(
+    val baseDir: Path,
+    val stripe: StripeCfg = StripeCfg(),
+    val metaCacheCap: Int = 1024,
+    val wal: WalCfg = WalCfg(baseDir.resolve("wal"))
+)
+
+enum class Preset { DURABLE, BALANCED, FAST }
+
+object AkkaraPresets {
+    fun of(baseDir: Path, preset: Preset): AkkDSLCfg = when (preset) {
+        Preset.DURABLE -> AkkDSLCfg(
+            baseDir,
+            stripe = StripeCfg(
+                k = 4, m = 2,
+                autoFlush = true,
+                flushThreshold = 128L * 1024 * 1024
+            ),
+            wal = WalCfg(
+                dir = baseDir.resolve("wal"),
+                fastMode = true,
+                fsyncBatchN = 64,
+                fsyncIntervalMicros = 8_000,
+                queueCap = 16_384,
+                backoffNanos = 500_000
+            )
+        )
+
+        Preset.BALANCED -> AkkDSLCfg(
+            baseDir,
+            stripe = StripeCfg(
+                k = 4, m = 2,
+                autoFlush = true,
+                flushThreshold = 256L * 1024 * 1024
+            ),
+            wal = WalCfg(
+                dir = baseDir.resolve("wal"),
+                fastMode = true,
+                fsyncBatchN = 256,
+                fsyncIntervalMicros = 12_000,
+                queueCap = 32_768,
+                backoffNanos = 400_000
+            )
+        )
+
+        Preset.FAST -> AkkDSLCfg(
+            baseDir,
+            stripe = StripeCfg(
+                k = 4, m = 2,
+                autoFlush = false,
+                flushThreshold = 512L * 1024 * 1024
+            ),
+            wal = WalCfg(
+                dir = baseDir.resolve("wal"),
+                fastMode = true,
+                fsyncBatchN = 4096,
+                fsyncIntervalMicros = 20_000,
+                queueCap = 1_000_000,
+                backoffNanos = 200_000
+            )
+        )
+    }
+}
+
+/* ==================== Builders ==================== */
+
+class StripeCfgBuilder {
     var k: Int = 4
     var m: Int = 2
+    var autoFlush: Boolean = true
     var parityCoder: ParityCoder? = null
-    var flushThreshold: Long = 32 * 1024 * 1024
-    var metaCacheCap: Int = 1024
+    var flushThreshold: Long = 128L * 1024 * 1024
 
-    private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
-
-    fun wal(block: WalCfgBuilder.() -> Unit) {
-        walBuilder.apply(block)
-    }
-
-    fun build(): AkkDSLCfg {
+    fun build(): StripeCfg {
         require(k >= 1) { "k must be >= 1" }
         require(m >= 1) { "m must be >= 1" }
         require(flushThreshold > 0) { "flushThreshold must be > 0" }
-
-        val pc = parityCoder ?: RSParityCoder(m)
-
-        return AkkDSLCfg(
-            baseDir = baseDir,
-            k = k,
-            m = m,
-            parityCoder = pc,
-            flushThreshold = flushThreshold,
-            walCfg = walBuilder.build()
-        )
+        val pc = parityCoder ?: RSErrorCorrectingParityCoder(m)
+        return StripeCfg(k, m, autoFlush, pc, flushThreshold)
     }
 }
 
@@ -117,13 +162,17 @@ class WalCfgBuilder(defaultPath: Path) {
     var dir: Path = defaultPath
     var filePrefix: String = "wal"
     var enableLog: Boolean = false
-    var fastMode: Boolean = false
-    var fsyncBatchN: Int = 32
-    var fsyncIntervalMicros: Long = 4_000L
-    var queueCap: Int = 8192
-    var backoffNanos: Long = 1_000_000L
+    var fastMode: Boolean = true           // Durable既定に合わせる
+    var fsyncBatchN: Int = 64
+    var fsyncIntervalMicros: Long = 8_000
+    var queueCap: Int = 16_384
+    var backoffNanos: Long = 500_000
 
     fun build(): WalCfg {
+        require(fsyncBatchN >= 1) { "fsyncBatchN must be >= 1" }
+        require(fsyncIntervalMicros >= 0) { "fsyncIntervalMicros must be >= 0" }
+        require(queueCap >= 1) { "queueCap must be >= 1" }
+        require(backoffNanos >= 0) { "backoffNanos must be >= 0" }
         return WalCfg(
             dir = dir,
             filePrefix = filePrefix,
@@ -135,6 +184,67 @@ class WalCfgBuilder(defaultPath: Path) {
             backoffNanos = backoffNanos
         )
     }
+}
+
+class AkkDSLCfgBuilder(private val baseDir: Path) {
+    var metaCacheCap: Int = 1024
+
+    private val stripeBuilder = StripeCfgBuilder()
+    private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
+
+    /** Stripe 設定ブロック */
+    fun stripe(block: StripeCfgBuilder.() -> Unit) {
+        stripeBuilder.apply(block)
+    }
+
+    fun wal(block: WalCfgBuilder.() -> Unit) {
+        walBuilder.apply(block)
+    }
+
+    fun build(): AkkDSLCfg {
+        val stripe = stripeBuilder.build()
+        val wal = walBuilder.build()
+        return AkkDSLCfg(
+            baseDir = baseDir,
+            stripe = stripe,
+            metaCacheCap = metaCacheCap,
+            wal = wal
+        )
+    }
+
+    /* ------- 旧API互換（非推奨）：必要なら残す。使わないなら削除でOK ------- */
+
+    @Deprecated("Use stripe { k = ... }")
+    var k: Int
+        get() = stripeBuilder.k
+        set(value) {
+            stripeBuilder.k = value
+        }
+
+    @Deprecated("Use stripe { m = ... }")
+    var m: Int
+        get() = stripeBuilder.m
+        set(value) {
+            stripeBuilder.m = value
+        }
+
+    @Deprecated("Use stripe { parityCoder = ... }")
+    var parityCoder: ParityCoder?
+        get() = stripeBuilder.parityCoder
+        set(value) {
+            stripeBuilder.parityCoder = value
+        }
+
+    @Deprecated("Use stripe { flushThreshold = ... }")
+    var flushThreshold: Long
+        get() = stripeBuilder.flushThreshold
+        set(value) {
+            stripeBuilder.flushThreshold = value
+        }
+
+    @Deprecated("Use wal { ... }")
+    val walCfgBuilder: WalCfgBuilder
+        get() = walBuilder
 }
 
 /**

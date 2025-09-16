@@ -15,7 +15,6 @@ import dev.swiftstorm.akkaradb.format.akk.AkkBlockPackerDirect
 import dev.swiftstorm.akkaradb.format.akk.AkkRecordWriter
 import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
 import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
-import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
@@ -251,28 +250,27 @@ class AkkaraDB private constructor(
 
         fun open(
             baseDir: Path,
-            k: Int = 4,
-            m: Int = 2,
-            parityCoder: ParityCoder = RSParityCoder(m),
-            // 32 * 1024 * 1024 = 32 MiB
-            flushThresholdBytes: Long = 32L * 1024 * 1024,
-            walDir: Path = baseDir.resolve("wal"),
-            walFilePrefix: String = "wal",
-            walEnableLog: Boolean = false,
-            walFastMode: Boolean = false,
-            walFsyncBatchN: Int? = null, // 32
-            walFsyncIntervalMicros: Long? = null, //4_000L 4000 micros = 4 ms
-            walQueueCapacity: Int = 8192,
-            walBackoffNanos: Long = 1_000_000L, // 1 ms
-            metaCacheCap: Int = 1024,
+            stripeK: Int,
+            stripeAutoFlush: Boolean,
+            parityCoder: ParityCoder,
+            flushThresholdBytes: Long,
+            walDir: Path,
+            walFilePrefix: String,
+            walEnableLog: Boolean,
+            walFastMode: Boolean,
+            walFsyncBatchN: Int?,
+            walFsyncIntervalMicros: Long?, //4_000L 4000 micros = 4 ms
+            walQueueCapacity: Int,
+            walBackoffNanos: Long,
+            metaCacheCap: Int,
         ): AkkaraDB {
             val manifest = AkkManifest(baseDir.resolve("manifest.json"))
             manifest.load()
             val stripe = AkkStripeWriter(
                 baseDir,
-                k,
+                stripeK,
                 parityCoder,
-                autoFlush = true,
+                autoFlush = stripeAutoFlush,
                 onCommit = { committed -> manifest.advance(committed) }
             )
             val wal = WalWriter(
@@ -305,7 +303,7 @@ class AkkaraDB private constructor(
                     val sstPath = baseDir.resolve("sst_${System.nanoTime()}.aksst")
                     SSTableWriter(sstPath, pool).use { it.write(records) }
 
-                    if (records.size >= k) {
+                    if (records.size >= stripeK) {
                         for (r in records) {
                             val need = AkkRecordWriter.computeMaxSize(r)
                             pool.borrow(need) { tmp ->

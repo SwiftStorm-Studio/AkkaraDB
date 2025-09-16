@@ -92,38 +92,36 @@ class WalWriter(
         check(running.get()) { "WalWriter is closed" }
         val lsn = nextLsn.incrementAndGet()
         val len = payload.remaining
-        val total = Hdr.TAG + Hdr.LSN + Hdr.LEN + len
+
+        val payloadRO = payload.asReadOnly()
+        val crc = java.util.zip.CRC32C().apply {
+            update(payloadRO.asReadOnlyByteBuffer().duplicate())
+        }.value.toInt()
+
+        val total = Hdr.TAG + Hdr.LSN + Hdr.LEN + len + 4
 
         val buf = io.get(total)
         buf.put(Tag.ADD)
         buf.putLong(lsn)
         buf.putInt(len)
-        buf.put(payload.asReadOnly())
+        buf.put(payloadRO)
+        buf.putInt(crc)
         buf.flip()
 
         if (fastMode) {
-            // Enqueue without fsync; bounded queue with light backpressure.
             val op: () -> Unit = {
                 synchronized(writeLock) { writeFully(buf) }
                 io.release(buf)
             }
-            // offer with light retry until accepted or writer is closed
             while (running.get() && !(queue!!.offer(op))) {
-                // optional short timeout-based offer; uncomment if preferred over parkNanos:
-                // if (queue.offer(op, 200, TimeUnit.MICROSECONDS)) break
                 LockSupport.parkNanos(backoffNanos)
             }
             if (!running.get()) {
-                // writer closed while waiting; ensure buffer is released
-                io.release(buf)
-                throw IllegalStateException("WalWriter is closed")
+                io.release(buf); throw IllegalStateException("WalWriter is closed")
             }
         } else {
             try {
-                synchronized(writeLock) {
-                    writeFully(buf)
-                    force()
-                }
+                synchronized(writeLock) { writeFully(buf); force() }
             } finally {
                 io.release(buf)
             }
