@@ -10,8 +10,6 @@ import java.nio.file.StandardOpenOption.READ
 import kotlin.math.max
 
 object WalReplay {
-    val SEG_REGEX = Regex("""(?i)wal[-_]?(\d+)\.(akw|wal|log)$""")
-
     data class Result(
         val applied: Long,
         val lastStripe: Long,
@@ -20,17 +18,23 @@ object WalReplay {
     )
 
     @JvmStatic
-    fun replay(dirOrFile: Path, mem: MemTable, startStripe: Long = 0L, startSeq: Long = Long.MIN_VALUE): Result {
+    fun replay(
+        dirOrFile: Path,
+        mem: MemTable,
+        prefix: String,
+        startStripe: Long = 0L,
+        startSeq: Long = Long.MIN_VALUE
+    ): Result {
         return if (Files.isRegularFile(dirOrFile)) {
             val r = replayOne(dirOrFile, mem, startStripe, startSeq)
             Result(r.applied, r.lastStripe, r.lastSeq, segmentsVisited = 1)
         } else {
-            val segs = Files.list(dirOrFile).use { s ->
-                s.filter { Files.isRegularFile(it) }
-                    .filter { matchesWal(it) }
-                    .toList()
-                    .sortedBy { segmentId(it) ?: Long.MIN_VALUE }
-            }
+            val segs: List<Path> = Files.list(dirOrFile).use { s ->
+                s.toList()
+            }.filter { Files.isRegularFile(it) }
+                .mapNotNull { p -> WalNaming.parseIndex(prefix, p.fileName.toString())?.let { idx -> idx to p } }
+                .sortedBy { it.first }
+                .map { it.second }
 
             var curStripe = startStripe
             var curSeq = startSeq
@@ -44,16 +48,6 @@ object WalReplay {
             }
             Result(totalApplied, curStripe, curSeq, segmentsVisited = segs.size)
         }
-    }
-
-    private fun matchesWal(path: Path): Boolean {
-        val name = path.fileName.toString()
-        return SEG_REGEX.containsMatchIn(name)
-    }
-
-    private fun segmentId(path: Path): Long? {
-        val m = SEG_REGEX.matchEntire(path.fileName.toString()) ?: return null
-        return m.groupValues[1].toLongOrNull()
     }
 
     // ──────────────────────────── per-file replay ────────────────────────────

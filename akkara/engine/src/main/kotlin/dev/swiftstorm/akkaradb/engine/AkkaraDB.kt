@@ -338,10 +338,11 @@ class AkkaraDB private constructor(
 
             val cp = manifest.lastCheckpoint
             WalReplay.replay(
-                walDir,
-                mem,
-                cp?.stripe ?: 0L,
-                cp?.lastSeq ?: Long.MIN_VALUE
+                dirOrFile = walDir,
+                mem = mem,
+                prefix = walFilePrefix,
+                startStripe = cp?.stripe ?: 0L,
+                startSeq = cp?.lastSeq ?: Long.MIN_VALUE
             )
 
             val compactor = Compactor(levels, baseDir, manifest, pool = pool).also { it.maybeCompact() }

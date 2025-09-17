@@ -2,7 +2,8 @@ package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.engine.wal.WalReplay.SEG_REGEX
+import dev.swiftstorm.akkaradb.engine.wal.WalNaming.fileName
+import dev.swiftstorm.akkaradb.engine.wal.WalNaming.parseIndex
 import java.io.Closeable
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -178,7 +179,8 @@ class WalWriter(
 
     /** Delete WAL segments older than last checkpoint. */
     fun pruneObsoleteSegments() {
-        val keepFrom = lastCheckpointSegIdx ?: return
+        val base = lastCheckpointSegIdx ?: return
+        val keepFrom = (base - 1).coerceAtLeast(0)
         synchronized(writeLock) {
             Files.list(dir).use { stream ->
                 stream.filter { p ->
@@ -238,19 +240,19 @@ class WalWriter(
     }
 
     private fun segmentPath(idx: Int): Path =
-        dir.resolve("${prefix()}_${idx.toString().padStart(6, '0')}.log")
+        dir.resolve(fileName(prefix(), idx))
 
     private fun prefix() = filePrefix
 
     private fun scanLatestSegmentIndex(dir: Path, prefix: String): Int {
-        if (dir.notExists()) return 0
-        var maxIdx = 0
+        if (dir.notExists()) return -1
+        var maxIdx = -1
         Files.list(dir).use { stream ->
             stream.filter { p ->
                 val n = p.fileName.toString()
-                n.startsWith(prefix) && n.endsWith(".log")
+                n.startsWith(prefix) && (n.endsWith(".log") || n.endsWith(".wal") || n.endsWith(".akw"))
             }.forEach { p ->
-                parseSegmentIndex(p.fileName.toString())?.let { idx ->
+                parseIndex(prefix, p.fileName.toString())?.let { idx ->
                     if (idx > maxIdx) maxIdx = idx
                 }
             }
@@ -259,7 +261,7 @@ class WalWriter(
     }
 
     private fun parseSegmentIndex(name: String): Int? =
-        SEG_REGEX.matchEntire(name)?.groupValues?.get(1)?.toIntOrNull()
+        parseIndex(prefix(), name)
 
     private inline fun lg(crossinline msg: () -> String) {
         if (enableLog) println("[WAL] ${msg()}")

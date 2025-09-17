@@ -9,6 +9,7 @@ import dev.swiftstorm.akkaradb.common.internal.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPack
 import dev.swiftstorm.akkaradb.common.internal.binpack.BinPackBufferPool
 import dev.swiftstorm.akkaradb.format.akk.parity.RSErrorCorrectingParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import org.objenesis.ObjenesisStd
 import java.io.Closeable
@@ -49,6 +50,27 @@ object AkkDSL {
             T::class
         )
     }
+
+    inline fun <reified T : Any> open(cfg: AkkDSLCfg): PackedTable<T> =
+        PackedTable(
+            AkkaraDB.open(
+                cfg.baseDir,
+                cfg.stripe.k,
+                cfg.stripe.autoFlush,
+                cfg.stripe.parityCoder,
+                cfg.stripe.flushThreshold,
+                cfg.wal.dir,
+                cfg.wal.filePrefix,
+                cfg.wal.enableLog,
+                cfg.wal.fastMode,
+                cfg.wal.fsyncBatchN,
+                cfg.wal.fsyncIntervalMicros,
+                cfg.wal.queueCap,
+                cfg.wal.backoffNanos,
+                cfg.metaCacheCap,
+            ),
+            T::class
+        )
 
     inline fun <reified T : Any> AkkaraDB.open(): PackedTable<T> =
         PackedTable(
@@ -92,6 +114,7 @@ object AkkaraPresets {
             stripe = StripeCfg(
                 k = 4, m = 2,
                 autoFlush = true,
+                parityCoder = RSParityCoder(2),
                 flushThreshold = 128L * 1024 * 1024
             ),
             wal = WalCfg(
@@ -192,7 +215,6 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
     private val stripeBuilder = StripeCfgBuilder()
     private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
 
-    /** Stripe 設定ブロック */
     fun stripe(block: StripeCfgBuilder.() -> Unit) {
         stripeBuilder.apply(block)
     }
@@ -211,40 +233,6 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
             wal = wal
         )
     }
-
-    /* ------- 旧API互換（非推奨）：必要なら残す。使わないなら削除でOK ------- */
-
-    @Deprecated("Use stripe { k = ... }")
-    var k: Int
-        get() = stripeBuilder.k
-        set(value) {
-            stripeBuilder.k = value
-        }
-
-    @Deprecated("Use stripe { m = ... }")
-    var m: Int
-        get() = stripeBuilder.m
-        set(value) {
-            stripeBuilder.m = value
-        }
-
-    @Deprecated("Use stripe { parityCoder = ... }")
-    var parityCoder: ParityCoder?
-        get() = stripeBuilder.parityCoder
-        set(value) {
-            stripeBuilder.parityCoder = value
-        }
-
-    @Deprecated("Use stripe { flushThreshold = ... }")
-    var flushThreshold: Long
-        get() = stripeBuilder.flushThreshold
-        set(value) {
-            stripeBuilder.flushThreshold = value
-        }
-
-    @Deprecated("Use wal { ... }")
-    val walCfgBuilder: WalCfgBuilder
-        get() = walBuilder
 }
 
 /**
