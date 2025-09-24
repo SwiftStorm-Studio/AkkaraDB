@@ -54,13 +54,13 @@ value class ByteBufferL private constructor(
 
     companion object {
         /**
-         * Wraps an existing [ByteBuffer] **without mutating** its state for the caller.
+         * Wraps an existing [ByteBuffer] without modifying it.
          *
-         * Internally performs `buf.duplicate()` and applies `order(LITTLE_ENDIAN)` to the duplicate,
-         * ensuring a LE view while keeping the original buffer untouched.
+         * The provided buffer's byte order is not changed; instead a `duplicate()` is made and
+         * `order(LITTLE_ENDIAN)` is applied to the duplicate before wrapping it.
          *
-         * @param buf the source buffer to wrap
-         * @return an [ByteBufferL] whose underlying buffer is a LE-ordered duplicate of [buf]
+         * @param buf the buffer to wrap
+         * @return a new LE-enforcing view around a duplicate of [buf]
          */
         fun wrap(buf: ByteBuffer): ByteBufferL {
             buf.order(ByteOrder.LITTLE_ENDIAN)
