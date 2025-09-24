@@ -1,9 +1,8 @@
 package dev.swiftstorm.akkaradb.engine.util
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.getByteBuffer
 import java.lang.Long.rotateLeft
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.channels.ReadableByteChannel
 import java.nio.channels.WritableByteChannel
 import kotlin.math.ceil
@@ -45,9 +44,9 @@ class BloomFilter private constructor(
     fun byteSize(): Int = bitset.size * 8
 
     fun writeTo(ch: WritableByteChannel) {
-        val buf = ByteBuffer.allocate(byteSize()).order(ByteOrder.LITTLE_ENDIAN)
-        buf.asLongBuffer().put(bitset)
-        ch.write(buf.flip())
+        val buf = ByteBufferL.allocate(byteSize())
+        buf.putLongs(bitset)
+        ch.write(buf.toMutableByteBuffer().flip())
     }
 
     /* ───────── companion ───────── */
@@ -56,18 +55,18 @@ class BloomFilter private constructor(
             return Builder(expectedInsertions, fpRate)
         }
 
-        /** Deserialize from a mapped/read‑only [ByteBuffer]. */
-        fun readFrom(buf: ByteBuffer, hashCount: Int): BloomFilter {
-            require(buf.remaining() % 8 == 0) { "Bloom bitset size must be multiple of 8" }
-            val longs = LongArray(buf.remaining() / 8) { buf.long }
+        /** Deserialize from a mapped/read‑only [ByteBufferL]. */
+        fun readFrom(buf: ByteBufferL, hashCount: Int): BloomFilter {
+            require(buf.remaining % 8 == 0) { "Bloom bitset size must be multiple of 8" }
+            val longs = LongArray(buf.remaining / 8) { buf.long }
             val bits = longs.size * 64
             return BloomFilter(bits, hashCount, longs)
         }
 
         /** Deserialize when the byte length is known but not mapped yet (e.g. FileChannel). */
         fun readFrom(ch: ReadableByteChannel, bytes: Int, hashCount: Int): BloomFilter {
-            val buf = ByteBuffer.allocate(bytes)
-            while (buf.hasRemaining()) ch.read(buf)
+            val buf = ByteBufferL.allocate(bytes)
+            while (buf.hasRemaining()) ch.read(buf.getByteBuffer())
             buf.flip()
             return readFrom(buf, hashCount)
         }

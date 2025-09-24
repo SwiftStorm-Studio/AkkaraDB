@@ -70,7 +70,7 @@ class SSTableReader(
         val hcBuf: MappedByteBuffer = mapRO(ch, bloomOff + bloomSize, 4)
         val hashCount = hcBuf.int
         require(hashCount > 0) { "invalid bloom hashCount: $hashCount" }
-        bloom = BloomFilter.readFrom(bloomBuf, hashCount)
+        //TODO:  bloom = BloomFilter.readFrom(bloomBuf, hashCount)
 
         // Index
         val indexSize = (bloomOff - indexOff).toInt()
@@ -80,6 +80,7 @@ class SSTableReader(
     }
 
     fun get(key: ByteBufferL): Record? {
+        if (!bloom.mightContain(key)) return null
         val off = index.lookup(key) ?: return null
 
         // Always BLOCK_SIZE padded block

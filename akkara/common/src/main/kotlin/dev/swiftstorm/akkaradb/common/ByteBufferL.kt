@@ -6,6 +6,7 @@ import dev.swiftstorm.akkaradb.common.ByteBufferL.Companion.allocate
 import dev.swiftstorm.akkaradb.common.ByteBufferL.Companion.wrap
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.LongBuffer
 import java.nio.ReadOnlyBufferException
 import kotlin.math.min
 
@@ -376,9 +377,42 @@ value class ByteBufferL private constructor(
         b.putInt(v); return this
     }
 
+    inline fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
+        require(off >= 0 && len >= 0 && off + len <= src.size) { "bad range" }
+        require((b.position() and 3) == 0) { "position must be 4-byte aligned" }
+        requireRemaining(len * 4)
+
+        val view = b.duplicate()
+        val start = view.position()
+        view.limit(start + len * 4)
+        val ib: java.nio.IntBuffer = view.slice().order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+
+        ib.put(src, off, len)
+
+        b.position(start + len * 4)
+        return this
+    }
+
     /** Puts a little-endian `long`. */
     inline fun putLong(v: Long): ByteBufferL {
         b.putLong(v); return this
+    }
+
+    /** Puts multiple little-endian `long`s from [src] starting at [off] for [len] elements. */
+    inline fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
+        require(off >= 0 && len >= 0 && off + len <= src.size) { "bad range" }
+        require((b.position() and 7) == 0) { "position must be 8-byte aligned" }
+        requireRemaining(len * 8)
+
+        val view = b.duplicate()
+        val start = view.position()
+        view.limit(start + len * 8)
+        val lb: LongBuffer = view.slice().order(ByteOrder.LITTLE_ENDIAN).asLongBuffer()
+
+        lb.put(src, off, len)
+
+        b.position(start + len * 8)
+        return this
     }
 
     /** Puts a little-endian `float`. */
