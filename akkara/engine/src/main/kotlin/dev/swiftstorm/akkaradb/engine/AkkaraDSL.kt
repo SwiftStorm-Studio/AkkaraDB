@@ -30,45 +30,18 @@ object AkkDSL {
         configure: AkkDSLCfgBuilder.() -> Unit = {}
     ): PackedTable<T> {
         val cfg = AkkDSLCfgBuilder(baseDir).apply(configure).build()
-        return PackedTable(
-            AkkaraDB.open(
-                baseDir,
-                cfg.stripe.k,
-                cfg.stripe.autoFlush,
-                cfg.stripe.parityCoder,
-                cfg.stripe.flushThreshold,
-                cfg.wal.dir,
-                cfg.wal.filePrefix,
-                cfg.wal.enableLog,
-                cfg.wal.fastMode,
-                cfg.wal.fsyncBatchN,
-                cfg.wal.fsyncIntervalMicros,
-                cfg.wal.queueCap,
-                cfg.wal.backoffNanos,
-                cfg.metaCacheCap,
-            ),
-            T::class
-        )
+        return open(cfg)
     }
+
+    inline fun <reified T : Any> open(
+        baseDir: Path,
+        mode: StartupMode,
+        customize: AkkDSLCfgBuilder.() -> Unit = {}
+    ): PackedTable<T> = open(AkkaraPresets.of(baseDir, mode, customize))
 
     inline fun <reified T : Any> open(cfg: AkkDSLCfg): PackedTable<T> =
         PackedTable(
-            AkkaraDB.open(
-                cfg.baseDir,
-                cfg.stripe.k,
-                cfg.stripe.autoFlush,
-                cfg.stripe.parityCoder,
-                cfg.stripe.flushThreshold,
-                cfg.wal.dir,
-                cfg.wal.filePrefix,
-                cfg.wal.enableLog,
-                cfg.wal.fastMode,
-                cfg.wal.fsyncBatchN,
-                cfg.wal.fsyncIntervalMicros,
-                cfg.wal.queueCap,
-                cfg.wal.backoffNanos,
-                cfg.metaCacheCap,
-            ),
+            AkkaraDB.open(cfg),
             T::class
         )
 
@@ -92,8 +65,8 @@ data class WalCfg(
     val filePrefix: String = "wal",
     val enableLog: Boolean = false,
     val fastMode: Boolean = true,
-    val fsyncBatchN: Int = 64,
-    val fsyncIntervalMicros: Long = 8_000,
+    val fsyncBatchN: Int? = 64,
+    val fsyncIntervalMicros: Long? = 8_000L,
     val queueCap: Int = 16_384,
     val backoffNanos: Long = 500_000
 )
@@ -105,61 +78,78 @@ data class AkkDSLCfg(
     val wal: WalCfg = WalCfg(baseDir.resolve("wal"))
 )
 
-enum class Preset { DURABLE, BALANCED, FAST }
+enum class StartupMode { FAST, NORMAL, DURABLE, CUSTOM }
 
 object AkkaraPresets {
-    fun of(baseDir: Path, preset: Preset): AkkDSLCfg = when (preset) {
-        Preset.DURABLE -> AkkDSLCfg(
-            baseDir,
-            stripe = StripeCfg(
-                k = 4, m = 2,
-                autoFlush = true,
-                parityCoder = RSParityCoder(2),
-                flushThreshold = 128L * 1024 * 1024
-            ),
-            wal = WalCfg(
-                dir = baseDir.resolve("wal"),
-                fastMode = true,
-                fsyncBatchN = 64,
-                fsyncIntervalMicros = 8_000,
-                queueCap = 16_384,
-                backoffNanos = 500_000
-            )
-        )
+    fun of(
+        baseDir: Path,
+        mode: StartupMode,
+        customize: AkkDSLCfgBuilder.() -> Unit = {}
+    ): AkkDSLCfg {
+        val builder = AkkDSLCfgBuilder(baseDir)
+        when (mode) {
+            StartupMode.FAST -> builder.configureFast()
+            StartupMode.NORMAL -> builder.configureNormal()
+            StartupMode.DURABLE -> builder.configureDurable()
+            StartupMode.CUSTOM -> {}
+        }
+        builder.apply(customize)
+        return builder.build()
+    }
+}
 
-        Preset.BALANCED -> AkkDSLCfg(
-            baseDir,
-            stripe = StripeCfg(
-                k = 4, m = 2,
-                autoFlush = true,
-                flushThreshold = 256L * 1024 * 1024
-            ),
-            wal = WalCfg(
-                dir = baseDir.resolve("wal"),
-                fastMode = true,
-                fsyncBatchN = 256,
-                fsyncIntervalMicros = 12_000,
-                queueCap = 32_768,
-                backoffNanos = 400_000
-            )
-        )
+private fun AkkDSLCfgBuilder.configureDurable() {
+    metaCacheCap = 1024
+    stripe {
+        k = 4
+        m = 2
+        autoFlush = true
+        parityCoder = RSParityCoder(2)
+        flushThreshold = 128L * 1024 * 1024
+    }
+    wal {
+        fastMode = false
+        enableLog = false
+        fsyncBatchN = 1
+        fsyncIntervalMicros = 8_000L
+        queueCap = 16_384
+        backoffNanos = 500_000
+    }
+}
 
-        Preset.FAST -> AkkDSLCfg(
-            baseDir,
-            stripe = StripeCfg(
-                k = 4, m = 2,
-                autoFlush = false,
-                flushThreshold = 512L * 1024 * 1024
-            ),
-            wal = WalCfg(
-                dir = baseDir.resolve("wal"),
-                fastMode = true,
-                fsyncBatchN = 4096,
-                fsyncIntervalMicros = 20_000,
-                queueCap = 1_000_000,
-                backoffNanos = 200_000
-            )
-        )
+private fun AkkDSLCfgBuilder.configureNormal() {
+    metaCacheCap = 2048
+    stripe {
+        k = 4
+        m = 2
+        autoFlush = true
+        flushThreshold = 256L * 1024 * 1024
+    }
+    wal {
+        fastMode = true
+        enableLog = false
+        fsyncBatchN = 256
+        fsyncIntervalMicros = 12_000L
+        queueCap = 32_768
+        backoffNanos = 400_000
+    }
+}
+
+private fun AkkDSLCfgBuilder.configureFast() {
+    metaCacheCap = 4096
+    stripe {
+        k = 4
+        m = 1
+        autoFlush = false
+        parityCoder = RSParityCoder(1)
+        flushThreshold = 1L * 1024 * 1024 * 1024
+    }
+    wal {
+        fastMode = true
+        enableLog = false
+        disableFsync()
+        queueCap = 1_000_000
+        backoffNanos = 50_000
     }
 }
 
@@ -186,14 +176,19 @@ class WalCfgBuilder(defaultPath: Path) {
     var filePrefix: String = "wal"
     var enableLog: Boolean = false
     var fastMode: Boolean = true           // Durable既定に合わせる
-    var fsyncBatchN: Int = 64
-    var fsyncIntervalMicros: Long = 8_000
+    var fsyncBatchN: Int? = 64
+    var fsyncIntervalMicros: Long? = 8_000L
     var queueCap: Int = 16_384
     var backoffNanos: Long = 500_000
 
+    fun disableFsync() {
+        fsyncBatchN = null
+        fsyncIntervalMicros = null
+    }
+
     fun build(): WalCfg {
-        require(fsyncBatchN >= 1) { "fsyncBatchN must be >= 1" }
-        require(fsyncIntervalMicros >= 0) { "fsyncIntervalMicros must be >= 0" }
+        require(fsyncBatchN == null || fsyncBatchN!! >= 1) { "fsyncBatchN must be >= 1" }
+        require(fsyncIntervalMicros == null || fsyncIntervalMicros!! >= 0) { "fsyncIntervalMicros must be >= 0" }
         require(queueCap >= 1) { "queueCap must be >= 1" }
         require(backoffNanos >= 0) { "backoffNanos must be >= 0" }
         return WalCfg(

@@ -59,12 +59,13 @@ tombstoneTTL = 24h (planned?)
 
 ```kotlin
 import dev.swiftstorm.akkaradb.engine.AkkaraDB
+import dev.swiftstorm.akkaradb.engine.StartupMode
 import dev.swiftstorm.akkaradb.common.Record
 import java.nio.file.Paths
 
 fun main() {
     val base = Paths.get("data")
-    val db = AkkaraDB.open(base, k = 4, m = 2)
+    val db = AkkaraDB.open(base, mode = StartupMode.NORMAL)
 
     db.put(Record("hello", "world", seqNo = 1))
 
@@ -89,6 +90,17 @@ fun main() {
 * Gradle (KTS)
 
 ```
+
+### Startup modes
+
+The `StartupMode` enum captures tuned profiles for the write-ahead log and stripe subsystem:
+
+* `FAST` – asynchronous WAL with fsync-on-close semantics and a large queue for peak throughput.
+* `NORMAL` – balanced defaults suitable for mixed read/write workloads.
+* `DURABLE` – synchronous fsync after every append, enabling the most conservative durability.
+* `CUSTOM` – start from an empty builder and provide your own overrides via the DSL.
+
+Every mode can be tweaked by passing a customization lambda to `AkkaraDB.open` or `AkkDSL.open`.
 ./gradlew build
 ```
 
