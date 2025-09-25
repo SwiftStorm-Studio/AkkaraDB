@@ -264,6 +264,11 @@ class AkkaraDB private constructor(
             walFsyncIntervalMicros = cfg.wal.fsyncIntervalMicros,
             walQueueCapacity = cfg.wal.queueCap,
             walBackoffNanos = cfg.wal.backoffNanos,
+            manifestPath = cfg.manifest.path,
+            manifestFastMode = cfg.manifest.isFastMode,
+            manifestBatchMaxEvents = cfg.manifest.batchMaxEvents,
+            manifestBatchMaxMicros = cfg.manifest.batchMaxMicros,
+            manifestStrongSyncIntervalMillis = cfg.manifest.strongSyncIntervalMillis,
             metaCacheCap = cfg.metaCacheCap,
         )
 
@@ -287,9 +292,24 @@ class AkkaraDB private constructor(
             walFsyncIntervalMicros: Long?, //4_000L 4000 micros = 4 ms
             walQueueCapacity: Int,
             walBackoffNanos: Long,
+            manifestPath: Path,
+            manifestFastMode: Boolean,
+            manifestBatchMaxEvents: Int,
+            manifestBatchMaxMicros: Long,
+            manifestStrongSyncIntervalMillis: Long,
             metaCacheCap: Int,
         ): AkkaraDB {
-            val manifest = AkkManifest(baseDir.resolve("manifest.json"))
+            val manifest = AkkManifest(
+                path = manifestPath,
+                isFastMode = manifestFastMode,
+                batchMaxEvents = manifestBatchMaxEvents,
+                batchMaxMicros = manifestBatchMaxMicros,
+                strongSyncIntervalMillis = manifestStrongSyncIntervalMillis
+            ).also {
+                if (it.isFastMode) {
+                    it.start()
+                }
+            }
             manifest.load()
             val stripe = AkkStripeWriter(
                 baseDir,
@@ -314,6 +334,8 @@ class AkkaraDB private constructor(
             val levels = buildLevelsFromManifest(baseDir, manifest, pool)
 
             if (levels.isEmpty()) levels += ConcurrentLinkedDeque<SSTableReader>()
+
+            val compactor = Compactor(levels, baseDir, manifest, pool = pool).also { it.maybeCompact() }
 
             val mem = MemTable(
                 thresholdBytesPerShard = flushThresholdBytes,
@@ -352,6 +374,7 @@ class AkkaraDB private constructor(
                         lastKeyHex = lastKey
                     )
                     levels[0].addFirst(SSTableReader(sstPath, pool))
+                    compactor.maybeCompact()
 
                     manifest.checkpoint("memFlush")
 
@@ -369,8 +392,6 @@ class AkkaraDB private constructor(
                 startStripe = cp?.stripe ?: 0L,
                 startSeq = cp?.lastSeq ?: Long.MIN_VALUE
             )
-
-            val compactor = Compactor(levels, baseDir, manifest, pool = pool).also { it.maybeCompact() }
 
             return AkkaraDB(mem, stripe, manifest, wal, levels, pool, compactor, metaCacheCap)
         }

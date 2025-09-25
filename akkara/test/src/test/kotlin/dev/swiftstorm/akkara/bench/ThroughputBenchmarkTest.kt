@@ -10,7 +10,6 @@ import org.junit.jupiter.api.Test
 import java.nio.file.Files
 import java.nio.file.Path
 import java.text.DecimalFormat
-import java.util.Comparator
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.ThreadLocalRandom
@@ -45,30 +44,51 @@ class ThroughputBenchmarkTest {
         require(config.threadCount > 0) { "threadCount must be positive" }
         require(config.measurementSeconds > 0) { "measurementSeconds must be positive" }
 
-        val baseDir = Files.createTempDirectory("akkara-dsl-bench-")
-        return try {
-            AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST) {
-                metaCacheCap = 4_096
-                stripe {
-                    k = 4
-                    m = 1
-                    autoFlush = false
-                    flushThreshold = 512L * 1024 * 1024
-                }
-                wal {
-                    disableFsync()
-                    queueCap = 262_144
-                    backoffNanos = 100_000
-                }
-            }.use { table ->
-                val keys = seedDataset(table, config)
-                val result = measureThroughput(table, config, keys)
-                table.db.flush()
-                result
+        val baseDir = Path.of("akkara-dsl-bench").also { Files.createDirectories(it) }
+
+        return AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST) {
+            metaCacheCap = 4_096
+            stripe {
+                k = 4
+                m = 1
+                autoFlush = false
+                flushThreshold = 512L * 1024 * 1024
             }
-        } finally {
-            deleteDirectoryRecursively(baseDir)
+            wal {
+                disableFsync()
+                queueCap = 262_144
+                backoffNanos = 100_000
+            }
+        }.use { table ->
+            val keys = seedDataset(table, config)
+            val result = measureThroughput(table, config, keys)
+            table.db.flush()
+            result
         }
+
+//        return try {
+//            AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST) {
+//                metaCacheCap = 4_096
+//                stripe {
+//                    k = 4
+//                    m = 1
+//                    autoFlush = false
+//                    flushThreshold = 512L * 1024 * 1024
+//                }
+//                wal {
+//                    disableFsync()
+//                    queueCap = 262_144
+//                    backoffNanos = 100_000
+//                }
+//            }.use { table ->
+//                val keys = seedDataset(table, config)
+//                val result = measureThroughput(table, config, keys)
+//                table.db.flush()
+//                result
+//            }
+//        } finally {
+//            deleteDirectoryRecursively(baseDir)
+//        }
     }
 
     private fun measureThroughput(

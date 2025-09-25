@@ -71,11 +71,20 @@ data class WalCfg(
     val backoffNanos: Long = 500_000
 )
 
+data class ManifestCfg(
+    val path: Path,
+    val isFastMode: Boolean = true,
+    val batchMaxEvents: Int = 128,
+    val batchMaxMicros: Long = 500,
+    val strongSyncIntervalMillis: Long = 1000
+)
+
 data class AkkDSLCfg(
     val baseDir: Path,
     val stripe: StripeCfg = StripeCfg(),
     val metaCacheCap: Int = 1024,
-    val wal: WalCfg = WalCfg(baseDir.resolve("wal"))
+    val wal: WalCfg = WalCfg(baseDir.resolve("wal")),
+    val manifest: ManifestCfg = ManifestCfg(baseDir.resolve("MANIFEST"))
 )
 
 enum class StartupMode { FAST, NORMAL, DURABLE, CUSTOM }
@@ -115,6 +124,12 @@ private fun AkkDSLCfgBuilder.configureDurable() {
         queueCap = 16_384
         backoffNanos = 500_000
     }
+    manifest {
+        isFastMode = false
+        batchMaxEvents = 1
+        batchMaxMicros = 0
+        strongSyncIntervalMillis = 0
+    }
 }
 
 private fun AkkDSLCfgBuilder.configureNormal() {
@@ -133,6 +148,12 @@ private fun AkkDSLCfgBuilder.configureNormal() {
         queueCap = 32_768
         backoffNanos = 400_000
     }
+    manifest {
+        isFastMode = true
+        batchMaxEvents = 256
+        batchMaxMicros = 1_000
+        strongSyncIntervalMillis = 500
+    }
 }
 
 private fun AkkDSLCfgBuilder.configureFast() {
@@ -150,6 +171,12 @@ private fun AkkDSLCfgBuilder.configureFast() {
         disableFsync()
         queueCap = 1_000_000
         backoffNanos = 50_000
+    }
+    manifest {
+        isFastMode = true
+        batchMaxEvents = 1024
+        batchMaxMicros = 2_000
+        strongSyncIntervalMillis = 1000
     }
 }
 
@@ -204,11 +231,33 @@ class WalCfgBuilder(defaultPath: Path) {
     }
 }
 
+class ManifestCfgBuilder(defaultPath: Path) {
+    var path: Path = defaultPath
+    var isFastMode: Boolean = true
+    var batchMaxEvents: Int = 128
+    var batchMaxMicros: Long = 500
+    var strongSyncIntervalMillis: Long = 1000
+
+    fun build(): ManifestCfg {
+        require(batchMaxEvents >= 1) { "batchMaxEvents must be >= 1" }
+        require(batchMaxMicros >= 0) { "batchMaxMicros must be >= 0" }
+        require(strongSyncIntervalMillis >= 0) { "strongSyncIntervalMillis must be >= 0" }
+        return ManifestCfg(
+            path = path,
+            isFastMode = isFastMode,
+            batchMaxEvents = batchMaxEvents,
+            batchMaxMicros = batchMaxMicros,
+            strongSyncIntervalMillis = strongSyncIntervalMillis
+        )
+    }
+}
+
 class AkkDSLCfgBuilder(private val baseDir: Path) {
     var metaCacheCap: Int = 1024
 
     private val stripeBuilder = StripeCfgBuilder()
     private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
+    private val manifestBuilder = ManifestCfgBuilder(baseDir.resolve("MANIFEST"))
 
     fun stripe(block: StripeCfgBuilder.() -> Unit) {
         stripeBuilder.apply(block)
@@ -218,14 +267,20 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
         walBuilder.apply(block)
     }
 
+    fun manifest(block: ManifestCfgBuilder.() -> Unit) {
+        manifestBuilder.apply(block)
+    }
+
     fun build(): AkkDSLCfg {
         val stripe = stripeBuilder.build()
         val wal = walBuilder.build()
+        val manifest = manifestBuilder.build()
         return AkkDSLCfg(
             baseDir = baseDir,
             stripe = stripe,
             metaCacheCap = metaCacheCap,
-            wal = wal
+            wal = wal,
+            manifest = manifest
         )
     }
 }
