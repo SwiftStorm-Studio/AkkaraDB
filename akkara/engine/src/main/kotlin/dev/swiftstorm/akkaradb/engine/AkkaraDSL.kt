@@ -36,7 +36,7 @@ object AkkDSL {
     inline fun <reified T : Any> open(
         baseDir: Path,
         mode: StartupMode,
-        customize: AkkDSLCfgBuilder.() -> Unit = {}
+        noinline customize: AkkDSLCfgBuilder.() -> Unit = {}
     ): PackedTable<T> = open(AkkaraPresets.of(baseDir, mode, customize))
 
     inline fun <reified T : Any> open(cfg: AkkDSLCfg): PackedTable<T> =

@@ -98,17 +98,9 @@ subprojects {
 
         "akkara-test" -> {
             dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-api"))
-                implementation(project(":akkara-format-akk"))
-                implementation(project(":akkara-engine"))
-                implementation(project(":akkara-java-api"))
-                implementation(project(":akkara-replica"))
-
-                implementation(kotlin("test"))
-                implementation(kotlin("serialization"))
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0")
-                implementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
+                testImplementation(kotlin("test"))
+                testImplementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
+                testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.13.1")
             }
         }
     }
