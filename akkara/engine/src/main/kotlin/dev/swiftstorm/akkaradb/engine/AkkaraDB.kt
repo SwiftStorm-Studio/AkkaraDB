@@ -249,6 +249,31 @@ class AkkaraDB private constructor(
         }
 
         fun open(
+            cfg: AkkDSLCfg
+        ): AkkaraDB = open(
+            baseDir = cfg.baseDir,
+            stripeK = cfg.stripe.k,
+            stripeAutoFlush = cfg.stripe.autoFlush,
+            parityCoder = cfg.stripe.parityCoder,
+            flushThresholdBytes = cfg.stripe.flushThreshold,
+            walDir = cfg.wal.dir,
+            walFilePrefix = cfg.wal.filePrefix,
+            walEnableLog = cfg.wal.enableLog,
+            walFastMode = cfg.wal.fastMode,
+            walFsyncBatchN = cfg.wal.fsyncBatchN,
+            walFsyncIntervalMicros = cfg.wal.fsyncIntervalMicros,
+            walQueueCapacity = cfg.wal.queueCap,
+            walBackoffNanos = cfg.wal.backoffNanos,
+            metaCacheCap = cfg.metaCacheCap,
+        )
+
+        fun open(
+            baseDir: Path,
+            mode: StartupMode,
+            customize: AkkDSLCfgBuilder.() -> Unit = {}
+        ): AkkaraDB = open(AkkaraPresets.of(baseDir, mode, customize))
+
+        fun open(
             baseDir: Path,
             stripeK: Int,
             stripeAutoFlush: Boolean,
