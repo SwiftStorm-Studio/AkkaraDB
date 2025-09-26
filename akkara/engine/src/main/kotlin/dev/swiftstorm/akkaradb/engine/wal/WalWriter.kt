@@ -206,6 +206,8 @@ class WalWriter(
         runCatching { ch.close() }
     }
 
+    fun fsync() = ch.force(false)
+
     // ─────────── internals ───────────
 
     private fun enqueueOrBackpressure(op: () -> Unit) {

@@ -39,6 +39,7 @@ class AkkaraDB private constructor(
     private val stripeWriter: AkkStripeWriter,
     private val manifest: AkkManifest,
     val wal: WalWriter,
+    private val durabilityOrchestrator: DurabilityOrchestrator?,
     private val levels: MutableList<ConcurrentLinkedDeque<SSTableReader>>,
     private val pool: BufferPool = Pools.io(),
     private val compactor: Compactor,
@@ -240,6 +241,7 @@ class AkkaraDB private constructor(
         flush()
         memTable.close(); wal.close(); stripeWriter.close(); readerPool.close()
         levels.forEach { deque -> deque.forEach(SSTableReader::close) }
+        durabilityOrchestrator?.stop()
     }
 
     /* --------------- factory --------------- */
@@ -252,8 +254,12 @@ class AkkaraDB private constructor(
             cfg: AkkDSLCfg
         ): AkkaraDB = open(
             baseDir = cfg.baseDir,
+            useAutoFsync = cfg.useAutoFsync,
             stripeK = cfg.stripe.k,
             stripeAutoFlush = cfg.stripe.autoFlush,
+            stripeIsFastMode = cfg.stripe.isFastMode,
+            stripeFsyncBatchN = cfg.stripe.fsyncBatchN,
+            stripeFsyncIntervalMicros = cfg.stripe.fsyncIntervalMicros,
             parityCoder = cfg.stripe.parityCoder,
             flushThresholdBytes = cfg.stripe.flushThreshold,
             walDir = cfg.wal.dir,
@@ -280,10 +286,17 @@ class AkkaraDB private constructor(
 
         fun open(
             baseDir: Path,
+            useAutoFsync: Boolean,
+            /* ── stripe ── */
             stripeK: Int,
             stripeAutoFlush: Boolean,
+            stripeIsFastMode: Boolean,
+            stripeFsyncBatchN: Int,
+            stripeFsyncIntervalMicros: Long,
+            /* ───────── */
             parityCoder: ParityCoder,
             flushThresholdBytes: Long,
+            /* ── WAL ── */
             walDir: Path,
             walFilePrefix: String,
             walEnableLog: Boolean,
@@ -292,6 +305,7 @@ class AkkaraDB private constructor(
             walFsyncIntervalMicros: Long?, //4_000L 4000 micros = 4 ms
             walQueueCapacity: Int,
             walBackoffNanos: Long,
+            /* ── manifest ── */
             manifestPath: Path,
             manifestFastMode: Boolean,
             manifestBatchMaxEvents: Int,
@@ -316,7 +330,10 @@ class AkkaraDB private constructor(
                 stripeK,
                 parityCoder,
                 autoFlush = stripeAutoFlush,
-                onCommit = { committed -> manifest.advance(committed) }
+                isFastMode = stripeIsFastMode,
+                onCommit = { committed -> manifest.advance(committed) },
+                fsyncBatchN = stripeFsyncBatchN,
+                fsyncIntervalMicros = stripeFsyncIntervalMicros
             )
             val wal = WalWriter(
                 dir = walDir,
@@ -330,6 +347,19 @@ class AkkaraDB private constructor(
             )
             val pool = Pools.io()
             val packer = AkkBlockPackerDirect({ blk -> stripe.addBlock(blk) })
+
+            var durabilityOrchestrator: DurabilityOrchestrator? = null
+
+            if (useAutoFsync) {
+                durabilityOrchestrator = DurabilityOrchestrator(
+                    stripe = stripe,
+                    wal = wal,
+                    manifest = manifest,
+                    periodMs = 1200L,
+                    minIntervalMs = 200L,
+                    jitterPct = 0.10
+                )
+            }
 
             val levels = buildLevelsFromManifest(baseDir, manifest, pool)
 
@@ -393,7 +423,7 @@ class AkkaraDB private constructor(
                 startSeq = cp?.lastSeq ?: Long.MIN_VALUE
             )
 
-            return AkkaraDB(mem, stripe, manifest, wal, levels, pool, compactor, metaCacheCap)
+            return AkkaraDB(mem, stripe, manifest, wal, durabilityOrchestrator, levels, pool, compactor, metaCacheCap)
         }
 
         private fun buildLevelsFromManifest(

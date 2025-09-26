@@ -56,6 +56,9 @@ data class StripeCfg(
     val k: Int = 4,
     val m: Int = 2,
     val autoFlush: Boolean = true,
+    val isFastMode: Boolean = false,
+    val fsyncBatchN: Int = 32,
+    val fsyncIntervalMicros: Long = 500,
     val parityCoder: ParityCoder = RSErrorCorrectingParityCoder(m),
     val flushThreshold: Long = 128L * 1024 * 1024
 )
@@ -81,6 +84,7 @@ data class ManifestCfg(
 
 data class AkkDSLCfg(
     val baseDir: Path,
+    val useAutoFsync: Boolean = false,
     val stripe: StripeCfg = StripeCfg(),
     val metaCacheCap: Int = 1024,
     val wal: WalCfg = WalCfg(baseDir.resolve("wal")),
@@ -113,6 +117,8 @@ private fun AkkDSLCfgBuilder.configureDurable() {
         k = 4
         m = 2
         autoFlush = true
+        fsyncBatchN = 32
+        fsyncIntervalMicros = 500
         parityCoder = RSParityCoder(2)
         flushThreshold = 128L * 1024 * 1024
     }
@@ -138,6 +144,8 @@ private fun AkkDSLCfgBuilder.configureNormal() {
         k = 4
         m = 2
         autoFlush = true
+        fsyncBatchN = 64
+        fsyncIntervalMicros = 1_000
         flushThreshold = 256L * 1024 * 1024
     }
     wal {
@@ -158,10 +166,12 @@ private fun AkkDSLCfgBuilder.configureNormal() {
 
 private fun AkkDSLCfgBuilder.configureFast() {
     metaCacheCap = 4096
+    useAutoFsync = true
     stripe {
         k = 4
         m = 1
         autoFlush = false
+        isFastMode = true
         parityCoder = RSParityCoder(1)
         flushThreshold = 1L * 1024 * 1024 * 1024
     }
@@ -186,15 +196,18 @@ class StripeCfgBuilder {
     var k: Int = 4
     var m: Int = 2
     var autoFlush: Boolean = true
+    var isFastMode: Boolean = false
     var parityCoder: ParityCoder? = null
     var flushThreshold: Long = 128L * 1024 * 1024
+    var fsyncBatchN: Int = 64
+    var fsyncIntervalMicros: Long = 1_000
 
     fun build(): StripeCfg {
         require(k >= 1) { "k must be >= 1" }
         require(m >= 1) { "m must be >= 1" }
         require(flushThreshold > 0) { "flushThreshold must be > 0" }
         val pc = parityCoder ?: RSErrorCorrectingParityCoder(m)
-        return StripeCfg(k, m, autoFlush, pc, flushThreshold)
+        return StripeCfg(k, m, autoFlush, isFastMode, fsyncBatchN, fsyncIntervalMicros, pc, flushThreshold)
     }
 }
 
@@ -254,6 +267,7 @@ class ManifestCfgBuilder(defaultPath: Path) {
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
     var metaCacheCap: Int = 1024
+    var useAutoFsync: Boolean = false
 
     private val stripeBuilder = StripeCfgBuilder()
     private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
@@ -277,6 +291,7 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
         val manifest = manifestBuilder.build()
         return AkkDSLCfg(
             baseDir = baseDir,
+            useAutoFsync = useAutoFsync,
             stripe = stripe,
             metaCacheCap = metaCacheCap,
             wal = wal,

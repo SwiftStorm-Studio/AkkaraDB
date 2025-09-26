@@ -43,17 +43,19 @@ class AkkStripeWriter(
     val baseDir: Path,
     override val k: Int,
     val parityCoder: ParityCoder? = null,
-    private val autoFlush: Boolean = true,
+    private val autoFlush: Boolean,
+    /** If true, `flush()` will NOT issue fsync/fdatasync (best-effort, faster, non-durable). */
+    private val isFastMode: Boolean,
     private val pool: BufferPool = Pools.io(),
     // --- group commit controls ---
-    private val fsyncBatchN: Int = 32,
-    private val fsyncIntervalMicros: Long = 500,
+    private val fsyncBatchN: Int,
+    private val fsyncIntervalMicros: Long,
     private val onCommit: ((Long) -> Unit)? = null
 ) : Closeable, StripeWriter {
 
     /* ───────── lane writers ───────── */
-    private val dataCh = Array<FileWriter>(k) { idx -> makeWriter(baseDir.resolve("data_$idx.akd")) }
-    private val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> makeWriter(baseDir.resolve("parity_$idx.akp")) }
+    val dataCh = Array<FileWriter>(k) { idx -> makeWriter(baseDir.resolve("data_$idx.akd")) }
+    val parityCh = Array(parityCoder?.parityCount ?: 0) { idx -> makeWriter(baseDir.resolve("parity_$idx.akp")) }
 
     override val m: Int get() = parityCh.size
 
@@ -109,11 +111,12 @@ class AkkStripeWriter(
         }
     }
 
-    /** Force fsync on every lane (blocking). */
+    /** Flush lane buffers. If [isFastMode] is true, fsync/fdatasync is **skipped**. */
     override fun flush(): Long {
         if (closed) return stripesWritten
-        dataCh.forEach(FileWriter::flush)
-        parityCh.forEach(FileWriter::flush)
+        // In fast mode we still push buffered bytes to the file (write), but skip durability.
+        dataCh.forEach { it.flush(force = !isFastMode).also { /* no-op */ } }
+        parityCh.forEach { it.flush(force = !isFastMode).also { /* no-op */ } }
         stripesSinceLastFlush = 0
         lastFlushAtNanos = System.nanoTime()
         onCommit?.invoke(stripesWritten_)
@@ -135,9 +138,18 @@ class AkkStripeWriter(
         seek(stripes)
     }
 
+    fun fsyncAll(): Long {
+        if (closed) return stripesWritten
+        dataCh.forEach { it.sync() }
+        parityCh.forEach { it.sync() }
+        return stripesWritten
+    }
+
     override fun close() {
         if (closed) return
         try {
+            // Respect isFastMode on close as well. If you want "always durable on close",
+            // change to flush(force = true) by adding a separate close path.
             flush()
         } catch (_: Throwable) {
             // best-effort
@@ -167,11 +179,17 @@ class AkkStripeWriter(
         System.getProperty("os.name")?.startsWith("Windows", ignoreCase = true) == true
 
     /* ───────── writer interfaces (ByteBufferL) ───────── */
-    private interface FileWriter : Closeable {
+    interface FileWriter : Closeable {
         var lastWritten: ByteBufferL?
         fun write(buf: ByteBufferL)
-        fun flush()
+
+        /**
+         * Flush buffered bytes to the file. If [force] is true, also issue a durability barrier
+         * (e.g., fsync/fdatasync). If false, only pushes page-cache writes (non-durable).
+         */
+        fun flush(force: Boolean = true)
         fun seek(pos: Long)
+        fun sync()
     }
 
     private interface FileWriterEx : FileWriter {
@@ -181,7 +199,7 @@ class AkkStripeWriter(
     /**
      * Direct file writer backed by Netty-native FileDescriptor (Linux only).
      * - write(): zero-copy pwrite() into page cache.
-     * - flush(): fsync(2) via JDK descriptor.
+     * - flush(): fsync(2) via JDK descriptor when force=true.
      */
     private class FdWriter(path: Path) : FileWriterEx {
         private val fd: FileDescriptor = FileDescriptor.from(path.toString())
@@ -207,10 +225,15 @@ class AkkStripeWriter(
             offset += len
         }
 
-        override fun flush() = jdkFd.sync()
+        override fun flush(force: Boolean) {
+            if (force) jdkFd.sync()
+        }
+
         override fun seek(pos: Long) {
             offset = pos; ch.position(pos)
         }
+
+        override fun sync() = jdkFd.sync()
 
         override fun truncate(size: Long) {
             ch.truncate(size); seek(size)
@@ -218,7 +241,7 @@ class AkkStripeWriter(
 
         override fun close() {
             try {
-                flush()
+                flush(force = true)
             } finally {
                 fd.close(); ch.close()
             }
@@ -226,8 +249,8 @@ class AkkStripeWriter(
     }
 
     /**
-     * Portable JDK writer: aggregates into 1MiB lane buffer and calls fdatasync
-     * at group-commit boundaries.
+     * Portable JDK writer: aggregates into 1MiB lane buffer and optionally calls fdatasync
+     * at group-commit boundaries depending on [force].
      */
     private class JdkAggWriter(
         path: Path,
@@ -247,19 +270,24 @@ class AkkStripeWriter(
             lastWritten = buf
             val need = buf.remaining
             if (need >= agg.capacity) {
-                flushLane(); writeDirect(buf); return
+                flushLane()
+                writeDirect(buf)
+                return
             }
             if (agg.remaining < need) flushLane()
             agg.put(buf.asReadOnlyByteBuffer())
         }
 
-        override fun flush() {
-            flushLane(); ch.force(false)
+        override fun flush(force: Boolean) {
+            flushLane()
+            if (force) ch.force(false)
         }
 
         override fun seek(pos: Long) {
             flushLane(); this@JdkAggWriter.pos = pos
         }
+
+        override fun sync() = ch.force(false)
 
         override fun truncate(size: Long) {
             flushLane(); ch.truncate(size); pos = size; preallocLimit = roundUp(size, preallocStep)
@@ -267,7 +295,7 @@ class AkkStripeWriter(
 
         override fun close() {
             try {
-                flush()
+                flush(force = true)
             } finally {
                 ch.close(); raf.close(); pool.release(agg)
             }

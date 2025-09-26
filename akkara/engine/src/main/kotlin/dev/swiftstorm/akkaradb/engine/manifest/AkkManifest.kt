@@ -182,6 +182,8 @@ class AkkManifest(
         flusherThread = null
     }
 
+    fun fsync() = fastCh?.force(false)
+
     /* ─────────── Append path (mode-aware) ─────────── */
 
     private fun append(line: String) {
