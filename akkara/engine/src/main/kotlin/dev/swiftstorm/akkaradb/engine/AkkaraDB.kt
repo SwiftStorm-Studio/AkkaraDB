@@ -350,16 +350,16 @@ class AkkaraDB private constructor(
 
             var durabilityOrchestrator: DurabilityOrchestrator? = null
 
-            if (useAutoFsync) {
-                durabilityOrchestrator = DurabilityOrchestrator(
-                    stripe = stripe,
-                    wal = wal,
-                    manifest = manifest,
-                    periodMs = 1200L,
-                    minIntervalMs = 200L,
-                    jitterPct = 0.10
-                )
-            }
+//            if (useAutoFsync) {
+//                durabilityOrchestrator = DurabilityOrchestrator(
+//                    stripe = stripe,
+//                    wal = wal,
+//                    manifest = manifest,
+//                    periodMs = 5000L,
+//                    minIntervalMs = 200L,
+//                    jitterPct = 0.10
+//                )
+//            }
 
             val levels = buildLevelsFromManifest(baseDir, manifest, pool)
 

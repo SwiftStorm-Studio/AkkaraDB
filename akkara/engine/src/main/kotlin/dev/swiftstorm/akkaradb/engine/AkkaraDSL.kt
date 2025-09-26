@@ -85,6 +85,9 @@ data class ManifestCfg(
 data class AkkDSLCfg(
     val baseDir: Path,
     val useAutoFsync: Boolean = false,
+    val doPeriodMs: Long = 15000L, // 15秒毎
+    val doMinIntervalMs: Long = 1000L, // 最短1秒間隔
+    val doJitterPct: Double = 0.10, // ±10%
     val stripe: StripeCfg = StripeCfg(),
     val metaCacheCap: Int = 1024,
     val wal: WalCfg = WalCfg(baseDir.resolve("wal")),
@@ -140,6 +143,7 @@ private fun AkkDSLCfgBuilder.configureDurable() {
 
 private fun AkkDSLCfgBuilder.configureNormal() {
     metaCacheCap = 2048
+    useAutoFsync = true
     stripe {
         k = 4
         m = 2
@@ -167,6 +171,9 @@ private fun AkkDSLCfgBuilder.configureNormal() {
 private fun AkkDSLCfgBuilder.configureFast() {
     metaCacheCap = 4096
     useAutoFsync = true
+    doPeriodMs = 60000L // 60秒毎
+    doMinIntervalMs = 10000L // 最短5秒間隔
+    doJitterPct = 0.05 // ±5%
     stripe {
         k = 4
         m = 1
@@ -268,6 +275,9 @@ class ManifestCfgBuilder(defaultPath: Path) {
 class AkkDSLCfgBuilder(private val baseDir: Path) {
     var metaCacheCap: Int = 1024
     var useAutoFsync: Boolean = false
+    var doPeriodMs: Long = 1500L
+    var doMinIntervalMs: Long = 1000L
+    var doJitterPct: Double = 0.10
 
     private val stripeBuilder = StripeCfgBuilder()
     private val walBuilder = WalCfgBuilder(baseDir.resolve("wal"))
@@ -292,6 +302,9 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
         return AkkDSLCfg(
             baseDir = baseDir,
             useAutoFsync = useAutoFsync,
+            doPeriodMs = doPeriodMs,
+            doMinIntervalMs = doMinIntervalMs,
+            doJitterPct = doJitterPct,
             stripe = stripe,
             metaCacheCap = metaCacheCap,
             wal = wal,
