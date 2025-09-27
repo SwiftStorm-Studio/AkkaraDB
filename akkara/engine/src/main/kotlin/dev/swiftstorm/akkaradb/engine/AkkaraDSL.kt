@@ -187,8 +187,8 @@ private fun AkkDSLCfgBuilder.configureFast() {
         fastMode = true
         enableLog = false
         disableFsync()
-        queueCap = 1_000_000
-        backoffNanos = 50_000
+        queueCap = 65_536
+        backoffNanos = 100_000
     }
     manifest {
         isFastMode = true

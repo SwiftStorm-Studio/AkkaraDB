@@ -14,22 +14,24 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.LongAdder
+import kotlin.math.max
 
 class ThroughputBenchmarkTest {
 
     @Test
-    fun `AkkaraDB DSL throughput benchmark prints aggregated metrics`() {
+    fun `AkkaraDB DSL throughput benchmark prints aggregated metrics with op-count stop`() {
         val availableProcessors = Runtime.getRuntime().availableProcessors()
         val threadCount = availableProcessors.coerceIn(1, 8)
 
         val config = BenchmarkConfig(
-            warmupSeconds = 1,
-            measurementSeconds = 2,
             threadCount = threadCount,
-            readRatioPercent = 60,
             keysPerThread = 512,
-            payloadBytes = 256
+            payloadBytes = 256,
+            targetReadRatioPercent = 60,
+            warmupOpsTotal = 50_000,       // ← warmup は件数で指定
+            measurementOpsTotal = 300_000  // ← 測定も件数で指定
         )
 
         val result = runDslThroughputBenchmark(config)
@@ -37,129 +39,165 @@ class ThroughputBenchmarkTest {
 
         assertTrue(result.operations > 0, "Benchmark recorded no operations")
         assertEquals(result.operations, result.readOperations + result.writeOperations)
+        assertEquals(config.measurementOpsTotal.toLong(), result.operations, "Measured ops must match configured total")
         assertTrue(result.throughputOpsPerSecond > 0.0, "Throughput must be positive")
     }
 
     private fun runDslThroughputBenchmark(config: BenchmarkConfig): BenchmarkResult {
         require(config.threadCount > 0) { "threadCount must be positive" }
-        require(config.measurementSeconds > 0) { "measurementSeconds must be positive" }
+        require(config.measurementOpsTotal > 0) { "measurementOpsTotal must be positive" }
 
         val baseDir = Path.of("akkara-dsl-bench").also { Files.createDirectories(it) }
 
+<<<<<<< Updated upstream
         return AkkDSL.open<BenchAccount>(baseDir, StartupMode.ULTRA_FAST).use { table ->
+=======
+        // 片付けを入れたいなら finally で deleteDirectoryRecursively(baseDir) を呼ぶ
+        return AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST).use { table ->
+>>>>>>> Stashed changes
             val keys = seedDataset(table, config)
-            val result = measureThroughput(table, config, keys)
-            table.db.flush()
-            result
-        }
+            // warmup（件数指定・計測しない）
+            runWorkersWithTargets(
+                table = table,
+                keys = keys,
+                threadCount = config.threadCount,
+                payloadBytes = config.payloadBytes,
+                totalOps = config.warmupOpsTotal,
+                targetReadRatioPercent = config.targetReadRatioPercent,
+                recordMetrics = false
+            )
 
-//        return try {
-//            AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST) {
-//                metaCacheCap = 4_096
-//                stripe {
-//                    k = 4
-//                    m = 1
-//                    autoFlush = false
-//                    flushThreshold = 512L * 1024 * 1024
-//                }
-//                wal {
-//                    disableFsync()
-//                    queueCap = 262_144
-//                    backoffNanos = 100_000
-//                }
-//            }.use { table ->
-//                val keys = seedDataset(table, config)
-//                val result = measureThroughput(table, config, keys)
-//                table.db.flush()
-//                result
-//            }
-//        } finally {
-//            deleteDirectoryRecursively(baseDir)
-//        }
+            // 測定（件数指定・経過時間を測る）
+            val (ops, reads, writes, elapsedNanos) = runWorkersWithTargets(
+                table = table,
+                keys = keys,
+                threadCount = config.threadCount,
+                payloadBytes = config.payloadBytes,
+                totalOps = config.measurementOpsTotal,
+                targetReadRatioPercent = config.targetReadRatioPercent,
+                recordMetrics = true
+            )
+
+            //table.db.close()
+
+            BenchmarkResult(
+                config = config,
+                operations = ops,
+                readOperations = reads,
+                writeOperations = writes,
+                measurementDurationSeconds = elapsedNanos / 1_000_000_000.0
+            )
+        }
     }
 
-    private fun measureThroughput(
+    /**
+     * 全体の目標件数 totalOps を read/write 比率で分割し、
+     * 各スレッドがアトミック残量を取り合う形で消費する。
+     * 戻り値: 測定モード時のみ (ops, reads, writes, elapsedNanos) を返す。非測定時は 0 を返す。
+     */
+    private fun runWorkersWithTargets(
         table: PackedTable<BenchAccount>,
-        config: BenchmarkConfig,
-        keys: Array<ShortUUID>
-    ): BenchmarkResult {
+        keys: Array<ShortUUID>,
+        threadCount: Int,
+        payloadBytes: Int,
+        totalOps: Long,
+        targetReadRatioPercent: Int,
+        recordMetrics: Boolean
+    ): QuadMetrics {
         require(keys.isNotEmpty()) { "Benchmark key space must not be empty" }
-        val operations = LongAdder()
-        val readOperations = LongAdder()
-        val writeOperations = LongAdder()
+        val ratio = targetReadRatioPercent.coerceIn(0, 100)
+        val targetReads = (totalOps * ratio) / 100
+        val targetWrites = totalOps - targetReads
 
-        val executor = Executors.newFixedThreadPool(config.threadCount)
-        val tasks = ArrayList<Future<*>>(config.threadCount)
-        val warmupDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(config.warmupSeconds)
-        val measurementDurationNanos = TimeUnit.SECONDS.toNanos(config.measurementSeconds)
+        val readRemaining = AtomicLong(targetReads)
+        val writeRemaining = AtomicLong(targetWrites)
+
+        val ops = if (recordMetrics) LongAdder() else null
+        val reads = if (recordMetrics) LongAdder() else null
+        val writes = if (recordMetrics) LongAdder() else null
+
+        val executor = Executors.newFixedThreadPool(threadCount)
+        val tasks = ArrayList<Future<*>>(threadCount)
+
+        val start = if (recordMetrics) System.nanoTime() else 0L
 
         try {
-            repeat(config.threadCount) { workerIndex ->
+            repeat(threadCount) { workerIndex ->
                 tasks += executor.submit {
                     val rng = ThreadLocalRandom.current()
-                    while (System.nanoTime() < warmupDeadline) {
-                        val uuid = keys[rng.nextInt(keys.size)]
-                        val performRead = rng.nextInt(100) < config.readRatioPercent
-                        if (performRead) {
-                            table.get("tenant", uuid)
-                        } else {
-                            performWrite(table, uuid, workerIndex, rng, config.payloadBytes)
-                        }
-                    }
+                    while (true) {
+                        val rRem = readRemaining.get()
+                        val wRem = writeRemaining.get()
+                        if (rRem <= 0 && wRem <= 0) break
 
-                    val measurementDeadline = System.nanoTime() + measurementDurationNanos
-                    while (System.nanoTime() < measurementDeadline) {
-                        val uuid = keys[rng.nextInt(keys.size)]
-                        val performRead = rng.nextInt(100) < config.readRatioPercent
-                        if (performRead) {
-                            table.get("tenant", uuid)
-                            readOperations.increment()
+                        val doRead = decideNextOp(rng, rRem, wRem)
+                        if (doRead) {
+                            if (readRemaining.get() > 0 && readRemaining.decrementAndGet() >= 0) {
+                                val uuid = keys[rng.nextInt(keys.size)]
+                                table.get("tenant", uuid)
+                                reads?.increment()
+                                ops?.increment()
+                            }
                         } else {
-                            performWrite(table, uuid, workerIndex, rng, config.payloadBytes)
-                            writeOperations.increment()
+                            if (writeRemaining.get() > 0 && writeRemaining.decrementAndGet() >= 0) {
+                                val uuid = keys[rng.nextInt(keys.size)]
+                                performWrite(table, uuid, workerIndex, rng, payloadBytes)
+                                writes?.increment()
+                                ops?.increment()
+                            }
                         }
-                        operations.increment()
                     }
                 }
             }
         } finally {
             executor.shutdown()
             try {
-                if (!executor.awaitTermination(config.measurementSeconds + config.warmupSeconds + 5, TimeUnit.SECONDS)) {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
                     executor.shutdownNow()
                 }
-                for (future in tasks) {
-                    future.get()
-                }
+                // 例外を表面化
+                for (f in tasks) f.get()
             } catch (ie: InterruptedException) {
                 executor.shutdownNow()
                 Thread.currentThread().interrupt()
-            } catch (e: Exception) {
-                throw RuntimeException("Benchmark worker failed", e)
             }
         }
 
-        val ops = operations.sum()
-        val reads = readOperations.sum()
-        val writes = writeOperations.sum()
-
-        return BenchmarkResult(
-            config = config,
-            operations = ops,
-            readOperations = reads,
-            writeOperations = writes,
-            measurementDurationSeconds = config.measurementSeconds.toDouble()
+        val elapsed = if (recordMetrics) (System.nanoTime() - start) else 0L
+        return QuadMetrics(
+            operations = ops?.sum() ?: 0L,
+            reads = reads?.sum() ?: 0L,
+            writes = writes?.sum() ?: 0L,
+            elapsedNanos = elapsed
         )
+    }
+
+    /**
+     * 残量に応じて次のオペレーションを選ぶ。
+     * 片方 0 → もう片方。両方>0 → 残量比に比例した確率で選択（目標比率に近づける）。
+     */
+    private fun decideNextOp(rng: ThreadLocalRandom, readRem: Long, writeRem: Long): Boolean {
+        return when {
+            readRem <= 0 && writeRem > 0 -> false
+            writeRem <= 0 && readRem > 0 -> true
+            readRem <= 0 && writeRem <= 0 -> true // どちらでもよい（呼び出し側で break される）
+            else -> {
+                val sum = readRem + writeRem
+                val threshold = readRem.toDouble() / sum.toDouble()
+                rng.nextDouble() < threshold
+            }
+        }
     }
 
     private fun seedDataset(
         table: PackedTable<BenchAccount>,
         config: BenchmarkConfig
     ): Array<ShortUUID> {
-        val keys = ArrayList<ShortUUID>(config.totalKeySpace)
+        val keySpace = max(1, config.threadCount * config.keysPerThread)
+        val keys = ArrayList<ShortUUID>(keySpace)
         val rng = ThreadLocalRandom.current()
 
-        repeat(config.totalKeySpace) {
+        repeat(keySpace) {
             val uuid = ShortUUID.generate()
             val payload = ByteArray(config.payloadBytes).also(rng::nextBytes)
             val account = BenchAccount(
@@ -176,7 +214,6 @@ class ThroughputBenchmarkTest {
             table.put("tenant", uuid, account)
             keys += uuid
         }
-
         return keys.toTypedArray()
     }
 
@@ -198,7 +235,6 @@ class ThroughputBenchmarkTest {
                 "tier-${(balance / 10_000L) % 8}"
             )
         }
-
         if (!updated) {
             val payload = ByteArray(payloadBytes).also(rng::nextBytes)
             table.put(
@@ -232,21 +268,23 @@ class ThroughputBenchmarkTest {
         }
     }
 
+    // ---- Config / Result / DTOs ----
+
     private data class BenchmarkConfig(
-        val warmupSeconds: Long,
-        val measurementSeconds: Long,
         val threadCount: Int,
-        val readRatioPercent: Int,
         val keysPerThread: Int,
-        val payloadBytes: Int
+        val payloadBytes: Int,
+        val targetReadRatioPercent: Int,
+        val warmupOpsTotal: Long,
+        val measurementOpsTotal: Long
     ) {
         init {
-            require(warmupSeconds >= 0) { "warmupSeconds cannot be negative" }
-            require(measurementSeconds > 0) { "measurementSeconds must be positive" }
             require(threadCount > 0) { "threadCount must be positive" }
-            require(readRatioPercent in 0..100) { "readRatioPercent must be between 0 and 100" }
             require(keysPerThread > 0) { "keysPerThread must be positive" }
             require(payloadBytes > 0) { "payloadBytes must be positive" }
+            require(targetReadRatioPercent in 0..100) { "targetReadRatioPercent must be 0..100" }
+            require(warmupOpsTotal >= 0) { "warmupOpsTotal cannot be negative" }
+            require(measurementOpsTotal > 0) { "measurementOpsTotal must be positive" }
         }
 
         val totalKeySpace: Int = threadCount * keysPerThread
@@ -259,10 +297,14 @@ class ThroughputBenchmarkTest {
         val writeOperations: Long,
         val measurementDurationSeconds: Double
     ) {
-        val throughputOpsPerSecond: Double = if (measurementDurationSeconds == 0.0) 0.0 else operations / measurementDurationSeconds
-        val throughputPerThread: Double = if (config.threadCount == 0) 0.0 else throughputOpsPerSecond / config.threadCount
-        val readSharePercent: Double = if (operations == 0L) 0.0 else (readOperations.toDouble() / operations) * 100.0
-        val writeSharePercent: Double = if (operations == 0L) 0.0 else (writeOperations.toDouble() / operations) * 100.0
+        val throughputOpsPerSecond: Double =
+            if (measurementDurationSeconds == 0.0) 0.0 else operations / measurementDurationSeconds
+        val throughputPerThread: Double =
+            if (config.threadCount == 0) 0.0 else throughputOpsPerSecond / config.threadCount
+        val readSharePercent: Double =
+            if (operations == 0L) 0.0 else (readOperations.toDouble() / operations) * 100.0
+        val writeSharePercent: Double =
+            if (operations == 0L) 0.0 else (writeOperations.toDouble() / operations) * 100.0
 
         fun toPrettyString(): String {
             val integerFormat = DecimalFormat("#,##0")
@@ -271,16 +313,17 @@ class ThroughputBenchmarkTest {
                 appendLine("AkkaraDB DSL throughput benchmark")
                 appendLine(" Startup mode         : FAST (custom WAL queue)")
                 appendLine(" Threads              : ${config.threadCount}")
-                appendLine(" Warm-up duration (s) : ${integerFormat.format(config.warmupSeconds)}")
-                appendLine(" Measurement (s)      : ${integerFormat.format(config.measurementSeconds)}")
                 appendLine(" Key space (records)  : ${integerFormat.format(config.totalKeySpace)}")
                 appendLine(" Payload bytes        : ${integerFormat.format(config.payloadBytes)}")
-                appendLine(" Target read ratio (%) : ${integerFormat.format(config.readRatioPercent.toLong())}")
+                appendLine(" Target read ratio (%) : ${integerFormat.format(config.targetReadRatioPercent.toLong())}")
+                appendLine(" Warm-up ops (total)  : ${integerFormat.format(config.warmupOpsTotal)}")
+                appendLine(" Measurement ops      : ${integerFormat.format(config.measurementOpsTotal)}")
                 appendLine(" Total operations     : ${integerFormat.format(operations)}")
                 appendLine(" Ops/sec              : ${decimalFormat.format(throughputOpsPerSecond)}")
                 appendLine(" Ops/sec/thread       : ${decimalFormat.format(throughputPerThread)}")
                 appendLine(" Reads                : ${integerFormat.format(readOperations)} (${decimalFormat.format(readSharePercent)}%)")
                 appendLine(" Writes               : ${integerFormat.format(writeOperations)} (${decimalFormat.format(writeSharePercent)}%)")
+                appendLine(" Measurement time (s) : ${decimalFormat.format(measurementDurationSeconds)}")
             }
         }
     }
@@ -291,5 +334,12 @@ class ThroughputBenchmarkTest {
         var version: Long = 0,
         var payload: ByteArray = ByteArray(0),
         var tags: List<String> = emptyList()
+    )
+
+    private data class QuadMetrics(
+        val operations: Long,
+        val reads: Long,
+        val writes: Long,
+        val elapsedNanos: Long
     )
 }
