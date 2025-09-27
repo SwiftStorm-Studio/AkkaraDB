@@ -94,7 +94,7 @@ data class AkkDSLCfg(
     val manifest: ManifestCfg = ManifestCfg(baseDir.resolve("MANIFEST"))
 )
 
-enum class StartupMode { FAST, NORMAL, DURABLE, CUSTOM }
+enum class StartupMode { ULTRA_FAST, FAST, NORMAL, DURABLE, CUSTOM }
 
 object AkkaraPresets {
     fun of(
@@ -104,6 +104,7 @@ object AkkaraPresets {
     ): AkkDSLCfg {
         val builder = AkkDSLCfgBuilder(baseDir)
         when (mode) {
+            StartupMode.ULTRA_FAST -> builder.configureUltraFast()
             StartupMode.FAST -> builder.configureFast()
             StartupMode.NORMAL -> builder.configureNormal()
             StartupMode.DURABLE -> builder.configureDurable()
@@ -170,10 +171,10 @@ private fun AkkDSLCfgBuilder.configureNormal() {
 
 private fun AkkDSLCfgBuilder.configureFast() {
     metaCacheCap = 4096
-    useAutoFsync = true
-    doPeriodMs = 60000L // 60秒毎
-    doMinIntervalMs = 10000L // 最短5秒間隔
-    doJitterPct = 0.05 // ±5%
+//    useAutoFsync = true
+//    doPeriodMs = 120000L // 2分毎
+//    doMinIntervalMs = 3000L // 最短30秒間隔
+//    doJitterPct = 0.05 // ±5%
     stripe {
         k = 4
         m = 1
@@ -196,6 +197,65 @@ private fun AkkDSLCfgBuilder.configureFast() {
         strongSyncIntervalMillis = 1000
     }
 }
+
+// AkkaraDSL.kt の builder で呼ぶ想定
+private fun AkkDSLCfgBuilder.configureUltraFast() {
+    // 周期fsyncを止める（DurabilityOrchestrator無効化）
+    useAutoFsync = false
+
+    // 読み取りのヒット率を少し上げる程度（上げすぎはヒープ圧迫）
+    metaCacheCap = 4_096
+
+    // ---- Stripe / データ書き出し ----
+    stripe {
+        k = 4
+        m = 1
+        isFastMode = true
+        autoFlush = false
+        parityCoder = RSParityCoder(1)
+
+        // フラッシュ粒度は“中〜大”。2GiBは過大なので縮める
+        // まずは 512MiB 起点。環境によって 256MiB/768MiB でA/B
+        flushThreshold = 512L * 1024 * 1024
+
+        // 実装にあれば：fsyncを粗く
+        // （存在しないなら無視してOK）
+        fsyncBatchN = 2_048
+        fsyncIntervalMicros = 50_000 // 50ms
+    }
+
+    // ---- WAL ----
+    wal {
+        fastMode = true
+        enableLog = false
+        // 走行中fsync無し（close時のみforce）
+        disableFsync()
+
+        // キューは“太すぎない”のが重要：OOMとGCテールを避ける
+        // まず 65,536 起点。余裕があれば 131,072 まで。
+        queueCap = 65_536
+
+        // 満杯時の“尾”を短く
+        backoffNanos = 3_000 // 3µs（2–8µsでA/B）
+    }
+
+    // ---- Manifest ----
+    manifest {
+        isFastMode = true
+        // バッチは中〜大。過大にすると溜め込みメモリが増える
+        batchMaxEvents = 4_096       // 2,048 / 4,096 / 8,192 をA/B
+        batchMaxMicros = 50_000      // 50ms（10–100msでA/B）
+
+        // 強同期は測定窓から外す
+        strongSyncIntervalMillis = 600_000 // 10分
+    }
+
+    // compaction / prune を測定中に走らせないスイッチがあればOFF
+    // compactorEnabled = false
+    // pruneEnabled = false
+}
+
+
 
 /* ==================== Builders ==================== */
 

@@ -255,6 +255,9 @@ class AkkaraDB private constructor(
         ): AkkaraDB = open(
             baseDir = cfg.baseDir,
             useAutoFsync = cfg.useAutoFsync,
+            doPeriodMs = cfg.doPeriodMs,
+            doMinIntervalMs = cfg.doMinIntervalMs,
+            doJitterPct = cfg.doJitterPct,
             stripeK = cfg.stripe.k,
             stripeAutoFlush = cfg.stripe.autoFlush,
             stripeIsFastMode = cfg.stripe.isFastMode,
@@ -287,6 +290,9 @@ class AkkaraDB private constructor(
         fun open(
             baseDir: Path,
             useAutoFsync: Boolean,
+            doPeriodMs: Long,
+            doMinIntervalMs: Long,
+            doJitterPct: Double,
             /* ── stripe ── */
             stripeK: Int,
             stripeAutoFlush: Boolean,
@@ -350,16 +356,16 @@ class AkkaraDB private constructor(
 
             var durabilityOrchestrator: DurabilityOrchestrator? = null
 
-//            if (useAutoFsync) {
-//                durabilityOrchestrator = DurabilityOrchestrator(
-//                    stripe = stripe,
-//                    wal = wal,
-//                    manifest = manifest,
-//                    periodMs = 5000L,
-//                    minIntervalMs = 200L,
-//                    jitterPct = 0.10
-//                )
-//            }
+            if (useAutoFsync) {
+                durabilityOrchestrator = DurabilityOrchestrator(
+                    stripe = stripe,
+                    wal = wal,
+                    manifest = manifest,
+                    periodMs = doPeriodMs,
+                    minIntervalMs = doMinIntervalMs,
+                    jitterPct = doJitterPct
+                )
+            }
 
             val levels = buildLevelsFromManifest(baseDir, manifest, pool)
 

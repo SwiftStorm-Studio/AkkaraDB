@@ -46,20 +46,7 @@ class ThroughputBenchmarkTest {
 
         val baseDir = Path.of("akkara-dsl-bench").also { Files.createDirectories(it) }
 
-        return AkkDSL.open<BenchAccount>(baseDir, StartupMode.FAST) {
-            metaCacheCap = 4_096
-            stripe {
-                k = 4
-                m = 1
-                autoFlush = false
-                flushThreshold = 512L * 1024 * 1024
-            }
-            wal {
-                disableFsync()
-                queueCap = 262_144
-                backoffNanos = 100_000
-            }
-        }.use { table ->
+        return AkkDSL.open<BenchAccount>(baseDir, StartupMode.ULTRA_FAST).use { table ->
             val keys = seedDataset(table, config)
             val result = measureThroughput(table, config, keys)
             table.db.flush()
