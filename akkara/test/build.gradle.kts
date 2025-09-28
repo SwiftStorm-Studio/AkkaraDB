@@ -3,5 +3,5 @@ tasks.test {
     testLogging {
         showStandardStreams = true
     }
-    maxHeapSize = "16G"
+    maxHeapSize = "512M"
 }
