@@ -96,7 +96,7 @@ class ByteBufferL private constructor(
 
     /** Moves the position forward by [n] bytes (bounds‑checked). */
     fun advance(n: Int): ByteBufferL {
-        val p = buf.position();
+        val p = buf.position()
         val np = p + n
         require(np in 0..buf.limit()) { "advance out of bounds: pos=$p, n=$n, newPos=$np, limit=${buf.limit()}" }
         buf.position(np); return this
@@ -179,35 +179,41 @@ class ByteBufferL private constructor(
 
     /* ======================= Relative primitive I/O ======================= */
 
-    inline fun get(): Byte = buf.get()
-    inline fun put(v: Byte): ByteBufferL {
-        buf.put(v); return this
-    }
+    var byte: Byte
+        get() = buf.get()
+        set(v) {
+            buf.put(v)
+        }
 
-    inline fun getShort(): Short = buf.getShort()
-    inline fun putShort(v: Short): ByteBufferL {
-        buf.putShort(v); return this
-    }
+    var short: Short
+        get() = buf.getShort()
+        set(v) {
+            buf.putShort(v)
+        }
 
-    inline fun getInt(): Int = buf.getInt()
-    inline fun putInt(v: Int): ByteBufferL {
-        buf.putInt(v); return this
-    }
+    var int: Int
+        get() = buf.getInt()
+        set(v) {
+            buf.putInt(v)
+        }
 
-    inline fun getLong(): Long = buf.getLong()
-    inline fun putLong(v: Long): ByteBufferL {
-        buf.putLong(v); return this
-    }
+    var long: Long
+        get() = buf.getLong()
+        set(v) {
+            buf.putLong(v)
+        }
 
-    inline fun getFloat(): Float = buf.getFloat()
-    inline fun putFloat(v: Float): ByteBufferL {
-        buf.putFloat(v); return this
-    }
+    var float: Float
+        get() = buf.getFloat()
+        set(v) {
+            buf.putFloat(v)
+        }
 
-    inline fun getDouble(): Double = buf.getDouble()
-    inline fun putDouble(v: Double): ByteBufferL {
-        buf.putDouble(v); return this
-    }
+    var double: Double
+        get() = buf.getDouble()
+        set(v) {
+            buf.putDouble(v)
+        }
 
     /* ======================= Absolute primitive I/O ======================= */
 
@@ -303,12 +309,25 @@ class ByteBufferL private constructor(
 
     /** Returns the underlying buffer (LE‑ordered view). Mutating position/limit affects this wrapper. */
     fun toByteBuffer(): ByteBuffer = buf
+
+    /** Returns true if this buffer is backed by a heap array. */
+    fun hasArray(): Boolean = buf.hasArray()
+
+    /**
+     * Returns the underlying array if present. Throws if this buffer is not backed by an array.
+     *
+     * ⚠ Note: use [arrayOffset] and [position] to interpret correct indexes.
+     */
+    fun array(): ByteArray = buf.array()
+
+    /** Returns the starting offset into [array] where this buffer's data begins. */
+    fun arrayOffset(): Int = buf.arrayOffset()
 }
 
 /* ======================= Convenience top‑level APIs ======================= */
 
 operator fun ByteBufferL.compareTo(other: ByteBufferL): Int = compareLexUnsigned(this, other)
-operator fun ByteBufferL.compareTo(other: ByteBuffer): Int = compareLexUnsigned(this, ByteBufferL.wrap(other))
+operator fun ByteBufferL.compareTo(other: ByteBuffer): Int = compareLexUnsigned(this, wrap(other))
 
 /**
  * Lexicographically compares remaining bytes of [a] and [b] as **unsigned** bytes.
