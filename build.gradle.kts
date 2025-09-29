@@ -45,6 +45,7 @@ subprojects {
             afterEvaluate {
                 dependencies {
                     compileOnly(libs.slf4j)
+                    implementation(kotlin("stdlib"))
                     implementation(kotlin("reflect"))
                     implementation("org.objenesis:objenesis:3.4")
                 }
