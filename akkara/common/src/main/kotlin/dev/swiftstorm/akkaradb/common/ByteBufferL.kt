@@ -32,7 +32,9 @@ import java.nio.channels.WritableByteChannel
  *
  * Design:
  *  - Always Little-Endian semantics without relying on buffer.order().
- *  - Position/limit management lives here; all primitive I/O delegates to [LE] (VarHandle-based).
+ *  - Position/limit management is exposed as Kotlin properties.
+ *  - Relative primitive I/O is property-based (i8/i16/i32/i64/f32/f64).
+ *  - Absolute primitive I/O uses property-based view via [at(index)].
  *  - AkkaraDB-specific 32B header read/write delegates to [AKHdr32].
  *  - No view buffers on hot paths; only duplicate/slice used for safe slicing.
  *
@@ -41,16 +43,11 @@ import java.nio.channels.WritableByteChannel
  *      val b = ByteBufferL.wrap(poolBuf)
  *      val fp = AKHdr32.sipHash24(keyBytes, seed64)
  *      val mk = AKHdr32.buildMiniKeyLE(keyBytes)
- *      b.putHeader32(kLen = keyBytes.size, vLen = valueLen.toLong(), seq, flags, fp, mk)
- *       .putBytes(keyBytes)
- *       .putBytes(valueBytes)
- *       .align(32 * 1024)
- *  - Reader:
- *      val h = b.readHeader32(recOff)
- *      val keyOff = recOff + AKHdr32.SIZE
- *      val valOff = keyOff + h.kLen
- *      val keySlice = b.sliceAt(keyOff, h.kLen)
- *      val valSlice = b.sliceAt(valOff, h.vLen)
+ *      val recOff = b.putRecord32(keyBytes, valueBytes, seq, flags, fp, mk)
+ *      b.align(32 * 1024)
+ *  - Absolute access:
+ *      b.at(recOff).i32 = 0xABCD
+ *      val v = b.at(recOff + 8).i64
  */
 class ByteBufferL private constructor(
     @PublishedApi internal val buf: ByteBuffer
@@ -71,40 +68,32 @@ class ByteBufferL private constructor(
         }
     }
 
-    // ---------------- Basics (state) ----------------
-    inline fun capacity(): Int = buf.capacity()
-    inline fun position(): Int = buf.position()
-    inline fun position(newPos: Int): ByteBufferL {
-        buf.position(newPos); return this
-    }
+    // ---------------- Basics as properties ----------------
+    /** Total capacity (immutable). */
+    val capacity: Int get() = buf.capacity()
 
-    inline fun limit(): Int = buf.limit()
-    inline fun limit(newLimit: Int): ByteBufferL {
-        buf.limit(newLimit); return this
-    }
+    /** Short alias when you want to emphasize size math. */
+    val cap: Int get() = buf.capacity()
 
-    inline fun remaining(): Int = buf.remaining()
-    inline fun clear(): ByteBufferL {
-        buf.clear(); return this
-    }
+    /** Current position (mutable). */
+    var position: Int
+        get() = buf.position()
+        set(value) {
+            buf.position(value)
+        }
 
-    inline fun flip(): ByteBufferL {
-        buf.flip(); return this
-    }
+    /** Current limit (mutable). */
+    var limit: Int
+        get() = buf.limit()
+        set(value) {
+            buf.limit(value)
+        }
 
-    inline fun rewind(): ByteBufferL {
-        buf.rewind(); return this
-    }
+    /** Remaining bytes (derived). */
+    val remaining: Int get() = buf.remaining()
 
-    inline fun mark(): ByteBufferL {
-        buf.mark(); return this
-    }
-
-    inline fun reset(): ByteBufferL {
-        buf.reset(); return this
-    }
-
-    inline fun isDirect(): Boolean = buf.isDirect
+    /** Direct buffer flag. */
+    val isDirect: Boolean get() = buf.isDirect
 
     /** Expose underlying buffer (position/limit are shared). */
     fun unwrap(): ByteBuffer = buf
@@ -126,70 +115,124 @@ class ByteBufferL private constructor(
         return d.slice().order(ByteOrder.LITTLE_ENDIAN)
     }
 
-    // ---------------- Relative primitives (cursor-like; LE delegated) ----------------
-    inline fun getU8(): Int = LE.cursor(buf).getU8()
-    inline fun putU8(v: Int): ByteBufferL {
-        LE.cursor(buf).putU8(v); return this
-    }
+    // ---------------- Relative primitives via properties ----------------
+    /**
+     * Relative read/write properties:
+     *  - get: reads a value at current position and advances position
+     *  - set: writes a value at current position and advances position
+     *
+     * Naming:
+     *  - i8 : unsigned 8-bit (Int 0..255)
+     *  - i16: Short (LE)
+     *  - i32: Int (LE)
+     *  - i64: Long (LE)
+     *  - f32: Float (LE)
+     *  - f64: Double (LE)
+     */
+    var i8: Int
+        get() = LE.cursor(buf).getU8()
+        set(v) {
+            LE.cursor(buf).putU8(v)
+        }
 
-    inline fun getShort(): Short = LE.cursor(buf).getShort()
-    inline fun putShort(v: Short): ByteBufferL {
-        LE.cursor(buf).putShort(v); return this
-    }
+    var i16: Short
+        get() = LE.cursor(buf).getShort()
+        set(v) {
+            LE.cursor(buf).putShort(v)
+        }
 
-    inline fun getInt(): Int = LE.cursor(buf).getInt()
-    inline fun putInt(v: Int): ByteBufferL {
-        LE.cursor(buf).putInt(v); return this
-    }
+    var i32: Int
+        get() = LE.cursor(buf).getInt()
+        set(v) {
+            LE.cursor(buf).putInt(v)
+        }
 
-    inline fun getLong(): Long = LE.cursor(buf).getLong()
-    inline fun putLong(v: Long): ByteBufferL {
-        LE.cursor(buf).putLong(v); return this
-    }
+    var i64: Long
+        get() = LE.cursor(buf).getLong()
+        set(v) {
+            LE.cursor(buf).putLong(v)
+        }
 
-    inline fun getFloat(): Float = LE.cursor(buf).getFloat()
-    inline fun putFloat(v: Float): ByteBufferL {
-        LE.cursor(buf).putFloat(v); return this
-    }
+    var f32: Float
+        get() = LE.cursor(buf).getFloat()
+        set(v) {
+            LE.cursor(buf).putFloat(v)
+        }
 
-    inline fun getDouble(): Double = LE.cursor(buf).getDouble()
-    inline fun putDouble(v: Double): ByteBufferL {
-        LE.cursor(buf).putDouble(v); return this
-    }
+    var f64: Double
+        get() = LE.cursor(buf).getDouble()
+        set(v) {
+            LE.cursor(buf).putDouble(v)
+        }
 
+    /** Relative bulk write of bytes. */
     fun putBytes(src: ByteArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
         LE.cursor(buf).putBytes(src, off, len); return this
     }
 
-    // ---------------- Absolute primitives (LE delegated) ----------------
-    inline fun getU8(at: Int): Int = LE.getU8(buf, at)
-    inline fun putU8(at: Int, v: Int): ByteBufferL {
-        LE.putU8(buf, at, v); return this
+    /** Relative bulk write (aligned) */
+    fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
+        LE.cursor(buf).putInts(src, off, len); return this
     }
 
-    inline fun getShort(at: Int): Short = LE.getShort(buf, at)
-    inline fun putShort(at: Int, v: Short): ByteBufferL {
-        LE.putShort(buf, at, v); return this
+    fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
+        LE.cursor(buf).putLongs(src, off, len); return this
     }
 
-    inline fun getInt(at: Int): Int = LE.getInt(buf, at)
-    inline fun putInt(at: Int, v: Int): ByteBufferL {
-        LE.putInt(buf, at, v); return this
-    }
+    // ---------------- Absolute primitives via view ----------------
+    /**
+     * Property-based absolute access view at a fixed [index].
+     * Example:
+     *   b.at(128).i32 = 42
+     *   val x = b.at(136).i64
+     */
+    fun at(index: Int): At = At(index)
 
-    inline fun getLong(at: Int): Long = LE.getLong(buf, at)
-    inline fun putLong(at: Int, v: Long): ByteBufferL {
-        LE.putLong(buf, at, v); return this
-    }
+    inner class At internal constructor(private val base: Int) {
+        var i8: Int
+            get() = LE.getU8(buf, base)
+            set(v) {
+                LE.putU8(buf, base, v)
+            }
 
-    inline fun getFloat(at: Int): Float = LE.getFloat(buf, at)
-    inline fun putFloat(at: Int, v: Float): ByteBufferL {
-        LE.putFloat(buf, at, v); return this
-    }
+        var i16: Short
+            get() = LE.getShort(buf, base)
+            set(v) {
+                LE.putShort(buf, base, v)
+            }
 
-    inline fun getDouble(at: Int): Double = LE.getDouble(buf, at)
-    inline fun putDouble(at: Int, v: Double): ByteBufferL {
-        LE.putDouble(buf, at, v); return this
+        var i32: Int
+            get() = LE.getInt(buf, base)
+            set(v) {
+                LE.putInt(buf, base, v)
+            }
+
+        var i64: Long
+            get() = LE.getLong(buf, base)
+            set(v) {
+                LE.putLong(buf, base, v)
+            }
+
+        var f32: Float
+            get() = LE.getFloat(buf, base)
+            set(v) {
+                LE.putFloat(buf, base, v)
+            }
+
+        var f64: Double
+            get() = LE.getDouble(buf, base)
+            set(v) {
+                LE.putDouble(buf, base, v)
+            }
+
+        /** Absolute bulk write helpers pinned to this base (for parity stripes etc.). */
+        fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): At {
+            LE.putInts(buf, base, src, off, len); return this
+        }
+
+        fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): At {
+            LE.putLongs(buf, base, src, off, len); return this
+        }
     }
 
     // ---------------- AkkaraDB header bridge (32B) ----------------
@@ -209,23 +252,6 @@ class ByteBufferL private constructor(
     /** Relative read of 32B header at current position; advances by 32. */
     fun readHeader32(): AKHdr32.Header = AKHdr32.readRel(buf)
 
-    // ---------------- Bulk (aligned) ----------------
-    fun putInts(at: Int, src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
-        LE.putInts(buf, at, src, off, len); return this
-    }
-
-    fun putLongs(at: Int, src: LongArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
-        LE.putLongs(buf, at, src, off, len); return this
-    }
-
-    fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
-        LE.cursor(buf).putInts(src, off, len); return this
-    }
-
-    fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
-        LE.cursor(buf).putLongs(src, off, len); return this
-    }
-
     // ---------------- Align / padding / CRC ----------------
     /** Power-of-two alignment by zero fill (e.g., 32*1024 for block size). */
     fun align(pow2: Int): ByteBufferL {
@@ -242,13 +268,12 @@ class ByteBufferL private constructor(
 
     // ---------------- Channels ----------------
     /** Write exactly [len] bytes from current position to [ch], advancing position. */
-    fun writeFully(ch: WritableByteChannel, len: Int = remaining()): Int = LE.writeFully(ch, buf, len)
+    fun writeFully(ch: WritableByteChannel, len: Int = remaining): Int = LE.writeFully(ch, buf, len)
 
     /** Read exactly [len] bytes into this buffer from [ch], advancing position. */
     fun readFully(ch: ReadableByteChannel, len: Int): Int = LE.readFully(ch, buf, len)
 
     // ---------------- Convenience (header + key/value) ----------------
-
     /**
      * Write header32 + key + value (relative).
      * Returns absolute offset to the start of the header for convenience.
@@ -261,7 +286,7 @@ class ByteBufferL private constructor(
         keyFP64: Long,
         miniKey: Long
     ): Int {
-        val hdrPos = position()
+        val hdrPos = position
         putHeader32(key.size, value.size.toLong(), seq, flags, keyFP64, miniKey)
         putBytes(key)
         putBytes(value)
