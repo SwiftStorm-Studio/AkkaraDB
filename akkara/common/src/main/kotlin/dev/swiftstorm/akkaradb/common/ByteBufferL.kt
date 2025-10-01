@@ -89,14 +89,17 @@ class ByteBufferL private constructor(
             buf.limit(value)
         }
 
+    var byte: ByteBuffer
+        get() = buf
+        set(value) {
+            buf.put(value)
+        }
+
     /** Remaining bytes (derived). */
     val remaining: Int get() = buf.remaining()
 
     /** Direct buffer flag. */
     val isDirect: Boolean get() = buf.isDirect
-
-    /** Expose underlying buffer (position/limit are shared). */
-    fun unwrap(): ByteBuffer = buf
 
     /** Read-only duplicate; independent position/limit; LE order applied for convenience. */
     fun asReadOnlyDuplicate(): ByteBuffer = buf.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
@@ -113,6 +116,20 @@ class ByteBufferL private constructor(
         val d = buf.duplicate()
         d.position(at).limit(at + len)
         return d.slice().order(ByteOrder.LITTLE_ENDIAN)
+    }
+
+    // ---------------- for method chaining ----------------
+
+    fun position(newPos: Int): ByteBufferL {
+        position = newPos; return this
+    }
+
+    fun limit(newLim: Int): ByteBufferL {
+        limit = newLim; return this
+    }
+
+    fun clear(): ByteBufferL {
+        buf.clear(); return this
     }
 
     // ---------------- Relative primitives via properties ----------------

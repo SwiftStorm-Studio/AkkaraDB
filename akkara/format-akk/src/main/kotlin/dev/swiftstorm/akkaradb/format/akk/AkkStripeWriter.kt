@@ -17,16 +17,19 @@
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+
 @file:Suppress("NOTHING_TO_INLINE", "unused")
 
-package dev.swiftstorm.akkaradb.format.impl
+package dev.swiftstorm.akkaradb.format.akk
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.vh.LE
+import dev.swiftstorm.akkaradb.format.akk.parity.DualXorParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.NoParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
+import dev.swiftstorm.akkaradb.format.akk.parity.XorParityCoder
 import dev.swiftstorm.akkaradb.format.api.*
-import java.io.Closeable
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
@@ -38,18 +41,24 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.zip.CRC32C
 import kotlin.math.min
 
 /**
  * High-performance StripeWriter implementation targeting NVMe + Java 17.
  *
- * Design goals:
- * - Append-only, lane-synchronized offsets (k data + m parity).
- * - Minimal syscalls: contiguous writes per-lane; fsync grouped by (N blocks or T µs).
- * - Two durability modes: SYNC (safety-first), ASYNC (FastMode: background fsync).
- * - Zero-copy hot path: blocks are direct buffers from BufferPool; no heap copies.
- * - Parity pluggable (XOR/DualXor/RS). Default is XOR for m==1, DualXor for m==2.
+ * Changes for new ParityCoder:
+ * - Staging now stores ByteBufferL (LE/direct). No unwrap() until IO.
+ * - Parity encode uses coder.encodeInto(data: Array<ByteBufferL>, parityOut: Array<ByteBufferL>).
+ *
+ * Local improvements (no-JNI):
+ * - Per-stripe CRC32C using JDK's java.util.zip.CRC32C (optional).
+ * - Positional writes (FileChannel.write(buf, off)) for safer future parallelization.
+ * - O(1) pending commit counter (avoid ConcurrentLinkedQueue.size()).
+ * - Time-based flush trigger (flushPolicy.maxMicros).
+ * - Parity buffer pool release guarded with try/finally.
  */
 class AkkStripeWriter(
     override val k: Int,
@@ -57,10 +66,10 @@ class AkkStripeWriter(
     laneDir: Path,
     private val pool: BufferPool,
     private val coder: ParityCoder = when (m) {
-        0 -> NoParity
-        1 -> XorParity
-        2 -> DualXorParity
-        else -> RsPlaceholder(m) // TODO: replace with real RS coder
+        0 -> NoParityCoder()
+        1 -> XorParityCoder()
+        2 -> DualXorParityCoder()
+        else -> RSParityCoder(m)
     },
     override var flushPolicy: FlushPolicy = FlushPolicy(),
     private val fastMode: Boolean = false,
@@ -68,7 +77,11 @@ class AkkStripeWriter(
     private val laneFilePrefixData: String = "data_",
     private val laneFilePrefixParity: String = "parity_",
     private val laneFileExtData: String = ".akd",
-    private val laneFileExtParity: String = ".akp"
+    private val laneFileExtParity: String = ".akp",
+    /** Enable per-stripe CRC32C computation via JDK CRC32C (no JNI). */
+    private val crc32cEnabled: Boolean = false,
+    /** Optional sink to receive computed CRC32C per stripe (length=k). */
+    private val crcSink: ((stripeIndex: Long, crcPerLane: IntArray) -> Unit)? = null
 ) : StripeWriter {
 
     override val blockSize: Int = BLOCK_SIZE
@@ -76,7 +89,8 @@ class AkkStripeWriter(
 
     // ---- Lane files ----
     private val dataCh: Array<FileChannel>
-    private val parityCh: Array<FileChannel> = if (m > 0) Array(m) { open(laneDir.resolve("$laneFilePrefixParity${it}$laneFileExtParity")) } else emptyArray()
+    private val parityCh: Array<FileChannel> =
+        if (m > 0) Array(m) { open(laneDir.resolve("$laneFilePrefixParity${it}$laneFileExtParity")) } else emptyArray()
 
     @Volatile
     override var lastSealedStripe: Long = -1; private set
@@ -90,10 +104,14 @@ class AkkStripeWriter(
     private val closed = AtomicBoolean(false)
 
     // Staging for current stripe (data only). Index = laneId [0..k-1]
-    private val stage: Array<ByteBuffer?> = arrayOfNulls(k)
+    // NOTE: store ByteBufferL (not ByteBuffer). We unwrap only for IO.
+    private val stage: Array<ByteBufferL?> = arrayOfNulls(k)
 
     // Commit queue (sealed-but-not-durable stripes)
     private val commitQ = ConcurrentLinkedQueue<Long>()
+
+    // O(1) pending count to avoid ConcurrentLinkedQueue.size() hot cost
+    private val pendingCommits = AtomicInteger(0)
 
     // Metrics (monotonic)
     private val sealedStripes = AtomicLong(0)
@@ -104,6 +122,10 @@ class AkkStripeWriter(
     private val laneWriteMicros = AtomicLong(0)
     private val fsyncMicros = AtomicLong(0)
     private val backpressureMaxMicros = AtomicLong(0)
+
+    // Last commit-group start time (for time-based trigger)
+    @Volatile
+    private var lastCommitStartNanos: Long = System.nanoTime()
 
     private val fsyncExec: Executor by lazy {
         flushPolicy.executor ?: Executors.newSingleThreadExecutor { r ->
@@ -136,16 +158,16 @@ class AkkStripeWriter(
     // ------------------------------------------------------------
     override fun addBlock(block: ByteBufferL) {
         ensureOpen()
-        val bb = block.unwrap()
+        val bb = block.duplicate()
         require(bb.isDirect) { "Block must be direct" }
         require(bb.remaining() == blockSize) { "Block must be exactly $blockSize bytes" }
 
         val idx = pendingInStripe
         require(idx in 0 until k) { "too many blocks for current stripe: $idx >= $k" }
 
-        // Capture a positioned duplicate to avoid caller position interference
-        val dup = bb.duplicate()
-        stage[idx] = dup
+        // Keep ByteBufferL as-is (do not duplicate underlying ByteBuffer unless needed).
+        // Caller position is not mutated since we only duplicate/unwrap for IO later.
+        stage[idx] = block
         pendingInStripe = idx + 1
 
         if (pendingInStripe == k) {
@@ -153,44 +175,59 @@ class AkkStripeWriter(
         }
     }
 
-    /** Seals current stripe: writes data+parity to lanes, enqueues for commit. */
+    /** Seals current stripe: (optional) CRC, parity encode, positional lane writes, enqueue commit. */
     private fun sealStripe() {
         val stripeIndex = lastSealedStripe + 1
         val off = stripeIndex * blockSize.toLong()
 
-        // --- Parity ---
-        val parityBufs: Array<ByteBuffer> = if (m > 0) Array(m) { pool.get(blockSize).unwrap().apply { clear(); limit(blockSize) } } else emptyArray()
-        val parityStart = System.nanoTime()
-        coder.encode(stage.requireFull(k), parityBufs)
-        val parityEnd = System.nanoTime()
-        parityMicros.addAndGet((parityEnd - parityStart) / 1000)
+        val dataL: Array<ByteBufferL> = stage.requireFull(k)
 
-        // --- Lane writes (contiguous per-lane) ---
-        val writeStart = System.nanoTime()
-        // data lanes
-        for (lane in 0 until k) {
-            val ch = dataCh[lane]
-            val buf = stage[lane]!!
-            buf.position(0).limit(blockSize)
-            ch.position(off)
-            writeFully(ch, buf)
-            bytesWrittenData.addAndGet(blockSize.toLong())
-        }
-        // parity lanes (if any)
-        if (m > 0) {
-            for (pm in 0 until m) {
-                val ch = parityCh[pm]
-                val buf = parityBufs[pm]
-                buf.position(0).limit(blockSize)
-                ch.position(off)
-                writeFully(ch, buf)
-                bytesWrittenParity.addAndGet(blockSize.toLong())
+        // --- CRC32C (optional, no JNI; uses JDK's CRC32C) ---
+        if (crc32cEnabled) {
+            val crc = IntArray(k)
+            val c = CRC32C()
+            for (i in 0 until k) {
+                val bb: ByteBuffer = dataL[i].duplicate().position(0).limit(blockSize)
+                c.reset()
+                c.update(bb)
+                crc[i] = c.value.toInt()
             }
-            // recycle parity buffers back to pool
-            for (b in parityBufs) pool.release(ByteBufferL.wrap(b))
+            crcSink?.invoke(stripeIndex, crc)
         }
-        val writeEnd = System.nanoTime()
-        laneWriteMicros.addAndGet((writeEnd - writeStart) / 1000)
+
+        // --- Parity ---
+        val parityBufs: Array<ByteBufferL> =
+            if (m > 0) Array(m) { pool.get(blockSize) } else emptyArray()
+        try {
+            val parityStart = System.nanoTime()
+            coder.encodeInto(dataL, parityBufs)
+            val parityEnd = System.nanoTime()
+            parityMicros.addAndGet((parityEnd - parityStart) / 1000)
+
+            // --- Lane writes (positional; contiguous per-lane) ---
+            val writeStart = System.nanoTime()
+            // data lanes
+            for (lane in 0 until k) {
+                val ch = dataCh[lane]
+                val buf = dataL[lane].duplicate().position(0).limit(blockSize)
+                writeFullyAt(ch, buf, off)
+                bytesWrittenData.addAndGet(blockSize.toLong())
+            }
+            // parity lanes (if any)
+            if (m > 0) {
+                for (pm in 0 until m) {
+                    val ch = parityCh[pm]
+                    val p = parityBufs[pm].duplicate().position(0).limit(blockSize)
+                    writeFullyAt(ch, p, off)
+                    bytesWrittenParity.addAndGet(blockSize.toLong())
+                }
+            }
+            val writeEnd = System.nanoTime()
+            laneWriteMicros.addAndGet((writeEnd - writeStart) / 1000)
+        } finally {
+            // recycle parity buffers back to pool even if encode/write throws
+            if (m > 0) for (b in parityBufs) pool.release(b)
+        }
 
         // Reset staging
         for (i in 0 until k) stage[i] = null
@@ -200,31 +237,44 @@ class AkkStripeWriter(
         lastSealedStripe = stripeIndex
         sealedStripes.incrementAndGet()
         commitQ.add(stripeIndex)
+        pendingCommits.incrementAndGet()
 
         // Group-commit policy check
         maybeCommit()
     }
 
+    /** Positional write fully: does not mutate channel's implicit position. */
+    private fun writeFullyAt(ch: FileChannel, buf: ByteBuffer, off: Long) {
+        var curOff = off
+        while (buf.hasRemaining()) {
+            val n = ch.write(buf, curOff)
+            if (n < 0) throw IOException("channel closed")
+            curOff += n
+        }
+    }
+
     private fun maybeCommit() {
-        val n = commitQ.size
+        val n = pendingCommits.get()
         if (n == 0) return
         val policyBlocks = flushPolicy.maxBlocks
         val policyMicros = flushPolicy.maxMicros
-        var doCommit = false
 
-        if (policyBlocks > 0 && n >= policyBlocks) doCommit = true
-        // Time-based trigger: simple heuristic — if queue non-empty and enough time elapsed since last fsync.
-        // We don't track the exact timestamp of last fsync group here for simplicity; engines can call flush() proactively.
-        if (!doCommit && policyMicros <= 0L) return
-        if (doCommit) performCommit(FlushMode.ASYNC.takeIf { fastMode } ?: FlushMode.SYNC)
+        val doByBlocks = (policyBlocks > 0 && n >= policyBlocks)
+        val doByTime = (policyMicros > 0L &&
+                (System.nanoTime() - lastCommitStartNanos) >= policyMicros * 1_000)
+
+        if (doByBlocks || doByTime) {
+            lastCommitStartNanos = System.nanoTime()
+            performCommit(FlushMode.ASYNC.takeIf { fastMode } ?: FlushMode.SYNC)
+        }
     }
 
     override fun flush(mode: FlushMode): CommitTicket {
         ensureOpen()
-        // If there is a complete stripe staged, it is already sealed in addBlock(); otherwise nothing to seal here.
-        if (commitQ.isEmpty()) {
+        if (pendingCommits.get() == 0) {
             return CommitTicket(lastSealedStripe, CompletableFuture.completedFuture(lastDurableStripe))
         }
+        lastCommitStartNanos = System.nanoTime()
         return performCommit(mode)
     }
 
@@ -235,15 +285,13 @@ class AkkStripeWriter(
         return when (mode) {
             FlushMode.SYNC -> {
                 val t0 = System.nanoTime()
-                // Order: force all data lanes, then parity lanes
                 forceAll()
                 val t1 = System.nanoTime()
                 fsyncMicros.addAndGet((t1 - t0) / 1000)
                 lastDurableStripe = upto
-                durableStripes.set(upto + 1)
+                durableStripes.set(upto + 1) // total durable stripes (count-like)
                 CommitTicket(upto, CompletableFuture.completedFuture(upto))
             }
-
             FlushMode.ASYNC -> {
                 val fut = CompletableFuture<Long>()
                 fsyncExec.execute {
@@ -266,27 +314,20 @@ class AkkStripeWriter(
 
     private fun drainCommitUpto(): Long {
         var last = -1L
+        var drained = 0
         var x = commitQ.poll()
         while (x != null) {
             last = x
+            drained++
             x = commitQ.poll()
         }
+        if (drained > 0) pendingCommits.addAndGet(-drained)
         return last
     }
 
     private fun forceAll() {
-        // Both arrays may be empty depending on m
         for (ch in dataCh) ch.force(false)
         for (ch in parityCh) ch.force(false)
-    }
-
-    private fun writeFully(ch: FileChannel, buf: ByteBuffer) {
-        var left = buf.remaining()
-        while (left > 0) {
-            val n = ch.write(buf)
-            if (n < 0) throw IOException("channel closed")
-            left -= n
-        }
     }
 
     override fun sealIfComplete(): Boolean {
@@ -297,17 +338,15 @@ class AkkStripeWriter(
     }
 
     override fun seek(stripeIndex: Long) {
-        // Simple seek: advance logical counters without scanning. Caller must ensure correctness.
         require(stripeIndex >= -1) { "invalid stripeIndex" }
         lastSealedStripe = stripeIndex
         lastDurableStripe = min(lastDurableStripe, stripeIndex)
         pendingInStripe = 0
         commitQ.clear()
+        pendingCommits.set(0)
     }
 
     override fun recover(): RecoveryResult {
-        // Lightweight placeholder: position after the lastDurableStripe we tracked.
-        // A production impl would scan lane tails or consult Manifest.
         return RecoveryResult(lastSealedStripe, lastDurableStripe, false)
     }
 
@@ -325,9 +364,10 @@ class AkkStripeWriter(
     override fun close() {
         if (closed.compareAndSet(false, true)) {
             try {
-                // Best-effort: seal partial if complete; then fsync remaining
                 if (pendingInStripe == k) sealStripe()
-                if (commitQ.isNotEmpty()) performCommit(if (fastMode) FlushMode.ASYNC else FlushMode.SYNC).future.join()
+                if (pendingCommits.get() > 0) {
+                    performCommit(if (fastMode) FlushMode.ASYNC else FlushMode.SYNC).future.join()
+                }
             } finally {
                 var first: Throwable? = null
                 fun swallow(t: Throwable) {
@@ -349,142 +389,19 @@ class AkkStripeWriter(
         check(!closed.get()) { "writer closed" }
     }
 
-    private fun Array<ByteBuffer?>.requireFull(n: Int): Array<ByteBuffer> {
+    private fun Array<ByteBufferL?>.requireFull(n: Int): Array<ByteBufferL> {
         check(size >= n) { "staging size < k" }
         @Suppress("UNCHECKED_CAST")
         val out = Array(n) { i ->
-            val b = this[i] ?: error("missing block for lane=$i")
-            b
+            this[i] ?: error("missing block for lane=$i")
         }
         return out
     }
 
+    private fun ByteBufferL.duplicate(): ByteBuffer = this.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN)
+
     private fun alignUp(x: Long, pow2: Long): Long {
         require(pow2 > 0 && (pow2 and (pow2 - 1)) == 0L)
         return (x + (pow2 - 1)) and (pow2 - 1).inv()
-    }
-}
-
-// =====================================================================================
-// Parity encoders
-// =====================================================================================
-
-/** Strategy interface for parity generation. */
-interface ParityCoder : Closeable {
-    /**
-     * Encode [data] blocks into [parity] blocks.
-     * Each buffer position/limit define the write window; implementations write exactly BLOCK_SIZE bytes.
-     */
-    fun encode(data: Array<ByteBuffer>, parity: Array<ByteBuffer>)
-    override fun close() {}
-}
-
-/** No parity (m==0). */
-object NoParity : ParityCoder {
-    override fun encode(data: Array<ByteBuffer>, parity: Array<ByteBuffer>) {
-        require(parity.isEmpty())
-    }
-}
-
-/** XOR parity (m==1): p0 = data0 ^ data1 ^ ... ^ data{k-1}. */
-object XorParity : ParityCoder {
-    override fun encode(data: Array<ByteBuffer>, parity: Array<ByteBuffer>) {
-        require(parity.size == 1) { "XOR requires exactly 1 parity buffer" }
-        val p = parity[0]
-        val sz = data[0].remaining()
-        p.clear(); p.limit(sz)
-
-        // Initialize parity with first data block
-        val d0 = data[0].duplicate().apply { position(0).limit(sz) }
-        p.put(d0)
-        p.flip()
-
-        val tmp = ByteBuffer.allocateDirect(sz)
-        var i = 1
-        while (i < data.size) {
-            tmp.clear(); tmp.limit(sz)
-            val di = data[i].duplicate().apply { position(0).limit(sz) }
-            tmp.put(di); tmp.flip()
-            xorInto(p, tmp)
-            i++
-        }
-        p.position(sz).limit(sz)
-    }
-
-    private fun xorInto(dst: ByteBuffer, src: ByteBuffer) {
-        // XOR in 8-byte chunks for throughput
-        val n = dst.limit()
-        var off = 0
-        while (off + 8 <= n) {
-            val a = LE.getLong(dst, off)
-            val b = LE.getLong(src, off)
-            LE.putLong(dst, off, a xor b)
-            off += 8
-        }
-        while (off < n) {
-            val a = dst.get(off)
-            val b = src.get(off)
-            dst.put(off, (a.toInt() xor b.toInt()).toByte())
-            off++
-        }
-    }
-}
-
-/** Dual-XOR (m==2) example: p0 = XOR(all even lanes), p1 = XOR(all odd lanes). */
-object DualXorParity : ParityCoder {
-    override fun encode(data: Array<ByteBuffer>, parity: Array<ByteBuffer>) {
-        require(parity.size == 2) { "DualXor requires exactly 2 parity buffers" }
-        val sz = data[0].remaining()
-        for (p in parity) {
-            p.clear(); p.limit(sz)
-        }
-
-        // Initialize
-        var evenInit = false
-        var oddInit = false
-        for (i in data.indices) {
-            val di = data[i].duplicate().apply { position(0).limit(sz) }
-            val dst = if ((i and 1) == 0) parity[0] else parity[1]
-            if ((i and 1) == 0 && !evenInit || (i and 1) == 1 && !oddInit) {
-                dst.put(di); dst.flip()
-                if ((i and 1) == 0) evenInit = true else oddInit = true
-            } else {
-                xorInto(dst, di)
-            }
-        }
-        parity[0].position(sz).limit(sz)
-        parity[1].position(sz).limit(sz)
-    }
-
-    private fun xorInto(dst: ByteBuffer, src: ByteBuffer) {
-        val n = dst.limit()
-        var off = 0
-        while (off + 8 <= n) {
-            val a = LE.getLong(dst, off)
-            val b = LE.getLong(src, off)
-            LE.putLong(dst, off, a xor b)
-            off += 8
-        }
-        while (off < n) {
-            val a = dst.get(off)
-            val b = src.get(off)
-            dst.put(off, (a.toInt() xor b.toInt()).toByte())
-            off++
-        }
-    }
-}
-
-/** Placeholder for Reed-Solomon parity (m>=3). Replace with a proper GF(256) coder. */
-class RsPlaceholder(private val m: Int) : ParityCoder {
-    override fun encode(data: Array<ByteBuffer>, parity: Array<ByteBuffer>) {
-        // Simple fallback: first parity = XOR(all), others = zero. Not fault-tolerant beyond 1 loss.
-        require(parity.size == m)
-        if (m == 0) return
-        if (parity.isEmpty()) return
-        XorParity.encode(data, arrayOf(parity[0]))
-        for (i in 1 until parity.size) {
-            val p = parity[i]
-            p.clear(); LE.fillZero(p, p.capacity()); p.limit(p.capacity())
-        }
     }
 }
