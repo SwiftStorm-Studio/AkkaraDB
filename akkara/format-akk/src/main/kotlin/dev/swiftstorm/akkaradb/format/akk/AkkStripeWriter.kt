@@ -17,7 +17,6 @@
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-
 @file:Suppress("NOTHING_TO_INLINE", "unused")
 
 package dev.swiftstorm.akkaradb.format.akk
@@ -175,24 +174,21 @@ class AkkStripeWriter(
         }
     }
 
-    /** Seals current stripe: (optional) CRC, parity encode, positional lane writes, enqueue commit. */
+    /** Seals current stripe: tail-CRC stamp, parity encode, positional lane writes, enqueue commit. */
     private fun sealStripe() {
         val stripeIndex = lastSealedStripe + 1
         val off = stripeIndex * blockSize.toLong()
 
         val dataL: Array<ByteBufferL> = stage.requireFull(k)
 
-        // --- CRC32C (optional, no JNI; uses JDK's CRC32C) ---
-        if (crc32cEnabled) {
-            val crc = IntArray(k)
+        run {
             val c = CRC32C()
             for (i in 0 until k) {
-                val bb: ByteBuffer = dataL[i].duplicate().position(0).limit(blockSize)
-                c.reset()
-                c.update(bb)
-                crc[i] = c.value.toInt()
+                val bb = dataL[i].duplicate()           // ByteBuffer (LE)
+                bb.position(0).limit(blockSize - 4)
+                c.reset(); c.update(bb)
+                bb.putInt(blockSize - 4, c.value.toInt())
             }
-            crcSink?.invoke(stripeIndex, crc)
         }
 
         // --- Parity ---
@@ -397,8 +393,6 @@ class AkkStripeWriter(
         }
         return out
     }
-
-    private fun ByteBufferL.duplicate(): ByteBuffer = this.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN)
 
     private fun alignUp(x: Long, pow2: Long): Long {
         require(pow2 > 0 && (pow2 and (pow2 - 1)) == 0L)

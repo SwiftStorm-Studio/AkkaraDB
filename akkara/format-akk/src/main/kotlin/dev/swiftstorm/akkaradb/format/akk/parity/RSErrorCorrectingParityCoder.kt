@@ -88,7 +88,9 @@ class RSErrorCorrectingParityCoder(
     override fun encodeInto(data: Array<ByteBufferL>, parityOut: Array<ByteBufferL>) {
         val k = data.size
         val m = parityOut.size
-        require(k > 0); require(m == parityCount); require(k + m <= 255)
+        require(k > 0) { "data is empty" }
+        require(m == parityCount) { "parityOut.size=$m but parityCount=$parityCount" }
+        require(k + m <= 255) { "RS(8) requires n=k+m ≤ 255; got k=$k, m=$m" }
         requireAllHave(blockSize, data); requireAllHave(blockSize, parityOut)
         ensureCoeff(k)
         val c = coeff!!
