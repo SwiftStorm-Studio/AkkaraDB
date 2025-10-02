@@ -76,11 +76,7 @@ class AkkStripeWriter(
     private val laneFilePrefixData: String = "data_",
     private val laneFilePrefixParity: String = "parity_",
     private val laneFileExtData: String = ".akd",
-    private val laneFileExtParity: String = ".akp",
-    /** Enable per-stripe CRC32C computation via JDK CRC32C (no JNI). */
-    private val crc32cEnabled: Boolean = false,
-    /** Optional sink to receive computed CRC32C per stripe (length=k). */
-    private val crcSink: ((stripeIndex: Long, crcPerLane: IntArray) -> Unit)? = null
+    private val laneFileExtParity: String = ".akp"
 ) : StripeWriter {
 
     override val blockSize: Int = BLOCK_SIZE
@@ -361,17 +357,37 @@ class AkkStripeWriter(
         if (closed.compareAndSet(false, true)) {
             try {
                 if (pendingInStripe == k) sealStripe()
-                if (pendingCommits.get() > 0) {
-                    performCommit(if (fastMode) FlushMode.ASYNC else FlushMode.SYNC).future.join()
+
+                val barrier = CompletableFuture<Void>()
+                (flushPolicy.executor ?: fsyncExec).execute {
+                    barrier.complete(null)
                 }
+                barrier.join()
+
+                if (pendingCommits.get() > 0) {
+                    performCommit(FlushMode.SYNC)
+                }
+
+                if (lastSealedStripe >= 0) {
+                    val exactSize = (lastSealedStripe + 1) * blockSize.toLong()
+                    for (ch in dataCh) if (ch.size() != exactSize) ch.truncate(exactSize)
+                    for (ch in parityCh) if (ch.size() != exactSize) ch.truncate(exactSize)
+                    dataCh.firstOrNull()?.force(true)
+                } else {
+                    dataCh.firstOrNull()?.force(true)
+                }
+
+                for (ch in dataCh) ch.force(false)
+                for (ch in parityCh) ch.force(false)
+
             } finally {
                 var first: Throwable? = null
                 fun swallow(t: Throwable) {
                     if (first == null) first = t
                 }
-                (dataCh + parityCh).forEach { ch ->
+                (dataCh + parityCh).forEach {
                     try {
-                        ch.close()
+                        it.close()
                     } catch (t: Throwable) {
                         swallow(t)
                     }
