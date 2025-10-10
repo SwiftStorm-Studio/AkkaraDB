@@ -16,37 +16,26 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
-
-@file:Suppress("unused", "DuplicatedCode")
+@file:Suppress("unused", "DuplicatedCode", "NOTHING_TO_INLINE")
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.vh.LE
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityKind
 import java.lang.Long.rotateLeft
 import java.lang.Long.rotateRight
+import java.nio.ByteBuffer
 
 /**
- * Dual-XOR parity coder (m = 2).
+ * Dual-XOR (P+Q) parity coder (m = 2).
  *
- * ## Overview
- * - Produces two independent parity blocks:
- *   - **P** = XOR of all data blocks
- *   - **Q** = XOR of bit-rotated data blocks (rotation amount depends on lane index)
- *
- * ## Properties
- * - Supports up to **one data loss** (can be reconstructed using either P or Q).
- * - Any lost parity block(s) can be recomputed from all data blocks.
- * - Losing both parity blocks simultaneously is still safe as long as all data blocks remain.
- * - **Two data losses cannot be reconstructed** — Reed–Solomon should be used instead.
- *
- * ## Implementation Notes
- * - Operates in 64-bit chunks for throughput; handles remaining tail bytes separately.
- * - All access is **absolute-index** based; buffer positions/limits remain unchanged.
- * - No heap allocations on the hot path.
- * - Bit rotations use lane-dependent constants to avoid collisions between P and Q.
+ * - No allocations on the hot path
+ * - Absolute-index I/O via LE.* on raw ByteBuffer
+ * - 64-bit wide XOR + tail-bytes
+ * - Q uses bit-rotated values for better protection
  */
 class DualXorParityCoder(
     override val blockSize: Int = BLOCK_SIZE
@@ -56,42 +45,60 @@ class DualXorParityCoder(
     override val kind: ParityKind = ParityKind.DUAL_XOR
     override val supportsErrorCorrection: Boolean = true // up to 1 data erasure
 
-    private fun rotBits64ForLane(lane: Int): Int = (lane * 13 + 5) and 63
-    private fun rotBits8ForLane(lane: Int): Int = (lane * 3 + 1) and 7
+    private inline fun rotBits64ForLane(lane: Int): Int = (lane * 13 + 5) and 63
+    private inline fun rotBits8ForLane(lane: Int): Int = (lane * 3 + 1) and 7
 
-    override fun encodeInto(
-        data: Array<ByteBufferL>,
-        parityOut: Array<ByteBufferL>
-    ) {
-        require(parityOut.size == parityCount) { "parityOut.size != 2" }
+    override fun encodeInto(data: Array<ByteBufferL>, parityOut: Array<ByteBufferL>) {
+        require(parityOut.size == 2) { "parityOut.size != 2" }
         val k = data.size
         require(k > 0) { "data is empty" }
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parityOut)
 
-        val p = parityOut[0]
-        val q = parityOut[1]
-        val pPos = p.position
-        val qPos = q.position
+        val pBBL = parityOut[0];
+        val qBBL = parityOut[1]
+        val pBuf: ByteBuffer = pBBL.duplicate()
+        val qBuf: ByteBuffer = qBBL.duplicate()
+        val pBase = pBBL.position;
+        val qBase = qBBL.position
 
-        val longs = (blockSize ushr 3)
-        val tail = blockSize - (longs shl 3)
+        val dBufs = Array(k) { i -> data[i].duplicate() }
+        val dBase = IntArray(k) { i -> data[i].position }
+
+        val longBytes = (blockSize ushr 3) shl 3
+        val tail = blockSize - longBytes
 
         // 64-bit wide
         var off = 0
-        while (off < (longs shl 3)) {
+        while (off < longBytes) {
             var accP = 0L
             var accQ = 0L
-            for (i in 0 until k) {
-                val d = data[i]
-                val dPos = d.position
-                val v = d.at(dPos + off).i64
-                accP = accP xor v
-                val r = rotBits64ForLane(i)
-                accQ = accQ xor if (r == 0) v else rotateLeft(v, r)
+            when (k) {
+                4 -> {
+                    val v0 = LE.getLong(dBufs[0], dBase[0] + off)
+                    val v1 = LE.getLong(dBufs[1], dBase[1] + off)
+                    val v2 = LE.getLong(dBufs[2], dBase[2] + off)
+                    val v3 = LE.getLong(dBufs[3], dBase[3] + off)
+                    accP = v0 xor v1 xor v2 xor v3
+                    accQ = (if (rotBits64ForLane(0) == 0) v0 else rotateLeft(v0, rotBits64ForLane(0))) xor
+                            (if (rotBits64ForLane(1) == 0) v1 else rotateLeft(v1, rotBits64ForLane(1))) xor
+                            (if (rotBits64ForLane(2) == 0) v2 else rotateLeft(v2, rotBits64ForLane(2))) xor
+                            (if (rotBits64ForLane(3) == 0) v3 else rotateLeft(v3, rotBits64ForLane(3)))
+                }
+
+                else -> {
+                    var i = 0
+                    while (i < k) {
+                        val v = LE.getLong(dBufs[i], dBase[i] + off)
+                        accP = accP xor v
+                        val r = rotBits64ForLane(i)
+                        accQ = accQ xor if (r == 0) v else rotateLeft(v, r)
+                        i++
+                    }
+                }
             }
-            p.at(pPos + off).i64 = accP
-            q.at(qPos + off).i64 = accQ
+            LE.putLong(pBuf, pBase + off, accP)
+            LE.putLong(qBuf, qBase + off, accQ)
             off += 8
         }
 
@@ -101,50 +108,54 @@ class DualXorParityCoder(
             val idx = off + t
             var bp = 0
             var bq = 0
-            for (i in 0 until k) {
-                val d = data[i]
-                val v = d.at(d.position + idx).i8 // 0..255
+            var i = 0
+            while (i < k) {
+                val v = LE.getU8(dBufs[i], dBase[i] + idx)
                 bp = bp xor v
                 val r8 = rotBits8ForLane(i)
                 bq = bq xor rotl8(v, r8)
+                i++
             }
-            p.at(pPos + idx).i8 = bp
-            q.at(qPos + idx).i8 = bq
+            LE.putU8(pBuf, pBase + idx, bp)
+            LE.putU8(qBuf, qBase + idx, bq)
             t++
         }
     }
 
-    override fun verify(
-        data: Array<ByteBufferL>,
-        parity: Array<ByteBufferL>
-    ): Boolean {
-        require(parity.size == parityCount) { "parity.size != 2" }
+    override fun verify(data: Array<ByteBufferL>, parity: Array<ByteBufferL>): Boolean {
+        require(parity.size == 2) { "parity.size != 2" }
         val k = data.size
         require(k > 0) { "data is empty" }
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parity)
 
-        val p = parity[0]
-        val q = parity[1]
-        val pPos = p.position
-        val qPos = q.position
+        val pBBL = parity[0];
+        val qBBL = parity[1]
+        val pBuf = pBBL.duplicate();
+        val qBuf = qBBL.duplicate()
+        val pBase = pBBL.position;
+        val qBase = qBBL.position
 
-        val longs = (blockSize ushr 3)
-        val tail = blockSize - (longs shl 3)
+        val dBufs = Array(k) { i -> data[i].duplicate() }
+        val dBase = IntArray(k) { i -> data[i].position }
+
+        val longBytes = (blockSize ushr 3) shl 3
+        val tail = blockSize - longBytes
 
         var off = 0
-        while (off < (longs shl 3)) {
+        while (off < longBytes) {
             var accP = 0L
             var accQ = 0L
-            for (i in 0 until k) {
-                val d = data[i]
-                val v = d.at(d.position + off).i64
+            var i = 0
+            while (i < k) {
+                val v = LE.getLong(dBufs[i], dBase[i] + off)
                 accP = accP xor v
                 val r = rotBits64ForLane(i)
                 accQ = accQ xor if (r == 0) v else rotateLeft(v, r)
+                i++
             }
-            if (accP != p.at(pPos + off).i64) return false
-            if (accQ != q.at(qPos + off).i64) return false
+            if (accP != LE.getLong(pBuf, pBase + off)) return false
+            if (accQ != LE.getLong(qBuf, qBase + off)) return false
             off += 8
         }
 
@@ -153,13 +164,15 @@ class DualXorParityCoder(
             val idx = off + t
             var bp = 0
             var bq = 0
-            for (i in 0 until k) {
-                val v = data[i].at(data[i].position + idx).i8
+            var i = 0
+            while (i < k) {
+                val v = LE.getU8(dBufs[i], dBase[i] + idx)
                 bp = bp xor v
                 bq = bq xor rotl8(v, rotBits8ForLane(i))
+                i++
             }
-            if (bp != p.at(pPos + idx).i8) return false
-            if (bq != q.at(qPos + idx).i8) return false
+            if (bp != LE.getU8(pBuf, pBase + idx)) return false
+            if (bq != LE.getU8(qBuf, qBase + idx)) return false
             t++
         }
         return true
@@ -173,164 +186,158 @@ class DualXorParityCoder(
         outData: Array<ByteBufferL>,
         outParity: Array<ByteBufferL>
     ): Int {
-        val lossData = lostDataIdx.size
-        val lossPar = lostParityIdx.size
-        require(lossPar <= 2) { "at most 2 parity losses supported" }
-        require(lossData <= 2) { "at most 2 data losses declared; DualXor can only fix up to 1" }
-        if (lossData >= 2) {
-            throw IllegalArgumentException("DualXor cannot reconstruct two data losses; use RS coder")
-        }
+        val losses = lostDataIdx.size + lostParityIdx.size
+        require(losses <= 2) { "too many losses" }
+        require(parity.size == 2) { "parity.size != 2" }
+        requireAllHave(blockSize, outData)
+        requireAllHave(blockSize, outParity)
+        data.forEach { if (it != null) require(it.remaining >= blockSize) }
+        parity.forEach { if (it != null) require(it.remaining >= blockSize) }
 
-        if (lossData == 0 && lossPar > 0) {
+        // lost parity only -> recompute
+        if (lostDataIdx.isEmpty() && lostParityIdx.isNotEmpty()) {
             val k = data.size
-            for (i in 0 until k) requireNotNull(data[i]) { "parity reconstruct requires all data present" }
-
+            for (i in 0 until k) requireNotNull(data[i]) { "reconstruct parity requires all data present" }
             val needP = lostParityIdx.any { it == 0 }
             val needQ = lostParityIdx.any { it == 1 }
-            val tmpP = if (needP) outParity[lostParityIdx.indexOf(0)] else null
-            val tmpQ = if (needQ) outParity[lostParityIdx.indexOf(1)] else null
-            val arrData = Array(k) { requireNotNull(data[it]) }
-            encodeInto(arrData, arrayOfNotNull(tmpP, tmpQ))
-            return lossPar
+            val outP = if (needP) outParity[lostParityIdx.indexOf(0)] else null
+            val outQ = if (needQ) outParity[lostParityIdx.indexOf(1)] else null
+            val arr = Array(k) { requireNotNull(data[it]) }
+            if (outP != null && outQ != null) encodeInto(arr, arrayOf(outP, outQ))
+            else if (outP != null) encodeInto(arr, arrayOf(outP, dummyNull()))
+            else if (outQ != null) encodeInto(arr, arrayOf(dummyNull(), outQ))
+            return lostParityIdx.size
         }
 
-        if (lossData == 1) {
+        // one data loss -> use P or Q
+        if (lostDataIdx.size == 1) {
             val li = lostDataIdx[0]
-            require(li in data.indices) { "lost data index out of range: $li" }
-
-            val haveP = parity.getOrNull(0) != null
-            val haveQ = parity.getOrNull(1) != null
-
-            require(haveP || haveQ) { "need at least one parity (P or Q) to reconstruct one data block" }
+            val haveP = parity[0] != null
+            val haveQ = parity[1] != null
+            require(haveP || haveQ) { "need at least one parity to reconstruct" }
 
             val out = outData[0]
-            require(out.remaining >= blockSize) { "out buffer too small" }
+            val outBuf = out.duplicate();
+            val outBase = out.position
+
+            val k = data.size
+            val dBufs = Array(k) { i -> data[i]?.duplicate() }
+            val dBase = IntArray(k) { i -> data[i]?.position ?: 0 }
+
+            val longBytes = (blockSize ushr 3) shl 3
+            val tail = blockSize - longBytes
 
             if (haveP) {
-                val p = parity[0]!!
-                val pPos = p.position
-
-                val longs = (blockSize ushr 3)
-                val tail = blockSize - (longs shl 3)
-                val outPos = out.position
+                val pBBL = parity[0]!!
+                val pBuf = pBBL.duplicate();
+                val pBase = pBBL.position
 
                 var off = 0
-                while (off < (longs shl 3)) {
-                    var acc = p.at(pPos + off).i64
-                    for (i in data.indices) {
-                        if (i == li) continue
-                        val buf = requireNotNull(data[i]) { "only one data loss supported" }
-                        acc = acc xor buf.at(buf.position + off).i64
+                while (off < longBytes) {
+                    var acc = LE.getLong(pBuf, pBase + off)
+                    var i = 0
+                    while (i < k) {
+                        if (i != li) {
+                            val db = dBufs[i]!!
+                            acc = acc xor LE.getLong(db, dBase[i] + off)
+                        }
+                        i++
                     }
-                    out.at(outPos + off).i64 = acc
+                    LE.putLong(outBuf, outBase + off, acc)
                     off += 8
                 }
                 var t = 0
                 while (t < tail) {
                     val idx = off + t
-                    var b = parity[0]!!.at(pPos + idx).i8
-                    for (i in data.indices) {
-                        if (i == li) continue
-                        val buf = requireNotNull(data[i])
-                        b = b xor buf.at(buf.position + idx).i8
+                    var b = LE.getU8(pBuf, pBase + idx)
+                    var i = 0
+                    while (i < k) {
+                        if (i != li) {
+                            val db = dBufs[i]!!
+                            b = b xor LE.getU8(db, dBase[i] + idx)
+                        }
+                        i++
                     }
-                    out.at(outPos + idx).i8 = b
+                    LE.putU8(outBuf, outBase + idx, b)
                     t++
                 }
             } else {
-                val q = parity[1]!!
-                val qPos = q.position
-
-                val r64 = rotBits64ForLane(li)
+                val qBBL = parity[1]!!
+                val qBuf = qBBL.duplicate();
+                val qBase = qBBL.position
+                val r64 = rotBits64ForLane(li);
                 val r8 = rotBits8ForLane(li)
 
-                val longs = (blockSize ushr 3)
-                val tail = blockSize - (longs shl 3)
-                val outPos = out.position
-
                 var off = 0
-                while (off < (longs shl 3)) {
-                    var acc = q.at(qPos + off).i64
-                    for (i in data.indices) {
-                        if (i == li) continue
-                        val buf = requireNotNull(data[i]) { "only one data loss supported" }
-                        val v = buf.at(buf.position + off).i64
-                        val ri = rotBits64ForLane(i)
-                        acc = acc xor if (ri == 0) v else rotateLeft(v, ri)
+                while (off < longBytes) {
+                    var acc = LE.getLong(qBuf, qBase + off)
+                    var i = 0
+                    while (i < k) {
+                        if (i != li) {
+                            val db = dBufs[i]!!
+                            val v = LE.getLong(db, dBase[i] + off)
+                            val ri = rotBits64ForLane(i)
+                            acc = acc xor if (ri == 0) v else rotateLeft(v, ri)
+                        }
+                        i++
                     }
-                    // acc = ROTL_li(D_li) → D_li = ROR_li(acc)
                     val restored = if (r64 == 0) acc else rotateRight(acc, r64)
-                    out.at(outPos + off).i64 = restored
+                    LE.putLong(outBuf, outBase + off, restored)
                     off += 8
                 }
                 var t = 0
                 while (t < tail) {
                     val idx = off + t
-                    var b = parity[1]!!.at(qPos + idx).i8
-                    for (i in data.indices) {
-                        if (i == li) continue
-                        val v = requireNotNull(data[i]).at(requireNotNull(data[i]).position + idx).i8
-                        b = b xor rotl8(v, rotBits8ForLane(i))
+                    var b = LE.getU8(qBuf, qBase + idx)
+                    var i = 0
+                    while (i < k) {
+                        if (i != li) {
+                            val v = LE.getU8(dBufs[i]!!, dBase[i] + idx)
+                            b = b xor rotl8(v, rotBits8ForLane(i))
+                        }
+                        i++
                     }
-                    // b = rotl8(D_li, r8) → D_li = rotr8(b, r8)
-                    out.at(outPos + idx).i8 = rotr8(b, r8)
+                    LE.putU8(outBuf, outBase + idx, rotr8(b, r8))
                     t++
                 }
             }
 
-            if (lossPar > 0) {
-                val k = data.size
-                val fullData = Array(k) { idx -> if (idx == li) out else requireNotNull(data[idx]) }
-                if (lossPar == 2) {
-                    encodeInto(fullData, outParity)
+            // if parity also lost -> recompute from full data (using recovered out)
+            if (lostParityIdx.isNotEmpty()) {
+                val full = Array(k) { idx -> if (idx == li) out else requireNotNull(data[idx]) }
+                if (lostParityIdx.size == 2) {
+                    encodeInto(full, outParity)
                 } else {
                     val which = lostParityIdx[0]
-                    if (which == 0) {
-                        encodeInto(fullData, arrayOf(outParity[0], dummyNullParity()))
-                    } else {
-                        encodeInto(fullData, arrayOf(dummyNullParity(), outParity[0]))
-                    }
+                    if (which == 0) encodeInto(full, arrayOf(outParity[0], dummyNull()))
+                    else encodeInto(full, arrayOf(dummyNull(), outParity[0]))
                 }
             }
-            return 1 + lossPar
+            return 1 + lostParityIdx.size
         }
 
         return 0
     }
 
     override fun attachScratch(buf: ByteBufferL?) {}
-
     override fun scratchBytesHint(k: Int, m: Int): Int = 0
 
-    /* -------------------- helpers -------------------- */
-
+    // ---- helpers ----
     private fun requireAllHave(size: Int, arr: Array<ByteBufferL>) {
-        for (b in arr) {
-            require(b.remaining >= size) {
-                "buffer remaining < blockSize: remaining=${b.remaining}, required=$size"
-            }
+        for (b in arr) require(b.remaining >= size) {
+            "buffer remaining < blockSize: remaining=${b.remaining}, required=$size"
         }
     }
-
     private fun rotl8(x: Int, r: Int): Int {
-        val v = x and 0xFF
+        val v = x and 0xFF;
         val n = r and 7
         return ((v shl n) or (v ushr (8 - n))) and 0xFF
     }
-
     private fun rotr8(x: Int, r: Int): Int {
-        val v = x and 0xFF
+        val v = x and 0xFF;
         val n = r and 7
         return ((v ushr n) or (v shl (8 - n))) and 0xFF
     }
 
-    private fun arrayOfNotNull(vararg items: ByteBufferL?): Array<ByteBufferL> {
-        return Array(items.count { it != null }) { idx ->
-            items.filterNotNull()[idx]
-        }
-    }
-
-    private fun dummyNullParity(): ByteBufferL {
-        throw UnsupportedOperationException("dummyNullParity should not be called")
-    }
+    private fun dummyNull(): ByteBufferL = throw UnsupportedOperationException("not used")
 }

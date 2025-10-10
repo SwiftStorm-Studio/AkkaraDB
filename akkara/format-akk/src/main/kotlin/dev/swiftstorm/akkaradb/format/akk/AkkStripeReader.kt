@@ -233,28 +233,21 @@ class AkkStripeReader(
     }
 
     private fun readFullyAtStreamingCrc(
-        ch: FileChannel,
-        buf: ByteBuffer,
-        off: Long,
-        crc: CRC32C
+        ch: FileChannel, buf: ByteBuffer, off: Long, crc: CRC32C
     ): Int {
         var first = true
         var got = 0
-        while (buf.hasRemaining()) {
-            val n = ch.read(buf, off + got)
+        val dup = buf.duplicate()
+        while (dup.hasRemaining()) {
+            val n = ch.read(dup, off + got)
             if (n < 0) return if (first) -1 else got
             if (n == 0) break
 
-            // update CRC for newly filled region, but never include tail CRC field
             val newEnd = min(got + n, blockSize - 4)
             if (newEnd > got) {
-                val slice = buf.duplicate()
-                    .order(ByteOrder.LITTLE_ENDIAN)
-                    .position(got)
-                    .limit(newEnd)
-                crc.update(slice)
+                val s = buf.duplicate().position(got).limit(newEnd) // order設定なし
+                crc.update(s)
             }
-
             first = false
             got += n
         }
@@ -309,5 +302,5 @@ class AkkStripeReader(
     }
 
     private fun asByteBuffer(b: ByteBufferL): ByteBuffer =
-        b.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        b.duplicate()
 }

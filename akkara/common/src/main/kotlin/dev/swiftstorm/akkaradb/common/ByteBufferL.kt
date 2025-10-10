@@ -344,4 +344,15 @@ class ByteBufferL private constructor(
         val valSlice = sliceAt(valOff, vLenInt)
         return h to (keySlice to valSlice)
     }
+
+    // ---------------- Unsafe direct access (internal) ----------------
+    inline fun getI64At(off: Int): Long = LE.getLong(buf, off)
+    inline fun putI64At(off: Int, v: Long) {
+        LE.putLong(buf, off, v)
+    }
+
+    inline fun getU8At(off: Int): Int = LE.getU8(buf, off)
+    inline fun putU8At(off: Int, v: Int) {
+        LE.putU8(buf, off, v)
+    }
 }

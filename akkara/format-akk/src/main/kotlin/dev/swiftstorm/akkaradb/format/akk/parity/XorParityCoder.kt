@@ -17,22 +17,23 @@
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-@file:Suppress("unused", "DuplicatedCode")
+@file:Suppress("NOTHING_TO_INLINE", "DuplicatedCode", "KotlinConstantConditions")
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.vh.LE
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityKind
+import java.nio.ByteBuffer
 
 /**
  * XOR parity coder (m = 1).
  *
- * - **No allocations on the hot path**
- * - **Absolute-index I/O** with [ByteBufferL.i64] to avoid cursor mutations
- * - Operates in 64-bit chunks, then a small byte tail
- * - Requires each buffer to have at least [blockSize] bytes remaining
+ * - No allocations on the hot path
+ * - Absolute-index I/O via LE.* on raw ByteBuffer
+ * - 64-bit wide XOR + tail-bytes
  */
 class XorParityCoder(
     override val blockSize: Int = BLOCK_SIZE
@@ -40,8 +41,9 @@ class XorParityCoder(
 
     override val parityCount: Int = 1
     override val kind: ParityKind = ParityKind.XOR
-    override val supportsErrorCorrection: Boolean = true // up to 1 erasure (XOR)
+    override val supportsErrorCorrection: Boolean = true // up to 1 erasure
 
+    // ---------------- encode ----------------
     override fun encodeInto(
         data: Array<ByteBufferL>,
         parityOut: Array<ByteBufferL>
@@ -51,38 +53,70 @@ class XorParityCoder(
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parityOut)
 
-        val p = parityOut[0]
-        val pPos = p.position
-        val longs = (blockSize ushr 3)
-        val tail = blockSize - (longs shl 3)
+        // Parity buffer + absolute base
+        val pBBL = parityOut[0]
+        val pBuf: ByteBuffer = pBBL.duplicate()
+        val pBase = pBBL.position
 
-        // 64-bit wide XOR
+        // Data buffers + absolute bases
+        val dBufs = Array(data.size) { i -> data[i].duplicate() }
+        val dBase = IntArray(data.size) { i -> data[i].position }
+
+        val longBytes = (blockSize ushr 3) shl 3
+        val tail = blockSize - longBytes
+
+        // 64-bit XOR
         var off = 0
-        while (off < (longs shl 3)) {
+        while (off < longBytes) {
             var acc = 0L
-            // XOR across all data lanes at this offset
-            for (d in data) {
-                val dPos = d.position
-                acc = acc xor d.at(dPos + off).i64
+            // 軽アンローリング（k==4が多い前提ならここを増やす）
+            when (dBufs.size) {
+                4 -> {
+                    acc = acc xor LE.getLong(dBufs[0], dBase[0] + off)
+                    acc = acc xor LE.getLong(dBufs[1], dBase[1] + off)
+                    acc = acc xor LE.getLong(dBufs[2], dBase[2] + off)
+                    acc = acc xor LE.getLong(dBufs[3], dBase[3] + off)
+                }
+
+                else -> {
+                    var i = 0
+                    while (i < dBufs.size) {
+                        acc = acc xor LE.getLong(dBufs[i], dBase[i] + off)
+                        i++
+                    }
+                }
             }
-            p.at(pPos + off).i64 = acc
+            LE.putLong(pBuf, pBase + off, acc)
             off += 8
         }
 
         // tail bytes
         var t = 0
         while (t < tail) {
-            var b = 0
             val idx = off + t
-            for (d in data) {
-                val dPos = d.position
-                b = b xor d.at(dPos + idx).i8
+            var b = 0
+            when (dBufs.size) {
+                4 -> {
+                    b = b xor LE.getU8(dBufs[0], dBase[0] + idx)
+                    b = b xor LE.getU8(dBufs[1], dBase[1] + idx)
+                    b = b xor LE.getU8(dBufs[2], dBase[2] + idx)
+                    b = b xor LE.getU8(dBufs[3], dBase[3] + idx)
+                }
+
+                else -> {
+                    var i = 0
+                    while (i < dBufs.size) {
+                        b = b xor LE.getU8(dBufs[i], dBase[i] + idx)
+                        i++
+                    }
+                }
             }
-            p.at(pPos + idx).i8 = b
+            LE.putU8(pBuf, pBase + idx, b)
             t++
         }
     }
 
+    // ---------------- verify ----------------
     override fun verify(
         data: Array<ByteBufferL>,
         parity: Array<ByteBufferL>
@@ -92,35 +126,66 @@ class XorParityCoder(
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parity)
 
-        val p = parity[0]
-        val pPos = p.position
-        val longs = (blockSize ushr 3)
-        val tail = blockSize - (longs shl 3)
+        val pBBL = parity[0]
+        val pBuf = pBBL.duplicate()
+        val pBase = pBBL.position
+
+        val dBufs = Array(data.size) { i -> data[i].duplicate() }
+        val dBase = IntArray(data.size) { i -> data[i].position }
+
+        val longBytes = (blockSize ushr 3) shl 3
+        val tail = blockSize - longBytes
 
         var off = 0
-        while (off < (longs shl 3)) {
+        while (off < longBytes) {
             var acc = 0L
-            for (d in data) {
-                val dPos = d.position
-                acc = acc xor d.at(dPos + off).i64
+            when (dBufs.size) {
+                4 -> {
+                    acc = acc xor LE.getLong(dBufs[0], dBase[0] + off)
+                    acc = acc xor LE.getLong(dBufs[1], dBase[1] + off)
+                    acc = acc xor LE.getLong(dBufs[2], dBase[2] + off)
+                    acc = acc xor LE.getLong(dBufs[3], dBase[3] + off)
+                }
+
+                else -> {
+                    var i = 0
+                    while (i < dBufs.size) {
+                        acc = acc xor LE.getLong(dBufs[i], dBase[i] + off)
+                        i++
+                    }
+                }
             }
-            if (acc != p.at(pPos + off).i64) return false
+            if (acc != LE.getLong(pBuf, pBase + off)) return false
             off += 8
         }
 
         var t = 0
         while (t < tail) {
+            val idx = off + t
             var b = 0
-            for (d in data) {
-                val base = d.position + off
-                b = b xor d.at(base + t).i8
+            when (dBufs.size) {
+                4 -> {
+                    b = b xor LE.getU8(dBufs[0], dBase[0] + idx)
+                    b = b xor LE.getU8(dBufs[1], dBase[1] + idx)
+                    b = b xor LE.getU8(dBufs[2], dBase[2] + idx)
+                    b = b xor LE.getU8(dBufs[3], dBase[3] + idx)
+                }
+
+                else -> {
+                    var i = 0
+                    while (i < dBufs.size) {
+                        b = b xor LE.getU8(dBufs[i], dBase[i] + idx)
+                        i++
+                    }
+                }
             }
-            if (b != p.at(pPos + off + t).i8) return false
+            if (b != LE.getU8(pBuf, pBase + idx)) return false
             t++
         }
         return true
     }
 
+    // ---------------- reconstruct (up to 1 erasure) ----------------
     override fun reconstruct(
         lostDataIdx: IntArray,
         lostParityIdx: IntArray,
@@ -135,66 +200,71 @@ class XorParityCoder(
         requireAllHave(blockSize, outData)
         requireAllHave(blockSize, outParity)
 
-        // lost parity -> recompute parity from present data
+        // lost parity -> recompute from present data
         if (lostParityIdx.isNotEmpty()) {
             require(lostParityIdx.size == 1 && lostParityIdx[0] == 0) { "invalid lostParityIdx for XOR" }
-            val presentData = ArrayList<ByteBufferL>(data.size)
-            for (d in data) presentData += requireNotNull(d) { "reconstruct parity requires all data present" }
-            encodeInto(presentData.toTypedArray(), arrayOf(outParity[0]))
+            val present = ArrayList<ByteBufferL>(data.size)
+            for (d in data) present += requireNotNull(d) { "reconstruct parity requires all data present" }
+            encodeInto(present.toTypedArray(), arrayOf(outParity[0]))
             return 1
         }
 
-        // lost data -> XOR of all present data plus existing parity
+        // lost data -> parity ^ xor(all other data)
         if (lostDataIdx.isNotEmpty()) {
-            require(lostDataIdx.size == 1) { "only one lost data block can be reconstructed" }
             val li = lostDataIdx[0]
-            require(li in data.indices) { "lost data index out of range: $li" }
-            val p = requireNotNull(parity[0]) { "parity block required to reconstruct data" }
+            val pBBL = requireNotNull(parity[0]) { "parity block required" }
+            val pBuf = pBBL.duplicate()
+            val pBase = pBBL.position
+
             val out = outData[0]
+            val outBuf = out.duplicate()
+            val outBase = out.position
 
-            requireAllHave(blockSize, arrayOf(out))
-            val longs = (blockSize ushr 3)
-            val tail = blockSize - (longs shl 3)
+            val dBufs = Array(data.size) { i -> data[i]?.duplicate() }
+            val dBase = IntArray(data.size) { i -> data[i]?.position ?: 0 }
 
-            val outPos = out.position
-            val pPos = p.position
+            val longBytes = (blockSize ushr 3) shl 3
+            val tail = blockSize - longBytes
 
             var off = 0
-            while (off < (longs shl 3)) {
-                var acc = p.at(pPos + off).i64
-                // XOR all present data except the lost index
-                for ((i, d) in data.withIndex()) {
-                    if (i == li) continue
-                    val buf = requireNotNull(d) { "only one data loss supported for XOR" }
-                    val dPos = buf.position
-                    acc = acc xor buf.at(dPos + off).i64
+            while (off < longBytes) {
+                var acc = LE.getLong(pBuf, pBase + off)
+                var i = 0
+                while (i < dBufs.size) {
+                    if (i != li) {
+                        val db = dBufs[i]
+                        if (db != null) acc = acc xor LE.getLong(db, dBase[i] + off)
+                    }
+                    i++
                 }
-                out.at(outPos + off).i64 = acc
+                LE.putLong(outBuf, outBase + off, acc)
                 off += 8
             }
 
             var t = 0
             while (t < tail) {
-                var b = p.at(pPos + off + t).i8
-                for ((i, d) in data.withIndex()) {
-                    if (i == li) continue
-                    val buf = requireNotNull(d)
-                    b = b xor buf.at(buf.position + off + t).i8
+                val idx = off + t
+                var b = LE.getU8(pBuf, pBase + idx)
+                var i = 0
+                while (i < dBufs.size) {
+                    if (i != li) {
+                        val db = dBufs[i]
+                        if (db != null) b = b xor LE.getU8(db, dBase[i] + idx)
+                    }
+                    i++
                 }
-                out.at(outPos + off + t).i8 = b
+                LE.putU8(outBuf, outBase + idx, b)
                 t++
             }
             return 1
         }
-
-        // nothing to do
         return 0
     }
 
     override fun attachScratch(buf: ByteBufferL?) {}
-
     override fun scratchBytesHint(k: Int, m: Int): Int = 0
 
+    // ------------- helpers -------------
     private fun requireAllHave(size: Int, arr: Array<ByteBufferL>) {
         for (b in arr) {
             require(b.remaining >= size) {
