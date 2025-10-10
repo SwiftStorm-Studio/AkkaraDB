@@ -17,10 +17,12 @@
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-@file:Suppress("NOTHING_TO_INLINE", "unused")
+@file:Suppress("NOTHING_TO_INLINE", "unused", "DuplicatedCode")
 
 package dev.swiftstorm.akkaradb.common
 
+import dev.swiftstorm.akkaradb.common.types.U32
+import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.common.vh.LE
 import java.nio.ByteBuffer
 import kotlin.math.min
@@ -39,8 +41,8 @@ import kotlin.math.min
  *  -- total 32 bytes
  *
  * Notes:
- *  - API accepts vLen as Long but enforces u32 range (0..0xFFFF_FFFF).
- *  - Uses LE.* primitives (VarHandle-based, always Little-Endian).
+ *  - vLen は U32、seq/keyFP64/miniKey は U64 で表現。
+ *  - LE.* primitives（VarHandle）で常にLittle-Endian。
  */
 object AKHdr32 {
 
@@ -54,41 +56,42 @@ object AKHdr32 {
     const val OFF_MINI = 24
 
     data class Header(
-        val kLen: Int,
-        val vLen: Int,       // stored as u32; exposed as Int (0..0xFFFF_FFFF fits Int positive range?)
-        val seq: Long,
-        val flags: Int,
-        val keyFP64: Long,
-        val miniKey: Long
+        val kLen: Int,     // u16 (0..65535)
+        val vLen: U32,     // u32
+        val seq: U64,      // u64
+        val flags: Int,    // u8 (0..255)
+        val keyFP64: U64,  // u64
+        val miniKey: U64   // u64
     )
+
+    // -------- Write / Read --------
 
     /** Absolute write of 32-byte header at [at]. */
     @JvmStatic
     fun write(
         buf: ByteBuffer, at: Int,
-        kLen: Int, vLen: Long, seq: Long, flags: Int,
-        keyFP64: Long, miniKey: Long
+        kLen: Int, vLen: U32, seq: U64, flags: Int,
+        keyFP64: U64, miniKey: U64
     ) {
-        require(kLen in 0..0xFFFF) { "kLen out of range" }
-        require(vLen in 0..0xFFFF_FFFFL) { "vLen out of u32 range" }
-        require(flags in 0..0xFF) { "flags out of range" }
-        require(at >= 0 && at + SIZE <= buf.capacity()) { "header out of bounds" }
+        require(kLen in 0..0xFFFF) { "kLen out of range: $kLen" }
+        require(flags in 0..0xFF) { "flags out of range: $flags" }
+        require(at >= 0 && at + SIZE <= buf.capacity()) { "header out of bounds: at=$at cap=${buf.capacity()}" }
 
-        LE.putShort(buf, at + OFF_KLEN, kLen.toShort())
-        LE.putInt(buf, at + OFF_VLEN, vLen.toInt())
-        LE.putLong(buf, at + OFF_SEQ, seq)
+        LE.putShort(buf, at + OFF_KLEN, (kLen and 0xFFFF).toShort())
+        LE.putU32(buf, at + OFF_VLEN, vLen)
+        LE.putU64(buf, at + OFF_SEQ, seq)
         LE.putU8(buf, at + OFF_FLAGS, flags)
         LE.putU8(buf, at + OFF_PAD0, 0)
-        LE.putLong(buf, at + OFF_KFP, keyFP64)
-        LE.putLong(buf, at + OFF_MINI, miniKey)
+        LE.putU64(buf, at + OFF_KFP, keyFP64)
+        LE.putU64(buf, at + OFF_MINI, miniKey)
     }
 
     /** Relative write: writes at current position and advances by 32. */
     @JvmStatic
     fun writeRel(
         buf: ByteBuffer,
-        kLen: Int, vLen: Long, seq: Long, flags: Int,
-        keyFP64: Long, miniKey: Long
+        kLen: Int, vLen: U32, seq: U64, flags: Int,
+        keyFP64: U64, miniKey: U64
     ) {
         val p = buf.position()
         write(buf, p, kLen, vLen, seq, flags, keyFP64, miniKey)
@@ -98,13 +101,13 @@ object AKHdr32 {
     /** Absolute read of 32-byte header from [at]. */
     @JvmStatic
     fun read(buf: ByteBuffer, at: Int): Header {
-        require(at >= 0 && at + SIZE <= buf.capacity()) { "header out of bounds" }
+        require(at >= 0 && at + SIZE <= buf.capacity()) { "header out of bounds: at=$at cap=${buf.capacity()}" }
         val kLen = (LE.getShort(buf, at + OFF_KLEN).toInt() and 0xFFFF)
-        val vLen = LE.getInt(buf, at + OFF_VLEN) // (0..0xFFFF_FFFF) will show as signed Int; use toUInt() if needed
-        val seq = LE.getLong(buf, at + OFF_SEQ)
+        val vLen = LE.getU32(buf, at + OFF_VLEN)
+        val seq = LE.getU64(buf, at + OFF_SEQ)
         val flags = LE.getU8(buf, at + OFF_FLAGS)
-        val kfp = LE.getLong(buf, at + OFF_KFP)
-        val mini = LE.getLong(buf, at + OFF_MINI)
+        val kfp = LE.getU64(buf, at + OFF_KFP)
+        val mini = LE.getU64(buf, at + OFF_MINI)
         return Header(kLen, vLen, seq, flags, kfp, mini)
     }
 
@@ -121,7 +124,7 @@ object AKHdr32 {
 
     /** Pack first up to 8 bytes of [key] into a little-endian 64-bit word (key[0] -> bits 7:0). */
     @JvmStatic
-    fun buildMiniKeyLE(key: ByteArray): Long {
+    fun buildMiniKeyLE(key: ByteArray): U64 {
         val n = min(8, key.size)
         var x = 0L
         var i = 0
@@ -129,26 +132,26 @@ object AKHdr32 {
             x = x or ((key[i].toLong() and 0xFFL) shl (8 * i))
             i++
         }
-        return x
+        return U64.fromSigned(x)
     }
 
     /** SipHash-2-4(key, seed64) → 64-bit fingerprint (k0=seed, k1=seed^phi). */
     @JvmStatic
-    fun sipHash24(key: ByteArray, seed64: Long): Long {
-        val k0 = seed64
-        val k1 = seed64 xor 0x9E3779B97F4A7C15uL.toLong() // use unsigned literal
-        return sipHash24(key, k0, k1)
+    fun sipHash24(key: ByteArray, seed64: U64): U64 {
+        val k0 = seed64.raw
+        val k1 = seed64.raw xor 0x9E3779B97F4A7C15uL.toLong() // golden ratio φ
+        return sipHash24(key, U64.fromSigned(k0), U64.fromSigned(k1))
     }
 
     /** SipHash-2-4(key, (k0,k1)). */
     @JvmStatic
-    fun sipHash24(m: ByteArray, k0: Long, k1: Long): Long {
-        var v0 = 0x736f6d6570736575L xor k0
-        var v1 = 0x646f72616e646f6dL xor k1
-        var v2 = 0x6c7967656e657261L xor k0
-        var v3 = 0x7465646279746573L xor k1
+    fun sipHash24(m: ByteArray, k0: U64, k1: U64): U64 {
+        var v0 = 0x736f6d6570736575L xor k0.raw
+        var v1 = 0x646f72616e646f6dL xor k1.raw
+        var v2 = 0x6c7967656e657261L xor k0.raw
+        var v3 = 0x7465646279746573L xor k1.raw
 
-        var i = 0;
+        var i = 0
         val n = m.size
         while (i + 8 <= n) {
             val mi = (m[i].toLong() and 0xFF) or
@@ -176,55 +179,40 @@ object AKHdr32 {
 
         var b = (n.toLong() and 0xFF) shl 56
         when (n and 7) {
-            7 -> {
-                b = b or ((m[n - 7].toLong() and 0xFFL)) or
-                        ((m[n - 6].toLong() and 0xFFL) shl 8) or
-                        ((m[n - 5].toLong() and 0xFFL) shl 16) or
-                        ((m[n - 4].toLong() and 0xFFL) shl 24) or
-                        ((m[n - 3].toLong() and 0xFFL) shl 32) or
-                        ((m[n - 2].toLong() and 0xFFL) shl 40) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 48)
-            }
+            7 -> b = b or ((m[n - 7].toLong() and 0xFFL)) or
+                    ((m[n - 6].toLong() and 0xFFL) shl 8) or
+                    ((m[n - 5].toLong() and 0xFFL) shl 16) or
+                    ((m[n - 4].toLong() and 0xFFL) shl 24) or
+                    ((m[n - 3].toLong() and 0xFFL) shl 32) or
+                    ((m[n - 2].toLong() and 0xFFL) shl 40) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 48)
 
-            6 -> {
-                b = b or ((m[n - 6].toLong() and 0xFFL)) or
-                        ((m[n - 5].toLong() and 0xFFL) shl 8) or
-                        ((m[n - 4].toLong() and 0xFFL) shl 16) or
-                        ((m[n - 3].toLong() and 0xFFL) shl 24) or
-                        ((m[n - 2].toLong() and 0xFFL) shl 32) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 40)
-            }
+            6 -> b = b or ((m[n - 6].toLong() and 0xFFL)) or
+                    ((m[n - 5].toLong() and 0xFFL) shl 8) or
+                    ((m[n - 4].toLong() and 0xFFL) shl 16) or
+                    ((m[n - 3].toLong() and 0xFFL) shl 24) or
+                    ((m[n - 2].toLong() and 0xFFL) shl 32) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 40)
 
-            5 -> {
-                b = b or ((m[n - 5].toLong() and 0xFFL)) or
-                        ((m[n - 4].toLong() and 0xFFL) shl 8) or
-                        ((m[n - 3].toLong() and 0xFFL) shl 16) or
-                        ((m[n - 2].toLong() and 0xFFL) shl 24) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 32)
-            }
+            5 -> b = b or ((m[n - 5].toLong() and 0xFFL)) or
+                    ((m[n - 4].toLong() and 0xFFL) shl 8) or
+                    ((m[n - 3].toLong() and 0xFFL) shl 16) or
+                    ((m[n - 2].toLong() and 0xFFL) shl 24) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 32)
 
-            4 -> {
-                b = b or ((m[n - 4].toLong() and 0xFFL)) or
-                        ((m[n - 3].toLong() and 0xFFL) shl 8) or
-                        ((m[n - 2].toLong() and 0xFFL) shl 16) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 24)
-            }
+            4 -> b = b or ((m[n - 4].toLong() and 0xFFL)) or
+                    ((m[n - 3].toLong() and 0xFFL) shl 8) or
+                    ((m[n - 2].toLong() and 0xFFL) shl 16) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 24)
 
-            3 -> {
-                b = b or ((m[n - 3].toLong() and 0xFFL)) or
-                        ((m[n - 2].toLong() and 0xFFL) shl 8) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 16)
-            }
+            3 -> b = b or ((m[n - 3].toLong() and 0xFFL)) or
+                    ((m[n - 2].toLong() and 0xFFL) shl 8) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 16)
 
-            2 -> {
-                b = b or ((m[n - 2].toLong() and 0xFFL)) or
-                        ((m[n - 1].toLong() and 0xFFL) shl 8)
-            }
+            2 -> b = b or ((m[n - 2].toLong() and 0xFFL)) or
+                    ((m[n - 1].toLong() and 0xFFL) shl 8)
 
-            1 -> {
-                b = b or (m[n - 1].toLong() and 0xFFL)
-            }
-
+            1 -> b = b or (m[n - 1].toLong() and 0xFFL)
             0 -> {}
         }
 
@@ -252,6 +240,6 @@ object AKHdr32 {
             v1 = v1 xor v2; v3 = v3 xor v0
             v2 = (v2 shl 32) or (v2 ushr 32)
         }
-        return v0 xor v1 xor v2 xor v3
+        return U64.fromSigned(v0 xor v1 xor v2 xor v3)
     }
 }

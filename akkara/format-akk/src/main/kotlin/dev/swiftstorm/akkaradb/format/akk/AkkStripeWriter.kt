@@ -143,10 +143,11 @@ class AkkStripeWriter(
         }
     }
 
-    private fun open(p: Path): FileChannel = FileChannel.open(
-        p,
-        CREATE, WRITE, READ, DSYNC // DSYNC gives stronger ordering for safety mode
-    )
+    private fun open(p: Path): FileChannel =
+        when (fastMode) {
+            true -> FileChannel.open(p, CREATE, READ, WRITE)
+            false -> FileChannel.open(p, CREATE, READ, WRITE, DSYNC)
+        }
 
     // ------------------------------------------------------------
     // Write path

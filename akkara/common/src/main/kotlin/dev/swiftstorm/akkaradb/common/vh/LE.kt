@@ -21,6 +21,8 @@
 
 package dev.swiftstorm.akkaradb.common.vh
 
+import dev.swiftstorm.akkaradb.common.types.U32
+import dev.swiftstorm.akkaradb.common.types.U64
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.VarHandle
 import java.nio.ByteBuffer
@@ -40,13 +42,9 @@ import kotlin.math.min
  *  - Zero-copy CRC32C over ByteBuffer ranges.
  *  - Deterministic writeFully/readFully, zero fill, power-of-two align.
  *
- * Non-Goals (deliberately excluded for portability/perf):
- *  - Any DB/domain-specific layouts (record headers, flags, hashing, etc.)
- *  - Endian switching (keep LE only; branching hurts P99).
- *
- * Notes:
- *  - Bounds checks use capacity (absolute) / remaining (relative) for predictability.
- *  - Bulk methods require alignment (4B for ints, 8B for longs).
+ * Non-Goals:
+ *  - DB/domain-specific layoutsは含めない（ヘッダ等は別クラスへ）。
+ *  - Endian switching禁止（LE固定で分岐を消す）。
  */
 object LE {
 
@@ -121,12 +119,31 @@ object LE {
         rangeCheck(buf, at, 8); VH.F64.set(buf, at, v)
     }
 
+    // ----- Unsigned convenience (u32/u64) -----
+    @JvmStatic
+    inline fun getU32(buf: ByteBuffer, at: Int): U32 =
+        U32.fromSigned(getInt(buf, at))
+
+    @JvmStatic
+    inline fun putU32(buf: ByteBuffer, at: Int, v: U32) {
+        putInt(buf, at, v.raw)
+    }
+
+    @JvmStatic
+    inline fun getU64(buf: ByteBuffer, at: Int): U64 =
+        U64.fromSigned(getLong(buf, at))
+
+    @JvmStatic
+    inline fun putU64(buf: ByteBuffer, at: Int, v: U64) {
+        putLong(buf, at, v.raw)
+    }
+
     // ---------------- Bulk (absolute; aligned) ----------------
     /** Put [len] ints from [src][off..off+len) at [at]. Requires 4-byte alignment. */
     @JvmStatic
     fun putInts(buf: ByteBuffer, at: Int, src: IntArray, off: Int = 0, len: Int = src.size - off) {
         require(off >= 0 && len >= 0 && off + len <= src.size)
-        require((at and 3) == 0) { "unaligned int write: at=$at" }
+        require((at and 3) == 0) { "unaligned int write: at=$at (must be 4B-aligned)" }
         rangeCheck(buf, at, len shl 2)
         var p = at;
         var i = off;
@@ -140,7 +157,7 @@ object LE {
     @JvmStatic
     fun putLongs(buf: ByteBuffer, at: Int, src: LongArray, off: Int = 0, len: Int = src.size - off) {
         require(off >= 0 && len >= 0 && off + len <= src.size)
-        require((at and 7) == 0) { "unaligned long write: at=$at" }
+        require((at and 7) == 0) { "unaligned long write: at=$at (must be 8B-aligned)" }
         rangeCheck(buf, at, len shl 3)
         var p = at;
         var i = off;
@@ -161,7 +178,6 @@ object LE {
             ensure(1);
             val p = buf.position(); buf.position(p + 1); return buf.get(p).toInt() and 0xFF
         }
-
         inline fun putU8(v: Int): Cursor {
             ensure(1);
             val p = buf.position(); buf.put(p, (v and 0xFF).toByte()); buf.position(p + 1); return this
@@ -171,7 +187,6 @@ object LE {
             ensure(2);
             val p = buf.position(); buf.position(p + 2); return VH.I16.get(buf, p) as Short
         }
-
         inline fun putShort(v: Short): Cursor {
             ensure(2);
             val p = buf.position(); VH.I16.set(buf, p, v); buf.position(p + 2); return this
@@ -181,7 +196,6 @@ object LE {
             ensure(4);
             val p = buf.position(); buf.position(p + 4); return VH.I32.get(buf, p) as Int
         }
-
         inline fun putInt(v: Int): Cursor {
             ensure(4);
             val p = buf.position(); VH.I32.set(buf, p, v); buf.position(p + 4); return this
@@ -191,17 +205,36 @@ object LE {
             ensure(8);
             val p = buf.position(); buf.position(p + 8); return VH.I64.get(buf, p) as Long
         }
-
         inline fun putLong(v: Long): Cursor {
             ensure(8);
             val p = buf.position(); VH.I64.set(buf, p, v); buf.position(p + 8); return this
+        }
+
+        // ----- Unsigned convenience (cursor) -----
+        inline fun getU32(): U32 {
+            ensure(4);
+            val p = buf.position(); buf.position(p + 4); return U32.fromSigned(VH.I32.get(buf, p) as Int)
+        }
+
+        inline fun putU32(v: U32): Cursor {
+            ensure(4);
+            val p = buf.position(); VH.I32.set(buf, p, v.raw); buf.position(p + 4); return this
+        }
+
+        inline fun getU64(): U64 {
+            ensure(8);
+            val p = buf.position(); buf.position(p + 8); return U64.fromSigned(VH.I64.get(buf, p) as Long)
+        }
+
+        inline fun putU64(v: U64): Cursor {
+            ensure(8);
+            val p = buf.position(); VH.I64.set(buf, p, v.raw); buf.position(p + 8); return this
         }
 
         inline fun getFloat(): Float {
             ensure(4);
             val p = buf.position(); buf.position(p + 4); return VH.F32.get(buf, p) as Float
         }
-
         inline fun putFloat(v: Float): Cursor {
             ensure(4);
             val p = buf.position(); VH.F32.set(buf, p, v); buf.position(p + 4); return this
@@ -211,7 +244,6 @@ object LE {
             ensure(8);
             val p = buf.position(); buf.position(p + 8); return VH.F64.get(buf, p) as Double
         }
-
         inline fun putDouble(v: Double): Cursor {
             ensure(8);
             val p = buf.position(); VH.F64.set(buf, p, v); buf.position(p + 8); return this
@@ -226,7 +258,7 @@ object LE {
         fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): Cursor {
             require(off >= 0 && len >= 0 && off + len <= src.size)
             val bytes = len shl 2; ensure(bytes)
-            val p0 = buf.position(); require((p0 and 3) == 0) { "unaligned int write: pos=$p0" }
+            val p0 = buf.position(); require((p0 and 3) == 0) { "unaligned int write: pos=$p0 (must be 4B-aligned)" }
             var p = p0;
             var i = off;
             val end = off + len
@@ -240,7 +272,7 @@ object LE {
         fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): Cursor {
             require(off >= 0 && len >= 0 && off + len <= src.size)
             val bytes = len shl 3; ensure(bytes)
-            val p0 = buf.position(); require((p0 and 7) == 0) { "unaligned long write: pos=$p0" }
+            val p0 = buf.position(); require((p0 and 7) == 0) { "unaligned long write: pos=$p0 (must be 8B-aligned)" }
             var p = p0;
             var i = off;
             val end = off + len
@@ -258,7 +290,6 @@ object LE {
         inline fun position(newPos: Int): Cursor {
             buf.position(newPos); return this
         }
-
         inline fun limit(): Int = buf.limit()
         inline fun limit(newLimit: Int): Cursor {
             buf.limit(newLimit); return this

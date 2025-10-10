@@ -21,6 +21,8 @@
 
 package dev.swiftstorm.akkaradb.common
 
+import dev.swiftstorm.akkaradb.common.types.U32
+import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.common.vh.LE
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -33,21 +35,10 @@ import java.nio.channels.WritableByteChannel
  * Design:
  *  - Always Little-Endian semantics without relying on buffer.order().
  *  - Position/limit management is exposed as Kotlin properties.
- *  - Relative primitive I/O is property-based (i8/i16/i32/i64/f32/f64).
+ *  - Relative primitive I/O is property-based (i8/i16/i32/i64/f32/f64 + u32/u64).
  *  - Absolute primitive I/O uses property-based view via [at(index)].
- *  - AkkaraDB-specific 32B header read/write delegates to [AKHdr32].
+ *  - 32B header read/write delegates to [AKHdr32] (vLen: U32, seq/keyFP/mini: U64).
  *  - No view buffers on hot paths; only duplicate/slice used for safe slicing.
- *
- * Typical usage:
- *  - WAL/Stripe writer:
- *      val b = ByteBufferL.wrap(poolBuf)
- *      val fp = AKHdr32.sipHash24(keyBytes, seed64)
- *      val mk = AKHdr32.buildMiniKeyLE(keyBytes)
- *      val recOff = b.putRecord32(keyBytes, valueBytes, seq, flags, fp, mk)
- *      b.align(32 * 1024)
- *  - Absolute access:
- *      b.at(recOff).i32 = 0xABCD
- *      val v = b.at(recOff + 8).i64
  */
 class ByteBufferL private constructor(
     @PublishedApi internal val buf: ByteBuffer
@@ -69,30 +60,19 @@ class ByteBufferL private constructor(
     }
 
     // ---------------- Basics as properties ----------------
-    /** Total capacity (immutable). */
     val capacity: Int get() = buf.capacity()
-
-    /** Short alias when you want to emphasize size math. */
     val cap: Int get() = buf.capacity()
 
-    /** Current position (mutable). */
     var position: Int
         get() = buf.position()
         set(value) {
             buf.position(value)
         }
 
-    /** Current limit (mutable). */
     var limit: Int
         get() = buf.limit()
         set(value) {
             buf.limit(value)
-        }
-
-    var byte: ByteBuffer
-        get() = buf
-        set(value) {
-            buf.put(value)
         }
 
     /** Remaining bytes (derived). */
@@ -119,7 +99,6 @@ class ByteBufferL private constructor(
     }
 
     // ---------------- for method chaining ----------------
-
     fun position(newPos: Int): ByteBufferL {
         position = newPos; return this
     }
@@ -141,10 +120,12 @@ class ByteBufferL private constructor(
      * Naming:
      *  - i8 : unsigned 8-bit (Int 0..255)
      *  - i16: Short (LE)
-     *  - i32: Int (LE)
-     *  - i64: Long (LE)
+     *  - i32: Int   (LE)
+     *  - i64: Long  (LE)
+     *  - u32: U32   (LE, unsigned 32-bit)
+     *  - u64: U64   (LE, unsigned 64-bit)
      *  - f32: Float (LE)
-     *  - f64: Double (LE)
+     *  - f64: Double(LE)
      */
     var i8: Int
         get() = LE.cursor(buf).getU8()
@@ -168,6 +149,18 @@ class ByteBufferL private constructor(
         get() = LE.cursor(buf).getLong()
         set(v) {
             LE.cursor(buf).putLong(v)
+        }
+
+    var u32: U32
+        get() = LE.cursor(buf).getU32()
+        set(v) {
+            LE.cursor(buf).putU32(v)
+        }
+
+    var u64: U64
+        get() = LE.cursor(buf).getU64()
+        set(v) {
+            LE.cursor(buf).putU64(v)
         }
 
     var f32: Float
@@ -230,6 +223,18 @@ class ByteBufferL private constructor(
                 LE.putLong(buf, base, v)
             }
 
+        var u32: U32
+            get() = LE.getU32(buf, base)
+            set(v) {
+                LE.putU32(buf, base, v)
+            }
+
+        var u64: U64
+            get() = LE.getU64(buf, base)
+            set(v) {
+                LE.putU64(buf, base, v)
+            }
+
         var f32: Float
             get() = LE.getFloat(buf, base)
             set(v) {
@@ -253,15 +258,21 @@ class ByteBufferL private constructor(
     }
 
     // ---------------- AkkaraDB header bridge (32B) ----------------
-    /** Absolute write of 32B header. vLen is Long but must be within u32. */
-    fun putHeader32(at: Int, kLen: Int, vLen: Long, seq: Long, flags: Int, keyFP64: Long, miniKey: Long): ByteBufferL {
+    /** Absolute write of 32B header (U32/U64 API). */
+    fun putHeader32(at: Int, kLen: Int, vLen: U32, seq: U64, flags: Int, keyFP64: U64, miniKey: U64): ByteBufferL {
         AKHdr32.write(buf, at, kLen, vLen, seq, flags, keyFP64, miniKey); return this
     }
 
-    /** Relative write of 32B header at current position; advances by 32. */
-    fun putHeader32(kLen: Int, vLen: Long, seq: Long, flags: Int, keyFP64: Long, miniKey: Long): ByteBufferL {
+    /** Relative write of 32B header at current position; advances by 32 (U32/U64 API). */
+    fun putHeader32(kLen: Int, vLen: U32, seq: U64, flags: Int, keyFP64: U64, miniKey: U64): ByteBufferL {
         AKHdr32.writeRel(buf, kLen, vLen, seq, flags, keyFP64, miniKey); return this
     }
+
+    fun putHeader32(at: Int, kLen: Int, vLen: Long, seq: Long, flags: Int, keyFP64: Long, miniKey: Long): ByteBufferL =
+        putHeader32(at, kLen, U32.of(vLen), U64.fromSigned(seq), flags, U64.fromSigned(keyFP64), U64.fromSigned(miniKey))
+
+    fun putHeader32(kLen: Int, vLen: Long, seq: Long, flags: Int, keyFP64: Long, miniKey: Long): ByteBufferL =
+        putHeader32(kLen, U32.of(vLen), U64.fromSigned(seq), flags, U64.fromSigned(keyFP64), U64.fromSigned(miniKey))
 
     /** Absolute read of 32B header. */
     fun readHeader32(at: Int): AKHdr32.Header = AKHdr32.read(buf, at)
@@ -298,30 +309,39 @@ class ByteBufferL private constructor(
     fun putRecord32(
         key: ByteArray,
         value: ByteArray,
-        seq: Long,
+        seq: U64,
         flags: Int,
-        keyFP64: Long,
-        miniKey: Long
+        keyFP64: U64,
+        miniKey: U64
     ): Int {
         val hdrPos = position
-        putHeader32(key.size, value.size.toLong(), seq, flags, keyFP64, miniKey)
+        putHeader32(key.size, U32.of(value.size.toLong()), seq, flags, keyFP64, miniKey)
         putBytes(key)
         putBytes(value)
         return hdrPos
     }
 
+    /** Overload for callers with primitives. */
+    fun putRecord32(
+        key: ByteArray,
+        value: ByteArray,
+        seq: Long,
+        flags: Int,
+        keyFP64: Long,
+        miniKey: Long
+    ): Int = putRecord32(key, value, U64.fromSigned(seq), flags, U64.fromSigned(keyFP64), U64.fromSigned(miniKey))
+
     /**
      * Read header32 at [recOff] and return slices for key/value.
      * Result pair: (header, Pair(keySlice, valueSlice))
      */
-    fun readRecord32(
-        recOff: Int
-    ): Pair<AKHdr32.Header, Pair<ByteBuffer, ByteBuffer>> {
+    fun readRecord32(recOff: Int): Pair<AKHdr32.Header, Pair<ByteBuffer, ByteBuffer>> {
         val h = readHeader32(recOff)
         val keyOff = recOff + AKHdr32.SIZE
         val valOff = keyOff + h.kLen
         val keySlice = sliceAt(keyOff, h.kLen)
-        val valSlice = sliceAt(valOff, h.vLen)
+        val vLenInt = h.vLen.toIntExact() // should fit; current chunk size <= block size
+        val valSlice = sliceAt(valOff, vLenInt)
         return h to (keySlice to valSlice)
     }
 }
