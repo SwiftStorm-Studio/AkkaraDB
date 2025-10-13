@@ -72,7 +72,7 @@ class AkkStripeWriter(
     },
     override var flushPolicy: FlushPolicy = FlushPolicy(),
     private val fastMode: Boolean = false,
-    private val fallocateHintBytes: Long = 0L,
+    fallocateHintBytes: Long = 0L,
     private val laneFilePrefixData: String = "data_",
     private val laneFilePrefixParity: String = "parity_",
     private val laneFileExtData: String = ".akd",
