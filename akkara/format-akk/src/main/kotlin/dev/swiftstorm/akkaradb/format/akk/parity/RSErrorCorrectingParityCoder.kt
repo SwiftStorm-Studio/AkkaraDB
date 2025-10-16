@@ -24,10 +24,8 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
-import dev.swiftstorm.akkaradb.common.vh.LE
 import dev.swiftstorm.akkaradb.format.api.ECParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityKind
-import java.nio.ByteBuffer
 import java.util.*
 
 class RSErrorCorrectingParityCoder(
@@ -84,7 +82,7 @@ class RSErrorCorrectingParityCoder(
     /* ================= ParityCoder ================= */
 
     override fun encodeInto(data: Array<ByteBufferL>, parityOut: Array<ByteBufferL>) {
-        val k = data.size;
+        val k = data.size
         val m = parityOut.size
         require(k > 0) { "data is empty" }
         require(m == parityCount) { "parityOut.size=$m but parityCount=$parityCount" }
@@ -95,20 +93,17 @@ class RSErrorCorrectingParityCoder(
 
         zeroBlocks(parityOut)
 
-        // src buffers & bases (position cache)
-        val sBufs = Array(k) { i -> data[i].duplicate() }
         val sBase = IntArray(k) { i -> data[i].position }
-
         for (i in 0 until k) {
             val aCol = IntArray(m) { j -> c[j][i] }
             for (j in 0 until m) if (aCol[j] != 0) {
-                saxpy(parityOut[j], sBufs[i], sBase[i], aCol[j])
+                saxpy(parityOut[j], parityOut[j].position, data[i], sBase[i], aCol[j])
             }
         }
     }
 
     override fun verify(data: Array<ByteBufferL>, parity: Array<ByteBufferL>): Boolean {
-        val k = data.size;
+        val k = data.size
         val m = parity.size
         require(k > 0); require(m == parityCount); require(k + m <= 255)
         requireAllHave(blockSize, data); requireAllHave(blockSize, parity)
@@ -116,9 +111,7 @@ class RSErrorCorrectingParityCoder(
         val c = coeff!!
 
         val N = blockSize
-        val dBufs = Array(k) { i -> data[i].duplicate() }
         val dBase = IntArray(k) { i -> data[i].position }
-        val pBufs = Array(m) { j -> parity[j].duplicate() }
         val pBase = IntArray(m) { j -> parity[j].position }
 
         var pos = 0
@@ -128,11 +121,11 @@ class RSErrorCorrectingParityCoder(
                 val row = c[j]
                 var i = 0
                 while (i < k) {
-                    val s = LE.getU8(dBufs[i], dBase[i] + pos)
+                    val s = data[i].getU8At(dBase[i] + pos)
                     if (s != 0) acc = acc xor (mulLUT[(row[i] shl 8) or s].toInt() and 0xFF)
                     i++
                 }
-                if (acc != LE.getU8(pBufs[j], pBase[j] + pos)) return false
+                if (acc != parity[j].getU8At(pBase[j] + pos)) return false
             }
             pos++
         }
@@ -147,7 +140,7 @@ class RSErrorCorrectingParityCoder(
         outData: Array<ByteBufferL>,
         outParity: Array<ByteBufferL>
     ): Int {
-        val k = data.size;
+        val k = data.size
         val m = parityCount
         require(parity.size == m); require(k + m <= 255)
         for (d in data) if (d != null) require(d.remaining >= blockSize)
@@ -185,21 +178,15 @@ class RSErrorCorrectingParityCoder(
             val M = Array(eData) { IntArray(eData) }
             for (r in 0 until eData) {
                 val row = c[J[r]]
-                for (t in 0 until eData) {
-                    M[r][t] = row[lostDataIdx[t]]
-                }
+                for (t in 0 until eData) M[r][t] = row[lostDataIdx[t]]
             }
             val Minv = invertMatrix(M)
 
             val N = blockSize
-            val pBufs = Array(m) { j -> parity[j]?.duplicate() }
             val pBase = IntArray(m) { j -> parity[j]?.position ?: 0 }
-
             val outMap = HashMap<Int, ByteBufferL>(eData)
             for (t in 0 until eData) outMap[lostDataIdx[t]] = outData[t]
             val outBase = IntArray(eData) { outData[it].position }
-
-            val dBufs = Array(k) { i -> data[i]?.duplicate() }
             val dBase = IntArray(k) { i -> data[i]?.position ?: 0 }
 
             var pos = 0
@@ -208,16 +195,16 @@ class RSErrorCorrectingParityCoder(
                 val S = IntArray(eData)
                 for (r in 0 until eData) {
                     val j = J[r]
-                    var accumKnown = LE.getU8(pBufs[j]!!, pBase[j] + pos)
+                    var accumKnown = parity[j]?.getU8At(pBase[j] + pos) ?: 0
                     val crow = c[j]
                     var i = 0
                     while (i < k) {
                         if (outMap.containsKey(i)) {
                             i++; continue
-                        } // i in L (lost)
-                        val db = dBufs[i]
+                        } // i in L
+                        val db = data[i]
                         if (db != null) {
-                            val s = LE.getU8(db, dBase[i] + pos)
+                            val s = db.getU8At(dBase[i] + pos)
                             if (s != 0) accumKnown = accumKnown xor (mulLUT[(crow[i] shl 8) or s].toInt() and 0xFF)
                         }
                         i++
@@ -237,7 +224,7 @@ class RSErrorCorrectingParityCoder(
                     }
                     val dst = outMap[lostDataIdx[t]]!!
                     val ob = outBase[t] + pos
-                    LE.putU8(dst.duplicate(), ob, v)
+                    dst.putU8At(ob, v)
                 }
                 pos++
             }
@@ -304,59 +291,58 @@ class RSErrorCorrectingParityCoder(
         val erasuresSet = (knownErasures?.toMutableSet() ?: mutableSetOf())
         for (i in 0 until missCnt) erasuresSet.add(missing[i])
 
-        // cache duplicates & bases to avoid repeated position() calls
-        val dBufs = Array(k) { i -> presentData[i]?.duplicate() }
+        // cache bases
         val dBase = IntArray(k) { i -> presentData[i]?.position ?: 0 }
-        val pBufs = Array(m) { j -> presentParity[j]?.duplicate() }
         val pBase = IntArray(m) { j -> presentParity[j]?.position ?: 0 }
+
+        // prepare outputs
+        for (i in 0 until missCnt) outIndices[i] = missing[i]
 
         val S = IntArray(m)
         val tmp = IntArray(m + 1)
 
-        for (i in 0 until missCnt) outIndices[i] = missing[i]
-
         for (pos in 0 until blockSize) {
-            // cword (systematic codeword) is streamed via LE.getU8 from cached buffers
             // syndromes S_r = c(α^{r+1})
-            val aPows = IntArray(n)
-            aPows[0] = 1
             var r = 0
             while (r < m) {
                 val a = r + 1
-                // precompute α^{(r+1)·i} on the fly
                 var acc = 0
+                // data part
                 var i = 0
                 var xPow = 1
                 while (i < k) {
-                    val ci = dBufs[i]?.let { LE.getU8(it, dBase[i] + pos) } ?: 0
+                    val ci = presentData[i]?.getU8At(dBase[i] + pos) ?: 0
                     if (ci != 0) acc = gfAdd(acc, gfMul(ci, xPow))
                     xPow = gfMul(xPow, gfPowAlpha(a))
                     i++
                 }
+                // parity part
                 var j = 0
                 xPow = 1
                 while (j < m) {
-                    val cj = pBufs[j]?.let { LE.getU8(it, pBase[j] + pos) } ?: 0
+                    val cj = presentParity[j]?.getU8At(pBase[j] + pos) ?: 0
                     if (cj != 0) acc = gfAdd(acc, gfMul(cj, xPow))
                     xPow = gfMul(xPow, gfPowAlpha(a))
                     j++
                 }
-                S[r] = acc
-                r++
+                S[r] = acc; r++
             }
 
+            // all-zero syndrome → skip
             var allZero = true
             r = 0
             while (r < m) {
                 if (S[r] != 0) {
                     allZero = false; break
-                }
-                r++
+                }; r++
             }
             if (allZero) continue
 
+            // erasure locator from hints
             val erasures = erasuresSet.toIntArray()
             val erasureLoc = makeErasureLocatorPoly(erasures)
+
+            // Berlekamp–Massey
             var L = 0
             var B = intArrayOf(1)
             var b = 1
@@ -375,8 +361,7 @@ class RSErrorCorrectingParityCoder(
                 if (2 * L <= r) {
                     L = r + 1 - L; B = T; b = d
                 }
-                B = polyShift(B)
-                r++
+                B = polyShift(B); r++
             }
 
             // Chien search
@@ -402,8 +387,7 @@ class RSErrorCorrectingParityCoder(
                     if (s != 0 && sig != 0) acc = gfAdd(acc, gfMul(s, sig))
                     j++
                 }
-                omega[i] = acc
-                i++
+                omega[i] = acc; i++
             }
             val sigmaPrime = IntArray(maxOf(0, sigma.size - 1))
             i = 1
@@ -424,13 +408,10 @@ class RSErrorCorrectingParityCoder(
                 i++
             }
 
-            // apply & write recovered symbols for targets only（data領域のみ outBuffers へ）
             var t = 0
             while (t < missCnt) {
                 val dataIdx = outIndices[t]
-                // codeword value at dataIdx after correction:
-                var valAt = dBufs[dataIdx]?.let { LE.getU8(it, dBase[dataIdx] + pos) } ?: 0
-                // if dataIdx is among corrected locations, add its error value
+                var valAt = presentData[dataIdx]?.getU8At(dBase[dataIdx] + pos) ?: 0
                 var e = 0
                 while (e < errN) {
                     if (errorLocs[e] == dataIdx) {
@@ -439,7 +420,7 @@ class RSErrorCorrectingParityCoder(
                     e++
                 }
                 val ob = outBuffers[t].position + pos
-                LE.putU8(outBuffers[t].duplicate(), ob, valAt)
+                outBuffers[t].putU8At(ob, valAt)
                 t++
             }
         }
@@ -449,53 +430,38 @@ class RSErrorCorrectingParityCoder(
     /* ---------------- kernels & helpers ---------------- */
 
     /** dst ^= a * src */
-    private inline fun saxpy(dst: ByteBufferL, srcBuf: ByteBuffer, srcBase: Int, a: Int) {
+    private inline fun saxpy(dst: ByteBufferL, dstBase: Int, src: ByteBufferL, srcBase: Int, a: Int) {
         val N = blockSize
         val lutBase = a shl 8
-        val dBuf = dst.duplicate()
-        val dBase = dst.position
         var p = 0
         while (p < N) {
-            val s = LE.getU8(srcBuf, srcBase + p)
+            val s = src.getU8At(srcBase + p)
             if (s != 0) {
                 val m = mulLUT[lutBase or s].toInt() and 0xFF
-                val d = LE.getU8(dBuf, dBase + p)
-                LE.putU8(dBuf, dBase + p, d xor m)
+                val d = dst.getU8At(dstBase + p)
+                dst.putU8At(dstBase + p, d xor m)
             }
             p++
         }
     }
 
-    /** Zero all parity buffers up to blockSize bytes (absolute, LE). */
+    /** Zero all parity buffers up to blockSize bytes. */
     private fun zeroBlocks(parityOut: Array<ByteBufferL>) {
-        for (b in parityOut) {
-            val buf = b.duplicate()
-            val base = b.position
-            var off = 0
-            while (off < blockSize) {
-                LE.putU8(buf, base + off, 0)
-                off++
-            }
-        }
+        for (b in parityOut) b.fillZero(blockSize)
     }
 
     private fun encodeRowInto(dst: ByteBufferL, data: Array<ByteBufferL>, c: Array<IntArray>, j: Int) {
-        val N = blockSize
         val base = dst.position
-        val dBuf = dst.duplicate()
-        // zero dst
-        var p = 0
-        while (p < N) {
-            LE.putU8(dBuf, base + p, 0); p++
-        }
-        // accumulate
-        for (i in data.indices) {
-            val di = data[i]
+        dst.fillZero(blockSize)
+        val k = data.size
+        val dBase = IntArray(k) { i -> data[i].position }
+        for (i in 0 until k) {
             val a = c[j][i]; if (a == 0) continue
-            saxpy(dst, di.duplicate(), di.position, a)
+            saxpy(dst, base, data[i], dBase[i], a)
         }
     }
 
+    // Gauss–Jordan
     private fun invertMatrix(a0: Array<IntArray>): Array<IntArray> {
         val n = a0.size
         val a = Array(n) { r -> a0[r].clone() }
@@ -512,7 +478,9 @@ class RSErrorCorrectingParityCoder(
             val invPivot = gfInv(a[row][col])
             var c = 0
             while (c < n) {
-                a[row][c] = gfMul(a[row][c], invPivot); inv[row][c] = gfMul(inv[row][c], invPivot); c++
+                a[row][c] = gfMul(a[row][c], invPivot)
+                inv[row][c] = gfMul(inv[row][c], invPivot)
+                c++
             }
             var r = 0
             while (r < n) {

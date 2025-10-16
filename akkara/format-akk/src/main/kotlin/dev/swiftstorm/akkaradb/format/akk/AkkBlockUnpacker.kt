@@ -1,69 +1,86 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.AKHdr32
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.vh.LE
 import dev.swiftstorm.akkaradb.format.api.BlockUnpacker
-import java.io.Closeable
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import dev.swiftstorm.akkaradb.format.api.RecordCursor
+import dev.swiftstorm.akkaradb.format.api.RecordView
 
 /**
- * High‑throughput 32KiB block unpacker (LE) — API‑preserving rewrite.
- *
- * Responsibilities
- *  • Validate the frame header `[payloadLen:u32 LE]` and bounds.
- *  • Iterate the payload as `[u32 recLen][bytes…]` and expose each record to caller.
- *  • CRC32C validation is *not* performed here (StripeReader already verified/repaired).
- *
- * Zero‑copy by default
- *  • Returned records are *views* (read‑only ByteBufferL wrapping a sub‑range of the block).
- *  • Callers MUST NOT release() these views to a pool; only the original 32KiB block is pool‑managed.
- *
- * Failure model
- *  • Malformed frames (negative/oversized lengths, overrun) → IllegalArgumentException.
+ * High-throughput unpacker for blocks with AKHdr32-based records.
+ * Validates frame bounds, iterates record-by-record, and returns zero-copy slices.
  */
-class AkkBlockUnpacker : BlockUnpacker, Closeable {
+class AkkBlockUnpacker : BlockUnpacker {
 
-    override fun unpackInto(block: ByteBufferL, out: MutableList<ByteBufferL>) {
-        out.clear()
+    override fun cursor(block: ByteBufferL): RecordCursor {
+        val payloadLen = block.at(0).i32
+        require(payloadLen in 0..PAYLOAD_LIMIT) { "invalid payloadLen=$payloadLen" }
+        val start = 4
+        val end = start + payloadLen
+        require(end <= BLOCK_SIZE - 4) { "payload overruns block: end=$end > ${BLOCK_SIZE - 4}" }
 
-        // We work on the raw ByteBuffer for absolute LE ops
-        val bb: ByteBuffer = block.duplicate() // independent pos/lim, LE order applied by ByteBufferL
-        require(bb.capacity() >= BLOCK_SIZE) { "block must be a 32KiB buffer" }
+        return object : RecordCursor {
+            var p = start
+            override fun hasNext(): Boolean = p < end
+            override fun tryNext(): RecordView? {
+                if (!hasNext()) return null
+                if (p + AKHdr32.SIZE > end) return null
+                val h = block.readHeader32(p)
+                val kLen = h.kLen
+                val vLenInt = h.vLen.toIntExact()
+                val total = AKHdr32.SIZE + kLen + vLenInt
+                val next = p + total
+                if (next > end) return null
 
-        // --- Frame header ---
-        val payloadLen = LE.getInt(bb, 0)
-        require(payloadLen in 0..PAYLOAD_LIMIT) {
-            "invalid payloadLen=$payloadLen (limit=$PAYLOAD_LIMIT)"
-        }
-        val payloadStart = 4
-        val payloadEndExcl = payloadStart + payloadLen
-        require(payloadEndExcl <= BLOCK_SIZE - 4) {
-            "payload overruns block: end=$payloadEndExcl > ${BLOCK_SIZE - 4}"
-        }
+                val keyOff = p + AKHdr32.SIZE
+                val valOff = keyOff + kLen
+                val keySlice = block.sliceAt(keyOff, kLen)
+                val valSlice = block.sliceAt(valOff, vLenInt)
 
-        // --- Hot loop over [len | bytes] ---
-        var p = payloadStart
-        while (p < payloadEndExcl) {
-            val recLen = LE.getInt(bb, p)
-            require(recLen >= 0) { "negative recLen at offset=$p" }
-            val recStart = p + 4
-            val recEndExcl = recStart + recLen
-            require(recEndExcl <= payloadEndExcl) {
-                "record overruns payload: end=$recEndExcl > $payloadEndExcl"
+                val view = RecordView(
+                    key = keySlice,
+                    value = valSlice,
+                    seq = h.seq,
+                    flags = h.flags,
+                    kLen = kLen,
+                    vLen = h.vLen,
+                    totalLen = total
+                )
+                p = next
+                return view
             }
 
-            // Zero‑copy read‑only view of [recStart, recEndExcl)
-            val view: ByteBuffer = bb.duplicate().position(recStart).limit(recEndExcl)
-                .asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
-            out += ByteBufferL.wrap(view)
-
-            p = recEndExcl
+            override fun next(): RecordView = tryNext() ?: error("no more records or malformed tail at offset=$p")
         }
     }
 
-    override fun close() { /* stateless */
+    override fun unpackInto(block: ByteBufferL, out: MutableList<RecordView>) {
+        out.clear()
+        val cur = cursor(block)
+        while (true) {
+            val v = cur.tryNext() ?: break
+            out += v
+        }
     }
 }

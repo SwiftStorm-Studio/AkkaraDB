@@ -21,7 +21,16 @@ package dev.swiftstorm.akkaradb.format.api
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 
-interface BlockUnpacker {
+/**
+ * Unpacks a 32 KiB block built with AKHdr32 records.
+ * StripeReader is responsible for CRC verification/repair; the Unpacker only trusts and parses.
+ */
+interface BlockUnpacker : AutoCloseable {
+    /** Forward-only cursor over records inside the payload. */
+    fun cursor(block: ByteBufferL): RecordCursor
 
-    fun unpackInto(block: ByteBufferL, out: MutableList<ByteBufferL>)
+    /** Materialize zero-copy RecordView slices into [out]. Clears [out] first. */
+    fun unpackInto(block: ByteBufferL, out: MutableList<RecordView>)
+
+    override fun close() {}
 }

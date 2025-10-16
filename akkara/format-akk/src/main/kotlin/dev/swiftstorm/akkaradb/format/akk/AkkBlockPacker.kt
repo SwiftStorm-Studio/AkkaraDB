@@ -1,76 +1,148 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.format.akk
 
+import dev.swiftstorm.akkaradb.common.AKHdr32
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.BufferPool
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.common.types.U32
+import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
 import java.io.Closeable
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import kotlin.math.min
 
 /**
- * 32KiB fixed-size block packer (LE). Keeps the existing BlockPacker interface
- * and introduces `fastMode` for more aggressive zero-padding.
+ * Direct-write 32 KiB block packer using ByteBufferL and AKHdr32.
  *
  * Block layout:
- * [0..3]     : payloadLen (u32 LE)
- * [4..4+N)   : payload (varlen sequence of [u32 recLen][bytes])
- * [4+N..-5]  : zero padding
- * [-4..-1]   : CRC32C (stamped later by the StripeWriter)
+ *  [0..3]     : payloadLen (u32 LE)
+ *  [4..4+N)   : payload = repeated records:
+ *               AKHdr32 (32B) + key + value
+ *  [4+N..-5]  : zero padding
+ *  [-4..-1]   : CRC32C over bytes [0 .. BLOCK_SIZE-4)
  *
- * Responsibility split:
- * - This class ONLY builds the framed payload and zero pads up to (BLOCK_SIZE-4).
- * - CRC is stamped by `AkkStripeWriter.sealStripe()` over the range [0..BLOCK_SIZE-4).
- *
- * Fast/Durable design note:
- * - `fastMode=false` uses a smaller zero buffer (8KiB) and simple loops.
- * - `fastMode=true` uses a larger zero buffer (64KiB) to reduce put() calls and stabilize P99.
- *
- * Ownership:
- * - `onBlockReady` takes ownership of the emitted 32KiB direct buffer.
- * - Caller-provided `record` buffers are never mutated (we duplicate before reading).
+ * Responsibilities:
+ *  - Write AKHdr32 at an absolute payload offset (no raw ByteBuffer usage)
+ *  - Copy key and value once each via ByteBufferL.putBytes(...)
+ *  - Seal with payloadLen + zero padding + CRC32C (crc32cRange)
  */
 class AkkBlockPacker(
     private val onBlockReady: (ByteBufferL) -> Unit,
-    private val pool: BufferPool = Pools.io(),
-    private val fastMode: Boolean = false
+    private val pool: BufferPool = Pools.io()
 ) : BlockPacker, Closeable {
 
-    // Currently building 32KiB block
-    private var scratch: ByteBufferL = pool.get(BLOCK_SIZE)
-
-    // Payload write position (first 4 bytes are payloadLen)
-    private var writePos: Int = 4
+    private var buf: ByteBufferL = pool.get(BLOCK_SIZE)
+    private var payloadPos: Int = 4
+    private var openBlock = false
     private var closed = false
 
-    override fun addRecord(record: ByteBufferL) {
-        check(!closed) { "packer already closed" }
-        val recBB: ByteBuffer = record.duplicate() // do not touch caller's position/limit
-        val recLen = recBB.remaining()
-        val need = 4 + recLen // [u32 len] + body
-        require(need <= PAYLOAD_LIMIT) {
-            "Encoded record (${need}B) exceeds payload limit ($PAYLOAD_LIMIT)"
-        }
-        // If the payload area would overflow, emit current block first
-        if (writePos + need > PAYLOAD_LIMIT) emitBlock()
+    override fun beginBlock() {
+        ensureOpen()
+        if (openBlock && payloadPos > 4) endBlock()
+        buf.clear()
+        // reserve [0..3] for payloadLen
+        buf.position = 4
+        payloadPos = 4
+        openBlock = true
+    }
 
-        // ==== write ====
-        val bb = scratch.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-        // tentatively update total payload length at head
-        bb.putInt(writePos - 4, (writePos - 4) + need)
-        bb.putInt(writePos, recLen)
-        bb.position(writePos + 4)
-        bb.limit(writePos + 4 + recLen)
-        bb.put(recBB.duplicate())
-        writePos += need
+    override fun tryAppend(
+        key: ByteBufferL,
+        value: ByteBufferL,
+        seq: U64,
+        flags: Int,
+        keyFP64: U64,
+        miniKey: U64
+    ): Boolean {
+        ensureOpen()
+        if (!openBlock) beginBlock()
+
+        val kLen = key.remaining
+        val vLen = value.remaining
+        require(kLen in 0..0xFFFF) { "key too long: $kLen" }
+        require(flags in 0..0xFF) { "flags (u8) out of range: $flags" }
+
+        val need = AKHdr32.SIZE + kLen + vLen
+        if (payloadPos + need > PAYLOAD_LIMIT) return false
+
+        // --- write AKHdr32 at absolute position (ByteBufferL API only) ---
+        buf.putHeader32(
+            at = payloadPos,
+            kLen = kLen,
+            vLen = U32.of(vLen.toLong()),
+            seq = seq,
+            flags = flags,
+            keyFP64 = keyFP64,
+            miniKey = miniKey
+        )
+
+        // --- copy key then value via ByteBufferL bulk copy (no raw access) ---
+        buf.position = payloadPos + AKHdr32.SIZE
+        if (kLen > 0) buf.put(key, kLen)
+        if (vLen > 0) buf.put(value, vLen)
+
+        payloadPos += need
+        buf.position = payloadPos
+        return true
+    }
+
+    override fun endBlock() {
+        ensureOpen()
+        if (!openBlock) return
+        if (payloadPos <= 4) {
+            // empty: drop current work buffer content and keep it for reuse
+            openBlock = false
+            buf.position = 0
+            buf.limit = buf.capacity
+            return
+        }
+
+        // (1) write payloadLen at head
+        val payloadLen = payloadPos - 4
+        buf.at(0).i32 = payloadLen
+
+        // (2) zero-pad [payloadPos .. BLOCK_SIZE-4)
+        val padBytes = (BLOCK_SIZE - 4) - payloadPos
+        if (padBytes > 0) {
+            buf.position = payloadPos
+            buf.fillZero(padBytes) // uses ByteBufferL's internal zero chunk
+        }
+
+        // (3) stamp CRC32C over [0 .. BLOCK_SIZE-4)
+        val crc = buf.crc32cRange(0, BLOCK_SIZE - 4)
+        buf.at(BLOCK_SIZE - 4).i32 = crc
+
+        // (4) emit & rotate a fresh buffer
+        val full = buf
+        buf = pool.get(BLOCK_SIZE)
+        payloadPos = 4
+        openBlock = false
+        onBlockReady(full)
     }
 
     override fun flush() {
-        check(!closed) { "packer already closed" }
-        if (writePos > 4) emitBlock()
+        ensureOpen()
+        if (openBlock && payloadPos > 4) endBlock()
+        else openBlock = false
     }
 
     override fun close() {
@@ -78,54 +150,12 @@ class AkkBlockPacker(
         try {
             flush()
         } finally {
+            pool.release(buf)
             closed = true
         }
     }
 
-    // ---- internals ----
-    private fun emitBlock() {
-        val bb = scratch.duplicate().order(ByteOrder.LITTLE_ENDIAN)
-        val payloadLen = writePos - 4
-        // seal payloadLen at head
-        bb.putInt(0, payloadLen)
-
-        // zero pad [writePos .. BLOCK_SIZE-4)
-        zeroPad(bb, writePos, BLOCK_SIZE - 4)
-
-        // hand off ownership and allocate a fresh block
-        val full = scratch
-        scratch = pool.get(BLOCK_SIZE)
-        writePos = 4
-        onBlockReady(full)
-    }
-
-    private fun zeroPad(bb: ByteBuffer, from: Int, toExcl: Int) {
-        val need = toExcl - from
-        if (need <= 0) return
-        val z = if (fastMode) ZERO_PAD_CHUNK_64K else ZERO_PAD_CHUNK
-        var pos = from
-        while (pos < toExcl) {
-            val n = min(z.limit(), toExcl - pos)
-            val dst = bb.duplicate().position(pos).limit(pos + n)
-            val src = z.duplicate().position(0).limit(n)
-            dst.put(src)
-            pos += n
-        }
-    }
-
-    companion object {
-        /** 8KiB zero buffer (read-only, direct, LE) */
-        private val ZERO_PAD_CHUNK: ByteBuffer =
-            ByteBuffer.allocateDirect(8 * 1024)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .apply { clear() }
-                .asReadOnlyBuffer()
-
-        /** 64KiB zero buffer for fastMode to reduce put() calls */
-        private val ZERO_PAD_CHUNK_64K: ByteBuffer =
-            ByteBuffer.allocateDirect(64 * 1024)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .apply { clear() }
-                .asReadOnlyBuffer()
+    private fun ensureOpen() {
+        check(!closed) { "packer already closed" }
     }
 }

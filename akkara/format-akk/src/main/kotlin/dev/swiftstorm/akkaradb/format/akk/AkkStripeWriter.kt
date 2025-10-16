@@ -30,7 +30,6 @@ import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.akk.parity.XorParityCoder
 import dev.swiftstorm.akkaradb.format.api.*
 import java.io.IOException
-import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -42,22 +41,15 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.util.zip.CRC32C
 import kotlin.math.min
 
 /**
- * High-performance StripeWriter implementation targeting NVMe + Java 17.
+ * High-performance StripeWriter (ByteBufferL-only).
  *
- * Changes for new ParityCoder:
- * - Staging now stores ByteBufferL (LE/direct). No unwrap() until IO.
- * - Parity encode uses coder.encodeInto(data: Array<ByteBufferL>, parityOut: Array<ByteBufferL>).
- *
- * Local improvements (no-JNI):
- * - Per-stripe CRC32C using JDK's java.util.zip.CRC32C (optional).
- * - Positional writes (FileChannel.write(buf, off)) for safer future parallelization.
- * - O(1) pending commit counter (avoid ConcurrentLinkedQueue.size()).
- * - Time-based flush trigger (flushPolicy.maxMicros).
- * - Parity buffer pool release guarded with try/finally.
+ * 変更点:
+ *  - CRC32C は ByteBufferL.crc32cRange() に統一（JDK CRC32C と ByteBuffer 非依存）
+ *  - 書き込みは FileChannel.position(off) + ByteBufferL.writeFully()
+ *  - すべて ByteBufferL API のみで完結
  */
 class AkkStripeWriter(
     override val k: Int,
@@ -99,13 +91,10 @@ class AkkStripeWriter(
     private val closed = AtomicBoolean(false)
 
     // Staging for current stripe (data only). Index = laneId [0..k-1]
-    // NOTE: store ByteBufferL (not ByteBuffer). We unwrap only for IO.
     private val stage: Array<ByteBufferL?> = arrayOfNulls(k)
 
     // Commit queue (sealed-but-not-durable stripes)
     private val commitQ = ConcurrentLinkedQueue<Long>()
-
-    // O(1) pending count to avoid ConcurrentLinkedQueue.size() hot cost
     private val pendingCommits = AtomicInteger(0)
 
     // Metrics (monotonic)
@@ -118,7 +107,6 @@ class AkkStripeWriter(
     private val fsyncMicros = AtomicLong(0)
     private val backpressureMaxMicros = AtomicLong(0)
 
-    // Last commit-group start time (for time-based trigger)
     @Volatile
     private var lastCommitStartNanos: Long = System.nanoTime()
 
@@ -134,7 +122,6 @@ class AkkStripeWriter(
         Files.createDirectories(laneDir)
         dataCh = Array(k) { open(laneDir.resolve("$laneFilePrefixData${it}$laneFileExtData")) }
         if (fallocateHintBytes > 0) {
-            // Portable preallocation: bump size; OS may sparsely allocate.
             val hint = alignUp(fallocateHintBytes, blockSize.toLong())
             (dataCh + parityCh).forEach { ch ->
                 val cur = ch.size()
@@ -144,25 +131,19 @@ class AkkStripeWriter(
     }
 
     private fun open(p: Path): FileChannel =
-        when (fastMode) {
-            true -> FileChannel.open(p, CREATE, READ, WRITE)
-            false -> FileChannel.open(p, CREATE, READ, WRITE, DSYNC)
-        }
+        if (fastMode) FileChannel.open(p, CREATE, READ, WRITE)
+        else FileChannel.open(p, CREATE, READ, WRITE, DSYNC)
 
     // ------------------------------------------------------------
     // Write path
     // ------------------------------------------------------------
     override fun addBlock(block: ByteBufferL) {
         ensureOpen()
-        val bb = block.duplicate()
-        require(bb.isDirect) { "Block must be direct" }
-        require(bb.remaining() == blockSize) { "Block must be exactly $blockSize bytes" }
-
         val idx = pendingInStripe
         require(idx in 0 until k) { "too many blocks for current stripe: $idx >= $k" }
+        require(block.isDirect) { "Block must be direct" }
+        require(block.remaining == blockSize) { "Block must be exactly $blockSize bytes" }
 
-        // Keep ByteBufferL as-is (do not duplicate underlying ByteBuffer unless needed).
-        // Caller position is not mutated since we only duplicate/unwrap for IO later.
         stage[idx] = block
         pendingInStripe = idx + 1
 
@@ -178,40 +159,37 @@ class AkkStripeWriter(
 
         val dataL: Array<ByteBufferL> = stage.requireFull(k)
 
+        // --- CRC32C stamp (ByteBufferL only) ---
         run {
-            val c = CRC32C()
             for (i in 0 until k) {
-                val bb = dataL[i].duplicate()           // ByteBuffer (LE)
-                bb.position(0).limit(blockSize - 4)
-                c.reset(); c.update(bb)
-                bb.putInt(blockSize - 4, c.value.toInt())
+                val buf = dataL[i]
+                val crc = buf.crc32cRange(0, blockSize - 4)
+                buf.at(blockSize - 4).i32 = crc
             }
         }
 
-        // --- Parity ---
+        // --- Parity encode ---
         val parityBufs: Array<ByteBufferL> =
-            if (m > 0) Array(m) { pool.get(blockSize) } else emptyArray()
+            if (m > 0) Array(m) { pool.get(blockSize).clear() } else emptyArray()
         try {
             val parityStart = System.nanoTime()
             coder.encodeInto(dataL, parityBufs)
             val parityEnd = System.nanoTime()
             parityMicros.addAndGet((parityEnd - parityStart) / 1000)
 
-            // --- Lane writes (positional; contiguous per-lane) ---
+            // --- Lane writes (positional; contiguous per lane) ---
             val writeStart = System.nanoTime()
             // data lanes
             for (lane in 0 until k) {
                 val ch = dataCh[lane]
-                val buf = dataL[lane].duplicate().position(0).limit(blockSize)
-                writeFullyAt(ch, buf, off)
+                positionalWriteFully(ch, dataL[lane], off)
                 bytesWrittenData.addAndGet(blockSize.toLong())
             }
             // parity lanes (if any)
             if (m > 0) {
                 for (pm in 0 until m) {
                     val ch = parityCh[pm]
-                    val p = parityBufs[pm].duplicate().position(0).limit(blockSize)
-                    writeFullyAt(ch, p, off)
+                    positionalWriteFully(ch, parityBufs[pm], off)
                     bytesWrittenParity.addAndGet(blockSize.toLong())
                 }
             }
@@ -236,14 +214,13 @@ class AkkStripeWriter(
         maybeCommit()
     }
 
-    /** Positional write fully: does not mutate channel's implicit position. */
-    private fun writeFullyAt(ch: FileChannel, buf: ByteBuffer, off: Long) {
-        var curOff = off
-        while (buf.hasRemaining()) {
-            val n = ch.write(buf, curOff)
-            if (n < 0) throw IOException("channel closed")
-            curOff += n
-        }
+    /** FileChannel.position(off) + ByteBufferL.writeFully(...). */
+    private fun positionalWriteFully(ch: FileChannel, block: ByteBufferL, off: Long) {
+        ch.position(off)
+        // 書き込みは block の duplicate を使い position=0 から blockSize 分
+        val dup = block.duplicate().position(0)
+        val wrote = dup.writeFully(ch, blockSize)
+        if (wrote != blockSize) throw IOException("short write: $wrote/$blockSize")
     }
 
     private fun maybeCommit() {
@@ -282,7 +259,7 @@ class AkkStripeWriter(
                 val t1 = System.nanoTime()
                 fsyncMicros.addAndGet((t1 - t0) / 1000)
                 lastDurableStripe = upto
-                durableStripes.set(upto + 1) // total durable stripes (count-like)
+                durableStripes.set(upto + 1)
                 CommitTicket(upto, CompletableFuture.completedFuture(upto))
             }
             FlushMode.ASYNC -> {

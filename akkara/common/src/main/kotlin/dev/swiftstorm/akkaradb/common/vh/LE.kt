@@ -16,7 +16,6 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 @file:Suppress("NOTHING_TO_INLINE", "unused", "duplicatedCode")
 
 package dev.swiftstorm.akkaradb.common.vh
@@ -41,10 +40,6 @@ import kotlin.math.min
  *  - Absolute + relative (cursor) primitive I/O, aligned bulk ops.
  *  - Zero-copy CRC32C over ByteBuffer ranges.
  *  - Deterministic writeFully/readFully, zero fill, power-of-two align.
- *
- * Non-Goals:
- *  - DB/domain-specific layoutsは含めない（ヘッダ等は別クラスへ）。
- *  - Endian switching禁止（LE固定で分岐を消す）。
  */
 object LE {
 
@@ -145,8 +140,8 @@ object LE {
         require(off >= 0 && len >= 0 && off + len <= src.size)
         require((at and 3) == 0) { "unaligned int write: at=$at (must be 4B-aligned)" }
         rangeCheck(buf, at, len shl 2)
-        var p = at;
-        var i = off;
+        var p = at
+        var i = off
         val end = off + len
         while (i < end) {
             VH.I32.set(buf, p, src[i]); p += 4; i++
@@ -159,8 +154,8 @@ object LE {
         require(off >= 0 && len >= 0 && off + len <= src.size)
         require((at and 7) == 0) { "unaligned long write: at=$at (must be 8B-aligned)" }
         rangeCheck(buf, at, len shl 3)
-        var p = at;
-        var i = off;
+        var p = at
+        var i = off
         val end = off + len
         while (i < end) {
             VH.I64.set(buf, p, src[i]); p += 8; i++
@@ -175,77 +170,77 @@ object LE {
         inline fun remaining(): Int = buf.remaining()
 
         inline fun getU8(): Int {
-            ensure(1);
+            ensure(1)
             val p = buf.position(); buf.position(p + 1); return buf.get(p).toInt() and 0xFF
         }
         inline fun putU8(v: Int): Cursor {
-            ensure(1);
+            ensure(1)
             val p = buf.position(); buf.put(p, (v and 0xFF).toByte()); buf.position(p + 1); return this
         }
 
         inline fun getShort(): Short {
-            ensure(2);
+            ensure(2)
             val p = buf.position(); buf.position(p + 2); return VH.I16.get(buf, p) as Short
         }
         inline fun putShort(v: Short): Cursor {
-            ensure(2);
+            ensure(2)
             val p = buf.position(); VH.I16.set(buf, p, v); buf.position(p + 2); return this
         }
 
         inline fun getInt(): Int {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); buf.position(p + 4); return VH.I32.get(buf, p) as Int
         }
         inline fun putInt(v: Int): Cursor {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); VH.I32.set(buf, p, v); buf.position(p + 4); return this
         }
 
         inline fun getLong(): Long {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); buf.position(p + 8); return VH.I64.get(buf, p) as Long
         }
         inline fun putLong(v: Long): Cursor {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); VH.I64.set(buf, p, v); buf.position(p + 8); return this
         }
 
         // ----- Unsigned convenience (cursor) -----
         inline fun getU32(): U32 {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); buf.position(p + 4); return U32.fromSigned(VH.I32.get(buf, p) as Int)
         }
 
         inline fun putU32(v: U32): Cursor {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); VH.I32.set(buf, p, v.raw); buf.position(p + 4); return this
         }
 
         inline fun getU64(): U64 {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); buf.position(p + 8); return U64.fromSigned(VH.I64.get(buf, p) as Long)
         }
 
         inline fun putU64(v: U64): Cursor {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); VH.I64.set(buf, p, v.raw); buf.position(p + 8); return this
         }
 
         inline fun getFloat(): Float {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); buf.position(p + 4); return VH.F32.get(buf, p) as Float
         }
         inline fun putFloat(v: Float): Cursor {
-            ensure(4);
+            ensure(4)
             val p = buf.position(); VH.F32.set(buf, p, v); buf.position(p + 4); return this
         }
 
         inline fun getDouble(): Double {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); buf.position(p + 8); return VH.F64.get(buf, p) as Double
         }
         inline fun putDouble(v: Double): Cursor {
-            ensure(8);
+            ensure(8)
             val p = buf.position(); VH.F64.set(buf, p, v); buf.position(p + 8); return this
         }
 
@@ -259,8 +254,8 @@ object LE {
             require(off >= 0 && len >= 0 && off + len <= src.size)
             val bytes = len shl 2; ensure(bytes)
             val p0 = buf.position(); require((p0 and 3) == 0) { "unaligned int write: pos=$p0 (must be 4B-aligned)" }
-            var p = p0;
-            var i = off;
+            var p = p0
+            var i = off
             val end = off + len
             while (i < end) {
                 VH.I32.set(buf, p, src[i]); p += 4; i++
@@ -273,8 +268,8 @@ object LE {
             require(off >= 0 && len >= 0 && off + len <= src.size)
             val bytes = len shl 3; ensure(bytes)
             val p0 = buf.position(); require((p0 and 7) == 0) { "unaligned long write: pos=$p0 (must be 8B-aligned)" }
-            var p = p0;
-            var i = off;
+            var p = p0
+            var i = off
             val end = off + len
             while (i < end) {
                 VH.I64.set(buf, p, src[i]); p += 8; i++

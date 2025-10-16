@@ -16,7 +16,6 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 @file:Suppress("NOTHING_TO_INLINE", "unused", "DuplicatedCode")
 
 package dev.swiftstorm.akkaradb.common

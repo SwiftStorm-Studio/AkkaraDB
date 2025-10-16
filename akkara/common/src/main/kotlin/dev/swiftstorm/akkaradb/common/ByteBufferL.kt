@@ -16,7 +16,6 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 @file:Suppress("NOTHING_TO_INLINE", "unused")
 
 package dev.swiftstorm.akkaradb.common
@@ -32,13 +31,18 @@ import java.nio.channels.WritableByteChannel
 /**
  * ByteBufferL — thin Little-Endian buffer wrapper for AkkaraDB.
  *
- * Design:
- *  - Always Little-Endian semantics without relying on buffer.order().
- *  - Position/limit management is exposed as Kotlin properties.
- *  - Relative primitive I/O is property-based (i8/i16/i32/i64/f32/f64 + u32/u64).
- *  - Absolute primitive I/O uses property-based view via [at(index)].
- *  - 32B header read/write delegates to [AKHdr32] (vLen: U32, seq/keyFP/mini: U64).
- *  - No view buffers on hot paths; only duplicate/slice used for safe slicing.
+ * Design goals:
+ *  - Always Little-Endian semantics without relying on external callers to set buffer.order().
+ *  - Keep position/limit management as Kotlin properties for readability.
+ *  - Prefer property-based relative and absolute primitive I/O (i8/i16/i32/i64/f32/f64 + u32/u64).
+ *  - Avoid view buffers on hot paths; use duplicate/slice for safe slicing.
+ *  - Public methods NEVER return raw ByteBuffer; they return ByteBufferL to preserve LE safety.
+ *  - Raw ByteBuffer exposure is available as `internal` helpers (raw*), with intentionally unsafe semantics.
+ *
+ * Usage tips:
+ *  - Use `at(index)` for absolute property-based access.
+ *  - Use `slice()` / `sliceAt(off,len)` to obtain LE-safe subviews as ByteBufferL.
+ *  - Prefer your BufferPool in production; `allocate()` is for convenience.
  */
 class ByteBufferL private constructor(
     @PublishedApi internal val buf: ByteBuffer
@@ -53,60 +57,98 @@ class ByteBufferL private constructor(
         @JvmStatic
         fun allocate(capacity: Int, direct: Boolean = true): ByteBufferL {
             val bb = if (direct) ByteBuffer.allocateDirect(capacity) else ByteBuffer.allocate(capacity)
-            // Not required by LE, but makes intent explicit for incidental relative ops outside LE.
+            // Not required by LE code paths, but sets an explicit default for any incidental relative ops.
             bb.order(ByteOrder.LITTLE_ENDIAN)
             return ByteBufferL(bb)
         }
     }
 
     // ---------------- Basics as properties ----------------
+    /** Buffer total capacity. */
     val capacity: Int get() = buf.capacity()
+
+    /** Short alias for capacity. */
     val cap: Int get() = buf.capacity()
 
+    /** Current position. */
     var position: Int
         get() = buf.position()
         set(value) {
             buf.position(value)
         }
 
+    /** Current limit. */
     var limit: Int
         get() = buf.limit()
         set(value) {
             buf.limit(value)
         }
 
-    /** Remaining bytes (derived). */
+    /** Remaining bytes derived from position/limit. */
     val remaining: Int get() = buf.remaining()
 
-    /** Direct buffer flag. */
+    /** Whether the underlying buffer is direct. */
     val isDirect: Boolean get() = buf.isDirect
 
-    /** Read-only duplicate; independent position/limit; LE order applied for convenience. */
-    fun asReadOnlyDuplicate(): ByteBuffer = buf.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN)
+    // ---------------- LE-safe views (public) ----------------
+    /**
+     * Read-only duplicate as a LE-safe ByteBufferL view.
+     * Note: Writes via this view will throw, as the underlying buffer is read-only.
+     */
+    fun asReadOnlyDuplicate(): ByteBufferL =
+        ByteBufferL(buf.asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN))
 
-    /** Duplicate; independent position/limit; LE order applied for convenience. */
-    fun duplicate(): ByteBuffer = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+    /** Duplicate with independent position/limit as a LE-safe ByteBufferL view. */
+    fun duplicate(): ByteBufferL =
+        ByteBufferL(buf.duplicate().order(ByteOrder.LITTLE_ENDIAN))
 
-    /** Slice of remaining region; independent position/limit; LE order applied. */
-    fun slice(): ByteBuffer = buf.slice().order(ByteOrder.LITTLE_ENDIAN)
+    /** Slice of the remaining region as a LE-safe ByteBufferL view. */
+    fun slice(): ByteBufferL =
+        ByteBufferL(buf.slice().order(ByteOrder.LITTLE_ENDIAN))
 
-    /** Absolute slice at [at] with [len]; independent position/limit; LE order applied. */
-    fun sliceAt(at: Int, len: Int): ByteBuffer {
+    /**
+     * Absolute slice at [at] with [len] as a LE-safe ByteBufferL view.
+     * Throws if the requested range is out-of-bounds.
+     */
+    fun sliceAt(at: Int, len: Int): ByteBufferL {
         require(at >= 0 && len >= 0 && at + len <= buf.capacity()) { "slice OOB" }
         val d = buf.duplicate()
         d.position(at).limit(at + len)
-        return d.slice().order(ByteOrder.LITTLE_ENDIAN)
+        return ByteBufferL(d.slice().order(ByteOrder.LITTLE_ENDIAN))
+    }
+
+    /** Whether there are remaining bytes. */
+    fun has(): Boolean = remaining > 0
+
+    // ---------------- Intentional raw exposure (internal) ----------------
+    /** Internal: expose raw underlying ByteBuffer (unsafe w.r.t. LE semantics). */
+    internal fun rawBuffer(): ByteBuffer = buf
+
+    /** Internal: raw duplicate with no enforced LE safety on callers. */
+    internal fun rawDuplicate(): ByteBuffer = buf.duplicate()
+
+    /** Internal: raw slice with no enforced LE safety on callers. */
+    internal fun rawSlice(): ByteBuffer = buf.slice()
+
+    /** Internal: raw absolute slice with no enforced LE safety on callers. */
+    internal fun rawSliceAt(at: Int, len: Int): ByteBuffer {
+        val d = buf.duplicate()
+        d.position(at).limit(at + len)
+        return d.slice()
     }
 
     // ---------------- for method chaining ----------------
+    /** Set position and return this for chaining. */
     fun position(newPos: Int): ByteBufferL {
         position = newPos; return this
     }
 
+    /** Set limit and return this for chaining. */
     fun limit(newLim: Int): ByteBufferL {
         limit = newLim; return this
     }
 
+    /** Clear (position=0, limit=capacity) and return this for chaining. */
     fun clear(): ByteBufferL {
         buf.clear(); return this
     }
@@ -114,18 +156,18 @@ class ByteBufferL private constructor(
     // ---------------- Relative primitives via properties ----------------
     /**
      * Relative read/write properties:
-     *  - get: reads a value at current position and advances position
-     *  - set: writes a value at current position and advances position
+     * - get: reads a value at current position and advances position
+     * - set: writes a value at current position and advances position
      *
      * Naming:
-     *  - i8 : unsigned 8-bit (Int 0..255)
-     *  - i16: Short (LE)
-     *  - i32: Int   (LE)
-     *  - i64: Long  (LE)
-     *  - u32: U32   (LE, unsigned 32-bit)
-     *  - u64: U64   (LE, unsigned 64-bit)
-     *  - f32: Float (LE)
-     *  - f64: Double(LE)
+     * - i8 : unsigned 8-bit (Int 0..255)
+     * - i16: Short (LE)
+     * - i32: Int   (LE)
+     * - i64: Long  (LE)
+     * - u32: U32   (LE, unsigned 32-bit)
+     * - u64: U64   (LE, unsigned 64-bit)
+     * - f32: Float (LE)
+     * - f64: Double(LE)
      */
     var i8: Int
         get() = LE.cursor(buf).getU8()
@@ -180,11 +222,31 @@ class ByteBufferL private constructor(
         LE.cursor(buf).putBytes(src, off, len); return this
     }
 
-    /** Relative bulk write (aligned) */
+    /** Relative bulk write from another ByteBufferL (direct→direct, non-destructive). */
+    fun put(src: ByteBufferL, len: Int = src.remaining): ByteBufferL {
+        require(len in 0..src.remaining) { "len out of range: $len > ${src.remaining}" }
+
+        val dstBB = this.buf
+        val srcBB = src.buf
+
+        val dstPos = dstBB.position()
+        val srcPos = srcBB.position()
+
+        val slice = srcBB.slice()
+        slice.limit(len)
+        dstBB.put(slice) // ByteBuffer→ByteBuffer copy
+
+        dstBB.position(dstPos + len)
+        srcBB.position(srcPos)
+        return this
+    }
+
+    /** Relative bulk write of Ints (aligned). */
     fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
         LE.cursor(buf).putInts(src, off, len); return this
     }
 
+    /** Relative bulk write of Longs (aligned). */
     fun putLongs(src: LongArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
         LE.cursor(buf).putLongs(src, off, len); return this
     }
@@ -193,8 +255,8 @@ class ByteBufferL private constructor(
     /**
      * Property-based absolute access view at a fixed [index].
      * Example:
-     *   b.at(128).i32 = 42
-     *   val x = b.at(136).i64
+     *   buf.at(128).i32 = 42
+     *   val x = buf.at(136).i64
      */
     fun at(index: Int): At = At(index)
 
@@ -332,15 +394,15 @@ class ByteBufferL private constructor(
     ): Int = putRecord32(key, value, U64.fromSigned(seq), flags, U64.fromSigned(keyFP64), U64.fromSigned(miniKey))
 
     /**
-     * Read header32 at [recOff] and return slices for key/value.
-     * Result pair: (header, Pair(keySlice, valueSlice))
+     * Read header32 at [recOff] and return LE-safe slices for key/value.
+     * Result pair: (header, Pair(keySliceL, valueSliceL))
      */
-    fun readRecord32(recOff: Int): Pair<AKHdr32.Header, Pair<ByteBuffer, ByteBuffer>> {
+    fun readRecord32(recOff: Int): Pair<AKHdr32.Header, Pair<ByteBufferL, ByteBufferL>> {
         val h = readHeader32(recOff)
         val keyOff = recOff + AKHdr32.SIZE
         val valOff = keyOff + h.kLen
         val keySlice = sliceAt(keyOff, h.kLen)
-        val vLenInt = h.vLen.toIntExact() // should fit; current chunk size <= block size
+        val vLenInt = h.vLen.toIntExact() // current chunk size should fit into Int
         val valSlice = sliceAt(valOff, vLenInt)
         return h to (keySlice to valSlice)
     }

@@ -16,17 +16,14 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 @file:Suppress("NOTHING_TO_INLINE", "DuplicatedCode", "KotlinConstantConditions")
 
 package dev.swiftstorm.akkaradb.format.akk.parity
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.vh.LE
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
 import dev.swiftstorm.akkaradb.format.api.ParityKind
-import java.nio.ByteBuffer
 
 /**
  * XOR parity coder (m = 1).
@@ -53,65 +50,36 @@ class XorParityCoder(
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parityOut)
 
-        // Parity buffer + absolute base
-        val pBBL = parityOut[0]
-        val pBuf: ByteBuffer = pBBL.duplicate()
-        val pBase = pBBL.position
+        val p = parityOut[0]
+        val pBase = p.position
 
-        // Data buffers + absolute bases
-        val dBufs = Array(data.size) { i -> data[i].duplicate() }
         val dBase = IntArray(data.size) { i -> data[i].position }
 
         val longBytes = (blockSize ushr 3) shl 3
         val tail = blockSize - longBytes
 
-        // 64-bit XOR
         var off = 0
         while (off < longBytes) {
             var acc = 0L
-            // 軽アンローリング（k==4が多い前提ならここを増やす）
-            when (dBufs.size) {
-                4 -> {
-                    acc = acc xor LE.getLong(dBufs[0], dBase[0] + off)
-                    acc = acc xor LE.getLong(dBufs[1], dBase[1] + off)
-                    acc = acc xor LE.getLong(dBufs[2], dBase[2] + off)
-                    acc = acc xor LE.getLong(dBufs[3], dBase[3] + off)
-                }
-
-                else -> {
-                    var i = 0
-                    while (i < dBufs.size) {
-                        acc = acc xor LE.getLong(dBufs[i], dBase[i] + off)
-                        i++
-                    }
-                }
+            var i = 0
+            while (i < data.size) {
+                acc = acc xor data[i].getI64At(dBase[i] + off)
+                i++
             }
-            LE.putLong(pBuf, pBase + off, acc)
+            p.putI64At(pBase + off, acc)
             off += 8
         }
 
-        // tail bytes
         var t = 0
         while (t < tail) {
             val idx = off + t
             var b = 0
-            when (dBufs.size) {
-                4 -> {
-                    b = b xor LE.getU8(dBufs[0], dBase[0] + idx)
-                    b = b xor LE.getU8(dBufs[1], dBase[1] + idx)
-                    b = b xor LE.getU8(dBufs[2], dBase[2] + idx)
-                    b = b xor LE.getU8(dBufs[3], dBase[3] + idx)
-                }
-
-                else -> {
-                    var i = 0
-                    while (i < dBufs.size) {
-                        b = b xor LE.getU8(dBufs[i], dBase[i] + idx)
-                        i++
-                    }
-                }
+            var i = 0
+            while (i < data.size) {
+                b = b xor data[i].getU8At(dBase[i] + idx)
+                i++
             }
-            LE.putU8(pBuf, pBase + idx, b)
+            p.putU8At(pBase + idx, b)
             t++
         }
     }
@@ -126,11 +94,9 @@ class XorParityCoder(
         requireAllHave(blockSize, data)
         requireAllHave(blockSize, parity)
 
-        val pBBL = parity[0]
-        val pBuf = pBBL.duplicate()
-        val pBase = pBBL.position
+        val p = parity[0]
+        val pBase = p.position
 
-        val dBufs = Array(data.size) { i -> data[i].duplicate() }
         val dBase = IntArray(data.size) { i -> data[i].position }
 
         val longBytes = (blockSize ushr 3) shl 3
@@ -139,23 +105,12 @@ class XorParityCoder(
         var off = 0
         while (off < longBytes) {
             var acc = 0L
-            when (dBufs.size) {
-                4 -> {
-                    acc = acc xor LE.getLong(dBufs[0], dBase[0] + off)
-                    acc = acc xor LE.getLong(dBufs[1], dBase[1] + off)
-                    acc = acc xor LE.getLong(dBufs[2], dBase[2] + off)
-                    acc = acc xor LE.getLong(dBufs[3], dBase[3] + off)
-                }
-
-                else -> {
-                    var i = 0
-                    while (i < dBufs.size) {
-                        acc = acc xor LE.getLong(dBufs[i], dBase[i] + off)
-                        i++
-                    }
-                }
+            var i = 0
+            while (i < data.size) {
+                acc = acc xor data[i].getI64At(dBase[i] + off)
+                i++
             }
-            if (acc != LE.getLong(pBuf, pBase + off)) return false
+            if (acc != p.getI64At(pBase + off)) return false
             off += 8
         }
 
@@ -163,23 +118,12 @@ class XorParityCoder(
         while (t < tail) {
             val idx = off + t
             var b = 0
-            when (dBufs.size) {
-                4 -> {
-                    b = b xor LE.getU8(dBufs[0], dBase[0] + idx)
-                    b = b xor LE.getU8(dBufs[1], dBase[1] + idx)
-                    b = b xor LE.getU8(dBufs[2], dBase[2] + idx)
-                    b = b xor LE.getU8(dBufs[3], dBase[3] + idx)
-                }
-
-                else -> {
-                    var i = 0
-                    while (i < dBufs.size) {
-                        b = b xor LE.getU8(dBufs[i], dBase[i] + idx)
-                        i++
-                    }
-                }
+            var i = 0
+            while (i < data.size) {
+                b = b xor data[i].getU8At(dBase[i] + idx)
+                i++
             }
-            if (b != LE.getU8(pBuf, pBase + idx)) return false
+            if (b != p.getU8At(pBase + idx)) return false
             t++
         }
         return true
@@ -212,15 +156,13 @@ class XorParityCoder(
         // lost data -> parity ^ xor(all other data)
         if (lostDataIdx.isNotEmpty()) {
             val li = lostDataIdx[0]
-            val pBBL = requireNotNull(parity[0]) { "parity block required" }
-            val pBuf = pBBL.duplicate()
-            val pBase = pBBL.position
+
+            val p = requireNotNull(parity[0]) { "parity block required" }
+            val pBase = p.position
 
             val out = outData[0]
-            val outBuf = out.duplicate()
             val outBase = out.position
 
-            val dBufs = Array(data.size) { i -> data[i]?.duplicate() }
             val dBase = IntArray(data.size) { i -> data[i]?.position ?: 0 }
 
             val longBytes = (blockSize ushr 3) shl 3
@@ -228,32 +170,32 @@ class XorParityCoder(
 
             var off = 0
             while (off < longBytes) {
-                var acc = LE.getLong(pBuf, pBase + off)
+                var acc = p.getI64At(pBase + off)
                 var i = 0
-                while (i < dBufs.size) {
+                while (i < data.size) {
                     if (i != li) {
-                        val db = dBufs[i]
-                        if (db != null) acc = acc xor LE.getLong(db, dBase[i] + off)
+                        val db = data[i]
+                        if (db != null) acc = acc xor db.getI64At(dBase[i] + off)
                     }
                     i++
                 }
-                LE.putLong(outBuf, outBase + off, acc)
+                out.putI64At(outBase + off, acc)
                 off += 8
             }
 
             var t = 0
             while (t < tail) {
                 val idx = off + t
-                var b = LE.getU8(pBuf, pBase + idx)
+                var b = p.getU8At(pBase + idx)
                 var i = 0
-                while (i < dBufs.size) {
+                while (i < data.size) {
                     if (i != li) {
-                        val db = dBufs[i]
-                        if (db != null) b = b xor LE.getU8(db, dBase[i] + idx)
+                        val db = data[i]
+                        if (db != null) b = b xor db.getU8At(dBase[i] + idx)
                     }
                     i++
                 }
-                LE.putU8(outBuf, outBase + idx, b)
+                out.putU8At(outBase + idx, b)
                 t++
             }
             return 1
