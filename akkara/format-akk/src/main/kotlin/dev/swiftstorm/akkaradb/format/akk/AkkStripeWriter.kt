@@ -217,7 +217,6 @@ class AkkStripeWriter(
     /** FileChannel.position(off) + ByteBufferL.writeFully(...). */
     private fun positionalWriteFully(ch: FileChannel, block: ByteBufferL, off: Long) {
         ch.position(off)
-        // 書き込みは block の duplicate を使い position=0 から blockSize 分
         val dup = block.duplicate().position(0)
         val wrote = dup.writeFully(ch, blockSize)
         if (wrote != blockSize) throw IOException("short write: $wrote/$blockSize")

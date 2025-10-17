@@ -188,8 +188,8 @@ class SSTableReader(
  *   entries : u32  (total number of records; advisory)
  *   crc     : u32  (CRC32C over the entire file except this field)  [optional use]
  * ======================================================================= */
-private const val FOOTER_SIZE = 32
-private const val FOOTER_MAGIC = 0x414B5353 // 'A''K''S''S'
+const val FOOTER_SIZE = 32
+const val FOOTER_MAGIC = 0x414B5353 // 'A''K''S''S'
 
 data class Footer(
     val indexOff: Long,
