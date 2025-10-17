@@ -1,13 +1,7 @@
 package dev.swiftstorm.akkaradb.engine.sstable
 
+import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
-import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.MemRecord
-import dev.swiftstorm.akkaradb.common.RecordFlags
-import dev.swiftstorm.akkaradb.common.lexCompare
-import dev.swiftstorm.akkaradb.common.memRecordOf
-import dev.swiftstorm.akkaradb.engine.sstable.FOOTER_SIZE
-import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader.Footer
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockUnpacker
 import dev.swiftstorm.akkaradb.format.api.RecordCursor
 import dev.swiftstorm.akkaradb.format.api.RecordView
@@ -15,13 +9,8 @@ import java.io.Closeable
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption.CREATE
-import java.nio.file.StandardOpenOption.READ
-import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
-import java.nio.file.StandardOpenOption.WRITE
-import java.util.Comparator
-import java.util.PriorityQueue
-import java.util.UUID
+import java.nio.file.StandardOpenOption.*
+import java.util.*
 import kotlin.io.path.createDirectories
 import kotlin.io.path.notExists
 
@@ -66,15 +55,13 @@ class SSTCompactor(
 
     private fun levelPath(level: Int): Path = baseDir.resolve("L$level")
 
-    private fun listSstFiles(levelDir: Path): MutableList<Path> {
-        if (!Files.isDirectory(levelDir)) return mutableListOf()
-        val files = mutableListOf<Path>()
-        Files.list(levelDir).use { stream ->
+    private fun listSstFiles(levelDir: Path): List<Path> {
+        if (!Files.isDirectory(levelDir)) return emptyList()
+        return Files.list(levelDir).use { stream ->
             stream.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".sst") }
-                .forEach { files += it }
+                .sorted(Comparator.comparing { it.fileName.toString() })
+                .toList()
         }
-        files.sortBy { it.fileName.toString() }
-        return files
     }
 
     private fun compactLevel(level: Int) {
@@ -98,7 +85,7 @@ class SSTCompactor(
     private fun newFileName(level: Int): String {
         val ts = System.currentTimeMillis()
         val suffix = UUID.randomUUID().toString().replace("-", "").take(8)
-        return "L${level}_$ts_$suffix.sst"
+        return "L${level}_${ts}_$suffix.sst"
     }
 
     private fun compactInto(inputs: List<Path>, output: Path) {
