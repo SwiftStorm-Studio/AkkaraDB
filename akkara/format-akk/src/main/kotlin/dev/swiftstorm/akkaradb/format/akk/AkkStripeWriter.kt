@@ -45,11 +45,6 @@ import kotlin.math.min
 
 /**
  * High-performance StripeWriter (ByteBufferL-only).
- *
- * 変更点:
- *  - CRC32C は ByteBufferL.crc32cRange() に統一（JDK CRC32C と ByteBuffer 非依存）
- *  - 書き込みは FileChannel.position(off) + ByteBufferL.writeFully()
- *  - すべて ByteBufferL API のみで完結
  */
 class AkkStripeWriter(
     override val k: Int,
