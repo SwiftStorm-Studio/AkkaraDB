@@ -209,7 +209,7 @@ data class Footer(
             val bloomOff = buf.at(16).i64
             val entries = buf.at(24).i32
             // crc @28..31 (currently advisory; not enforced here)
-            require(indexOff > 0) { "indexOff must be > 0" }
+            require(indexOff >= 0) { "indexOff must be >= 0" }
             return Footer(indexOff, bloomOff, entries, ver)
         }
 
