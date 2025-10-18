@@ -90,6 +90,11 @@ class ByteBufferL private constructor(
     /** Whether the underlying buffer is direct. */
     val isDirect: Boolean get() = buf.isDirect
 
+    /** for internal use only: raw ByteBuffer exposure (unsafe w.r.t. LE semantics). */
+    @Deprecated("Exposes raw ByteBuffer; unsafe w.r.t. LE semantics. Use LE-safe methods instead.", ReplaceWith("this"))
+    val byte: ByteBuffer
+        get() = buf
+
     // ---------------- LE-safe views (public) ----------------
     /**
      * Read-only duplicate as a LE-safe ByteBufferL view.

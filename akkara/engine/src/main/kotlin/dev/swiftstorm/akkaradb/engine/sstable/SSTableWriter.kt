@@ -1,12 +1,31 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 @file:Suppress("NOTHING_TO_INLINE", "unused")
 
 package dev.swiftstorm.akkaradb.engine.sstable
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.MemRecord
-import dev.swiftstorm.akkaradb.engine.IndexBlock
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
 import dev.swiftstorm.akkaradb.engine.bridge.tryAppendMem
+import dev.swiftstorm.akkaradb.engine.util.IndexBlock
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockPacker
 import java.io.Closeable
 import java.nio.channels.SeekableByteChannel
@@ -109,17 +128,17 @@ class SSTableWriter(
             off
         } else 0L
 
-        // (3) Footer (fixed 32 bytes)
-        val footerBuf = ByteBufferL.allocate(FOOTER_SIZE)
-        Footer.writeTo(
+        // (3) Footer (fixed 32 bytes) — currently writes crc32c=0 (reader may skip verify)
+        val footerBuf = ByteBufferL.allocate(AKSSFooter.SIZE)
+        AKSSFooter.writeTo(
             dst = footerBuf,
             indexOff = indexOff,
             bloomOff = bloomOff,
             entries = totalEntries.toInt(),
-            crc32c = 0 // advisory (reader may ignore)
+            crc32c = 0
         )
         footerBuf.position(0)
-        footerBuf.writeFully(ch, FOOTER_SIZE)
+        footerBuf.writeFully(ch, AKSSFooter.SIZE)
 
         return SealResult(indexOff, bloomOff, totalEntries)
     }
@@ -130,44 +149,4 @@ class SSTableWriter(
     }
 
     data class SealResult(val indexOff: Long, val bloomOff: Long, val entries: Long)
-
-    /* ---------------- Footer (AKSS, 32 bytes) ---------------- */
-
-    companion object Footer {
-        private const val FOOTER_MAGIC = 0x414B5353 // 'A''K''S''S'
-        private const val FOOTER_VER = 1
-        private const val FOOTER_SIZE = 32
-
-        /**
-         * Write AKSS footer at current position of [dst].
-         * Layout (LE, 32 bytes total):
-         *   0  .. 3  : magic 'AKSS' (u32)
-         *   4        : ver (u8) = 1
-         *   5  .. 7  : pad (u24) = 0
-         *   8  .. 15 : indexOff (u64)
-         *   16 .. 23 : bloomOff (u64) -- 0 if none
-         *   24 .. 27 : entries (u32)  -- total records (tombstones included)
-         *   28 .. 31 : crc32c (u32)   -- optional, currently advisory
-         */
-        fun writeTo(
-            dst: ByteBufferL,
-            indexOff: Long,
-            bloomOff: Long,
-            entries: Int,
-            crc32c: Int = 0
-        ): ByteBufferL {
-            val start = dst.position
-            dst.at(start + 0).i32 = FOOTER_MAGIC
-            dst.at(start + 4).i8 = FOOTER_VER
-            dst.at(start + 5).i8 = 0
-            dst.at(start + 6).i8 = 0
-            dst.at(start + 7).i8 = 0
-            dst.at(start + 8).i64 = indexOff
-            dst.at(start + 16).i64 = bloomOff
-            dst.at(start + 24).i32 = entries
-            dst.at(start + 28).i32 = crc32c
-            dst.position(start + FOOTER_SIZE)
-            return dst
-        }
-    }
 }

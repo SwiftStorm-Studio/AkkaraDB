@@ -17,9 +17,7 @@
  * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-@file:Suppress("NOTHING_TO_INLINE", "unused")
-
-package dev.swiftstorm.akkaradb.engine
+package dev.swiftstorm.akkaradb.engine.util
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import java.nio.channels.WritableByteChannel
@@ -138,6 +136,7 @@ class IndexBlock private constructor(
             val ver = buf.at(OFF_VER).i8
             require(ver == VER) { "unsupported index ver=$ver" }
             val kSize = buf.at(OFF_KSIZE).i8
+            require(kSize == KEY_BYTES) { "unsupported index key size=$kSize (expected $KEY_BYTES)" }
             val count = buf.at(OFF_COUNT).i32
             require(count >= 0)
             val entriesBytes = count * ENTRY_BYTES
@@ -197,7 +196,7 @@ class IndexBlock private constructor(
         fun buildBuffer(): ByteBufferL {
             val count = keys.size
             val size = HEADER_SIZE + count * ENTRY_BYTES
-            val buf = ByteBufferL.allocate(size)
+            val buf = ByteBufferL.Companion.allocate(size)
 
             // header
             buf.at(OFF_MAGIC).i32 = MAGIC

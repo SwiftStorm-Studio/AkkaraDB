@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.engine.sstable
 
 import dev.swiftstorm.akkaradb.common.*
@@ -6,6 +25,7 @@ import dev.swiftstorm.akkaradb.format.akk.AkkBlockUnpacker
 import dev.swiftstorm.akkaradb.format.api.RecordCursor
 import dev.swiftstorm.akkaradb.format.api.RecordView
 import java.io.Closeable
+import java.lang.Long.compareUnsigned
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -16,7 +36,8 @@ import kotlin.io.path.notExists
 
 class SSTCompactor(
     private val baseDir: Path,
-    private val maxPerLevel: Int = 4
+    private val maxPerLevel: Int = 4,
+    private val seqClock: ((seq: Long) -> Long?)? = null
 ) {
 
     init {
@@ -89,7 +110,7 @@ class SSTCompactor(
     }
 
     private fun compactInto(inputs: List<Path>, output: Path) {
-        val iterators = inputs.map { SstIterator(it) }
+        val iterators = inputs.map { SSTIterator(it) }
         try {
             val expected = iterators.sumOf { it.totalEntries }
             FileChannel.open(output, CREATE, TRUNCATE_EXISTING, WRITE).use { ch ->
@@ -104,20 +125,26 @@ class SSTCompactor(
         }
     }
 
-    private fun merge(iterators: List<SstIterator>): Sequence<MemRecord> = sequence {
+    private fun merge(iterators: List<SSTIterator>): Sequence<MemRecord> =
+        merge(iterators, System.currentTimeMillis(), false, 24L * 60 * 60 * 1000, seqClock)
+
+    private fun merge(
+        iterators: List<SSTIterator>,
+        nowMillis: Long,
+        isBottomLevelCompaction: Boolean,
+        ttlMillis: Long = 24L * 60 * 60 * 1000,
+        seqClock: ((seq: Long) -> Long?)? = null
+    ): Sequence<MemRecord> = sequence {
         if (iterators.isEmpty()) return@sequence
+
         val comparator = Comparator<HeapEntry> { a, b ->
             val cmp = lexCompare(a.record.key, b.record.key)
             if (cmp != 0) cmp
-            else java.lang.Long.compareUnsigned(b.record.seq, a.record.seq) // seq降順
+            else compareUnsigned(b.record.seq, a.record.seq)
         }
         val pq = PriorityQueue(comparator)
 
-        iterators.forEach { iterator ->
-            iterator.nextRecord()?.let { record ->
-                pq += HeapEntry(record, iterator)
-            }
-        }
+        iterators.forEach { it.nextRecord()?.let { r -> pq += HeapEntry(r, it) } }
 
         while (pq.isNotEmpty()) {
             val first = pq.poll()
@@ -126,50 +153,50 @@ class SSTCompactor(
                 val peek = pq.peek()
                 if (lexCompare(peek.record.key, first.record.key) == 0) {
                     sameKey += pq.poll()
-                } else {
-                    break
-                }
+                } else break
             }
 
             sameKey.forEach { entry ->
-                val next = entry.iterator.nextRecord()
-                if (next != null) {
-                    pq += HeapEntry(next, entry.iterator)
-                }
+                entry.iterator.nextRecord()?.let { next -> pq += HeapEntry(next, entry.iterator) }
             }
 
-            var best: SstRecord? = null
+            var best: SSTRecord? = null
             for (he in sameKey) {
                 val r = he.record
                 if (best == null) {
-                    best = r; continue
-                }
-                val sCmp = java.lang.Long.compareUnsigned(r.seq, best!!.seq)
-                if (sCmp > 0) {
                     best = r
-                } else if (sCmp == 0) {
-                    val rT = r.isTombstone()
-                    val bT = best.isTombstone()
-                    if (rT && !bT) best = r
+                } else {
+                    val sCmp = compareUnsigned(r.seq, best.seq)
+                    if (sCmp > 0) {
+                        best = r
+                    } else if (sCmp == 0) {
+                        val rT = r.isTombstone()
+                        val bT = best.isTombstone()
+                        if (rT && !bT) best = r
+                    }
                 }
             }
             val winner = best!!
-            // TODO: tombstoneTTL（24h）を導入して古い墓石をdropする
 
             if (!winner.isTombstone()) {
+                yield(winner.toMemRecord())
+                continue
+            }
+
+            if (!shouldDropTombstone(winner, nowMillis, ttlMillis, isBottomLevelCompaction, seqClock)) {
                 yield(winner.toMemRecord())
             }
         }
     }
 
     private data class HeapEntry(
-        val record: SstRecord,
-        val iterator: SstIterator
+        val record: SSTRecord,
+        val iterator: SSTIterator
     )
 
-    private class SstIterator(private val path: Path) : Closeable {
+    private class SSTIterator(private val path: Path) : Closeable {
         private val channel: FileChannel = FileChannel.open(path, READ)
-        private val footer: Footer
+        private val footer: AKSSFooter.Footer
         private val dataEnd: Long
         private val unpacker = AkkBlockUnpacker()
         private var cursor: RecordCursor? = null
@@ -180,17 +207,17 @@ class SSTCompactor(
 
         init {
             val size = channel.size()
-            require(size >= FOOTER_SIZE) { "SST too small: $path" }
-            val footerBuf = ByteBufferL.allocate(FOOTER_SIZE)
-            channel.position(size - FOOTER_SIZE)
-            footerBuf.readFully(channel, FOOTER_SIZE)
+            require(size >= AKSSFooter.SIZE) { "SST too small: $path" }
+            val footerBuf = ByteBufferL.allocate(AKSSFooter.SIZE)
+            channel.position(size - AKSSFooter.SIZE)
+            footerBuf.readFully(channel, AKSSFooter.SIZE)
             footerBuf.position = 0
-            footer = Footer.readFrom(footerBuf)
+            footer = AKSSFooter.readFrom(footerBuf)
             dataEnd = footer.indexOff
             totalEntries = footer.entries.toLong()
         }
 
-        fun nextRecord(): SstRecord? {
+        fun nextRecord(): SSTRecord? {
             while (true) {
                 val cur = cursor
                 if (cur != null) {
@@ -210,7 +237,6 @@ class SSTCompactor(
             channel.position(off)
             blockBuf.readFully(channel, BLOCK_SIZE)
 
-            // ---- CRC32C 検証 [0 .. BLOCK_SIZE-4) ----
             val stored = blockBuf.at(BLOCK_SIZE - 4).i32
             val calc = blockBuf.crc32cRange(0, BLOCK_SIZE - 4)
             require(stored == calc) { "CRC32C mismatch at off=$off in $path" }
@@ -224,10 +250,10 @@ class SSTCompactor(
             channel.close()
         }
 
-        private fun RecordView.toRecord(): SstRecord {
+        private fun RecordView.toRecord(): SSTRecord {
             val keyCopy = copyBuffer(key)
             val valueCopy = copyBuffer(value)
-            return SstRecord(keyCopy, valueCopy, seq.raw, flags)
+            return SSTRecord(keyCopy, valueCopy, seq.raw, flags)
         }
 
         private fun copyBuffer(src: ByteBufferL): ByteBufferL {
@@ -244,7 +270,7 @@ class SSTCompactor(
         }
     }
 
-    private data class SstRecord(
+    private data class SSTRecord(
         val key: ByteBufferL,
         val value: ByteBufferL,
         val seq: Long,
@@ -259,4 +285,27 @@ class SSTCompactor(
         }
     }
 
+    private fun SSTRecord.deleteAtMillisOrNull(): Long? {
+        if (!isTombstone()) return null
+        val len = value.remaining
+        if (len != 8) return null
+        return value.at(0).i64
+    }
+
+    private fun shouldDropTombstone(
+        tomb: SSTRecord,
+        nowMillis: Long,
+        ttlMillis: Long,
+        isBottomLevelCompaction: Boolean,
+        seqClock: ((seq: Long) -> Long?)?
+    ): Boolean {
+        val stamped = tomb.deleteAtMillisOrNull()
+        val approx = if (stamped == null) seqClock?.invoke(tomb.seq) else null
+        val delAt = stamped ?: approx
+
+        val expired = (delAt != null) && (nowMillis - delAt >= ttlMillis)
+        val canDropHere = isBottomLevelCompaction
+
+        return expired && canDropHere
+    }
 }

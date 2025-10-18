@@ -35,15 +35,28 @@ import kotlin.math.min
  *  6   8   seq     (u64)
  *  14  1   flags   (u8)
  *  15  1   pad0    (=0)
- *  16  8   keyFP64 (u64) — SipHash-2-4(key, seed)
+ *  16  8   keyFP64 (u64) — SipHash-2-4(key, DEFAULT_SIPHASH_SEED)
  *  24  8   miniKey (u64) — first <=8B of key, LE-packed (rest zero)
  *  -- total 32 bytes
  *
+ * Spec / Generation policy:
+ *  - Endianness: all fields are Little-Endian via LE.* primitives.
+ *  - miniKey: buildMiniKeyLE(key) packs key[0]..key[<=7] into bits [7:0]..[63:56];
+ *    short keys are zero-padded toward high bits.
+ *  - keyFP64: SipHash-2-4 over the raw key bytes with k0 = DEFAULT_SIPHASH_SEED,
+ *    k1 = (DEFAULT_SIPHASH_SEED xor 0x9E3779B97F4A7C15). Use as a 64-bit fingerprint
+ *    for indexing, Bloom seeding, and fast pre-checks. Collisions are possible and
+ *    must be resolved by full key compare on the reader side.
+ *
  * Notes:
  *  - vLen は U32、seq/keyFP64/miniKey は U64 で表現。
- *  - LE.* primitives（VarHandle）で常にLittle-Endian。
+ *  - Reader/Writer must use the same SipHash parameters and LE packing to avoid
+ *    false negatives during lookups.
  */
 object AKHdr32 {
+
+    /** Default deterministic seed for SipHash-2-4 used to derive keyFP64. */
+    val DEFAULT_SIPHASH_SEED: U64 = U64.ZERO
 
     const val SIZE = 32
     const val OFF_KLEN = 0

@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.engine.manifest
 
 import java.io.Closeable
@@ -27,7 +46,7 @@ import kotlin.concurrent.thread
  */
 class AkkManifest(
     private val path: Path,
-    val isFastMode: Boolean = true,
+    val fastMode: Boolean = false,
     // Fast mode tuning (N/T/S)
     private val batchMaxEvents: Int = 128,
     private val batchMaxMicros: Long = 500,
@@ -74,21 +93,21 @@ class AkkManifest(
         val ts: Long
     )
 
-    data class CompactionStartEvent(
-        val level: Int,
-        val inputs: List<String>,
-        val ts: Long
-    )
-
-    data class CompactionEndEvent(
-        val level: Int,
-        val output: String,
-        val inputs: List<String>,
-        val entries: Long,
-        val firstKeyHex: String?,
-        val lastKeyHex: String?,
-        val ts: Long
-    )
+//    data class CompactionStartEvent(
+//        val level: Int,
+//        val inputs: List<String>,
+//        val ts: Long
+//    )
+//
+//    data class CompactionEndEvent(
+//        val level: Int,
+//        val output: String,
+//        val inputs: List<String>,
+//        val entries: Long,
+//        val firstKeyHex: String?,
+//        val lastKeyHex: String?,
+//        val ts: Long
+//    )
 
     data class Snapshot(
         val stripesWritten: Long,
@@ -147,7 +166,7 @@ class AkkManifest(
     /** Start fast-mode background flusher (no-op for durable mode). */
     @Synchronized
     fun start() {
-        if (!isFastMode || running.get()) return
+        if (!fastMode || running.get()) return
         Files.createDirectories(path.parent)
         fastCh = FileChannel.open(path, CREATE, WRITE, APPEND)
         running.set(true)
@@ -278,7 +297,7 @@ class AkkManifest(
      */
     @Synchronized
     override fun close() {
-        if (!isFastMode) return
+        if (!fastMode) return
         val t = flusherThread
         running.set(false)
         if (t != null && t.isAlive) t.join()
@@ -298,7 +317,7 @@ class AkkManifest(
     /* ─────────── Append path (mode-aware) ─────────── */
 
     private fun append(line: String) {
-        if (isFastMode) q.add(line) else appendNow(line)
+        if (fastMode) q.add(line) else appendNow(line)
     }
 
     // Durable mode: open→write→force(true)→close
@@ -384,7 +403,7 @@ class AkkManifest(
             fc.force(true)
         }
         // reopen for fast mode
-        if (isFastMode) {
+        if (fastMode) {
             fastCh = FileChannel.open(path, CREATE, WRITE, APPEND)
         }
     }
