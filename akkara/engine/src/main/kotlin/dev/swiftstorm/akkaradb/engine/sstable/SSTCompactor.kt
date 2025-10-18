@@ -108,7 +108,8 @@ class SSTCompactor(
         if (iterators.isEmpty()) return@sequence
         val comparator = Comparator<HeapEntry> { a, b ->
             val cmp = lexCompare(a.record.key, b.record.key)
-            if (cmp != 0) cmp else java.lang.Long.compareUnsigned(b.record.seq, a.record.seq)
+            if (cmp != 0) cmp
+            else java.lang.Long.compareUnsigned(b.record.seq, a.record.seq) // seq降順
         }
         val pq = PriorityQueue(comparator)
 
@@ -137,9 +138,26 @@ class SSTCompactor(
                 }
             }
 
-            val winner = sameKey.first()
-            if (!winner.record.isTombstone()) {
-                yield(winner.record.toMemRecord())
+            var best: SstRecord? = null
+            for (he in sameKey) {
+                val r = he.record
+                if (best == null) {
+                    best = r; continue
+                }
+                val sCmp = java.lang.Long.compareUnsigned(r.seq, best!!.seq)
+                if (sCmp > 0) {
+                    best = r
+                } else if (sCmp == 0) {
+                    val rT = r.isTombstone()
+                    val bT = best.isTombstone()
+                    if (rT && !bT) best = r
+                }
+            }
+            val winner = best!!
+            // TODO: tombstoneTTL（24h）を導入して古い墓石をdropする
+
+            if (!winner.isTombstone()) {
+                yield(winner.toMemRecord())
             }
         }
     }
@@ -191,6 +209,12 @@ class SSTCompactor(
             blockBuf.limit = BLOCK_SIZE
             channel.position(off)
             blockBuf.readFully(channel, BLOCK_SIZE)
+
+            // ---- CRC32C 検証 [0 .. BLOCK_SIZE-4) ----
+            val stored = blockBuf.at(BLOCK_SIZE - 4).i32
+            val calc = blockBuf.crc32cRange(0, BLOCK_SIZE - 4)
+            require(stored == calc) { "CRC32C mismatch at off=$off in $path" }
+
             blockBuf.position = 0
             blockBuf.limit = BLOCK_SIZE
             cursor = unpacker.cursor(blockBuf.asReadOnlyDuplicate())
