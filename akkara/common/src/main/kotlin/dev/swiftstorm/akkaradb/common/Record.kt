@@ -81,6 +81,31 @@ fun memRecordOf(key: ByteBufferL, value: ByteBufferL, seq: Long, flags: Byte = 0
     )
 
 /**
+ * Decide if [candidate] should replace [existing] in the MemTable.
+ *
+ * Rule set mirrors the requirements:
+ *  - Higher sequence numbers always replace lower ones.
+ *  - Equal sequence numbers never allow a value to resurrect a tombstone.
+ *  - Tombstones with the same sequence do not churn the entry (idempotent delete).
+ */
+fun shouldReplace(existing: MemRecord?, candidate: MemRecord): Boolean {
+    existing ?: return true
+
+    val seqCmp = candidate.seq.compareTo(existing.seq)
+    if (seqCmp > 0) return true
+    if (seqCmp < 0) return false
+
+    val candidateTombstone = candidate.tombstone
+    val existingTombstone = existing.tombstone
+
+    if (candidateTombstone && !existingTombstone) return true
+    if (!candidateTombstone && existingTombstone) return false
+
+    // Equal sequence & same tombstone state → keep existing to avoid churn.
+    return false
+}
+
+/**
  * Byte-wise lexicographic compare (dictionary order), independent of ByteOrder.
  * Uses LE-safe duplicates and property-based relative reads.
  */
