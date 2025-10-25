@@ -98,7 +98,10 @@ class SSTCompactor(
         if (allInputs.isEmpty()) return
 
         val output = nextLevelPath.resolve(newFileName(nextLevel))
-        compactInto(allInputs, output)
+
+        val isBottom = existingLevels().none { it > nextLevel }
+
+        compactInto(allInputs, output, isBottom)
 
         (currentLevelFiles + nextLevelFiles).forEach { Files.deleteIfExists(it) }
     }
@@ -109,13 +112,19 @@ class SSTCompactor(
         return "L${level}_${ts}_$suffix.sst"
     }
 
-    private fun compactInto(inputs: List<Path>, output: Path) {
+    private fun compactInto(inputs: List<Path>, output: Path, isBottomLevel: Boolean) {
         val iterators = inputs.map { SSTIterator(it) }
         try {
             val expected = iterators.sumOf { it.totalEntries }
             FileChannel.open(output, CREATE, TRUNCATE_EXISTING, WRITE).use { ch ->
                 SSTableWriter(ch, expected).use { writer ->
-                    val merged = merge(iterators)
+                    val merged = merge(
+                        iterators = iterators,
+                        nowMillis = System.currentTimeMillis(),
+                        isBottomLevelCompaction = isBottomLevel,
+                        ttlMillis = 24L * 60 * 60 * 1000,
+                        seqClock = seqClock
+                    )
                     writer.writeAll(merged)
                     writer.seal()
                 }

@@ -136,6 +136,20 @@ object AKHdr32 {
 
     /** Pack first up to 8 bytes of [key] into a little-endian 64-bit word (key[0] -> bits 7:0). */
     @JvmStatic
+    fun buildMiniKeyLE(key: ByteBufferL): U64 {
+        val dup = key.duplicate()
+        val bb = dup.byte
+        var x = 0L
+        var i = 0
+        while (i < 8 && bb.hasRemaining()) {
+            x = x or ((bb.get().toLong() and 0xFFL) shl (8 * i))
+            i++
+        }
+        return U64.fromSigned(x)
+    }
+
+    /** Pack first up to 8 bytes of [key] into a little-endian 64-bit word (key[0] -> bits 7:0). */
+    @JvmStatic
     fun buildMiniKeyLE(key: ByteArray): U64 {
         val n = min(8, key.size)
         var x = 0L
@@ -145,6 +159,105 @@ object AKHdr32 {
             i++
         }
         return U64.fromSigned(x)
+    }
+
+    @JvmStatic
+    fun sipHash24(key: ByteBufferL, seed64: U64): U64 {
+        val k0 = seed64.raw
+        val k1 = seed64.raw xor 0x9E3779B97F4A7C15uL.toLong()
+
+        var v0 = 0x736f6d6570736575L xor k0
+        var v1 = 0x646f72616e646f6dL xor k1
+        var v2 = 0x6c7967656e657261L xor k0
+        var v3 = 0x7465646279746573L xor k1
+
+        val dup = key.duplicate()
+        val bb = dup.byte
+        val n = bb.remaining()
+
+        while (bb.remaining() >= 8) {
+            val mi = bb.long  // LE
+            v3 = v3 xor mi
+            repeat(2) {
+                v0 += v1; v2 += v3
+                v1 = (v1 shl 13) or (v1 ushr 51); v3 = (v3 shl 16) or (v3 ushr 48)
+                v1 = v1 xor v0; v3 = v3 xor v2
+                v0 = (v0 shl 32) or (v0 ushr 32)
+                v2 += v1; v0 += v3
+                v1 = (v1 shl 17) or (v1 ushr 47); v3 = (v3 shl 21) or (v3 ushr 43)
+                v1 = v1 xor v2; v3 = v3 xor v0
+                v2 = (v2 shl 32) or (v2 ushr 32)
+            }
+            v0 = v0 xor mi
+        }
+
+        var b = (n.toLong() and 0xFF) shl 56
+        when (bb.remaining()) {
+            7 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
+                b = b or ((bb.get().toLong() and 0xFF) shl 32); b = b or ((bb.get().toLong() and 0xFF) shl 40)
+                b = b or ((bb.get().toLong() and 0xFF) shl 48)
+            }
+
+            6 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
+                b = b or ((bb.get().toLong() and 0xFF) shl 32); b = b or ((bb.get().toLong() and 0xFF) shl 40)
+            }
+
+            5 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
+                b = b or ((bb.get().toLong() and 0xFF) shl 32)
+            }
+
+            4 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
+            }
+
+            3 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+                b = b or ((bb.get().toLong() and 0xFF) shl 16)
+            }
+
+            2 -> {
+                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
+            }
+
+            1 -> {
+                b = b or (bb.get().toLong() and 0xFF)
+            }
+
+            0 -> {}
+        }
+
+        v3 = v3 xor b
+        repeat(2) {
+            v0 += v1; v2 += v3
+            v1 = (v1 shl 13) or (v1 ushr 51); v3 = (v3 shl 16) or (v3 ushr 48)
+            v1 = v1 xor v0; v3 = v3 xor v2
+            v0 = (v0 shl 32) or (v0 ushr 32)
+            v2 += v1; v0 += v3
+            v1 = (v1 shl 17) or (v1 ushr 47); v3 = (v3 shl 21) or (v3 ushr 43)
+            v1 = v1 xor v2; v3 = v3 xor v0
+            v2 = (v2 shl 32) or (v2 ushr 32)
+        }
+        v0 = v0 xor b
+
+        v2 = v2 xor 0xFF
+        repeat(4) {
+            v0 += v1; v2 += v3
+            v1 = (v1 shl 13) or (v1 ushr 51); v3 = (v3 shl 16) or (v3 ushr 48)
+            v1 = v1 xor v0; v3 = v3 xor v2
+            v0 = (v0 shl 32) or (v0 ushr 32)
+            v2 += v1; v0 += v3
+            v1 = (v1 shl 17) or (v1 ushr 47); v3 = (v3 shl 21) or (v3 ushr 43)
+            v1 = v1 xor v2; v3 = v3 xor v0
+            v2 = (v2 shl 32) or (v2 ushr 32)
+        }
+        return U64.fromSigned(v0 xor v1 xor v2 xor v3)
     }
 
     /** SipHash-2-4(key, seed64) → 64-bit fingerprint (k0=seed, k1=seed^phi). */

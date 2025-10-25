@@ -114,6 +114,7 @@ class AkkStripeWriter(
     init {
         require(k >= 1) { "k must be >=1" }
         require(m >= 0) { "m must be >=0" }
+        require(coder.parityCount == m) { "coder.parityCount(${coder.parityCount}) != m($m)" }
         Files.createDirectories(laneDir)
         dataCh = Array(k) { open(laneDir.resolve("$laneFilePrefixData${it}$laneFileExtData")) }
         if (fallocateHintBytes > 0) {
@@ -344,9 +345,9 @@ class AkkStripeWriter(
                     val exactSize = (lastSealedStripe + 1) * blockSize.toLong()
                     for (ch in dataCh) if (ch.size() != exactSize) ch.truncate(exactSize)
                     for (ch in parityCh) if (ch.size() != exactSize) ch.truncate(exactSize)
-                    dataCh.firstOrNull()?.force(true)
+                    dataCh.firstOrNull()?.force(false)
                 } else {
-                    dataCh.firstOrNull()?.force(true)
+                    dataCh.firstOrNull()?.force(false)
                 }
 
                 for (ch in dataCh) ch.force(false)

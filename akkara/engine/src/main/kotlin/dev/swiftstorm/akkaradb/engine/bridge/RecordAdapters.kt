@@ -19,6 +19,7 @@
 
 package dev.swiftstorm.akkaradb.engine.bridge
 
+import dev.swiftstorm.akkaradb.common.AKHdr32
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.MemRecord
 import dev.swiftstorm.akkaradb.common.types.U64
@@ -32,20 +33,16 @@ import kotlin.math.min
  * Keeps unsigned types out of MemRecord and confines them to the format boundary.
  */
 fun BlockPacker.tryAppendMem(mem: MemRecord): Boolean {
-    // Normalize flags to u8 range
     val flagsU8: Int = mem.flags.toInt() and 0xFF
-
-    // Convert JVM signed long -> U64 (same bits, no reinterpretation)
     val seqU64 = U64.fromSigned(mem.seq)
 
-    // Derive header helpers from key slice
-    val keyFp64 = U64(fnv1a64(mem.key))
-    val miniKey = U64(miniKeyLE8(mem.key))
+    // ★ ここが変更点：ByteBufferL 版のヘルパーでゼロコピー
+    val keyFp64 = AKHdr32.sipHash24(mem.key, AKHdr32.DEFAULT_SIPHASH_SEED)
+    val miniKey = AKHdr32.buildMiniKeyLE(mem.key)
 
     val key = mem.key.duplicate()
-    val value =
-        if (mem.tombstone) EMPTY_L
-        else mem.value.duplicate()
+    val value = if (mem.tombstone) ByteBufferL.allocate(0, direct = false)
+    else mem.value.duplicate()
 
     return this.tryAppend(key, value, seqU64, flagsU8, keyFp64, miniKey)
 }

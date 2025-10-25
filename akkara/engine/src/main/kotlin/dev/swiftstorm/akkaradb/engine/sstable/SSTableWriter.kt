@@ -128,7 +128,7 @@ class SSTableWriter(
             off
         } else 0L
 
-        // (3) Footer (fixed 32 bytes) — currently writes crc32c=0 (reader may skip verify)
+        // (3) Footer (fixed 32 bytes)
         val footerBuf = ByteBufferL.allocate(AKSSFooter.SIZE)
         AKSSFooter.writeTo(
             dst = footerBuf,
@@ -139,6 +139,41 @@ class SSTableWriter(
         )
         footerBuf.position(0)
         footerBuf.writeFully(ch, AKSSFooter.SIZE)
+
+        val size = ch.size()
+        val limit = size - 4
+        require(limit >= 0) { "illegal file size while sealing: $size" }
+
+        val oldPos = ch.position()
+        try {
+            val scratch = ByteBufferL.allocate(1 shl 20) // 1 MiB
+            val crc = java.util.zip.CRC32C()
+
+            ch.position(0L)
+            var total = 0L
+            while (total < limit) {
+                val toRead = kotlin.math.min(scratch.capacity.toLong(), limit - total).toInt()
+                scratch.clear()
+                scratch.limit(toRead)
+                // fill scratch completely
+                scratch.readFully(ch, toRead)
+                // update CRC from backing ByteBuffer
+                val bb = scratch.sliceAt(0, toRead)
+                bb.position(0).limit(toRead)
+                crc.update(bb.byte)
+                total += toRead
+            }
+
+            val have = crc.value.toInt()
+            val tail = ByteBufferL.allocate(4)
+            tail.at(0).i32 = have
+            tail.position(0)
+            ch.position(size - 4)
+            tail.writeFully(ch, 4)
+        } finally {
+            ch.position(oldPos)
+        }
+        // === 変更ここまで ===
 
         return SealResult(indexOff, bloomOff, totalEntries)
     }

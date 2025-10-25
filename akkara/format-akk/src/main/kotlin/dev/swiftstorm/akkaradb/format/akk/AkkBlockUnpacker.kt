@@ -32,8 +32,14 @@ import dev.swiftstorm.akkaradb.format.api.RecordView
  * Validates frame bounds, iterates record-by-record, and returns zero-copy slices.
  */
 class AkkBlockUnpacker : BlockUnpacker {
+    private fun verifyCrc32c(block: ByteBufferL) {
+        val stored = block.at(BLOCK_SIZE - 4).i32
+        val calc = block.crc32cRange(0, BLOCK_SIZE - 4)
+        require(calc == stored) { "crc32c mismatch: stored=$stored calc=$calc" }
+    }
 
     override fun cursor(block: ByteBufferL): RecordCursor {
+        verifyCrc32c(block)
         val payloadLen = block.at(0).i32
         require(payloadLen in 0..PAYLOAD_LIMIT) { "invalid payloadLen=$payloadLen" }
         val start = 4

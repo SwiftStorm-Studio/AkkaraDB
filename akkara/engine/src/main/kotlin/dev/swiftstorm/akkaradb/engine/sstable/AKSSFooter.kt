@@ -111,12 +111,9 @@ object AKSSFooter {
                 scratch.clear()
                 scratch.limit(toRead)
                 // fill scratch completely
-                var got = 0
-                while (got < toRead) {
-                    val n = scratch.readFully(ch, toRead - got) // advances scratch.position
-                    got += n
-                }
-                // feed CRC32C using the wrapped buffer content [0..toRead)
+                scratch.readFully(ch, toRead)
+
+                // backing ByteBuffer からCRC更新
                 val bb = scratch.sliceAt(0, toRead) // internal ByteBuffer; no public exposure
                 bb.position(0).limit(toRead)
                 crc.update(bb.byte)
@@ -130,4 +127,5 @@ object AKSSFooter {
             ch.position(oldPos)
         }
     }
+
 }

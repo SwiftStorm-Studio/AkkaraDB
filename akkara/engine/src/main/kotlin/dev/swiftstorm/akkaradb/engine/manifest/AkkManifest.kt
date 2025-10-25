@@ -333,12 +333,19 @@ class AkkManifest(
     /* ─────────── Flusher (Fast mode) ─────────── */
 
     private fun runFlusher() {
-        val ch = fastCh ?: return
         val batchBufs = ArrayList<ByteBuffer>(batchMaxEvents)
         var lastStrong = lastStrongSyncNanos
         val strongNs = strongSyncIntervalMillis * 1_000_000L
 
         while (running.get() || q.isNotEmpty()) {
+            // ---- re-acquire the current channel every iteration (rotation-safe)
+            val chNow = fastCh
+            if (chNow == null) {
+                Thread.sleep(1)
+                continue
+            }
+
+            // ---- build a batch (N or T µs)
             batchBufs.clear()
             var n = 0
             val start = System.nanoTime()
@@ -349,30 +356,41 @@ class AkkManifest(
                 if ((System.nanoTime() - start) > batchMaxMicros * 1_000L) break
             }
 
+            // ---- write batch
             if (batchBufs.isEmpty()) {
                 Thread.sleep(1)
             } else {
-                for (b in batchBufs) while (b.hasRemaining()) ch.write(b)
-                ch.force(false) // fdatasync-ish
-                maybeRotate(ch)
+                try {
+                    for (b in batchBufs) while (b.hasRemaining()) chNow.write(b)
+                    chNow.force(false) // fdatasync-ish
+                } catch (_: Throwable) {
+                    // channel might have been rotated/closed; retry next loop
+                }
+                // rotation may replace fastCh; do NOT keep using chNow after this point
+                maybeRotate()
             }
 
+            // ---- periodic strong sync on the *latest* channel
             val now = System.nanoTime()
             if (now - lastStrong >= strongNs) {
-                ch.force(true)
+                try {
+                    fastCh?.force(true)
+                } catch (_: Throwable) {
+                    // ignore; next loop will re-acquire
+                }
                 lastStrong = now
             }
         }
 
-        // final drain
-        val tail = mutableListOf<ByteBuffer>()
+        // ---- final drain on the latest channel
         while (true) {
             val s = q.poll() ?: break
-            tail += encodeRecord(s)
+            val buf = encodeRecord(s)
+            val chTail = fastCh ?: FileChannel.open(path, CREATE, WRITE, APPEND).also { fastCh = it }
+            while (buf.hasRemaining()) chTail.write(buf)
         }
-        for (b in tail) while (b.hasRemaining()) ch.write(b)
-        ch.force(true)
-        maybeRotate(ch)
+        fastCh?.force(true)
+        maybeRotate()
     }
 
     /* ─────────── Rotation ─────────── */
