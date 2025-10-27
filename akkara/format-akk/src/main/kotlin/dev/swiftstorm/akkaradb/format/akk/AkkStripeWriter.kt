@@ -45,6 +45,11 @@ import kotlin.math.min
 
 /**
  * High-performance StripeWriter (ByteBufferL-only).
+ *
+ * Notes:
+ * - Uses positional writes (FileChannel.write(buf, pos)) to avoid mutating channel position.
+ * - Avoids per-iteration ByteBuffer duplicates when writing.
+ * - Keeps API and on-disk layout fully compatible.
  */
 class AkkStripeWriter(
     override val k: Int,
@@ -76,10 +81,8 @@ class AkkStripeWriter(
 
     @Volatile
     override var lastSealedStripe: Long = -1; private set
-
     @Volatile
     override var lastDurableStripe: Long = -1; private set
-
     @Volatile
     override var pendingInStripe: Int = 0; private set
 
@@ -157,10 +160,12 @@ class AkkStripeWriter(
 
         // --- CRC32C stamp (ByteBufferL only) ---
         run {
-            for (i in 0 until k) {
+            var i = 0
+            while (i < k) {
                 val buf = dataL[i]
                 val crc = buf.crc32cRange(0, blockSize - 4)
                 buf.at(blockSize - 4).i32 = crc
+                i++
             }
         }
 
@@ -176,17 +181,19 @@ class AkkStripeWriter(
             // --- Lane writes (positional; contiguous per lane) ---
             val writeStart = System.nanoTime()
             // data lanes
-            for (lane in 0 until k) {
-                val ch = dataCh[lane]
-                positionalWriteFully(ch, dataL[lane], off)
+            var lane = 0
+            while (lane < k) {
+                positionalWriteFully(dataCh[lane], dataL[lane], off)
                 bytesWrittenData.addAndGet(blockSize.toLong())
+                lane++
             }
             // parity lanes (if any)
             if (m > 0) {
-                for (pm in 0 until m) {
-                    val ch = parityCh[pm]
-                    positionalWriteFully(ch, parityBufs[pm], off)
+                var pm = 0
+                while (pm < m) {
+                    positionalWriteFully(parityCh[pm], parityBufs[pm], off)
                     bytesWrittenParity.addAndGet(blockSize.toLong())
+                    pm++
                 }
             }
             val writeEnd = System.nanoTime()
@@ -210,12 +217,23 @@ class AkkStripeWriter(
         maybeCommit()
     }
 
-    /** FileChannel.position(off) + ByteBufferL.writeFully(...). */
+    /**
+     * Positional write without mutating the channel's file position.
+     * Uses a single ByteBuffer view and advances a local absolute position.
+     */
+    @Suppress("DEPRECATION")
     private fun positionalWriteFully(ch: FileChannel, block: ByteBufferL, off: Long) {
-        ch.position(off)
-        val dup = block.duplicate().position(0)
-        val wrote = dup.writeFully(ch, blockSize)
-        if (wrote != blockSize) throw IOException("short write: $wrote/$blockSize")
+        // Reuse a single view; do not mutate channel position.
+        val src = block.duplicate().position(0).byte
+        src.limit(blockSize)
+        var written = 0
+        while (written < blockSize) {
+            val n = ch.write(src, off + written.toLong())
+            if (n < 0) throw IOException("channel closed during write")
+            if (n == 0) continue // non-blocking safety (should not happen with FileChannel)
+            written += n
+        }
+        // `block` itself is not consumed (non-destructive)
     }
 
     private fun maybeCommit() {
@@ -331,10 +349,9 @@ class AkkStripeWriter(
             try {
                 if (pendingInStripe == k) sealStripe()
 
+                // Ensure fsync executor has picked up previous tasks before final sync.
                 val barrier = CompletableFuture<Void>()
-                (flushPolicy.executor ?: fsyncExec).execute {
-                    barrier.complete(null)
-                }
+                (flushPolicy.executor ?: fsyncExec).execute { barrier.complete(null) }
                 barrier.join()
 
                 if (pendingCommits.get() > 0) {
@@ -377,10 +394,7 @@ class AkkStripeWriter(
     private fun Array<ByteBufferL?>.requireFull(n: Int): Array<ByteBufferL> {
         check(size >= n) { "staging size < k" }
         @Suppress("UNCHECKED_CAST")
-        val out = Array(n) { i ->
-            this[i] ?: error("missing block for lane=$i")
-        }
-        return out
+        return Array(n) { i -> this[i] ?: error("missing block for lane=$i") }
     }
 
     private fun alignUp(x: Long, pow2: Long): Long {

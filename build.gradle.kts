@@ -27,7 +27,7 @@ allprojects {
         "akkara-engine" -> "0.0.1+alpha.1"
         "akkara-format-api" -> "0.0.1+alpha.1"
         "akkara-format-akk" -> "0.0.1+alpha.1"
-        "akkara-java-api" -> "0.0.1-SNAPSHOT"
+//        "akkara-java-api" -> "0.0.1-SNAPSHOT"
         "akkara-replica" -> "0.0.1-SNAPSHOT"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
@@ -91,16 +91,18 @@ subprojects {
             }
         }
 
-        "akkara-java-api" -> {
-            dependencies {
-                implementation(project(":akkara-engine"))
-            }
-        }
+//        "akkara-java-api" -> {
+//            dependencies {
+//                implementation(project(":akkara-engine"))
+//            }
+//        }
 
         "akkara-test" -> {
             dependencies {
                 testImplementation(kotlin("test"))
                 testImplementation(project(":akkara-common"))
+                testImplementation(project(":akkara-format-api"))
+                testImplementation(project(":akkara-format-akk"))
                 testImplementation(project(":akkara-engine"))
                 testImplementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
                 testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.13.1")

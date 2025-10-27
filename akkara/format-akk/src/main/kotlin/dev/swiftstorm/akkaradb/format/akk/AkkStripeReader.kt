@@ -54,14 +54,17 @@ class AkkStripeReader(
         require(k >= 1) { "k must be >=1" }
         require(m >= 0) { "m must be >=0" }
         require(coder.parityCount == m) { "coder.parityCount(${coder.parityCount}) != m($m)" }
+        Files.createDirectories(laneDir)
     }
 
     override val blockSize: Int = BLOCK_SIZE
     override var nextStripeIndex: Long = 0; private set
 
-    private val dataCh: Array<FileChannel>
+    private val dataCh: Array<FileChannel> =
+        Array(k) { open(laneDir.resolve("$laneFilePrefixData${it}$laneFileExtData")) }
     private val parityCh: Array<FileChannel> =
         if (m > 0) Array(m) { open(laneDir.resolve("$laneFilePrefixParity${it}$laneFileExtParity")) } else emptyArray()
+
     private val closed = AtomicBoolean(false)
 
     // ---- metrics ----
@@ -72,11 +75,6 @@ class AkkStripeReader(
     private val verifyMicros = AtomicLong(0)
     private val reconstructMicros = AtomicLong(0)
 
-    init {
-        Files.createDirectories(laneDir)
-        dataCh = Array(k) { open(laneDir.resolve("$laneFilePrefixData${it}$laneFileExtData")) }
-    }
-
     private fun open(p: Path): FileChannel = FileChannel.open(p, READ)
 
     override fun readStripe(): StripeReader.Stripe? {
@@ -84,125 +82,161 @@ class AkkStripeReader(
         val stripe = nextStripeIndex
         val off = stripe * blockSize.toLong()
 
-        val dataBufs = ArrayList<ByteBufferL>(k)
-        val parityBufs = ArrayList<ByteBufferL>(m)
+        // 事前にサイズが分かっているので Array を使って割り当て回数を最小化
+        val dataBufs = arrayOfNulls<ByteBufferL>(k)
+        val parityBufs = arrayOfNulls<ByteBufferL>(m)
 
         fun releaseAll() {
-            dataBufs.forEach(pool::release)
-            parityBufs.forEach(pool::release)
+            for (i in 0 until k) dataBufs[i]?.let(pool::release)
+            for (j in 0 until m) parityBufs[j]?.let(pool::release)
         }
 
         try {
             val tRead0 = System.nanoTime()
-            var anyEofAtHead = false
 
             // ---- read data lanes (positional) ----
+            var anyEofAtHead = false
             val missingData = BooleanArray(k)
-            for (lane in 0 until k) {
+
+            var lane = 0
+            while (lane < k) {
                 val buf = pool.get(blockSize).clear()
-                dataCh[lane].position(off)
-                val n = try {
-                    buf.readFully(dataCh[lane], blockSize)
-                } catch (eof: EOFException) {
-                    // EOF at head of stripe
+                val n = positionalReadFully(dataCh[lane], buf, off)
+                if (n < 0) { // EOF at head of lane
                     anyEofAtHead = true
                     pool.release(buf)
                     break
                 }
 
-                val full = (n == blockSize)
                 var corrupt = false
-                if (full) {
+                if (n == blockSize) {
                     val stored = buf.at(blockSize - 4).i32
                     val calc = buf.crc32cRange(0, blockSize - 4)
                     corrupt = (calc != stored)
                 }
 
-                if (!full || corrupt) missingData[lane] = true
-                dataBufs += buf
+                if (n != blockSize || corrupt) missingData[lane] = true
+                dataBufs[lane] = buf
                 bytesReadData.addAndGet(maxOf(0, n).toLong())
+                lane++
             }
+
             if (anyEofAtHead) {
                 releaseAll()
                 return null
             }
 
             // ---- read parity lanes (positional) ----
+            // 将来: 「データが全てOKならパリティを読まない」最適化を入れる余地あり（API互換のため今回は従来通り読む）
             val missingParity = BooleanArray(m)
-            for (pm in 0 until m) {
+            var pm = 0
+            while (pm < m) {
                 val buf = pool.get(blockSize).clear()
-                parityCh[pm].position(off)
-                var n = 0
-                try {
-                    n = buf.readFully(parityCh[pm], blockSize)
-                } catch (eof: EOFException) {
-                    n = -1
-                }
+                val n = positionalReadFully(parityCh[pm], buf, off)
                 if (n != blockSize) missingParity[pm] = true
-                parityBufs += buf
+                parityBufs[pm] = buf
                 bytesReadParity.addAndGet(maxOf(0, n).toLong())
+                pm++
             }
 
             val tRead1 = System.nanoTime()
             readMicros.addAndGet((tRead1 - tRead0) / 1_000)
 
             // ---- fast path: nothing missing ----
-            val anyMissing = missingData.any { it } || missingParity.any { it }
+            var anyMissing = false
+            run {
+                var i = 0
+                while (i < k) {
+                    if (missingData[i]) {
+                        anyMissing = true; break
+                    }; i++
+                }
+                if (!anyMissing) {
+                    var j = 0
+                    while (j < m) {
+                        if (missingParity[j]) {
+                            anyMissing = true; break
+                        }; j++
+                    }
+                }
+            }
             if (!anyMissing) {
                 stripesReturned.incrementAndGet()
                 nextStripeIndex = stripe + 1
-                val payloads = dataBufs.toList()
-                val laneBlocks = ArrayList<ByteBufferL>(k + m).apply {
-                    addAll(dataBufs); addAll(parityBufs)
+                // toList() 相当（N固定の軽い変換）
+                val payloads = listOf(*dataBufs.requireNoNulls())
+                val lanes = ArrayList<ByteBufferL>(k + m).apply {
+                    addAll(payloads)
+                    if (m > 0) addAll(listOf(*parityBufs.requireNoNulls()))
                 }
-                return StripeReader.Stripe(payloads, laneBlocks, pool)
+                return StripeReader.Stripe(payloads, lanes, pool)
             }
 
             // ---- collect erasures ----
-            val lostDataCount = missingData.count { it }
-            val lostParityCount = missingParity.count { it }
-            val lostDataIdx = IntArray(lostDataCount)
-            val lostParityIdx = IntArray(lostParityCount)
-            run {
-                var d = 0
-                for (i in 0 until k) if (missingData[i]) lostDataIdx[d++] = i
-                var p = 0
-                for (j in 0 until m) if (missingParity[j]) lostParityIdx[p++] = j
+            var lostDataCount = 0
+            var lostParityCount = 0
+            var i = 0
+            while (i < k) {
+                if (missingData[i]) lostDataCount++; i++
+            }
+            var j = 0
+            while (j < m) {
+                if (missingParity[j]) lostParityCount++; j++
             }
 
-            // too many erasures
             if (lostDataCount + lostParityCount > m) {
                 releaseAll()
                 throw IOException("unrecoverable stripe=$stripe (erasures=${lostDataCount + lostParityCount}, m=$m)")
             }
 
-            // ---- reconstruct & verify (if needed) ----
+            val lostDataIdx = IntArray(lostDataCount)
+            val lostParityIdx = IntArray(lostParityCount)
+            var di = 0; i = 0
+            while (i < k) {
+                if (missingData[i]) lostDataIdx[di++] = i; i++
+            }
+            var pj = 0; j = 0
+            while (j < m) {
+                if (missingParity[j]) lostParityIdx[pj++] = j; j++
+            }
+
+            // ---- reconstruct & verify ----
             if (lostDataCount > 0 || lostParityCount > 0) {
                 val tR0 = System.nanoTime()
 
-                val presentData: Array<ByteBufferL?> =
-                    Array(k) { i -> if (missingData[i]) null else dataBufs[i] }
-                val presentParity: Array<ByteBufferL?> =
-                    Array(m) { j -> if (missingParity[j]) null else parityBufs[j] }
+                val presentData = arrayOfNulls<ByteBufferL>(k)
+                val presentParity = arrayOfNulls<ByteBufferL>(m)
+                i = 0; while (i < k) {
+                    presentData[i] = if (missingData[i]) null else dataBufs[i]; i++
+                }
+                j = 0; while (j < m) {
+                    presentParity[j] = if (missingParity[j]) null else parityBufs[j]; j++
+                }
 
-                val outData: Array<ByteBufferL> = Array(lostDataCount) { pool.get(blockSize) }
-                val outParity: Array<ByteBufferL> = Array(lostParityCount) { pool.get(blockSize) }
+                val outData = Array(lostDataCount) { pool.get(blockSize) }
+                val outParity = Array(lostParityCount) { pool.get(blockSize) }
 
                 val repaired = coder.reconstruct(
                     lostDataIdx, lostParityIdx,
-                    presentData, presentParity,
+                    presentData,
+                    presentParity,
                     outData, outParity
                 )
 
-                for (t in outData.indices) {
-                    val di = lostDataIdx[t]
-                    pool.release(dataBufs[di])
-                    dataBufs[di] = outData[t]
+                // swap-in
+                i = 0
+                while (i < outData.size) {
+                    val idx = lostDataIdx[i]
+                    pool.release(dataBufs[idx]!!)
+                    dataBufs[idx] = outData[i]
+                    i++
                 }
-                for (t in outParity.indices) {
-                    val pj = lostParityIdx[t]
-                    pool.release(parityBufs[pj])
-                    parityBufs[pj] = outParity[t]
+                j = 0
+                while (j < outParity.size) {
+                    val idx = lostParityIdx[j]
+                    pool.release(parityBufs[idx]!!)
+                    parityBufs[idx] = outParity[j]
+                    j++
                 }
 
                 val tR1 = System.nanoTime()
@@ -210,7 +244,10 @@ class AkkStripeReader(
 
                 if (m > 0) {
                     val tV0 = System.nanoTime()
-                    val ok = coder.verify(dataBufs.toTypedArray(), parityBufs.toTypedArray())
+                    val ok = coder.verify(
+                        dataBufs.requireNoNulls(),
+                        parityBufs.requireNoNulls()
+                    )
                     val tV1 = System.nanoTime()
                     verifyMicros.addAndGet((tV1 - tV0) / 1_000)
                     if (!ok) {
@@ -222,11 +259,12 @@ class AkkStripeReader(
 
             stripesReturned.incrementAndGet()
             nextStripeIndex = stripe + 1
-            val payloads = dataBufs.toList()
-            val laneBlocks = ArrayList<ByteBufferL>(k + m).apply {
-                addAll(dataBufs); addAll(parityBufs)
+            val payloads = listOf(*dataBufs.requireNoNulls())
+            val lanes = ArrayList<ByteBufferL>(k + m).apply {
+                addAll(payloads)
+                if (m > 0) addAll(listOf(*parityBufs.requireNoNulls()))
             }
-            return StripeReader.Stripe(payloads, laneBlocks, pool)
+            return StripeReader.Stripe(payloads, lanes, pool)
 
         } catch (eof: EOFException) {
             releaseAll(); return null
@@ -274,11 +312,29 @@ class AkkStripeReader(
                     swallow(t)
                 }
             }
-            if (first != null) throw first!!
+            if (first != null) throw first
         }
     }
 
     private fun ensureOpen() {
         check(!closed.get()) { "reader closed" }
+    }
+
+    /**
+     * Positional read that does not mutate channel position.
+     * Returns bytes read; -1 means EOF at head.
+     */
+    @Suppress("DEPRECATION")
+    private fun positionalReadFully(ch: FileChannel, block: ByteBufferL, off: Long): Int {
+        val dst = block.duplicate().position(0).byte
+        dst.limit(blockSize)
+        var read = 0
+        while (read < blockSize) {
+            val n = ch.read(dst, off + read)
+            if (n < 0) return if (read == 0) -1 else read
+            if (n == 0) continue
+            read += n
+        }
+        return read
     }
 }
