@@ -284,16 +284,17 @@ class ByteBufferL private constructor(
         set(v) = relPutLong(v)
 
     var u32: U32
-        get() = U32.of(relGetInt().toLong() and 0xFFFF_FFFFL)
-        set(v) = relPutInt(v.toIntExact())
+        get() = LE.cursor(buf).getU32()
+        set(v) {
+            LE.cursor(buf).putU32(v)
+        }   // do NOT use toIntExact()
 
     var u64: U64
-        get() = LE.getU64(buf, (buf.position()).also { buf.position(it + 8) })
+        get() = LE.cursor(buf).getU64()
         set(v) {
-            val p = buf.position()
-            LE.putU64(buf, p, v)
-            buf.position(p + 8)
+            LE.cursor(buf).putU64(v)
         }
+
 
     var f32: Float
         get() = relGetFloat()
@@ -411,30 +412,17 @@ class ByteBufferL private constructor(
             }
 
         var u32: U32
-            get() {
-                val p = buf.position()
-                val v = LE.getU32(buf, p)
-                buf.position(p + 4)
-                return v
-            }
+            get() = LE.getU32(buf, base)
             set(v) {
-                val p = buf.position()
-                LE.putU32(buf, p, v)
-                buf.position(p + 4)
+                LE.putU32(buf, base, v)
             }
 
         var u64: U64
-            get() {
-                val p = buf.position()
-                val v = LE.getU64(buf, p)
-                buf.position(p + 8)
-                return v
-            }
+            get() = LE.getU64(buf, base)
             set(v) {
-                val p = buf.position()
-                LE.putU64(buf, p, v)
-                buf.position(p + 8)
+                LE.putU64(buf, base, v)
             }
+
 
         var f32: Float
             get() = LE.getFloat(buf, base)
@@ -516,20 +504,8 @@ class ByteBufferL private constructor(
 
     // ---------------- Channels ----------------
     /** Write exactly [len] bytes from current position to [ch], advancing position. */
-    fun writeFully(ch: WritableByteChannel, buf: ByteBuffer, len: Int): Int {
-        require(len >= 0 && len <= buf.remaining()) { "len=$len, remaining=${buf.remaining()}" }
-        var left = len
-        val dup = buf.duplicate()
-        while (left > 0) {
-            dup.limit(dup.position() + left)
-            val n = ch.write(dup)
-            require(n >= 0) { "channel closed" }
-            if (n == 0) continue
-            buf.position(buf.position() + n)
-            left -= n
-        }
-        return len
-    }
+    fun writeFully(ch: WritableByteChannel, len: Int): Int =
+        LE.writeFully(ch, buf, len)
     /** Read exactly [len] bytes into this buffer from [ch], advancing position. */
     fun readFully(ch: ReadableByteChannel, len: Int): Int = LE.readFully(ch, buf, len)
 
@@ -561,4 +537,30 @@ class ByteBufferL private constructor(
         keyFP64: Long,
         miniKey: Long
     ): Int = putRecord32(key, value, U64.fromSigned(seq), flags, U64.fromSigned(keyFP64), U64.fromSigned(miniKey))
+
+    /**
+     * Read a 32-byte record header at absolute offset [recOff] and return
+     * LE-safe slices for key and value without copying.
+     *
+     * Returns pair: (header, Pair(keySlice, valueSlice))
+     *
+     * Preconditions:
+     * - [recOff] points to the start of a record header (32 bytes).
+     * - The entire record (header + key + value) fits within the buffer.
+     */
+    fun readRecord32(recOff: Int): Pair<AKHdr32.Header, Pair<ByteBufferL, ByteBufferL>> {
+        // Read header (absolute, does not mutate global position)
+        val h = readHeader32(recOff)
+
+        // Compute absolute offsets
+        val keyOff = recOff + AKHdr32.SIZE
+        val kLen = h.kLen
+        val vLenI = h.vLen.toIntExact() // constrained by current chunk size
+
+        // LE-safe zero-copy slices (with bounds checks inside sliceAt)
+        val keySlice = sliceAt(keyOff, kLen)
+        val valSlice = sliceAt(keyOff + kLen, vLenI)
+
+        return h to (keySlice to valSlice)
+    }
 }

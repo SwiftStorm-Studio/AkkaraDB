@@ -76,6 +76,7 @@ class BloomFilter private constructor(
         val headerBytes = HEADER_SIZE
         val bodyBytes = byteSize
         val buf = ByteBufferL.allocate(headerBytes + bodyBytes)
+
         // header (absolute writes)
         buf.at(OFF_MAGIC).i32 = MAGIC
         buf.at(OFF_VER).i8 = VER
@@ -83,14 +84,23 @@ class BloomFilter private constructor(
         buf.at(OFF_PAD).i16 = 0
         buf.at(OFF_MBITS).u32 = dev.swiftstorm.akkaradb.common.types.U32.of(mBits.toLong())
         buf.at(OFF_SEED).i64 = seed
-        buf.at(HEADER_SIZE).putLongs(words)
-        // flush
+
+        // body: write per 8 bytes to avoid 8B-alignment requirement of putLongs()
+        var p = HEADER_SIZE
+        var i = 0
+        while (i < words.size) {
+            buf.at(p).i64 = words[i]
+            p += 8
+            i++
+        }
+
         buf.position(0)
         buf.writeFully(ch, headerBytes + bodyBytes)
     }
 
     fun writeTo(dst: ByteBufferL) {
         val start = dst.position
+
         // header
         dst.at(start + OFF_MAGIC).i32 = MAGIC
         dst.at(start + OFF_VER).i8 = VER
@@ -98,7 +108,16 @@ class BloomFilter private constructor(
         dst.at(start + OFF_PAD).i16 = 0
         dst.at(start + OFF_MBITS).u32 = dev.swiftstorm.akkaradb.common.types.U32.of(mBits.toLong())
         dst.at(start + OFF_SEED).i64 = seed
-        dst.at(start + HEADER_SIZE).putLongs(words)
+
+        // body: same reason, write per 8 bytes
+        var p = start + HEADER_SIZE
+        var i = 0
+        while (i < words.size) {
+            dst.at(p).i64 = words[i]
+            p += 8
+            i++
+        }
+
         dst.position(start + HEADER_SIZE + byteSize)
     }
 

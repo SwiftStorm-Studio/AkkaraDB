@@ -22,6 +22,7 @@ package dev.swiftstorm.akkaradb.common.vh
 
 import dev.swiftstorm.akkaradb.common.types.U32
 import dev.swiftstorm.akkaradb.common.types.U64
+import java.io.EOFException
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.VarHandle
 import java.nio.ByteBuffer
@@ -321,10 +322,12 @@ object LE {
     fun writeFully(ch: WritableByteChannel, buf: ByteBuffer, len: Int): Int {
         require(len >= 0 && len <= buf.remaining()) { "len=$len, remaining=${buf.remaining()}" }
         var left = len
+        val dup = buf.duplicate()        // single view reused
         while (left > 0) {
-            val v = buf.duplicate().limit(buf.position() + left)
-            val n = ch.write(v)
+            dup.limit(dup.position() + left)
+            val n = ch.write(dup)
             require(n >= 0) { "channel closed" }
+            if (n == 0) continue
             buf.position(buf.position() + n)
             left -= n
         }
@@ -336,15 +339,18 @@ object LE {
     fun readFully(ch: ReadableByteChannel, buf: ByteBuffer, len: Int): Int {
         require(len >= 0 && len <= buf.remaining()) { "len=$len, remaining=${buf.remaining()}" }
         var left = len
+        val dup = buf.duplicate()        // single view reused
         while (left > 0) {
-            val v = buf.duplicate().limit(buf.position() + left)
-            val n = ch.read(v)
-            if (n < 0) throw java.io.EOFException()
+            dup.limit(dup.position() + left)
+            val n = ch.read(dup)
+            if (n < 0) throw EOFException()
+            if (n == 0) continue
             buf.position(buf.position() + n)
             left -= n
         }
         return len
     }
+
 
     // ---------------- Zero fill / align ----------------
     private val ZERO = ByteArray(1024)
@@ -374,8 +380,9 @@ object LE {
     // ---------------- Internal ----------------
     @PublishedApi
     internal inline fun rangeCheck(buf: ByteBuffer, at: Int, len: Int) {
-        require(at >= 0 && len >= 0 && at + len <= buf.capacity()) {
-            "range OOB: at=$at len=$len cap=${buf.capacity()}"
+        val cap = buf.capacity()
+        require(at >= 0 && len >= 0 && at <= cap - len) {
+            "range OOB: at=$at len=$len cap=$cap"
         }
     }
 }
