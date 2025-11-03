@@ -161,7 +161,7 @@ class SSTableWriter(
                 // update CRC from backing ByteBuffer
                 val bb = scratch.sliceAt(0, toRead)
                 bb.position(0).limit(toRead)
-                crc.update(bb.byte)
+                crc.update(bb.rawDuplicate())
                 total += toRead
             }
 

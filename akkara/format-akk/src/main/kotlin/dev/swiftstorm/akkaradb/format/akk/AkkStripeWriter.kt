@@ -224,7 +224,7 @@ class AkkStripeWriter(
     @Suppress("DEPRECATION")
     private fun positionalWriteFully(ch: FileChannel, block: ByteBufferL, off: Long) {
         // Reuse a single view; do not mutate channel position.
-        val src = block.duplicate().position(0).byte
+        val src = block.duplicate().position(0).rawDuplicate()
         src.limit(blockSize)
         var written = 0
         while (written < blockSize) {

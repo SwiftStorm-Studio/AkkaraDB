@@ -110,8 +110,7 @@ class ByteBufferL private constructor(
 
     /** Intentionally unsafe: exposes raw ByteBuffer (LE invariants are not enforced). */
     @Deprecated("Exposes raw ByteBuffer; unsafe w.r.t. LE semantics. Use LE-safe methods instead.", ReplaceWith("this"))
-    val byte: ByteBuffer
-        get() = buf
+    fun rawDuplicate(): ByteBuffer = buf.duplicate()
 
     // ---------------- LE-safe views (public) ----------------
     /**
@@ -150,7 +149,6 @@ class ByteBufferL private constructor(
 
     // ---------------- Intentional raw exposure (internal) ----------------
     internal fun rawBuffer(): ByteBuffer = buf
-    internal fun rawDuplicate(): ByteBuffer = buf.duplicate()
     internal fun rawSlice(): ByteBuffer = buf.slice()
     internal fun rawSliceAt(at: Int, len: Int): ByteBuffer {
         val d = buf.duplicate()

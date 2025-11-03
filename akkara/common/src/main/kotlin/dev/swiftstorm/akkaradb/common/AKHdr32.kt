@@ -133,7 +133,7 @@ object AKHdr32 {
     @JvmStatic
     fun buildMiniKeyLE(key: ByteBufferL): U64 {
         val dup = key.duplicate()
-        val bb = dup.byte
+        val bb = dup.rawDuplicate()
         var x = 0L
         var i = 0
         while (i < 8 && bb.hasRemaining()) {
@@ -167,7 +167,7 @@ object AKHdr32 {
         var v3 = 0x7465646279746573L xor k1
 
         val dup = key.duplicate()
-        val bb = dup.byte
+        val bb = dup.rawDuplicate()
         val n = bb.remaining()
 
         while (bb.remaining() >= 8) {

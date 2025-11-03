@@ -115,7 +115,7 @@ object AKSSFooter {
 
                 val bb = scratch.sliceAt(0, toRead) // internal ByteBuffer; no public exposure
                 bb.position(0).limit(toRead)
-                crc.update(bb.byte)
+                crc.update(bb.rawDuplicate())
 
                 readTotal += toRead
             }
