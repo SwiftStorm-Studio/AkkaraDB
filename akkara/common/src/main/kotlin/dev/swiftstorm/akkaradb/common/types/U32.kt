@@ -36,7 +36,6 @@ value class U32(val raw: Int) : Comparable<U32> {
         @JvmStatic
         fun fromSigned(raw: Int): U32 = U32(raw)
 
-        // Constants: static getters（@JvmFieldは使わない）
         private val ZERO_CONST = U32(0)
         private val MAX_CONST = U32(-1) // 0xFFFF_FFFF
 

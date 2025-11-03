@@ -113,7 +113,6 @@ object AKSSFooter {
                 // fill scratch completely
                 scratch.readFully(ch, toRead)
 
-                // backing ByteBuffer からCRC更新
                 val bb = scratch.sliceAt(0, toRead) // internal ByteBuffer; no public exposure
                 bb.position(0).limit(toRead)
                 crc.update(bb.byte)

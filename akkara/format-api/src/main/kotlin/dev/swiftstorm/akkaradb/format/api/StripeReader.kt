@@ -88,14 +88,11 @@ interface StripeReader : Closeable {
     /**
      * Scans lane tails, validates CRC/length as available, and positions the reader
      * at the first **readable** stripe index after recovery.
-     *
-     * Returns the same structure as Writer の [StripeWriter.recover] と対応づけるため、
-     * [ReaderRecoveryResult] を返す（フィールドは Writer 側の [RecoveryResult] に合わせている）。
      */
     fun recover(): ReaderRecoveryResult = ReaderRecoveryResult(0, 0, false)
 
     /**
-     * Snapshot of internal performance counters (対になる Writer の metrics と同様にワンショット)。
+     * Snapshot of internal performance counters
      */
     fun metrics(): ReaderMetricsSnapshot = ReaderMetricsSnapshot()
 }
@@ -103,8 +100,7 @@ interface StripeReader : Closeable {
 /**
  * Recovery outcome for the reader.
  * - [lastSealed]   : last stripe that is fully formed and readable.
- * - [lastDurable]  : last stripe that is provably durable (manifest/superblock等を持つ場合)。
- *                    不明な場合は [lastSealed] と同じ値を返してよい。
+ * - [lastDurable]  : last stripe that is provably durable
  * - [truncatedTail]: true if incomplete/garbled tail blocks were discarded.
  */
 data class ReaderRecoveryResult(
@@ -115,7 +111,6 @@ data class ReaderRecoveryResult(
 
 /**
  * One-shot metrics snapshot for the reader.
- * Counter semantics mirror Writer の [StripeMetricsSnapshot] に対応。
  */
 data class ReaderMetricsSnapshot(
     val stripesReturned: Long = 0,

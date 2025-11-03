@@ -153,7 +153,7 @@ class BloomFilter private constructor(
             val ver = buf.at(OFF_VER).i8
             require(ver == VER) { "unsupported Bloom version: $ver" }
             val k = buf.at(OFF_K).i8
-            require(k in 1..16) { "invalid k: $k" } // 小さく守る
+            require(k in 1..16) { "invalid k: $k" }
             val mBits = buf.at(OFF_MBITS).u32.toIntExact()
             val seed = buf.at(OFF_SEED).i64
             require(isPow2(mBits)) { "mBits must be power-of-two" }

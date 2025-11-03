@@ -36,7 +36,6 @@ fun BlockPacker.tryAppendMem(mem: MemRecord): Boolean {
     val flagsU8: Int = mem.flags.toInt() and 0xFF
     val seqU64 = U64.fromSigned(mem.seq)
 
-    // ★ ここが変更点：ByteBufferL 版のヘルパーでゼロコピー
     val keyFp64 = AKHdr32.sipHash24(mem.key, AKHdr32.DEFAULT_SIPHASH_SEED)
     val miniKey = AKHdr32.buildMiniKeyLE(mem.key)
 

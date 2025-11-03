@@ -29,6 +29,7 @@ import dev.swiftstorm.akkaradb.engine.util.IndexBlock
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockPacker
 import java.io.Closeable
 import java.nio.channels.SeekableByteChannel
+import java.util.zip.CRC32C
 
 /**
  * SSTableWriter (v3)
@@ -147,7 +148,7 @@ class SSTableWriter(
         val oldPos = ch.position()
         try {
             val scratch = ByteBufferL.allocate(1 shl 20) // 1 MiB
-            val crc = java.util.zip.CRC32C()
+            val crc = CRC32C()
 
             ch.position(0L)
             var total = 0L
@@ -173,7 +174,6 @@ class SSTableWriter(
         } finally {
             ch.position(oldPos)
         }
-        // === 変更ここまで ===
 
         return SealResult(indexOff, bloomOff, totalEntries)
     }

@@ -47,11 +47,6 @@ import kotlin.math.min
  *    k1 = (DEFAULT_SIPHASH_SEED xor 0x9E3779B97F4A7C15). Use as a 64-bit fingerprint
  *    for indexing, Bloom seeding, and fast pre-checks. Collisions are possible and
  *    must be resolved by full key compare on the reader side.
- *
- * Notes:
- *  - vLen は U32、seq/keyFP64/miniKey は U64 で表現。
- *  - Reader/Writer must use the same SipHash parameters and LE packing to avoid
- *    false negatives during lookups.
  */
 object AKHdr32 {
 
