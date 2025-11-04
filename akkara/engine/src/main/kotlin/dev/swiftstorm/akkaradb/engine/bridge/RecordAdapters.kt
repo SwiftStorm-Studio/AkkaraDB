@@ -24,7 +24,6 @@ import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.MemRecord
 import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.format.api.BlockPacker
-import kotlin.math.min
 
 /**
  * Append a MemRecord via the *format* API by adapting JVM-native types (Long/Byte)
@@ -44,37 +43,4 @@ fun BlockPacker.tryAppendMem(mem: MemRecord): Boolean {
     else mem.value.duplicate()
 
     return this.tryAppend(key, value, seqU64, flagsU8, keyFp64, miniKey)
-}
-
-/** Read-only zero-length buffer for tombstones (LE-safe wrapper). */
-private val EMPTY_L: ByteBufferL = ByteBufferL.allocate(0, direct = false)
-
-/**
- * 64-bit FNV-1a over ByteBufferL (fast, non-cryptographic).
- * Suitable as a lightweight key fingerprint for AKHdr32.keyFP64.
- */
-private fun fnv1a64(buf: ByteBufferL): Long {
-    var h = 0xcbf29ce484222325UL // FNV offset basis (64-bit)
-    val bb = buf.duplicate()
-    while (bb.has()) {
-        val b = bb.i8.toUByte()
-        h = (h xor b.toULong()) * 0x00000100000001B3UL // FNV prime 64
-    }
-    return h.toLong()
-}
-
-/**
- * Mini-key: first ≤8 bytes of key as little-endian unsigned 64.
- * Short keys are zero-padded toward the high bytes.
- */
-private fun miniKeyLE8(buf: ByteBufferL): Long {
-    val bb = buf.duplicate()
-    val n = min(8, bb.remaining)
-    var acc = 0UL
-    var i = 0
-    while (i < n) {
-        acc = acc or ((bb.i8.toUByte().toULong()) shl (8 * i))
-        i++
-    }
-    return acc.toLong()
 }

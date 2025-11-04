@@ -140,4 +140,12 @@ class WalWriter(
         }
         runCatching { ch.force(false) }
     }
+
+    /** Truncate WAL file to zero length. Intended to be called after a durable checkpoint. */
+    fun truncate() {
+        synchronized(ch) {
+            ch.truncate(0)
+            ch.force(true)
+        }
+    }
 }

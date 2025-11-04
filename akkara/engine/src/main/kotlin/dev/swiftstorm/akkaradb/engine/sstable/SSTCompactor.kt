@@ -37,7 +37,8 @@ import kotlin.io.path.notExists
 class SSTCompactor(
     private val baseDir: Path,
     private val maxPerLevel: Int = 4,
-    private val seqClock: ((seq: Long) -> Long?)? = null
+    private val seqClock: ((seq: Long) -> Long?)? = null,
+    private val manifest: dev.swiftstorm.akkaradb.engine.manifest.AkkManifest? = null,
 ) {
 
     init {
@@ -101,9 +102,16 @@ class SSTCompactor(
 
         val isBottom = existingLevels().none { it > nextLevel }
 
-        compactInto(allInputs, output, isBottom)
+        val relInputs = allInputs.map { baseDir.relativize(it).toString() }
+        manifest?.compactionStart(level, relInputs)
 
+        val (entries, firstHex, lastHex) = compactInto(allInputs, output, isBottom)
+
+        // Delete inputs after successful write
         (currentLevelFiles + nextLevelFiles).forEach { Files.deleteIfExists(it) }
+
+        val relOut = baseDir.relativize(output).toString()
+        manifest?.compactionEnd(nextLevel, relOut, relInputs, entries, firstHex, lastHex)
     }
 
     private fun newFileName(level: Int): String {
@@ -112,7 +120,7 @@ class SSTCompactor(
         return "L${level}_${ts}_$suffix.sst"
     }
 
-    private fun compactInto(inputs: List<Path>, output: Path, isBottomLevel: Boolean) {
+    private fun compactInto(inputs: List<Path>, output: Path, isBottomLevel: Boolean): Triple<Long, String?, String?> {
         val iterators = inputs.map { SSTIterator(it) }
         try {
             val expected = iterators.sumOf { it.totalEntries }
@@ -125,8 +133,18 @@ class SSTCompactor(
                         ttlMillis = 24L * 60 * 60 * 1000,
                         seqClock = seqClock
                     )
-                    writer.writeAll(merged)
-                    writer.seal()
+                    var firstHex: String? = null
+                    var lastHex: String? = null
+                    val wrapped = sequence {
+                        for (r in merged) {
+                            if (firstHex == null) firstHex = firstKeyHex(r.key)
+                            lastHex = firstKeyHex(r.key)
+                            yield(r)
+                        }
+                    }
+                    writer.writeAll(wrapped)
+                    val seal = writer.seal()
+                    return Triple(seal.entries, firstHex, lastHex)
                 }
             }
         } finally {
@@ -136,6 +154,15 @@ class SSTCompactor(
 
     private fun merge(iterators: List<SSTIterator>): Sequence<MemRecord> =
         merge(iterators, System.currentTimeMillis(), false, 24L * 60 * 60 * 1000, seqClock)
+
+    private fun firstKeyHex(k: ByteBufferL): String = buildString {
+        val d = k.duplicate().position(0)
+        var i = 0
+        while (d.remaining > 0 && i < 16) {
+            append(String.format("%02x", d.i8))
+            i++
+        }
+    }
 
     private fun merge(
         iterators: List<SSTIterator>,

@@ -361,6 +361,7 @@ class ByteBufferL private constructor(
         return this
     }
 
+
     /** Relative bulk write of Ints (aligned). */
     fun putInts(src: IntArray, off: Int = 0, len: Int = src.size - off): ByteBufferL {
         require(off in 0..src.size && len >= 0 && off + len <= src.size) {
@@ -561,4 +562,14 @@ class ByteBufferL private constructor(
 
         return h to (keySlice to valSlice)
     }
+}
+
+fun ByteBufferL.putAscii(s: String): ByteBufferL {
+    // We rely on the caller's isAsciiNoSep(), but still guard for robustness.
+    for (ch in s) {
+        val code = ch.code
+        require(code <= 0x7F) { "Non-ASCII char: U+%04X".format(code) }
+        this.i8 = code
+    }
+    return this
 }

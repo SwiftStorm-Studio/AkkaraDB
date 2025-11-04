@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.*
@@ -43,8 +62,8 @@ class AkkaraDB private constructor(
     private val manifest: AkkManifest,
     private val stripe: AkkStripeWriter,
     private val readers: ConcurrentLinkedDeque<SSTableReader>,
+    private val durableCas: Boolean,
 ) : Closeable {
-
 
     // ---------------- API ----------------
 
@@ -97,8 +116,33 @@ class AkkaraDB private constructor(
 
     /** CAS by expected sequence: if matches current MemTable, set new value (or delete if null). */
     fun compareAndSwap(key: ByteBufferL, expectedSeq: Long, newValue: ByteBufferL?): Boolean {
-        // Minimal engine: CAS is in-memory only (non-durable). Returns true on success.
-        return mem.compareAndSwap(key.duplicate(), expectedSeq, newValue?.duplicate())
+        val ok = mem.compareAndSwap(key.duplicate(), expectedSeq, newValue?.duplicate())
+        if (ok && durableCas) {
+            // Log as an idempotent WAL op with the same seq so recovery converges.
+            val keyBytes = key.duplicate().position(0).readAllBytes()
+            if (newValue == null) {
+                val op = WalOp.Delete(
+                    key = keyBytes,
+                    seq = U64.fromSigned(expectedSeq),
+                    tombstoneFlag = 0x01,
+                    keyFP64 = AKHdr32.sipHash24(key, AKHdr32.DEFAULT_SIPHASH_SEED),
+                    miniKey = AKHdr32.buildMiniKeyLE(key)
+                )
+                wal.append(op)
+            } else {
+                val valBytes = newValue.duplicate().position(0).readAllBytes()
+                val op = WalOp.Add(
+                    key = keyBytes,
+                    value = valBytes,
+                    seq = U64.fromSigned(expectedSeq),
+                    flags = 0,
+                    keyFP64 = AKHdr32.sipHash24(key, AKHdr32.DEFAULT_SIPHASH_SEED),
+                    miniKey = AKHdr32.buildMiniKeyLE(key)
+                )
+                wal.append(op)
+            }
+        }
+        return ok
     }
 
     /** Iterate in-memory snapshot across shards. For full DB iteration, merge SSTs as needed (not provided). */
@@ -107,7 +151,8 @@ class AkkaraDB private constructor(
     /** Best-effort flush: hint MemTable, seal any complete stripes, and checkpoint manifest. */
     fun flush() {
         mem.flushHint()
-        stripe.flush(FlushMode.SYNC)
+        val sealed = stripe.sealIfComplete()
+        if (sealed) stripe.flush(FlushMode.SYNC)
         manifest.checkpoint(name = "flush", stripe = stripe.lastSealedStripe, lastSeq = mem.lastSeq())
     }
 
@@ -135,7 +180,8 @@ class AkkaraDB private constructor(
         val fastMode: Boolean = true,
         val walGroupN: Int = 32,
         val walGroupMicros: Long = 500,
-        val parityCoder: ParityCoder? = null
+        val parityCoder: ParityCoder? = null,
+        val durableCas: Boolean = false,
     )
 
     companion object {
@@ -172,7 +218,7 @@ class AkkaraDB private constructor(
             )
 
             // Prepare compactor and reader management
-            val compactor = SSTCompactor(sstDir)
+            val compactor = SSTCompactor(sstDir, manifest = manifest)
             fun rebuildReaders(into: ConcurrentLinkedDeque<SSTableReader>) {
                 // Close existing
                 into.forEach { runCatching { it.close() } }
@@ -194,12 +240,28 @@ class AkkaraDB private constructor(
                             .forEach { toOpen.add(it) }
                     }
                 }
-                toOpen.sortWith { a, b -> Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a)) }
+                // Sort by level (L0, L1, ...) then by mtime desc within level
+                toOpen.sortWith { a, b ->
+                    fun parseLevel(p: Path): Int {
+                        val parent = p.parent?.fileName?.toString() ?: return Int.MAX_VALUE
+                        return if (parent.startsWith("L")) parent.substring(1).toIntOrNull() ?: Int.MAX_VALUE else Int.MAX_VALUE
+                    }
+
+                    val la = parseLevel(a)
+                    val lb = parseLevel(b)
+                    if (la != lb) la - lb else Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a))
+                }
                 toOpen.forEach { p ->
                     val ch = FileChannel.open(p, StandardOpenOption.READ)
                     val r = SSTableReader.open(ch)
                     into.addLast(r)
                 }
+            }
+
+            fun levelOf(path: Path): Int {
+                // path .../sst/Lx/filename.sst
+                val parent = path.parent?.fileName?.toString() ?: return Int.MAX_VALUE
+                return if (parent.startsWith("L")) parent.substring(1).toIntOrNull() ?: Int.MAX_VALUE else Int.MAX_VALUE
             }
 
             // Prepare onFlush callback: write L0 SST and optionally pack into stripes
@@ -253,8 +315,10 @@ class AkkaraDB private constructor(
                         }
                         packer.flush()
                         packer.close()
-                        stripe.sealIfComplete()
-                        if (!stripe.isFastMode) stripe.flush(FlushMode.SYNC) else stripe.flush(FlushMode.ASYNC)
+                        val sealed = stripe.sealIfComplete()
+                        if (sealed) {
+                            if (!stripe.isFastMode) stripe.flush(FlushMode.SYNC) else stripe.flush(FlushMode.ASYNC)
+                        }
                     }.onFailure { /* stripes are optional; ignore in minimal engine */ }
 
                     val firstKey = sorted.first().key
@@ -287,7 +351,7 @@ class AkkaraDB private constructor(
             // Load existing SSTs from all levels (newest-first)
             rebuildReaders(readersDeque)
 
-            return AkkaraDB(base, wal, mem, manifest, stripe, readersDeque)
+            return AkkaraDB(base, wal, mem, manifest, stripe, readersDeque, durableCas = opts.durableCas)
         }
 
         private fun ByteBufferL.readAllBytes(): ByteArray {
