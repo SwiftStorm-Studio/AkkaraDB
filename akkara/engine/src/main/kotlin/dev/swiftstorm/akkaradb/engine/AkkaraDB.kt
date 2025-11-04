@@ -4,6 +4,7 @@ import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
+import dev.swiftstorm.akkaradb.engine.sstable.SSTCompactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
 import dev.swiftstorm.akkaradb.engine.wal.WalOp
@@ -117,7 +118,7 @@ class AkkaraDB private constructor(
             flush()
         } finally {
             runCatching { mem.close() }
-            runCatching { stripe?.close() }
+            runCatching { stripe.close() }
             runCatching { readers.forEach { it.close() } }
             runCatching { manifest.close() }
             runCatching { wal.close() }
@@ -145,9 +146,13 @@ class AkkaraDB private constructor(
             val laneDir = base.resolve("lanes")
             Files.createDirectories(sstDir)
             Files.createDirectories(laneDir)
+            // Ensure L0 directory for compaction pipeline exists
+            val l0Dir = sstDir.resolve("L0")
+            Files.createDirectories(l0Dir)
 
             val manifest = AkkManifest(base.resolve("manifest.akmf"), fastMode = true)
             manifest.load()
+            manifest.start()
 
             val pool = Pools.io()
 
@@ -166,6 +171,37 @@ class AkkaraDB private constructor(
                 fastMode = opts.fastMode
             )
 
+            // Prepare compactor and reader management
+            val compactor = SSTCompactor(sstDir)
+            fun rebuildReaders(into: ConcurrentLinkedDeque<SSTableReader>) {
+                // Close existing
+                into.forEach { runCatching { it.close() } }
+                into.clear()
+                val toOpen = ArrayList<Path>()
+                if (Files.isDirectory(sstDir)) {
+                    Files.list(sstDir).use { lvlStream ->
+                        lvlStream.filter { Files.isDirectory(it) && it.fileName.toString().startsWith("L") }
+                            .forEach { lvlDir ->
+                                Files.list(lvlDir).use { fs ->
+                                    fs.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".sst") }
+                                        .forEach { toOpen.add(it) }
+                                }
+                            }
+                    }
+                    // backward-compat: flat .aksst files
+                    Files.list(sstDir).use { rootStream ->
+                        rootStream.filter { Files.isRegularFile(it) && it.fileName.toString().endsWith(".aksst") }
+                            .forEach { toOpen.add(it) }
+                    }
+                }
+                toOpen.sortWith { a, b -> Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a)) }
+                toOpen.forEach { p ->
+                    val ch = FileChannel.open(p, StandardOpenOption.READ)
+                    val r = SSTableReader.open(ch)
+                    into.addLast(r)
+                }
+            }
+
             // Prepare onFlush callback: write L0 SST and optionally pack into stripes
             val readersDeque = ConcurrentLinkedDeque<SSTableReader>()
             val onFlushCb: (List<MemRecord>) -> Unit = { batch ->
@@ -177,7 +213,7 @@ class AkkaraDB private constructor(
                     java.util.Collections.sort(sorted, java.util.Comparator { a, b -> lexCompare(a.key, b.key) })
 
                     // Write SST (L0)
-                    val file = sstDir.resolve("L0_" + System.nanoTime().toString() + ".aksst")
+                    val file = l0Dir.resolve("L0_" + System.nanoTime().toString() + ".sst")
                     FileChannel.open(
                         file,
                         StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING
@@ -187,10 +223,6 @@ class AkkaraDB private constructor(
                             w.seal()
                         }
                     }
-                    // Newest-first readers order
-                    val chRo = FileChannel.open(file, StandardOpenOption.READ)
-                    val r = SSTableReader.open(chRo)
-                    readersDeque.addFirst(r)
 
                     // Pack to stripes (optional; only if at least k records to form blocks)
                     runCatching {
@@ -229,11 +261,16 @@ class AkkaraDB private constructor(
                     val lastKey = sorted.last().key
                     manifest.sstSeal(
                         level = 0,
-                        file = file.fileName.toString(),
+                        file = "L0/" + file.fileName.toString(),
                         entries = sorted.size.toLong(),
                         firstKeyHex = firstKeyHex(firstKey),
                         lastKeyHex = firstKeyHex(lastKey)
                     )
+
+                    // Run compaction and rebuild readers to reflect new levels
+                    runCatching { compactor.compact() }
+                    rebuildReaders(readersDeque)
+
                     manifest.checkpoint(name = "memFlush", stripe = stripe.lastSealedStripe, lastSeq = sorted.last().seq)
                 }
             }
@@ -247,19 +284,8 @@ class AkkaraDB private constructor(
             // Recovery: WAL → MemTable
             WalReplay.replay(walPath, mem)
 
-            // Load existing SSTs (newest-first by mtime)
-            if (Files.exists(sstDir)) {
-                Files.list(sstDir).use { stream ->
-                    stream.filter { it.fileName.toString().endsWith(".aksst") }
-                        .sorted { a, b -> Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a)) }
-                        .forEach { p ->
-                            FileChannel.open(p, StandardOpenOption.READ).use { ch ->
-                                val r = SSTableReader.open(ch)
-                                readersDeque.addLast(r)
-                            }
-                        }
-                }
-            }
+            // Load existing SSTs from all levels (newest-first)
+            rebuildReaders(readersDeque)
 
             return AkkaraDB(base, wal, mem, manifest, stripe, readersDeque)
         }

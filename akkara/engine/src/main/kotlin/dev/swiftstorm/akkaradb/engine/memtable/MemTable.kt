@@ -9,6 +9,7 @@ import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -106,28 +107,32 @@ class MemTable(
     /** Range iterator (merged across shards on demand). */
     fun iterator(range: KeyRange = KeyRange.ALL): Sequence<MemRecord> = sequence {
         val perShard = shards.map { it.snapshotRange(range) }
-        // K-way merge by seq preference? For MemTable we only need lexicographic key order;
-        // within the same key only the newest survives. We'll compress on merge.
-        val heap = PriorityQueue<Peekable>(compareBy { it.peek()?.key?.getI32At(0) })
+        val heap = PriorityQueue<Peekable>()
         perShard.filter { it.hasNext() }.forEach { heap.add(Peekable(it)) }
+
         var lastKey: ByteBufferL? = null
-        var lastSeq = Long.MIN_VALUE
+        var bestForKey: MemRecord? = null
+
+        suspend fun SequenceScope<MemRecord>.emitBestIfAny() {
+            bestForKey?.let { yield(it) }
+            bestForKey = null
+        }
+
         while (heap.isNotEmpty()) {
             val p = heap.poll()
             val rec = p.next()
-            // collapse duplicates with same key keeping highest seq
+
             if (lastKey == null || lexCompare(rec.key, lastKey) != 0) {
-                // new key boundary
-                yield(rec)
+                this.emitBestIfAny()
                 lastKey = rec.key
-                lastSeq = rec.seq
-            } else if (rec.seq > lastSeq) {
-                // replace with newer
-                yield(rec)
-                lastSeq = rec.seq
+                bestForKey = rec
+            } else if (rec.seq > (bestForKey?.seq ?: Long.MIN_VALUE)) {
+                bestForKey = rec
             }
+
             if (p.hasNext()) heap.add(p)
         }
+        this.emitBestIfAny()
     }
 
     // ─────────── internals ───────────
@@ -154,7 +159,7 @@ class MemTable(
         private val lock = ReentrantReadWriteLock()
 
         // Access-ordered LRU-ish map to enable optional eviction hooks (not used by default)
-        private var map: LinkedHashMap<Key, MemRecord> = newMap()
+        private var map: TreeMap<Key, MemRecord> = TreeMap()
 
         private var bytes: Long = 0L
         private var flushPending = AtomicBoolean(false)
@@ -206,23 +211,17 @@ class MemTable(
         }
 
         fun snapshotRange(range: KeyRange): Iterator<MemRecord> = lock.read {
-            val it = map.values.iterator()
-            object : Iterator<MemRecord> {
-                var next: MemRecord? = seek()
-                override fun hasNext(): Boolean = next != null
-                override fun next(): MemRecord {
-                    val r = next ?: throw NoSuchElementException()
-                    next = seek(); return r
-                }
+            val fromKey = range.start?.let { Key(it, fnv1a32(it)) }
+            val toKey = range.endExclusive?.let { Key(it, fnv1a32(it)) }
 
-                private fun seek(): MemRecord? {
-                    while (it.hasNext()) {
-                        val r = it.next()
-                        if (range.contains(r.key)) return r
-                    }
-                    return null
-                }
+            val view: NavigableMap<Key, MemRecord> = when {
+                fromKey != null && toKey != null -> map.subMap(fromKey, true, toKey, false)
+                fromKey != null -> map.tailMap(fromKey, true)
+                toKey != null -> map.headMap(toKey, false)
+                else -> map
             }
+
+            ArrayList(view.values).iterator()
         }
 
         fun maybeSealAndEnqueue() {
@@ -235,50 +234,52 @@ class MemTable(
             if (has && flushPending.compareAndSet(false, true)) sealAndEnqueue()
         }
 
-        private fun newMap(): LinkedHashMap<Key, MemRecord> = object : LinkedHashMap<Key, MemRecord>(256, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, MemRecord>?): Boolean = false
-        }
+        private fun newMap(): TreeMap<Key, MemRecord> = TreeMap()
 
         private fun sizeOf(r: MemRecord): Long = r.approxSizeBytes.toLong()
 
         private fun triggerIfNeeded(): Boolean {
             if (bytes >= nextFlushAt && flushPending.compareAndSet(false, true)) {
-                // next time trigger earlier to avoid storms
-                nextFlushAt = (softThresholdBytes * 0.8).toLong().coerceAtLeast(softThresholdBytes / 2)
+                nextFlushAt = (softThresholdBytes * 9 / 10)
+                    .coerceAtLeast(softThresholdBytes / 2)
                 return true
             }
             return false
         }
+
 
         private fun maybeSealOutsideLock() {
             if (flushPending.get()) sealAndEnqueue()
         }
 
         private fun sealAndEnqueue() {
-            // swap under write lock (O(1))
-            val sealed: LinkedHashMap<Key, MemRecord>
+            val sealed: TreeMap<Key, MemRecord>
             lock.write {
                 if (map.isEmpty()) {
-                    flushPending.set(false)
+                    // ★ 空でも次ラウンドのためにしきい値を戻す＆フラグ解除
+                    nextFlushAt = softThresholdBytes     // ← 追加
+                    flushPending.set(false)              // ← 追加
                     return
                 }
                 sealed = map
                 map = newMap()
                 bytes = 0L
+                nextFlushAt = softThresholdBytes
             }
-            // copy values out of lock
             val batch = ArrayList<MemRecord>(sealed.size)
             for (v in sealed.values) batch.add(v)
-            if (!queue.offer(batch)) {
-                // should not happen with unbounded queue; allow future retries
+            try {
+                queue.offer(batch)
+            } finally {
                 flushPending.set(false)
             }
         }
 
-        private data class Key(val key: ByteBufferL, val hash: Int) {
+        private data class Key(val key: ByteBufferL, val hash: Int) : Comparable<Key> {
             override fun hashCode(): Int = hash
             override fun equals(other: Any?): Boolean =
                 other is Key && bytesEqual(this.key, other.key)
+            override fun compareTo(other: Key): Int = lexCompare(this.key, other.key)
         }
     }
 
@@ -308,7 +309,7 @@ class MemTable(
                     } catch (_: Throwable) {
                     }
                 } else {
-                    Thread.onSpinWait()
+                    LockSupport.parkNanos(200_000) // 0.2ms
                 }
             }
         }
