@@ -26,8 +26,8 @@ project(":akkara-format-akk").projectDir = file("akkara/format-akk")
 //include("akkara-java-api")
 //project(":akkara-java-api").projectDir = file("akkara/java-api")
 
-include("akkara-replica")
-project(":akkara-replica").projectDir = file("akkara/replica")
+//include("akkara-replica")
+//project(":akkara-replica").projectDir = file("akkara/replica")
 
 include("akkara-cli")
 project(":akkara-cli").projectDir = file("akkara/cli")

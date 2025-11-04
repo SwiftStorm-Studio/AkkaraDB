@@ -28,7 +28,7 @@ allprojects {
         "akkara-format-api" -> "0.0.1+alpha.1"
         "akkara-format-akk" -> "0.0.1+alpha.1"
 //        "akkara-java-api" -> "0.0.1-SNAPSHOT"
-        "akkara-replica" -> "0.0.1-SNAPSHOT"
+//        "akkara-replica" -> "0.0.1-SNAPSHOT"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
@@ -84,12 +84,12 @@ subprojects {
             }
         }
 
-        "akkara-replica" -> {
-            dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-engine"))
-            }
-        }
+//        "akkara-replica" -> {
+//            dependencies {
+//                implementation(project(":akkara-common"))
+//                implementation(project(":akkara-engine"))
+//            }
+//        }
 
 //        "akkara-java-api" -> {
 //            dependencies {
