@@ -38,9 +38,8 @@ import kotlin.reflect.full.memberProperties
 import kotlin.reflect.jvm.isAccessible
 
 /**
- * AkkaraDSL v3: thin convenience layer over AkkaraDB v3.
- * - Provides builder presets to create AkkaraDB.Options
- * - Adds generic PackedTable<T> helpers for typed CRUD with composite keys
+ * Utility object providing factory methods for working with AkkaraDB in a type-safe and DSL-friendly manner.
+ * Offers functionality to open and configure packed tables using a flexible DSL approach.
  */
 object AkkDSL {
     // factory helpers

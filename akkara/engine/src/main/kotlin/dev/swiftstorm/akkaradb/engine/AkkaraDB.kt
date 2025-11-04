@@ -46,14 +46,14 @@ import java.nio.file.StandardOpenOption
 import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
- * AkkaraDB v3 engine implementation (minimal, spec-aligned).
+ * AkkaraDB is a high-level database class designed to provide a persisted key-value store
+ * with features such as write-ahead logging (WAL), in-memory storage with MemTable, and SSTable-based storage layers.
+ * It is meant to combine fast in-memory operations with reliable persistence mechanisms.
  *
- * Responsibilities:
- * - Durable writes via WAL (group-commit N or T) before acknowledging.
- * - In-memory MemTable with shard-level concurrency and flush callback.
- * - SSTable emission on flush (L0), newest-first reader list for lookups.
- * - Optional stripe packing of data blocks (32 KiB) for fast sequential scans.
- * - Simple manifest logging for SST seals and checkpoints.
+ * The class includes a factory for initialization via provided configuration options through the `Options` data class.
+ * AkkaraDB supports standard database operations and ensures consistency and durability.
+ *
+ * This private constructor prevents direct instantiation, and instances are expected to be created using the `open` method.
  */
 class AkkaraDB private constructor(
     private val baseDir: Path,
