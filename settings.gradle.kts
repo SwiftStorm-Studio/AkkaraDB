@@ -5,6 +5,9 @@ pluginManagement {
     }
 }
 
+include("akkaradb")
+project(":akkaradb").projectDir = file("akkara/akkaradb")
+
 include("akkara-test")
 project(":akkara-test").projectDir = file("akkara/test")
 
