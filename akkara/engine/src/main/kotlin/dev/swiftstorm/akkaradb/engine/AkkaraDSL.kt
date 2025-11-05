@@ -303,6 +303,10 @@ class PackedTable<T : Any>(val db: AkkaraDB, internal val kClass: KClass<T>) : C
     fun delete(uuid: ShortUUID) = delete("default", uuid)
     fun update(uuid: ShortUUID, mutator: T.() -> Unit): Boolean = update("default", uuid, mutator)
     fun upsert(uuid: ShortUUID, init: T.() -> Unit): T = upsert("default", uuid, init)
+
+    // Query
+    inline fun query(@AkkQueryDsl block: () -> AkkExpr<Boolean>): AkkQuery =
+        AkkQuery(block())
 }
 
 // ---- annotations ----

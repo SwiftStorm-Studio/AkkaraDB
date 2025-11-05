@@ -22,13 +22,12 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
+        "akkara-plugin" -> "0.1.0-SNAPSHOT"
         "akkara-cli" -> "0.0.1-SNAPSHOT"
         "akkara-common" -> "0.0.1+alpha.1"
         "akkara-engine" -> "0.0.1+alpha.1"
         "akkara-format-api" -> "0.0.1+alpha.1"
         "akkara-format-akk" -> "0.0.1+alpha.1"
-//        "akkara-java-api" -> "0.0.1-SNAPSHOT"
-//        "akkara-replica" -> "0.0.1-SNAPSHOT"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
@@ -45,9 +44,7 @@ subprojects {
             afterEvaluate {
                 dependencies {
                     compileOnly(libs.slf4j)
-                    implementation(kotlin("stdlib"))
                     implementation(kotlin("reflect"))
-                    implementation("org.objenesis:objenesis:3.4")
                 }
             }
         }
@@ -62,9 +59,6 @@ subprojects {
             dependencies {
                 implementation(project(":akkara-common"))
                 implementation(project(":akkara-format-api"))
-                implementation(platform("io.netty:netty-bom:4.2.2.Final"))
-
-                implementation("io.netty:netty-transport-classes-io_uring")
             }
         }
 
@@ -74,28 +68,17 @@ subprojects {
                 implementation(project(":akkara-format-api"))
                 implementation(project(":akkara-format-akk"))
 
-                implementation("org.objenesis:objenesis:3.4")
-
                 implementation(kotlin("reflect"))
                 implementation(kotlin("serialization"))
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-core:1.9.0")
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
-                implementation("org.jetbrains.kotlinx:kotlinx-serialization-cbor:1.9.0")
             }
         }
 
-//        "akkara-replica" -> {
-//            dependencies {
-//                implementation(project(":akkara-common"))
-//                implementation(project(":akkara-engine"))
-//            }
-//        }
-
-//        "akkara-java-api" -> {
-//            dependencies {
-//                implementation(project(":akkara-engine"))
-//            }
-//        }
+        "akkara-plugin" -> {
+            dependencies {
+                compileOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:${libs.versions.kotlin.get()}")
+                compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin-api:${libs.versions.kotlin.get()}")
+            }
+        }
 
         "akkara-test" -> {
             dependencies {
@@ -112,7 +95,6 @@ subprojects {
 
     java {
         withSourcesJar()
-        withJavadocJar()
 
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -144,12 +126,12 @@ subprojects {
             val artifactId = project.name
             val ver = project.version.toString()
             val repoUrl = if (ver.endsWith("SNAPSHOT")) {
-                "https://repo.ririfa.net/maven2-snap/"
+                "https://repo.swiftstorm.dev/maven2-snap/"
             } else {
-                "https://repo.ririfa.net/maven2-rel/"
+                "https://repo.swiftstorm.dev/maven2-rel/"
             }
 
-            val artifactUrl = "${repoUrl}net/ririfa/$artifactId/$ver/$artifactId-$ver.jar"
+            val artifactUrl = "${repoUrl}dev/swiftstorm/$artifactId/$ver/$artifactId-$ver.jar"
             logger.lifecycle("Checking existence of artifact at: $artifactUrl")
 
             val connection = URI(artifactUrl).toURL().openConnection() as HttpURLConnection
@@ -170,23 +152,6 @@ subprojects {
         }
     }
 
-    tasks.register<Jar>("plainJar") {
-        group = "ririfa"
-        description = "Project classes only"
-        dependsOn("classes")
-        archiveClassifier.set("")
-        duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-        from(sourceSets.main.get().output)
-    }
-
-//    tasks.register<ShadowJar>("relocatedFatJar") {
-//        dependsOn("classes")
-//        group = "ririfa"
-//        description = "Creates a relocated fat jar containing shadedAPI dependencies"
-//        archiveClassifier.set("fat")
-//        from(sourceSets.main.get().output)
-//    }
-
     tasks.register<Jar>("dokkaHtmlJar") {
         group = "dokka"
         description = "Generates HTML documentation using Dokka"
@@ -202,19 +167,18 @@ subprojects {
                 artifactId = project.name
                 version = project.version.toString()
 
-                artifact(tasks.named<Jar>("plainJar"))
-//                artifact(tasks.named<ShadowJar>("relocatedFatJar"))
+                artifact(tasks.named<Jar>("jar"))
                 artifact(tasks.named<Jar>("sourcesJar"))
                 artifact(tasks.named<Jar>("dokkaHtmlJar"))
 
                 pom {
                     name.set(project.name)
                     description.set("")
-                    url.set("https://github.com/ririf4/Yacla")
+                    url.set("https://github.com/SwiftStorm-Studio/AkkaraDB")
                     licenses {
                         license {
-                            name.set("MIT")
-                            url.set("https://opensource.org/license/mit")
+                            name.set("LGPL 3.0")
+                            url.set("https://www.gnu.org/licenses/lgpl-3.0.ja.html")
                         }
                     }
                     developers {
@@ -234,8 +198,8 @@ subprojects {
         }
         repositories {
             maven {
-                val releasesRepoUrl = uri("https://repo.ririfa.net/maven2-rel/")
-                val snapshotsRepoUrl = uri("https://repo.ririfa.net/maven2-snap/")
+                val releasesRepoUrl = uri("https://repo.swiftstorm.dev/maven2-rel/")
+                val snapshotsRepoUrl = uri("https://repo.swiftstorm.dev/maven2-snap/")
                 url = if (version.toString().endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl
 
                 credentials {
