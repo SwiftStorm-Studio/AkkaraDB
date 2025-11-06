@@ -18,7 +18,7 @@ import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
 
 /**
- * IR rewriter that rewrites boolean expressions inside `AkkDSL.query { ... }`
+ * IR rewriter that rewrites boolean expressions inside `PackedTable.query { ... }`
  * into AkkExpr nodes (AkkBin/AkkUn/AkkLit), so the runtime receives a typed AST.
  *
  * Current coverage:
@@ -58,7 +58,7 @@ private class QueryCallRewriter(
 ) {
     // FQNs in akkara-engine (keep in sync with engine module)
     private val fqAkkDSL = FqName("dev.swiftstorm.akkaradb.engine.AkkDSL")
-    private val fqQuery = FqName("dev.swiftstorm.akkaradb.engine.AkkDSL.query")
+    private val fqQuery = FqName("dev.swiftstorm.akkaradb.engine.PackedTable.query")
 
     private val fqExpr = FqName("dev.swiftstorm.akkaradb.engine.AkkExpr")
     private val fqCol = FqName("dev.swiftstorm.akkaradb.engine.AkkCol")
@@ -124,108 +124,89 @@ private class QueryCallRewriter(
      * Limited set (==, !=, !, literals, already-AkkExpr) for the first cut.
      */
     private fun rewriteExpr(expr: IrExpression): IrExpression {
-        // 1) AkkExpr reuse
-        if (expr.type.isAkkExprType()) {
-            return expr.apply { transformChildren(thisAsTransformer(), null) }
-        }
+        if (expr.type.isAkkExprType()) return expr.apply { transformChildren(thisAsTransformer(), null) }
 
-        // 2) Literals
         if (expr is IrConst) return newAkkLit(expr)
 
-        // 3) Binary operators
         if (expr is IrCall) {
             val sym = expr.symbol
 
-            // Equality checks
-            val eqEqSym = ctx.irBuiltIns.eqeqSymbol
-            val eqEqEqSym = ctx.irBuiltIns.eqeqeqSymbol
-            val ieeeSyms = ctx.irBuiltIns.ieee754equalsFunByOperandType.values
+            val isEq = (sym == ctx.irBuiltIns.eqeqSymbol) ||
+                    (sym == ctx.irBuiltIns.eqeqeqSymbol) ||
+                    (sym in ctx.irBuiltIns.ieee754equalsFunByOperandType.values)
 
-            if (sym == eqEqSym || sym == eqEqEqSym || sym in ieeeSyms) {
-                val args = expr.valueArgs()
-                if (args.size == 2) {
-                    val lhs = rewriteExpr(args[0])
-                    val rhs = rewriteExpr(args[1])
-                    val isLhsNull = args[0] is IrConst && (args[0] as IrConst).kind == IrConstKind.Null
-                    val isRhsNull = args[1] is IrConst && (args[1] as IrConst).kind == IrConstKind.Null
-                    return when {
-                        isRhsNull -> newAkkUn(opIS_NULL, lhs)
-                        isLhsNull -> newAkkUn(opIS_NULL, rhs)
-                        else -> newAkkBin(opEQ, lhs, rhs)
-                    }
+            if (isEq) {
+                val lhs0 = expr.arguments.getOrNull(0) ?: return expr
+                val rhs0 = expr.arguments.getOrNull(1) ?: return expr
+                val lhs = rewriteExpr(lhs0)
+                val rhs = rewriteExpr(rhs0)
+
+                val lhsIsNull = lhs0 is IrConst && lhs0.kind == IrConstKind.Null
+                val rhsIsNull = rhs0 is IrConst && rhs0.kind == IrConstKind.Null
+                return when {
+                    rhsIsNull -> newAkkUn(opIS_NULL, lhs)
+                    lhsIsNull -> newAkkUn(opIS_NULL, rhs)
+                    else -> newAkkBin(opEQ, lhs, rhs)
                 }
             }
 
-            // Comparison operators
-            fun match(opMap: Map<IrClassifierSymbol, IrSimpleFunctionSymbol>, akkOp: IrEnumEntrySymbol): IrExpression? {
-                val args = expr.valueArgs()
-                if (args.size != 1) return null
-                val receiver = expr.dispatchReceiver ?: return null
-                val symbolForType = opMap[receiver.type.classifierOrFail] ?: return null
-                if (sym != symbolForType) return null
-                val lhs = rewriteExpr(receiver)
-                val rhs = rewriteExpr(args[0])
-                return newAkkBin(akkOp, lhs, rhs)
+            fun match(opMap: Map<IrClassifierSymbol, IrSimpleFunctionSymbol>, akkName: String): IrExpression? {
+                val recv = expr.dispatchReceiver ?: return null
+                val arg0 = expr.arguments.getOrNull(0) ?: return null
+                val expected = opMap[recv.type.classifierOrFail] ?: return null
+                if (sym != expected) return null
+                return newAkkBin(enumEntry(symAkkOp, akkName), rewriteExpr(recv), rewriteExpr(arg0))
             }
 
-            match(ctx.irBuiltIns.lessFunByOperandType, enumEntry(symAkkOp, "LT"))?.let { return it }
-            match(ctx.irBuiltIns.greaterFunByOperandType, enumEntry(symAkkOp, "GT"))?.let { return it }
-            match(ctx.irBuiltIns.lessOrEqualFunByOperandType, enumEntry(symAkkOp, "LE"))?.let { return it }
-            match(ctx.irBuiltIns.greaterOrEqualFunByOperandType, enumEntry(symAkkOp, "GE"))?.let { return it }
+            match(ctx.irBuiltIns.lessFunByOperandType, "LT")?.let { return it }
+            match(ctx.irBuiltIns.greaterFunByOperandType, "GT")?.let { return it }
+            match(ctx.irBuiltIns.lessOrEqualFunByOperandType, "LE")?.let { return it }
+            match(ctx.irBuiltIns.greaterOrEqualFunByOperandType, "GE")?.let { return it }
         }
 
-        // 4) Unary NOT
         if (expr is IrCall &&
             expr.symbol.owner.name.asString() == "not" &&
-            expr.symbol.owner.parentClassFqName == FqName("kotlin.Boolean")
+            expr.type == ctx.irBuiltIns.booleanType
         ) {
-            val params = expr.symbol.owner.parameters
-            val recvIndex = params.indexOfFirst {
-                it.kind == IrParameterKind.DispatchReceiver || it.kind == IrParameterKind.ExtensionReceiver
+            val recv = expr.dispatchReceiver as? IrCall
+            if (recv != null &&
+                (recv.symbol == ctx.irBuiltIns.eqeqSymbol ||
+                        recv.symbol == ctx.irBuiltIns.eqeqeqSymbol ||
+                        recv.symbol in ctx.irBuiltIns.ieee754equalsFunByOperandType.values)
+            ) {
+                val lhs0 = recv.arguments.getOrNull(0)!!
+                val rhs0 = recv.arguments.getOrNull(1)!!
+                val lhs = rewriteExpr(lhs0)
+                val rhs = rewriteExpr(rhs0)
+
+                val lhsIsNull = lhs0 is IrConst && lhs0.kind == IrConstKind.Null
+                val rhsIsNull = rhs0 is IrConst && rhs0.kind == IrConstKind.Null
+                if (rhsIsNull) return newAkkUn(opIS_NOT_NULL, lhs)
+                if (lhsIsNull) return newAkkUn(opIS_NOT_NULL, rhs)
+                return newAkkBin(opNEQ, lhs, rhs)
             }
-            val recv = if (recvIndex >= 0) expr.arguments[recvIndex] else null
-            val x = rewriteExpr(requireNotNull(recv))
-            return newAkkUn(opNOT, x)
+
+            val recvAny = expr.dispatchReceiver ?: return expr
+            return newAkkUn(opNOT, rewriteExpr(recvAny))
         }
 
-        // 5) Boolean short-circuit (`&&`, `||`) → IrWhen
-        if (expr is IrWhen &&
-            expr.type == ctx.irBuiltIns.booleanType &&
-            expr.branches.size == 2
-        ) {
+        if (expr is IrWhen && expr.type == ctx.irBuiltIns.booleanType && expr.branches.size == 2) {
             val condRaw = expr.branches[0].condition
             val thenRaw = expr.branches[0].result
             val elseRaw = expr.branches[1].result
-
             val thenConst = (thenRaw as? IrConst)?.value as? Boolean
             val elseConst = (elseRaw as? IrConst)?.value as? Boolean
 
-            // a || b : when(a) { true -> true; else -> b }
-            if (thenConst == true) {
-                val cond = rewriteExpr(condRaw)
-                val rhs = rewriteExpr(elseRaw)
-                return newAkkBin(enumEntry(symAkkOp, "OR"), cond, rhs)
-            }
-
-            // a && b : when(a) { true -> b; else -> false }
-            if (elseConst == false) {
-                val cond = rewriteExpr(condRaw)
-                val rhs = rewriteExpr(thenRaw)
-                return newAkkBin(enumEntry(symAkkOp, "AND"), cond, rhs)
-            }
-
-            // Not a canonical short-circuit lowering; just recurse.
-            expr.transformChildren(thisAsTransformer(), null)
-            return expr
+            if (thenConst == true)  // a || b
+                return newAkkBin(enumEntry(symAkkOp, "OR"), rewriteExpr(condRaw), rewriteExpr(elseRaw))
+            if (elseConst == false) // a && b
+                return newAkkBin(enumEntry(symAkkOp, "AND"), rewriteExpr(condRaw), rewriteExpr(thenRaw))
         }
 
-        // 6) Fallback
         return when (expr) {
             is IrGetValue, is IrGetField, is IrCall, is IrWhen, is IrTypeOperatorCall, is IrVararg -> {
-                expr.transformChildren(thisAsTransformer(), null)
-                expr
+                expr.transformChildren(thisAsTransformer(), null); expr
             }
-
             else -> newAkkLit(Unit)
         }
     }
@@ -246,17 +227,18 @@ private class QueryCallRewriter(
     }
 
     private fun newAkkLit(any: Any?): IrExpression {
-        val const = when (any) {
+        val const: IrConst = when (any) {
             null -> IrConstImpl.constNull(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.anyNType)
             is String -> IrConstImpl.string(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.stringType, any)
-            is Boolean -> if (any) IrConstImpl.boolean(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.booleanType, true)
-            else IrConstImpl.boolean(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.booleanType, false)
-
+            is Boolean -> IrConstImpl.boolean(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.booleanType, any)
             is Int -> IrConstImpl.int(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.intType, any)
             is Long -> IrConstImpl.long(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.longType, any)
             is Float -> IrConstImpl.float(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.floatType, any)
             is Double -> IrConstImpl.double(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.doubleType, any)
-            else -> IrConstImpl.constNull(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.nothingNType) // keep minimal
+            is Short -> IrConstImpl.short(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.shortType, any)
+            is Byte -> IrConstImpl.byte(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.byteType, any)
+            is Char -> IrConstImpl.char(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.charType, any)
+            else -> IrConstImpl.constNull(UNDEFINED_OFFSET, UNDEFINED_OFFSET, ctx.irBuiltIns.anyNType)
         }
         return newAkkLit(const)
     }
@@ -288,15 +270,13 @@ private class QueryCallRewriter(
         return call
     }
 
-    private fun irGetEnum(entry: IrEnumEntrySymbol): IrExpression {
-        val enumType = entry.owner.parentAsClass.defaultType
-        return IrGetEnumValueImpl(
+    private fun irGetEnum(entry: IrEnumEntrySymbol): IrExpression =
+        IrGetEnumValueImpl(
             UNDEFINED_OFFSET,
             UNDEFINED_OFFSET,
-            enumType,
+            entry.owner.parentAsClass.defaultType,
             entry
         )
-    }
 
     private fun requirePrimaryCtor(fq: FqName): IrConstructorSymbol {
         val cls = ctx.referenceClass(ClassId.topLevel(fq))
@@ -319,12 +299,6 @@ private class QueryCallRewriter(
             ?: error("Enum entry $name not found in ${enumClass.owner.name}")
         return entry.symbol
     }
-
-    private fun IrCall.valueArgs(): List<IrExpression> =
-        symbol.owner.parameters
-            .filter { it.kind == IrParameterKind.Regular || it.kind == IrParameterKind.Context }
-            .mapNotNull { arguments[it.indexInParameters] }
-
 
     private fun IrType.isAkkExprType(): Boolean {
         val exprClass = ctx.referenceClass(ClassId.topLevel(fqExpr)) ?: return false

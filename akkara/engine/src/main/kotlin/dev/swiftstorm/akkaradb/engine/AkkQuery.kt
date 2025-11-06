@@ -1,5 +1,10 @@
 package dev.swiftstorm.akkaradb.engine
 
+import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
+import kotlin.reflect.full.memberProperties
+import kotlin.reflect.jvm.isAccessible
+
 /**
  * Algebraic expression node used by the query DSL.
  * A Kotlin compiler plugin can rewrite operators into this tree.
@@ -25,10 +30,7 @@ data class AkkUn<T>(
     val x: AkkExpr<*>
 ) : AkkExpr<T>
 
-/** Set / variadic node (e.g., IN (v1, v2, v3)). */
-data class AkkList<T>(val values: List<T>) : AkkExpr<List<T>>
-
-/** Supported operators (keep minimal first; extend as needed). */
+/** Supported operators. */
 enum class AkkOp {
     // comparisons
     GT, GE, LT, LE, EQ, NEQ,
@@ -40,7 +42,7 @@ enum class AkkOp {
     ADD, SUB, MUL, DIV,
 
     // sql-like helpers
-    LIKE, IN, IS_NULL, IS_NOT_NULL
+    IS_NULL, IS_NOT_NULL
 }
 
 /**
@@ -55,80 +57,128 @@ class AkkQuery(
     /** Root predicate expression (must evaluate to boolean). */
     val where: AkkExpr<Boolean>
 ) {
-
-    /** Render to a simplistic SQL WHERE string with '?' placeholders. */
-    fun toSql(): String = where.renderSql()
-
-    /** Extract bound values in left-to-right order. */
-    fun bindings(): List<Any?> = mutableListOf<Any?>().also { where.collectBindings(it) }
-
-    override fun toString(): String = "AkkQuery(sql=${toSql()}, bindings=${bindings()})"
+    override fun toString(): String = "AkkQuery(where=$where)"
 }
 
-private fun AkkExpr<*>.renderSql(): String = when (this) {
-    is AkkCol<*> -> (table?.let { "$it." } ?: "") + name
-    is AkkLit<*> -> "?"
-    is AkkList<*> -> values.joinToString(", ") { "?" }.let { "($it)" }
-    is AkkBin<*> -> when (op) {
-        AkkOp.GT -> "(${lhs.renderSql()} > ${rhs.renderSql()})"
-        AkkOp.GE -> "(${lhs.renderSql()} >= ${rhs.renderSql()})"
-        AkkOp.LT -> "(${lhs.renderSql()} < ${rhs.renderSql()})"
-        AkkOp.LE -> "(${lhs.renderSql()} <= ${rhs.renderSql()})"
-        AkkOp.EQ -> "(${lhs.renderSql()} = ${rhs.renderSql()})"
-        AkkOp.NEQ -> "(${lhs.renderSql()} <> ${rhs.renderSql()})"
-        AkkOp.AND -> "(${lhs.renderSql()} AND ${rhs.renderSql()})"
-        AkkOp.OR -> "(${lhs.renderSql()} OR ${rhs.renderSql()})"
-        AkkOp.ADD -> "(${lhs.renderSql()} + ${rhs.renderSql()})"
-        AkkOp.SUB -> "(${lhs.renderSql()} - ${rhs.renderSql()})"
-        AkkOp.MUL -> "(${lhs.renderSql()} * ${rhs.renderSql()})"
-        AkkOp.DIV -> "(${lhs.renderSql()} / ${rhs.renderSql()})"
-        AkkOp.LIKE -> "(${lhs.renderSql()} LIKE ${rhs.renderSql()})"
-        AkkOp.IN -> "(${lhs.renderSql()} IN ${rhs.renderSql()})"
-        else -> error("Unsupported binary op in renderer: $op")
+/**
+ * Execute a query by scanning all rows in this table's namespace and
+ * evaluating the AkkExpr<Boolean> predicate against decoded entities.
+ *
+ * This is a minimal executor:
+ *  - Full scan of in-memory + on-disk view exposed by AkkaraDB.iterator()
+ *  - Namespace filter (prefix = "<qualifiedName>:")
+ *  - Tombstones are skipped
+ *  - Entities are decoded via AdapterResolver and evaluated by a small interpreter
+ *
+ * Future work:
+ *  - Range pushdown (detect id equality / range and use prefix-bound scans)
+ *  - SSTable index/bloom seek to reduce IO
+ *  - Short-circuit evaluation and expression simplification
+ */
+fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
+    val adapter = AdapterResolver.getAdapterForClass(kClass)
+
+    @Suppress("UNCHECKED_CAST")
+    val props = kClass.memberProperties
+        .onEach { it.isAccessible = true }
+        .associateBy { it.name }
+
+    fun startsWithNamespace(key: ByteBufferL): Boolean {
+        val k = key.duplicate().position(0)
+        val n = nsBuf.duplicate().position(0)
+        if (k.remaining < n.remaining) return false
+        repeat(n.remaining) { if (k.i8 != n.i8) return false }
+        return true
     }
 
-    is AkkUn<*> -> when (op) {
-        AkkOp.NOT -> "(NOT ${x.renderSql()})"
-        AkkOp.IS_NULL -> "(${x.renderSql()} IS NULL)"
-        AkkOp.IS_NOT_NULL -> "(${x.renderSql()} IS NOT NULL)"
-        else -> error("Unsupported unary op in renderer: $op")
+    fun eval(e: AkkExpr<*>, entity: T): Any? {
+        fun eq(l: Any?, r: Any?): Boolean {
+            if (l == null || r == null) return l == r
+            if (l is Number && r is Number) {
+                val (a, b) = if (l is Float || l is Double || r is Float || r is Double)
+                    l.toDouble() to r.toDouble() else l.toLong() to r.toLong()
+                return a == b
+            }
+            return l == r
+        }
+
+        fun cmp(l: Any?, r: Any?): Int {
+            require(l != null && r != null) { "Comparison on null: $l vs $r" }
+            if (l is Number && r is Number) {
+                val (a, b) = if (l is Float || l is Double || r is Float || r is Double)
+                    l.toDouble() to r.toDouble() else l.toLong() to r.toLong()
+                return when (a) {
+                    is Double -> a.compareTo(b as Double)
+                    is Long -> a.compareTo(b as Long)
+                    else -> error("Unreachable")
+                }
+            }
+            @Suppress("UNCHECKED_CAST")
+            if (l is Comparable<*> && r::class == l::class) {
+                return (l as Comparable<Any>).compareTo(r)
+            }
+            error("Unsupported compare: ${l::class.simpleName} vs ${r::class.simpleName}")
+        }
+
+        return when (e) {
+            is AkkLit<*> -> e.value
+            is AkkCol<*> -> props[e.name]?.get(entity)
+                ?: error("No property '${e.name}' in ${kClass.simpleName}")
+
+            is AkkUn<*> -> {
+                val x = eval(e.x, entity)
+                when (e.op) {
+                    AkkOp.NOT -> !(x as Boolean? ?: false)
+                    AkkOp.IS_NULL -> (x == null)
+                    AkkOp.IS_NOT_NULL -> (x != null)
+                    else -> error("Unsupported unary op: ${e.op}")
+                }
+            }
+
+            is AkkBin<*> -> {
+                val l = eval(e.lhs, entity);
+                val r = eval(e.rhs, entity)
+                when (e.op) {
+                    AkkOp.EQ -> eq(l, r)
+                    AkkOp.NEQ -> !eq(l, r)
+                    AkkOp.GT -> cmp(l, r) > 0
+                    AkkOp.GE -> cmp(l, r) >= 0
+                    AkkOp.LT -> cmp(l, r) < 0
+                    AkkOp.LE -> cmp(l, r) <= 0
+                    AkkOp.AND -> {
+                        val l = eval(e.lhs, entity) as Boolean? ?: false
+                        if (!l) false else (eval(e.rhs, entity) as Boolean? ?: false)
+                    }
+
+                    AkkOp.OR -> {
+                        val l = eval(e.lhs, entity) as Boolean? ?: false
+                        if (l) true else (eval(e.rhs, entity) as Boolean? ?: false)
+                    }
+
+                    else -> error("Unsupported binary op: ${e.op}")
+                }
+            }
+
+            else -> error("Unknown expr node: ${e::class.simpleName}")
+        }
     }
 
-    else -> error("Unknown expression node: ${this::class.simpleName}")
+    return sequence {
+        for (rec in db.iterator()) {
+            if (rec.tombstone) continue
+            if (!startsWithNamespace(rec.key)) continue
+            val entity = adapter.read(rec.value.duplicate().position(0))
+            if (eval(query.where, entity) as Boolean) yield(entity)
+        }
+    }
 }
 
-private fun AkkExpr<*>.collectBindings(out: MutableList<Any?>): MutableList<Any?> = when (this) {
-    is AkkCol<*> -> out
-    is AkkLit<*> -> {
-        out += value; out
-    }
-
-    is AkkList<*> -> {
-        values.forEach { out += it }; out
-    }
-
-    is AkkBin<*> -> {
-        lhs.collectBindings(out); rhs.collectBindings(out)
-    }
-
-    is AkkUn<*> -> {
-        x.collectBindings(out)
-    }
-
-    else -> out
-}
-
+fun <T : Any> PackedTable<T>.runToList(query: AkkQuery): List<T> = run(query).toList()
+fun <T : Any> PackedTable<T>.firstOrNull(query: AkkQuery): T? = run(query).firstOrNull()
+fun <T : Any> PackedTable<T>.exists(query: AkkQuery): Boolean = run(query).any()
 
 /** Create a column node (optional sugar for prototypes/tests). */
 fun <T> col(name: String, table: String? = null): AkkCol<T> = AkkCol(table, name)
-
-/** LIKE sugar until operator-rewrite is available. */
-infix fun AkkExpr<String>.like(pattern: String): AkkExpr<Boolean> =
-    AkkBin(AkkOp.LIKE, this, AkkLit(pattern))
-
-/** IN sugar until operator-rewrite is available. */
-infix fun <T> AkkExpr<T>.isin(values: List<T>): AkkExpr<Boolean> =
-    AkkBin(AkkOp.IN, this, AkkList(values))
 
 /** IS NULL / IS NOT NULL sugar. */
 fun <T> isNull(e: AkkExpr<T?>): AkkExpr<Boolean> = AkkUn(AkkOp.IS_NULL, e)

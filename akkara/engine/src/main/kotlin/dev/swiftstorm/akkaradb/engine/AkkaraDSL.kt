@@ -173,7 +173,7 @@ class PackedTable<T : Any>(val db: AkkaraDB, internal val kClass: KClass<T>) : C
     }
 
     // Namespace prefix: "<qualifiedName>:"
-    private val nsBuf: ByteBufferL by lazy {
+    internal val nsBuf: ByteBufferL by lazy {
         val name = (kClass.qualifiedName ?: kClass.simpleName!!) + ":"
         ByteBufferL.wrap(StandardCharsets.US_ASCII.encode(name))
     }
