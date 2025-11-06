@@ -124,7 +124,7 @@ class SSTCompactor(
         val iterators = inputs.map { SSTIterator(it) }
         try {
             val expected = iterators.sumOf { it.totalEntries }
-            FileChannel.open(output, CREATE, TRUNCATE_EXISTING, WRITE).use { ch ->
+            FileChannel.open(output, CREATE, TRUNCATE_EXISTING, WRITE, READ).use { ch ->
                 SSTableWriter(ch, expected).use { writer ->
                     val merged = merge(
                         iterators = iterators,

@@ -55,14 +55,14 @@ sealed interface WalOp {
     data class Delete(
         val key: ByteArray,
         val seq: U64,
-        val tombstoneFlag: Int = 0x01,
+        val tombstoneFlag: Byte = 0x01,
         val keyFP64: U64 = U64.ZERO,
         val miniKey: U64 = AKHdr32.buildMiniKeyLE(key)
     ) : WalOp {
         override fun encodeInto(buf: ByteBufferL) {
-            buf.putHeader32(key.size, U32.ZERO, seq, tombstoneFlag, keyFP64, miniKey)
+            buf.putHeader32(key.size, U32.ZERO, seq, tombstoneFlag.toInt(), keyFP64, miniKey)
             buf.putBytes(key)
-// no value bytes
+            // no value bytes
         }
     }
 }

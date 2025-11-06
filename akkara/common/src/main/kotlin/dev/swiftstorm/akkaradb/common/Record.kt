@@ -42,10 +42,14 @@ data class MemRecord(
     fun withValue(newValue: ByteBufferL): MemRecord =
         copy(value = newValue, approxSizeBytes = estimateMemFootprint(key, newValue))
 
+    fun withValueAndSeq(newValue: ByteBufferL, newSeq: Long): MemRecord =
+        copy(value = newValue, seq = newSeq, approxSizeBytes = estimateMemFootprint(key, newValue))
+
     /** Convert to a tombstone (empty value), keeping key/seq. */
-    fun asTombstone(): MemRecord =
+    fun asTombstone(newSeq: Long): MemRecord =
         copy(
             value = EMPTY,
+            seq = newSeq,
             flags = flags.withFlag(RecordFlags.TOMBSTONE),
             approxSizeBytes = estimateMemFootprint(key, EMPTY)
         )

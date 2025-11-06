@@ -42,7 +42,7 @@ import java.io.Closeable
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.StandardOpenOption
+import java.nio.file.StandardOpenOption.*
 import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
@@ -117,14 +117,15 @@ class AkkaraDB private constructor(
     /** CAS by expected sequence: if matches current MemTable, set new value (or delete if null). */
     fun compareAndSwap(key: ByteBufferL, expectedSeq: Long, newValue: ByteBufferL?): Boolean {
         val ok = mem.compareAndSwap(key.duplicate(), expectedSeq, newValue?.duplicate())
+        val nextSeq = mem.lastSeq() // Advancing by MemTable
         if (ok && durableCas) {
             // Log as an idempotent WAL op with the same seq so recovery converges.
             val keyBytes = key.duplicate().position(0).readAllBytes()
             if (newValue == null) {
                 val op = WalOp.Delete(
                     key = keyBytes,
-                    seq = U64.fromSigned(expectedSeq),
-                    tombstoneFlag = 0x01,
+                    seq = U64.fromSigned(nextSeq),
+                    tombstoneFlag = RecordFlags.TOMBSTONE,
                     keyFP64 = AKHdr32.sipHash24(key, AKHdr32.DEFAULT_SIPHASH_SEED),
                     miniKey = AKHdr32.buildMiniKeyLE(key)
                 )
@@ -134,7 +135,7 @@ class AkkaraDB private constructor(
                 val op = WalOp.Add(
                     key = keyBytes,
                     value = valBytes,
-                    seq = U64.fromSigned(expectedSeq),
+                    seq = U64.fromSigned(nextSeq),
                     flags = 0,
                     keyFP64 = AKHdr32.sipHash24(key, AKHdr32.DEFAULT_SIPHASH_SEED),
                     miniKey = AKHdr32.buildMiniKeyLE(key)
@@ -154,6 +155,7 @@ class AkkaraDB private constructor(
         val sealed = stripe.sealIfComplete()
         if (sealed) stripe.flush(FlushMode.SYNC)
         manifest.checkpoint(name = "flush", stripe = stripe.lastSealedStripe, lastSeq = mem.lastSeq())
+        wal.forceSync()
     }
 
     fun lastSeq(): Long = mem.lastSeq()
@@ -252,7 +254,7 @@ class AkkaraDB private constructor(
                     if (la != lb) la - lb else Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a))
                 }
                 toOpen.forEach { p ->
-                    val ch = FileChannel.open(p, StandardOpenOption.READ)
+                    val ch = FileChannel.open(p, READ)
                     val r = SSTableReader.open(ch)
                     into.addLast(r)
                 }
@@ -278,7 +280,7 @@ class AkkaraDB private constructor(
                     val file = l0Dir.resolve("L0_" + System.nanoTime().toString() + ".sst")
                     FileChannel.open(
                         file,
-                        StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING
+                        CREATE, WRITE, READ, TRUNCATE_EXISTING
                     ).use { ch ->
                         SSTableWriter(ch, expectedEntries = sorted.size.toLong()).use { w ->
                             w.writeAll(sorted.asSequence())
@@ -343,7 +345,7 @@ class AkkaraDB private constructor(
 
             // WAL
             val walPath = base.resolve("wal.akwal")
-            val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros)
+            val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros, fastMode = opts.fastMode)
 
             // Recovery: WAL → MemTable
             WalReplay.replay(walPath, mem)

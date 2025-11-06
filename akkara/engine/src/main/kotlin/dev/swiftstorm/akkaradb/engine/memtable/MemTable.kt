@@ -55,7 +55,14 @@ class MemTable(
 
     init {
         val q = MpscQueue<List<MemRecord>>()
-        this.flusher = Flusher(q, onFlush, flusherThreadName).apply { start() }
+        this.flusher = Flusher(
+            queue = q,
+            sink = onFlush,
+            onFlushed = { batch ->
+                shards.forEach { it.onFlushed(batch) } // 全shardに通知（バッチを保持していたshardだけが削除）
+            },
+            tname = flusherThreadName
+        ).apply { start() }
         this.shards = Array(shardCount) { idx ->
             Shard(
                 shardId = idx,
@@ -111,8 +118,12 @@ class MemTable(
     /** Compare-and-swap by sequence (monotonic). */
     fun compareAndSwap(key: ByteBufferL, expectedSeq: Long, newValue: ByteBufferL?): Boolean {
         if (closed.get()) return false
-        val h = fnv1a32(key)
-        return shards[shardIdx(h)].cas(key, h, expectedSeq, newValue)
+        val k0 = key.duplicate().position(0)
+        val h = fnv1a32(k0)
+        val nextSeq = lastSeq() + 1
+        val cas = shards[shardIdx(h)].cas(k0, h, expectedSeq, nextSeq, newValue)
+        if (cas) seqGen.set(nextSeq)
+        return cas
     }
 
     /** Non-blocking flush hint for all shards. */
@@ -175,28 +186,62 @@ class MemTable(
         private val lock = ReentrantReadWriteLock()
 
         // Access-ordered LRU-ish map to enable optional eviction hooks (not used by default)
-        private var map: TreeMap<Key, MemRecord> = TreeMap()
+        private var active: TreeMap<Key, MemRecord> = TreeMap()
+        private val immutables = ArrayDeque<TreeMap<Key, MemRecord>>()
 
         private var bytes: Long = 0L
         private var flushPending = AtomicBoolean(false)
         private var nextFlushAt = softThresholdBytes
 
-        fun size(): Int = lock.read { map.size }
+        fun size(): Int = lock.read {
+            var total = active.size
+            for (imm in immutables) total += imm.size
+            total
+        }
+
         fun currentBytes(): Long = lock.read { bytes }
 
         fun get(key: ByteBufferL, keyHash: Int): MemRecord? = lock.read {
-            map[Key(key, keyHash)]
+            val k = Key(key, keyHash)
+            active[k]?.let { return it }
+            for (imm in immutables) {
+                imm[k]?.let { return it }
+            }
+            return null
         }
 
-        fun cas(key: ByteBufferL, keyHash: Int, expectedSeq: Long, newValue: ByteBufferL?): Boolean {
+        fun cas(
+            key: ByteBufferL,
+            keyHash: Int,
+            expectedSeq: Long,
+            newSeq: Long,
+            newValue: ByteBufferL?
+        ): Boolean {
             var ok = false
             lock.write {
                 val k = Key(key, keyHash)
-                val cur = map[k]
+
+                // Search in active first
+                var cur = active[k]
+
+                // If not found in active, check immutables (read-only)
+                if (cur == null) {
+                    for (imm in immutables) {
+                        val found = imm[k]
+                        if (found != null) {
+                            cur = found
+                            break
+                        }
+                    }
+                }
+
                 if ((cur?.seq ?: -1L) == expectedSeq) {
-                    val next = if (newValue == null) cur!!.asTombstone() else cur!!.withValue(newValue)
+                    val next = when {
+                        newValue == null -> cur!!.asTombstone(newSeq)
+                        else -> cur!!.withValueAndSeq(newValue, newSeq)
+                    }
                     if (shouldReplace(cur, next)) {
-                        map[k] = next
+                        active[k] = next  // always update active
                         bytes += sizeOf(next) - sizeOf(cur)
                         triggerIfNeeded()
                         ok = true
@@ -211,15 +256,10 @@ class MemTable(
             var needSeal = false
             lock.write {
                 val k = Key(rec.key, rec.keyHash)
-                val prev = map[k]
-                if (prev == null) {
-                    map[k] = rec
-                    bytes += sizeOf(rec)
-                } else {
-                    if (shouldReplace(prev, rec)) {
-                        map[k] = rec
-                        bytes += sizeOf(rec) - sizeOf(prev)
-                    }
+                val prev = active[k]
+                if (prev == null || shouldReplace(prev, rec)) {
+                    active[k] = rec
+                    bytes += sizeOf(rec) - (prev?.let { sizeOf(it) } ?: 0)
                 }
                 if (triggerIfNeeded()) needSeal = true
             }
@@ -230,14 +270,30 @@ class MemTable(
             val fromKey = range.start?.let { Key(it, fnv1a32(it)) }
             val toKey = range.endExclusive?.let { Key(it, fnv1a32(it)) }
 
-            val view: NavigableMap<Key, MemRecord> = when {
-                fromKey != null && toKey != null -> map.subMap(fromKey, true, toKey, false)
-                fromKey != null -> map.tailMap(fromKey, true)
-                toKey != null -> map.headMap(toKey, false)
-                else -> map
+            // active map view
+            val activeView: NavigableMap<Key, MemRecord> = when {
+                fromKey != null && toKey != null -> active.subMap(fromKey, true, toKey, false)
+                fromKey != null -> active.tailMap(fromKey, true)
+                toKey != null -> active.headMap(toKey, false)
+                else -> active
             }
 
-            ArrayList(view.values).iterator()
+            val merged = ArrayList<MemRecord>(activeView.size)
+            merged.addAll(activeView.values)
+
+            // include immutables
+            for (imm in immutables) {
+                val immView: NavigableMap<Key, MemRecord> = when {
+                    fromKey != null && toKey != null -> imm.subMap(fromKey, true, toKey, false)
+                    fromKey != null -> imm.tailMap(fromKey, true)
+                    toKey != null -> imm.headMap(toKey, false)
+                    else -> imm
+                }
+                merged.addAll(immView.values)
+            }
+
+            merged.sortWith { a, b -> lexCompare(a.key, b.key) }
+            merged.iterator()
         }
 
         fun maybeSealAndEnqueue() {
@@ -246,11 +302,16 @@ class MemTable(
 
         fun forceSealAndEnqueueIfNotEmpty() {
             var has = false
-            lock.read { has = map.isNotEmpty() }
+            lock.read { has = active.isNotEmpty() || immutables.isNotEmpty() }
             if (has && flushPending.compareAndSet(false, true)) sealAndEnqueue()
         }
 
-        private fun newMap(): TreeMap<Key, MemRecord> = TreeMap()
+        fun onFlushed(batch: List<MemRecord>) {
+            lock.write {
+                immutables.removeIf { imm -> imm.values === batch }
+            }
+        }
+
 
         private fun sizeOf(r: MemRecord): Long = r.approxSizeBytes.toLong()
 
@@ -263,7 +324,6 @@ class MemTable(
             return false
         }
 
-
         private fun maybeSealOutsideLock() {
             if (flushPending.get()) sealAndEnqueue()
         }
@@ -271,17 +331,18 @@ class MemTable(
         private fun sealAndEnqueue() {
             val sealed: TreeMap<Key, MemRecord>
             lock.write {
-                if (map.isEmpty()) {
-                    // ★ 空でも次ラウンドのためにしきい値を戻す＆フラグ解除
-                    nextFlushAt = softThresholdBytes     // ← 追加
-                    flushPending.set(false)              // ← 追加
+                if (active.isEmpty()) {
+                    nextFlushAt = softThresholdBytes
+                    flushPending.set(false)
                     return
                 }
-                sealed = map
-                map = newMap()
+                sealed = active
+                immutables.add(sealed)
+                active = TreeMap()
                 bytes = 0L
                 nextFlushAt = softThresholdBytes
             }
+
             val batch = ArrayList<MemRecord>(sealed.size)
             for (v in sealed.values) batch.add(v)
             try {
@@ -302,18 +363,21 @@ class MemTable(
     private class Flusher(
         private val queue: MpscQueue<List<MemRecord>>,
         private val sink: (List<MemRecord>) -> Unit,
+        private val onFlushed: (List<MemRecord>) -> Unit,
         tname: String
     ) {
         private val running = AtomicBoolean(true)
         private val th = Thread({ runLoop() }, tname).apply { isDaemon = true }
 
         fun start() = th.start()
-
         fun stopAndDrain() {
             running.set(false)
             th.join()
-            // Drain leftovers (best-effort)
-            while (true) sink(queue.poll() ?: break)
+            while (true) {
+                val b = queue.poll() ?: break
+                sink(b)
+                onFlushed(b)
+            }
         }
 
         private fun runLoop() {
@@ -322,10 +386,11 @@ class MemTable(
                 if (b != null) {
                     try {
                         sink(b)
-                    } catch (_: Throwable) {
+                    } finally {
+                        onFlushed(b)
                     }
                 } else {
-                    LockSupport.parkNanos(200_000) // 0.2ms
+                    LockSupport.parkNanos(200_000)
                 }
             }
         }

@@ -42,6 +42,7 @@ class WalWriter(
     private val path: Path,
     private val groupN: Int = 32,
     private val groupTmicros: Long = 500, // T=500µs default
+    private val fastMode: Boolean = false,
 ) : Closeable {
 
     private val ch: FileChannel
@@ -86,10 +87,28 @@ class WalWriter(
 
         val waiter = Waiter()
         q.put(Item(lsn, frame, waiter))
-        // wait until fsync has included this lsn
-        waiter.await(timeoutMicros = groupTmicros * 10) // soft bound, then yield until done
+
+        if (!fastMode) {
+            // Normal: wait until fsync has included this LSN
+            waiter.await(timeoutMicros = groupTmicros * 10)
+        }
+        // ──────────────────────
+
         return lsn
     }
+
+    fun forceSync() {
+        if (!running.get() || !ch.isOpen) return
+
+        synchronized(ch) {
+            runCatching {
+                if (ch.isOpen) {
+                    ch.force(false)
+                }
+            }.onFailure {}
+        }
+    }
+
 
     override fun close() {
         if (!running.getAndSet(false)) return

@@ -1,0 +1,103 @@
+package dev.swiftstorm.akkaradb
+
+import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.engine.AkkaraDB
+import org.junit.jupiter.api.Assertions
+import org.junit.jupiter.api.Test
+import java.nio.charset.StandardCharsets
+import java.nio.file.Path
+
+class AkkaraDBTest {
+
+    //    @TempDir
+    var temp: Path = Path.of("./test/")
+
+    private fun bb(str: String): ByteBufferL = ByteBufferL.wrap(StandardCharsets.US_ASCII.encode(str))
+
+    private fun toAsciiString(buf: ByteBufferL): String {
+        val d = buf.duplicate()
+        val arr = ByteArray(d.remaining)
+        var i = 0
+        while (i < arr.size) {
+            arr[i] = d.i8.toByte()
+            i++
+        }
+        return String(arr, StandardCharsets.US_ASCII)
+    }
+
+    @Test
+    fun putGetAndDelete() {
+        val db = AkkaraDB.open(
+            AkkaraDB.Options(
+                baseDir = temp.resolve("db1"),
+                fastMode = true,
+                walGroupN = 8,
+                walGroupMicros = 0,
+            )
+        )
+        try {
+            val k = bb("key-1")
+            val v = bb("value-1")
+            val seq1 = db.put(k.duplicate(), v.duplicate())
+            Assertions.assertTrue(seq1 > 0)
+
+            val got = db.get(k.duplicate())
+            Assertions.assertNotNull(got)
+            Assertions.assertEquals("value-1", toAsciiString(got!!))
+
+            val seq2 = db.delete(k.duplicate())
+            Assertions.assertTrue(seq2 > seq1)
+
+            val gone = db.get(k.duplicate())
+            Assertions.assertNull(gone)
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun compareAndSwap_updateAndDelete() {
+        val db = AkkaraDB.open(AkkaraDB.Options(baseDir = temp.resolve("db2")))
+        try {
+            val k = bb("cas-key")
+            val v1 = bb("v1")
+            val s1 = db.put(k.duplicate(), v1.duplicate())
+            Assertions.assertTrue(s1 > 0)
+
+            // success update
+            val ok = db.compareAndSwap(k.duplicate(), s1, bb("v2").duplicate())
+            Assertions.assertTrue(ok)
+            val g2 = db.get(k.duplicate())
+            Assertions.assertEquals("v2", toAsciiString(g2!!))
+
+            // fail on wrong expected seq
+            val bad = db.compareAndSwap(k.duplicate(), s1, bb("v3").duplicate())
+            Assertions.assertFalse(bad)
+
+            // delete with CAS
+            val s2 = db.lastSeq()
+            val delOk = db.compareAndSwap(k.duplicate(), s2, null)
+            Assertions.assertTrue(delOk)
+            Assertions.assertNull(db.get(k.duplicate()))
+        } finally {
+            db.close()
+        }
+    }
+
+    @Test
+    fun iterator_isLexOrder() {
+        val db = AkkaraDB.open(AkkaraDB.Options(baseDir = temp.resolve("db3")))
+        try {
+            val keys = listOf("a", "a\u0001", "a0", "a9", "b", "ba", "zz")
+            keys.shuffled().forEachIndexed { i, k ->
+                db.put(bb(k), bb("v$i"))
+            }
+            val iter = db.iterator()
+            val got = iter.map { toAsciiString(it.key) }.toList()
+            val sorted = keys.sorted() // byte-wise lex for ASCII is same as String natural order for 0..127
+            Assertions.assertEquals(sorted, got)
+        } finally {
+            db.close()
+        }
+    }
+}
