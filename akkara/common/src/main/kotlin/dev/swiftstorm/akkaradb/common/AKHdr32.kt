@@ -132,12 +132,13 @@ object AKHdr32 {
     /** Pack first up to 8 bytes of [key] into a little-endian 64-bit word (key[0] -> bits 7:0). */
     @JvmStatic
     fun buildMiniKeyLE(key: ByteBufferL): U64 {
-        val dup = key.duplicate()
-        val bb = dup.rawDuplicate()
+        val dup = key.asReadOnlyDuplicate()
+        val cnt = minOf(8, dup.remaining)
         var x = 0L
         var i = 0
-        while (i < 8 && bb.hasRemaining()) {
-            x = x or ((bb.get().toLong() and 0xFFL) shl (8 * i))
+        while (i < cnt) {
+            val b = dup.i8 // relative LE-safe read, returns 0..255
+            x = x or ((b.toLong() and 0xFFL) shl (8 * i))
             i++
         }
         return U64.fromSigned(x)

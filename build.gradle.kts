@@ -18,7 +18,7 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = if (name == "akkaradb") {
-        "0.0.1+dev.1"
+        "0.0.1+dev.3"
     } else {
         "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
