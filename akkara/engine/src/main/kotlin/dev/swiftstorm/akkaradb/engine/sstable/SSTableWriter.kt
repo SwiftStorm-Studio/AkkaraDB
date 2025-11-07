@@ -112,6 +112,10 @@ class SSTableWriter(
      * Finalize the SST by appending Index → Bloom → Footer.
      * Returns offsets and total entry count.
      */
+    /**
+     * Finalize the SST by appending Index → Bloom → Footer.
+     * Returns offsets and total entry count.
+     */
     fun seal(): SealResult {
         // (1) IndexBlock
         val indexOff = ch.position()
@@ -121,12 +125,17 @@ class SSTableWriter(
             idx.writeFully(ch, idx.remaining)
         }
 
-        // (2) BloomFilter (optional)
+        // (2) BloomFilter
         val bloomOff = if (totalEntries > 0) {
-            val off = ch.position()
             val bloom = bloomBuilder.build()
-            bloom.writeTo(ch)
-            off
+            // Safety: skip tiny Bloom filters (header only)
+            if (bloom.byteSize >= 20) {
+                val start = ch.position()
+                bloom.writeTo(ch)
+                start
+            } else {
+                0L
+            }
         } else 0L
 
         // (3) Footer (fixed 32 bytes)
@@ -141,6 +150,7 @@ class SSTableWriter(
         footerBuf.position(0)
         footerBuf.writeFully(ch, AKSSFooter.SIZE)
 
+        // (4) CRC32C over [0..size-4)
         val size = ch.size()
         val limit = size - 4
         require(limit >= 0) { "illegal file size while sealing: $size" }
@@ -156,9 +166,7 @@ class SSTableWriter(
                 val toRead = kotlin.math.min(scratch.capacity.toLong(), limit - total).toInt()
                 scratch.clear()
                 scratch.limit(toRead)
-                // fill scratch completely
                 scratch.readFully(ch, toRead)
-                // update CRC from backing ByteBuffer
                 val bb = scratch.sliceAt(0, toRead)
                 bb.position(0).limit(toRead)
                 crc.update(bb.rawDuplicate())

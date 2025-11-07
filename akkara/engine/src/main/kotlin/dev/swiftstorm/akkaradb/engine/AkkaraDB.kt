@@ -155,7 +155,10 @@ class AkkaraDB private constructor(
         val sealed = stripe.sealIfComplete()
         if (sealed) stripe.flush(FlushMode.SYNC)
         manifest.checkpoint(name = "flush", stripe = stripe.lastSealedStripe, lastSeq = mem.lastSeq())
+        val t0 = System.nanoTime()
         wal.forceSync()
+        val t1 = System.nanoTime()
+        println("fsync took ${(t1 - t0) / 1_000_000.0} ms")
     }
 
     fun lastSeq(): Long = mem.lastSeq()
@@ -180,8 +183,8 @@ class AkkaraDB private constructor(
         val m: Int = 2,
         val flushPolicy: FlushPolicy = FlushPolicy(maxBlocks = 32, maxMicros = 500),
         val fastMode: Boolean = true,
-        val walGroupN: Int = 32,
-        val walGroupMicros: Long = 500,
+        val walGroupN: Int = 64,
+        val walGroupMicros: Long = 1_000,
         val parityCoder: ParityCoder? = null,
         val durableCas: Boolean = false,
     )

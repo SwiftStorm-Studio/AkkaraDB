@@ -312,7 +312,6 @@ class MemTable(
             }
         }
 
-
         private fun sizeOf(r: MemRecord): Long = r.approxSizeBytes.toLong()
 
         private fun triggerIfNeeded(): Boolean {

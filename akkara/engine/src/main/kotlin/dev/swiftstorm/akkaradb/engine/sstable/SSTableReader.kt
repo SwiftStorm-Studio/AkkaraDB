@@ -171,17 +171,20 @@ class SSTableReader(
             indexBuf.position(0).limit(indexLen.toInt())
             val index = IndexBlock.readFrom(indexBuf)
 
-            // Read Bloom (optional)
-            val bloom =
-                if (footer.bloomOff > 0) {
-                    val bloomLen = (size - AKSSFooter.SIZE) - footer.bloomOff
-                    require(bloomLen >= 20) { "bloom length suspicious: $bloomLen" }
+// Read Bloom (optional)
+            val bloom = if (footer.bloomOff > 0) {
+                val bloomLen = (size - AKSSFooter.SIZE) - footer.bloomOff
+                if (bloomLen >= BloomFilter.HEADER_SIZE) {
                     val bloomBuf = ByteBufferL.allocate(bloomLen.toInt())
                     ch.position(footer.bloomOff)
                     bloomBuf.readFully(ch, bloomLen.toInt())
                     bloomBuf.position(0).limit(bloomLen.toInt())
                     BloomFilter.readFrom(bloomBuf)
-                } else null
+                } else {
+                    // too small to be valid → skip
+                    null
+                }
+            } else null
 
             return SSTableReader(ch, footer, index, bloom)
         }

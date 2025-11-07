@@ -22,6 +22,7 @@ package dev.swiftstorm.akkaradb.engine.wal
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import java.io.Closeable
+import java.nio.channels.ClosedChannelException
 import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
@@ -30,6 +31,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.LockSupport
 import kotlin.concurrent.thread
 
 /**
@@ -53,11 +55,19 @@ class WalWriter(
     private data class Item(val lsn: Long, val frame: ByteBufferL, val waiter: Waiter)
     private class Waiter {
         @Volatile
-        var done: Boolean = false
+        var done = false
+        private val thread = Thread.currentThread()
+
         fun await(timeoutMicros: Long) {
-            val end = System.nanoTime() + TimeUnit.MICROSECONDS.toNanos(timeoutMicros.coerceAtLeast(1))
-            while (!done && System.nanoTime() < end) Thread.onSpinWait()
-            while (!done) Thread.yield()
+            val deadline = System.nanoTime() + TimeUnit.MICROSECONDS.toNanos(timeoutMicros)
+            while (!done && System.nanoTime() < deadline) {
+                LockSupport.parkNanos(10_000)
+            }
+        }
+
+        fun signal() {
+            done = true
+            LockSupport.unpark(thread)
         }
     }
 
@@ -88,14 +98,11 @@ class WalWriter(
         val waiter = Waiter()
         q.put(Item(lsn, frame, waiter))
 
-        if (!fastMode) {
-            // Normal: wait until fsync has included this LSN
-            waiter.await(timeoutMicros = groupTmicros * 10)
-        }
-        // ──────────────────────
+        if (!fastMode) waiter.await(timeoutMicros = groupTmicros)
 
         return lsn
     }
+
 
     fun forceSync() {
         if (!running.get() || !ch.isOpen) return
@@ -112,10 +119,15 @@ class WalWriter(
 
     override fun close() {
         if (!running.getAndSet(false)) return
-        flusher.interrupt()
-        runCatching { flusher.join() }
-        runCatching { ch.force(false) }
-        runCatching { ch.close() }
+
+        q.offer(Item(-1, ByteBufferL.allocate(0), Waiter().apply { done = true }))
+
+        flusher.join(2000)
+
+        synchronized(ch) {
+            runCatching { ch.force(false) }
+            runCatching { ch.close() }
+        }
     }
 
     // ─────────── internals ───────────
@@ -127,37 +139,36 @@ class WalWriter(
 
     private fun flushLoop() {
         val batch = ArrayList<Item>(groupN.coerceAtLeast(1))
-        while (running.get() || q.isNotEmpty()) {
-            try {
-                // Wait up to Tµs for first item (or grab immediately if present)
+        try {
+            while (running.get() || q.isNotEmpty()) {
                 val first = q.poll(groupTmicros, TimeUnit.MICROSECONDS) ?: continue
+                if (first.lsn < 0) break
+
                 batch.add(first)
                 q.drainTo(batch, groupN - 1)
 
-                // write batch
-                for (it in batch) {
-                    val bb = it.frame.rawDuplicate()
-                    while (bb.hasRemaining()) ch.write(bb)
-                    io.release(it.frame)
+                synchronized(ch) {
+                    for (it in batch) {
+                        val bb = it.frame.rawDuplicate()
+                        while (bb.hasRemaining()) ch.write(bb)
+                        io.release(it.frame)
+                    }
+                    ch.force(false)
                 }
-                ch.force(false) // durable group commit
 
-                // acknowledge
-                for (it in batch) it.waiter.done = true
+                for (it in batch) {
+                    it.waiter.done = true
+                    it.waiter.signal()
+                }
                 batch.clear()
-            } catch (_: InterruptedException) {
-                break
+            }
+        } catch (e: ClosedChannelException) {
+            if (running.get()) throw e
+        } finally {
+            runCatching {
+                synchronized(ch) { ch.force(false) }
             }
         }
-        // drain rest
-        while (true) {
-            val it = q.poll() ?: break
-            val bb = it.frame.rawDuplicate()
-            while (bb.hasRemaining()) ch.write(bb)
-            io.release(it.frame)
-            it.waiter.done = true
-        }
-        runCatching { ch.force(false) }
     }
 
     /** Truncate WAL file to zero length. Intended to be called after a durable checkpoint. */

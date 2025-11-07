@@ -130,7 +130,7 @@ class BloomFilter private constructor(
         private const val OFF_PAD = 6
         private const val OFF_MBITS = 8
         private const val OFF_SEED = 12
-        private const val HEADER_SIZE = 20
+        internal const val HEADER_SIZE = 20
 
         operator fun invoke(
             expectedInsertions: Long,
@@ -140,9 +140,19 @@ class BloomFilter private constructor(
         ): Builder {
             require(expectedInsertions > 0) { "expectedInsertions must be positive" }
             require(fpRate in 1e-9..0.5) { "fpRate out of range" }
+
             val rawBits = optimalBits(expectedInsertions, fpRate)
             val mBits = if (roundBitsToPow2) roundUpPow2(rawBits) else rawBits.toInt().coerceAtLeast(64)
-            val k = optimalHashes(mBits, expectedInsertions)
+            var k = optimalHashes(mBits, expectedInsertions)
+
+            // Safety clamp: never allow unrealistic hash counts
+            if (k < 1) k = 1
+            else if (k > 16) {
+                // logarithmic degradation: cap at 16 but print a warning
+                println("[BloomFilter] WARN: excessive k=$k for mBits=$mBits, entries=$expectedInsertions; clamped to 16")
+                k = 16
+            }
+
             return Builder(mBits, k, seed.raw)
         }
 

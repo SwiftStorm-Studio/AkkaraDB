@@ -82,7 +82,6 @@ class AkkStripeReader(
         val stripe = nextStripeIndex
         val off = stripe * blockSize.toLong()
 
-        // 事前にサイズが分かっているので Array を使って割り当て回数を最小化
         val dataBufs = arrayOfNulls<ByteBufferL>(k)
         val parityBufs = arrayOfNulls<ByteBufferL>(m)
 

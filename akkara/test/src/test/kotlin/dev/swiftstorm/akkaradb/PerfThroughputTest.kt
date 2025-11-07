@@ -33,7 +33,7 @@ class PerfThroughputTest {
 
     @Test
     fun writeThroughputAndLatency() {
-        val N = System.getProperty("akk.perf.N")?.toIntOrNull() ?: 100_000
+        val N = System.getProperty("akk.perf.N")?.toIntOrNull() ?: 1_000_000
         val valueSize = System.getProperty("akk.perf.valueSize")?.toIntOrNull() ?: 64
 
         val db = AkkaraDB.open(
@@ -42,8 +42,8 @@ class PerfThroughputTest {
                 k = 4,
                 m = 1,
                 fastMode = true,
-                walGroupN = 256,
-                walGroupMicros = 12_000,
+                walGroupN = 512,
+                walGroupMicros = 50_000,
             )
         )
 
@@ -92,7 +92,7 @@ class PerfThroughputTest {
                 m = 1,
                 fastMode = true,
                 walGroupN = 256,
-                walGroupMicros = 12_000,
+                walGroupMicros = 50_000,
             )
         )
 
