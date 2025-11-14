@@ -292,8 +292,7 @@ class ByteBufferL private constructor(
         set(v) {
             LE.cursor(buf).putU64(v)
         }
-
-
+    
     var f32: Float
         get() = relGetFloat()
         set(v) = relPutFloat(v)
@@ -573,3 +572,30 @@ fun ByteBufferL.putAscii(s: String): ByteBufferL {
     }
     return this
 }
+
+fun ByteBufferL.debugString(limit: Int = Int.MAX_VALUE / 4): String {
+    val sb = StringBuilder()
+    for (i in 0 until minOf(limit, remaining)) {
+        sb.append(String.format("%02X ", i8))
+    }
+    if (remaining > 0) sb.append("...")
+    return sb.toString()
+}
+
+val ByteBufferL.hex: String
+    get() {
+        val sb = StringBuilder(remaining * 2)
+        val bb = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val p0 = bb.position()
+        val p1 = bb.limit()
+        var p = p0
+        while (p < p1) {
+            val b = LE.getU8(bb, p)
+            sb.append(HEX[(b ushr 4) and 0xF])
+            sb.append(HEX[b and 0xF])
+            p++
+        }
+        return sb.toString()
+    }
+
+private val HEX = "0123456789ABCDEF".toCharArray()

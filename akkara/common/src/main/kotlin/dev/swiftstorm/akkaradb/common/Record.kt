@@ -119,7 +119,7 @@ fun lexCompare(a: ByteBufferL, b: ByteBufferL): Int {
     val n = minOf(aa.remaining, bb.remaining)
     var i = 0
     while (i < n) {
-        val da = aa.i8          // 0..255 and advances
+        val da = aa.i8
         val db = bb.i8
         if (da != db) return da - db
         i++

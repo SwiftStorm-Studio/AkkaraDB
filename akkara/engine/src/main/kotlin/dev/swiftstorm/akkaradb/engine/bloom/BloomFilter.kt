@@ -196,8 +196,11 @@ class BloomFilter private constructor(
         private fun optimalBits(n: Long, p: Double): Long =
             ceil(-n * ln(p) / LN2_SQ).toLong().coerceAtLeast(64)
 
-        private fun optimalHashes(mBits: Int, n: Long): Int =
-            max(2, (mBits / n.toDouble() * LN2).roundToInt())
+        private fun optimalHashes(mBits: Int, n: Long): Int {
+            // optimal k is the best number of hash functions for the bloom filter
+            val k = (mBits.toDouble() / n * LN2).roundToInt()
+            return max(2, k)
+        }
 
         private fun isPow2(x: Int): Boolean = x > 0 && (x and (x - 1)) == 0
         private fun roundUpPow2(x: Long): Int {
