@@ -165,7 +165,7 @@ class PerfThroughputTest {
     @Test
     fun readFromSSTable() {
         try {
-            val N = System.getProperty("akk.perf.N")?.toIntOrNull() ?: 10000
+            val N = System.getProperty("akk.perf.N")?.toIntOrNull() ?: 100000
             val valueSize = System.getProperty("akk.perf.valueSize")?.toIntOrNull() ?: 64
 
             val base = temp.resolve("perf-sst")

@@ -99,19 +99,19 @@ Hardware: NVMe SSD, Intel i5-12500H, JDK 21, Linux (Lubuntu).
 
 ---
 
-### Read Performance (Memory-Hit)
+# Read Performance
 
-| bench |       N | valueSize |     ops/sec | p50 (µs) | p90 (µs) | p99 (µs) | Notes                 |
-|:------|--------:|----------:|------------:|---------:|---------:|---------:|:----------------------|
-| read  | 100 000 |      64 B | **362 152** |  **1.0** |  **2.0** | **12.1** | MemTable hit (no I/O) |
+| Path      | bench    |       N | valueSize |       ops/sec | p50 (µs) | p90 (µs) | p99 (µs) | Notes                     |
+|:----------|:---------|--------:|----------:|--------------:|---------:|---------:|---------:|:--------------------------|
+| In-Memory | read     | 100 000 |      64 B |   **362 152** |  **1.0** |  **2.0** | **12.1** | MemTable hit (no I/O)     |
+| SST (hot) | read-sst | 100 000 |      64 B | **70 594.85** | **11.8** | **17.8** | **34.0** | SST read, block-cache hot |
 
 **Summary**
 
-- Pure in-memory lookups reach ~360 k ops/s.
-- Latency dominated by key lookup and Bloom/Index check (< 2 µs typical).
-- Disk I/O not triggered; read path is CPU-bound.
+- In-memory lookups are fully CPU-bound and reach very high throughput with minimal latency.
+- SST reads show stable, low-latency performance with the block cache warmed.
+- Both paths exhibit consistent behavior across large key counts.
 
----
 
 ### Overall Evaluation
 

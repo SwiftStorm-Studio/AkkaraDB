@@ -292,7 +292,7 @@ class ByteBufferL private constructor(
         set(v) {
             LE.cursor(buf).putU64(v)
         }
-    
+
     var f32: Float
         get() = relGetFloat()
         set(v) = relPutFloat(v)
@@ -581,6 +581,19 @@ fun ByteBufferL.debugString(limit: Int = Int.MAX_VALUE / 4): String {
     if (remaining > 0) sb.append("...")
     return sb.toString()
 }
+
+fun ByteBufferL.toByteArray(): ByteArray {
+    val n = remaining
+    val dst = ByteArray(n)
+
+    val dup = buf.duplicate()
+    dup.limit(buf.limit()).position(buf.position())
+
+    dup.get(dst, 0, n)
+
+    return dst
+}
+
 
 val ByteBufferL.hex: String
     get() {

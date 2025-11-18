@@ -36,7 +36,7 @@ import kotlin.io.path.notExists
 
 class SSTCompactor(
     private val baseDir: Path,
-    private val maxPerLevel: Int = Int.MAX_VALUE,
+    private val maxPerLevel: Int = 4,
     private val seqClock: ((seq: Long) -> Long?)? = null,
     private val manifest: dev.swiftstorm.akkaradb.engine.manifest.AkkManifest? = null,
 ) {

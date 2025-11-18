@@ -86,9 +86,21 @@ class IndexBlock private constructor(
      */
     fun lookup32(targetKey32: ByteArray): Long {
         val idx = lowerBound32(targetKey32)
+
+        // case 1: target < firstKey0 → not present
         if (idx == 0 && compareKeyAt(0, targetKey32) > 0) return -1L
-        val hit = if (idx == count) count - 1 else idx
-        return blockOffAt(hit)
+
+        // case 2: idx == count → search in last block
+        if (idx == count) return blockOffAt(count - 1)
+
+        // case 3a: exact match → block idx
+        if (compareKeyAt(idx, targetKey32) == 0) return blockOffAt(idx)
+
+        // case 3b: target is between block[idx-1] .. block[idx]
+        if (idx > 0) return blockOffAt(idx - 1)
+
+        // fallback: should not arrive here
+        return blockOffAt(0)
     }
 
     /** Lookup for a variable-length key: internally normalized to 32 B. */

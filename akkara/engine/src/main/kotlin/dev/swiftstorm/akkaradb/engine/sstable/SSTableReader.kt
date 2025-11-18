@@ -23,6 +23,7 @@ package dev.swiftstorm.akkaradb.engine.sstable
 
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.lexCompare
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
 import dev.swiftstorm.akkaradb.engine.sstable.bs.UnpackerBlockSearcher
 import dev.swiftstorm.akkaradb.engine.util.IndexBlock
@@ -57,7 +58,7 @@ class SSTableReader(
     /** Point lookup. Returns a LE-safe value slice (zero-copy) or null. */
     fun get(key: ByteBufferL): ByteBufferL? {
         // Fast Bloom reject (if present)
-        if (bloom != null && !bloom.mightContain(key)) return null
+        //if (bloom != null && !bloom.mightContain(key)) return null
 
         // Locate candidate block via external index
         val blockOff = index.lookup(key)
@@ -82,7 +83,7 @@ class SSTableReader(
             for ((k, v) in searcher.iter(block.buf, startKey)) {
                 if (endKey != null) {
                     // stop when k >= endKey
-                    val cmp = dev.swiftstorm.akkaradb.common.lexCompare(k, endKey)
+                    val cmp = lexCompare(k, endKey)
                     if (cmp >= 0) return@sequence
                 }
                 yield(k to v)
