@@ -30,7 +30,10 @@ import dev.swiftstorm.akkaradb.engine.wal.WalOp
 import dev.swiftstorm.akkaradb.engine.wal.WalReplay
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
 import dev.swiftstorm.akkaradb.format.akk.AkkBlockPacker
+import dev.swiftstorm.akkaradb.format.akk.AkkBlockUnpacker
+import dev.swiftstorm.akkaradb.format.akk.AkkStripeReader
 import dev.swiftstorm.akkaradb.format.akk.AkkStripeWriter
+import dev.swiftstorm.akkaradb.format.akk.coder
 import dev.swiftstorm.akkaradb.format.akk.parity.DualXorParityCoder
 import dev.swiftstorm.akkaradb.format.akk.parity.NoParityCoder
 import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
@@ -60,10 +63,14 @@ class AkkaraDB private constructor(
     private val wal: WalWriter,
     private val mem: MemTable,
     private val manifest: AkkManifest,
-    private val stripe: AkkStripeWriter,
+    private val stripeW: AkkStripeWriter,
+    private val stripeR: AkkStripeReader?,
     private val readers: ConcurrentLinkedDeque<SSTableReader>,
     private val durableCas: Boolean,
+    private val useStripeForRead: Boolean
 ) : Closeable {
+
+    private val unpacker = AkkBlockUnpacker()
 
     // ---------------- API ----------------
 
@@ -111,6 +118,8 @@ class AkkaraDB private constructor(
             val v = r.get(key)
             if (v != null) return v
         }
+        // 3) Stripe fallback
+        if (useStripeForRead) stripeFallbackLookup(key)?.let { return it }
         return null
     }
 
@@ -152,9 +161,9 @@ class AkkaraDB private constructor(
     /** Best-effort flush: hint MemTable, seal any complete stripes, and checkpoint manifest. */
     fun flush() {
         mem.flushHint()
-        val sealed = stripe.sealIfComplete()
-        if (sealed) stripe.flush(FlushMode.SYNC)
-        manifest.checkpoint(name = "flush", stripe = stripe.lastSealedStripe, lastSeq = mem.lastSeq())
+        val sealed = stripeW.sealIfComplete()
+        if (sealed) stripeW.flush(FlushMode.SYNC)
+        manifest.checkpoint(name = "flush", stripe = stripeW.lastSealedStripe, lastSeq = mem.lastSeq())
         wal.forceSync()
     }
 
@@ -165,11 +174,38 @@ class AkkaraDB private constructor(
             flush()
         } finally {
             runCatching { mem.close() }
-            runCatching { stripe.close() }
+            runCatching { stripeW.close() }
             runCatching { readers.forEach { it.close() } }
             runCatching { manifest.close() }
             runCatching { wal.close() }
         }
+    }
+
+    private fun stripeFallbackLookup(key: ByteBufferL): ByteBufferL? {
+        val kdup = key.duplicate()
+
+        var stripeIndex = 0L
+        while (true) {
+            val stripeBlock = stripeR?.readStripe() ?: break
+
+            for (block in stripeBlock.payloads) {
+                val cursor = unpacker.cursor(block)
+
+                while (cursor.hasNext()) {
+                    val rec = cursor.next()
+
+                    if (lexCompare(rec.key, kdup) == 0) {
+                        // tombstone
+                        if (rec.flags and 1 != 0) return null
+                        return rec.value
+                    }
+                }
+            }
+
+            stripeIndex++
+        }
+
+        return null
     }
 
     // ---------------- factory ----------------
@@ -184,6 +220,7 @@ class AkkaraDB private constructor(
         val walGroupMicros: Long = 1_000,
         val parityCoder: ParityCoder? = null,
         val durableCas: Boolean = false,
+        val useStripeForRead: Boolean = false,
     )
 
     companion object {
@@ -350,10 +387,44 @@ class AkkaraDB private constructor(
             // Recovery: WAL → MemTable
             WalReplay.replay(walPath, mem)
 
+            runCatching {
+                val rec = stripe.recover()
+                if (rec.truncatedTail) {
+                    // Truncated partial blocks: enforce exact truncation
+                    val last = rec.lastSealed
+                    val exactSize = if (last >= 0) (last + 1) * stripe.blockSize.toLong() else 0L
+                    // truncate all lanes to same size
+                    for (ch in stripe.dataChannels()) ch.truncate(exactSize)
+                    for (ch in stripe.parityChannels()) ch.truncate(exactSize)
+                }
+
+                // Optionally, update manifest state
+                manifest.checkpoint(
+                    name = "stripeRecover",
+                    stripe = rec.lastDurable,
+                    lastSeq = mem.lastSeq()
+                )
+            }.onFailure { error("AkkStripeWriter recover failed: $it") }
+
             // Load existing SSTs from all levels (newest-first)
             rebuildReaders(readersDeque)
 
-            return AkkaraDB(base, wal, mem, manifest, stripe, readersDeque, durableCas = opts.durableCas)
+            val stripeReader =
+                if (opts.useStripeForRead)
+                    AkkStripeReader(opts.k, opts.m, laneDir, pool, stripe.coder())
+                else null
+
+            return AkkaraDB(
+                base,
+                wal,
+                mem,
+                manifest,
+                stripe,
+                stripeReader,
+                readersDeque,
+                opts.durableCas,
+                opts.useStripeForRead
+            )
         }
 
         private fun ByteBufferL.readAllBytes(): ByteArray {

@@ -56,7 +56,8 @@ class AkkStripeWriter(
     override val m: Int,
     laneDir: Path,
     private val pool: BufferPool,
-    private val coder: ParityCoder = when (m) {
+    @PublishedApi
+    internal val coder: ParityCoder = when (m) {
         0 -> NoParityCoder()
         1 -> XorParityCoder()
         2 -> DualXorParityCoder()
@@ -330,7 +331,45 @@ class AkkStripeWriter(
     }
 
     override fun recover(): RecoveryResult {
-        return RecoveryResult(lastSealedStripe, lastDurableStripe, false)
+        ensureOpen()
+
+        var minStripes: Long = Long.MAX_VALUE
+        var truncatedTail = false
+
+        // ---- check data lanes ----
+        for (ch in dataCh) {
+            val size = ch.size()
+            if (size % blockSize != 0L) truncatedTail = true
+            val stripes = size / blockSize
+            if (stripes < minStripes) minStripes = stripes
+        }
+
+        // ---- check parity lanes ----
+        for (ch in parityCh) {
+            val size = ch.size()
+            if (size % blockSize != 0L) truncatedTail = true
+            val stripes = size / blockSize
+            if (stripes < minStripes) minStripes = stripes
+        }
+
+        if (minStripes == Long.MAX_VALUE) {
+            lastSealedStripe = -1
+            lastDurableStripe = -1
+            pendingInStripe = 0
+            return RecoveryResult(-1, -1, truncatedTail)
+        }
+
+        val last = minStripes - 1
+
+        lastSealedStripe = last
+        lastDurableStripe = last
+
+        pendingInStripe = 0
+        for (i in 0 until k) stage[i] = null
+        commitQ.clear()
+        pendingCommits.set(0)
+
+        return RecoveryResult(lastSealedStripe, lastDurableStripe, truncatedTail)
     }
 
     override fun metrics(): StripeMetricsSnapshot = StripeMetricsSnapshot(
@@ -343,6 +382,9 @@ class AkkStripeWriter(
         fsyncMicros = fsyncMicros.get(),
         maxBackpressureMicros = backpressureMaxMicros.get()
     )
+
+    fun dataChannels(): Array<FileChannel> = dataCh
+    fun parityChannels(): Array<FileChannel> = parityCh
 
     override fun close() {
         if (closed.compareAndSet(false, true)) {
@@ -402,3 +444,6 @@ class AkkStripeWriter(
         return (x + (pow2 - 1)) and (pow2 - 1).inv()
     }
 }
+
+// Helper for AkkaraDB
+fun AkkStripeWriter.coder(): ParityCoder = coder
