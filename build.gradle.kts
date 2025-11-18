@@ -17,10 +17,10 @@ allprojects {
     apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
 
     group = "dev.swiftstorm"
-    version = if (name == "akkaradb") {
-        "0.0.1+dev.3"
-    } else {
-        "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
+    version = when (name) {
+        "akkaradb" -> "0.0.1+rc.3"
+        "akkara-plugin" -> "0.0.1+rc.1"
+        else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
 
@@ -113,5 +113,9 @@ subprojects {
     tasks.named<Jar>("jar") {
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
         archiveClassifier.set("")
+    }
+
+    tasks.named<Jar>("sourcesJar") {
+        from(sourceSets["main"].allSource)
     }
 }

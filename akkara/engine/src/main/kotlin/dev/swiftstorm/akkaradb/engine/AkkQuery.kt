@@ -113,8 +113,8 @@ fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
                     else -> error("Unreachable")
                 }
             }
-            @Suppress("UNCHECKED_CAST")
-            if (l is Comparable<*> && r::class == l::class) {
+            if (l is Comparable<*> && l::class == r::class) {
+                @Suppress("UNCHECKED_CAST")
                 return (l as Comparable<Any>).compareTo(r)
             }
             error("Unsupported compare: ${l::class.simpleName} vs ${r::class.simpleName}")

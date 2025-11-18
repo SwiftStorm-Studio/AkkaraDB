@@ -1,4 +1,5 @@
 @file:OptIn(FirIncompatiblePluginAPI::class, UnsafeDuringIrConstructionAPI::class)
+@file:Suppress("unused", "PrivatePropertyName", "DuplicatedCode", "SameParameterValue")
 
 package dev.swiftstorm.akkaradb.plugin
 
@@ -71,7 +72,7 @@ private class QueryCallRewriter(
     private val symAkkLitCtor by lazy { requirePrimaryCtor(fqLit) }
     private val symAkkBinCtor by lazy { requirePrimaryCtor(fqBin) }
     private val symAkkUnCtor by lazy { requirePrimaryCtor(fqUn) }
-    private val symAkkOp by lazy { ctx.referenceClass(fqOp) ?: error("AkkOp not found") }
+    private val symAkkOp by lazy { ctx.referenceClass(ClassId.topLevel(fqOp)) ?: error("AkkOp not found") }
 
     // AkkOp entries we currently use
     private val opEQ by lazy { enumEntry(symAkkOp, "EQ") }
@@ -124,10 +125,62 @@ private class QueryCallRewriter(
      * Limited set (==, !=, !, literals, already-AkkExpr) for the first cut.
      */
     private fun rewriteExpr(expr: IrExpression): IrExpression {
-        if (expr.type.isAkkExprType()) return expr.apply { transformChildren(thisAsTransformer(), null) }
+        // Already an AkkExpr<T> → only rewrite children
+        if (expr.type.isAkkExprType())
+            return expr.apply { transformChildren(thisAsTransformer(), null) }
 
+        // ----------- Literals -----------
         if (expr is IrConst) return newAkkLit(expr)
 
+        // ----------- Property access: IrGetField → AkkCol -----------
+        if (expr is IrGetField) {
+            val propName = expr.symbol.owner.name.asString()
+            val call = IrConstructorCallImpl.fromSymbolOwner(
+                startOffset = expr.startOffset,
+                endOffset = expr.endOffset,
+                type = ctx.referenceClass(ClassId.topLevel(fqCol))?.owner?.defaultType
+                    ?: error("AkkCol not found"),
+                constructorSymbol = requirePrimaryCtor(fqCol)
+            )
+            // <T> AkkCol<T>(table=null, name="field")
+            call.typeArguments[0] = expr.type
+            call.arguments[0] = IrConstImpl.constNull(
+                expr.startOffset, expr.endOffset, ctx.irBuiltIns.stringType
+            )
+            call.arguments[1] = IrConstImpl.string(
+                expr.startOffset, expr.endOffset, ctx.irBuiltIns.stringType, propName
+            )
+            return call
+        }
+
+        // ----------- Value access: IrGetValue (lambda params) -----------
+        if (expr is IrGetValue) {
+            // If it is a property reference captured into a temporary, resolve name
+            val symbol = expr.symbol
+            val name = symbol.owner.name.asString()
+
+            // Filter out lambda params & local vars → not columns
+            if (name != "this" && !name.startsWith("$")) {
+                val call = IrConstructorCallImpl.fromSymbolOwner(
+                    startOffset = expr.startOffset,
+                    endOffset = expr.endOffset,
+                    type = ctx.referenceClass(ClassId.topLevel(fqCol))?.owner?.defaultType
+                        ?: error("AkkCol not found"),
+                    constructorSymbol = requirePrimaryCtor(fqCol)
+                )
+                call.typeArguments[0] = expr.type
+                call.arguments[0] = IrConstImpl.constNull(
+                    expr.startOffset, expr.endOffset, ctx.irBuiltIns.stringType
+                )
+                call.arguments[1] = IrConstImpl.string(
+                    expr.startOffset, expr.endOffset, ctx.irBuiltIns.stringType, name
+                )
+                return call
+            }
+            // Otherwise → ignore (local variable etc.)
+        }
+
+        // ----------- Equality comparisons -----------
         if (expr is IrCall) {
             val sym = expr.symbol
 
@@ -150,6 +203,7 @@ private class QueryCallRewriter(
                 }
             }
 
+            // ----------- Comparisons < > <= >= -----------
             fun match(opMap: Map<IrClassifierSymbol, IrSimpleFunctionSymbol>, akkName: String): IrExpression? {
                 val recv = expr.dispatchReceiver ?: return null
                 val arg0 = expr.arguments.getOrNull(0) ?: return null
@@ -164,32 +218,16 @@ private class QueryCallRewriter(
             match(ctx.irBuiltIns.greaterOrEqualFunByOperandType, "GE")?.let { return it }
         }
 
+        // ----------- Unary NOT -----------
         if (expr is IrCall &&
             expr.symbol.owner.name.asString() == "not" &&
             expr.type == ctx.irBuiltIns.booleanType
         ) {
-            val recv = expr.dispatchReceiver as? IrCall
-            if (recv != null &&
-                (recv.symbol == ctx.irBuiltIns.eqeqSymbol ||
-                        recv.symbol == ctx.irBuiltIns.eqeqeqSymbol ||
-                        recv.symbol in ctx.irBuiltIns.ieee754equalsFunByOperandType.values)
-            ) {
-                val lhs0 = recv.arguments.getOrNull(0)!!
-                val rhs0 = recv.arguments.getOrNull(1)!!
-                val lhs = rewriteExpr(lhs0)
-                val rhs = rewriteExpr(rhs0)
-
-                val lhsIsNull = lhs0 is IrConst && lhs0.kind == IrConstKind.Null
-                val rhsIsNull = rhs0 is IrConst && rhs0.kind == IrConstKind.Null
-                if (rhsIsNull) return newAkkUn(opIS_NOT_NULL, lhs)
-                if (lhsIsNull) return newAkkUn(opIS_NOT_NULL, rhs)
-                return newAkkBin(opNEQ, lhs, rhs)
-            }
-
             val recvAny = expr.dispatchReceiver ?: return expr
             return newAkkUn(opNOT, rewriteExpr(recvAny))
         }
 
+        // ----------- When(Boolean) → AND/OR desugaring -----------
         if (expr is IrWhen && expr.type == ctx.irBuiltIns.booleanType && expr.branches.size == 2) {
             val condRaw = expr.branches[0].condition
             val thenRaw = expr.branches[0].result
@@ -203,12 +241,14 @@ private class QueryCallRewriter(
                 return newAkkBin(enumEntry(symAkkOp, "AND"), rewriteExpr(condRaw), rewriteExpr(thenRaw))
         }
 
-        return when (expr) {
-            is IrGetValue, is IrGetField, is IrCall, is IrWhen, is IrTypeOperatorCall, is IrVararg -> {
-                expr.transformChildren(thisAsTransformer(), null); expr
-            }
-            else -> newAkkLit(Unit)
+        // ----------- Children transform only -----------
+        if (expr is IrGetValue || expr is IrCall || expr is IrWhen || expr is IrTypeOperatorCall || expr is IrVararg) {
+            expr.transformChildren(thisAsTransformer(), null)
+            return expr
         }
+
+        // ----------- Everything else: treat as literal null -----------
+        return newAkkLit(null)
     }
 
     // ───────────── helpers for IR construction ─────────────

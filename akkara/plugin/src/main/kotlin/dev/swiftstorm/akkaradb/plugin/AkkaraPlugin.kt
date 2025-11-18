@@ -82,8 +82,8 @@ class AkkaraGradlePlugin : Plugin<Project>, KotlinCompilerPluginSupportPlugin {
     // ---- KotlinCompilerPluginSupportPlugin ----
 
     override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean {
-        // Apply only when a published version exists. Limit to JVM targets (incl. Android JVM & KMP JVM).
-        return publishedVersion != null && kotlinCompilation.target.platformType == KotlinPlatformType.jvm
+        return publishedVersion != null &&
+                kotlinCompilation.target.platformType == KotlinPlatformType.jvm
     }
 
     override fun getCompilerPluginId(): String = COMPILER_PLUGIN_ID

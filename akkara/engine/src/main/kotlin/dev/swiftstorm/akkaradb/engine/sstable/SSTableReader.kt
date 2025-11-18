@@ -25,7 +25,7 @@ import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.lexCompare
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
-import dev.swiftstorm.akkaradb.engine.sstable.bs.UnpackerBlockSearcher
+import dev.swiftstorm.akkaradb.engine.sstable.bs.StandardBlockSearcher
 import dev.swiftstorm.akkaradb.engine.util.IndexBlock
 import java.io.Closeable
 import java.nio.ByteBuffer
@@ -47,7 +47,7 @@ class SSTableReader(
     private val index: IndexBlock,
     private val bloom: BloomFilter?,
     private val cache: BlockCache = BlockCache(512),
-    private val searcher: BlockSearcher = UnpackerBlockSearcher
+    private val searcher: BlockSearcher = StandardBlockSearcher
 ) : Closeable {
 
     /** Close underlying channel (caller may choose to not hand ownership; this closes it). */

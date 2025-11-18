@@ -38,6 +38,21 @@ tasks.jar {
     archiveClassifier.set("thin")
 }
 
+tasks.named<Jar>("sourcesJar") {
+    from(files())
+
+    listOf(
+        project(":akkara-common"),
+        project(":akkara-format-api"),
+        project(":akkara-format-akk"),
+        project(":akkara-engine")
+    ).forEach { sub ->
+        from(sub.the<SourceSetContainer>()["main"].allSource)
+    }
+
+    archiveClassifier.set("sources")
+}
+
 // ===== Publish guard: skip if same version already exists on repo =====
 tasks.withType<PublishToMavenRepository>().configureEach {
     onlyIf {
