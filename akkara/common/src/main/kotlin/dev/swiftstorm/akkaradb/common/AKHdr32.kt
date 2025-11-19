@@ -51,7 +51,7 @@ import kotlin.math.min
 object AKHdr32 {
 
     /** Default deterministic seed for SipHash-2-4 used to derive keyFP64. */
-    val DEFAULT_SIPHASH_SEED: U64 = U64.ZERO
+    val DEFAULT_SIPHASH_SEED: U64 = U64.fromSigned(0x5AD6DCD676D23C25L)
 
     const val SIZE = 32
     const val OFF_KLEN = 0
@@ -167,13 +167,15 @@ object AKHdr32 {
         var v2 = 0x6c7967656e657261L xor k0
         var v3 = 0x7465646279746573L xor k1
 
-        val dup = key.duplicate()
-        val bb = dup.rawDuplicate()
+        // duplicate buffer without modifying original position/limit
+        val bb = key.buf.duplicate().order(java.nio.ByteOrder.LITTLE_ENDIAN)
         val n = bb.remaining()
 
+        // ---- process full 8-byte blocks ----
         while (bb.remaining() >= 8) {
-            val mi = bb.long  // LE
+            val mi = bb.long  // LE (ByteBufferL guarantees LITTLE_ENDIAN)
             v3 = v3 xor mi
+
             repeat(2) {
                 v0 += v1; v2 += v3
                 v1 = (v1 shl 13) or (v1 ushr 51); v3 = (v3 shl 16) or (v3 ushr 48)
@@ -184,51 +186,23 @@ object AKHdr32 {
                 v1 = v1 xor v2; v3 = v3 xor v0
                 v2 = (v2 shl 32) or (v2 ushr 32)
             }
+
             v0 = v0 xor mi
         }
 
+        // ---- last 1..7 bytes (LE, from the END) ----
         var b = (n.toLong() and 0xFF) shl 56
-        when (bb.remaining()) {
-            7 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
-                b = b or ((bb.get().toLong() and 0xFF) shl 32); b = b or ((bb.get().toLong() and 0xFF) shl 40)
-                b = b or ((bb.get().toLong() and 0xFF) shl 48)
-            }
+        val rem = bb.remaining()
 
-            6 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
-                b = b or ((bb.get().toLong() and 0xFF) shl 32); b = b or ((bb.get().toLong() and 0xFF) shl 40)
-            }
+        if (rem > 0) b = b or ((bb.get(bb.position() + rem - 1).toLong() and 0xFF) shl 0)
+        if (rem > 1) b = b or ((bb.get(bb.position() + rem - 2).toLong() and 0xFF) shl 8)
+        if (rem > 2) b = b or ((bb.get(bb.position() + rem - 3).toLong() and 0xFF) shl 16)
+        if (rem > 3) b = b or ((bb.get(bb.position() + rem - 4).toLong() and 0xFF) shl 24)
+        if (rem > 4) b = b or ((bb.get(bb.position() + rem - 5).toLong() and 0xFF) shl 32)
+        if (rem > 5) b = b or ((bb.get(bb.position() + rem - 6).toLong() and 0xFF) shl 40)
+        if (rem > 6) b = b or ((bb.get(bb.position() + rem - 7).toLong() and 0xFF) shl 48)
 
-            5 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
-                b = b or ((bb.get().toLong() and 0xFF) shl 32)
-            }
-
-            4 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-                b = b or ((bb.get().toLong() and 0xFF) shl 16); b = b or ((bb.get().toLong() and 0xFF) shl 24)
-            }
-
-            3 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-                b = b or ((bb.get().toLong() and 0xFF) shl 16)
-            }
-
-            2 -> {
-                b = b or (bb.get().toLong() and 0xFF); b = b or ((bb.get().toLong() and 0xFF) shl 8)
-            }
-
-            1 -> {
-                b = b or (bb.get().toLong() and 0xFF)
-            }
-
-            0 -> {}
-        }
-
+        // ---- final compression ----
         v3 = v3 xor b
         repeat(2) {
             v0 += v1; v2 += v3
@@ -253,6 +227,7 @@ object AKHdr32 {
             v1 = v1 xor v2; v3 = v3 xor v0
             v2 = (v2 shl 32) or (v2 ushr 32)
         }
+
         return U64.fromSigned(v0 xor v1 xor v2 xor v3)
     }
 

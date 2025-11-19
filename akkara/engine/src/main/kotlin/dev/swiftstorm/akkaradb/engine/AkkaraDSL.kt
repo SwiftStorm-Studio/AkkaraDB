@@ -22,7 +22,6 @@
 package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
-import dev.swiftstorm.akkaradb.common.ShortUUID
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
 import dev.swiftstorm.akkaradb.common.putAscii
@@ -167,7 +166,11 @@ private fun AkkDSLCfgBuilder.configureUltraFast() {
 
 // ---- PackedTable ----
 
-class PackedTable<T : Any>(val db: AkkaraDB, internal val kClass: KClass<T>) : Closeable {
+class PackedTable<T : Any>(
+    val db: AkkaraDB,
+    internal val kClass: KClass<T>
+) : Closeable {
+
     override fun close() {
         db.close()
     }
@@ -179,48 +182,36 @@ class PackedTable<T : Any>(val db: AkkaraDB, internal val kClass: KClass<T>) : C
     }
 
     companion object {
-        private const val SEP: Char = 0x1F.toChar() // ASCII unit separator
+        private const val SEP: Char = 0x1F.toChar() // unused now, preserved for safety
         private val EMPTY: ByteBufferL = ByteBufferL.allocate(0)
     }
 
-    private fun String.isAsciiNoSep(): Boolean = all { it.code in 0..0x7F } && indexOf(SEP) == -1
+    private fun String.isAscii(): Boolean =
+        all { it.code in 0..0x7F }
 
     /**
-     * Builds a contiguous key buffer: [namespace][id ASCII][SEP][uuid].
+     * Build key buffer:
+     *   [namespace][id ASCII]
      *
-     * This version avoids java.nio encoders and writes ASCII directly via ByteBufferL.
      * Preconditions:
-     * - `id.isAsciiNoSep()` ensures all chars are 0x00..0x7F and no 0x1F.
+     * - id.isAscii()
      */
-    internal fun keyBuf(id: String, uuid: ShortUUID): ByteBufferL {
-        require(id.isAsciiNoSep()) { "ID must be ASCII and not contain 0x1F: $id" }
+    internal fun keyBuf(id: String): ByteBufferL {
+        require(id.isAscii()) { "ID must be ASCII: $id" }
 
-        // LE-safe, independent cursors
         val rNs = nsBuf.duplicate().position(0)
-
-        // Prefer a ByteBufferL from ShortUUID; fall back to wrap() if only ByteBuffer is available.
-        val uuidBuf: ByteBufferL = uuid.toByteBufferL()
-
-        val outCap = rNs.remaining + id.length + 1 + uuidBuf.remaining
-        val out = ByteBufferL.allocate(outCap)
-
-        // [namespace]
+        val out = ByteBufferL.allocate(rNs.remaining + id.length)
         out.put(rNs)
-
-        // [id ASCII]
         out.putAscii(id)
-
-        // [SEP]
-        out.i8 = SEP.code
-
-        // [uuid bytes]
-        out.put(uuidBuf)
-
         return out
     }
 
+    /**
+     * Prefix buffer for listing/query operations.
+     * Returns: [namespace][id ASCII prefix]
+     */
     internal fun prefixBuf(id: String): ByteBufferL {
-        require(id.isAsciiNoSep())
+        require(id.isAscii())
         val rNs = nsBuf.duplicate().position(0)
         val idBuf = StandardCharsets.US_ASCII.encode(id)
         val out = ByteBufferL.allocate(rNs.remaining + idBuf.remaining())
@@ -228,81 +219,87 @@ class PackedTable<T : Any>(val db: AkkaraDB, internal val kClass: KClass<T>) : C
         return out
     }
 
-    // CRUD
-    fun put(id: String, uuid: ShortUUID, entity: T) {
+    // ========== CRUD ==========
+
+    fun put(id: String, entity: T) {
         val adapter = AdapterResolver.getAdapterForClass(kClass)
-        // Allocate from binpack pool with an estimated capacity
         val cap = adapter.estimateSize(entity).coerceAtLeast(32)
+
         val buf = BinPackBufferPool.get(cap)
         adapter.write(entity, buf)
-        // Prepare a read-ready view (position=0, limit=written)
-        val encoded = buf.asReadOnlyDuplicate().apply { position(0); limit(buf.position) }
-        val key = keyBuf(id, uuid)
+
+        val encoded = buf.asReadOnlyDuplicate().apply {
+            position(0)
+            limit(buf.position)
+        }
+
+        val key = keyBuf(id)
         db.put(key, encoded)
-        // Return pooled buffer
+
         BinPackBufferPool.release(buf)
     }
 
-    fun get(id: String, uuid: ShortUUID): T? {
-        val key = keyBuf(id, uuid)
-        val v = db.get(key) ?: return null
+    fun get(id: String): T? {
+        val key = keyBuf(id)
+        val raw = db.get(key) ?: return null
         val adapter = AdapterResolver.getAdapterForClass(kClass)
-        return adapter.read(v.duplicate().position(0))
+        return adapter.read(raw.duplicate().position(0))
     }
 
-    fun delete(id: String, uuid: ShortUUID) {
-        val key = keyBuf(id, uuid)
+    fun delete(id: String) {
+        val key = keyBuf(id)
         db.delete(key)
     }
 
-    // Higher-order helpers
-    fun update(id: String, uuid: ShortUUID, mutator: T.() -> Unit): Boolean {
-        val old = get(id, uuid) ?: return false
+    fun update(id: String, mutator: T.() -> Unit): Boolean {
+        val old = get(id) ?: return false
         val adapter = AdapterResolver.getAdapterForClass(kClass)
         val copy = adapter.copy(old).apply(mutator)
         if (copy == old) return false
-        put(id, uuid, copy)
+        put(id, copy)
         return true
     }
 
-    fun upsert(id: String, uuid: ShortUUID, init: T.() -> Unit): T {
-        val entity: T = get(id, uuid) ?: run {
+    fun upsert(id: String, init: T.() -> Unit): T {
+        val entity: T = get(id) ?: run {
             val ctor0 = kClass.constructors.firstOrNull { it.parameters.isEmpty() }
-            (ctor0?.call() ?: throw IllegalStateException("No-arg constructor required for ${kClass.simpleName}"))
+            (ctor0?.call() ?: error("No-arg constructor required for ${kClass.simpleName}"))
         }
+
         entity.init()
 
+        // Validation
         for (prop in kClass.memberProperties) {
             prop.isAccessible = true
             val v = prop.get(entity)
+
             if (prop.findAnnotation<Required>() != null) {
-                if (v == null) error("Property '${'$'}{prop.name}' is required")
+                if (v == null) error("Property '${prop.name}' is required")
             }
             if (prop.findAnnotation<NonEmpty>() != null) {
                 when (v) {
-                    is String -> if (v.isEmpty()) error("Property '${'$'}{prop.name}' must be non-empty")
-                    is Collection<*> -> if (v.isEmpty()) error("Property '${'$'}{prop.name}' must be non-empty")
+                    is String -> if (v.isEmpty()) error("Property '${prop.name}' must be non-empty")
+                    is Collection<*> -> if (v.isEmpty()) error("Property '${prop.name}' must be non-empty")
                 }
             }
             if (prop.findAnnotation<Positive>() != null) {
                 when (v) {
-                    is Int -> if (v <= 0) error("Property '${'$'}{prop.name}' must be > 0")
-                    is Long -> if (v <= 0L) error("Property '${'$'}{prop.name}' must be > 0")
+                    is Int -> if (v <= 0) error("Property '${prop.name}' must be > 0")
+                    is Long -> if (v <= 0L) error("Property '${prop.name}' must be > 0")
                 }
             }
         }
-        put(id, uuid, entity)
+
+        put(id, entity)
         return entity
     }
 
-    // Overloads
-    fun put(entity: T) = put("default", ShortUUID.generate(), entity)
-    fun put(id: String, entity: T) = put(id, ShortUUID.generate(), entity)
-    fun put(uuid: ShortUUID, entity: T) = put("default", uuid, entity)
-    fun get(uuid: ShortUUID): T? = get("default", uuid)
-    fun delete(uuid: ShortUUID) = delete("default", uuid)
-    fun update(uuid: ShortUUID, mutator: T.() -> Unit): Boolean = update("default", uuid, mutator)
-    fun upsert(uuid: ShortUUID, init: T.() -> Unit): T = upsert("default", uuid, init)
+    // Overloads using "default" id
+    fun put(entity: T) = put("default", entity)
+    fun get(): T? = get("default")
+    fun delete() = delete("default")
+    fun update(mutator: T.() -> Unit): Boolean = update("default", mutator)
+    fun upsert(init: T.() -> Unit): T = upsert("default", init)
 
     // Query
     inline fun query(@AkkQueryDsl block: () -> AkkExpr<Boolean>): AkkQuery =
