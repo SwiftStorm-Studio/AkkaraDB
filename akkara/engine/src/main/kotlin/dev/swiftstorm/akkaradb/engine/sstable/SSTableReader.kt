@@ -58,7 +58,7 @@ class SSTableReader(
     /** Point lookup. Returns a LE-safe value slice (zero-copy) or null. */
     fun get(key: ByteBufferL): ByteBufferL? {
         // Fast Bloom reject (if present)
-        //if (bloom != null && !bloom.mightContain(key)) return null
+        if (bloom != null && !bloom.mightContain(key)) return null
 
         // Locate candidate block via external index
         val blockOff = index.lookup(key)
