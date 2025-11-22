@@ -168,6 +168,7 @@ private fun AkkDSLCfgBuilder.configureUltraFast() {
 
 class PackedTable<T : Any>(
     val db: AkkaraDB,
+    @PublishedApi
     internal val kClass: KClass<T>
 ) : Closeable {
 
@@ -302,8 +303,9 @@ class PackedTable<T : Any>(
     fun upsert(init: T.() -> Unit): T = upsert("default", init)
 
     // Query
-    inline fun query(@AkkQueryDsl block: () -> AkkExpr<Boolean>): AkkQuery =
-        AkkQuery(block())
+    inline fun query(example: T, @AkkQueryDsl block: T.() -> AkkExpr<Boolean>): AkkQuery =
+        AkkQuery(block(example))
+
 }
 
 // ---- annotations ----

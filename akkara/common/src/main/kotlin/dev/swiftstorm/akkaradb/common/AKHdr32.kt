@@ -20,6 +20,7 @@
 
 package dev.swiftstorm.akkaradb.common
 
+import dev.swiftstorm.akkaradb.common.AKHdr32.Header
 import dev.swiftstorm.akkaradb.common.types.U32
 import dev.swiftstorm.akkaradb.common.types.U64
 import dev.swiftstorm.akkaradb.common.vh.LE
@@ -338,4 +339,18 @@ object AKHdr32 {
         }
         return U64.fromSigned(v0 xor v1 xor v2 xor v3)
     }
+}
+
+fun AKHdr32.peek(bufL: ByteBufferL): Header {
+    val buf = bufL.buf
+    val p = buf.position() // do not mutate caller's position
+
+    val kLen = (LE.getShort(buf, p + OFF_KLEN).toInt() and 0xFFFF)
+    val vLen = LE.getU32(buf, p + OFF_VLEN)
+    val seq = LE.getU64(buf, p + OFF_SEQ)
+    val flags = LE.getU8(buf, p + OFF_FLAGS)
+    val kfp = LE.getU64(buf, p + OFF_KFP)
+    val mini = LE.getU64(buf, p + OFF_MINI)
+
+    return Header(kLen, vLen, seq, flags, kfp, mini)
 }

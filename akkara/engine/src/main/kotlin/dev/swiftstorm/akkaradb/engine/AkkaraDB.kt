@@ -26,6 +26,7 @@ import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.engine.sstable.SSTCompactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
+import dev.swiftstorm.akkaradb.engine.util.PeekingIterator
 import dev.swiftstorm.akkaradb.engine.wal.WalOp
 import dev.swiftstorm.akkaradb.engine.wal.WalReplay
 import dev.swiftstorm.akkaradb.engine.wal.WalWriter
@@ -154,6 +155,48 @@ class AkkaraDB private constructor(
     /** Iterate in-memory snapshot across shards. For full DB iteration, merge SSTs as needed (not provided). */
     fun iterator(range: MemTable.KeyRange = MemTable.KeyRange.ALL): Sequence<MemRecord> = mem.iterator(range)
 
+    fun range(start: ByteBufferL, end: ByteBufferL): Sequence<MemRecord> = sequence {
+        val iters = ArrayList<PeekingIterator<MemRecord>>(readers.size + 1)
+
+        // MemTable iterator
+        iters.add(PeekingIterator(mem.iterator(MemTable.KeyRange(start, end)).iterator()))
+
+        // SST iterators
+        for (r in readers) {
+            val sstIter = r.range(start, end).map { (k, v) ->
+                recordFromSST(k, v)
+            }.iterator()
+            iters.add(PeekingIterator(sstIter))
+        }
+
+        // K-way merge
+        while (true) {
+            // prune finished
+            iters.removeIf { !it.hasNext() }
+            if (iters.isEmpty()) break
+
+            // find min key
+            val first = iters.minWithOrNull { a, b -> lexCompare(a.peek().key, b.peek().key) } ?: break
+            val minKey = first.peek().key
+
+            // take newest seq among same key
+            var best: MemRecord? = null
+            for (it in iters) {
+                if (!it.hasNext()) continue
+                val r = it.peek()
+                if (lexCompare(r.key, minKey) == 0) {
+                    if (best == null || r.seq > best.seq)
+                        best = r
+                    it.next() // consume
+                }
+            }
+
+            // emit only non-tombstone
+            if (best != null && !best.tombstone)
+                yield(best)
+        }
+    }
+
     /** Best-effort flush: hint MemTable, seal any complete stripes, and checkpoint manifest. */
     fun flush() {
         mem.flushHint()
@@ -203,6 +246,31 @@ class AkkaraDB private constructor(
 
         return null
     }
+
+    private fun recordFromSST(key: ByteBufferL, valBuf: ByteBufferL): MemRecord {
+        val hdr = AKHdr32.peek(valBuf)
+        val flags = hdr.flags.toByte()
+
+        val tomb = flags.hasFlag(RecordFlags.TOMBSTONE)
+        val realVal =
+            if (tomb) MemRecord.EMPTY
+            else {
+                val dup = valBuf.duplicate()
+                dup.position(AKHdr32.SIZE)
+                dup.limit(AKHdr32.SIZE + hdr.vLen.raw)
+                dup
+            }
+
+        return MemRecord(
+            key = key.asReadOnlyDuplicate(),
+            value = realVal,
+            seq = hdr.seq.raw.toLong(),
+            flags = flags,
+            keyHash = hdr.keyFP64.raw.toInt(), // or fnv1a fallback
+            approxSizeBytes = estimateMemFootprint(key, realVal)
+        )
+    }
+
 
     // ---------------- factory ----------------
 

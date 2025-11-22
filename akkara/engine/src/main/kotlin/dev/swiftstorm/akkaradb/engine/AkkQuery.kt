@@ -2,6 +2,7 @@ package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
+import java.nio.ByteBuffer
 import kotlin.reflect.full.memberProperties
 import kotlin.reflect.jvm.isAccessible
 
@@ -38,8 +39,8 @@ enum class AkkOp {
     // boolean
     AND, OR, NOT,
 
-    // arithmetic (optional baseline)
-    ADD, SUB, MUL, DIV,
+    // membership
+    IN, NOT_IN,
 
     // sql-like helpers
     IS_NULL, IS_NOT_NULL
@@ -47,11 +48,6 @@ enum class AkkOp {
 
 /**
  * Holds a compiled boolean expression tree for filtering (WHERE clause).
- * Provides simple SQL rendering and bound-parameter extraction.
- *
- * NOTE:
- * - This is a minimal scaffold for early integration.
- * - A future Kotlin compiler plugin can rewrite `> < == && || ! in` etc. into this AST.
  */
 class AkkQuery(
     /** Root predicate expression (must evaluate to boolean). */
@@ -61,19 +57,10 @@ class AkkQuery(
 }
 
 /**
- * Execute a query by scanning all rows in this table's namespace and
- * evaluating the AkkExpr<Boolean> predicate against decoded entities.
+ * Execute a query by scanning rows whose keys fall in this table's namespace
+ * and evaluating the AkkExpr<Boolean> predicate against decoded entities.
  *
- * This is a minimal executor:
- *  - Full scan of in-memory + on-disk view exposed by AkkaraDB.iterator()
- *  - Namespace filter (prefix = "<qualifiedName>:")
- *  - Tombstones are skipped
- *  - Entities are decoded via AdapterResolver and evaluated by a small interpreter
- *
- * Future work:
- *  - Range pushdown (detect id equality / range and use prefix-bound scans)
- *  - SSTable index/bloom seek to reduce IO
- *  - Short-circuit evaluation and expression simplification
+ * Uses AkkaraDB.range(start, end) to only touch keys with the `<ns>:` prefix.
  */
 fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
     val adapter = AdapterResolver.getAdapterForClass(kClass)
@@ -83,47 +70,97 @@ fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
         .onEach { it.isAccessible = true }
         .associateBy { it.name }
 
-    fun startsWithNamespace(key: ByteBufferL): Boolean {
-        val k = key.duplicate().position(0)
-        val n = nsBuf.duplicate().position(0)
-        if (k.remaining < n.remaining) return false
-        repeat(n.remaining) { if (k.i8 != n.i8) return false }
-        return true
+    fun eq(l: Any?, r: Any?): Boolean {
+        if (l == null || r == null) return l == r
+        if (l is Number && r is Number) {
+            val (a, b) =
+                if (l is Float || l is Double || r is Float || r is Double) {
+                    l.toDouble() to r.toDouble()
+                } else {
+                    l.toLong() to r.toLong()
+                }
+            return a == b
+        }
+        return l == r
     }
 
-    fun eval(e: AkkExpr<*>, entity: T): Any? {
-        fun eq(l: Any?, r: Any?): Boolean {
-            if (l == null || r == null) return l == r
-            if (l is Number && r is Number) {
-                val (a, b) = if (l is Float || l is Double || r is Float || r is Double)
-                    l.toDouble() to r.toDouble() else l.toLong() to r.toLong()
-                return a == b
-            }
-            return l == r
-        }
-
-        fun cmp(l: Any?, r: Any?): Int {
-            require(l != null && r != null) { "Comparison on null: $l vs $r" }
-            if (l is Number && r is Number) {
-                val (a, b) = if (l is Float || l is Double || r is Float || r is Double)
-                    l.toDouble() to r.toDouble() else l.toLong() to r.toLong()
-                return when (a) {
-                    is Double -> a.compareTo(b as Double)
-                    is Long -> a.compareTo(b as Long)
-                    else -> error("Unreachable")
+    fun cmp(l: Any?, r: Any?): Int {
+        require(l != null && r != null) { "Comparison on null: $l vs $r" }
+        if (l is Number && r is Number) {
+            val (a, b) =
+                if (l is Float || l is Double || r is Float || r is Double) {
+                    l.toDouble() to r.toDouble()
+                } else {
+                    l.toLong() to r.toLong()
                 }
+            @Suppress("UNCHECKED_CAST")
+            return when (a) {
+                is Double -> a.compareTo(b as Double)
+                is Long -> a.compareTo(b as Long)
+                else -> error("Unreachable")
             }
-            if (l is Comparable<*> && l::class == r::class) {
-                @Suppress("UNCHECKED_CAST")
-                return (l as Comparable<Any>).compareTo(r)
-            }
-            error("Unsupported compare: ${l::class.simpleName} vs ${r::class.simpleName}")
         }
+        if (l is Comparable<*> && l::class == r::class) {
+            @Suppress("UNCHECKED_CAST")
+            return (l as Comparable<Any>).compareTo(r)
+        }
+        error("Unsupported compare: ${l::class.simpleName} vs ${r::class.simpleName}")
+    }
 
-        return when (e) {
+    fun containsOp(element: Any?, container: Any?): Boolean {
+        if (container == null) return false
+        return when (container) {
+            is Iterable<*> ->
+                container.any { eq(it, element) }
+
+            is Array<*> ->
+                container.any { eq(it, element) }
+
+            is BooleanArray ->
+                container.any { eq(it, element) }
+
+            is ByteArray ->
+                container.any { eq(it, element) }
+
+            is ShortArray ->
+                container.any { eq(it, element) }
+
+            is IntArray ->
+                container.any { eq(it, element) }
+
+            is LongArray ->
+                container.any { eq(it, element) }
+
+            is FloatArray ->
+                container.any { eq(it, element) }
+
+            is DoubleArray ->
+                container.any { eq(it, element) }
+
+            is CharArray ->
+                container.any { eq(it, element) }
+
+            is Map<*, *> ->
+                container.keys.any { eq(it, element) }
+
+            is String -> when (element) {
+                null -> false
+                is CharSequence -> container.contains(element)
+                is Char -> container.indexOf(element) >= 0
+                else -> container.contains(element.toString())
+            }
+
+            else -> false
+        }
+    }
+
+    fun eval(e: AkkExpr<*>, entity: T): Any? =
+        when (e) {
             is AkkLit<*> -> e.value
-            is AkkCol<*> -> props[e.name]?.get(entity)
-                ?: error("No property '${e.name}' in ${kClass.simpleName}")
+
+            is AkkCol<*> ->
+                props[e.name]?.get(entity)
+                    ?: error("No property '${e.name}' in ${kClass.simpleName}")
 
             is AkkUn<*> -> {
                 val x = eval(e.x, entity)
@@ -136,7 +173,7 @@ fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
             }
 
             is AkkBin<*> -> {
-                val l = eval(e.lhs, entity);
+                val l = eval(e.lhs, entity)
                 val r = eval(e.rhs, entity)
                 when (e.op) {
                     AkkOp.EQ -> eq(l, r)
@@ -145,15 +182,24 @@ fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
                     AkkOp.GE -> cmp(l, r) >= 0
                     AkkOp.LT -> cmp(l, r) < 0
                     AkkOp.LE -> cmp(l, r) <= 0
+
                     AkkOp.AND -> {
-                        val l = eval(e.lhs, entity) as Boolean? ?: false
-                        if (!l) false else (eval(e.rhs, entity) as Boolean? ?: false)
+                        val lb = l as Boolean? ?: false
+                        val rb = r as Boolean? ?: false
+                        lb && rb
                     }
 
                     AkkOp.OR -> {
-                        val l = eval(e.lhs, entity) as Boolean? ?: false
-                        if (l) true else (eval(e.rhs, entity) as Boolean? ?: false)
+                        val lb = l as Boolean? ?: false
+                        val rb = r as Boolean? ?: false
+                        lb || rb
                     }
+
+                    AkkOp.IN ->
+                        containsOp(l, r)
+
+                    AkkOp.NOT_IN ->
+                        !containsOp(l, r)
 
                     else -> error("Unsupported binary op: ${e.op}")
                 }
@@ -161,21 +207,42 @@ fun <T : Any> PackedTable<T>.run(query: AkkQuery): Sequence<T> {
 
             else -> error("Unknown expr node: ${e::class.simpleName}")
         }
-    }
+
+    // Compute [start, end) for this table's namespace: "<qualifiedName>:"
+    val (startKey, endKey) = namespaceRange()
 
     return sequence {
-        for (rec in db.iterator()) {
-            if (rec.tombstone) continue
-            if (!startsWithNamespace(rec.key)) continue
+        for (rec in db.range(startKey, endKey)) {
             val entity = adapter.read(rec.value.duplicate().position(0))
-            if (eval(query.where, entity) as Boolean) yield(entity)
+            if (eval(query.where, entity) as Boolean) {
+                yield(entity)
+            }
         }
     }
 }
 
+// Use AkkaraDB.run(...) helpers
 fun <T : Any> PackedTable<T>.runToList(query: AkkQuery): List<T> = run(query).toList()
 fun <T : Any> PackedTable<T>.firstOrNull(query: AkkQuery): T? = run(query).firstOrNull()
 fun <T : Any> PackedTable<T>.exists(query: AkkQuery): Boolean = run(query).any()
+
+inline fun <T : Any> PackedTable<T>.runToList(
+    example: T,
+    @AkkQueryDsl block: T.() -> AkkExpr<Boolean>
+): List<T> =
+    run(query(example, block)).toList()
+
+inline fun <T : Any> PackedTable<T>.firstOrNull(
+    example: T,
+    @AkkQueryDsl block: T.() -> AkkExpr<Boolean>
+): T? =
+    run(query(example, block)).firstOrNull()
+
+inline fun <T : Any> PackedTable<T>.exists(
+    example: T,
+    @AkkQueryDsl block: T.() -> AkkExpr<Boolean>
+): Boolean =
+    run(query(example, block)).any()
 
 /** Create a column node (optional sugar for prototypes/tests). */
 fun <T> col(name: String, table: String? = null): AkkCol<T> = AkkCol(table, name)
@@ -187,3 +254,39 @@ fun <T> isNotNull(e: AkkExpr<T?>): AkkExpr<Boolean> = AkkUn(AkkOp.IS_NOT_NULL, e
 /** Marker to limit plugin/operator rewrites to the query scope. */
 @DslMarker
 annotation class AkkQueryDsl
+
+// ──────────────────────
+// Namespace range helper
+// ──────────────────────
+
+/**
+ * Compute [start, end) for keys belonging to this table.
+ *
+ * Keys are encoded as:
+ *   "<qualifiedName>:" + idAscii
+ *
+ * So all keys are in the byte range:
+ *   [nsBuf, nsBufWithLastByte+1)
+ */
+private fun PackedTable<*>.namespaceRange(): Pair<ByteBufferL, ByteBufferL> {
+    // Dump nsBuf bytes
+    val nsBytes = run {
+        val d = nsBuf.duplicate().position(0)
+        val arr = ByteArray(d.remaining)
+        var i = 0
+        while (d.remaining > 0) {
+            arr[i++] = d.i8.toByte()
+        }
+        arr
+    }
+
+    val start = ByteBufferL.wrap(ByteBuffer.wrap(nsBytes.clone()))
+
+    val hi = nsBytes.clone()
+    val lastIdx = hi.lastIndex
+    // ASCII only, so no overflow to worry about in practice (':' -> ';' etc.)
+    hi[lastIdx] = (hi[lastIdx] + 1).toByte()
+    val end = ByteBufferL.wrap(ByteBuffer.wrap(hi))
+
+    return start to end
+}
