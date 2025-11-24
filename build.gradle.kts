@@ -6,7 +6,7 @@ import java.util.*
 plugins {
     alias(libs.plugins.kotlin)
     alias(libs.plugins.dokka)
-    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.kapt)
     `maven-publish`
 }
 
@@ -14,12 +14,13 @@ allprojects {
     apply(plugin = "kotlin")
     apply(plugin = "org.jetbrains.dokka")
     apply(plugin = "maven-publish")
-    apply(plugin = "org.jetbrains.kotlin.plugin.serialization")
+    apply(plugin = "kotlin-kapt")
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.0.1+rc.4"
-        "akkara-plugin" -> "0.0.1+rc.1"
+        "akkaradb" -> "0.0.1+rc.8"
+        "akkara-plugin" -> "0.0.1+rc.22"
+        "akkara-compiler" -> "0.1.0"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
@@ -66,11 +67,14 @@ subprojects {
         }
 
         "akkara-plugin" -> {
-            afterEvaluate {
-                dependencies {
-                    compileOnly("org.jetbrains.kotlin:kotlin-compiler-embeddable:${libs.versions.kotlin.get()}")
-                    compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin-api:${libs.versions.kotlin.get()}")
-                }
+            dependencies {
+                compileOnly(kotlin("gradle-plugin-api"))
+            }
+        }
+
+        "akkara-compiler" -> {
+            dependencies {
+                compileOnly(kotlin("compiler-embeddable"))
             }
         }
 

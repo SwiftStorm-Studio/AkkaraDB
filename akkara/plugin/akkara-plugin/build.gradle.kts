@@ -33,7 +33,6 @@ publishing {
 tasks.jar {
     manifest {
         attributes(
-            "Implementation-Title" to "Akkara Compiler/Gradle Plugin",
             "Implementation-Version" to project.version.toString()
         )
     }

@@ -1,47 +1,42 @@
-@file:OptIn(FirIncompatiblePluginAPI::class, UnsafeDuringIrConstructionAPI::class)
+@file:OptIn(UnsafeDuringIrConstructionAPI::class)
 
-package dev.swiftstorm.akkaradb.plugin
+package dev.swiftstorm.akkaradb.plugin.compiler.ir
 
-import org.jetbrains.kotlin.backend.common.extensions.FirIncompatiblePluginAPI
-import org.jetbrains.kotlin.backend.common.extensions.IrGenerationExtension
 import org.jetbrains.kotlin.backend.common.extensions.IrPluginContext
 import org.jetbrains.kotlin.ir.UNDEFINED_OFFSET
 import org.jetbrains.kotlin.ir.declarations.IrEnumEntry
-import org.jetbrains.kotlin.ir.declarations.IrModuleFragment
+import org.jetbrains.kotlin.ir.declarations.IrFunction
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
 import org.jetbrains.kotlin.ir.expressions.*
-import org.jetbrains.kotlin.ir.expressions.impl.*
+import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
+import org.jetbrains.kotlin.ir.expressions.impl.IrConstructorCallImpl
+import org.jetbrains.kotlin.ir.expressions.impl.IrGetEnumValueImpl
+import org.jetbrains.kotlin.ir.expressions.impl.fromSymbolOwner
 import org.jetbrains.kotlin.ir.symbols.*
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.classFqName
 import org.jetbrains.kotlin.ir.types.classifierOrFail
-import org.jetbrains.kotlin.ir.util.constructors
-import org.jetbrains.kotlin.ir.util.defaultType
-import org.jetbrains.kotlin.ir.util.isSubtypeOfClass
-import org.jetbrains.kotlin.ir.util.parentAsClass
+import org.jetbrains.kotlin.ir.types.makeNullable
+import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.util.OperatorNameConventions
 
-class OperatorRewriteIrExtension : IrGenerationExtension {
-    override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
-        moduleFragment.transformChildren(QueryCallRewriter(pluginContext), null)
-    }
-}
-
-private class QueryCallRewriter(
+class QueryCallRewriter(
     private val ctx: IrPluginContext
 ) : IrElementTransformerVoid() {
 
-    private val fqExpr = FqName("dev.swiftstorm.akkaradb.engine.AkkExpr")
-    private val fqCol = FqName("dev.swiftstorm.akkaradb.engine.AkkCol")
-    private val fqLit = FqName("dev.swiftstorm.akkaradb.engine.AkkLit")
-    private val fqBin = FqName("dev.swiftstorm.akkaradb.engine.AkkBin")
-    private val fqUn = FqName("dev.swiftstorm.akkaradb.engine.AkkUn")
-    private val fqOp = FqName("dev.swiftstorm.akkaradb.engine.AkkOp")
+    private val fqAkkQuery = FqName("dev.swiftstorm.akkaradb.engine.query.AkkQuery")
+    private val fqExpr = FqName("dev.swiftstorm.akkaradb.engine.query.AkkExpr")
+    private val fqCol = FqName("dev.swiftstorm.akkaradb.engine.query.AkkCol")
+    private val fqLit = FqName("dev.swiftstorm.akkaradb.engine.query.AkkLit")
+    private val fqBin = FqName("dev.swiftstorm.akkaradb.engine.query.AkkBin")
+    private val fqUn = FqName("dev.swiftstorm.akkaradb.engine.query.AkkUn")
+    private val fqOp = FqName("dev.swiftstorm.akkaradb.engine.query.AkkOp")
 
     private val symAkkOp by lazy { ctx.referenceClass(ClassId.topLevel(fqOp))!! }
+    private val symAkkQuery by lazy { primaryCtor(fqAkkQuery) }
     private val symLit by lazy { primaryCtor(fqLit) }
     private val symBin by lazy { primaryCtor(fqBin) }
     private val symUn by lazy { primaryCtor(fqUn) }
@@ -63,43 +58,39 @@ private class QueryCallRewriter(
 
     override fun visitCall(expression: IrCall): IrExpression {
         // PackedTable<T>.query(...)
-        if (expression.symbol.owner.name.asString() == "query" &&
-            expression.dispatchReceiver?.type?.classFqName?.asString()
-                ?.startsWith("dev.swiftstorm.akkaradb.engine.PackedTable") == true
+        if (expression.symbol.owner.name.asString() == "query"
+            &&
+            expression.dispatchReceiver?.type?.classFqName?.asString()?.startsWith("dev.swiftstorm.akkaradb.engine.PackedTable") == true
         ) {
-            rewriteQueryInvocation(expression)
+            return rewriteQueryInvocation(expression)
         }
         return super.visitCall(expression)
     }
 
-    private fun rewriteQueryInvocation(call: IrCall) {
+    private fun rewriteQueryInvocation(call: IrCall): IrExpression {
         val callee = call.symbol.owner
 
         val lambdaParam = callee.parameters.lastOrNull { param ->
             param.kind == IrParameterKind.Regular || param.kind == IrParameterKind.Context
-        }
-            ?: return
+        } ?: return call
 
         val lambdaIndex = lambdaParam.indexInParameters
 
-        val lambdaArg = call.arguments.getOrNull(lambdaIndex) as? IrFunctionExpression ?: return
+        val lambdaArg = call.arguments.getOrNull(lambdaIndex) as? IrFunctionExpression ?: return call
         val fn = lambdaArg.function
 
-        fn.body?.transformChildren(object : IrElementTransformerVoid() {
-            override fun visitReturn(expression: IrReturn): IrExpression {
-                if (expression.returnTargetSymbol == fn.symbol) {
-                    val rewritten = rewriteExpr(expression.value)
-                    return IrReturnImpl(
-                        expression.startOffset,
-                        expression.endOffset,
-                        expression.type,
-                        expression.returnTargetSymbol,
-                        rewritten
-                    )
-                }
-                return super.visitReturn(expression)
-            }
-        }, null)
+        val returnedExpr = findLambdaReturnExpr(fn) ?: return call
+
+        val akkWhereExpr = rewriteExpr(returnedExpr)
+
+        return IrConstructorCallImpl.fromSymbolOwner(
+            call.startOffset,
+            call.endOffset,
+            symAkkQuery.owner.returnType,
+            symAkkQuery
+        ).apply {
+            arguments[0] = akkWhereExpr
+        }
     }
 
     private fun rewriteExpr(expr: IrExpression): IrExpression {
@@ -109,7 +100,7 @@ private class QueryCallRewriter(
             return expr
         }
 
-        // Plain literal (String, Int, Boolean, etc.)
+        // Plain literal
         if (expr is IrConst) return lit(expr)
 
         when (expr) {
@@ -121,6 +112,17 @@ private class QueryCallRewriter(
 
             is IrCall -> {
                 val sym = expr.symbol
+
+                // Property getter call -> column
+                if (sym.owner.isGetter) {
+                    val propName = sym.owner.correspondingPropertySymbol
+                        ?.owner
+                        ?.name
+                        ?.asString()
+                        ?: sym.owner.name.asString()
+
+                    return col(propName, expr.type, expr)
+                }
 
                 val lhsRaw = expr.arguments.getOrNull(0)
                 val rhsRaw = expr.arguments.getOrNull(1)
@@ -134,11 +136,9 @@ private class QueryCallRewriter(
                     val lhs = rewriteExpr(lhsRaw)
                     val rhs = rewriteExpr(rhsRaw)
 
-                    // x == null / null == x  -> IS_NULL(x)
                     if (lhsRaw.isNullConst()) return un(opIS_NULL, rhs)
                     if (rhsRaw.isNullConst()) return un(opIS_NULL, lhs)
 
-                    // x == y -> EQ(x, y)
                     return bin(opEQ, lhs, rhs)
                 }
 
@@ -195,7 +195,6 @@ private class QueryCallRewriter(
                 ) {
                     val recv = expr.dispatchReceiver!!
 
-                    // Special-case: !(lhs == rhs)  ->  NEQ / IS_NOT_NULL
                     if (recv is IrCall) {
                         val innerSym = recv.symbol
                         val lhs0 = recv.arguments.getOrNull(0)
@@ -206,7 +205,6 @@ private class QueryCallRewriter(
                                     innerSym in ctx.irBuiltIns.ieee754equalsFunByOperandType.values)
 
                         if (innerIsEq && lhs0 != null && rhs0 != null) {
-                            // !(x == null) / !(null == x)  ->  IS_NOT_NULL(x)
                             if (lhs0.isNullConst()) {
                                 val rhs = rewriteExpr(rhs0)
                                 return un(opIS_NOT_NULL, rhs)
@@ -216,20 +214,17 @@ private class QueryCallRewriter(
                                 return un(opIS_NOT_NULL, lhs)
                             }
 
-                            // !(x == y)  ->  NEQ(x, y)
                             val lhs = rewriteExpr(lhs0)
                             val rhs = rewriteExpr(rhs0)
                             return bin(opNEQ, lhs, rhs)
                         }
                     }
 
-                    // Generic unary NOT
                     return un(opNOT, rewriteExpr(recv))
                 }
             }
         }
 
-        // Fallback: just rewrite children recursively, keep the original node
         expr.transformChildren(thisAsTransformer(), null)
         return expr
     }
@@ -283,7 +278,7 @@ private class QueryCallRewriter(
             arguments[0] = IrConstImpl.constNull(
                 UNDEFINED_OFFSET,
                 UNDEFINED_OFFSET,
-                ctx.irBuiltIns.stringType
+                ctx.irBuiltIns.stringType.makeNullable()
             ) // table = null
             arguments[1] = IrConstImpl.string(
                 e.startOffset,
@@ -327,4 +322,20 @@ private class QueryCallRewriter(
         override fun visitExpression(expression: IrExpression): IrExpression =
             rewriteExpr(expression)
     }
+
+    private fun findLambdaReturnExpr(fn: IrFunction): IrExpression? {
+        var result: IrExpression? = null
+
+        fn.body?.transformChildren(object : IrElementTransformerVoid() {
+            override fun visitReturn(expression: IrReturn): IrExpression {
+                if (expression.returnTargetSymbol == fn.symbol) {
+                    result = expression.value
+                }
+                return expression
+            }
+        }, null)
+
+        return result
+    }
+
 }
