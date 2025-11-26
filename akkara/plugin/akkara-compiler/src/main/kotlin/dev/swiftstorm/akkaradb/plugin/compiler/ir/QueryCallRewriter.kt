@@ -394,35 +394,33 @@ class QueryCallRewriter(
                     return bin(opIN, rewriteExpr(argRaw), rewriteExpr(recvRaw))
                 }
 
-                // ===== !in :  !(y.contains(x)) =====
-                if (sym.owner.name == OperatorNameConventions.NOT) {
-                    val recv = expr.dispatchReceiver
-                    if (recv is IrCall && recv.symbol.owner.name == OperatorNameConventions.CONTAINS) {
-                        val x = recv.arguments.getOrNull(0) ?: return expr
-                        val y = recv.dispatchReceiver ?: return expr
-                        return bin(opNOT_IN, rewriteExpr(x), rewriteExpr(y))
-                    }
-                    if (recv != null) {
-                        return un(opNOT, rewriteExpr(recv))
-                    }
-                }
-
-                // ===== Unary !  (including != / x != null) =====
-                if (sym.owner.name == OperatorNameConventions.NOT &&
-                    expr.dispatchReceiver != null
-                ) {
-
+                // ===== Unary ! (covers !in, !=, x != null, and general !expr) =====
+                if (sym.owner.name == OperatorNameConventions.NOT && expr.dispatchReceiver != null) {
                     val recv = expr.dispatchReceiver!!
 
+                    // 1. !in  ->  !(y.contains(x))  ->  NOT_IN(x, y)
+                    if (recv is IrCall && recv.symbol.owner.name == OperatorNameConventions.CONTAINS) {
+                        val xRaw = recv.arguments.getOrNull(0) ?: return expr
+                        val yRaw = recv.dispatchReceiver ?: return expr
+                        return bin(opNOT_IN, rewriteExpr(xRaw), rewriteExpr(yRaw))
+                    }
+
+                    // 2. != / x != null  (encoded as ! (a == b) with EXCLEQ / EXCLEQEQ origin)
                     if (recv is IrCall) {
                         val innerSym = recv.symbol
                         val lhs0 = recv.arguments.getOrNull(0)
                         val rhs0 = recv.arguments.getOrNull(1)
-                        val innerIsEq = (innerSym == ctx.irBuiltIns.eqeqSymbol ||
-                                innerSym == ctx.irBuiltIns.eqeqeqSymbol ||
-                                innerSym in ctx.irBuiltIns.ieee754equalsFunByOperandType.values)
 
-                        if (innerIsEq && lhs0 != null && rhs0 != null) {
+                        val innerIsEq =
+                            innerSym == ctx.irBuiltIns.eqeqSymbol ||
+                                    innerSym == ctx.irBuiltIns.eqeqeqSymbol ||
+                                    innerSym in ctx.irBuiltIns.ieee754equalsFunByOperandType.values
+
+                        val isNeqOrigin =
+                            recv.origin == IrStatementOrigin.EXCLEQ ||
+                                    recv.origin == IrStatementOrigin.EXCLEQEQ
+
+                        if (innerIsEq && isNeqOrigin && lhs0 != null && rhs0 != null) {
                             if (lhs0.isNullConst()) {
                                 return un(opIS_NOT_NULL, rewriteExpr(rhs0))
                             }
@@ -434,11 +432,13 @@ class QueryCallRewriter(
                         }
                     }
 
+                    // 3. その他の単純な !expr
                     return un(opNOT, rewriteExpr(recv))
                 }
             }
         }
 
+        // Fallback: just rewrite children
         expr.transformChildren(thisAsTransformer(), null)
         return expr
     }

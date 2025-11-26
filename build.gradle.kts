@@ -28,7 +28,7 @@ allprojects {
     version = when (name) {
         "akkaradb" -> "0.1.0+rc.1"
         "akkara-plugin" -> "0.1.0+rc.1"
-        "akkara-compiler" -> "0.3.0"
+        "akkara-compiler" -> "0.3.1"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
