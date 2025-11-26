@@ -7,11 +7,9 @@ import org.jetbrains.kotlin.ir.UNDEFINED_OFFSET
 import org.jetbrains.kotlin.ir.declarations.IrEnumEntry
 import org.jetbrains.kotlin.ir.declarations.IrFunction
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
+import org.jetbrains.kotlin.ir.declarations.IrSimpleFunction
 import org.jetbrains.kotlin.ir.expressions.*
-import org.jetbrains.kotlin.ir.expressions.impl.IrConstImpl
-import org.jetbrains.kotlin.ir.expressions.impl.IrConstructorCallImpl
-import org.jetbrains.kotlin.ir.expressions.impl.IrGetEnumValueImpl
-import org.jetbrains.kotlin.ir.expressions.impl.fromSymbolOwner
+import org.jetbrains.kotlin.ir.expressions.impl.*
 import org.jetbrains.kotlin.ir.symbols.*
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.classFqName
@@ -19,8 +17,10 @@ import org.jetbrains.kotlin.ir.types.classifierOrFail
 import org.jetbrains.kotlin.ir.types.makeNullable
 import org.jetbrains.kotlin.ir.util.*
 import org.jetbrains.kotlin.ir.visitors.IrElementTransformerVoid
+import org.jetbrains.kotlin.name.CallableId
 import org.jetbrains.kotlin.name.ClassId
 import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.util.OperatorNameConventions
 
 class QueryCallRewriter(
@@ -28,12 +28,90 @@ class QueryCallRewriter(
 ) : IrElementTransformerVoid() {
 
     private val fqAkkQuery = FqName("dev.swiftstorm.akkaradb.engine.query.AkkQuery")
+    private val fqPackedTable = FqName("dev.swiftstorm.akkaradb.engine.PackedTable")
     private val fqExpr = FqName("dev.swiftstorm.akkaradb.engine.query.AkkExpr")
     private val fqCol = FqName("dev.swiftstorm.akkaradb.engine.query.AkkCol")
     private val fqLit = FqName("dev.swiftstorm.akkaradb.engine.query.AkkLit")
     private val fqBin = FqName("dev.swiftstorm.akkaradb.engine.query.AkkBin")
     private val fqUn = FqName("dev.swiftstorm.akkaradb.engine.query.AkkUn")
     private val fqOp = FqName("dev.swiftstorm.akkaradb.engine.query.AkkOp")
+
+    private val symRunQ: IrSimpleFunctionSymbol by lazy {
+        val cls = ctx.referenceClass(ClassId.topLevel(fqPackedTable))
+            ?: error("PackedTable not found")
+
+        cls.owner.declarations
+            .filterIsInstance<IrSimpleFunction>()
+            .firstOrNull { fn ->
+                fn.name.asString() == "runQ" &&
+
+                        fn.parameters.any { it.kind == IrParameterKind.DispatchReceiver } &&
+
+                        fn.parameters.count { it.kind == IrParameterKind.Regular } == 1 &&
+
+                        fn.parameters.first { it.kind == IrParameterKind.Regular }
+                            .type.classFqName?.asString() == "dev.swiftstorm.akkaradb.engine.query.AkkQuery"
+            }
+            ?.symbol
+            ?: error("PackedTable.runQ not found")
+    }
+
+    private val symAny: IrSimpleFunctionSymbol by lazy {
+        ctx.referenceFunctions(
+            CallableId(
+                FqName("kotlin.sequences"),
+                Name.identifier("any")
+            )
+        ).firstOrNull { fn ->
+            val params = fn.owner.parameters
+
+            val hasExtension =
+                params.any { it.kind == IrParameterKind.ExtensionReceiver }
+
+            val regularCount =
+                params.count { it.kind == IrParameterKind.Regular || it.kind == IrParameterKind.Context }
+
+            hasExtension && regularCount == 0
+        } ?: error("Sequence<T>.any() not found")
+    }
+
+    private val symFirstOrNull: IrSimpleFunctionSymbol by lazy {
+        ctx.referenceFunctions(
+            CallableId(
+                FqName("kotlin.sequences"),
+                Name.identifier("firstOrNull")
+            )
+        ).firstOrNull { fn ->
+            val params = fn.owner.parameters
+
+            val hasExtension =
+                params.any { it.kind == IrParameterKind.ExtensionReceiver }
+
+            val regularCount =
+                params.count { it.kind == IrParameterKind.Regular || it.kind == IrParameterKind.Context }
+
+            hasExtension && regularCount == 0
+        } ?: error("Sequence<T>.firstOrNull() not found")
+    }
+
+    private val symRunToList: IrSimpleFunctionSymbol by lazy {
+        ctx.referenceFunctions(
+            CallableId(
+                FqName("kotlin.sequences"),
+                Name.identifier("toList")
+            )
+        ).firstOrNull { fn ->
+            val params = fn.owner.parameters
+
+            val hasExtension =
+                params.any { it.kind == IrParameterKind.ExtensionReceiver }
+
+            val regularCount =
+                params.count { it.kind == IrParameterKind.Regular || it.kind == IrParameterKind.Context }
+
+            hasExtension && regularCount == 0
+        } ?: error("Sequence<T>.toList() not found")
+    }
 
     private val symAkkOp by lazy { ctx.referenceClass(ClassId.topLevel(fqOp))!! }
     private val symAkkQuery by lazy { primaryCtor(fqAkkQuery) }
@@ -57,21 +135,31 @@ class QueryCallRewriter(
     private val opNOT_IN by lazy { enumEntry("NOT_IN") }
 
     override fun visitCall(expression: IrCall): IrExpression {
-        // PackedTable<T>.query(...)
-        if (expression.symbol.owner.name.asString() == "query"
-            &&
-            expression.dispatchReceiver?.type?.classFqName?.asString()?.startsWith("dev.swiftstorm.akkaradb.engine.PackedTable") == true
-        ) {
-            return rewriteQueryInvocation(expression)
+        println("Akkara: visiting call to ${expression.symbol.owner.name.asString()}")
+        val owner = expression.symbol.owner
+
+        // FQ name-based check
+        val fqName = owner.parent.kotlinFqName.asString()
+
+        return if (fqName == "dev.swiftstorm.akkaradb.engine.PackedTable") {
+            println("Akkara: rewriting call to ${expression.symbol.owner.name.asString()}")
+            when (expression.symbol.owner.name.asString()) {
+                "query" -> rewriteQuery(expression)
+                "exists" -> rewriteExists(expression)
+                "firstOrNull" -> rewriteFirstOrNull(expression)
+                "runToList" -> rewriteRunToList(expression)
+                else -> super.visitCall(expression)
+            }
+        } else {
+            super.visitCall(expression)
         }
-        return super.visitCall(expression)
     }
 
-    private fun rewriteQueryInvocation(call: IrCall): IrExpression {
+    private fun rewriteQuery(call: IrCall): IrExpression {
         val callee = call.symbol.owner
 
         val lambdaParam = callee.parameters.lastOrNull { param ->
-            param.kind == IrParameterKind.Regular || param.kind == IrParameterKind.Context
+            param.kind == IrParameterKind.Regular || param.kind == IrParameterKind.Context || param.kind == IrParameterKind.ExtensionReceiver
         } ?: return call
 
         val lambdaIndex = lambdaParam.indexInParameters
@@ -90,6 +178,137 @@ class QueryCallRewriter(
             symAkkQuery
         ).apply {
             arguments[0] = akkWhereExpr
+        }
+    }
+
+    private fun rewriteExists(call: IrCall): IrExpression {
+        // Step 1: rewrite the AkkQuery expression
+        val akkQueryExpr = rewriteQuery(call)
+
+        // Step 2: Create runQ(...) call
+        val runQCall = IrCallImpl.fromSymbolOwner(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = symRunQ.owner.returnType,
+            symbol = symRunQ
+        ).apply {
+            // --- K2-safe argument mapping ---
+
+            val params = symRunQ.owner.parameters
+
+            // dispatch receiver index
+            val dispatchIndex = params.indexOfFirst { it == symRunQ.owner.dispatchReceiverParameter }
+            if (dispatchIndex >= 0) {
+                arguments[dispatchIndex] = call.dispatchReceiver
+                    ?: error("exists() call had no dispatch receiver")
+            }
+
+            // value parameter (AkkQuery) index
+            val queryIndex = params.indexOfFirst { p ->
+                p.type.classFqName?.asString() ==
+                        "dev.swiftstorm.akkaradb.engine.query.AkkQuery"
+            }
+            if (queryIndex >= 0) {
+                arguments[queryIndex] = akkQueryExpr
+            }
+        }
+
+        // Step 3: Sequence<T>.any()
+        return IrCallImpl(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = ctx.irBuiltIns.booleanType,
+            symbol = symAny
+        ).apply {
+            val params = symAny.owner.parameters
+
+            // extension receiver slot: Sequence<T>
+            val extIndex = params.indexOfFirst { it.kind == IrParameterKind.ExtensionReceiver }
+            if (extIndex >= 0) {
+                arguments[extIndex] = runQCall
+            }
+        }
+    }
+
+    private fun rewriteFirstOrNull(call: IrCall): IrExpression {
+        val akkQueryExpr = rewriteQuery(call)
+
+        val runQCall = IrCallImpl.fromSymbolOwner(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = symRunQ.owner.returnType,
+            symbol = symRunQ
+        ).apply {
+            val params = symRunQ.owner.parameters
+
+            val dispatchIndex = params.indexOfFirst { it == symRunQ.owner.dispatchReceiverParameter }
+            if (dispatchIndex >= 0) {
+                arguments[dispatchIndex] = call.dispatchReceiver
+                    ?: error("firstOrNull() call had no dispatch receiver")
+            }
+
+            val queryIndex = params.indexOfFirst { p ->
+                p.type.classFqName?.asString() ==
+                        "dev.swiftstorm.akkaradb.engine.query.AkkQuery"
+            }
+            if (queryIndex >= 0) {
+                arguments[queryIndex] = akkQueryExpr
+            }
+        }
+
+        return IrCallImpl(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = call.type,
+            symbol = symFirstOrNull
+        ).apply {
+            val params = symFirstOrNull.owner.parameters
+
+            val extIndex = params.indexOfFirst { it.kind == IrParameterKind.ExtensionReceiver }
+            if (extIndex >= 0) {
+                arguments[extIndex] = runQCall
+            }
+        }
+    }
+
+    private fun rewriteRunToList(call: IrCall): IrExpression {
+        val akkQueryExpr = rewriteQuery(call)
+
+        val runQCall = IrCallImpl.fromSymbolOwner(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = symRunQ.owner.returnType,
+            symbol = symRunQ
+        ).apply {
+            val params = symRunQ.owner.parameters
+
+            val dispatchIndex = params.indexOfFirst { it == symRunQ.owner.dispatchReceiverParameter }
+            if (dispatchIndex >= 0) {
+                arguments[dispatchIndex] = call.dispatchReceiver
+                    ?: error("runToList() call had no dispatch receiver")
+            }
+
+            val queryIndex = params.indexOfFirst { p ->
+                p.type.classFqName?.asString() ==
+                        "dev.swiftstorm.akkaradb.engine.query.AkkQuery"
+            }
+            if (queryIndex >= 0) {
+                arguments[queryIndex] = akkQueryExpr
+            }
+        }
+
+        return IrCallImpl(
+            startOffset = call.startOffset,
+            endOffset = call.endOffset,
+            type = call.type,
+            symbol = symRunToList
+        ).apply {
+            val params = symRunToList.owner.parameters
+
+            val extIndex = params.indexOfFirst { it.kind == IrParameterKind.ExtensionReceiver }
+            if (extIndex >= 0) {
+                arguments[extIndex] = runQCall
+            }
         }
     }
 
@@ -337,5 +556,4 @@ class QueryCallRewriter(
 
         return result
     }
-
 }

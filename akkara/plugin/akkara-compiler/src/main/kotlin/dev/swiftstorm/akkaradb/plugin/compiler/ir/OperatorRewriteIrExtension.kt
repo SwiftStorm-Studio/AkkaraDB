@@ -9,6 +9,7 @@ import org.jetbrains.kotlin.ir.visitors.transformChildrenVoid
 
 class OperatorRewriteIrExtension : IrGenerationExtension {
     override fun generate(moduleFragment: IrModuleFragment, pluginContext: IrPluginContext) {
+        println("[AkkaraDB] Running Operator Rewrite IR Extension")
         moduleFragment.transformChildrenVoid(QueryCallRewriter(pluginContext))
     }
 }

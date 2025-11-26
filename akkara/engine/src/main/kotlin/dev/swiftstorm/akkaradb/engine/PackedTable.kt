@@ -151,7 +151,7 @@ class PackedTable<T : Any>(
     fun update(mutator: T.() -> Unit): Boolean = update("default", mutator)
     fun upsert(init: T.() -> Unit): T = upsert("default", init)
 
-    inline fun query(
+    fun query(
         @AkkQueryDsl block: T.() -> Boolean
     ): AkkQuery {
         error(
@@ -323,17 +323,17 @@ class PackedTable<T : Any>(
         }
     }
 
-    inline fun runToList(
+    fun runToList(
         @AkkQueryDsl block: T.() -> Boolean
     ): List<T> =
         runQ(query(block)).toList()
 
-    inline fun firstOrNull(
+    fun firstOrNull(
         @AkkQueryDsl block: T.() -> Boolean
     ): T? =
         runQ(query(block)).firstOrNull()
 
-    inline fun exists(
+    fun exists(
         @AkkQueryDsl block: T.() -> Boolean
     ): Boolean =
         runQ(query(block)).any()

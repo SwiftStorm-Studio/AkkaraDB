@@ -1,14 +1,14 @@
 package dev.swiftstorm.akkaradb.plugin
 
-import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.artifacts.dsl.DependencyHandler
 import org.gradle.api.provider.Provider
-import org.jetbrains.kotlin.gradle.plugin.*
+import org.jetbrains.kotlin.gradle.plugin.KotlinCompilation
+import org.jetbrains.kotlin.gradle.plugin.KotlinCompilerPluginSupportPlugin
+import org.jetbrains.kotlin.gradle.plugin.SubpluginArtifact
+import org.jetbrains.kotlin.gradle.plugin.SubpluginOption
 import java.net.URL
 import javax.xml.parsers.DocumentBuilderFactory
-
-private var akkaraLibraryVersion: String? = null
 
 @Suppress("unused")
 fun DependencyHandler.akkara(
@@ -16,11 +16,36 @@ fun DependencyHandler.akkara(
     scope: String = "implementation"
 ) {
     if (version.isBlank()) error("[akkara] Version must not be blank")
-    akkaraLibraryVersion = version
     add(scope, "dev.swiftstorm:akkaradb:$version")
 }
 
-class AkkaraGradlePlugin : Plugin<Project>, KotlinCompilerPluginSupportPlugin {
+@Suppress("unused")
+class AkkaraGradlePlugin : KotlinCompilerPluginSupportPlugin {
+    private lateinit var project: Project
+
+    override fun apply(target: Project) {
+        this.project = target
+    }
+
+    override fun applyToCompilation(kotlinCompilation: KotlinCompilation<*>): Provider<List<SubpluginOption>> {
+        val providers = kotlinCompilation.target.project.providers
+        return providers.provider { emptyList() }
+    }
+
+    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean = true
+
+    override fun getCompilerPluginId(): String = "dev.swiftstorm.akkaradb.plugin.compiler"
+
+    override fun getPluginArtifact(): SubpluginArtifact {
+        val versionProvider: Provider<String> =
+            project.providers.provider { fetchLatestCompilerVersion() }
+
+        return SubpluginArtifact(
+            groupId = "dev.swiftstorm",
+            artifactId = "akkara-compiler",
+            version = versionProvider.get()
+        )
+    }
 
     private fun fetchLatestCompilerVersion(): String {
         val metadataUrl =
@@ -38,43 +63,4 @@ class AkkaraGradlePlugin : Plugin<Project>, KotlinCompilerPluginSupportPlugin {
             throw RuntimeException("Failed to fetch latest Akkara compiler version", e)
         }
     }
-
-    override fun apply(target: Project) {}
-
-    override fun isApplicable(kotlinCompilation: KotlinCompilation<*>): Boolean =
-        kotlinCompilation.target.platformType == KotlinPlatformType.jvm &&
-                kotlinCompilation.target.project.plugins.hasPlugin(AkkaraGradlePlugin::class.java)
-
-    override fun getCompilerPluginId(): String =
-        "dev.swiftstorm.akkaradb.compiler"
-
-    override fun getPluginArtifact(): SubpluginArtifact {
-        val project = getAppliedProjectOrThrow()
-
-        val versionProvider: Provider<String> =
-            project.providers.provider { fetchLatestCompilerVersion() }
-
-        return SubpluginArtifact(
-            groupId = "dev.swiftstorm",
-            artifactId = "akkara-compiler",
-            version = versionProvider.get()
-        )
-    }
-
-    override fun applyToCompilation(kotlinCompilation: KotlinCompilation<*>)
-            : Provider<List<SubpluginOption>> {
-        val providers = kotlinCompilation.target.project.providers
-
-        return providers.provider {
-            akkaraLibraryVersion
-                ?.let { listOf(SubpluginOption("akkaraVersion", it)) }
-                ?: emptyList()
-        }
-    }
-
-    private fun getAppliedProjectOrThrow(): Project =
-        Project::class.java.getDeclaredField("project").let { field ->
-            field.isAccessible = true
-            field.get(this) as Project
-        }
 }

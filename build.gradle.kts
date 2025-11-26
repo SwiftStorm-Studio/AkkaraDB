@@ -10,6 +10,14 @@ plugins {
     `maven-publish`
 }
 
+tasks.register("publishAllModule") {
+    dependsOn(
+        ":akkaradb:publish",
+        ":akkara-plugin:publish",
+        ":akkara-compiler:publish"
+    )
+}
+
 allprojects {
     apply(plugin = "kotlin")
     apply(plugin = "org.jetbrains.dokka")
@@ -18,9 +26,9 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.0.1+rc.8"
-        "akkara-plugin" -> "0.0.1+rc.22"
-        "akkara-compiler" -> "0.1.0"
+        "akkaradb" -> "0.1.0+rc.1"
+        "akkara-plugin" -> "0.1.0+rc.1"
+        "akkara-compiler" -> "0.3.0"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
@@ -73,8 +81,10 @@ subprojects {
         }
 
         "akkara-compiler" -> {
-            dependencies {
-                compileOnly(kotlin("compiler-embeddable"))
+            afterEvaluate {
+                dependencies {
+                    compileOnly(kotlin("compiler"))
+                }
             }
         }
 

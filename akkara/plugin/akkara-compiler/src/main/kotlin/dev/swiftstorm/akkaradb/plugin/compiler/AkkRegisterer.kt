@@ -10,9 +10,6 @@ import org.jetbrains.kotlin.config.CompilerConfiguration
 class AkkRegisterer : CompilerPluginRegistrar() {
     override val supportsK2: Boolean = true
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
-        println("[AkkaraDB] Registering IR generation extension")
-        IrGenerationExtension.registerExtension(
-            OperatorRewriteIrExtension()
-        )
+        IrGenerationExtension.registerExtension(OperatorRewriteIrExtension())
     }
 }

@@ -5,7 +5,7 @@ plugins {
 publishing {
     publications {
         create<MavenPublication>("mavenJava") {
-            from(components["java"])
+            from(components["kotlin"])
         }
     }
     repositories {
