@@ -8,6 +8,7 @@ import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
 import dev.swiftstorm.akkaradb.common.putAscii
 import dev.swiftstorm.akkaradb.engine.query.*
 import java.io.Closeable
+import java.math.BigDecimal
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import kotlin.reflect.KClass
@@ -189,71 +190,55 @@ class PackedTable<T : Any>(
         }
 
         fun cmp(l: Any?, r: Any?): Int {
-            require(l != null && r != null) { "Comparison on null: $l vs $r" }
+            require(l != null && r != null)
+
             if (l is Number && r is Number) {
-                val (a, b) =
-                    if (l is Float || l is Double || r is Float || r is Double) {
-                        l.toDouble() to r.toDouble()
-                    } else {
-                        l.toLong() to r.toLong()
+                return when {
+                    l is BigDecimal || r is BigDecimal -> {
+                        val a = (l as? BigDecimal) ?: BigDecimal(l.toString())
+                        val b = (r as? BigDecimal) ?: BigDecimal(r.toString())
+                        a.compareTo(b)
                     }
-                @Suppress("UNCHECKED_CAST")
-                return when (a) {
-                    is Double -> a.compareTo(b as Double)
-                    is Long -> a.compareTo(b as Long)
-                    else -> error("Unreachable")
+
+                    l is Double || l is Float || r is Double || r is Float -> {
+                        l.toDouble().compareTo(r.toDouble())
+                    }
+
+                    else -> {
+                        l.toLong().compareTo(r.toLong())
+                    }
                 }
             }
+
             if (l is Comparable<*> && l::class == r::class) {
                 @Suppress("UNCHECKED_CAST")
                 return (l as Comparable<Any>).compareTo(r)
             }
+
             error("Unsupported compare: ${l::class.simpleName} vs ${r::class.simpleName}")
         }
 
         fun containsOp(element: Any?, container: Any?): Boolean {
             if (container == null) return false
             return when (container) {
-                is Iterable<*> ->
-                    container.any { eq(it, element) }
-
-                is Array<*> ->
-                    container.any { eq(it, element) }
-
-                is BooleanArray ->
-                    container.any { eq(it, element) }
-
-                is ByteArray ->
-                    container.any { eq(it, element) }
-
-                is ShortArray ->
-                    container.any { eq(it, element) }
-
-                is IntArray ->
-                    container.any { eq(it, element) }
-
-                is LongArray ->
-                    container.any { eq(it, element) }
-
-                is FloatArray ->
-                    container.any { eq(it, element) }
-
-                is DoubleArray ->
-                    container.any { eq(it, element) }
-
-                is CharArray ->
-                    container.any { eq(it, element) }
-
-                is Map<*, *> ->
-                    container.keys.any { eq(it, element) }
-
+                is Set<*> -> container.contains(element)
+                is Iterable<*> -> container.any { eq(it, element) }
+                is Array<*> -> container.any { eq(it, element) }
+                is BooleanArray -> container.any { eq(it, element) }
+                is ByteArray -> container.any { eq(it, element) }
+                is ShortArray -> container.any { eq(it, element) }
+                is IntArray -> container.any { eq(it, element) }
+                is LongArray -> container.any { eq(it, element) }
+                is FloatArray -> container.any { eq(it, element) }
+                is DoubleArray -> container.any { eq(it, element) }
+                is CharArray -> container.any { eq(it, element) }
+                is Map<*, *> -> container.containsKey(element)
                 is String -> when (element) {
                     null -> false
                     is CharSequence -> container.contains(element)
-                    is Char -> container.indexOf(element) >= 0
-                    else -> container.contains(element.toString())
+                    is Char -> element in container
+                    else -> element.toString() in container
                 }
-
                 else -> false
             }
         }
@@ -262,9 +247,11 @@ class PackedTable<T : Any>(
             when (e) {
                 is AkkLit<*> -> e.value
 
-                is AkkCol<*> ->
-                    props[e.name]?.get(entity)
+                is AkkCol<*> -> {
+                    val prop = props[e.name]
                         ?: error("No property '${e.name}' in ${kClass.simpleName}")
+                    prop.get(entity)
+                }
 
                 is AkkUn<*> -> {
                     val x = eval(e.x, entity)
