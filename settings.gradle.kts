@@ -5,29 +5,20 @@ pluginManagement {
     }
 }
 
-include("akkaradb")
-project(":akkaradb").projectDir = file("akkara/akkaradb")
+fun safeInclude(name: String, path: String) {
+    val dir = file(path)
+    if (dir.exists()) {
+        include(name)
+        project(":$name").projectDir = dir
+    }
+}
 
-include("akkara-test")
-project(":akkara-test").projectDir = file("akkara/test")
-
-include("akkara-common")
-project(":akkara-common").projectDir = file("akkara/common")
-
-include("akkara-engine")
-project(":akkara-engine").projectDir = file("akkara/engine")
-
-include(":akkara-plugin")
-project(":akkara-plugin").projectDir = file("akkara/plugin/akkara-plugin")
-
-include(":akkara-compiler")
-project(":akkara-compiler").projectDir = file("akkara/plugin/akkara-compiler")
-
-include("akkara-format-api")
-project(":akkara-format-api").projectDir = file("akkara/format-api")
-
-include("akkara-format-akk")
-project(":akkara-format-akk").projectDir = file("akkara/format-akk")
-
-include("akkara-cli")
-project(":akkara-cli").projectDir = file("akkara/cli")
+safeInclude("akkaradb", "akkara/akkaradb")
+safeInclude("akkara-test", "akkara/test")
+safeInclude("akkara-common", "akkara/common")
+safeInclude("akkara-engine", "akkara/engine")
+safeInclude("akkara-plugin", "akkara/plugin/akkara-plugin")
+safeInclude("akkara-compiler", "akkara/plugin/akkara-compiler")
+safeInclude("akkara-format-api", "akkara/format-api")
+safeInclude("akkara-format-akk", "akkara/format-akk")
+safeInclude("akkara-cli", "akkara/cli")

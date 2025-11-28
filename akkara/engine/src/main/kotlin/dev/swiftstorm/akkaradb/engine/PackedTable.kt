@@ -181,25 +181,6 @@ class PackedTable<T : Any, ID : Any>(
     }
 
     /**
-     * Updates an existing entity identified by the given ID. The update is performed by applying
-     * the provided mutator function to a copied version of the entity. If the entity is not found
-     * or if the result of the mutation is equal to the original entity, no update is performed.
-     *
-     * @param id The identifier of the entity to be updated.
-     * @param mutator A lambda function that allows modification of the copied entity.
-     * @return `true` if the entity is successfully updated, `false` otherwise.
-     */
-    fun update(id: ID, mutator: T.() -> Unit): Boolean {
-        val old = get(id) ?: return false
-        val adapter = AdapterResolver.getAdapterForClass(kClass)
-        val new = adapter.copy(old).apply(mutator)
-
-        if (new == old) return false
-        put(id, new)
-        return true
-    }
-
-    /**
      * Inserts or updates an entity in the database based on the specified ID.
      *
      * If the entity with the given ID does not already exist, a new instance of the entity is created using
@@ -386,9 +367,9 @@ class PackedTable<T : Any, ID : Any>(
     fun exists(@AkkQueryDsl block: T.() -> Boolean) =
         runQ(query(block)).any()
 
-    /**
-     * namespace の範囲（prefix スキャン用）
-     */
+    fun count(@AkkQueryDsl block: T.() -> Boolean) =
+        runQ(query(block)).count()
+
     private fun namespaceRange(): Pair<ByteBufferL, ByteBufferL> {
         val arr = run {
             val d = nsBuf.duplicate().position(0)
