@@ -1,3 +1,22 @@
+/*
+ * AkkaraDB
+ * Copyright (C) 2025 Swift Storm Studio
+ *
+ * This file is part of AkkaraDB.
+ *
+ * AkkaraDB is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ *
+ * AkkaraDB is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
 @file:Suppress("unused")
 
 package dev.swiftstorm.akkaradb.engine
@@ -5,74 +24,106 @@ package dev.swiftstorm.akkaradb.engine
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
-import dev.swiftstorm.akkaradb.common.putAscii
 import dev.swiftstorm.akkaradb.engine.query.*
 import java.io.Closeable
 import java.math.BigDecimal
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import kotlin.reflect.KClass
+import kotlin.reflect.KProperty1
 import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.memberProperties
 import kotlin.reflect.jvm.isAccessible
 
-class PackedTable<T : Any>(
+
+/**
+ * A class representing a table abstraction that packs entities for storage and retrieval in a database.
+ * Provides CRUD operations, query execution, and entity ID management.
+ *
+ * @param T The type of the entity stored in the table. Must be a non-nullable type.
+ * @param ID The type of the identifier used for entities in the table. Must be a non-nullable type.
+ * @param db The database instance to which this table is bound.
+ * @param kClass The KClass of the entity type [T], used for reflection and metadata purposes.
+ * @param idClass The KClass of the identifier type [ID], used for validation and serialization purposes.
+ */
+class PackedTable<T : Any, ID : Any>(
     val db: AkkaraDB,
-    @PublishedApi
-    internal val kClass: KClass<T>
+    @PublishedApi internal val kClass: KClass<T>,
+    @PublishedApi internal val idClass: KClass<ID>
 ) : Closeable {
 
     override fun close() {
         db.close()
     }
 
-    // Namespace prefix: "<qualifiedName>:"
-    internal val nsBuf: ByteBufferL by lazy {
+    private val nsBuf: ByteBufferL by lazy {
         val name = (kClass.qualifiedName ?: kClass.simpleName!!) + ":"
         ByteBufferL.wrap(StandardCharsets.US_ASCII.encode(name))
     }
 
-    companion object {
-        private const val SEP: Char = 0x1F.toChar() // unused now, preserved for safety
-        private val EMPTY: ByteBufferL = ByteBufferL.allocate(0)
+    private val idProp: KProperty1<T, *> by lazy {
+        val ids = kClass.memberProperties.filter { it.findAnnotation<Id>() != null }
+
+        require(ids.size == 1) {
+            "Type ${kClass.simpleName}: Exactly one @Id is required, found ${ids.size}"
+        }
+
+        val p = ids.first()
+        p.isAccessible = true
+
+        val actualType = p.returnType.classifier as? KClass<*>
+            ?: error("Cannot determine @Id type for ${p.name}")
+
+        require(idClass == actualType) {
+            "@Id type mismatch: expected ${idClass.simpleName}, but was ${actualType.simpleName}"
+        }
+
+        p
     }
 
-    private fun String.isAscii(): Boolean =
-        all { it.code in 0..0x7F }
+    @Suppress("UNCHECKED_CAST")
+    private fun extractId(entity: T): ID =
+        idProp.get(entity) as ID
 
-    /**
-     * Build key buffer:
-     *   [namespace][id ASCII]
-     *
-     * Preconditions:
-     * - id.isAscii()
-     */
-    internal fun keyBuf(id: String): ByteBufferL {
-        require(id.isAscii()) { "ID must be ASCII: $id" }
+    private fun encodeId(id: ID): ByteBufferL {
+        val adapter = AdapterResolver.getAdapterForClass(idClass)
+        val cap = adapter.estimateSize(id).coerceAtLeast(8)
+        val buf = BinPackBufferPool.get(cap)
 
-        val rNs = nsBuf.duplicate().position(0)
-        val out = ByteBufferL.allocate(rNs.remaining + id.length)
-        out.put(rNs)
-        out.putAscii(id)
-        return out
+        adapter.write(id, buf)
+
+        val ro = buf.asReadOnlyDuplicate().apply {
+            position(0)
+            limit(buf.position)
+        }
+
+        BinPackBufferPool.release(buf)
+        return ro
     }
 
-    /**
-     * Prefix buffer for listing/query operations.
-     * Returns: [namespace][id ASCII prefix]
-     */
-    internal fun prefixBuf(id: String): ByteBufferL {
-        require(id.isAscii())
-        val rNs = nsBuf.duplicate().position(0)
-        val idBuf = StandardCharsets.US_ASCII.encode(id)
-        val out = ByteBufferL.allocate(rNs.remaining + idBuf.remaining())
-        out.put(rNs).put(ByteBufferL.wrap(idBuf))
+    internal fun keyBuf(id: ID): ByteBufferL {
+        val ns = nsBuf.duplicate().position(0)
+        val idBytes = encodeId(id)
+
+        val out = ByteBufferL.allocate(ns.remaining + idBytes.remaining)
+        out.put(ns)
+        out.put(idBytes)
         return out
     }
 
     // ========== CRUD ==========
 
-    fun put(id: String, entity: T) {
+    /**
+     * Stores or updates the specified entity in the database using the provided ID.
+     *
+     * This method serializes the given entity into a binary format using a resolved adapter
+     * and stores it in the database under the constructed key derived from the given ID.
+     * If an entry already exists for the specified ID, it will be overwritten.
+     *
+     * @param id The unique identifier of type [ID] used to associate the entity within the database.
+     * @param entity The entity of type [T] to be serialized and stored in the database.
+     */
+    fun put(id: ID, entity: T) {
         val adapter = AdapterResolver.getAdapterForClass(kClass)
         val cap = adapter.estimateSize(entity).coerceAtLeast(32)
 
@@ -90,67 +141,88 @@ class PackedTable<T : Any>(
         BinPackBufferPool.release(buf)
     }
 
-    fun get(id: String): T? {
+    /**
+     * Inserts or updates the provided entity in the database. The entity's ID is extracted and used
+     * to construct a key for the underlying storage. If an entry with the entity's ID already exists,
+     * it will be overwritten.
+     *
+     * @param entity The entity of type [T] to be stored in the database.
+     */
+    fun put(entity: T) {
+        val id = extractId(entity)
+        put(id, entity)
+    }
+
+    /**
+     * Retrieves an entity from the database based on the specified ID.
+     *
+     * This function constructs a key using the given ID, retrieves the raw data associated with
+     * that key from the database, resolves an adapter for the entity's class type, and then reads
+     * and deserializes the entity from the raw data. If the ID does not exist in the database, or
+     * the data has been tombstoned, it returns null.
+     *
+     * @param id The identifier of the entity to retrieve.
+     * @return The deserialized entity of type [T], or null if the ID is not found or the data is invalid.
+     */
+    fun get(id: ID): T? {
         val key = keyBuf(id)
         val raw = db.get(key) ?: return null
         val adapter = AdapterResolver.getAdapterForClass(kClass)
         return adapter.read(raw.duplicate().position(0))
     }
 
-    fun delete(id: String) {
-        val key = keyBuf(id)
-        db.delete(key)
+    /**
+     * Deletes an entry from the database corresponding to the provided ID.
+     *
+     * @param id The identifier of the entry to be deleted. This ID is used to construct the key for locating the entry in the database.
+     */
+    fun delete(id: ID) {
+        db.delete(keyBuf(id))
     }
 
-    fun update(id: String, mutator: T.() -> Unit): Boolean {
+    /**
+     * Updates an existing entity identified by the given ID. The update is performed by applying
+     * the provided mutator function to a copied version of the entity. If the entity is not found
+     * or if the result of the mutation is equal to the original entity, no update is performed.
+     *
+     * @param id The identifier of the entity to be updated.
+     * @param mutator A lambda function that allows modification of the copied entity.
+     * @return `true` if the entity is successfully updated, `false` otherwise.
+     */
+    fun update(id: ID, mutator: T.() -> Unit): Boolean {
         val old = get(id) ?: return false
         val adapter = AdapterResolver.getAdapterForClass(kClass)
-        val copy = adapter.copy(old).apply(mutator)
-        if (copy == old) return false
-        put(id, copy)
+        val new = adapter.copy(old).apply(mutator)
+
+        if (new == old) return false
+        put(id, new)
         return true
     }
 
-    fun upsert(id: String, init: T.() -> Unit): T {
-        val entity: T = get(id) ?: run {
-            val ctor0 = kClass.constructors.firstOrNull { it.parameters.isEmpty() }
-            (ctor0?.call() ?: error("No-arg constructor required for ${kClass.simpleName}"))
+    /**
+     * Inserts or updates an entity in the database based on the specified ID.
+     *
+     * If the entity with the given ID does not already exist, a new instance of the entity is created using
+     * a no-argument constructor. The newly created or existing entity is then modified using the provided initialization
+     * block and stored in the database.
+     *
+     * @param id The identifier of the entity to insert or update.
+     * @param init A lambda function to initialize or modify the entity of type [T].
+     * @return The newly created or updated entity of type [T].
+     */
+    fun upsert(id: ID, init: T.() -> Unit): T {
+        val entity = get(id) ?: run {
+            val ctor = kClass.constructors.firstOrNull { it.parameters.isEmpty() }
+                ?: error("No-arg constructor required for ${kClass.simpleName}")
+            ctor.call()
         }
 
         entity.init()
-
-        // Validation
-        for (prop in kClass.memberProperties) {
-            prop.isAccessible = true
-            val v = prop.get(entity)
-
-            if (prop.findAnnotation<Required>() != null) {
-                if (v == null) error("Property '${prop.name}' is required")
-            }
-            if (prop.findAnnotation<NonEmpty>() != null) {
-                when (v) {
-                    is String -> if (v.isEmpty()) error("Property '${prop.name}' must be non-empty")
-                    is Collection<*> -> if (v.isEmpty()) error("Property '${prop.name}' must be non-empty")
-                }
-            }
-            if (prop.findAnnotation<Positive>() != null) {
-                when (v) {
-                    is Int -> if (v <= 0) error("Property '${prop.name}' must be > 0")
-                    is Long -> if (v <= 0L) error("Property '${prop.name}' must be > 0")
-                }
-            }
-        }
-
         put(id, entity)
         return entity
     }
 
-    // Overloads using "default" id
-    fun put(entity: T) = put("default", entity)
-    fun get(): T? = get("default")
-    fun delete() = delete("default")
-    fun update(mutator: T.() -> Unit): Boolean = update("default", mutator)
-    fun upsert(init: T.() -> Unit): T = upsert("default", init)
+    // ========== Query ==========
 
     fun query(
         @AkkQueryDsl block: T.() -> Boolean
@@ -273,25 +345,20 @@ class PackedTable<T : Any>(
                         AkkOp.GE -> cmp(l, r) >= 0
                         AkkOp.LT -> cmp(l, r) < 0
                         AkkOp.LE -> cmp(l, r) <= 0
-
                         AkkOp.AND -> {
                             val lb = l as Boolean? ?: false
                             val rb = r as Boolean? ?: false
                             lb && rb
                         }
-
                         AkkOp.OR -> {
                             val lb = l as Boolean? ?: false
                             val rb = r as Boolean? ?: false
                             lb || rb
                         }
-
                         AkkOp.IN ->
                             containsOp(l, r)
-
                         AkkOp.NOT_IN ->
                             !containsOp(l, r)
-
                         else -> error("Unsupported binary op: ${e.op}")
                     }
                 }
@@ -310,51 +377,45 @@ class PackedTable<T : Any>(
         }
     }
 
-    fun runToList(
-        @AkkQueryDsl block: T.() -> Boolean
-    ): List<T> =
+    fun runToList(@AkkQueryDsl block: T.() -> Boolean) =
         runQ(query(block)).toList()
 
-    fun firstOrNull(
-        @AkkQueryDsl block: T.() -> Boolean
-    ): T? =
+    fun firstOrNull(@AkkQueryDsl block: T.() -> Boolean) =
         runQ(query(block)).firstOrNull()
 
-    fun exists(
-        @AkkQueryDsl block: T.() -> Boolean
-    ): Boolean =
+    fun exists(@AkkQueryDsl block: T.() -> Boolean) =
         runQ(query(block)).any()
 
     /**
-     * Compute [start, end) for keys belonging to this table.
-     *
-     * Keys are encoded as:
-     *   "<qualifiedName>:" + idAscii
-     *
-     * So all keys are in the byte range:
-     *   [nsBuf, nsBufWithLastByte+1)
+     * namespace の範囲（prefix スキャン用）
      */
     private fun namespaceRange(): Pair<ByteBufferL, ByteBufferL> {
-        // Dump nsBuf bytes
-        val nsBytes = run {
+        val arr = run {
             val d = nsBuf.duplicate().position(0)
-            val arr = ByteArray(d.remaining)
+            val a = ByteArray(d.remaining)
             var i = 0
-            while (d.remaining > 0) {
-                arr[i++] = d.i8.toByte()
-            }
-            arr
+            while (d.remaining > 0) a[i++] = d.i8.toByte()
+            a
         }
 
-        val start = ByteBufferL.wrap(ByteBuffer.wrap(nsBytes.clone()))
-
-        val hi = nsBytes.clone()
-        val lastIdx = hi.lastIndex
-        // ASCII only, so no overflow to worry about in practice (':' -> ';' etc.)
-        hi[lastIdx] = (hi[lastIdx] + 1).toByte()
+        val start = ByteBufferL.wrap(ByteBuffer.wrap(arr.clone()))
+        val hi = arr.clone()
+        hi[hi.lastIndex] = (hi.last().toInt() + 1).toByte()
         val end = ByteBufferL.wrap(ByteBuffer.wrap(hi))
-
         return start to end
     }
-
 }
+
+/**
+ * Annotation used to mark a property as an identifier for an entity or data model.
+ *
+ * This annotation can be applied only to properties and is retained at runtime.
+ * It is typically used in database-related frameworks or serialization mechanisms
+ * to specify a primary key or unique identifier for an object.
+ *
+ * Annotation Target: PROPERTY
+ * Annotation Retention: RUNTIME
+ */
+@Target(AnnotationTarget.PROPERTY)
+@Retention(AnnotationRetention.RUNTIME)
+annotation class Id

@@ -32,15 +32,18 @@ import java.nio.file.Path
  */
 object AkkDSL {
     // factory helpers
-    inline fun <reified T : Any> open(baseDir: Path, configure: AkkDSLCfgBuilder.() -> Unit = {}): PackedTable<T> {
+    inline fun <reified T : Any, reified ID : Any> open(baseDir: Path, configure: AkkDSLCfgBuilder.() -> Unit = {}): PackedTable<T, ID> {
         val cfg = AkkDSLCfgBuilder(baseDir).apply(configure).build()
-        return open<T>(cfg)
+        return open<T, ID>(cfg)
     }
 
-    inline fun <reified T : Any> open(baseDir: Path, mode: StartupMode, noinline customize: AkkDSLCfgBuilder.() -> Unit = {}): PackedTable<T> =
-        open<T>(AkkaraPresets.of(baseDir, mode, customize))
+    inline fun <reified T : Any, reified ID : Any> open(
+        baseDir: Path,
+        mode: StartupMode,
+        noinline customize: AkkDSLCfgBuilder.() -> Unit = {}
+    ): PackedTable<T, ID> = open<T, ID>(AkkaraPresets.of(baseDir, mode, customize))
 
-    inline fun <reified T : Any> open(cfg: AkkDSLCfg): PackedTable<T> {
+    inline fun <reified T : Any, reified ID : Any> open(cfg: AkkDSLCfg): PackedTable<T, ID> {
         val opts = AkkaraDB.Options(
             baseDir = cfg.baseDir,
             k = cfg.k,
@@ -53,10 +56,10 @@ object AkkDSL {
             durableCas = cfg.durableCas,
         )
         val db = AkkaraDB.open(opts)
-        return PackedTable(db, T::class)
+        return PackedTable(db, T::class, ID::class)
     }
 
-    inline fun <reified T : Any> AkkaraDB.open(): PackedTable<T> = PackedTable(this, T::class)
+    inline fun <reified T : Any, reified ID : Any> AkkaraDB.open(): PackedTable<T, ID> = PackedTable(this, T::class, ID::class)
 }
 
 // ---- configuration (v3-focused, minimal) ----
@@ -157,10 +160,13 @@ private fun AkkDSLCfgBuilder.configureUltraFast() {
 // ---- annotations ----
 
 @Target(AnnotationTarget.PROPERTY)
+@Retention(AnnotationRetention.RUNTIME)
 annotation class Required
 
 @Target(AnnotationTarget.PROPERTY)
+@Retention(AnnotationRetention.RUNTIME)
 annotation class NonEmpty
 
 @Target(AnnotationTarget.PROPERTY)
+@Retention(AnnotationRetention.RUNTIME)
 annotation class Positive
