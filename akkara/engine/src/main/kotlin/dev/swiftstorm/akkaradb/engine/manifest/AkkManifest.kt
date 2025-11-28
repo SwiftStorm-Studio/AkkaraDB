@@ -395,6 +395,7 @@ class AkkManifest(
 
     /* ─────────── Rotation ─────────── */
 
+    @Synchronized
     private fun maybeRotate(ch: FileChannel? = fastCh) {
         if (rotateMaxBytes <= 0) return
         val curSize = try {

@@ -20,6 +20,7 @@
 package dev.swiftstorm.akkaradb.engine.util
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.fnv1a32
 import java.nio.channels.WritableByteChannel
 import kotlin.math.min
 
@@ -132,6 +133,7 @@ class IndexBlock private constructor(
         private const val MAGIC = 0x414B4958 // 'A''K''I''X'
         private const val VER = 1
         private const val KEY_BYTES = 32
+        private const val PREFIX_LEN = 24
         private const val ENTRY_BYTES = KEY_BYTES + 8
         private const val OFF_MAGIC = 0
         private const val OFF_VER = 4
@@ -165,12 +167,21 @@ class IndexBlock private constructor(
         fun normalize32(key: ByteBufferL): ByteArray {
             val src = key.duplicate()
             val out = ByteArray(KEY_BYTES)
-            val n = min(KEY_BYTES, src.remaining)
+
+            val n = min(PREFIX_LEN, src.remaining)
             var i = 0
             while (i < n) {
                 out[i] = (src.i8 and 0xFF).toByte()
                 i++
             }
+
+            val h = fnv1a32(key)  // Int
+            var p = PREFIX_LEN
+            out[p++] = (h ushr 24).toByte()
+            out[p++] = (h ushr 16).toByte()
+            out[p++] = (h ushr 8).toByte()
+            out[p] = (h ushr 0).toByte()
+
             return out
         }
     }

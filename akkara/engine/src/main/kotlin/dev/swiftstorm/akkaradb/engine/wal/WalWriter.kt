@@ -22,6 +22,7 @@ package dev.swiftstorm.akkaradb.engine.wal
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
 import java.io.Closeable
+import java.io.IOException
 import java.nio.channels.ClosedChannelException
 import java.nio.channels.FileChannel
 import java.nio.file.Files
@@ -98,11 +99,15 @@ class WalWriter(
         val waiter = Waiter()
         q.put(Item(lsn, frame, waiter))
 
-        if (!fastMode) waiter.await(timeoutMicros = groupTmicros)
+        if (!fastMode) {
+            waiter.await(timeoutMicros = groupTmicros * 10)
+            if (!waiter.done) {
+                throw IOException("WAL fsync timeout")
+            }
+        }
 
         return lsn
     }
-
 
     fun forceSync() {
         if (!running.get() || !ch.isOpen) return

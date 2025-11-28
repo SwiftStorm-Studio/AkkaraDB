@@ -285,6 +285,7 @@ class AkkaraDB private constructor(
         val parityCoder: ParityCoder? = null,
         val durableCas: Boolean = false,
         val useStripeForRead: Boolean = false,
+        val bloomFPRate: Double = 0.01
     )
 
     companion object {
@@ -361,12 +362,6 @@ class AkkaraDB private constructor(
                 }
             }
 
-            fun levelOf(path: Path): Int {
-                // path .../sst/Lx/filename.sst
-                val parent = path.parent?.fileName?.toString() ?: return Int.MAX_VALUE
-                return if (parent.startsWith("L")) parent.substring(1).toIntOrNull() ?: Int.MAX_VALUE else Int.MAX_VALUE
-            }
-
             // Prepare onFlush callback: write L0 SST and optionally pack into stripes
             val readersDeque = ConcurrentLinkedDeque<SSTableReader>()
             val onFlushCb: (List<MemRecord>) -> Unit = { batch ->
@@ -383,7 +378,7 @@ class AkkaraDB private constructor(
                         file,
                         CREATE, WRITE, READ, TRUNCATE_EXISTING
                     ).use { ch ->
-                        SSTableWriter(ch, expectedEntries = sorted.size.toLong()).use { w ->
+                        SSTableWriter(ch, expectedEntries = sorted.size.toLong(), opts.bloomFPRate).use { w ->
                             w.writeAll(sorted.asSequence())
                             w.seal()
                         }
