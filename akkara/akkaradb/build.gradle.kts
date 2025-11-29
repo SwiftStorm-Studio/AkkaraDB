@@ -1,3 +1,4 @@
+import org.jetbrains.dokka.gradle.DokkaExtension
 import java.net.HttpURLConnection
 import java.net.URI
 
@@ -36,6 +37,18 @@ tasks.shadowJar {
 }
 tasks.jar {
     archiveClassifier.set("thin")
+}
+extensions.configure<DokkaExtension> {
+    dokkaSourceSets.configureEach {
+        listOf(
+            project(":akkara-common"),
+            project(":akkara-format-api"),
+            project(":akkara-format-akk"),
+            project(":akkara-engine")
+        ).forEach { sub ->
+            sourceRoots.from(sub.the<SourceSetContainer>()["main"].allSource.srcDirs)
+        }
+    }
 }
 
 tasks.named<Jar>("sourcesJar") {
