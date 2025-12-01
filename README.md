@@ -10,12 +10,21 @@ AkkaraDB is a JVM-native, ultra-low-latency embedded key–value store written i
 
 > **Note**: The Akkara Compiler Plugin is required for Typed API (AkkaraDSL) and Query DSL features. It is automatically applied when using the Gradle plugin.
 
-### Gradle (Kotlin DSL) — Recommended
+#### Latest Versions:
+
+AkkaraPlugin: ![AkkaraDB Plugin Version](https://img.shields.io/badge/dynamic/xml?url=https://repo.ririfa.net/repository/maven-public/dev/swiftstorm/akkara-plugin/maven-metadata.xml&query=/metadata/versioning/latest&style=plastic&logo=sonatype&label=Nexus)
+
+AkkaraDB: ![AkkaraDB Version](https://img.shields.io/badge/dynamic/xml?url=https://repo.ririfa.net/repository/maven-public/dev/swiftstorm/akkaradb/maven-metadata.xml&query=/metadata/versioning/latest&style=plastic&logo=sonatype&label=Nexus)
+
+AkkaraCompiler: ![Akkara Compiler Version](https://img.shields.io/badge/dynamic/xml?url=https://repo.ririfa.net/repository/maven-public/dev/swiftstorm/akkara-compiler/maven-metadata.xml&query=/metadata/versioning/latest&style=plastic&logo=sonatype&label=Nexus)
+
+<details open>
+<summary><strong>Gradle (Kotlin DSL) — Recommended</strong></summary>
 
 ```kotlin
 plugins {
     kotlin("jvm") version "2.1.0"
-    id("dev.swiftstorm.akkaradb-plugin") version "0.1.0+rc.1"
+  id("dev.swiftstorm.akkaradb-plugin") version "$version"
 }
 
 repositories {
@@ -25,7 +34,7 @@ repositories {
 
 dependencies {
     // Recommended: Use the akkara() function provided by the plugin
-    akkara("0.2.0")
+  akkara("$version", "$scope")
 }
 ```
 
@@ -34,17 +43,19 @@ dependencies {
 
 ```kotlin
 dependencies {
-    implementation("dev.swiftstorm:akkaradb:0.2.0")
+  implementation("dev.swiftstorm:akkaradb:$version")
 }
 ```
 </details>
-
-### Gradle (Groovy DSL)
+</details>
+<p>
+<details>
+<summary><strong>Gradle (Groovy DSL)</strong></summary>
 
 ```groovy
 plugins {
-    id 'org.jetbrains.kotlin.jvm' version '2.1.0'
-    id 'dev.swiftstorm.akkaradb-plugin' version '0.1.0+rc.1'
+  id 'org.jetbrains.kotlin.jvm' version '$version'
+  id 'dev.swiftstorm.akkaradb-plugin' version '$version'
 }
 
 repositories {
@@ -54,7 +65,7 @@ repositories {
 
 dependencies {
     // Recommended: Use the akkara() function provided by the plugin
-    akkara('0.2.0')
+  akkara('$version', '$scope')
 }
 ```
 
@@ -68,13 +79,16 @@ dependencies {
 ```
 </details>
 
-### Maven
+</details>
+<p>
+<details>
+<summary><strong>Maven</strong></summary>
 
 ```xml
 <properties>
-    <kotlin.version>2.1.0</kotlin.version>
+  <kotlin.version>2.2.21</kotlin.version>
     <akkaradb.version>0.2.0</akkaradb.version>
-    <akkara-compiler.version>0.3.1</akkara-compiler.version>
+  <akkara-compiler.version>0.3.2</akkara-compiler.version>
 </properties>
 
 <repositories>
@@ -114,6 +128,50 @@ dependencies {
     </plugins>
 </build>
 ```
+
+</details>
+
+### Required Configuration
+
+> **Important**: The Akkara compiler plugin requires the Kotlin compiler to run in `in-process` mode.
+
+**For Gradle projects:**
+
+Add the following to your `gradle.properties`:
+
+```properties
+kotlin.compiler.execution.strategy=in-process
+```
+
+**For Maven projects:**
+
+Choose one of the following options:
+
+1. **Recommended**: Create a `.mvn/maven.config` file in your project root:
+
+```
+   -Dkotlin.compiler.execution.strategy=in-process
+```
+
+2. **Alternative**: Pass the property via command line:
+
+```bash
+   mvn clean compile -Dkotlin.compiler.execution.strategy=in-process
+```
+
+This setting is **required** for the Akkara compiler plugin to correctly transform query DSL expressions (such as `&&`, `||` operators). Without it, compilation
+may fail with IR lowering errors.
+
+<details>
+<summary>Why is this required?</summary>
+
+The Akkara compiler plugin performs IR (Intermediate Representation) transformations to convert query DSL syntax into optimized query expressions. When Kotlin
+compilation runs in `daemon` mode (the default), the plugin execution order can become unstable, causing the transformations to occur after the JVM optimization
+phase, which results in compilation errors.
+
+Setting `in-process` mode ensures the plugin runs in the same process as your build tool, guaranteeing correct execution order.
+
+</details>
 
 ## Quick Start
 

@@ -155,6 +155,52 @@ class QueryCallRewriter(
         }
     }
 
+    override fun visitWhen(expression: IrWhen): IrExpression {
+        val transformed = super.visitWhen(expression) as? IrWhen ?: return super.visitWhen(expression)
+
+        if (transformed.origin == IrStatementOrigin.ANDAND && transformed.branches.size == 2) {
+            val firstBranch = transformed.branches[0]
+            val secondBranch = transformed.branches[1]
+
+            val conditionA = firstBranch.condition
+            val resultB = firstBranch.result
+
+            val isElseBranch = secondBranch.condition.let { cond ->
+                cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
+            }
+            val isFalseResult = secondBranch.result.let { res ->
+                res is IrConst && res.kind == IrConstKind.Boolean && res.value == false
+            }
+
+            if (isElseBranch && isFalseResult) {
+                return bin(opAND, conditionA, resultB)
+            }
+        }
+
+        if (transformed.origin == IrStatementOrigin.OROR && transformed.branches.size == 2) {
+            val firstBranch = transformed.branches[0]
+            val secondBranch = transformed.branches[1]
+
+            val conditionA = firstBranch.condition
+            val resultTrue = firstBranch.result
+
+            val isTrueResult = resultTrue.let { res ->
+                res is IrConst && res.kind == IrConstKind.Boolean && res.value == true
+            }
+
+            val isElseBranch = secondBranch.condition.let { cond ->
+                cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
+            }
+
+            if (isTrueResult && isElseBranch) {
+                val resultB = secondBranch.result
+                return bin(opOR, conditionA, resultB)
+            }
+        }
+
+        return transformed
+    }
+
     private fun rewriteQuery(call: IrCall): IrExpression {
         val callee = call.symbol.owner
 
@@ -377,14 +423,6 @@ class QueryCallRewriter(
                 cmp(ctx.irBuiltIns.lessOrEqualFunByOperandType, opLE)?.let { return it }
                 cmp(ctx.irBuiltIns.greaterFunByOperandType, opGT)?.let { return it }
                 cmp(ctx.irBuiltIns.greaterOrEqualFunByOperandType, opGE)?.let { return it }
-
-                // ===== && / || =====
-                if (sym == ctx.irBuiltIns.andandSymbol && lhsRaw != null && rhsRaw != null) {
-                    return bin(opAND, rewriteExpr(lhsRaw), rewriteExpr(rhsRaw))
-                }
-                if (sym == ctx.irBuiltIns.ororSymbol && lhsRaw != null && rhsRaw != null) {
-                    return bin(opOR, rewriteExpr(lhsRaw), rewriteExpr(rhsRaw))
-                }
 
                 // ===== in (desugared to .contains) =====
                 if (sym.owner.name == OperatorNameConventions.CONTAINS) {
