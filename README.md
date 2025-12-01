@@ -8,10 +8,13 @@ AkkaraDB is a JVM-native, ultra-low-latency embedded key–value store written i
 
 ## Installation
 
-### Gradle (Kotlin DSL) with Plugin
+> **Note**: The Akkara Compiler Plugin is required for Typed API (AkkaraDSL) and Query DSL features. It is automatically applied when using the Gradle plugin.
+
+### Gradle (Kotlin DSL) — Recommended
 
 ```kotlin
 plugins {
+    kotlin("jvm") version "2.1.0"
     id("dev.swiftstorm.akkaradb-plugin") version "0.1.0+rc.1"
 }
 
@@ -21,14 +24,26 @@ repositories {
 }
 
 dependencies {
-    implementation("dev.swiftstorm:akkaradb:0.2.0")
+    // Recommended: Use the akkara() function provided by the plugin
+    akkara("0.2.0")
 }
 ```
 
-### Gradle (Groovy DSL) with Plugin
+<details>
+<summary>Alternative: Manual dependency declaration</summary>
+
+```kotlin
+dependencies {
+    implementation("dev.swiftstorm:akkaradb:0.2.0")
+}
+```
+</details>
+
+### Gradle (Groovy DSL)
 
 ```groovy
 plugins {
+    id 'org.jetbrains.kotlin.jvm' version '2.1.0'
     id 'dev.swiftstorm.akkaradb-plugin' version '0.1.0+rc.1'
 }
 
@@ -38,13 +53,30 @@ repositories {
 }
 
 dependencies {
+    // Recommended: Use the akkara() function provided by the plugin
+    akkara('0.2.0')
+}
+```
+
+<details>
+<summary>Alternative: Manual dependency declaration</summary>
+
+```groovy
+dependencies {
     implementation 'dev.swiftstorm:akkaradb:0.2.0'
 }
 ```
+</details>
 
 ### Maven
 
 ```xml
+<properties>
+    <kotlin.version>2.1.0</kotlin.version>
+    <akkaradb.version>0.2.0</akkaradb.version>
+    <akkara-compiler.version>0.3.1</akkara-compiler.version>
+</properties>
+
 <repositories>
     <repository>
         <id>swiftstorm</id>
@@ -56,9 +88,31 @@ dependencies {
     <dependency>
         <groupId>dev.swiftstorm</groupId>
         <artifactId>akkaradb</artifactId>
-        <version>0.2.0</version>
+        <version>${akkaradb.version}</version>
     </dependency>
 </dependencies>
+
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.jetbrains.kotlin</groupId>
+            <artifactId>kotlin-maven-plugin</artifactId>
+            <version>${kotlin.version}</version>
+            <configuration>
+                <compilerPlugins>
+                    <plugin>dev.swiftstorm.akkaradb.plugin.compiler</plugin>
+                </compilerPlugins>
+            </configuration>
+            <dependencies>
+                <dependency>
+                    <groupId>dev.swiftstorm</groupId>
+                    <artifactId>akkara-compiler</artifactId>
+                    <version>${akkara-compiler.version}</version>
+                </dependency>
+            </dependencies>
+        </plugin>
+    </plugins>
+</build>
 ```
 
 ## Quick Start
