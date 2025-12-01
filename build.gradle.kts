@@ -81,10 +81,8 @@ subprojects {
         }
 
         "akkara-compiler" -> {
-            afterEvaluate {
-                dependencies {
-                    compileOnly(kotlin("compiler"))
-                }
+            dependencies {
+                compileOnly(kotlin("compiler"))
             }
         }
 
