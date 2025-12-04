@@ -21,4 +21,4 @@ safeInclude("akkara-plugin", "akkara/plugin/akkara-plugin")
 safeInclude("akkara-compiler", "akkara/plugin/akkara-compiler")
 safeInclude("akkara-format-api", "akkara/format-api")
 safeInclude("akkara-format-akk", "akkara/format-akk")
-safeInclude("akkara-cli", "akkara/cli")
+// safeInclude("akkara-cli", "akkara/cli") CLI will be produced by `AkkaraDB-CXX` project
