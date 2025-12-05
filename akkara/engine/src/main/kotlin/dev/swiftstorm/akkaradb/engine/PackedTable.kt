@@ -25,9 +25,9 @@ import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
 import dev.swiftstorm.akkaradb.engine.query.*
+import dev.swiftstorm.akkaradb.engine.util.murmur3_128
 import java.io.Closeable
 import java.math.BigDecimal
-import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import kotlin.reflect.KClass
 import kotlin.reflect.KProperty1
@@ -50,14 +50,22 @@ class PackedTable<T : Any, ID : Any>(
     @PublishedApi internal val kClass: KClass<T>,
     @PublishedApi internal val idClass: KClass<ID>
 ) : Closeable {
-
     override fun close() {
         db.close()
     }
 
     private val nsBuf: ByteBufferL by lazy {
-        val name = (kClass.qualifiedName ?: kClass.simpleName!!) + ":"
-        ByteBufferL.wrap(StandardCharsets.US_ASCII.encode(name))
+        val fqn = kClass.qualifiedName ?: kClass.simpleName!!
+        val nameBytes = ByteBufferL.wrap(
+            StandardCharsets.UTF_8.encode(fqn)
+        )
+
+        val hash = murmur3_128(nameBytes, seed = 0)
+
+        // Use upper 64bit only
+        ByteBufferL.allocate(8).apply {
+            i64 = hash[0]
+        }
     }
 
     private val idProp: KProperty1<T, *> by lazy {
@@ -81,8 +89,7 @@ class PackedTable<T : Any, ID : Any>(
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun extractId(entity: T): ID =
-        idProp.get(entity) as ID
+    private fun extractId(entity: T): ID = idProp.get(entity) as ID
 
     private fun encodeId(id: ID): ByteBufferL {
         val adapter = AdapterResolver.getAdapterForClass(idClass)
@@ -370,18 +377,16 @@ class PackedTable<T : Any, ID : Any>(
         runQ(query(block)).count()
 
     private fun namespaceRange(): Pair<ByteBufferL, ByteBufferL> {
-        val arr = run {
-            val d = nsBuf.duplicate().position(0)
-            val a = ByteArray(d.remaining)
-            var i = 0
-            while (d.remaining > 0) a[i++] = d.i8.toByte()
-            a
+        val hash = nsBuf.duplicate().position(0).i64
+
+        val start = ByteBufferL.allocate(8).apply {
+            i64 = hash
         }
 
-        val start = ByteBufferL.wrap(ByteBuffer.wrap(arr.clone()))
-        val hi = arr.clone()
-        hi[hi.lastIndex] = (hi.last().toInt() + 1).toByte()
-        val end = ByteBufferL.wrap(ByteBuffer.wrap(hi))
+        val end = ByteBufferL.allocate(8).apply {
+            i64 = hash + 1
+        }
+
         return start to end
     }
 }
