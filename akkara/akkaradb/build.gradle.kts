@@ -3,7 +3,6 @@ import java.net.HttpURLConnection
 import java.net.URI
 
 plugins {
-    alias(libs.plugins.kotlin)
     alias(libs.plugins.shadow)
     `maven-publish`
 }

@@ -1,6 +1,7 @@
 package dev.swiftstorm.akkaradb.common.binpack.primitive
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
+import dev.swiftstorm.akkaradb.common.binpack.AdapterSetting
 import dev.swiftstorm.akkaradb.common.binpack.TypeAdapter
 
 /**
@@ -46,7 +47,10 @@ class StringAdapter(private val validate: Boolean = true) : TypeAdapter<String> 
 
     override fun read(buffer: ByteBufferL): String {
         val size = buffer.i32
-        require(size >= 0) { "Negative size: $size" }
+        require(size >= 0) { "Negative string size: $size" }
+        require(size <= AdapterSetting.maxStringLength) {
+            "String size $size exceeds configured limit (${AdapterSetting.maxStringLength})"
+        }
         require(buffer.remaining >= size) {
             "Insufficient bytes: need=$size remaining=${buffer.remaining}"
         }

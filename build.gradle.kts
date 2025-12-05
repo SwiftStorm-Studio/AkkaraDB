@@ -26,9 +26,9 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.2.0"
+        "akkaradb" -> "0.2.1"
         "akkara-plugin" -> "0.1.0"
-        "akkara-compiler" -> "0.3.3"
+        "akkara-compiler" -> "0.3.4"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
     }
     description = ""
@@ -64,13 +64,15 @@ subprojects {
         }
 
         "akkara-engine" -> {
-            dependencies {
-                implementation(project(":akkara-common"))
-                implementation(project(":akkara-format-api"))
-                implementation(project(":akkara-format-akk"))
+            afterEvaluate {
+                dependencies {
+                    implementation(project(":akkara-common"))
+                    implementation(project(":akkara-format-api"))
+                    implementation(project(":akkara-format-akk"))
 
-                compileOnly(kotlin("reflect"))
-                compileOnly(kotlin("serialization"))
+                    compileOnly(kotlin("reflect"))
+                    compileOnly(kotlin("serialization"))
+                }
             }
         }
 

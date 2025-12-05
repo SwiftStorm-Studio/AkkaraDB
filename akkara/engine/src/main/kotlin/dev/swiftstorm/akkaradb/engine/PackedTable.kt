@@ -35,7 +35,6 @@ import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.memberProperties
 import kotlin.reflect.jvm.isAccessible
 
-
 /**
  * A class representing a table abstraction that packs entities for storage and retrieval in a database.
  * Provides CRUD operations, query execution, and entity ID management.

@@ -135,14 +135,12 @@ class QueryCallRewriter(
     private val opNOT_IN by lazy { enumEntry("NOT_IN") }
 
     override fun visitCall(expression: IrCall): IrExpression {
-        println("Akkara: visiting call to ${expression.symbol.owner.name.asString()}")
         val owner = expression.symbol.owner
 
         // FQ name-based check
         val fqName = owner.parent.kotlinFqName.asString()
 
         return if (fqName == "dev.swiftstorm.akkaradb.engine.PackedTable") {
-            println("Akkara: rewriting call to ${expression.symbol.owner.name.asString()}")
             when (expression.symbol.owner.name.asString()) {
                 "query" -> rewriteQuery(expression)
                 "exists" -> rewriteExists(expression)
@@ -153,52 +151,6 @@ class QueryCallRewriter(
         } else {
             super.visitCall(expression)
         }
-    }
-
-    override fun visitWhen(expression: IrWhen): IrExpression {
-        val transformed = super.visitWhen(expression) as? IrWhen ?: return super.visitWhen(expression)
-
-        if (transformed.origin == IrStatementOrigin.ANDAND && transformed.branches.size == 2) {
-            val firstBranch = transformed.branches[0]
-            val secondBranch = transformed.branches[1]
-
-            val conditionA = firstBranch.condition
-            val resultB = firstBranch.result
-
-            val isElseBranch = secondBranch.condition.let { cond ->
-                cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
-            }
-            val isFalseResult = secondBranch.result.let { res ->
-                res is IrConst && res.kind == IrConstKind.Boolean && res.value == false
-            }
-
-            if (isElseBranch && isFalseResult) {
-                return bin(opAND, conditionA, resultB)
-            }
-        }
-
-        if (transformed.origin == IrStatementOrigin.OROR && transformed.branches.size == 2) {
-            val firstBranch = transformed.branches[0]
-            val secondBranch = transformed.branches[1]
-
-            val conditionA = firstBranch.condition
-            val resultTrue = firstBranch.result
-
-            val isTrueResult = resultTrue.let { res ->
-                res is IrConst && res.kind == IrConstKind.Boolean && res.value == true
-            }
-
-            val isElseBranch = secondBranch.condition.let { cond ->
-                cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
-            }
-
-            if (isTrueResult && isElseBranch) {
-                val resultB = secondBranch.result
-                return bin(opOR, conditionA, resultB)
-            }
-        }
-
-        return transformed
     }
 
     private fun rewriteQuery(call: IrCall): IrExpression {
@@ -367,6 +319,48 @@ class QueryCallRewriter(
 
         // Plain literal
         if (expr is IrConst) return lit(expr)
+
+        if (expr is IrWhen) {
+            if (expr.origin == IrStatementOrigin.ANDAND && expr.branches.size == 2) {
+                val firstBranch = expr.branches[0]
+                val secondBranch = expr.branches[1]
+
+                val conditionA = firstBranch.condition
+                val resultB = firstBranch.result
+
+                val isElseBranch = secondBranch.condition.let { cond ->
+                    cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
+                }
+                val isFalseResult = secondBranch.result.let { res ->
+                    res is IrConst && res.kind == IrConstKind.Boolean && res.value == false
+                }
+
+                if (isElseBranch && isFalseResult) {
+                    return bin(opAND, rewriteExpr(conditionA), rewriteExpr(resultB))
+                }
+            }
+
+            if (expr.origin == IrStatementOrigin.OROR && expr.branches.size == 2) {
+                val firstBranch = expr.branches[0]
+                val secondBranch = expr.branches[1]
+
+                val conditionA = firstBranch.condition
+                val resultTrue = firstBranch.result
+
+                val isTrueResult = resultTrue.let { res ->
+                    res is IrConst && res.kind == IrConstKind.Boolean && res.value == true
+                }
+
+                val isElseBranch = secondBranch.condition.let { cond ->
+                    cond is IrConst && cond.kind == IrConstKind.Boolean && cond.value == true
+                }
+
+                if (isTrueResult && isElseBranch) {
+                    val resultB = secondBranch.result
+                    return bin(opOR, rewriteExpr(conditionA), rewriteExpr(resultB))
+                }
+            }
+        }
 
         when (expr) {
             // Field access -> column

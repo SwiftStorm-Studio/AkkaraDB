@@ -4,6 +4,8 @@ dokka = "2.0.0"
 shadow = "9.2.2"
 slf4j = "2.1.0-alpha1"
 
+binpack = "1.1.0"
+
 [plugins]
 kotlin = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
@@ -12,5 +14,5 @@ kapt = { id = "org.jetbrains.kotlin.kapt", version.ref = "kotlin" }
 
 [libraries]
 slf4j = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
-kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
-kotlin-compiler = { group = "org.jetbrains.kotlin", name = "kotlin-compiler", version.ref = "kotlin" }
+
+binpack = { module = "net.ririfa:binpack", version.ref = "binpack" }
