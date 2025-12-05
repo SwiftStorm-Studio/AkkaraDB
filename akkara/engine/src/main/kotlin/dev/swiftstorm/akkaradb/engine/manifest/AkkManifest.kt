@@ -295,7 +295,6 @@ class AkkManifest(
     /**
      * Stop fast-mode flusher and close channel, performing a final strong sync.
      */
-    @Synchronized
     override fun close() {
         if (!fastMode) return
         val t = flusherThread
@@ -341,6 +340,7 @@ class AkkManifest(
             // ---- re-acquire the current channel every iteration (rotation-safe)
             val chNow = fastCh
             if (chNow == null) {
+                if (!running.get()) break
                 Thread.sleep(1)
                 continue
             }

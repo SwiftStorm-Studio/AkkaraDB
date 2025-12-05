@@ -210,13 +210,14 @@ class AkkaraDB private constructor(
 
     override fun close() {
         try {
+            println("Phase: flushing and closing AkkaraDB...")
             flush()
         } finally {
-            runCatching { mem.close() }
-            runCatching { stripeW.close() }
-            runCatching { readers.forEach { it.close() } }
-            runCatching { manifest.close() }
-            runCatching { wal.close() }
+            runCatching { println("Phase: mem.close"); mem.close() }
+            runCatching { println("Phase: stripeW.close"); stripeW.close() }
+            runCatching { println("Phase: readers.close"); readers.forEach { it.close() } }
+            runCatching { println("Phase: manifest.close"); manifest.close() }
+            runCatching { println("Phase: wal.close"); wal.close() }
         }
     }
 

@@ -114,7 +114,20 @@ class PackedTable<T : Any, ID : Any>(
         val out = ByteBufferL.allocate(ns.remaining + idBytes.remaining)
         out.put(ns)
         out.put(idBytes)
-        return out
+        val result = out.position(0)
+
+        println("[PackedTable.keyBuf] Generated key:")
+        println("  Namespace: ${ns.remaining} bytes")
+        println("  ID bytes: ${idBytes.remaining} bytes")
+        println("  Total key: ${result.remaining} bytes")
+        val keyHex = result.duplicate().let { buf ->
+            (0 until minOf(16, buf.remaining)).joinToString(" ") {
+                "%02X".format(buf.i8 and 0xFF)
+            }
+        }
+        println("  Key hex: [$keyHex...]")
+
+        return result
     }
 
     // ========== CRUD ==========
@@ -142,7 +155,22 @@ class PackedTable<T : Any, ID : Any>(
         }
 
         val key = keyBuf(id)
-        db.put(key, encoded)
+
+        println("[PackedTable.put] Writing entity:")
+        println("  Entity: $entity")
+        println("  Key: ${key.remaining} bytes")
+        println("  Value: ${encoded.remaining} bytes")
+
+        val seq = db.put(key, encoded)
+
+        println("  Assigned seq: $seq")
+
+        val readBack = db.get(key.duplicate().position(0))
+        if (readBack != null) {
+            println("  ✓ Read back successful: ${readBack.remaining} bytes")
+        } else {
+            println("  ✗ WARNING: Could not read back immediately after put!")
+        }
 
         BinPackBufferPool.release(buf)
     }
@@ -354,6 +382,12 @@ class PackedTable<T : Any, ID : Any>(
         // Compute [start, end) for this table's namespace: "<qualifiedName>:"
         val (startKey, endKey) = namespaceRange()
 
+        println("[PackedTable.runQ] Debug Info:")
+        println("  Table class: ${kClass.qualifiedName}")
+        println("  Namespace hash: ${nsBuf.duplicate().position(0).i64}")
+        println("  Range start: ${startKey.remaining} bytes, i64=${startKey.duplicate().position(0).i64}")
+        println("  Range end: ${endKey.remaining} bytes, i64=${endKey.duplicate().position(0).i64}")
+
         return sequence {
             for (rec in db.range(startKey, endKey)) {
                 val entity = adapter.read(rec.value.duplicate().position(0))
@@ -381,11 +415,10 @@ class PackedTable<T : Any, ID : Any>(
 
         val start = ByteBufferL.allocate(8).apply {
             i64 = hash
-        }
-
+        }.position(0)
         val end = ByteBufferL.allocate(8).apply {
             i64 = hash + 1
-        }
+        }.position(0)
 
         return start to end
     }
