@@ -21,7 +21,9 @@
 
 package dev.swiftstorm.akkaradb.engine.sstable
 
+import dev.swiftstorm.akkaradb.common.AKHdr32
 import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
+import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.lexCompare
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
@@ -72,21 +74,34 @@ class SSTableReader(
     }
 
     /** Range iterator [startKey, endKey). endKey == null means "to EOF". */
-    fun range(startKey: ByteBufferL, endKey: ByteBufferL? = null): Sequence<Pair<ByteBufferL, ByteBufferL>> = sequence {
-        // Find starting block via index
+    fun range(
+        startKey: ByteBufferL,
+        endKey: ByteBufferL? = null
+    ): Sequence<Triple<ByteBufferL, ByteBufferL, AKHdr32.Header>> = sequence {
         var idx = index.lowerBound32(IndexBlock.normalize32(startKey))
         if (idx == index.size()) return@sequence
 
         while (idx < index.size()) {
             val off = index.blockOffAt(idx)
             val block = loadBlock(off)
-            for ((k, v) in searcher.iter(block.buf, startKey)) {
-                if (endKey != null) {
-                    // stop when k >= endKey
-                    val cmp = lexCompare(k, endKey)
-                    if (cmp >= 0) return@sequence
+
+            val (start, end) = payloadBounds(block.buf)
+            var pos = start
+
+            while (pos < end) {
+                val (hdr, pair) = block.buf.readRecord32(pos)
+                val (k, v) = pair
+
+                // Range check
+                if (lexCompare(k, startKey) >= 0) {
+                    if (endKey != null && lexCompare(k, endKey) >= 0) {
+                        return@sequence
+                    }
+                    yield(Triple(k, v, hdr))
                 }
-                yield(k to v)
+
+                // Next record
+                pos += AKHdr32.SIZE + hdr.kLen + hdr.vLen.toIntExact()
             }
             idx++
         }
@@ -108,6 +123,15 @@ class SSTableReader(
         val block = Block(off, bufL)
         cache.put(off, block)
         return block
+    }
+
+    private fun payloadBounds(block: ByteBufferL): Pair<Int, Int> {
+        val payloadLen = block.at(0).i32
+        require(payloadLen in 0..PAYLOAD_LIMIT)
+        val start = 4
+        val end = start + payloadLen
+        require(end <= BLOCK_SIZE - 4)
+        return start to end
     }
 
     /** Random-access read into a direct ByteBuffer (order LE set for consistency). */

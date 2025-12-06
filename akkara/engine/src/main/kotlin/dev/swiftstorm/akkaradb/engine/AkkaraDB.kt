@@ -152,9 +152,6 @@ class AkkaraDB private constructor(
         return ok
     }
 
-    /** Iterate in-memory snapshot across shards. For full DB iteration, merge SSTs as needed (not provided). */
-    fun iterator(range: MemTable.KeyRange = MemTable.KeyRange.ALL): Sequence<MemRecord> = mem.iterator(range)
-
     fun range(start: ByteBufferL, end: ByteBufferL): Sequence<MemRecord> = sequence {
         val iters = ArrayList<PeekingIterator<MemRecord>>(readers.size + 1)
 
@@ -163,37 +160,45 @@ class AkkaraDB private constructor(
 
         // SST iterators
         for (r in readers) {
-            val sstIter = r.range(start, end).map { (k, v) ->
-                recordFromSST(k, v)
+            val sstIter = r.range(start, end).map { (k, v, hdr) ->
+                val tombstone = hdr.flags and RecordFlags.TOMBSTONE.toInt() != 0
+                val actualValue = if (tombstone) MemRecord.EMPTY else v.asReadOnlyDuplicate()
+
+                MemRecord(
+                    key = k.asReadOnlyDuplicate(),
+                    value = actualValue,
+                    seq = hdr.seq.raw,
+                    flags = hdr.flags.toByte(),
+                    keyHash = hdr.keyFP64.raw.toInt(),
+                    approxSizeBytes = estimateMemFootprint(k, actualValue)
+                )
             }.iterator()
             iters.add(PeekingIterator(sstIter))
         }
 
+
         // K-way merge
         while (true) {
-            // prune finished
             iters.removeIf { !it.hasNext() }
             if (iters.isEmpty()) break
 
-            // find min key
-            val first = iters.minWithOrNull { a, b -> lexCompare(a.peek().key, b.peek().key) } ?: break
-            val minKey = first.peek().key
+            val first = iters.minWithOrNull { a, b ->
+                lexCompare(a.peek().key, b.peek().key)
+            } ?: break
 
-            // take newest seq among same key
-            var best: MemRecord? = null
-            for (it in iters) {
-                if (!it.hasNext()) continue
-                val r = it.peek()
-                if (lexCompare(r.key, minKey) == 0) {
-                    if (best == null || r.seq > best.seq)
-                        best = r
-                    it.next() // consume
-                }
+            val rec = first.next()
+
+            // Dedup
+            while (true) {
+                val next = iters.filter { it.hasNext() }
+                    .minByOrNull { lexCompare(it.peek().key, rec.key) }
+                if (next == null || !next.hasNext()) break
+                val peek = next.peek()
+                if (lexCompare(peek.key, rec.key) != 0) break
+                next.next()
             }
 
-            // emit only non-tombstone
-            if (best != null && !best.tombstone)
-                yield(best)
+            if (!rec.tombstone) yield(rec)
         }
     }
 
@@ -247,31 +252,6 @@ class AkkaraDB private constructor(
 
         return null
     }
-
-    private fun recordFromSST(key: ByteBufferL, valBuf: ByteBufferL): MemRecord {
-        val hdr = AKHdr32.peek(valBuf)
-        val flags = hdr.flags.toByte()
-
-        val tomb = flags.hasFlag(RecordFlags.TOMBSTONE)
-        val realVal =
-            if (tomb) MemRecord.EMPTY
-            else {
-                val dup = valBuf.duplicate()
-                dup.position(AKHdr32.SIZE)
-                dup.limit(AKHdr32.SIZE + hdr.vLen.raw)
-                dup
-            }
-
-        return MemRecord(
-            key = key.asReadOnlyDuplicate(),
-            value = realVal,
-            seq = hdr.seq.raw.toLong(),
-            flags = flags,
-            keyHash = hdr.keyFP64.raw.toInt(), // or fnv1a fallback
-            approxSizeBytes = estimateMemFootprint(key, realVal)
-        )
-    }
-
 
     // ---------------- factory ----------------
 
@@ -444,8 +424,15 @@ class AkkaraDB private constructor(
             val walPath = base.resolve("wal.akwal")
             val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros, fastMode = opts.fastMode)
 
+            println("[AkkaraDB] WAL path: $walPath")
+            println("[AkkaraDB] WAL exists: ${Files.exists(walPath)}")
+            if (Files.exists(walPath)) {
+                println("[AkkaraDB] WAL size: ${Files.size(walPath)} bytes")
+            }
+
             // Recovery: WAL → MemTable
-            WalReplay.replay(walPath, mem)
+            val replayResult = WalReplay.replay(walPath, mem)
+            println("[AkkaraDB] WAL replay result: ${replayResult.applied} entries")
 
             runCatching {
                 val rec = stripe.recover()

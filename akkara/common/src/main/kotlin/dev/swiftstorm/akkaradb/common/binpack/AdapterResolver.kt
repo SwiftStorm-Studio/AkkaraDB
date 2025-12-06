@@ -44,11 +44,11 @@ object AdapterResolver {
      * Checks custom adapters first, then falls back to built-in adapters.
      */
     fun getAdapterForType(type: KType): TypeAdapter<*> {
-        // Fast path: Check cache first
         adapterCache[type]?.let { return it }
 
-        // Use computeIfAbsent for thread-safe lazy initialization
-        return adapterCache.computeIfAbsent(type) { resolveAdapter(it) }
+        // resolveAdapter を先に呼んで、その結果をキャッシュに入れる
+        val adapter = resolveAdapter(type)
+        return adapterCache.putIfAbsent(type, adapter) ?: adapter
     }
 
     /**
