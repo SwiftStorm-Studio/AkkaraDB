@@ -64,7 +64,8 @@ class AkkaraDB private constructor(
     private val stripeR: AkkStripeReader?,
     private val readers: ConcurrentLinkedDeque<SSTableReader>,
     private val durableCas: Boolean,
-    private val useStripeForRead: Boolean
+    private val useStripeForRead: Boolean,
+    private val isDebugEnabled: Boolean
 ) : Closeable {
 
     private val unpacker = AkkBlockUnpacker()
@@ -266,7 +267,8 @@ class AkkaraDB private constructor(
         val parityCoder: ParityCoder? = null,
         val durableCas: Boolean = false,
         val useStripeForRead: Boolean = false,
-        val bloomFPRate: Double = 0.01
+        val bloomFPRate: Double = 0.01,
+        val debug: Boolean = false
     )
 
     companion object {
@@ -470,7 +472,8 @@ class AkkaraDB private constructor(
                 stripeReader,
                 readersDeque,
                 opts.durableCas,
-                opts.useStripeForRead
+                opts.useStripeForRead,
+                opts.debug
             )
         }
 

@@ -24,7 +24,8 @@ package dev.swiftstorm.akkaradb.engine.query
  */
 class AkkQuery(
     /** Root predicate expression (must evaluate to boolean). */
-    val where: AkkExpr<Boolean>
+    val where: AkkExpr<Boolean>,
+    val captures: Array<Any?>
 ) {
     override fun toString(): String = "AkkQuery(where=$where)"
 }

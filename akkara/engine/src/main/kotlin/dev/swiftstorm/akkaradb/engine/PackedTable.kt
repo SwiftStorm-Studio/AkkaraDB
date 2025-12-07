@@ -340,6 +340,10 @@ class PackedTable<T : Any, ID : Any>(
                     prop.get(entity)
                 }
 
+                is AkkCapture<*> -> {
+                    query.captures[e.index]
+                }
+
                 is AkkUn<*> -> {
                     val x = eval(e.x, entity)
                     when (e.op) {
