@@ -54,6 +54,9 @@ object AkkDSL {
             walGroupMicros = cfg.walGroupMicros,
             parityCoder = cfg.parityCoder,
             durableCas = cfg.durableCas,
+            useStripeForRead = cfg.useStripeForRead,
+            bloomFPRate = cfg.bloomFPRate,
+            debug = cfg.debug
         )
         val db = AkkaraDB.open(opts)
         return PackedTable(db, T::class, ID::class)
@@ -75,6 +78,9 @@ data class AkkDSLCfg(
     val walGroupMicros: Long = 500,
     val parityCoder: ParityCoder? = null,
     val durableCas: Boolean = false,
+    val useStripeForRead: Boolean = false,
+    val bloomFPRate: Double = 0.01,
+    val debug: Boolean = false
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -87,6 +93,9 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
     var walGroupMicros: Long = 500
     var parityCoder: ParityCoder? = null
     var durableCas: Boolean = false
+    var useStripeForRead: Boolean = false
+    var bloomFPRate: Double = 0.01
+    var debug: Boolean = false
 
     fun build(): AkkDSLCfg {
         require(k >= 1) { "k must be >= 1" }
@@ -95,7 +104,22 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
         require(flushMaxMicros >= 0) { "flushMaxMicros must be >= 0" }
         require(walGroupN >= 1) { "walGroupN must be >= 1" }
         require(walGroupMicros >= 0) { "walGroupMicros must be >= 0" }
-        return AkkDSLCfg(baseDir, k, m, flushMaxBlocks, flushMaxMicros, fastMode, walGroupN, walGroupMicros, parityCoder, durableCas)
+        require(bloomFPRate in 1e-9..0.5) { "bloomFPRate must be in [1e-9, 0.5]" }
+        return AkkDSLCfg(
+            baseDir,
+            k,
+            m,
+            flushMaxBlocks,
+            flushMaxMicros,
+            fastMode,
+            walGroupN,
+            walGroupMicros,
+            parityCoder,
+            durableCas,
+            useStripeForRead,
+            bloomFPRate,
+            debug
+        )
     }
 }
 

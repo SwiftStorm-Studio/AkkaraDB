@@ -34,7 +34,7 @@ import java.util.zip.CRC32C
  * - crc32c is over payload only
  * - A *partial* tail (short read) is safely ignored by the reader (v3要件: WAL_TRUNCATED)
  */
-internal object WalFraming {
+object WalFraming {
     private val CRC32C_TL = ThreadLocal.withInitial { CRC32C() }
 
 

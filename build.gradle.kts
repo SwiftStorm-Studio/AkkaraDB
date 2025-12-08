@@ -26,7 +26,7 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.2.7+rc.6"
+        "akkaradb" -> "0.2.7"
         "akkara-plugin" -> "0.1.0"
         "akkara-compiler" -> "0.3.9"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
@@ -85,6 +85,26 @@ subprojects {
         "akkara-compiler" -> {
             dependencies {
                 compileOnly(kotlin("compiler"))
+            }
+        }
+
+        "akkara-debugger-core" -> {
+            dependencies {
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-format-api"))
+                implementation(project(":akkara-format-akk"))
+                implementation(project(":akkara-engine"))
+            }
+        }
+
+        "akkara-debugger-cli" -> {
+            apply(plugin = "application")
+
+            dependencies {
+                implementation(project(":akkara-common"))
+                implementation(project(":akkara-debugger-core"))
+                implementation("com.github.ajalt.clikt:clikt:5.0.2")
+                implementation("com.github.ajalt.mordant:mordant:3.0.2")
             }
         }
 

@@ -3,3 +3,4 @@
 build
 akkara/test/**
 .kotlin
+akkara/debugger/**

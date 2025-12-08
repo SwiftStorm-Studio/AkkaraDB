@@ -563,6 +563,18 @@ class ByteBufferL private constructor(
     }
 }
 
+fun ByteBufferL.hasRemaining(): Boolean = remaining > 0
+
+fun ByteBufferL.copy(): ByteBufferL {
+    val dup = duplicate().position(0)
+    val len = dup.remaining
+    val dst = ByteBufferL.allocate(len, direct = false)
+    if (len > 0) dst.put(dup, len)
+    dst.position = 0
+    dst.limit = len
+    return dst
+}
+
 fun ByteBufferL.putAscii(s: String): ByteBufferL {
     // We rely on the caller's isAsciiNoSep(), but still guard for robustness.
     for (ch in s) {
@@ -593,7 +605,6 @@ fun ByteBufferL.toByteArray(): ByteArray {
 
     return dst
 }
-
 
 val ByteBufferL.hex: String
     get() {

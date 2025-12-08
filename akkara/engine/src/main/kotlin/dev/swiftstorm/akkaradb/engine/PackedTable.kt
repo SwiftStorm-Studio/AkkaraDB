@@ -24,6 +24,7 @@ package dev.swiftstorm.akkaradb.engine
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
+import dev.swiftstorm.akkaradb.engine.AkkaraDB.Companion.logger
 import dev.swiftstorm.akkaradb.engine.query.*
 import dev.swiftstorm.akkaradb.engine.util.murmur3_128
 import java.io.Closeable
@@ -116,16 +117,16 @@ class PackedTable<T : Any, ID : Any>(
         out.put(idBytes)
         val result = out.position(0)
 
-        println("[PackedTable.keyBuf] Generated key:")
-        println("  Namespace: ${ns.remaining} bytes")
-        println("  ID bytes: ${idBytes.remaining} bytes")
-        println("  Total key: ${result.remaining} bytes")
+        logger.debug("[PackedTable.keyBuf] Generated key:")
+        logger.debug("  Namespace: ${ns.remaining} bytes")
+        logger.debug("  ID bytes: ${idBytes.remaining} bytes")
+        logger.debug("  Total key: ${result.remaining} bytes")
         val keyHex = result.duplicate().let { buf ->
             (0 until minOf(16, buf.remaining)).joinToString(" ") {
                 "%02X".format(buf.i8 and 0xFF)
             }
         }
-        println("  Key hex: [$keyHex...]")
+        logger.debug("  Key hex: [$keyHex...]")
 
         return result
     }
@@ -156,20 +157,20 @@ class PackedTable<T : Any, ID : Any>(
 
         val key = keyBuf(id)
 
-        println("[PackedTable.put] Writing entity:")
-        println("  Entity: $entity")
-        println("  Key: ${key.remaining} bytes")
-        println("  Value: ${encoded.remaining} bytes")
+        logger.debug("[PackedTable.put] Writing entity:")
+        logger.debug("  Entity: $entity")
+        logger.debug("  Key: ${key.remaining} bytes")
+        logger.debug("  Value: ${encoded.remaining} bytes")
 
         val seq = db.put(key, encoded)
 
-        println("  Assigned seq: $seq")
+        logger.debug("  Assigned seq: $seq")
 
         val readBack = db.get(key.duplicate().position(0))
         if (readBack != null) {
-            println("  ✓ Read back successful: ${readBack.remaining} bytes")
+            logger.debug("  ✓ Read back successful: ${readBack.remaining} bytes")
         } else {
-            println("  ✗ WARNING: Could not read back immediately after put!")
+            logger.debug("  ✗ WARNING: Could not read back immediately after put!")
         }
 
         BinPackBufferPool.release(buf)
@@ -335,8 +336,7 @@ class PackedTable<T : Any, ID : Any>(
                 is AkkLit<*> -> e.value
 
                 is AkkCol<*> -> {
-                    val prop = props[e.name]
-                        ?: error("No property '${e.name}' in ${kClass.simpleName}")
+                    val prop = props[e.name] ?: error("No property '${e.name}' in ${kClass.simpleName}")
                     prop.get(entity)
                 }
 
@@ -386,11 +386,11 @@ class PackedTable<T : Any, ID : Any>(
         // Compute [start, end) for this table's namespace: "<qualifiedName>:"
         val (startKey, endKey) = namespaceRange()
 
-        println("[PackedTable.runQ] Debug Info:")
-        println("  Table class: ${kClass.qualifiedName}")
-        println("  Namespace hash: ${nsBuf.duplicate().position(0).i64}")
-        println("  Range start: ${startKey.remaining} bytes, i64=${startKey.duplicate().position(0).i64}")
-        println("  Range end: ${endKey.remaining} bytes, i64=${endKey.duplicate().position(0).i64}")
+        logger.debug("[PackedTable.runQ] Debug Info:")
+        logger.debug("  Table class: ${kClass.qualifiedName}")
+        logger.debug("  Namespace hash: ${nsBuf.duplicate().position(0).i64}")
+        logger.debug("  Range start: ${startKey.remaining} bytes, i64=${startKey.duplicate().position(0).i64}")
+        logger.debug("  Range end: ${endKey.remaining} bytes, i64=${endKey.duplicate().position(0).i64}")
 
         return sequence {
             for (rec in db.range(startKey, endKey)) {

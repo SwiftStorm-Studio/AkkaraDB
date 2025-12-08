@@ -21,6 +21,8 @@ package dev.swiftstorm.akkaradb.engine
 
 import dev.swiftstorm.akkaradb.common.*
 import dev.swiftstorm.akkaradb.common.types.U64
+import dev.swiftstorm.akkaradb.engine.logging.AkkLogger
+import dev.swiftstorm.akkaradb.engine.logging.impl.AkkLoggerImpl
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
 import dev.swiftstorm.akkaradb.engine.sstable.SSTCompactor
@@ -65,9 +67,8 @@ class AkkaraDB private constructor(
     private val readers: ConcurrentLinkedDeque<SSTableReader>,
     private val durableCas: Boolean,
     private val useStripeForRead: Boolean,
-    private val isDebugEnabled: Boolean
+    private val logger: AkkLogger
 ) : Closeable {
-
     private val unpacker = AkkBlockUnpacker()
 
     // ---------------- API ----------------
@@ -216,42 +217,69 @@ class AkkaraDB private constructor(
 
     override fun close() {
         try {
-            println("Phase: flushing and closing AkkaraDB...")
+            logger.debug("Phase: flushing and closing AkkaraDB...")
             flush()
         } finally {
-            runCatching { println("Phase: mem.close"); mem.close() }
-            runCatching { println("Phase: stripeW.close"); stripeW.close() }
-            runCatching { println("Phase: readers.close"); readers.forEach { it.close() } }
-            runCatching { println("Phase: manifest.close"); manifest.close() }
-            runCatching { println("Phase: wal.close"); wal.close() }
+            runCatching { logger.debug("Phase: mem.close"); mem.close() }
+            runCatching { logger.debug("Phase: stripeW.close"); stripeW.close() }
+            runCatching { logger.debug("Phase: readers.close"); readers.forEach { it.close() } }
+            runCatching { logger.debug("Phase: manifest.close"); manifest.close() }
+            runCatching { logger.debug("Phase: wal.close"); wal.close() }
         }
     }
 
     private fun stripeFallbackLookup(key: ByteBufferL): ByteBufferL? {
+        val reader = stripeR ?: return null
         val kdup = key.duplicate()
+        reader.seek(0)
 
-        var stripeIndex = 0L
+        var bestSeq = Long.MIN_VALUE
+        var bestValue: ByteBufferL? = null
+        var bestIsTombstone = false
+
+        // Debug用
+        var stripesScanned = 0
+        var keysFound = 0
+
         while (true) {
-            val stripeBlock = stripeR?.readStripe() ?: break
+            val stripe = reader.readStripe() ?: break
+            stripesScanned++
 
-            for (block in stripeBlock.payloads) {
-                val cursor = unpacker.cursor(block)
+            stripe.use {
+                for (block in it.payloads) {
+                    val cursor = unpacker.cursor(block)
+                    while (cursor.hasNext()) {
+                        val rec = cursor.next()
+                        if (lexCompare(rec.key, kdup) == 0) {
+                            keysFound++
+                            val seq = rec.seq.raw
 
-                while (cursor.hasNext()) {
-                    val rec = cursor.next()
-
-                    if (lexCompare(rec.key, kdup) == 0) {
-                        // tombstone
-                        if (rec.flags and 1 != 0) return null
-                        return rec.value
+                            if (seq > bestSeq) {
+                                bestSeq = seq
+                                bestIsTombstone = (rec.flags and 1) != 0
+                                bestValue = if (bestIsTombstone) null else rec.value.copy()
+                            } else if (seq == bestSeq) {
+                                val isTombstone = (rec.flags and 1) != 0
+                                if (isTombstone && !bestIsTombstone) {
+                                    bestIsTombstone = true
+                                    bestValue = null
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            stripeIndex++
         }
 
-        return null
+        if (keysFound > 0) {
+            logger.debug(
+                "[StripeFallback] key=${firstKeyHex(kdup)}, " +
+                        "stripes=$stripesScanned, versions=$keysFound, " +
+                        "bestSeq=$bestSeq, tombstone=$bestIsTombstone"
+            )
+        }
+
+        return bestValue
     }
 
     // ---------------- factory ----------------
@@ -272,7 +300,11 @@ class AkkaraDB private constructor(
     )
 
     companion object {
+        lateinit var logger: AkkLogger
+
         fun open(opts: Options): AkkaraDB {
+            logger = AkkLoggerImpl { opts.debug }
+
             val base = opts.baseDir
             Files.createDirectories(base)
             val sstDir = base.resolve("sst")
@@ -426,15 +458,15 @@ class AkkaraDB private constructor(
             val walPath = base.resolve("wal.akwal")
             val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros, fastMode = opts.fastMode)
 
-            println("[AkkaraDB] WAL path: $walPath")
-            println("[AkkaraDB] WAL exists: ${Files.exists(walPath)}")
+            logger.debug("WAL path: $walPath")
+            logger.debug("WAL exists: ${Files.exists(walPath)}")
             if (Files.exists(walPath)) {
-                println("[AkkaraDB] WAL size: ${Files.size(walPath)} bytes")
+                logger.debug("WAL size: ${Files.size(walPath)} bytes")
             }
 
             // Recovery: WAL → MemTable
             val replayResult = WalReplay.replay(walPath, mem)
-            println("[AkkaraDB] WAL replay result: ${replayResult.applied} entries")
+            logger.debug("WAL replay result: ${replayResult.applied} entries")
 
             runCatching {
                 val rec = stripe.recover()
@@ -458,10 +490,7 @@ class AkkaraDB private constructor(
             // Load existing SSTs from all levels (newest-first)
             rebuildReaders(readersDeque)
 
-            val stripeReader =
-                if (opts.useStripeForRead)
-                    AkkStripeReader(opts.k, opts.m, laneDir, pool, stripe.coder())
-                else null
+            val stripeReader = if (opts.useStripeForRead) AkkStripeReader(opts.k, opts.m, laneDir, pool, stripe.coder()) else null
 
             return AkkaraDB(
                 base,
@@ -473,7 +502,7 @@ class AkkaraDB private constructor(
                 readersDeque,
                 opts.durableCas,
                 opts.useStripeForRead,
-                opts.debug
+                logger
             )
         }
 

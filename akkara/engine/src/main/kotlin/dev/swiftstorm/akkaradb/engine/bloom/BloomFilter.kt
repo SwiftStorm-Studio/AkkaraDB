@@ -130,7 +130,7 @@ class BloomFilter private constructor(
         private const val OFF_PAD = 6
         private const val OFF_MBITS = 8
         private const val OFF_SEED = 12
-        internal const val HEADER_SIZE = 20
+        const val HEADER_SIZE = 20
 
         operator fun invoke(
             expectedInsertions: Long,
