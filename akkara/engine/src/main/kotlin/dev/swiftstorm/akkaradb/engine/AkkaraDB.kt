@@ -228,60 +228,6 @@ class AkkaraDB private constructor(
         }
     }
 
-    private fun stripeFallbackLookup(key: ByteBufferL): ByteBufferL? {
-        val reader = stripeR ?: return null
-        val kdup = key.duplicate()
-        reader.seek(0)
-
-        var bestSeq = Long.MIN_VALUE
-        var bestValue: ByteBufferL? = null
-        var bestIsTombstone = false
-
-        // Debug用
-        var stripesScanned = 0
-        var keysFound = 0
-
-        while (true) {
-            val stripe = reader.readStripe() ?: break
-            stripesScanned++
-
-            stripe.use {
-                for (block in it.payloads) {
-                    val cursor = unpacker.cursor(block)
-                    while (cursor.hasNext()) {
-                        val rec = cursor.next()
-                        if (lexCompare(rec.key, kdup) == 0) {
-                            keysFound++
-                            val seq = rec.seq.raw
-
-                            if (seq > bestSeq) {
-                                bestSeq = seq
-                                bestIsTombstone = (rec.flags and 1) != 0
-                                bestValue = if (bestIsTombstone) null else rec.value.copy()
-                            } else if (seq == bestSeq) {
-                                val isTombstone = (rec.flags and 1) != 0
-                                if (isTombstone && !bestIsTombstone) {
-                                    bestIsTombstone = true
-                                    bestValue = null
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (keysFound > 0) {
-            logger.debug(
-                "[StripeFallback] key=${firstKeyHex(kdup)}, " +
-                        "stripes=$stripesScanned, versions=$keysFound, " +
-                        "bestSeq=$bestSeq, tombstone=$bestIsTombstone"
-            )
-        }
-
-        return bestValue
-    }
-
     // ---------------- factory ----------------
 
     data class Options(
@@ -524,5 +470,61 @@ class AkkaraDB private constructor(
                 i++
             }
         }
+    }
+
+    // ---------------- private ----------------
+
+    private fun stripeFallbackLookup(key: ByteBufferL): ByteBufferL? {
+        val reader = stripeR ?: return null
+        val kdup = key.duplicate()
+        reader.seek(0)
+
+        var bestSeq = Long.MIN_VALUE
+        var bestValue: ByteBufferL? = null
+        var bestIsTombstone = false
+
+        // Debug用
+        var stripesScanned = 0
+        var keysFound = 0
+
+        while (true) {
+            val stripe = reader.readStripe() ?: break
+            stripesScanned++
+
+            stripe.use {
+                for (block in it.payloads) {
+                    val cursor = unpacker.cursor(block)
+                    while (cursor.hasNext()) {
+                        val rec = cursor.next()
+                        if (lexCompare(rec.key, kdup) == 0) {
+                            keysFound++
+                            val seq = rec.seq.raw
+
+                            if (seq > bestSeq) {
+                                bestSeq = seq
+                                bestIsTombstone = (rec.flags and 1) != 0
+                                bestValue = if (bestIsTombstone) null else rec.value.copy()
+                            } else if (seq == bestSeq) {
+                                val isTombstone = (rec.flags and 1) != 0
+                                if (isTombstone && !bestIsTombstone) {
+                                    bestIsTombstone = true
+                                    bestValue = null
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (keysFound > 0) {
+            logger.debug(
+                "[StripeFallback] key=${firstKeyHex(kdup)}, " +
+                        "stripes=$stripesScanned, versions=$keysFound, " +
+                        "bestSeq=$bestSeq, tombstone=$bestIsTombstone"
+            )
+        }
+
+        return bestValue
     }
 }
