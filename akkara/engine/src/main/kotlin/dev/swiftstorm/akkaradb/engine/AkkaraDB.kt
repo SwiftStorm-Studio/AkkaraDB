@@ -235,7 +235,8 @@ class AkkaraDB private constructor(
         val k: Int = 4,
         val m: Int = 2,
         val flushPolicy: FlushPolicy = FlushPolicy(maxBlocks = 32, maxMicros = 500),
-        val fastMode: Boolean = true,
+        val walFastMode: Boolean = true,
+        val stripeFastMode: Boolean = true,
         val walGroupN: Int = 64,
         val walGroupMicros: Long = 1_000,
         val parityCoder: ParityCoder? = null,
@@ -279,7 +280,7 @@ class AkkaraDB private constructor(
                     else -> RSParityCoder(opts.m)
                 },
                 flushPolicy = opts.flushPolicy,
-                fastMode = opts.fastMode
+                fastMode = opts.stripeFastMode
             )
 
             // Prepare compactor and reader management
@@ -402,7 +403,7 @@ class AkkaraDB private constructor(
 
             // WAL
             val walPath = base.resolve("wal.akwal")
-            val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros, fastMode = opts.fastMode)
+            val wal = WalWriter(walPath, groupN = opts.walGroupN, groupTmicros = opts.walGroupMicros, fastMode = opts.walFastMode)
 
             logger.debug("WAL path: $walPath")
             logger.debug("WAL exists: ${Files.exists(walPath)}")

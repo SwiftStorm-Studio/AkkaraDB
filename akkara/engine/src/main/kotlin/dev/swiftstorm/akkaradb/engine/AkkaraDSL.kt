@@ -49,7 +49,8 @@ object AkkDSL {
             k = cfg.k,
             m = cfg.m,
             flushPolicy = FlushPolicy(maxBlocks = cfg.flushMaxBlocks, maxMicros = cfg.flushMaxMicros),
-            fastMode = cfg.fastMode,
+            walFastMode = cfg.walFastMode,
+            stripeFastMode = cfg.stripeFastMode,
             walGroupN = cfg.walGroupN,
             walGroupMicros = cfg.walGroupMicros,
             parityCoder = cfg.parityCoder,
@@ -73,7 +74,8 @@ data class AkkDSLCfg(
     val m: Int = 2,
     val flushMaxBlocks: Int = 32,
     val flushMaxMicros: Long = 500,
-    val fastMode: Boolean = true,
+    val walFastMode: Boolean = true,
+    val stripeFastMode: Boolean = true,
     val walGroupN: Int = 32,
     val walGroupMicros: Long = 500,
     val parityCoder: ParityCoder? = null,
@@ -88,7 +90,8 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
     var m: Int = 2
     var flushMaxBlocks: Int = 32
     var flushMaxMicros: Long = 500
-    var fastMode: Boolean = true
+    var walFastMode: Boolean = true
+    var stripeFastMode: Boolean = true
     var walGroupN: Int = 32
     var walGroupMicros: Long = 500
     var parityCoder: ParityCoder? = null
@@ -111,7 +114,8 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
             m,
             flushMaxBlocks,
             flushMaxMicros,
-            fastMode,
+            walFastMode,
+            stripeFastMode,
             walGroupN,
             walGroupMicros,
             parityCoder,
@@ -142,7 +146,7 @@ object AkkaraPresets {
 
 private fun AkkDSLCfgBuilder.configureDurable() {
     k = 4; m = 2
-    fastMode = false
+    walFastMode = false
     walGroupN = 1
     walGroupMicros = 0
     flushMaxBlocks = 32
@@ -153,7 +157,7 @@ private fun AkkDSLCfgBuilder.configureDurable() {
 
 private fun AkkDSLCfgBuilder.configureNormal() {
     k = 4; m = 2
-    fastMode = true
+    walFastMode = true
     walGroupN = 64
     walGroupMicros = 1000
     flushMaxBlocks = 64
@@ -163,7 +167,7 @@ private fun AkkDSLCfgBuilder.configureNormal() {
 
 private fun AkkDSLCfgBuilder.configureFast() {
     k = 4; m = 1
-    fastMode = true
+    walFastMode = true
     walGroupN = 256
     walGroupMicros = 12_000
     flushMaxBlocks = 256
@@ -173,7 +177,7 @@ private fun AkkDSLCfgBuilder.configureFast() {
 
 private fun AkkDSLCfgBuilder.configureUltraFast() {
     k = 4; m = 1
-    fastMode = true
+    walFastMode = true
     walGroupN = 512
     walGroupMicros = 50_000
     flushMaxBlocks = 512

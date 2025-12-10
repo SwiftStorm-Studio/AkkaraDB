@@ -39,7 +39,11 @@ import kotlin.concurrent.write
  *  - Optional range iterator across shards (merged on-demand)
  */
 class MemTable(
-    shardCount: Int = Runtime.getRuntime().availableProcessors().coerceAtLeast(2),
+    shardCount: Int = Runtime
+        .getRuntime()
+        .availableProcessors()
+        .coerceAtLeast(2)
+        .coerceAtMost(8),
     /** Soft threshold per shard (bytes) to request a flush. */
     private val thresholdBytesPerShard: Long = (64L * 1024 * 1024) / shardCount,
     /** Callback invoked by the flusher with an immutable sealed batch. */
