@@ -54,15 +54,14 @@ cd AkkaraDB
 
 ```
 main       : 安定版（リリース用）
-develop    : 開発版（最新機能）
-feature/*  : 機能ブランチ
-hotfix/*   : 緊急修正ブランチ
+dev        : 開発版（最新機能）
+vₙ         : 過去バージョンブランチ  
 ```
 
-開発に参加する場合は`develop`ブランチをチェックアウト：
+開発に参加する場合は`dev`ブランチをチェックアウト：
 
 ```bash
-git checkout develop
+git checkout dev
 ```
 
 ---
