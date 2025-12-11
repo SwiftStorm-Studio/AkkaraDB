@@ -16,43 +16,58 @@ Kotlinのデータクラスを使った型安全なAPI:
 ```kotlin
 import dev.swiftstorm.akkaradb.engine.AkkDSL
 import dev.swiftstorm.akkaradb.engine.StartupMode
-import dev.swiftstorm.akkaradb.common.ShortUUID
+import dev.swiftstorm.akkaradb.engine.Id
 import java.nio.file.Paths
 
-// 1. データモデル定義
+// 1. データモデル定義（@IdアノテーションでIDフィールドを指定）
 data class User(
+    @Id val id: String,
     val name: String,
     val age: Int,
     val email: String
 )
 
 fun main() {
-    // 2. データベースを開く
+    // 2. データベースを開く（型パラメータにエンティティ型とID型を指定）
     val base = Paths.get("./data/akkdb")
-    val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
+    val users = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
 
-    // 3. データを書き込む
-    val id = ShortUUID.generate()
+    // 3. データを書き込む（IDを指定）
     users.put(
-        "user", id, User(
+        "user001",
+        User(
+            id = "user001",
             name = "山田太郎",
             age = 28,
             email = "yamada@example.com"
         )
     )
-    println("書き込み完了: user:$id")
+    println("書き込み完了: user001")
 
     // 4. データを読み取る
-    val user = users.get("user", id)
+    val user = users.get("user001")
     println("読み取り結果: $user")
 
     // 5. データを削除
-    users.delete("user", id)
+    users.delete("user001")
     println("削除完了")
 
     // 6. データベースを閉じる
     users.close()
 }
+```
+
+**@Idアノテーションなしでエンティティ自体からIDを抽出する場合:**
+
+```kotlin
+data class User(
+    @Id val id: String,
+    val name: String,
+    val age: Int
+)
+
+// エンティティからIDを自動抽出して書き込み
+users.put(User(id = "user001", name = "太郎", age = 25))
 ```
 
 ### Low-level API
@@ -108,60 +123,68 @@ Typed APIでは、用途に応じて起動モードを選択できます:
 
 ```kotlin
 // バランス型（推奨）
-val db = AkkDSL.open<User>(base, StartupMode.NORMAL)
+val db = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
 
 // 高速書き込み優先（耐久性は若干低下）
-val db = AkkDSL.open<User>(base, StartupMode.FAST)
+val db = AkkDSL.open<User, String>(base, StartupMode.FAST)
 
 // 耐久性優先（書き込み速度は低下）
-val db = AkkDSL.open<User>(base, StartupMode.DURABLE)
+val db = AkkDSL.open<User, String>(base, StartupMode.DURABLE)
 
 // 超高速（テスト用、fsync最小化）
-val db = AkkDSL.open<User>(base, StartupMode.ULTRA_FAST)
+val db = AkkDSL.open<User, String>(base, StartupMode.ULTRA_FAST)
 ```
 
 各モードの詳細は[API リファレンス](./API_REFERENCE.md#起動モード)を参照してください。
 
-## 🔍 範囲検索
+## 🔍 範囲検索とクエリ
 
-キー範囲でイテレートする:
+### クエリDSL
 
-```kotlin
-// Typed API
-val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
-
-// user:00000000 から user:99999999 の範囲を検索
-users.put("user", "00000001", User("Alice", 25, "alice@example.com"))
-users.put("user", "00000002", User("Bob", 30, "bob@example.com"))
-users.put("user", "00000003", User("Charlie", 35, "charlie@example.com"))
-
-for ((ns, id, user) in users.range("user", "00000000", "00000099")) {
-    println("$ns:$id -> $user")
-}
-```
-
-## 🔄 Compare-And-Swap（CAS）
-
-楽観的ロックによる更新:
+型安全なクエリでフィルタリング:
 
 ```kotlin
-val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
-val id = ShortUUID.generate()
-
-// 初期書き込み
-val seq1 = users.put("user", id, User("太郎", 25, "taro@example.com"))
-
-// CAS: seq1が一致する場合のみ更新
-val success = users.compareAndSwap(
-    "user", id,
-    expectedSeq = seq1,
-    newValue = User("太郎", 26, "taro@example.com") // 年齢を更新
+data class User(
+    @Id val id: String,
+    val name: String,
+    val age: Int,
+    val isActive: Boolean
 )
 
-if (success) {
-    println("更新成功")
-} else {
-    println("更新失敗（他のスレッドが先に更新した）")
+val users = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
+
+// 年齢が25歳以上かつアクティブなユーザーを検索
+val results = users.runToList { age >= 25 && isActive }
+
+for (user in results) {
+    println(user)
+}
+
+// 最初の1件のみ取得
+val firstUser = users.firstOrNull { age >= 30 }
+
+// 存在確認
+val exists = users.exists { name == "太郎" }
+
+// 件数カウント
+val count = users.count { age < 20 }
+```
+
+## 🔄 upsert（更新または挿入）
+
+データが存在しない場合は作成、存在する場合は更新:
+
+```kotlin
+data class Counter(
+    @Id val id: String,
+    var count: Int = 0
+)
+
+val counters = AkkDSL.open<Counter, String>(base, StartupMode.NORMAL)
+
+// カウンターをインクリメント（存在しなければ作成）
+counters.upsert("counter1") {
+    count += 1
 }
 ```
 
@@ -183,17 +206,12 @@ val db = AkkaraDB.open(
 )
 ```
 
-パラメータの詳細は[API リファレンス](./API_REFERENCE.md#options)を参照してください。
-
-## 📊 次のステップ
-
-- [アーキテクチャ](./ARCHITECTURE.md) - 内部動作の理解
-- [API リファレンス](./API_REFERENCE.md) - 全API仕様
-- [ベンチマーク](./BENCHMARKS.md) - パフォーマンス特性の理解
-- [ビルド](./BUILD.md) - ソースから開発
+パラメータの詳細は[API リファレンス](./API_REFERENCE.md#options設定)を参照してください。
 
 ---
 
-戻る: [概要](./ABOUT.md) | 次へ: [API リファレンス](./API_REFERENCE.md)
+次へ: [API リファレンス](./API_REFERENCE.md) | [アーキテクチャ](./ARCHITECTURE.md) | [ベンチマーク](./BENCHMARKS.md)
+
+[概要に戻る](./ABOUT.md)
 
 ---
