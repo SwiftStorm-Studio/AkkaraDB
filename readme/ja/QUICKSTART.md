@@ -1,3 +1,11 @@
+わかった！2つの`put`メソッドがあるね：
+
+1. `put(id: ID, entity: T)` - IDとエンティティを別々に指定
+2. `put(entity: T)` - エンティティから`@Id`アノテーション付きフィールドを自動抽出
+
+つまり、両方使えるってことだね。修正版：
+
+```markdown
 # クイックスタート
 
 5分でAkkaraDBを使い始めるためのガイドです。
@@ -32,7 +40,7 @@ fun main() {
     val base = Paths.get("./data/akkdb")
     val users = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
 
-    // 3. データを書き込む（IDを指定）
+    // 3. データを書き込む（方法1: IDとエンティティを別々に指定）
     users.put(
         "user001",
         User(
@@ -42,7 +50,16 @@ fun main() {
             email = "yamada@example.com"
         )
     )
-    println("書き込み完了: user001")
+    
+    // または、方法2: エンティティから@Idを自動抽出
+    users.put(User(
+        id = "user002",
+        name = "佐藤花子",
+        age = 25,
+        email = "sato@example.com"
+    ))
+    
+    println("書き込み完了")
 
     // 4. データを読み取る
     val user = users.get("user001")
@@ -55,19 +72,6 @@ fun main() {
     // 6. データベースを閉じる
     users.close()
 }
-```
-
-**@Idアノテーションなしでエンティティ自体からIDを抽出する場合:**
-
-```kotlin
-data class User(
-    @Id val id: String,
-    val name: String,
-    val age: Int
-)
-
-// エンティティからIDを自動抽出して書き込み
-users.put(User(id = "user001", name = "太郎", age = 25))
 ```
 
 ### Low-level API
@@ -137,9 +141,7 @@ val db = AkkDSL.open<User, String>(base, StartupMode.ULTRA_FAST)
 
 各モードの詳細は[API リファレンス](./API_REFERENCE.md#起動モード)を参照してください。
 
-## 🔍 範囲検索とクエリ
-
-### クエリDSL
+## 🔍 クエリDSL
 
 型安全なクエリでフィルタリング:
 
@@ -153,9 +155,13 @@ data class User(
 
 val users = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
 
+// データを追加
+users.put(User("u001", "太郎", 30, true))
+users.put(User("u002", "花子", 25, true))
+users.put(User("u003", "次郎", 18, false))
+
 // 年齢が25歳以上かつアクティブなユーザーを検索
 val results = users.runToList { age >= 25 && isActive }
-
 for (user in results) {
     println(user)
 }
@@ -186,6 +192,14 @@ val counters = AkkDSL.open<Counter, String>(base, StartupMode.NORMAL)
 counters.upsert("counter1") {
     count += 1
 }
+
+// 再度実行すると既存レコードが更新される
+counters.upsert("counter1") {
+    count += 1
+}
+
+val counter = counters.get("counter1")
+println("Count: ${counter?.count}") // 2
 ```
 
 ## 🛠️ オプション設定
