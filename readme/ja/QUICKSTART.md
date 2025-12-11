@@ -1,0 +1,199 @@
+# クイックスタート
+
+5分でAkkaraDBを使い始めるためのガイドです。
+
+## 📝 前提条件
+
+- [インストール](./INSTALLATION.md)が完了していること
+- JDK 17以上がインストールされていること
+
+## 🚀 基本的な使い方
+
+### Typed API（推奨）
+
+Kotlinのデータクラスを使った型安全なAPI:
+
+```kotlin
+import dev.swiftstorm.akkaradb.engine.AkkDSL
+import dev.swiftstorm.akkaradb.engine.StartupMode
+import dev.swiftstorm.akkaradb.common.ShortUUID
+import java.nio.file.Paths
+
+// 1. データモデル定義
+data class User(
+    val name: String,
+    val age: Int,
+    val email: String
+)
+
+fun main() {
+    // 2. データベースを開く
+    val base = Paths.get("./data/akkdb")
+    val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
+
+    // 3. データを書き込む
+    val id = ShortUUID.generate()
+    users.put(
+        "user", id, User(
+            name = "山田太郎",
+            age = 28,
+            email = "yamada@example.com"
+        )
+    )
+    println("書き込み完了: user:$id")
+
+    // 4. データを読み取る
+    val user = users.get("user", id)
+    println("読み取り結果: $user")
+
+    // 5. データを削除
+    users.delete("user", id)
+    println("削除完了")
+
+    // 6. データベースを閉じる
+    users.close()
+}
+```
+
+### Low-level API
+
+`ByteBufferL`を使った直接操作:
+
+```kotlin
+import dev.swiftstorm.akkaradb.engine.AkkaraDB
+import dev.swiftstorm.akkaradb.common.ByteBufferL
+import java.nio.charset.StandardCharsets
+import java.nio.file.Paths
+
+fun main() {
+    // 1. データベースを開く
+    val base = Paths.get("./data/akkdb")
+    val db = AkkaraDB.open(
+        AkkaraDB.Options(baseDir = base)
+    )
+
+    // 2. キーと値を準備
+    val key = ByteBufferL.wrap(
+        StandardCharsets.UTF_8.encode("hello")
+    ).position(0)
+
+    val value = ByteBufferL.wrap(
+        StandardCharsets.UTF_8.encode("world")
+    ).position(0)
+
+    // 3. 書き込み
+    val seq = db.put(key, value)
+    println("書き込み完了 (seq=$seq)")
+
+    // 4. 読み取り
+    val result = db.get(key)
+    if (result != null) {
+        val str = StandardCharsets.UTF_8.decode(result.rawDuplicate()).toString()
+        println("読み取り結果: $str")
+    }
+
+    // 5. 削除
+    db.delete(key)
+    println("削除完了")
+
+    // 6. フラッシュして閉じる
+    db.flush()
+    db.close()
+}
+```
+
+## 🎛️ 起動モード
+
+Typed APIでは、用途に応じて起動モードを選択できます:
+
+```kotlin
+// バランス型（推奨）
+val db = AkkDSL.open<User>(base, StartupMode.NORMAL)
+
+// 高速書き込み優先（耐久性は若干低下）
+val db = AkkDSL.open<User>(base, StartupMode.FAST)
+
+// 耐久性優先（書き込み速度は低下）
+val db = AkkDSL.open<User>(base, StartupMode.DURABLE)
+
+// 超高速（テスト用、fsync最小化）
+val db = AkkDSL.open<User>(base, StartupMode.ULTRA_FAST)
+```
+
+各モードの詳細は[API リファレンス](./API_REFERENCE.md#起動モード)を参照してください。
+
+## 🔍 範囲検索
+
+キー範囲でイテレートする:
+
+```kotlin
+// Typed API
+val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
+
+// user:00000000 から user:99999999 の範囲を検索
+users.put("user", "00000001", User("Alice", 25, "alice@example.com"))
+users.put("user", "00000002", User("Bob", 30, "bob@example.com"))
+users.put("user", "00000003", User("Charlie", 35, "charlie@example.com"))
+
+for ((ns, id, user) in users.range("user", "00000000", "00000099")) {
+    println("$ns:$id -> $user")
+}
+```
+
+## 🔄 Compare-And-Swap（CAS）
+
+楽観的ロックによる更新:
+
+```kotlin
+val users = AkkDSL.open<User>(base, StartupMode.NORMAL)
+val id = ShortUUID.generate()
+
+// 初期書き込み
+val seq1 = users.put("user", id, User("太郎", 25, "taro@example.com"))
+
+// CAS: seq1が一致する場合のみ更新
+val success = users.compareAndSwap(
+    "user", id,
+    expectedSeq = seq1,
+    newValue = User("太郎", 26, "taro@example.com") // 年齢を更新
+)
+
+if (success) {
+    println("更新成功")
+} else {
+    println("更新失敗（他のスレッドが先に更新した）")
+}
+```
+
+## 🛠️ オプション設定
+
+詳細なチューニングが必要な場合は、低レベルAPIの`Options`を使用:
+
+```kotlin
+val db = AkkaraDB.open(
+    AkkaraDB.Options(
+        baseDir = Paths.get("./data/akkdb"),
+        k = 4,                      // データレーン数
+        m = 2,                      // パリティレーン数
+        walGroupN = 512,            // WALグループコミット数
+        walGroupMicros = 50_000,    // WALグループコミット時間(µs)
+        stripeFastMode = true,      // Stripe高速モード
+        walFastMode = true          // WAL高速モード
+    )
+)
+```
+
+パラメータの詳細は[API リファレンス](./API_REFERENCE.md#options)を参照してください。
+
+## 📊 次のステップ
+
+- [アーキテクチャ](./ARCHITECTURE.md) - 内部動作の理解
+- [API リファレンス](./API_REFERENCE.md) - 全API仕様
+- [ベンチマーク](./BENCHMARKS.md) - パフォーマンス特性の理解
+- [ビルド](./BUILD.md) - ソースから開発
+
+---
+
+戻る: [概要](./ABOUT.md) | 次へ: [API リファレンス](./API_REFERENCE.md)
+
+---
