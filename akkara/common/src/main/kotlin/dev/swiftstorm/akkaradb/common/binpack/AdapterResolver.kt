@@ -46,7 +46,6 @@ object AdapterResolver {
     fun getAdapterForType(type: KType): TypeAdapter<*> {
         adapterCache[type]?.let { return it }
 
-        // resolveAdapter を先に呼んで、その結果をキャッシュに入れる
         val adapter = resolveAdapter(type)
         return adapterCache.putIfAbsent(type, adapter) ?: adapter
     }

@@ -18,6 +18,13 @@ tasks.register("publishAllModule") {
     )
 }
 
+tasks {
+    build {
+        dependsOn("clean")
+        dependsOn(":akkaradb:shadowJar")
+    }
+}
+
 allprojects {
     apply(plugin = "kotlin")
     apply(plugin = "org.jetbrains.dokka")
@@ -26,7 +33,7 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.2.9"
+        "akkaradb" -> "0.2.10"
         "akkara-plugin" -> "0.1.0"
         "akkara-compiler" -> "0.3.9"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
