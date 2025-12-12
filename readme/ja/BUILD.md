@@ -8,7 +8,7 @@ AkkaraDBをソースからビルドする方法を説明します。
 - [リポジトリのクローン](#リポジトリのクローン)
 - [ビルド手順](#ビルド手順)
 - [テスト実行](#テスト実行)
-- [モジュール別ビルド](#モジュール別ビルド)
+- [モジュール構成](#モジュール構成)
 - [IDEセットアップ](#ideセットアップ)
 - [トラブルシューティング](#トラブルシューティング)
 - [開発ガイドライン](#開発ガイドライン)
@@ -33,7 +33,7 @@ AkkaraDBをソースからビルドする方法を説明します。
 
 ### 推奨
 
-- **Kotlin 2.1以上** （Gradleが自動的にダウンロード）
+- **Kotlin 2.2.21** （Gradleが自動的にダウンロード）
 - **IntelliJ IDEA 2024.1以上** （IDE使用時）
 
 ---
@@ -55,7 +55,6 @@ cd AkkaraDB
 ```
 main       : 安定版（リリース用）
 dev        : 開発版（最新機能）
-vₙ         : 過去バージョンブランチ  
 ```
 
 開発に参加する場合は`dev`ブランチをチェックアウト：
@@ -69,6 +68,8 @@ git checkout dev
 ## ビルド手順
 
 ### 全モジュールのビルド
+
+プロジェクトルートで以下を実行すると、すべてのモジュールがビルドされ、成果物が生成されます：
 
 ```bash
 # Gradleラッパーを使用（推奨）
@@ -85,11 +86,16 @@ BUILD SUCCESSFUL in 45s
 127 actionable tasks: 127 executed
 ```
 
-**成果物:**
+**主な成果物（プロジェクトルートビルドで生成）:**
 
-- `akkara/akkaradb/build/libs/akkaradb-0.2.9.jar` - Fat JAR（メイン成果物）
-- `akkara/akkaradb/build/libs/akkaradb-0.2.9-thin.jar` - Thin JAR
+- `akkara/akkaradb/build/libs/akkaradb-0.2.9.jar` - Fat JAR（全依存関係を含むメイン成果物）
+- `akkara/akkaradb/build/libs/akkaradb-0.2.9-thin.jar` - Thin JAR（依存関係なし）
 - `akkara/akkaradb/build/libs/akkaradb-0.2.9-sources.jar` - ソースJAR
+
+**プラグイン成果物:**
+
+- `akkara/plugin/akkara-plugin/build/libs/akkara-plugin-0.1.0.jar` - Gradleプラグイン
+- `akkara/plugin/akkara-compiler/build/libs/akkara-compiler-0.3.9.jar` - Kotlinコンパイラプラグイン
 
 ---
 
@@ -149,62 +155,112 @@ BUILD SUCCESSFUL in 12s
 
 ---
 
-### プロパティテスト実行
-
-```bash
-# 長時間実行テスト（1M+ cases）
-./gradlew :akkara-test:test --tests "*PropertyTest*"
-```
-
----
-
 ### テストレポート確認
 
 ```bash
-# テスト実行後、レポートを開く
+# テスト実行後、レポートを開く（macOS）
 open akkara/engine/build/reports/tests/test/index.html
 
 # Linux
 xdg-open akkara/engine/build/reports/tests/test/index.html
+
+# Windows
+start akkara/engine/build/reports/tests/test/index.html
 ```
 
 ---
 
-## モジュール別ビルド
+## モジュール構成
 
-### akkara/common
+AkkaraDBは以下のモジュールで構成されています：
 
-基礎プリミティブモジュール：
+### コアモジュール
+
+```
+akkara/
+├── common/              # 基礎プリミティブ（ByteBufferL, LE, 型定義）
+├── format-api/          # フォーマットAPI（BlockPacker, StripeWriter等）
+├── format-akk/          # AKK実装（AkkBlockPacker, パリティコーダー）
+├── engine/              # ストレージエンジン本体（MemTable, WAL, SSTable等）
+└── akkaradb/            # 統合モジュール（Fat JAR生成）
+```
+
+### プラグインモジュール
+
+```
+akkara/plugin/
+├── akkara-plugin/       # Gradleプラグイン
+└── akkara-compiler/     # Kotlinコンパイラプラグイン（IR変換）
+```
+
+---
+
+### モジュール依存関係
+
+```
+akkaradb (Fat JAR)
+  ├─ engine
+  │   ├─ common
+  │   ├─ format-api
+  │   └─ format-akk
+  │       └─ common
+  ├─ format-api
+  │   └─ common
+  └─ format-akk
+      └─ common
+
+akkara-compiler
+  └─ kotlin-compiler (compileOnly)
+
+akkara-plugin
+  └─ gradle-plugin-api (compileOnly)
+```
+
+---
+
+### 個別モジュールビルド
+
+特定のモジュールのみをビルドすることも可能です：
+
+#### akkara-common
 
 ```bash
 ./gradlew :akkara-common:build
 ```
 
-**成果物:**
-
-- `akkara/common/build/libs/akkara-common-0.2.9.jar`
+**成果物:** `akkara/common/build/libs/akkara-common-0.0.0+dev-YYYYMMDD-HHmmss.jar`
 
 ---
 
-### akkara/engine
-
-ストレージエンジン本体：
+#### akkara-engine
 
 ```bash
 ./gradlew :akkara-engine:build
 ```
 
-**依存:**
-
-- `akkara-common`
-- `akkara-format-api`
-- `akkara-format-akk`
+**成果物:** `akkara/engine/build/libs/akkara-engine-0.0.0+dev-YYYYMMDD-HHmmss.jar`
 
 ---
 
-### akkara/plugin
+#### akkaradb（統合モジュール）
 
-Kotlinコンパイラプラグイン：
+Fat JARの生成：
+
+```bash
+./gradlew :akkaradb:shadowJar
+```
+
+**成果物:** `akkara/akkaradb/build/libs/akkaradb-0.2.9.jar`
+
+**除外される依存関係:**
+
+- Kotlin標準ライブラリ（実行環境に存在する前提）
+- Kotlinxライブラリ
+- JetBrains annotations
+
+---
+
+#### プラグイン
 
 ```bash
 # Gradleプラグイン
@@ -213,31 +269,6 @@ Kotlinコンパイラプラグイン：
 # コンパイラプラグイン
 ./gradlew :akkara-compiler:build
 ```
-
-**成果物:**
-
-- `akkara/plugin/akkara-plugin/build/libs/akkara-plugin-0.1.0.jar`
-- `akkara/plugin/akkara-compiler/build/libs/akkara-compiler-0.3.9.jar`
-
----
-
-### akkara/akkaradb（統合モジュール）
-
-Fat JARの生成：
-
-```bash
-./gradlew :akkaradb:shadowJar
-```
-
-**成果物:**
-
-- `akkara/akkaradb/build/libs/akkaradb-0.2.9.jar` - 全依存関係を含む
-
-**除外される依存:**
-
-- Kotlin標準ライブラリ（実行環境に存在する前提）
-- Kotlinxライブラリ
-- JetBrains annotations
 
 ---
 
@@ -260,7 +291,7 @@ IntelliJがGradleプロジェクトを自動認識し、依存関係をダウン
 
 1. `File` → `Settings` → `Plugins`
 2. `Kotlin`を検索してインストール（通常はプリインストール済み）
-3. バージョン確認: `2.1.0`以上
+3. バージョン確認: `2.2.21`以上
 
 ---
 
@@ -371,12 +402,14 @@ code --install-extension vscjava.vscode-gradle
 **解決策:**
 
 ```bash
-# build.gradle.ktsでバージョン確認
-cat build.gradle.kts | grep "kotlin"
+# gradle/libs.versions.toml でバージョン確認
+cat gradle/libs.versions.toml | grep "kotlin"
 
 # IntelliJのKotlinプラグインを更新
 # File → Settings → Plugins → Kotlin → Update
 ```
+
+**現在のバージョン:** Kotlin 2.2.21
 
 ---
 
@@ -423,7 +456,7 @@ echo "kotlin.compiler.execution.strategy=in-process" >> gradle.properties
 ./gradlew clean build
 ```
 
-詳細は[インストール](./INSTALLATION.md#コンパイラプラグイン設定必須)を参照してください。
+詳細は[インストール](./INSTALLATION.md#-コンパイラプラグイン設定必須)を参照してください。
 
 ---
 
@@ -443,8 +476,24 @@ fun put(key: ByteBufferL, value: ByteBufferL)
 // 定数: UPPER_SNAKE_CASE
 const val BLOCK_SIZE = 32 * 1024
 
-// プライベート変数: camelCase with underscore prefix
-private val _sealed = AtomicBoolean(false)
+// プライベート変数: camelCase
+private val sealed = AtomicBoolean(false)
+```
+
+---
+
+### バージョン管理
+
+プロジェクトでは各モジュールごとに異なるバージョンが設定されています：
+
+```kotlin
+// build.gradle.kts
+version = when (name) {
+    "akkaradb" -> "0.2.9"           // メインアーティファクト
+    "akkara-plugin" -> "0.1.0"       // Gradleプラグイン
+    "akkara-compiler" -> "0.3.9"     // コンパイラプラグイン
+    else -> "0.0.0+dev-${timestamp}" // 開発版
+}
 ```
 
 ---
@@ -487,7 +536,7 @@ Closes #123
 
 ```
 main
-  └─ develop
+  └─ dev
        ├─ feature/cas-support
        ├─ feature/bloom-filter
        └─ hotfix/wal-corruption
@@ -497,12 +546,12 @@ main
 
 ```bash
 # 新機能開発
-git checkout develop
+git checkout dev
 git checkout -b feature/my-feature
 # ... 開発 ...
 git commit -m "feat(engine): add my feature"
 git push origin feature/my-feature
-# → Pull Request to develop
+# → Pull Request to dev
 
 # 緊急修正
 git checkout main
@@ -510,7 +559,7 @@ git checkout -b hotfix/critical-bug
 # ... 修正 ...
 git commit -m "fix(wal): resolve corruption issue"
 git push origin hotfix/critical-bug
-# → Pull Request to main & develop
+# → Pull Request to main & dev
 ```
 
 ---
@@ -568,70 +617,73 @@ dependencies {
 
 ---
 
-### パフォーマンステスト実行
-
-```bash
-# ベンチマークモジュール実行
-./gradlew :akkara-test:jmh
-
-# 特定のベンチマークのみ
-./gradlew :akkara-test:jmh -Pinclude=".*WriteBenchmark.*"
-
-# 結果確認
-cat akkara/test/build/reports/jmh/results.txt
-```
-
----
-
 ### デバッグビルド
 
 ```bash
-# デバッグ情報付きでビルド
-./gradlew build -Pdebug=true
-
 # ログレベルを上げる
 ./gradlew build --debug
 
 # スタックトレース表示
 ./gradlew build --stacktrace
+
+# 情報レベル
+./gradlew build --info
 ```
 
 ---
 
-## 継続的インテグレーション
+## パブリッシュ
 
-AkkaraDBはGitHub Actionsを使用しています。
-
-### ワークフロー
-
-```yaml
-# .github/workflows/build.yml
-name: Build
-on: [ push, pull_request ]
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-java@v3
-        with:
-          distribution: 'corretto'
-          java-version: '17'
-      - run: ./gradlew build test
-```
-
----
-
-### ローカルでのCI再現
+### 全モジュールのパブリッシュ
 
 ```bash
-# Actを使用（GitHub Actions互換）
-brew install act  # macOS
-# または
-sudo apt install act  # Linux
+# Maven repositoryにパブリッシュ
+./gradlew publishAllModule
+```
 
-# ワークフロー実行
-act push
+このタスクは以下のモジュールをパブリッシュします：
+
+- `akkaradb` (v0.2.9)
+- `akkara-plugin` (v0.1.0)
+- `akkara-compiler` (v0.3.9)
+
+---
+
+### パブリッシュ先
+
+```kotlin
+repositories {
+    maven {
+        val releasesRepoUrl = uri("https://repo.swiftstorm.dev/maven2-rel/")
+        val snapshotsRepoUrl = uri("https://repo.swiftstorm.dev/maven2-snap/")
+        url = if (version.toString().endsWith("SNAPSHOT")) 
+            snapshotsRepoUrl 
+        else 
+            releasesRepoUrl
+    }
+}
+```
+
+---
+
+### 重複パブリッシュの防止
+
+AkkaraDBは既存のアーティファクトを上書きしないよう、パブリッシュ前にHTTP HEADリクエストで存在確認を行います：
+
+```kotlin
+tasks.withType<PublishToMavenRepository>().configureEach {
+    onlyIf {
+        val artifactUrl = "${repoRoot}${groupPath}/$artifactId/$ver/$artifactId-$ver.jar"
+        val exists = checkArtifactExists(artifactUrl)
+        
+        if (exists) {
+            logger.lifecycle("Artifact already exists, skipping publish.")
+            false
+        } else {
+            true
+        }
+    }
+}
 ```
 
 ---
@@ -640,7 +692,15 @@ act push
 
 ### バージョニング
 
-セマンティックバージョニング（SemVer）を使用：
+各モジュールは独立してバージョン管理されています：
+
+```
+akkaradb:       0.2.9  (メインライブラリ)
+akkara-plugin:  0.1.0  (Gradleプラグイン)
+akkara-compiler: 0.3.9 (コンパイラプラグイン)
+```
+
+セマンティックバージョニング（SemVer）に従います：
 
 ```
 MAJOR.MINOR.PATCH
@@ -672,7 +732,7 @@ git commit -m "chore: release v0.2.10"
 git tag v0.2.10
 
 # 4. プッシュ
-git push origin develop
+git push origin dev
 git push origin v0.2.10
 
 # 5. パブリッシュ
@@ -733,7 +793,7 @@ AkkaraDBへの貢献を歓迎します！
 ### プルリクエスト
 
 1. Issueを作成（既存のIssueがない場合）
-2. `main`ブランチからフォーク
+2. `dev`ブランチからフォーク
 3. `feature/your-feature`ブランチを作成
 4. 変更を実装
 5. テストを追加
@@ -746,7 +806,6 @@ AkkaraDBへの貢献を歓迎します！
 - **GitHub リポジトリ**: https://github.com/SwiftStorm-Studio/AkkaraDB
 - **Maven リポジトリ**: https://repo.swiftstorm.dev/maven2/
 - **ドキュメント**: [目次](../README.md)
-- **Discord コミュニティ**: https://discord.swiftstorm.dev
 
 ---
 

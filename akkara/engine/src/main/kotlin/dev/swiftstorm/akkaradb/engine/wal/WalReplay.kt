@@ -36,22 +36,11 @@ object WalReplay {
         if (!Files.exists(path)) return Result(0)
 
         val fileSize = Files.size(path)
-        println("[AkkaraDB] WAL path: $path")
-        println("[AkkaraDB] WAL exists: ${Files.exists(path)}")
-        println("[AkkaraDB] WAL size: $fileSize bytes")
 
-        if (fileSize == 0L) {
-            println("[AkkaraDB] WAL replay result: 0 entries")
-            return Result(0)
-        }
+        if (fileSize == 0L) Result(0)
 
         var applied = 0L
         FileChannel.open(path, StandardOpenOption.READ).use { ch ->
-            val channelSize = ch.size()
-            if (channelSize != fileSize) {
-                println("[AkkaraDB] WARNING: FileChannel.size() ($channelSize) != Files.size() ($fileSize)")
-            }
-
             val map = ch.map(FileChannel.MapMode.READ_ONLY, 0, fileSize)
             while (true) {
                 val payload = WalFraming.readOne(map) ?: break // stop at partial/tail

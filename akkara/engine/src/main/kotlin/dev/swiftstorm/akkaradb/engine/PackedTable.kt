@@ -42,17 +42,17 @@ import kotlin.reflect.jvm.isAccessible
  *
  * @param T The type of the entity stored in the table. Must be a non-nullable type.
  * @param ID The type of the identifier used for entities in the table. Must be a non-nullable type.
- * @param db The database instance to which this table is bound.
+ * @param akkdb The database instance to which this table is bound.
  * @param kClass The KClass of the entity type [T], used for reflection and metadata purposes.
  * @param idClass The KClass of the identifier type [ID], used for validation and serialization purposes.
  */
 class PackedTable<T : Any, ID : Any>(
-    val db: AkkaraDB,
+    val akkdb: AkkaraDB,
     @PublishedApi internal val kClass: KClass<T>,
     @PublishedApi internal val idClass: KClass<ID>
 ) : Closeable {
     override fun close() {
-        db.close()
+        akkdb.close()
     }
 
     private val nsBuf: ByteBufferL by lazy {
@@ -162,11 +162,11 @@ class PackedTable<T : Any, ID : Any>(
         logger.debug("  Key: ${key.remaining} bytes")
         logger.debug("  Value: ${encoded.remaining} bytes")
 
-        val seq = db.put(key, encoded)
+        val seq = akkdb.put(key, encoded)
 
         logger.debug("  Assigned seq: $seq")
 
-        val readBack = db.get(key.duplicate().position(0))
+        val readBack = akkdb.get(key.duplicate().position(0))
         if (readBack != null) {
             logger.debug("  ✓ Read back successful: ${readBack.remaining} bytes")
         } else {
@@ -201,7 +201,7 @@ class PackedTable<T : Any, ID : Any>(
      */
     fun get(id: ID): T? {
         val key = keyBuf(id)
-        val raw = db.get(key) ?: return null
+        val raw = akkdb.get(key) ?: return null
         val adapter = AdapterResolver.getAdapterForClass(kClass)
         return adapter.read(raw.duplicate().position(0))
     }
@@ -212,7 +212,7 @@ class PackedTable<T : Any, ID : Any>(
      * @param id The identifier of the entry to be deleted. This ID is used to construct the key for locating the entry in the database.
      */
     fun delete(id: ID) {
-        db.delete(keyBuf(id))
+        akkdb.delete(keyBuf(id))
     }
 
     /**
@@ -393,7 +393,7 @@ class PackedTable<T : Any, ID : Any>(
         logger.debug("  Range end: ${endKey.remaining} bytes, i64=${endKey.duplicate().position(0).i64}")
 
         return sequence {
-            for (rec in db.range(startKey, endKey)) {
+            for (rec in akkdb.range(startKey, endKey)) {
                 val entity = adapter.read(rec.value.duplicate().position(0))
                 if (eval(query.where, entity) as Boolean) {
                     yield(entity)

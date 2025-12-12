@@ -16,7 +16,7 @@ AkkaraDBをプロジェクトにセットアップする方法を説明します
 ## 📋 要件
 
 - **JDK 17以上**
-- **Kotlin 2.1以上** （Typed API使用時）
+- **Kotlin 2.2.21以上** （Typed API使用時）
 - **Gradle** または **Maven**
 
 ## 📦 リポジトリ設定
@@ -85,8 +85,7 @@ plugins {
 }
 
 dependencies {
-    akkara('0.2.9')
-    // or akkara('0.2.9', 'implementation')
+    implementation 'dev.swiftstorm:akkaradb:0.2.9' // バージョンを指定して追加できます
 }
 ```
 

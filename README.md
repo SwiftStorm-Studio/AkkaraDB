@@ -4,21 +4,9 @@
 
 JVM上で動作する超低レイテンシな組み込みキーバリューストア
 
-### Documents are under construction!! Please wait for a while!!
-
 ---
 
 ## 📚 ドキュメント
-
-### 日本語 (Japanese)
-
-- [📖 概要](./readme/ja/ABOUT.md) - AkkaraDBとは？主な特徴
-- [⚡ クイックスタート](./readme/ja/QUICKSTART.md) - 5分で始める
-- [📦 インストール](./readme/ja/INSTALLATION.md) - セットアップ手順
-- [🏗️ アーキテクチャ](./readme/ja/ARCHITECTURE.md) - 内部設計の詳細
-- [📘 API リファレンス](./readme/ja/API_REFERENCE.md) - API仕様
-- [⚡ ベンチマーク](./readme/ja/BENCHMARKS.md) - パフォーマンス測定結果
-- [🔧 ビルド](./readme/ja/BUILD.md) - ソースからビルド
 
 ### English
 
@@ -30,21 +18,40 @@ JVM上で動作する超低レイテンシな組み込みキーバリュース�
 - [⚡ Benchmarks](./readme/en/BENCHMARKS.md) - Performance results
 - [🔧 Build](./readme/en/BUILD.md) - Build from source
 
+### 日本語 (Japanese)
+
+- [📖 概要](./readme/ja/ABOUT.md) - AkkaraDBとは？主な特徴
+- [⚡ クイックスタート](./readme/ja/QUICKSTART.md) - 5分で始める
+- [📦 インストール](./readme/ja/INSTALLATION.md) - セットアップ手順
+- [🏗️ アーキテクチャ](./readme/ja/ARCHITECTURE.md) - 内部設計の詳細
+- [📘 API リファレンス](./readme/ja/API_REFERENCE.md) - API仕様
+- [⚡ ベンチマーク](./readme/ja/BENCHMARKS.md) - パフォーマンス測定結果
+- [🔧 ビルド](./readme/ja/BUILD.md) - ソースからビルド
+
 ---
 
 ## 🚀 クイックスタート
 
 ```kotlin
-// データモデル定義
-data class User(val name: String, val age: Int)
+import dev.swiftstorm.akkaradb.engine.AkkDSL
+import dev.swiftstorm.akkaradb.engine.StartupMode
+import dev.swiftstorm.akkaradb.common.ShortUUID
+import java.nio.file.Paths
 
-val base = java.nio.file.Paths.get("./data/akkdb")
-val users = dev.swiftstorm.akkaradb.engine.AkkDSL.open<User>(base, dev.swiftstorm.akkaradb.engine.StartupMode.NORMAL)
+// データモデル定義
+data class User(
+    @Id val id: ShortUUID,
+    val name: String,
+    val age: Int
+)
+
+val base = Paths.get("./data/akkdb")
+val users = AkkDSL.open<User, String>(base, StartupMode.NORMAL)
 
 // 書き込み・読み取り
-val id = dev.swiftstorm.akkaradb.common.ShortUUID.generate()
-users.put("user", id, User(name = "太郎", age = 42))
-val user = users.get("user", id)
+val id = ShortUUID.generate()
+users.put(User(id = id, name = "太郎", age = 42))
+val user = users.get(id)
 
 users.close()
 ```
