@@ -202,10 +202,14 @@ class AkkStripeWriter(
         } finally {
             // recycle parity buffers back to pool even if encode/write throws
             if (m > 0) for (b in parityBufs) pool.release(b)
+
+            // recycle data buffers (from stage) back to pool
+            for (i in 0 until k) {
+                stage[i]?.let { pool.release(it) }
+                stage[i] = null
+            }
         }
 
-        // Reset staging
-        for (i in 0 until k) stage[i] = null
         pendingInStripe = 0
 
         // Mark sealed & enqueue for commit
@@ -243,7 +247,7 @@ class AkkStripeWriter(
         val policyBlocks = flushPolicy.maxBlocks
         val policyMicros = flushPolicy.maxMicros
 
-        val doByBlocks = (policyBlocks > 0 && n >= policyBlocks)
+        val doByBlocks = (policyBlocks in 1..n)
         val doByTime = (policyMicros > 0L &&
                 (System.nanoTime() - lastCommitStartNanos) >= policyMicros * 1_000)
 
@@ -413,6 +417,13 @@ class AkkStripeWriter(
                 for (ch in parityCh) ch.force(false)
 
             } finally {
+                // Release any remaining staged buffers (incomplete stripe)
+                for (i in 0 until k) {
+                    stage[i]?.let { pool.release(it) }
+                    stage[i] = null
+                }
+                pendingInStripe = 0
+
                 var first: Throwable? = null
                 fun swallow(t: Throwable) {
                     if (first == null) first = t

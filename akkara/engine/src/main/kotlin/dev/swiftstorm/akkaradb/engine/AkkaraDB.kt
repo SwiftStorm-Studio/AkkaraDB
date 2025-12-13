@@ -286,8 +286,7 @@ class AkkaraDB private constructor(
             // Prepare compactor and reader management
             val compactor = SSTCompactor(sstDir, manifest = manifest)
             fun rebuildReaders(into: ConcurrentLinkedDeque<SSTableReader>) {
-                // Close existing
-                into.forEach { runCatching { it.close() } }
+                val oldReaders = ArrayList(into)
                 into.clear()
                 val toOpen = ArrayList<Path>()
                 if (Files.isDirectory(sstDir)) {
@@ -322,6 +321,9 @@ class AkkaraDB private constructor(
                     val r = SSTableReader.open(ch)
                     into.addLast(r)
                 }
+
+                // Close old readers
+                oldReaders.forEach { runCatching { it.close() } }
             }
 
             // Prepare onFlush callback: write L0 SST and optionally pack into stripes

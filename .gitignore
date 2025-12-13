@@ -1,6 +1,5 @@
 .gradle
 .idea
 build
-akkara/test/**
 .kotlin
 akkara/debugger/**

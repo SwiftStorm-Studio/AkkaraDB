@@ -23,6 +23,7 @@ package dev.swiftstorm.akkaradb.engine.sstable
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.MemRecord
+import dev.swiftstorm.akkaradb.common.Pools
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
 import dev.swiftstorm.akkaradb.engine.bridge.tryAppendMem
 import dev.swiftstorm.akkaradb.engine.util.IndexBlock
@@ -75,6 +76,9 @@ class SSTableWriter(
         }
         indexBuilder.addKey32(fk, blockOff)
         pendingFirstKey32 = null
+
+        // Release the buffer back to the pool.
+        Pools.io().release(fullBlock)
     })
 
     /**

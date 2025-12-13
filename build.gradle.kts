@@ -8,6 +8,7 @@ plugins {
     alias(libs.plugins.dokka)
     alias(libs.plugins.kapt)
     `maven-publish`
+    application
 }
 
 tasks.register("publishAllModule") {
@@ -96,14 +97,27 @@ subprojects {
         }
 
         "akkara-test" -> {
+            apply(plugin = "application")
+
             dependencies {
                 testImplementation(kotlin("test"))
+                testImplementation(kotlin("reflect"))
                 testImplementation(project(":akkara-common"))
                 testImplementation(project(":akkara-format-api"))
                 testImplementation(project(":akkara-format-akk"))
                 testImplementation(project(":akkara-engine"))
                 testImplementation("org.junit.jupiter:junit-jupiter-api:5.13.1")
                 testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.13.1")
+            }
+
+            tasks.named<JavaExec>("run") {
+                jvmArgs = listOf(
+                    "-Xmx4G",
+                    "-XX:+UseG1GC",
+                    "-XX:+AlwaysPreTouch",
+                    "-XX:MaxGCPauseMillis=50",
+                    "-Dfile.encoding=UTF-8"
+                )
             }
         }
     }

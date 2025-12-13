@@ -375,6 +375,7 @@ class MemTable(
         fun start() = th.start()
         fun stopAndDrain() {
             running.set(false)
+            LockSupport.unpark(th)
             th.join()
             while (true) {
                 val b = queue.poll() ?: break
