@@ -1001,10 +1001,15 @@ class TypedApiBenchmark {
                 val indices = (0 until keyCount).shuffled()
                 repeat(keyCount) { i ->
                     val id = "user_%08d".format(indices[i])
-                    val elapsed = measureNanoTime {
-                        db.get(id)
+                    try {
+                        val elapsed = measureNanoTime {
+                            db.get(id)
+                        }
+                        readLatencies[i] = elapsed
+                    } catch (e: Exception) {
+                        println("Failed at i=$i, id=$id")
+                        throw e
                     }
-                    readLatencies[i] = elapsed
                 }
 
                 db.close()
@@ -1045,17 +1050,17 @@ fun main(args: Array<String>) {
     println(
         """
         ╔══════════════════════════════════════════════════════════════════════╗
-        ║           AkkaraDB v3 ベンチマークスイート                            ║
+        ║           AkkaraDB v3 ベンチマークスイート                               ║
         ╠══════════════════════════════════════════════════════════════════════╣
-        ║  使用方法:                                                           ║
-        ║    --benchmark all         すべてのベンチマーク                       ║
-        ║    --benchmark write       書き込みベンチマーク                       ║
-        ║    --benchmark read        読み取りベンチマーク                       ║
-        ║    --benchmark bloom       Bloomフィルターベンチマーク                ║
-        ║    --benchmark range       範囲検索ベンチマーク                       ║
-        ║    --benchmark mixed       混合ワークロードベンチマーク               ║
-        ║    --benchmark mt          マルチスレッドベンチマーク                 ║
-        ║    --benchmark typed       Typed API ベンチマーク                    ║
+        ║  使用方法:                                                            ║
+        ║    --benchmark all         すべてのベンチマーク                         ║
+        ║    --benchmark write       書き込みベンチマーク                         ║
+        ║    --benchmark read        読み取りベンチマーク                         ║
+        ║    --benchmark bloom       Bloomフィルターベンチマーク                  ║
+        ║    --benchmark range       範囲検索ベンチマーク                         ║
+        ║    --benchmark mixed       混合ワークロードベンチマーク                   ║
+        ║    --benchmark mt          マルチスレッドベンチマーク                     ║
+        ║    --benchmark typed       Typed API ベンチマーク                      ║
         ╚══════════════════════════════════════════════════════════════════════╝
     """.trimIndent()
     )

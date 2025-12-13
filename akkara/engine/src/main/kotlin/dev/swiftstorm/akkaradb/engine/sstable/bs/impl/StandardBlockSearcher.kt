@@ -1,30 +1,10 @@
-/*
- * AkkaraDB
- * Copyright (C) 2025 Swift Storm Studio
- *
- * This file is part of AkkaraDB.
- *
- * AkkaraDB is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
- *
- * AkkaraDB is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with AkkaraDB.  If not, see <https://www.gnu.org/licenses/>.
- */
+package dev.swiftstorm.akkaradb.engine.sstable.bs.impl
 
-package dev.swiftstorm.akkaradb.engine.sstable.bs
-
-import dev.swiftstorm.akkaradb.common.BlockConst.BLOCK_SIZE
-import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
+import dev.swiftstorm.akkaradb.common.BlockConst
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.bytesEqual
 import dev.swiftstorm.akkaradb.common.lexCompare
-import dev.swiftstorm.akkaradb.engine.sstable.BlockSearcher
+import dev.swiftstorm.akkaradb.engine.sstable.bs.BlockSearcher
 
 /* =======================================================================
  * StandardBlockSearcher
@@ -90,10 +70,10 @@ object StandardBlockSearcher : BlockSearcher {
     /** Return (payloadStart, payloadEndExclusive). Validates bounds. */
     private fun payloadBounds(block: ByteBufferL): Pair<Int, Int> {
         val payloadLen = block.at(0).i32
-        require(payloadLen in 0..PAYLOAD_LIMIT) { "invalid payloadLen=$payloadLen" }
+        require(payloadLen in 0..BlockConst.PAYLOAD_LIMIT) { "invalid payloadLen=$payloadLen" }
         val start = 4
         val end = start + payloadLen
-        require(end <= BLOCK_SIZE - 4) { "payload overruns block: end=$end > ${BLOCK_SIZE - 4}" }
+        require(end <= BlockConst.BLOCK_SIZE - 4) { "payload overruns block: end=$end > ${BlockConst.BLOCK_SIZE - 4}" }
         return start to end
     }
 

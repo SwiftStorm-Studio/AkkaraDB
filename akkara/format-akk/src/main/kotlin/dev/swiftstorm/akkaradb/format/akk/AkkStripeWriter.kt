@@ -229,11 +229,11 @@ class AkkStripeWriter(
     @Suppress("DEPRECATION")
     private fun positionalWriteFully(ch: FileChannel, block: ByteBufferL, off: Long) {
         // Reuse a single view; do not mutate channel position.
-        val src = block.duplicate().position(0).rawDuplicate()
+        val src = block.duplicate().position(0)
         src.limit(blockSize)
         var written = 0
         while (written < blockSize) {
-            val n = ch.write(src, off + written.toLong())
+            val n = ch.write(src.rawDuplicate(), off + written.toLong())
             if (n < 0) throw IOException("channel closed during write")
             if (n == 0) continue // non-blocking safety (should not happen with FileChannel)
             written += n

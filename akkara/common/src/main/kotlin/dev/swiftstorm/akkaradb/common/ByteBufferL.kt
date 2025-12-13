@@ -563,12 +563,14 @@ class ByteBufferL private constructor(
     }
 }
 
+val ByteBufferL.isReadOnly: Boolean get() = buf.isReadOnly
+
 fun ByteBufferL.hasRemaining(): Boolean = remaining > 0
 
-fun ByteBufferL.copy(): ByteBufferL {
+fun ByteBufferL.copy(isDirect: Boolean = false): ByteBufferL {
     val dup = duplicate().position(0)
     val len = dup.remaining
-    val dst = ByteBufferL.allocate(len, direct = false)
+    val dst = ByteBufferL.allocate(len, direct = isDirect)
     if (len > 0) dst.put(dup, len)
     dst.position = 0
     dst.limit = len

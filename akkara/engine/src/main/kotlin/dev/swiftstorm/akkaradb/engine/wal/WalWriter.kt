@@ -21,6 +21,7 @@ package dev.swiftstorm.akkaradb.engine.wal
 
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.Pools
+import dev.swiftstorm.akkaradb.common.hasRemaining
 import java.io.Closeable
 import java.io.IOException
 import java.nio.channels.ClosedChannelException
@@ -154,8 +155,8 @@ class WalWriter(
 
                 synchronized(ch) {
                     for (it in batch) {
-                        val bb = it.frame.rawDuplicate()
-                        while (bb.hasRemaining()) ch.write(bb)
+                        val bb = it.frame
+                        while (bb.hasRemaining()) ch.write(bb.rawDuplicate())
                         io.release(it.frame)
                     }
                     ch.force(false)
