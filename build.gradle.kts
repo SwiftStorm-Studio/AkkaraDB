@@ -30,11 +30,10 @@ allprojects {
     apply(plugin = "kotlin")
     apply(plugin = "org.jetbrains.dokka")
     apply(plugin = "maven-publish")
-    apply(plugin = "kotlin-kapt")
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.2.10"
+        "akkaradb" -> "0.3.1"
         "akkara-plugin" -> "0.1.0"
         "akkara-compiler" -> "0.3.9"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"

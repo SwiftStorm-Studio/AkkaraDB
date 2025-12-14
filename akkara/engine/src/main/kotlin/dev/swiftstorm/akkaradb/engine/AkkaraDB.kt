@@ -180,7 +180,6 @@ class AkkaraDB private constructor(
                 val sstIter = r.range(start, end).map { (k, v, hdr) ->
                     val tombstone = hdr.flags and RecordFlags.TOMBSTONE.toInt() != 0
                     val actualValue = if (tombstone) MemRecord.EMPTY else v.asReadOnlyDuplicate()
-
                     MemRecord(
                         key = k.asReadOnlyDuplicate(),
                         value = actualValue,
@@ -193,15 +192,14 @@ class AkkaraDB private constructor(
                 iters.add(PeekingIterator(sstIter))
             }
 
+            val batch = ArrayList<MemRecord>(1024)
+
             // K-way merge
             while (true) {
                 iters.removeIf { !it.hasNext() }
                 if (iters.isEmpty()) break
 
-                val first = iters.minWithOrNull { a, b ->
-                    lexCompare(a.peek().key, b.peek().key)
-                } ?: break
-
+                val first = iters.minWithOrNull { a, b -> lexCompare(a.peek().key, b.peek().key) } ?: break
                 val rec = first.next()
 
                 // Dedup
@@ -214,8 +212,17 @@ class AkkaraDB private constructor(
                     next.next()
                 }
 
-                if (!rec.tombstone) yield(rec)
+                if (!rec.tombstone) {
+                    batch.add(rec)
+                    if (batch.size >= 1024) {
+                        yieldAll(batch)
+                        batch.clear()
+                    }
+                }
             }
+
+            if (batch.isNotEmpty()) yieldAll(batch)
+
         } finally {
             acquiredReaders.forEach { it.release() }
         }
@@ -223,11 +230,17 @@ class AkkaraDB private constructor(
 
     /** Best-effort flush: hint MemTable, seal any complete stripes, and checkpoint manifest. */
     fun flush() {
+        logger.debug("Phase: AkkaraDB.flush called")
         mem.flushHint()
+        logger.debug("Phase: MemTable.flushHint completed")
         val sealed = stripeW.sealIfComplete()
+        logger.debug("Phase: StripeWriter.sealIfComplete completed; sealed=$sealed")
         if (sealed) stripeW.flush(FlushMode.SYNC)
+        logger.debug("Phase: StripeWriter.flush completed")
         manifest.checkpoint(name = "flush", stripe = stripeW.lastSealedStripe, lastSeq = mem.lastSeq())
+        logger.debug("Phase: Manifest.checkpoint completed")
         wal.forceSync()
+        logger.debug("Phase: Wal.forceSync completed")
     }
 
     fun lastSeq(): Long = mem.lastSeq()
