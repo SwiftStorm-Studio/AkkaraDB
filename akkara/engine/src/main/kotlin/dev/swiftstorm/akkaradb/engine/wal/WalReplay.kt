@@ -48,7 +48,7 @@ object WalReplay {
                 val bb = ByteBufferL.wrap(payload)
                 val hdr = AKHdr32.readRel(bb.rawDuplicate())
                 val keySlice = bb.sliceAt(bb.position, hdr.kLen)
-                bb.position = bb.position + hdr.kLen
+                bb.position += hdr.kLen
                 val vLen = hdr.vLen.toIntExact()
                 val valSlice = if (vLen > 0) bb.sliceAt(bb.position, vLen) else ByteBufferL.allocate(0, direct = false)
                 if ((hdr.flags and RecordFlags.TOMBSTONE.toInt()) != 0) {

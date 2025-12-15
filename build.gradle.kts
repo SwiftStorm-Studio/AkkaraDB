@@ -33,7 +33,7 @@ allprojects {
 
     group = "dev.swiftstorm"
     version = when (name) {
-        "akkaradb" -> "0.3.1"
+        "akkaradb" -> "0.4.0"
         "akkara-plugin" -> "0.1.0"
         "akkara-compiler" -> "0.3.9"
         else -> "0.0.0+dev-${SimpleDateFormat("yyyyMMdd-HHmmss").format(Date())}"
