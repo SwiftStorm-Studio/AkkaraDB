@@ -35,7 +35,7 @@ class AkkaraDBTest {
                 walGroupMicros = 0,
             )
         )
-        try {
+        db.use { db ->
             val k = bb("key-1")
             val v = bb("value-1")
             val seq1 = db.put(k.duplicate(), v.duplicate())
@@ -50,15 +50,13 @@ class AkkaraDBTest {
 
             val gone = db.get(k.duplicate())
             Assertions.assertNull(gone)
-        } finally {
-            db.close()
         }
     }
 
     @Test
     fun compareAndSwap_updateAndDelete() {
         val db = AkkaraDB.open(AkkaraDB.Options(baseDir = temp.resolve("db2")))
-        try {
+        db.use { db ->
             val k = bb("cas-key")
             val v1 = bb("v1")
             val s1 = db.put(k.duplicate(), v1.duplicate())
@@ -79,8 +77,6 @@ class AkkaraDBTest {
             val delOk = db.compareAndSwap(k.duplicate(), s2, null)
             Assertions.assertTrue(delOk)
             Assertions.assertNull(db.get(k.duplicate()))
-        } finally {
-            db.close()
         }
     }
 }

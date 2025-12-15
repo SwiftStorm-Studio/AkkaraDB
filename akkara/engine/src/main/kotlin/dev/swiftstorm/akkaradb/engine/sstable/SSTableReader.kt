@@ -27,7 +27,8 @@ import dev.swiftstorm.akkaradb.common.BlockConst.PAYLOAD_LIMIT
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.lexCompare
 import dev.swiftstorm.akkaradb.engine.bloom.BloomFilter
-import dev.swiftstorm.akkaradb.engine.sstable.bs.StandardBlockSearcher
+import dev.swiftstorm.akkaradb.engine.sstable.bs.BlockSearcher
+import dev.swiftstorm.akkaradb.engine.sstable.bs.impl.StandardBlockSearcher
 import dev.swiftstorm.akkaradb.engine.util.IndexBlock
 import java.io.Closeable
 import java.nio.ByteBuffer

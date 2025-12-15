@@ -47,13 +47,10 @@ object WalFraming {
         // payload
         out.put(ro)
         // crc32c(payload)
+        val crcBuf = ro.duplicate().limit(ro.position + len)
         val crc = CRC32C_TL.get().apply {
             reset()
-            update(
-                ro.duplicate()
-                    .limit(ro.position + len)
-                    .rawDuplicate()
-            )
+            update(crcBuf.rawDuplicate())
         }.value.toInt()
         out.i32 = crc
         out.position = 0

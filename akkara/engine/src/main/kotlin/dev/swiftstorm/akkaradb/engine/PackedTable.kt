@@ -24,6 +24,7 @@ package dev.swiftstorm.akkaradb.engine
 import dev.swiftstorm.akkaradb.common.ByteBufferL
 import dev.swiftstorm.akkaradb.common.binpack.AdapterResolver
 import dev.swiftstorm.akkaradb.common.binpack.BinPackBufferPool
+import dev.swiftstorm.akkaradb.common.copy
 import dev.swiftstorm.akkaradb.engine.AkkaraDB.Companion.logger
 import dev.swiftstorm.akkaradb.engine.query.*
 import dev.swiftstorm.akkaradb.engine.util.murmur3_128
@@ -148,32 +149,29 @@ class PackedTable<T : Any, ID : Any>(
         val cap = adapter.estimateSize(entity).coerceAtLeast(32)
 
         val buf = BinPackBufferPool.get(cap)
-        adapter.write(entity, buf)
+        try {
+            adapter.write(entity, buf)
 
-        val encoded = buf.asReadOnlyDuplicate().apply {
-            position(0)
-            limit(buf.position)
+            val encoded = buf.asReadOnlyDuplicate().apply {
+                position(0)
+                limit(buf.position)
+            }
+
+            val frozen = encoded.copy()
+
+            val key = keyBuf(id)
+
+            logger.debug("[PackedTable.put] Writing entity:")
+            logger.debug("  Entity: $entity")
+            logger.debug("  Key: ${key.remaining} bytes")
+            logger.debug("  Value: ${encoded.remaining} bytes")
+
+            val seq = akkdb.put(key, frozen)
+
+            logger.debug("  Assigned seq: $seq")
+        } finally {
+            BinPackBufferPool.release(buf)
         }
-
-        val key = keyBuf(id)
-
-        logger.debug("[PackedTable.put] Writing entity:")
-        logger.debug("  Entity: $entity")
-        logger.debug("  Key: ${key.remaining} bytes")
-        logger.debug("  Value: ${encoded.remaining} bytes")
-
-        val seq = akkdb.put(key, encoded)
-
-        logger.debug("  Assigned seq: $seq")
-
-        val readBack = akkdb.get(key.duplicate().position(0))
-        if (readBack != null) {
-            logger.debug("  ✓ Read back successful: ${readBack.remaining} bytes")
-        } else {
-            logger.debug("  ✗ WARNING: Could not read back immediately after put!")
-        }
-
-        BinPackBufferPool.release(buf)
     }
 
     /**

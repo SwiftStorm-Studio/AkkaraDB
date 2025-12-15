@@ -325,11 +325,11 @@ class AkkStripeReader(
      */
     @Suppress("DEPRECATION")
     private fun positionalReadFully(ch: FileChannel, block: ByteBufferL, off: Long): Int {
-        val dst = block.duplicate().position(0).rawDuplicate()
+        val dst = block.duplicate().position(0)
         dst.limit(blockSize)
         var read = 0
         while (read < blockSize) {
-            val n = ch.read(dst, off + read)
+            val n = ch.read(dst.rawDuplicate(), off + read)
             if (n < 0) return if (read == 0) -1 else read
             if (n == 0) continue
             read += n

@@ -25,6 +25,7 @@ import dev.swiftstorm.akkaradb.engine.logging.AkkLogger
 import dev.swiftstorm.akkaradb.engine.logging.impl.AkkLoggerImpl
 import dev.swiftstorm.akkaradb.engine.manifest.AkkManifest
 import dev.swiftstorm.akkaradb.engine.memtable.MemTable
+import dev.swiftstorm.akkaradb.engine.sstable.RefCountedSSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTCompactor
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableReader
 import dev.swiftstorm.akkaradb.engine.sstable.SSTableWriter
@@ -64,7 +65,7 @@ class AkkaraDB private constructor(
     private val manifest: AkkManifest,
     private val stripeW: AkkStripeWriter,
     private val stripeR: AkkStripeReader?,
-    private val readers: ConcurrentLinkedDeque<SSTableReader>,
+    private val readers: ConcurrentLinkedDeque<RefCountedSSTableReader>,
     private val durableCas: Boolean,
     private val useStripeForRead: Boolean,
     private val logger: AkkLogger
@@ -111,12 +112,22 @@ class AkkaraDB private constructor(
     /** Get value for key, or null if missing or tombstoned. */
     fun get(key: ByteBufferL): ByteBufferL? {
         // 1) MemTable fast path
-        mem.get(key)?.let { rec -> return if (rec.tombstone) null else rec.value }
-        // 2) SST newest-first
-        for (r in readers) {
-            val v = r.get(key)
-            if (v != null) return v
+        mem.get(key)?.let { rec ->
+            return if (rec.tombstone) null else rec.value
         }
+
+        // 2) SST newest-first (snapshot + acquire)
+        val snapshot = readers.toList()
+        for (r in snapshot) {
+            if (!r.acquire()) continue
+            try {
+                val v = r.get(key)
+                if (v != null) return v
+            } finally {
+                r.release()
+            }
+        }
+
         // 3) Stripe fallback
         if (useStripeForRead) stripeFallbackLookup(key)?.let { return it }
         return null
@@ -155,62 +166,81 @@ class AkkaraDB private constructor(
     }
 
     fun range(start: ByteBufferL, end: ByteBufferL): Sequence<MemRecord> = sequence {
-        val iters = ArrayList<PeekingIterator<MemRecord>>(readers.size + 1)
+        val snapshot = readers.toList()
+        val acquiredReaders = snapshot.filter { it.acquire() }
 
-        // MemTable iterator
-        iters.add(PeekingIterator(mem.iterator(MemTable.KeyRange(start, end)).iterator()))
+        try {
+            val iters = ArrayList<PeekingIterator<MemRecord>>(acquiredReaders.size + 1)
 
-        // SST iterators
-        for (r in readers) {
-            val sstIter = r.range(start, end).map { (k, v, hdr) ->
-                val tombstone = hdr.flags and RecordFlags.TOMBSTONE.toInt() != 0
-                val actualValue = if (tombstone) MemRecord.EMPTY else v.asReadOnlyDuplicate()
+            // MemTable iterator
+            iters.add(PeekingIterator(mem.iterator(MemTable.KeyRange(start, end)).iterator()))
 
-                MemRecord(
-                    key = k.asReadOnlyDuplicate(),
-                    value = actualValue,
-                    seq = hdr.seq.raw,
-                    flags = hdr.flags.toByte(),
-                    keyHash = hdr.keyFP64.raw.toInt(),
-                    approxSizeBytes = estimateMemFootprint(k, actualValue)
-                )
-            }.iterator()
-            iters.add(PeekingIterator(sstIter))
-        }
-
-
-        // K-way merge
-        while (true) {
-            iters.removeIf { !it.hasNext() }
-            if (iters.isEmpty()) break
-
-            val first = iters.minWithOrNull { a, b ->
-                lexCompare(a.peek().key, b.peek().key)
-            } ?: break
-
-            val rec = first.next()
-
-            // Dedup
-            while (true) {
-                val next = iters.filter { it.hasNext() }
-                    .minByOrNull { lexCompare(it.peek().key, rec.key) }
-                if (next == null || !next.hasNext()) break
-                val peek = next.peek()
-                if (lexCompare(peek.key, rec.key) != 0) break
-                next.next()
+            // SST iterators
+            for (r in acquiredReaders) {
+                val sstIter = r.range(start, end).map { (k, v, hdr) ->
+                    val tombstone = hdr.flags and RecordFlags.TOMBSTONE.toInt() != 0
+                    val actualValue = if (tombstone) MemRecord.EMPTY else v.asReadOnlyDuplicate()
+                    MemRecord(
+                        key = k.asReadOnlyDuplicate(),
+                        value = actualValue,
+                        seq = hdr.seq.raw,
+                        flags = hdr.flags.toByte(),
+                        keyHash = hdr.keyFP64.raw.toInt(),
+                        approxSizeBytes = estimateMemFootprint(k, actualValue)
+                    )
+                }.iterator()
+                iters.add(PeekingIterator(sstIter))
             }
 
-            if (!rec.tombstone) yield(rec)
+            val batch = ArrayList<MemRecord>(1024)
+
+            // K-way merge
+            while (true) {
+                iters.removeIf { !it.hasNext() }
+                if (iters.isEmpty()) break
+
+                val first = iters.minWithOrNull { a, b -> lexCompare(a.peek().key, b.peek().key) } ?: break
+                val rec = first.next()
+
+                // Dedup
+                while (true) {
+                    val next = iters.filter { it.hasNext() }
+                        .minByOrNull { lexCompare(it.peek().key, rec.key) }
+                    if (next == null || !next.hasNext()) break
+                    val peek = next.peek()
+                    if (lexCompare(peek.key, rec.key) != 0) break
+                    next.next()
+                }
+
+                if (!rec.tombstone) {
+                    batch.add(rec)
+                    if (batch.size >= 1024) {
+                        yieldAll(batch)
+                        batch.clear()
+                    }
+                }
+            }
+
+            if (batch.isNotEmpty()) yieldAll(batch)
+
+        } finally {
+            acquiredReaders.forEach { it.release() }
         }
     }
 
     /** Best-effort flush: hint MemTable, seal any complete stripes, and checkpoint manifest. */
     fun flush() {
+        logger.debug("Phase: AkkaraDB.flush called")
         mem.flushHint()
+        logger.debug("Phase: MemTable.flushHint completed")
         val sealed = stripeW.sealIfComplete()
+        logger.debug("Phase: StripeWriter.sealIfComplete completed; sealed=$sealed")
         if (sealed) stripeW.flush(FlushMode.SYNC)
+        logger.debug("Phase: StripeWriter.flush completed")
         manifest.checkpoint(name = "flush", stripe = stripeW.lastSealedStripe, lastSeq = mem.lastSeq())
+        logger.debug("Phase: Manifest.checkpoint completed")
         wal.forceSync()
+        logger.debug("Phase: Wal.forceSync completed")
     }
 
     fun lastSeq(): Long = mem.lastSeq()
@@ -285,9 +315,10 @@ class AkkaraDB private constructor(
 
             // Prepare compactor and reader management
             val compactor = SSTCompactor(sstDir, manifest = manifest)
-            fun rebuildReaders(into: ConcurrentLinkedDeque<SSTableReader>) {
+            fun rebuildReaders(into: ConcurrentLinkedDeque<RefCountedSSTableReader>) {
                 val oldReaders = ArrayList(into)
                 into.clear()
+
                 val toOpen = ArrayList<Path>()
                 if (Files.isDirectory(sstDir)) {
                     Files.list(sstDir).use { lvlStream ->
@@ -305,6 +336,7 @@ class AkkaraDB private constructor(
                             .forEach { toOpen.add(it) }
                     }
                 }
+
                 // Sort by level (L0, L1, ...) then by mtime desc within level
                 toOpen.sortWith { a, b ->
                     fun parseLevel(p: Path): Int {
@@ -316,18 +348,18 @@ class AkkaraDB private constructor(
                     val lb = parseLevel(b)
                     if (la != lb) la - lb else Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a))
                 }
+
                 toOpen.forEach { p ->
                     val ch = FileChannel.open(p, READ)
-                    val r = SSTableReader.open(ch)
-                    into.addLast(r)
+                    val inner = SSTableReader.open(ch)
+                    into.addLast(RefCountedSSTableReader(inner))
                 }
 
-                // Close old readers
-                oldReaders.forEach { runCatching { it.close() } }
+                oldReaders.forEach { it.close() }
             }
 
             // Prepare onFlush callback: write L0 SST and optionally pack into stripes
-            val readersDeque = ConcurrentLinkedDeque<SSTableReader>()
+            val readersDeque = ConcurrentLinkedDeque<RefCountedSSTableReader>()
             val onFlushCb: (List<MemRecord>) -> Unit = { batch ->
                 if (batch.isEmpty()) {
                     manifest.checkpoint(name = "memFlush-empty")
