@@ -1,8 +1,8 @@
-# AkkaraDB v3 Specification
+# AkkaraDB v1 - v3 Specification
 
-**Version:** 3.0  
+**Version:** 0.4.0
 **Status:** Production Candidate  
-**Date:** 2025-01-XX  
+**Date:** 2025-12-17
 **Authors:** Swift Storm Studio
 
 ---
