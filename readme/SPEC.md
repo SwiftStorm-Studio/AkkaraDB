@@ -1,8 +1,8 @@
 # AkkaraDB v3 Specification
 
-**Version:** 3.0  
+**SPEC Version:** 3.0  
 **Status:** Production Candidate  
-**Date:** 2025-01-XX  
+**Date:** 2025-12-18
 **Authors:** Swift Storm Studio
 
 ---
@@ -648,7 +648,7 @@ Future v4 may use `FormatBump` manifest events for online migration.
 
 **Document Metadata:**
 
-- Version: 3.0
-- Last Updated: 2025-12-12
+- SPEC Version: 3.0
+- Last Updated: 2025-12-18
 - License: LGPL-3.0
 - Copyright: © 2025 Swift Storm Studio
