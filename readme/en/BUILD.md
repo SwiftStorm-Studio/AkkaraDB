@@ -54,13 +54,13 @@ cd AkkaraDB
 
 ```
 main       : Stable (for releases)
-dev        : Development (latest features)
+dev        : Other (relics of the past)
 ```
 
-To participate in development, checkout the `dev` branch:
+To participate in development, checkout the `main` branch:
 
 ```bash
-git checkout dev
+git checkout main
 ```
 
 ---
@@ -532,38 +532,6 @@ Closes #123
 
 ---
 
-### Branch Strategy
-
-```
-main
-  └─ dev
-       ├─ feature/cas-support
-       ├─ feature/bloom-filter
-       └─ hotfix/wal-corruption
-```
-
-**Workflow:**
-
-```bash
-# Feature development
-git checkout dev
-git checkout -b feature/my-feature
-# ... develop ...
-git commit -m "feat(engine): add my feature"
-git push origin feature/my-feature
-# → Pull Request to dev
-
-# Emergency fix
-git checkout main
-git checkout -b hotfix/critical-bug
-# ... fix ...
-git commit -m "fix(wal): resolve corruption issue"
-git push origin hotfix/critical-bug
-# → Pull Request to main & dev
-```
-
----
-
 ### Pull Request
 
 **Checklist:**
@@ -732,7 +700,7 @@ git commit -m "chore: release v0.2.10"
 git tag v0.2.10
 
 # 4. Push
-git push origin dev
+git push origin main
 git push origin v0.2.10
 
 # 5. Publish
@@ -793,7 +761,7 @@ Propose features on [GitHub Discussions](https://github.com/SwiftStorm-Studio/Ak
 ### Pull Requests
 
 1. Create an issue (if not already existing)
-2. Fork from `dev` branch
+2. Fork from `main` branch
 3. Create `feature/your-feature` branch
 4. Implement changes
 5. Add tests

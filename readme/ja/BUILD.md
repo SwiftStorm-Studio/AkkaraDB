@@ -54,13 +54,13 @@ cd AkkaraDB
 
 ```
 main       : 安定版（リリース用）
-dev        : 開発版（最新機能）
+dev        : その他（過去の産物）
 ```
 
-開発に参加する場合は`dev`ブランチをチェックアウト：
+開発に参加する場合は`main`ブランチをチェックアウト：
 
 ```bash
-git checkout dev
+git checkout main
 ```
 
 ---
@@ -532,38 +532,6 @@ Closes #123
 
 ---
 
-### ブランチ戦略
-
-```
-main
-  └─ dev
-       ├─ feature/cas-support
-       ├─ feature/bloom-filter
-       └─ hotfix/wal-corruption
-```
-
-**ワークフロー:**
-
-```bash
-# 新機能開発
-git checkout dev
-git checkout -b feature/my-feature
-# ... 開発 ...
-git commit -m "feat(engine): add my feature"
-git push origin feature/my-feature
-# → Pull Request to dev
-
-# 緊急修正
-git checkout main
-git checkout -b hotfix/critical-bug
-# ... 修正 ...
-git commit -m "fix(wal): resolve corruption issue"
-git push origin hotfix/critical-bug
-# → Pull Request to main & dev
-```
-
----
-
 ### プルリクエスト
 
 **チェックリスト:**
@@ -732,7 +700,7 @@ git commit -m "chore: release v0.2.10"
 git tag v0.2.10
 
 # 4. プッシュ
-git push origin dev
+git push origin main
 git push origin v0.2.10
 
 # 5. パブリッシュ
@@ -793,7 +761,7 @@ AkkaraDBへの貢献を歓迎します！
 ### プルリクエスト
 
 1. Issueを作成（既存のIssueがない場合）
-2. `dev`ブランチからフォーク
+2. `main`ブランチからフォーク
 3. `feature/your-feature`ブランチを作成
 4. 変更を実装
 5. テストを追加
