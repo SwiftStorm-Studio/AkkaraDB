@@ -21,6 +21,7 @@
 
 package dev.swiftstorm.akkaradb.engine
 
+import dev.swiftstorm.akkaradb.engine.logging.AkkLogger
 import dev.swiftstorm.akkaradb.format.akk.parity.RSParityCoder
 import dev.swiftstorm.akkaradb.format.api.FlushPolicy
 import dev.swiftstorm.akkaradb.format.api.ParityCoder
@@ -57,7 +58,8 @@ object AkkDSL {
             durableCas = cfg.durableCas,
             useStripeForRead = cfg.useStripeForRead,
             bloomFPRate = cfg.bloomFPRate,
-            debug = cfg.debug
+            debug = cfg.debug,
+            customLogger = cfg.customLogger
         )
         val db = AkkaraDB.open(opts)
         return PackedTable(db, T::class, ID::class)
@@ -82,7 +84,8 @@ data class AkkDSLCfg(
     val durableCas: Boolean = false,
     val useStripeForRead: Boolean = false,
     val bloomFPRate: Double = 0.01,
-    val debug: Boolean = false
+    val debug: Boolean = false,
+    val customLogger: AkkLogger? = null,
 )
 
 class AkkDSLCfgBuilder(private val baseDir: Path) {
@@ -99,6 +102,7 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
     var useStripeForRead: Boolean = false
     var bloomFPRate: Double = 0.01
     var debug: Boolean = false
+    var customLogger: AkkLogger? = null
 
     fun build(): AkkDSLCfg {
         require(k >= 1) { "k must be >= 1" }
@@ -122,7 +126,8 @@ class AkkDSLCfgBuilder(private val baseDir: Path) {
             durableCas,
             useStripeForRead,
             bloomFPRate,
-            debug
+            debug,
+            customLogger
         )
     }
 }

@@ -273,14 +273,15 @@ class AkkaraDB private constructor(
         val durableCas: Boolean = false,
         val useStripeForRead: Boolean = false,
         val bloomFPRate: Double = 0.01,
-        val debug: Boolean = false
+        val debug: Boolean = false,
+        val customLogger: AkkLogger? = null
     )
 
     companion object {
         lateinit var logger: AkkLogger
 
         fun open(opts: Options): AkkaraDB {
-            logger = AkkLoggerImpl { opts.debug }
+            logger = opts.customLogger ?: AkkLoggerImpl { opts.debug }
 
             val base = opts.baseDir
             Files.createDirectories(base)

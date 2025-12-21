@@ -8,6 +8,8 @@ import org.jetbrains.kotlin.config.CompilerConfiguration
 
 @OptIn(ExperimentalCompilerApi::class)
 class AkkRegisterer : CompilerPluginRegistrar() {
+    override val pluginId: String
+        get() = "dev.swiftstorm.akkaradb-plugin"
     override val supportsK2: Boolean = true
     override fun ExtensionStorage.registerExtensions(configuration: CompilerConfiguration) {
         IrGenerationExtension.registerExtension(OperatorRewriteIrExtension())

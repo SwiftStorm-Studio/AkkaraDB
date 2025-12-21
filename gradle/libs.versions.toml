@@ -1,5 +1,5 @@
 [versions]
-kotlin = "2.2.21"
+kotlin = "2.3.0"
 dokka = "2.0.0"
 shadow = "9.2.2"
 slf4j = "2.1.0-alpha1"
