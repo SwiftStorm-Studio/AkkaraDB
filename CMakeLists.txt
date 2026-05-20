@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.1)
 
 project(AkkaraDB
         DESCRIPTION "Low-latency, crash-safe JVM KV store with WAL & stripe parity"
-        VERSION 0.5.0
+        VERSION 0.6.0
         LANGUAGES CXX
 )
 

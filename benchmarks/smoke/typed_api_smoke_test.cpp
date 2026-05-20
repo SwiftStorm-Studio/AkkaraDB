@@ -210,6 +210,40 @@ namespace {
         }).to_vector();
         assert(fallback_or.size() == 2);
 
+        auto selected_names = profiles.query([](auto profile) {
+            return profile.name.in({"Alice", "Carol"});
+        }).to_vector();
+        assert(selected_names.size() == 2);
+
+        auto selected_emails = profiles.query([](auto profile) {
+            return profile.email.in({"a@example.test", "c@example.test"});
+        }).to_vector();
+        assert(selected_emails.size() == 2);
+
+        auto prefixed_email = profiles.query([](auto profile) {
+            return profile.email.starts_with("b@");
+        }).to_vector();
+        assert(prefixed_email.size() == 1);
+        assert(prefixed_email[0].value.id == 2);
+
+        auto liked_email = profiles.query([](auto profile) {
+            return profile.email.like("c@%");
+        }).to_vector();
+        assert(liked_email.size() == 1);
+        assert(liked_email[0].value.id == 3);
+
+        auto contained_name = profiles.query([](auto profile) {
+            return profile.name.contains("lic");
+        }).to_vector();
+        assert(contained_name.size() == 1);
+        assert(contained_name[0].value.id == 1);
+
+        auto excluded_ages = profiles.query([](auto profile) {
+            return profile.age.not_in(std::vector<uint32_t>{30, 41});
+        }).to_vector();
+        assert(excluded_ages.size() == 1);
+        assert(excluded_ages[0].value.id == 2);
+
         size_t ranged = 0;
         auto range = profiles.scan(2ULL, 4ULL);
         while (range.has_next()) {

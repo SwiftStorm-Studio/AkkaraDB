@@ -60,6 +60,43 @@ namespace akkaradb::engine::memtable {
             return core::build_mini_key(key.data(), key.size());
         }
 
+        [[nodiscard]] uint64_t load_u64_le(const uint8_t* p) noexcept {
+            uint64_t v = 0;
+            std::memcpy(&v, p, sizeof(v));
+            return v;
+        }
+
+        [[nodiscard]] uint64_t avalanche64(uint64_t x) noexcept {
+            x ^= x >> 33;
+            x *= 0xff51afd7ed558ccdULL;
+            x ^= x >> 33;
+            x *= 0xc4ceb9fe1a85ec53ULL;
+            x ^= x >> 33;
+            return x;
+        }
+
+        [[nodiscard]] uint64_t compute_shard_hash(std::span<const uint8_t> key) noexcept {
+            const auto* p = key.data();
+            size_t n = key.size();
+            uint64_t h = 0x9e3779b97f4a7c15ULL ^ (static_cast<uint64_t>(n) * 0xbf58476d1ce4e5b9ULL);
+
+            while (n >= 8) {
+                uint64_t lane = load_u64_le(p);
+                lane *= 0x9ddfea08eb382d69ULL;
+                lane ^= lane >> 32;
+                h ^= lane;
+                h = (h << 27) | (h >> 37);
+                h = h * 5 + 0x52dce729;
+                p += 8;
+                n -= 8;
+            }
+
+            uint64_t tail = 0;
+            for (size_t i = 0; i < n; ++i) { tail |= static_cast<uint64_t>(p[i]) << (i * 8); }
+            h ^= tail * 0x9ddfea08eb382d69ULL;
+            return avalanche64(h);
+        }
+
         [[nodiscard]] uint32_t next_pow2_clamped(uint64_t n, uint32_t min_value, uint32_t max_value) noexcept {
             uint32_t p = 1;
             while (p < n && p < max_value) { p <<= 1; }
@@ -81,9 +118,9 @@ namespace akkaradb::engine::memtable {
             return next_pow2_clamped(target, 2, effective_cap);
         }
 
-        [[nodiscard]] uint32_t shard_for(uint64_t fp64, uint32_t shard_count) noexcept {
+        [[nodiscard]] uint32_t shard_for_hash(uint64_t hash, uint32_t shard_count) noexcept {
             if (shard_count <= 1) { return 0; }
-            return static_cast<uint32_t>(fp64 & static_cast<uint64_t>(shard_count - 1));
+            return static_cast<uint32_t>(hash & static_cast<uint64_t>(shard_count - 1));
         }
 
         [[noreturn]] void throw_status_error(const char* op, const core::Status& st) {
@@ -251,7 +288,7 @@ namespace akkaradb::engine::memtable {
             ) {
                 const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
                 const uint64_t mini = compute_mini(key, precomputed_mk);
-                const uint32_t shard_index = shard_for(fp64, shard_count_);
+                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
 
                 auto& shard = *shards_[shard_index];
                 bool should_flush = false;
@@ -278,7 +315,7 @@ namespace akkaradb::engine::memtable {
             void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputed_fp64, uint64_t precomputed_mk) {
                 const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
                 const uint64_t mini = compute_mini(key, precomputed_mk);
-                const uint32_t shard_index = shard_for(fp64, shard_count_);
+                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
 
                 put(key, {}, seq, RecordView::FLAG_TOMBSTONE, fp64, mini);
                 shards_[shard_index]->puts_applied.fetch_sub(1, std::memory_order_relaxed);
@@ -289,8 +326,8 @@ namespace akkaradb::engine::memtable {
                 if (out == nullptr) { return false; }
 
                 const core::ByteView key_view = to_byte_view(key);
-                const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
-                const uint32_t shard_index = shard_for(fp64, shard_count_);
+                (void)precomputed_fp64;
+                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
                 const auto& shard = *shards_[shard_index];
 
                 if (raw_active_get_enabled_.load(std::memory_order_acquire) && shard.immutable_count.load(std::memory_order_acquire) == 0) {

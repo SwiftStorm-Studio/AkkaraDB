@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,14 +35,38 @@ namespace akkaradb {
         struct ProxyTag {};
 
         enum class Op {
-            Eq, Ne, Gt, Ge, Lt, Le, And, Or
+            Eq, Ne, Gt, Ge, Lt, Le, And, Or, In, NotIn, StartsWith, Contains, Like
         };
 
         struct AlwaysTrue {};
 
+        template <Op Operator, typename L, typename R>
+        struct Compare;
+
         template <auto FieldPtr>
         struct Column {
             static constexpr auto field_ptr = FieldPtr;
+
+            template <typename R>
+            [[nodiscard]] auto in(R&& rhs) const;
+
+            template <typename T>
+            [[nodiscard]] auto in(std::initializer_list<T> rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto not_in(R&& rhs) const;
+
+            template <typename T>
+            [[nodiscard]] auto not_in(std::initializer_list<T> rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto starts_with(R&& rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto contains(R&& rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto like(R&& rhs) const;
         };
 
         template <typename T>
@@ -171,6 +196,98 @@ namespace akkaradb {
         template <typename X> requires(is_expr_v<X>)
         [[nodiscard]] auto operator!(X&& x) { return Not<std::remove_cvref_t<X>>{std::forward<X>(x)}; }
 
+        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        [[nodiscard]] auto in(L&& lhs, R&& rhs) {
+            return Compare<Op::In, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
+                as_expr(std::forward<L>(lhs)),
+                as_expr(std::forward<R>(rhs))
+            };
+        }
+
+        template <typename L, typename T> requires(is_expr_v<L>)
+        [[nodiscard]] auto in(L&& lhs, std::initializer_list<T> rhs) {
+            return in(std::forward<L>(lhs), std::vector<literal_storage_t<T>>{rhs.begin(), rhs.end()});
+        }
+
+        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        [[nodiscard]] auto not_in(L&& lhs, R&& rhs) {
+            return Compare<Op::NotIn, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
+                as_expr(std::forward<L>(lhs)),
+                as_expr(std::forward<R>(rhs))
+            };
+        }
+
+        template <typename L, typename T> requires(is_expr_v<L>)
+        [[nodiscard]] auto not_in(L&& lhs, std::initializer_list<T> rhs) {
+            return not_in(std::forward<L>(lhs), std::vector<literal_storage_t<T>>{rhs.begin(), rhs.end()});
+        }
+
+        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        [[nodiscard]] auto starts_with(L&& lhs, R&& rhs) {
+            return Compare<Op::StartsWith, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
+                as_expr(std::forward<L>(lhs)),
+                as_expr(std::forward<R>(rhs))
+            };
+        }
+
+        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        [[nodiscard]] auto contains(L&& lhs, R&& rhs) {
+            return Compare<Op::Contains, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
+                as_expr(std::forward<L>(lhs)),
+                as_expr(std::forward<R>(rhs))
+            };
+        }
+
+        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        [[nodiscard]] auto like(L&& lhs, R&& rhs) {
+            return Compare<Op::Like, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
+                as_expr(std::forward<L>(lhs)),
+                as_expr(std::forward<R>(rhs))
+            };
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::in(R&& rhs) const {
+            return query::in(*this, std::forward<R>(rhs));
+        }
+
+        template <auto FieldPtr>
+        template <typename T>
+        [[nodiscard]] auto Column<FieldPtr>::in(std::initializer_list<T> rhs) const {
+            return query::in(*this, rhs);
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::not_in(R&& rhs) const {
+            return query::not_in(*this, std::forward<R>(rhs));
+        }
+
+        template <auto FieldPtr>
+        template <typename T>
+        [[nodiscard]] auto Column<FieldPtr>::not_in(std::initializer_list<T> rhs) const {
+            return query::not_in(*this, rhs);
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::starts_with(R&& rhs) const {
+            return query::starts_with(*this, std::forward<R>(rhs));
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::contains(R&& rhs) const {
+            return query::contains(*this, std::forward<R>(rhs));
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::like(R&& rhs) const {
+            return query::like(*this, std::forward<R>(rhs));
+        }
+
         template <typename Entity>
         [[nodiscard]] auto make_proxy() { return akkaradb_query_proxy(ProxyTag<Entity>{}); }
 
@@ -240,6 +357,56 @@ namespace akkaradb {
         template <typename T, typename Entity>
         [[nodiscard]] const T& eval(const Literal<T>& literal, const Entity&) { return literal.value; }
 
+        template <typename Needle, typename Haystack>
+        [[nodiscard]] bool contains_value(const Haystack& haystack, const Needle& needle) {
+            for (const auto& value : haystack) {
+                if (value == needle) { return true; }
+            }
+            return false;
+        }
+
+        template <typename Value, typename Pattern>
+        [[nodiscard]] bool string_starts_with(const Value& value, const Pattern& pattern) {
+            std::string_view haystack{value};
+            std::string_view needle{pattern};
+            return haystack.starts_with(needle);
+        }
+
+        template <typename Value, typename Pattern>
+        [[nodiscard]] bool string_contains(const Value& value, const Pattern& pattern) {
+            std::string_view haystack{value};
+            std::string_view needle{pattern};
+            return haystack.find(needle) != std::string_view::npos;
+        }
+
+        [[nodiscard]] inline bool like_match(std::string_view value, size_t vi, std::string_view pattern, size_t pi) {
+            while (pi < pattern.size()) {
+                if (pattern[pi] == '%') {
+                    while (pi + 1 < pattern.size() && pattern[pi + 1] == '%') { ++pi; }
+                    if (pi + 1 == pattern.size()) { return true; }
+                    for (size_t next = vi; next <= value.size(); ++next) {
+                        if (like_match(value, next, pattern, pi + 1)) { return true; }
+                    }
+                    return false;
+                }
+                if (pattern[pi] == '_') {
+                    if (vi >= value.size()) { return false; }
+                    ++vi;
+                    ++pi;
+                    continue;
+                }
+                if (vi >= value.size() || value[vi] != pattern[pi]) { return false; }
+                ++vi;
+                ++pi;
+            }
+            return vi == value.size();
+        }
+
+        template <typename Value, typename Pattern>
+        [[nodiscard]] bool string_like(const Value& value, const Pattern& pattern) {
+            return like_match(std::string_view{value}, 0, std::string_view{pattern}, 0);
+        }
+
         template <Op Operator, typename L, typename R, typename Entity>
         [[nodiscard]] bool eval(const Compare<Operator, L, R>& expr, const Entity& entity) {
             const auto lhs = eval(expr.lhs, entity);
@@ -250,6 +417,11 @@ namespace akkaradb {
             else if constexpr (Operator == Op::Ge) { return lhs >= rhs; }
             else if constexpr (Operator == Op::Lt) { return lhs < rhs; }
             else if constexpr (Operator == Op::Le) { return lhs <= rhs; }
+            else if constexpr (Operator == Op::In) { return contains_value(rhs, lhs); }
+            else if constexpr (Operator == Op::NotIn) { return !contains_value(rhs, lhs); }
+            else if constexpr (Operator == Op::StartsWith) { return string_starts_with(lhs, rhs); }
+            else if constexpr (Operator == Op::Contains) { return string_contains(lhs, rhs); }
+            else if constexpr (Operator == Op::Like) { return string_like(lhs, rhs); }
         }
 
         template <Op Operator, typename L, typename R, typename Entity>
@@ -392,7 +564,7 @@ namespace akkaradb {
                         std::string(field_name),
                         [](const Entity& entity, ArenaByteBuffer& out) {
                             out.clear();
-                            binpack::BinPack::encode_into(entity.*FieldPtr, out);
+                            encode_index_field_value(entity.*FieldPtr, out);
                         }
                     }
                 );
@@ -485,7 +657,7 @@ namespace akkaradb {
 
                 reset_temp_buffers();
                 field_buffer_.clear();
-                binpack::BinPack::encode_into(value, field_buffer_);
+                encode_index_field_value(value, field_buffer_);
                 make_index_search_prefix(prefix, field_buffer_, scan_start_buffer_);
                 scan_end_buffer_ = scan_start_buffer_;
                 if (!detail::increment_be_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
@@ -583,9 +755,17 @@ namespace akkaradb {
                 Table, Index
             };
 
+            struct QueryRange {
+                std::vector<uint8_t> start_key;
+                std::vector<uint8_t> end_key;
+                size_t index_search_prefix_size = 0;
+                bool dynamic_index_pk_offset = false;
+                bool dedupe_index_pks = false;
+            };
+
             struct QueryPlan {
                 QuerySourceKind kind = QuerySourceKind::Table;
-                size_t index_search_prefix_size = 0;
+                std::vector<QueryRange> ranges;
             };
 
             class QuerySource {
@@ -607,51 +787,80 @@ namespace akkaradb {
                 private:
                     friend class PackedTable;
 
-                    QuerySource(
-                        const PackedTable* table,
-                        QuerySourceKind kind,
-                        size_t index_search_prefix_size,
-                        std::span<const uint8_t> start_key,
-                        std::span<const uint8_t> end_key
-                    )
+                    QuerySource(const PackedTable* table, QueryPlan plan)
                         : table_{table},
-                          kind_{kind},
-                          index_search_prefix_size_{index_search_prefix_size},
-                          scan_arena_{std::make_unique<core::BufferArena>()},
-                          rows_{table_->engine_->scan(*scan_arena_, start_key, end_key)},
-                          it_{rows_.begin()} { advance(); }
+                          kind_{plan.kind},
+                          ranges_{std::move(plan.ranges)},
+                          scan_arena_{std::make_unique<core::BufferArena>()} {
+                        open_next_range();
+                        advance();
+                    }
+
+                    void open_next_range() {
+                        while (range_index_ < ranges_.size()) {
+                            const auto& range = ranges_[range_index_++];
+                            index_search_prefix_size_ = range.index_search_prefix_size;
+                            dynamic_index_pk_offset_ = range.dynamic_index_pk_offset;
+                            dedupe_index_pks_ = range.dedupe_index_pks;
+                            it_ = {};
+                            rows_ = {};
+                            scan_arena_->reset();
+                            rows_ = table_->engine_->scan(*scan_arena_, range.start_key, range.end_key);
+                            it_ = rows_.begin();
+                            return;
+                        }
+                    }
 
                     void advance() {
                         pending_.reset();
-                        while (!(it_ == rows_.end())) {
-                            const auto& raw = *it_;
-                            ++it_;
-                            Entry entry;
-                            if (kind_ == QuerySourceKind::Table) {
-                                const auto key = raw.key;
-                                if (key.size() < table_->pk_prefix_.size() || std::memcmp(
-                                    key.data(),
-                                    table_->pk_prefix_.data(),
-                                    table_->pk_prefix_.size()
-                                ) != 0) { return; }
+                        while (range_index_ <= ranges_.size()) {
+                            while (!(it_ == rows_.end())) {
+                                const auto& raw = *it_;
+                                ++it_;
+                                Entry entry;
+                                if (kind_ == QuerySourceKind::Table) {
+                                    const auto key = raw.key;
+                                    if (key.size() < table_->pk_prefix_.size() || std::memcmp(
+                                        key.data(),
+                                        table_->pk_prefix_.data(),
+                                        table_->pk_prefix_.size()
+                                    ) != 0) { return; }
 
-                                std::span<const uint8_t> pk_bytes{key.data() + table_->pk_prefix_.size(), key.size() - table_->pk_prefix_.size()};
-                                entry = Entry{binpack::BinPack::decode<PK>(pk_bytes), binpack::BinPack::decode<Entity>(raw.value)};
+                                    std::span<const uint8_t> pk_bytes{key.data() + table_->pk_prefix_.size(), key.size() - table_->pk_prefix_.size()};
+                                    entry = Entry{binpack::BinPack::decode<PK>(pk_bytes), binpack::BinPack::decode<Entity>(raw.value)};
+                                }
+                                else {
+                                    const auto key = raw.key;
+                                    size_t pk_offset = index_search_prefix_size_;
+                                    if (dynamic_index_pk_offset_) {
+                                        if (key.size() <= 12) { continue; }
+                                        const size_t field_size = read_be32(key.data() + 8);
+                                        pk_offset = 12 + field_size;
+                                    }
+                                    if (key.size() <= pk_offset) { continue; }
+                                    const std::span<const uint8_t> pk_bytes{key.data() + pk_offset, key.size() - pk_offset};
+                                    if (dedupe_index_pks_) {
+                                        std::string pk_key{reinterpret_cast<const char*>(pk_bytes.data()), pk_bytes.size()};
+                                        if (!seen_index_pks_.insert(std::move(pk_key)).second) { continue; }
+                                    }
+                                    if (!table_->get_by_pk_bytes(pk_bytes, entry)) { continue; }
+                                }
+                                pending_ = std::move(entry);
+                                return;
                             }
-                            else {
-                                const auto key = raw.key;
-                                if (key.size() <= index_search_prefix_size_) { continue; }
-                                const std::span<const uint8_t> pk_bytes{key.data() + index_search_prefix_size_, key.size() - index_search_prefix_size_};
-                                if (!table_->get_by_pk_bytes(pk_bytes, entry)) { continue; }
-                            }
-                            pending_ = std::move(entry);
-                            return;
+                            if (range_index_ >= ranges_.size()) { return; }
+                            open_next_range();
                         }
                     }
 
                     const PackedTable* table_;
                     QuerySourceKind kind_;
                     size_t index_search_prefix_size_;
+                    bool dynamic_index_pk_offset_ = false;
+                    bool dedupe_index_pks_ = false;
+                    std::unordered_set<std::string> seen_index_pks_;
+                    std::vector<QueryRange> ranges_;
+                    size_t range_index_ = 0;
                     std::unique_ptr<core::BufferArena> scan_arena_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView> rows_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView>::iterator it_;
@@ -710,7 +919,7 @@ namespace akkaradb {
                         QueryPlan plan;
                         table_->make_query_plan(expr_, plan);
                         return Iterator{
-                            QuerySource{table_, plan.kind, plan.index_search_prefix_size, table_->scan_start_buffer_, table_->scan_end_buffer_},
+                            QuerySource{table_, std::move(plan)},
                             expr_,
                             limit_
                         };
@@ -842,7 +1051,7 @@ namespace akkaradb {
                     [[nodiscard]] FindRange find(const Field& value) const {
                         table_->reset_temp_buffers();
                         table_->field_buffer_.clear();
-                        binpack::BinPack::encode_into(value, table_->field_buffer_);
+                        table_->encode_index_field_value(value, table_->field_buffer_);
                         table_->make_index_search_prefix(prefix_, table_->field_buffer_, table_->scan_start_buffer_);
                         table_->scan_end_buffer_ = table_->scan_start_buffer_;
                         if (!detail::increment_be_bytes(table_->scan_end_buffer_.data(), table_->scan_end_buffer_.size())) { table_->scan_end_buffer_.clear(); }
@@ -897,8 +1106,26 @@ namespace akkaradb {
                 if (try_make_index_plan(expr, plan)) { return; }
 
                 plan.kind = QuerySourceKind::Table;
-                plan.index_search_prefix_size = 0;
+                plan.ranges.clear();
                 make_prefix_start_end(pk_prefix_, scan_start_buffer_, scan_end_buffer_);
+                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 0);
+            }
+
+            void add_query_range(
+                QueryPlan& plan,
+                std::span<const uint8_t> start_key,
+                std::span<const uint8_t> end_key,
+                size_t index_search_prefix_size,
+                bool dynamic_index_pk_offset = false,
+                bool dedupe_index_pks = false
+            ) const {
+                QueryRange range;
+                range.start_key.assign(start_key.begin(), start_key.end());
+                range.end_key.assign(end_key.begin(), end_key.end());
+                range.index_search_prefix_size = index_search_prefix_size;
+                range.dynamic_index_pk_offset = dynamic_index_pk_offset;
+                range.dedupe_index_pks = dedupe_index_pks;
+                plan.ranges.push_back(std::move(range));
             }
 
             template <typename Expr>
@@ -958,56 +1185,100 @@ namespace akkaradb {
                 else { return false; }
             }
 
+            [[nodiscard]] static bool like_pattern_to_prefix(std::string_view pattern, std::string_view& prefix) {
+                const size_t wildcard = pattern.find_first_of("%_");
+                if (wildcard == std::string_view::npos) {
+                    prefix = pattern;
+                    return true;
+                }
+                if (pattern[wildcard] != '%' || wildcard + 1 != pattern.size()) { return false; }
+                prefix = pattern.substr(0, wildcard);
+                return true;
+            }
+
+            [[nodiscard]] static uint32_t read_be32(const uint8_t* src) noexcept {
+                return (static_cast<uint32_t>(src[0]) << 24) |
+                    (static_cast<uint32_t>(src[1]) << 16) |
+                    (static_cast<uint32_t>(src[2]) << 8) |
+                    static_cast<uint32_t>(src[3]);
+            }
+
+            template <typename Field>
+            static void encode_index_field_value(const Field& value, ArenaByteBuffer& out) {
+                binpack::BinPack::encode_into(value, out);
+            }
+
+            [[nodiscard]] bool try_make_string_prefix_index_plan(const std::array<uint8_t, 8>& index_prefix, std::string_view prefix, QueryPlan& plan) const {
+                (void)prefix;
+                make_prefix_start_end(index_prefix, scan_start_buffer_, scan_end_buffer_);
+                plan.kind = QuerySourceKind::Index;
+                plan.ranges.clear();
+                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 0, true, true);
+                return true;
+            }
+
             template <query::Op Operator, auto FieldPtr, typename Lit>
             [[nodiscard]] bool try_make_field_index_plan(const Lit& literal, QueryPlan& plan) const {
                 using Field = binpack::detail::member_of<FieldPtr>;
                 const IndexDef* idx = find_index_def_for<FieldPtr>();
                 if (idx == nullptr) { return false; }
 
-                Field value{};
-                if (!literal_to_field<Field>(literal, value)) { return false; }
-
                 if constexpr (Operator == query::Op::Eq) {
+                    Field value{};
+                    if (!literal_to_field<Field>(literal, value)) { return false; }
                     field_buffer_.clear();
-                    binpack::BinPack::encode_into(value, field_buffer_);
+                    encode_index_field_value(value, field_buffer_);
                     make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
                     scan_end_buffer_ = scan_start_buffer_;
                     if (!detail::increment_be_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
                     plan.kind = QuerySourceKind::Index;
-                    plan.index_search_prefix_size = scan_start_buffer_.size();
+                    plan.ranges.clear();
+                    add_query_range(plan, scan_start_buffer_, scan_end_buffer_, scan_start_buffer_.size());
                     return true;
+                }
+                else if constexpr (Operator == query::Op::In) {
+                    return false;
+                }
+                else if constexpr (Operator == query::Op::StartsWith) {
+                    return false;
+                }
+                else if constexpr (Operator == query::Op::Like) {
+                    return false;
                 }
                 else if constexpr ((Operator == query::Op::Gt || Operator == query::Op::Ge || Operator == query::Op::Lt || Operator == query::Op::Le) &&
                     std::is_integral_v<Field> && std::is_unsigned_v<Field>) {
+                    Field value{};
+                    if (!literal_to_field<Field>(literal, value)) { return false; }
                     make_prefix_start_end(idx->prefix, scan_start_buffer_, scan_end_buffer_);
                     field_buffer_.clear();
 
                     if constexpr (Operator == query::Op::Gt) {
                         if (value == std::numeric_limits<Field>::max()) { return false; }
                         const Field lower = static_cast<Field>(value + 1);
-                        binpack::BinPack::encode_into(lower, field_buffer_);
+                        encode_index_field_value(lower, field_buffer_);
                         make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
                     }
                     else if constexpr (Operator == query::Op::Ge) {
-                        binpack::BinPack::encode_into(value, field_buffer_);
+                        encode_index_field_value(value, field_buffer_);
                         make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
                     }
                     else if constexpr (Operator == query::Op::Lt) {
                         if (value == std::numeric_limits<Field>::lowest()) { return false; }
-                        binpack::BinPack::encode_into(value, field_buffer_);
+                        encode_index_field_value(value, field_buffer_);
                         make_index_search_prefix(idx->prefix, field_buffer_, scan_end_buffer_);
                     }
                     else if constexpr (Operator == query::Op::Le) {
                         if (value != std::numeric_limits<Field>::max()) {
                             const Field upper = static_cast<Field>(value + 1);
-                            binpack::BinPack::encode_into(upper, field_buffer_);
+                            encode_index_field_value(upper, field_buffer_);
                             make_index_search_prefix(idx->prefix, field_buffer_, scan_end_buffer_);
                         }
-                        else { binpack::BinPack::encode_into(value, field_buffer_); }
+                        else { encode_index_field_value(value, field_buffer_); }
                     }
 
                     plan.kind = QuerySourceKind::Index;
-                    plan.index_search_prefix_size = 12 + field_buffer_.size();
+                    plan.ranges.clear();
+                    add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 12 + field_buffer_.size());
                     return true;
                 }
                 else { return false; }

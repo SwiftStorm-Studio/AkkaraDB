@@ -227,13 +227,15 @@ namespace {
 
     struct Value {
         enum Kind {
-            Missing, Null, Bool, Int, Double, String
+            Missing, Null, Bool, Int, Double, String, List, Map
         } kind = Missing;
 
         bool b = false;
         int64_t i = 0;
         double d = 0.0;
         std::string s;
+        std::vector<Value> list;
+        std::vector<std::pair<Value, Value>> map;
 
         [[nodiscard]] static Value missing() { return {}; }
 
@@ -268,6 +270,20 @@ namespace {
             Value v;
             v.kind = String;
             v.s = std::move(value);
+            return v;
+        }
+
+        [[nodiscard]] static Value list_value(std::vector<Value> values) {
+            Value v;
+            v.kind = List;
+            v.list = std::move(values);
+            return v;
+        }
+
+        [[nodiscard]] static Value map_value(std::vector<std::pair<Value, Value>> values) {
+            Value v;
+            v.kind = Map;
+            v.map = std::move(values);
             return v;
         }
 
@@ -336,9 +352,25 @@ namespace {
             case TypeDesc::Double: return Value::floating(bits_to_double(in.u64()));
             case TypeDesc::String: return Value::string(in.str_i32());
             case TypeDesc::Nullable: return in.u8() == 0 ? Value::null() : read_binpack_value(in, *type.elem);
-            case TypeDesc::Struct:
-            case TypeDesc::List:
-            case TypeDesc::Map: skip_binpack_value(in, type);
+            case TypeDesc::List: {
+                const auto count = in.u32();
+                std::vector<Value> values;
+                values.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) { values.push_back(read_binpack_value(in, *type.elem)); }
+                return Value::list_value(std::move(values));
+            }
+            case TypeDesc::Map: {
+                const auto count = in.u32();
+                std::vector<std::pair<Value, Value>> values;
+                values.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    Value key = read_binpack_value(in, *type.key);
+                    Value value = read_binpack_value(in, *type.value);
+                    values.emplace_back(std::move(key), std::move(value));
+                }
+                return Value::map_value(std::move(values));
+            }
+            case TypeDesc::Struct: skip_binpack_value(in, type);
                 return Value::missing();
             default: throw std::runtime_error("Unknown AkkaraDB schema kind while reading value");
         }
@@ -418,6 +450,24 @@ namespace {
             case 0x07: return Value::floating(bits_to_double(in.u64()));
             case 0x08: return Value::string(in.str_i32());
             case 0x09: return Value::null();
+            case 0x0A: {
+                const auto count = in.u32();
+                std::vector<Value> values;
+                values.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) { values.push_back(parse_literal(in)); }
+                return Value::list_value(std::move(values));
+            }
+            case 0x0B: {
+                const auto count = in.u32();
+                std::vector<std::pair<Value, Value>> values;
+                values.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    Value key = parse_literal(in);
+                    Value value = parse_literal(in);
+                    values.emplace_back(std::move(key), std::move(value));
+                }
+                return Value::map_value(std::move(values));
+            }
             default: throw std::runtime_error("Unknown AkkaraDB query literal tag");
         }
     }
@@ -480,8 +530,78 @@ namespace {
             case Value::Int: return lhs.i == rhs.i;
             case Value::Double: return lhs.d == rhs.d;
             case Value::String: return lhs.s == rhs.s;
+            case Value::List:
+                if (lhs.list.size() != rhs.list.size()) { return false; }
+                for (size_t i = 0; i < lhs.list.size(); ++i) {
+                    if (!values_equal(lhs.list[i], rhs.list[i])) { return false; }
+                }
+                return true;
+            case Value::Map:
+                if (lhs.map.size() != rhs.map.size()) { return false; }
+                for (const auto& [lhs_key, lhs_value] : lhs.map) {
+                    bool found = false;
+                    for (const auto& [rhs_key, rhs_value] : rhs.map) {
+                        if (values_equal(lhs_key, rhs_key) && values_equal(lhs_value, rhs_value)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) { return false; }
+                }
+                return true;
             default: return false;
         }
+    }
+
+    [[nodiscard]] bool value_in_list(const Value& needle, const Value& haystack) {
+        if (haystack.kind != Value::List) { return false; }
+        for (const Value& value : haystack.list) {
+            if (values_equal(needle, value)) { return true; }
+        }
+        return false;
+    }
+
+    [[nodiscard]] Value map_get_value(const Value& map, const Value& key) {
+        if (map.kind != Value::Map) { return Value::null(); }
+        for (const auto& [candidate_key, value] : map.map) {
+            if (values_equal(candidate_key, key)) { return value; }
+        }
+        return Value::null();
+    }
+
+    [[nodiscard]] bool string_starts_with(const Value& value, const Value& prefix) {
+        return value.kind == Value::String && prefix.kind == Value::String && value.s.starts_with(prefix.s);
+    }
+
+    [[nodiscard]] bool string_contains(const Value& value, const Value& needle) {
+        return value.kind == Value::String && needle.kind == Value::String && value.s.find(needle.s) != std::string::npos;
+    }
+
+    [[nodiscard]] bool like_match(std::string_view value, size_t vi, std::string_view pattern, size_t pi) {
+        while (pi < pattern.size()) {
+            if (pattern[pi] == '%') {
+                while (pi + 1 < pattern.size() && pattern[pi + 1] == '%') { ++pi; }
+                if (pi + 1 == pattern.size()) { return true; }
+                for (size_t next = vi; next <= value.size(); ++next) {
+                    if (like_match(value, next, pattern, pi + 1)) { return true; }
+                }
+                return false;
+            }
+            if (pattern[pi] == '_') {
+                if (vi >= value.size()) { return false; }
+                ++vi;
+                ++pi;
+                continue;
+            }
+            if (vi >= value.size() || value[vi] != pattern[pi]) { return false; }
+            ++vi;
+            ++pi;
+        }
+        return vi == value.size();
+    }
+
+    [[nodiscard]] bool string_like(const Value& value, const Value& pattern) {
+        return value.kind == Value::String && pattern.kind == Value::String && like_match(value.s, 0, pattern.s, 0);
     }
 
     [[nodiscard]] Value eval_expr(const QueryProgram& program, const Expr& expr, std::span<const uint8_t> row_value) {
@@ -519,11 +639,14 @@ namespace {
                     case 5: return Value::boolean(values_equal(lhs, rhs));
                     case 6: return Value::boolean(!values_equal(lhs, rhs));
                     case 9: return Value::boolean(!value_is_true(lhs));
+                    case 10: return Value::boolean(value_in_list(lhs, rhs));
+                    case 11: return Value::boolean(!value_in_list(lhs, rhs));
                     case 12: return Value::boolean(lhs.kind == Value::Null);
                     case 13: return Value::boolean(lhs.kind != Value::Null);
-                    case 10:
-                    case 11:
-                    case 14: throw std::runtime_error("AkkaraDB native query operator is not supported yet");
+                    case 14: return map_get_value(lhs, rhs);
+                    case 15: return Value::boolean(string_starts_with(lhs, rhs));
+                    case 16: return Value::boolean(string_contains(lhs, rhs));
+                    case 17: return Value::boolean(string_like(lhs, rhs));
                     default: throw std::runtime_error("Unsupported AkkaraDB binary query operator");
                 }
             }
