@@ -80,7 +80,8 @@ namespace akkaradb::engine::memtable {
                     std::unique_ptr<Impl> impl_;
             };
 
-            [[nodiscard]] static std::unique_ptr<MemTable> create(const Options& options = {});
+            [[nodiscard]] static std::unique_ptr<MemTable> create();
+            [[nodiscard]] static std::unique_ptr<MemTable> create(const Options& options);
 
             ~MemTable();
 

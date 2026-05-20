@@ -12,7 +12,7 @@ Storage は CrystalDiskMark や fio など、測定ツールと条件を一緒�
 ## Benchmark Environments
 
 <details>
-<summary>Machine A</summary>
+<summary>Machine A - MemTable</summary>
 
 ### Environment
 
@@ -40,8 +40,10 @@ Storage は CrystalDiskMark や fio など、測定ツールと条件を一緒�
 
 ```powershell
 cmake --build cmake-build-release --target akkaradb_memtable_throughput_benchmark --config Release
+cmake --build cmake-build-release --target akkaradb_sstable_throughput_benchmark --config Release
 cmake-build-release\bin\akkaradb_memtable_throughput_benchmark.exe 500000 --backend=bptree --writers=16
 cmake-build-release\bin\akkaradb_memtable_throughput_benchmark.exe 500000 --backend=art --writers=16
+cmake-build-release\bin\akkaradb_sstable_throughput_benchmark.exe 500000 --readers=16 --codec=zstd --block-size=32KiB --cache-bytes=64MiB
 ```
 
 ### MemTable B+Tree Results
@@ -138,12 +140,67 @@ Notes:
 - `put_smp` / `get_smp` / `scan_smp` are all `7813` samples in this run.
 - `flush_records` is `0` for every case because `threshold_bytes_per_shard` is disabled.
 
+### SSTable Results
+
+Common settings:
+
+```text
+ops_per_case = 500000
+codec = zstd
+block_size = 32768
+block_cache_bytes = 64.00 MiB
+max_case_payload_bytes = 512.00 MiB
+reader_threads = 16
+warmup_ops = 50000
+```
+
+| Key | Value | Ops | Readers | Write ops/s | Get ops/s | Scan ops/s | SST bytes |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 16 | 500,000 | 16 | 3,141,082 | 2,266,773 | 11,003,521 | 11,878,856 |
+| 16 | 64 | 500,000 | 16 | 2,477,237 | 2,003,691 | 6,062,906 | 15,246,632 |
+| 16 | 256 | 500,000 | 16 | 1,976,265 | 1,725,708 | 3,839,167 | 17,199,432 |
+| 32 | 1024 | 500,000 | 16 | 594,141 | 671,074 | 2,012,104 | 37,808,512 |
+| 32 | 4096 | 130,055 | 16 | 239,685 | 246,631 | 517,099 | 58,003,088 |
+| 64 | 16384 | 32,640 | 16 | 26,453 | 52,959 | 53,360 | 333,609,296 |
+
+| Key | Value | Get P50/P90/P99/P999 | Scan P50/P90/P99/P999 |
+|---:|---:|---:|---:|
+| 8 | 16 | 1.00 / 6.60 / 133.40 / 447.90 us | 0.08 / 0.09 / 0.18 / 0.31 us |
+| 16 | 64 | 1.30 / 7.80 / 130.10 / 485.50 us | 0.08 / 0.16 / 1.14 / 1.79 us |
+| 16 | 256 | 1.20 / 9.40 / 177.10 / 526.30 us | 0.10 / 0.59 / 0.99 / 2.01 us |
+| 32 | 1024 | 1.00 / 19.70 / 526.60 / 1153.40 us | 0.45 / 0.68 / 1.09 / 3.28 us |
+| 32 | 4096 | 1.40 / 246.50 / 767.50 / 1552.20 us | 1.79 / 2.56 / 3.83 / 6.39 us |
+| 64 | 16384 | 265.10 / 592.60 / 1251.20 / 1710.40 us | 17.80 / 21.83 / 32.46 / 35.15 us |
+
+| Key | Value | Write ms | Open ms | Get ms | Scan ms | Write file MiB/s | Get file MiB/s | Scan file MiB/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 16 | 159.18 | 6.77 | 220.58 | 45.44 | 71.17 | 51.36 | 249.31 |
+| 16 | 64 | 201.84 | 8.48 | 249.54 | 82.47 | 72.04 | 58.27 | 176.31 |
+| 16 | 256 | 253.00 | 9.10 | 289.74 | 130.24 | 64.83 | 56.61 | 125.95 |
+| 32 | 1024 | 841.55 | 12.51 | 745.07 | 248.50 | 42.85 | 48.39 | 145.10 |
+| 32 | 4096 | 542.61 | 10.26 | 527.33 | 251.51 | 101.94 | 104.90 | 219.94 |
+| 64 | 16384 | 1233.87 | 12.57 | 616.33 | 611.70 | 257.85 | 516.21 | 520.12 |
+
+| Key | Value | Write payload MiB/s | Get payload MiB/s | Scan payload MiB/s | Get samples | Scan samples |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 16 | 71.89 | 51.88 | 251.85 | 7,813 | 7,813 |
+| 16 | 64 | 189.00 | 152.87 | 462.56 | 7,813 | 7,813 |
+| 16 | 256 | 512.64 | 447.65 | 995.88 | 7,813 | 7,813 |
+| 32 | 1024 | 598.35 | 675.82 | 2026.35 | 7,813 | 7,813 |
+| 32 | 4096 | 943.58 | 970.93 | 2035.70 | 2,033 | 2,033 |
+| 64 | 16384 | 414.95 | 830.71 | 837.00 | 510 | 510 |
+
+Notes:
+
+- `Ops` is capped by `max_case_payload_bytes` for large value cases, so `32/4096` and `64/16384` run fewer than 500,000 operations.
+- `file MiB/s` is based on generated SST file bytes. `payload MiB/s` is based on key + value payload bytes.
+
 </details>
 
 ## Copy Template
 
 <details>
-<summary>Machine X - Owner / Benchmark name</summary>
+<summary>Machine X - Benchmark type</summary>
 
 ### Environment
 

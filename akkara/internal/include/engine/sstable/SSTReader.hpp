@@ -48,7 +48,8 @@ namespace akkaradb::engine::sst {
                 uint64_t block_cache_bytes = 64ULL * 1024ULL * 1024ULL;
             };
 
-            [[nodiscard]] static std::unique_ptr<SSTReader> open(const std::filesystem::path& path, const Options& options = {});
+            [[nodiscard]] static std::unique_ptr<SSTReader> open(const std::filesystem::path& path);
+            [[nodiscard]] static std::unique_ptr<SSTReader> open(const std::filesystem::path& path, const Options& options);
 
             ~SSTReader();
             SSTReader(const SSTReader&) = delete;

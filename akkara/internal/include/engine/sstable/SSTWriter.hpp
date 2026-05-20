@@ -52,7 +52,8 @@ namespace akkaradb::engine::sst {
                 std::vector<uint8_t> last_key;
             };
 
-            [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records, const Options& options = {});
+            [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records);
+            [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records, const Options& options);
 
         private:
             SSTWriter() = delete;

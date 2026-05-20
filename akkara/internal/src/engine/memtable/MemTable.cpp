@@ -548,6 +548,8 @@ namespace akkaradb::engine::memtable {
         return impl_->next();
     }
 
+    std::unique_ptr<MemTable> MemTable::create() { return create(Options{}); }
+
     std::unique_ptr<MemTable> MemTable::create(const Options& options) { return std::unique_ptr<MemTable>{new MemTable(options)}; }
 
     MemTable::MemTable(const Options& options) : impl_{std::make_unique<Impl>(options)} {}

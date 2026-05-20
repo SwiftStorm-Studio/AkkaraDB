@@ -415,6 +415,8 @@ namespace akkaradb::engine::sst {
             uint64_t cache_capacity_{0};
     };
 
+    std::unique_ptr<SSTReader> SSTReader::open(const std::filesystem::path& path) { return open(path, Options{}); }
+
     std::unique_ptr<SSTReader> SSTReader::open(const std::filesystem::path& path, const Options& options) {
         std::unique_ptr<SSTReader> reader(new SSTReader());
         reader->impl_ = std::make_unique<Impl>(path, options);

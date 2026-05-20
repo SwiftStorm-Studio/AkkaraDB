@@ -150,6 +150,10 @@ namespace akkaradb::engine::sst {
         }
     } // namespace
 
+    SSTWriter::Result SSTWriter::write(const std::filesystem::path& path, std::span<const core::RecordView> records) {
+        return write(path, records, Options{});
+    }
+
     SSTWriter::Result SSTWriter::write(const std::filesystem::path& path, std::span<const core::RecordView> records, const Options& options) {
         if (records.empty()) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         if (options.block_size < 4096 || (options.block_size & 7u) != 0) {
