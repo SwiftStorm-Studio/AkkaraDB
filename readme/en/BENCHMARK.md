@@ -4,6 +4,8 @@ This file is an index of the benchmark and smoke-test targets that currently exi
 
 `akkaradb_benchmark` is now the SPECv5 typed API comparison benchmark. It compares raw inline, raw heap, typed trivial aggregate, typed BinPack, and non-unique secondary-index paths.
 
+Multi-machine benchmark results are recorded in [`benchmarks/MULTI_MACHINE_BENCHMARK_RESULTS.md`](benchmarks/MULTI_MACHINE_BENCHMARK_RESULTS.md).
+
 ## Current Targets
 
 | Target                                   | Purpose                                                                                                                        |

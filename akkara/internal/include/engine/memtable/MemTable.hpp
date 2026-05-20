@@ -104,6 +104,7 @@ namespace akkaradb::engine::memtable {
             void advance_seq(uint64_t seq) noexcept;
 
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const;
+            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const;
 
             [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const;
 

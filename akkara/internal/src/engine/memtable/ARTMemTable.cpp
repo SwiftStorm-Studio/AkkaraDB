@@ -93,10 +93,23 @@ namespace akkaradb::engine {
 
     ARTMemTable::VersionChain* ARTMemTable::make_chain(const core::OwnedRecord* initial) {
         VersionChain* chain = arena_new<VersionChain>();
-        chain->ring[0].store(initial, std::memory_order_relaxed);
-        chain->head.store(0, std::memory_order_relaxed);
-        chain->count.store(1, std::memory_order_relaxed);
+        chain->ring[0] = initial;
+        chain->head = 0;
+        chain->count = 1;
         entries_.fetch_add(1, std::memory_order_relaxed);
+        return chain;
+    }
+
+    ARTMemTable::VersionChain* ARTMemTable::append_chain(const VersionChain* previous, const core::OwnedRecord* record) {
+        if (previous == nullptr) { return make_chain(record); }
+
+        VersionChain* chain = arena_new<VersionChain>();
+        chain->ring = previous->ring;
+        chain->head = static_cast<uint8_t>((previous->head + 1) & (MAX_VERSIONS_PER_KEY - 1));
+        chain->count = previous->count < MAX_VERSIONS_PER_KEY ? static_cast<uint8_t>(previous->count + 1) : previous->count;
+        chain->ring[chain->head] = record;
+
+        if (previous->count < MAX_VERSIONS_PER_KEY) { entries_.fetch_add(1, std::memory_order_relaxed); }
         return chain;
     }
 
@@ -117,58 +130,29 @@ namespace akkaradb::engine {
         return record;
     }
 
-    void ARTMemTable::append_version(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept {
-        if (chain == nullptr) { return; }
-
-        chain->version.fetch_add(1, std::memory_order_acq_rel);
-
-        const uint8_t prev_head = chain->head.load(std::memory_order_relaxed);
-        const uint8_t prev_count = chain->count.load(std::memory_order_relaxed);
-        const uint8_t next_head = static_cast<uint8_t>((prev_head + 1) & (MAX_VERSIONS_PER_KEY - 1));
-
-        chain->ring[next_head].store(record, std::memory_order_release);
-        if (prev_count < MAX_VERSIONS_PER_KEY) {
-            chain->count.store(static_cast<uint8_t>(prev_count + 1), std::memory_order_relaxed);
-            entries.fetch_add(1, std::memory_order_relaxed);
-        }
-        chain->head.store(next_head, std::memory_order_release);
-
-        chain->version.fetch_add(1, std::memory_order_release);
-    }
-
-    bool ARTMemTable::visible_record(VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept {
+    bool ARTMemTable::visible_record(const VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
 
-        for (;;) {
-            const uint64_t begin = chain->version.load(std::memory_order_acquire);
-            if ((begin & 1ULL) != 0ULL) { continue; }
+        const uint8_t head = chain->head;
+        const uint8_t count = chain->count;
+        if (count == 0) { return false; }
 
-            const uint8_t head = chain->head.load(std::memory_order_relaxed);
-            const uint8_t count = chain->count.load(std::memory_order_relaxed);
+        const core::OwnedRecord* newest = chain->ring[head];
+        if (newest != nullptr && newest->seq() <= snapshot_seq) {
+            *out = to_view(*newest);
+            return true;
+        }
 
-            const core::OwnedRecord* selected = nullptr;
-            if (count > 0) {
-                const core::OwnedRecord* newest = chain->ring[head].load(std::memory_order_relaxed);
-                if (newest != nullptr && newest->seq() <= snapshot_seq) { selected = newest; }
-                else {
-                    for (uint8_t i = 1; i < count; ++i) {
-                        const uint8_t idx = static_cast<uint8_t>((head - i) & (MAX_VERSIONS_PER_KEY - 1));
-                        const core::OwnedRecord* candidate = chain->ring[idx].load(std::memory_order_relaxed);
-                        if (candidate != nullptr && candidate->seq() <= snapshot_seq) {
-                            selected = candidate;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            const uint64_t end = chain->version.load(std::memory_order_acquire);
-            if (begin == end && (end & 1ULL) == 0ULL) {
-                if (selected == nullptr) { return false; }
-                *out = to_view(*selected);
+        for (uint8_t i = 1; i < count; ++i) {
+            const uint8_t idx = static_cast<uint8_t>((head - i) & (MAX_VERSIONS_PER_KEY - 1));
+            const core::OwnedRecord* candidate = chain->ring[idx];
+            if (candidate != nullptr && candidate->seq() <= snapshot_seq) {
+                *out = to_view(*candidate);
                 return true;
             }
         }
+
+        return false;
     }
 
     RecordView ARTMemTable::to_view(const core::OwnedRecord& record) noexcept {
@@ -195,17 +179,19 @@ namespace akkaradb::engine {
         switch (node->kind) {
             case NodeBase::Kind::Node4: {
                 const auto* n = static_cast<const Node4*>(node);
-                const void* found = std::memchr(n->keys.data(), key, n->child_count);
-                if (found == nullptr) { return nullptr; }
-                const auto idx = static_cast<size_t>(static_cast<const uint8_t*>(found) - n->keys.data());
-                return n->children[idx];
+                const uint16_t count = n->child_count;
+                for (uint16_t i = 0; i < count; ++i) {
+                    if (n->keys[i] == key) { return n->children[i]; }
+                }
+                return nullptr;
             }
             case NodeBase::Kind::Node16: {
                 const auto* n = static_cast<const Node16*>(node);
-                const void* found = std::memchr(n->keys.data(), key, n->child_count);
-                if (found == nullptr) { return nullptr; }
-                const auto idx = static_cast<size_t>(static_cast<const uint8_t*>(found) - n->keys.data());
-                return n->children[idx];
+                const uint16_t count = n->child_count;
+                for (uint16_t i = 0; i < count; ++i) {
+                    if (n->keys[i] == key) { return n->children[i]; }
+                }
+                return nullptr;
             }
             case NodeBase::Kind::Node48: {
                 const auto* n = static_cast<const Node48*>(node);
@@ -353,8 +339,11 @@ namespace akkaradb::engine {
         depth += node_prefix.size();
         if (depth == key.size()) {
             if (node->terminal != nullptr) {
-                append_version(node->terminal, record, entries_);
-                return {const_cast<NodeBase*>(node), false, false};
+                VersionChain* terminal = append_chain(node->terminal, record);
+                ChildVec children;
+                export_children(node, children);
+                NodeBase* updated = clone_with(node, node_prefix, terminal, children);
+                return {updated, true, false};
             }
             VersionChain* terminal = make_chain(record);
             ChildVec children;

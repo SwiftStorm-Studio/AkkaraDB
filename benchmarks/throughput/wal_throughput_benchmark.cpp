@@ -357,7 +357,7 @@ namespace {
             key_fp64.resize(static_cast<size_t>(ops_per_case));
             for (int i = 0; i < ops_per_case; ++i) {
                 const auto& key = keys[static_cast<size_t>(i)];
-                key_fp64[static_cast<size_t>(i)] = core::compute_key_fp64(
+                key_fp64[static_cast<size_t>(i)] = compute_key_fp64(
                     reinterpret_cast<const uint8_t*>(key.data()),
                     key.size()
                 );

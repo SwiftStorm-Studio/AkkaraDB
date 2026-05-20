@@ -1,13 +1,13 @@
-# 複数環境ベンチマーク結果
+# Multi-machine Benchmark Results
 
-このファイルは、複数の開発環境で測定した AkkaraDB native のベンチマーク結果をまとめるための記録です。
-CPU、RAM、SSD、OS、コンパイラ、電源設定の影響を受けるため、異なるマシン間の順位付けではなく、環境差を含めた参考値として扱います。
-回帰確認では、同一マシン・同一 commit・同一ビルド設定・同一コマンドでの before/after 比較を基本にします。
+This file records AkkaraDB native benchmark results measured across multiple development environments.
+CPU, RAM, SSD, OS, compiler, and power settings all affect the numbers, so results should be treated as reference values that include environment differences rather than as a direct ranking between machines.
+For regression checks, compare before/after results on the same machine, same commit, same build settings, and same command.
 
-## 追加ルール
+## Adding New Results
 
-新しい環境を追加するときは、下の `<details>` ブロックをコピーして、Environment、Commands、Results を同じ形式で追記します。
-Storage は CrystalDiskMark や fio など、測定ツールと条件を一緒に残します。公称値を使う場合は `Vendor spec` と明記します。
+When adding a new environment, copy the `<details>` block below and keep Environment, Commands, and Results in the same format.
+For storage, record the measurement tool and conditions together, such as CrystalDiskMark, KDiskMark, or fio. If using vendor specifications, mark them explicitly as `Vendor spec`.
 
 ## Benchmark Environments
 

@@ -19,6 +19,7 @@
 // internal/include/core/record/MemHdr16.hpp
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace akkaradb::core {

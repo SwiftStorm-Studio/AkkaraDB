@@ -120,6 +120,8 @@ namespace akkaradb::engine::memtable {
             struct Shard {
                 mutable std::shared_mutex mutex;
                 std::shared_ptr<IMemTable> active;
+                std::atomic<IMemTable*> active_raw{nullptr};
+                std::atomic<uint32_t> immutable_count{0};
 
                 struct Immutable {
                     uint64_t id;
@@ -230,6 +232,7 @@ namespace akkaradb::engine::memtable {
                     auto table = options_.backend_factory();
                     if (!table) { throw std::invalid_argument("MemTable backend_factory returned null"); }
                     shards_[i]->active = std::shared_ptr<IMemTable>{std::move(table)};
+                    shards_[i]->active_raw.store(shards_[i]->active.get(), std::memory_order_relaxed);
                     shards_[i]->active_bytes = shards_[i]->active->sizeBytes();
                     shards_[i]->approx_bytes.store(shards_[i]->active_bytes, std::memory_order_relaxed);
                     publish_tables_locked(*shards_[i]);
@@ -282,13 +285,19 @@ namespace akkaradb::engine::memtable {
                 shards_[shard_index]->removes_applied.fetch_add(1, std::memory_order_relaxed);
             }
 
-            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const {
+            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const {
                 if (out == nullptr) { return false; }
 
                 const core::ByteView key_view = to_byte_view(key);
-                const uint64_t fp64 = compute_fp64(key, 0);
+                const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
                 const uint32_t shard_index = shard_for(fp64, shard_count_);
                 const auto& shard = *shards_[shard_index];
+
+                if (raw_active_get_enabled_.load(std::memory_order_acquire) && shard.immutable_count.load(std::memory_order_acquire) == 0) {
+                    const IMemTable* active = shard.active_raw.load(std::memory_order_acquire);
+                    return active != nullptr && active->get(key_view, snapshot_seq, out);
+                }
+
                 const auto published = shard.published.load(std::memory_order_acquire);
                 if (!published) { return false; }
 
@@ -300,7 +309,7 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const {
                 RecordView view;
-                if (!get(key, snapshot_seq, &view)) { return std::nullopt; }
+                if (!get(key, snapshot_seq, &view, 0)) { return std::nullopt; }
                 if (view.is_tombstone()) { return false; }
                 const auto value = view.value();
                 out.assign(value.begin(), value.end());
@@ -309,7 +318,7 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const {
                 RecordView view;
-                if (!get(key, snapshot_seq, &view)) { return std::nullopt; }
+                if (!get(key, snapshot_seq, &view, 0)) { return std::nullopt; }
                 return !view.is_tombstone();
             }
 
@@ -429,12 +438,16 @@ namespace akkaradb::engine::memtable {
             }
 
             void set_flush_callback(const FlushCallback& cb) {
+                raw_active_get_enabled_.store(false, std::memory_order_release);
                 for (auto& worker : flushers_) { if (worker) { worker->drain(); } }
 
                 flushers_.clear();
                 flushers_.resize(shard_count_);
 
-                if (!cb) { return; }
+                if (!cb) {
+                    raw_active_get_enabled_.store(true, std::memory_order_release);
+                    return;
+                }
 
                 for (uint32_t i = 0; i < shard_count_; ++i) {
                     flushers_[i] = std::make_unique<Flusher>(cb, [this, i](uint64_t immutable_id) { on_flushed(i, immutable_id); });
@@ -472,6 +485,7 @@ namespace akkaradb::engine::memtable {
                 for (auto it = shard.immutables.rbegin(); it != shard.immutables.rend(); ++it) {
                     published->immutables.push_back(std::const_pointer_cast<const IMemTable>(it->table));
                 }
+                shard.immutable_count.store(static_cast<uint32_t>(published->immutables.size()), std::memory_order_release);
                 std::shared_ptr<const Shard::PublishedTables> published_const = std::move(published);
                 shard.published.store(std::move(published_const), std::memory_order_release);
             }
@@ -494,15 +508,18 @@ namespace akkaradb::engine::memtable {
 
                     auto new_active = options_.backend_factory();
                     if (!new_active) { throw std::invalid_argument("MemTable backend_factory returned null"); }
+                    immutable_id = shard.next_immutable_id++;
+                    shard.immutables.emplace_back(Shard::Immutable{immutable_id, sealed, sealed_bytes});
+                    shard.immutable_count.store(static_cast<uint32_t>(shard.immutables.size()), std::memory_order_release);
+
                     shard.active = std::shared_ptr<IMemTable>{std::move(new_active)};
+                    shard.active_raw.store(shard.active.get(), std::memory_order_release);
                     shard.active_bytes = shard.active->sizeBytes();
 
                     size_t total_bytes = shard.approx_bytes.load(std::memory_order_relaxed);
                     total_bytes = total_bytes - sealed_bytes + shard.active_bytes + sealed_bytes;
                     shard.approx_bytes.store(total_bytes, std::memory_order_relaxed);
 
-                    immutable_id = shard.next_immutable_id++;
-                    shard.immutables.emplace_back(Shard::Immutable{immutable_id, sealed, sealed_bytes});
                     publish_tables_locked(shard);
                 }
 
@@ -533,6 +550,7 @@ namespace akkaradb::engine::memtable {
 
             std::atomic<uint64_t> seq_gen_;
             std::atomic<uint64_t> flushes_completed_{0};
+            std::atomic<bool> raw_active_get_enabled_{true};
     };
 
     MemTable::RangeIterator::RangeIterator(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
@@ -571,7 +589,11 @@ namespace akkaradb::engine::memtable {
 
     void MemTable::advance_seq(uint64_t seq) noexcept { impl_->advance_seq(seq); }
 
-    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const { return impl_->get(key, snapshot_seq, out); }
+    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const { return impl_->get(key, snapshot_seq, out, 0); }
+
+    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const {
+        return impl_->get(key, snapshot_seq, out, precomputed_fp64);
+    }
 
     std::optional<bool> MemTable::get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const {
         return impl_->get_into(key, snapshot_seq, out);

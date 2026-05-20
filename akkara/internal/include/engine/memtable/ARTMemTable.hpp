@@ -61,10 +61,9 @@ namespace akkaradb::engine {
 
         private:
             struct VersionChain {
-                std::atomic<uint64_t> version{0};
-                std::atomic<uint8_t> head{0};
-                std::atomic<uint8_t> count{0};
-                std::array<std::atomic<const core::OwnedRecord*>, MAX_VERSIONS_PER_KEY> ring{};
+                uint8_t head{0};
+                uint8_t count{0};
+                std::array<const core::OwnedRecord*, MAX_VERSIONS_PER_KEY> ring{};
 
                 VersionChain() noexcept = default;
             };
@@ -97,6 +96,8 @@ namespace akkaradb::engine {
 
                 Node16(const uint8_t* pfx, uint16_t pfx_len, VersionChain* term) noexcept : NodeBase{Kind::Node16, 0, pfx, pfx_len, term} {}
             };
+
+            static_assert((MAX_VERSIONS_PER_KEY & (MAX_VERSIONS_PER_KEY - 1)) == 0, "version ring size must be a power of two");
 
             struct Node48 final : NodeBase {
                 std::array<uint8_t, 256> child_index{};
@@ -144,6 +145,7 @@ namespace akkaradb::engine {
 
             [[nodiscard]] const uint8_t* copy_prefix(std::span<const uint8_t> prefix);
             [[nodiscard]] VersionChain* make_chain(const core::OwnedRecord* initial);
+            [[nodiscard]] VersionChain* append_chain(const VersionChain* previous, const core::OwnedRecord* record);
             [[nodiscard]] core::OwnedRecord* make_record(
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
@@ -153,8 +155,7 @@ namespace akkaradb::engine {
                 uint64_t precomputed_mk
             );
 
-            static void append_version(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
-            [[nodiscard]] static bool visible_record(VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept;
+            [[nodiscard]] static bool visible_record(const VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept;
             [[nodiscard]] static RecordView to_view(const core::OwnedRecord& record) noexcept;
 
             static void export_children(const NodeBase* node, ChildVec& out);

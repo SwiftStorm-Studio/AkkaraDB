@@ -92,7 +92,7 @@ namespace {
         uint64_t threshold_bytes_per_shard = kAutoFlushDisabledThreshold;
         bool flush_after_scan = false;
         bool use_prehash = false;
-        BackendKind backend = BackendKind::BPTree;
+        BackendKind backend = BackendKind::ART;
     };
 
     [[nodiscard]] static uint32_t next_pow2_clamped(uint64_t n, uint32_t min_value, uint32_t max_value) {
@@ -379,6 +379,7 @@ namespace {
     static void run_get_parallel(
         memtable::MemTable& memtable,
         const std::vector<std::string>& keys,
+        const std::vector<uint64_t>* key_fp64,
         uint64_t snapshot,
         int reader_threads,
         std::vector<uint32_t>* latency_samples_ns
@@ -395,7 +396,7 @@ namespace {
             for (size_t i = 0; i < keys.size(); ++i) {
                 const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
                 const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                if (!memtable.get(as_u8(keys[i]), snapshot, &out)) {
+                if (!memtable.get(as_u8(keys[i]), snapshot, &out, key_fp64 ? (*key_fp64)[i] : 0ULL)) {
                     std::fprintf(stderr, "GET miss at i=%zu\n", i);
                     std::exit(3);
                 }
@@ -421,7 +422,7 @@ namespace {
                 for (size_t i = static_cast<size_t>(tid); i < keys.size(); i += static_cast<size_t>(reader_threads)) {
                     const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
                     const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                    if (!memtable.get(as_u8(keys[i]), snapshot, &out)) {
+                    if (!memtable.get(as_u8(keys[i]), snapshot, &out, key_fp64 ? (*key_fp64)[i] : 0ULL)) {
                         std::fprintf(stderr, "GET miss at i=%zu (tid=%d)\n", i, tid);
                         std::exit(3);
                     }
@@ -571,7 +572,7 @@ namespace {
 
         const uint64_t snapshot = memtable->last_seq();
         const auto get_t0 = Clock::now();
-        run_get_parallel(*memtable, keys, snapshot, writer_threads, &get_latency_ns);
+        run_get_parallel(*memtable, keys, fp_ptr, snapshot, writer_threads, &get_latency_ns);
         const auto get_ms = std::chrono::duration<double, std::milli>(Clock::now() - get_t0).count();
         const auto scan_t0 = Clock::now();
         const double scan_ops_per_sec = run_scan_single(*memtable, snapshot, keys.size(), &scan_latency_ns);
