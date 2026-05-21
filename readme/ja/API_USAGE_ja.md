@@ -115,6 +115,26 @@ for (auto it = rows.begin(); !(it == rows.end()); ++it) {
 }
 ```
 
+scan から返る `key` と `value` は non-owning view です。arena の `reset()`、`clear()`、destruction の後には参照できません。scan 結果を arena の lifetime より長く保持したい場合は、返却直後に own 化します。
+
+AkkaraDB の native buffer として保持する場合は、`BufferView::to_owned()` で `OwnedBuffer` に deep copy する方法を強く推奨します。`OwnedBuffer` は move-only の所有型で、view の lifetime を arena から切り離せるため、API 境界を越えて値を保持する用途に向いています。
+
+```cpp
+#include "core/buffer/BufferView.hpp"
+#include "core/buffer/OwnedBuffer.hpp"
+
+auto value_bytes = std::as_bytes(row.value);
+akkaradb::core::BufferView value_view{value_bytes};
+akkaradb::core::OwnedBuffer owned_value = value_view.to_owned();
+```
+
+アプリケーション側で `std::vector<uint8_t>` を標準の所有型として使っている場合は、vector への copy でも問題ありません。
+
+```cpp
+std::vector<uint8_t> owned_key{row.key.begin(), row.key.end()};
+std::vector<uint8_t> owned_value{row.value.begin(), row.value.end()};
+```
+
 `start_key` と `end_key` は半開区間として扱う設計です。prefix scan をしたい場合は、次の prefix に相当する end key を呼び出し側で渡します。上の例では `"user:"` から `"user;"` までを scan しています。
 
 ### version history

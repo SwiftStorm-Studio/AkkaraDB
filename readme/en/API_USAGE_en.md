@@ -115,6 +115,26 @@ for (auto it = rows.begin(); !(it == rows.end()); ++it) {
 }
 ```
 
+The returned `key` and `value` are non-owning views. They must not be used after the arena is reset, cleared, or destroyed. If scan results need to outlive the arena, make an owning copy immediately.
+
+When retaining data as a native AkkaraDB buffer, prefer `BufferView::to_owned()` strongly. It deep-copies the bytes into an `OwnedBuffer`, a move-only owning type, and cleanly detaches the value lifetime from the arena before it crosses an API boundary.
+
+```cpp
+#include "core/buffer/BufferView.hpp"
+#include "core/buffer/OwnedBuffer.hpp"
+
+auto value_bytes = std::as_bytes(row.value);
+akkaradb::core::BufferView value_view{value_bytes};
+akkaradb::core::OwnedBuffer owned_value = value_view.to_owned();
+```
+
+Copying into `std::vector<uint8_t>` is also fine when the application already uses vector as its owning byte container.
+
+```cpp
+std::vector<uint8_t> owned_key{row.key.begin(), row.key.end()};
+std::vector<uint8_t> owned_value{row.value.begin(), row.value.end()};
+```
+
 The `start_key` and `end_key` arguments are intended to describe a half-open range. For prefix scans, pass the next prefix as the end key. The example above scans from `"user:"` to `"user;"`.
 
 ### Version History
