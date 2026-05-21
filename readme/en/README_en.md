@@ -446,6 +446,11 @@ recovery behavior.
 The native architecture overview is [ARCHITECTURE_en.md](ARCHITECTURE_en.md). It explains how the public APIs, `AkkEngine`, MemTable, WAL, Blob Manager, SST
 Manager, Manifest, VersionLog, API servers, cluster runtime, and JNI scan path fit together.
 
+## Native API Usage
+
+The native low-level and high-level API guide is [API_USAGE_en.md](API_USAGE_en.md). It covers direct `AkkEngine` usage and the typed `AkkaraDB` / `PackedTable`
+API.
+
 ---
 
 ## License
