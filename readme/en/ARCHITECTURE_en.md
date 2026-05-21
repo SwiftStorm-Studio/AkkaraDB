@@ -144,7 +144,7 @@ Main responsibilities:
 
 ### Record and Key Model
 
-The raw engine orders keys by bytewise lexicographic comparison. Higher layers must encode keys in a way that preserves the ordering they need. `PackedTable` uses big-endian encodings for integral primary keys so unsigned numeric order and byte order line up for common primary-key layouts.
+The raw engine orders keys by bytewise lexicographic comparison. Higher layers must encode keys in a way that preserves the ordering they need. `PackedTable` uses little-endian encodings for integral primary keys to stay consistent with the native binary formats; numeric range semantics are enforced by typed scan/query logic rather than by assuming byte order matches numeric order.
 
 In memory, records are represented by `OwnedRecord`. It is designed as a compact 64-byte metadata object:
 
@@ -419,7 +419,7 @@ PackedTable<User, id>.put(user)
   +-- engine.put(primary_key, encoded_user)
   |
   +-- for each secondary index:
-        [index_prefix:8][field_len:u32be][encoded_field][encoded_pk] -> empty value
+        [index_prefix:8][field_len:u32le][encoded_field][encoded_pk] -> empty value
 ```
 
 Secondary index entries are non-unique. The encoded primary key suffix keeps duplicate field values distinct and lets index scans recover the primary row.
@@ -436,7 +436,7 @@ JVM scanQuery(start, end, queryBytes, schemaBytes)
   +-- matching rows are returned to JVM RowView(ByteBufferL key, ByteBufferL value)
 ```
 
-Query and schema payload integers are big-endian because the JVM serializers use `DataOutputStream`. Unsupported operators must be treated as query-evaluation errors rather than silently matching rows.
+Query and schema payload integers are little-endian. Unsupported operators must be treated as query-evaluation errors rather than silently matching rows.
 
 ---
 
@@ -546,4 +546,3 @@ High-level `AkkaraDB::open` maps `StartupMode` presets into `AkkEngineOptions`.
 ## Relationship to SPEC.md
 
 This architecture document intentionally avoids replacing `SPEC.md`. Use this document to understand component responsibilities and data flow. Use `SPEC.md` as the source of truth for exact binary layouts, magic numbers, CRC ranges, protocol frames, configuration fields, and compatibility rules.
-

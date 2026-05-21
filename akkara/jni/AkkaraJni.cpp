@@ -124,23 +124,23 @@ namespace {
 
             [[nodiscard]] uint16_t u16() {
                 ensure(2);
-                const uint16_t out = static_cast<uint16_t>((static_cast<uint16_t>(bytes_[pos_]) << 8) | static_cast<uint16_t>(bytes_[pos_ + 1]));
+                const uint16_t out = static_cast<uint16_t>(bytes_[pos_]) | static_cast<uint16_t>(static_cast<uint16_t>(bytes_[pos_ + 1]) << 8);
                 pos_ += 2;
                 return out;
             }
 
             [[nodiscard]] uint32_t u32() {
                 ensure(4);
-                const uint32_t out = (static_cast<uint32_t>(bytes_[pos_]) << 24) | (static_cast<uint32_t>(bytes_[pos_ + 1]) << 16) | (static_cast<uint32_t>(
-                    bytes_[pos_ + 2]) << 8) | static_cast<uint32_t>(bytes_[pos_ + 3]);
+                const uint32_t out = static_cast<uint32_t>(bytes_[pos_]) | (static_cast<uint32_t>(bytes_[pos_ + 1]) << 8) | (static_cast<uint32_t>(
+                    bytes_[pos_ + 2]) << 16) | (static_cast<uint32_t>(bytes_[pos_ + 3]) << 24);
                 pos_ += 4;
                 return out;
             }
 
             [[nodiscard]] uint64_t u64() {
-                const uint64_t hi = u32();
                 const uint64_t lo = u32();
-                return (hi << 32) | lo;
+                const uint64_t hi = u32();
+                return lo | (hi << 32);
             }
 
             [[nodiscard]] std::string str_u16() {

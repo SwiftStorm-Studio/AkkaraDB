@@ -144,7 +144,7 @@ JVM 層は `AKKARADB_BUILD_JNI=ON` のとき、JNI bridge 経由で同じ native
 
 ### レコードとキーのモデル
 
-raw engine は key を bytewise lexicographic comparison で順序付けします。上位層は必要な順序が保たれるように key を encode する必要があります。`PackedTable` はよく使う primary-key layout で unsigned numeric order と byte order が合うように、integral primary key に big-endian encoding を使います。
+raw engine は key を bytewise lexicographic comparison で順序付けします。上位層は必要な順序が保たれるように key を encode する必要があります。`PackedTable` はよく使う primary-key layout で unsigned numeric order と byte order が合うように、integral primary key に little-endian encoding を使います。
 
 メモリ上の record は `OwnedRecord` で表されます。これは 64-byte の compact な metadata object として設計されています。
 
@@ -419,7 +419,7 @@ PackedTable<User, id>.put(user)
   +-- engine.put(primary_key, encoded_user)
   |
   +-- for each secondary index:
-        [index_prefix:8][field_len:u32be][encoded_field][encoded_pk] -> empty value
+        [index_prefix:8][field_len:u32le][encoded_field][encoded_pk] -> empty value
 ```
 
 secondary index entry は non-unique です。encoded primary key suffix によって同じ field value を持つ entry を区別でき、index scan から primary row を復元できます。
@@ -436,7 +436,7 @@ JVM scanQuery(start, end, queryBytes, schemaBytes)
   +-- matching rows are returned to JVM RowView(ByteBufferL key, ByteBufferL value)
 ```
 
-query / schema payload の integer field は big-endian です。これは JVM serializer が `DataOutputStream` を使うためです。未対応 operator は silently matching rows ではなく query-evaluation error として扱うべきです。
+query / schema payload の integer field は little-endian です。これは JVM serializer が `little-endian writer` を使うためです。未対応 operator は silently matching rows ではなく query-evaluation error として扱うべきです。
 
 ---
 

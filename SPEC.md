@@ -227,27 +227,26 @@ Offset  Size  Field             Description
 [table_prefix:8][encoded_pk] -> BinPack::encode(entity)
 ```
 
-`table_prefix` is `FNV-1a-64(table_name)` written big-endian.
+`table_prefix` is `FNV-1a-64(table_name)` written little-endian.
 
-For integral primary keys of size <= 8, `encoded_pk` is a fixed-width big-endian integer using exactly `sizeof(PK)` bytes. For non-integral primary keys,
+For integral primary keys of size <= 8, `encoded_pk` is a fixed-width little-endian integer using exactly `sizeof(PK)` bytes. For non-integral primary keys,
 `encoded_pk` is `BinPack::encode(pk)`.
 
 #### Secondary Index Entry
 
 ```
-[index_prefix:8][field_len:u32be][encoded_field][encoded_pk] -> empty value
+[index_prefix:8][field_len:u32le][encoded_field][encoded_pk] -> empty value
 ```
 
-`index_prefix` is `FNV-1a-64(table_name + ":idx:" + field_name)` written big-endian.
+`index_prefix` is `FNV-1a-64(table_name + ":idx:" + field_name)` written little-endian.
 
 Index entries are non-unique. The encoded primary key suffix makes duplicate field values distinct and allows exact-match index scans to recover the entity by
 primary key.
 
 ### 3.6 Key Ordering
 
-Raw engine keys are ordered lexicographically by bytes. PackedTable therefore uses big-endian fixed-width encodings for integral primary keys and big-endian
-BinPack integer encodings. Signed integer ordering is bytewise and should not be assumed to match numeric ordering across negative values unless the type
-mapping is designed for that.
+Raw engine keys are ordered lexicographically by bytes. PackedTable stores numeric fields little-endian to match the rest of the native binary formats. Numeric
+ordering should therefore be enforced by typed scan/query logic rather than by assuming bytewise key order matches numeric order.
 
 ---
 
@@ -880,7 +879,7 @@ Built-in adapters include:
 - `std::pair<A, B>` and `std::tuple<Ts...>`
 - aggregate structs through Boost.PFR
 
-Integers are encoded big-endian by BinPack.
+Integers are encoded little-endian by BinPack.
 
 ### 15.5 JNI Bridge
 
@@ -911,7 +910,7 @@ The JNI engine entry points are:
 against each row value before yielding it. The row value is decoded with the supplied schema. The query payload is produced by the JVM `AstSerializer`; the schema
 payload is produced by `SchemaSerializer`.
 
-All query and schema payload integer fields are big-endian because the JVM serializers use `DataOutputStream`. Payload strings are UTF-8.
+All query and schema payload integer fields are little-endian. Payload strings are UTF-8.
 
 #### 15.5.2 Query Payload
 
@@ -919,7 +918,7 @@ The query payload contains captures followed by one recursive expression tree:
 
 ```text
 QueryPayload:
-  capture_count:u32be
+  capture_count:u32le
   captures[capture_count]:Literal
   where:Expr
 ```
@@ -936,12 +935,12 @@ Literal:
 |-------------|----------|---------------------------------|
 | `0x01`      | Bool     | `value:u8`, `0` false, else true |
 | `0x02`      | Int8     | `value:u8` interpreted signed    |
-| `0x03`      | Int16    | `value:i16be`                    |
-| `0x04`      | Int32    | `value:i32be`                    |
-| `0x05`      | Int64    | `value:i64be`                    |
-| `0x06`      | Float    | IEEE-754 bits as `u32be`         |
-| `0x07`      | Double   | IEEE-754 bits as `u64be`         |
-| `0x08`      | String   | `len:i32be`, then UTF-8 bytes    |
+| `0x03`      | Int16    | `value:i16le`                    |
+| `0x04`      | Int32    | `value:i32le`                    |
+| `0x05`      | Int64    | `value:i64le`                    |
+| `0x06`      | Float    | IEEE-754 bits as `u32le`         |
+| `0x07`      | Double   | IEEE-754 bits as `u64le`         |
+| `0x08`      | String   | `len:i32le`, then UTF-8 bytes    |
 | `0x09`      | Null     | none                             |
 
 Expression format:
@@ -951,8 +950,8 @@ Expr:
   Bin = tag 0x01, op:u8, lhs:Expr, rhs:Expr
   Un  = tag 0x02, op:u8, x:Expr
   Lit = tag 0x03, literal:Literal
-  Col = tag 0x04, name_len:u16be, name_utf8
-  Cap = tag 0x05, capture_index:u32be
+  Col = tag 0x04, name_len:u16le, name_utf8
+  Cap = tag 0x05, capture_index:u32le
 ```
 
 `op` is `AkkOp.ordinal + 1`. The current JVM operator order is:
@@ -985,7 +984,7 @@ The schema payload describes the BinPack layout of the row value. The root is al
 StructSchema:
   field_count:u8
   fields[field_count]:
-    name_len:u16be
+    name_len:u16le
     name_utf8
     type:TypeDescriptor
 ```
@@ -1035,8 +1034,7 @@ Primitive values and strings can be read for predicates. Struct, list, and map v
 
 ### 16.2 Endianness
 
-Internal disk structures in WAL, SST, Blob, and Manifest use little-endian field serialization. BinPack uses big-endian integer serialization because its output
-is also used in ordered keys.
+Internal disk structures in WAL, SST, Blob, Manifest, BinPack, PackedTable keys, and JNI query/schema payloads use little-endian field serialization.
 
 ### 16.3 Checksum Policy
 

@@ -50,7 +50,7 @@ namespace akkaradb {
         struct ProxyTag {};
 
         enum class Op {
-            Eq, Ne, Gt, Ge, Lt, Le, And, Or, In, NotIn, StartsWith, Contains, Like
+            Eq, Ne, Gt, Ge, Lt, Le, And, Or, In, NotIn, StartsWith, Contains, Like, IsNull, IsNotNull
         };
 
         struct AlwaysTrue {};
@@ -58,9 +58,24 @@ namespace akkaradb {
         template <Op Operator, typename L, typename R>
         struct Compare;
 
+        template <typename Parent, auto FieldPtr>
+        struct FieldPath;
+
+        template <typename Map, typename Key>
+        struct MapGet;
+
         template <auto FieldPtr>
         struct Column {
             static constexpr auto field_ptr = FieldPtr;
+
+            template <auto NestedFieldPtr>
+            [[nodiscard]] auto field() const;
+
+            template <typename R>
+            [[nodiscard]] auto map_get(R&& key) const;
+
+            template <typename R>
+            [[nodiscard]] auto get(R&& key) const;
 
             template <typename R>
             [[nodiscard]] auto in(R&& rhs) const;
@@ -82,6 +97,10 @@ namespace akkaradb {
 
             template <typename R>
             [[nodiscard]] auto like(R&& rhs) const;
+
+            [[nodiscard]] auto is_null() const;
+
+            [[nodiscard]] auto is_not_null() const;
         };
 
         template <typename T>
@@ -108,6 +127,47 @@ namespace akkaradb {
             X x;
         };
 
+        template <Op Operator, typename X>
+        struct Unary {
+            static constexpr Op op = Operator;
+            X x;
+        };
+
+        template <typename Parent, auto FieldPtr>
+        struct FieldPath {
+            static constexpr auto field_ptr = FieldPtr;
+            Parent parent;
+
+            template <auto NestedFieldPtr>
+            [[nodiscard]] auto field() const;
+
+            template <typename R>
+            [[nodiscard]] auto map_get(R&& key) const;
+
+            template <typename R>
+            [[nodiscard]] auto get(R&& key) const;
+
+            [[nodiscard]] auto is_null() const;
+
+            [[nodiscard]] auto is_not_null() const;
+        };
+
+        template <typename Map, typename Key>
+        struct MapGet {
+            Map map;
+            Key key;
+
+            template <typename R>
+            [[nodiscard]] auto map_get(R&& nested_key) const;
+
+            template <typename R>
+            [[nodiscard]] auto get(R&& nested_key) const;
+
+            [[nodiscard]] auto is_null() const;
+
+            [[nodiscard]] auto is_not_null() const;
+        };
+
         template <typename T>
         struct is_expr : std::false_type {};
 
@@ -116,6 +176,12 @@ namespace akkaradb {
 
         template <auto FieldPtr>
         struct is_expr<Column<FieldPtr>> : std::true_type {};
+
+        template <typename Parent, auto FieldPtr>
+        struct is_expr<FieldPath<Parent, FieldPtr>> : std::true_type {};
+
+        template <typename Map, typename Key>
+        struct is_expr<MapGet<Map, Key>> : std::true_type {};
 
         template <typename T>
         struct is_expr<Literal<T>> : std::true_type {};
@@ -128,6 +194,9 @@ namespace akkaradb {
 
         template <typename X>
         struct is_expr<Not<X>> : std::true_type {};
+
+        template <Op Operator, typename X>
+        struct is_expr<Unary<Operator, X>> : std::true_type {};
 
         template <typename T>
         inline constexpr bool is_expr_v = is_expr<std::remove_cvref_t<T>>::value;
@@ -261,6 +330,97 @@ namespace akkaradb {
             };
         }
 
+        template <typename X> requires(is_expr_v<X>)
+        [[nodiscard]] auto is_null(X&& x) {
+            return Unary<Op::IsNull, std::remove_cvref_t<X>>{std::forward<X>(x)};
+        }
+
+        template <typename X> requires(is_expr_v<X>)
+        [[nodiscard]] auto is_not_null(X&& x) {
+            return Unary<Op::IsNotNull, std::remove_cvref_t<X>>{std::forward<X>(x)};
+        }
+
+        template <auto FieldPtr, typename X> requires(is_expr_v<X>)
+        [[nodiscard]] auto field(X&& x) {
+            return FieldPath<std::remove_cvref_t<X>, FieldPtr>{std::forward<X>(x)};
+        }
+
+        template <typename M, typename K> requires(is_expr_v<M>)
+        [[nodiscard]] auto map_get(M&& map, K&& key) {
+            return MapGet<std::remove_cvref_t<M>, decltype(as_expr(std::forward<K>(key)))>{
+                std::forward<M>(map),
+                as_expr(std::forward<K>(key))
+            };
+        }
+
+        template <auto FieldPtr>
+        template <auto NestedFieldPtr>
+        [[nodiscard]] auto Column<FieldPtr>::field() const {
+            return query::field<NestedFieldPtr>(*this);
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::map_get(R&& key) const {
+            return query::map_get(*this, std::forward<R>(key));
+        }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::get(R&& key) const {
+            return query::map_get(*this, std::forward<R>(key));
+        }
+
+        template <typename Parent, auto FieldPtr>
+        template <auto NestedFieldPtr>
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::field() const {
+            return query::field<NestedFieldPtr>(*this);
+        }
+
+        template <typename Parent, auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::map_get(R&& key) const {
+            return query::map_get(*this, std::forward<R>(key));
+        }
+
+        template <typename Parent, auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::get(R&& key) const {
+            return query::map_get(*this, std::forward<R>(key));
+        }
+
+        template <typename Parent, auto FieldPtr>
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::is_null() const {
+            return query::is_null(*this);
+        }
+
+        template <typename Parent, auto FieldPtr>
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::is_not_null() const {
+            return query::is_not_null(*this);
+        }
+
+        template <typename Map, typename Key>
+        template <typename R>
+        [[nodiscard]] auto MapGet<Map, Key>::map_get(R&& nested_key) const {
+            return query::map_get(*this, std::forward<R>(nested_key));
+        }
+
+        template <typename Map, typename Key>
+        template <typename R>
+        [[nodiscard]] auto MapGet<Map, Key>::get(R&& nested_key) const {
+            return query::map_get(*this, std::forward<R>(nested_key));
+        }
+
+        template <typename Map, typename Key>
+        [[nodiscard]] auto MapGet<Map, Key>::is_null() const {
+            return query::is_null(*this);
+        }
+
+        template <typename Map, typename Key>
+        [[nodiscard]] auto MapGet<Map, Key>::is_not_null() const {
+            return query::is_not_null(*this);
+        }
+
         template <auto FieldPtr>
         template <typename R>
         [[nodiscard]] auto Column<FieldPtr>::in(R&& rhs) const {
@@ -303,6 +463,16 @@ namespace akkaradb {
             return query::like(*this, std::forward<R>(rhs));
         }
 
+        template <auto FieldPtr>
+        [[nodiscard]] auto Column<FieldPtr>::is_null() const {
+            return query::is_null(*this);
+        }
+
+        template <auto FieldPtr>
+        [[nodiscard]] auto Column<FieldPtr>::is_not_null() const {
+            return query::is_not_null(*this);
+        }
+
         template <typename Entity>
         [[nodiscard]] auto make_proxy() { return akkaradb_query_proxy(ProxyTag<Entity>{}); }
 
@@ -337,6 +507,38 @@ namespace akkaradb {
         inline constexpr bool is_compare_v = is_compare<std::remove_cvref_t<T>>::value;
 
         template <typename T>
+        struct is_not : std::false_type {};
+
+        template <typename X>
+        struct is_not<Not<X>> : std::true_type {};
+
+        template <typename T>
+        inline constexpr bool is_not_v = is_not<std::remove_cvref_t<T>>::value;
+
+        template <typename T>
+        struct is_unary : std::false_type {};
+
+        template <Op Operator, typename X>
+        struct is_unary<Unary<Operator, X>> : std::true_type {};
+
+        template <typename T>
+        inline constexpr bool is_unary_v = is_unary<std::remove_cvref_t<T>>::value;
+
+        template <typename T>
+        struct is_optional : std::false_type {};
+
+        template <typename T>
+        struct is_optional<std::optional<T>> : std::true_type {};
+
+        template <typename T>
+        inline constexpr bool is_optional_v = is_optional<std::remove_cvref_t<T>>::value;
+
+        template <typename T>
+        inline constexpr bool is_string_like_v = requires(const std::remove_cvref_t<T>& value) {
+            std::string_view{value};
+        };
+
+        template <typename T>
         struct is_and : std::false_type {};
 
         template <typename L, typename R>
@@ -367,7 +569,22 @@ namespace akkaradb {
         [[nodiscard]] bool eval(const AlwaysTrue&, const Entity&) { return true; }
 
         template <auto FieldPtr, typename Entity>
-        [[nodiscard]] auto eval(const Column<FieldPtr>&, const Entity& entity) { return entity.*FieldPtr; }
+        [[nodiscard]] decltype(auto) eval(const Column<FieldPtr>&, const Entity& entity) { return (entity.*FieldPtr); }
+
+        template <typename Parent, auto FieldPtr, typename Entity>
+        [[nodiscard]] decltype(auto) eval(const FieldPath<Parent, FieldPtr>& expr, const Entity& entity) {
+            return (eval(expr.parent, entity).*FieldPtr);
+        }
+
+        template <typename Map, typename Key, typename Entity>
+        [[nodiscard]] auto eval(const MapGet<Map, Key>& expr, const Entity& entity) {
+            const auto& map = eval(expr.map, entity);
+            const auto& key = eval(expr.key, entity);
+            using Value = typename std::remove_cvref_t<decltype(map)>::mapped_type;
+            const auto it = map.find(key);
+            if (it == map.end()) { return std::optional<Value>{}; }
+            return std::optional<Value>{it->second};
+        }
 
         template <typename T, typename Entity>
         [[nodiscard]] const T& eval(const Literal<T>& literal, const Entity&) { return literal.value; }
@@ -422,16 +639,37 @@ namespace akkaradb {
             return like_match(std::string_view{value}, 0, std::string_view{pattern}, 0);
         }
 
+        template <typename Value>
+        [[nodiscard]] bool value_is_null(const Value& value) {
+            if constexpr (is_optional_v<Value>) { return !value.has_value(); }
+            else {
+                (void)value;
+                return false;
+            }
+        }
+
+        template <typename L, typename R>
+        [[nodiscard]] bool value_eq(const L& lhs, const R& rhs) {
+            if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_equal(lhs, rhs); }
+            else { return lhs == rhs; }
+        }
+
+        template <typename L, typename R>
+        [[nodiscard]] bool value_lt(const L& lhs, const R& rhs) {
+            if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_less(lhs, rhs); }
+            else { return lhs < rhs; }
+        }
+
         template <Op Operator, typename L, typename R, typename Entity>
         [[nodiscard]] bool eval(const Compare<Operator, L, R>& expr, const Entity& entity) {
             const auto lhs = eval(expr.lhs, entity);
             const auto rhs = eval(expr.rhs, entity);
-            if constexpr (Operator == Op::Eq) { return lhs == rhs; }
-            else if constexpr (Operator == Op::Ne) { return lhs != rhs; }
-            else if constexpr (Operator == Op::Gt) { return lhs > rhs; }
-            else if constexpr (Operator == Op::Ge) { return lhs >= rhs; }
-            else if constexpr (Operator == Op::Lt) { return lhs < rhs; }
-            else if constexpr (Operator == Op::Le) { return lhs <= rhs; }
+            if constexpr (Operator == Op::Eq) { return value_eq(lhs, rhs); }
+            else if constexpr (Operator == Op::Ne) { return !value_eq(lhs, rhs); }
+            else if constexpr (Operator == Op::Gt) { return value_lt(rhs, lhs); }
+            else if constexpr (Operator == Op::Ge) { return !value_lt(lhs, rhs); }
+            else if constexpr (Operator == Op::Lt) { return value_lt(lhs, rhs); }
+            else if constexpr (Operator == Op::Le) { return !value_lt(rhs, lhs); }
             else if constexpr (Operator == Op::In) { return contains_value(rhs, lhs); }
             else if constexpr (Operator == Op::NotIn) { return !contains_value(rhs, lhs); }
             else if constexpr (Operator == Op::StartsWith) { return string_starts_with(lhs, rhs); }
@@ -447,6 +685,13 @@ namespace akkaradb {
 
         template <typename X, typename Entity>
         [[nodiscard]] bool eval(const Not<X>& expr, const Entity& entity) { return !eval(expr.x, entity); }
+
+        template <Op Operator, typename X, typename Entity>
+        [[nodiscard]] bool eval(const Unary<Operator, X>& expr, const Entity& entity) {
+            const auto value = eval(expr.x, entity);
+            if constexpr (Operator == Op::IsNull) { return value_is_null(value); }
+            else { return !value_is_null(value); }
+        }
     } // namespace query
 
     #define AKKARADB_QUERYABLE_FIELD(Type, Field) ::akkaradb::query::Column<&Type::Field> Field{};
@@ -675,7 +920,7 @@ namespace akkaradb {
                 encode_index_field_value(value, field_buffer_);
                 make_index_search_prefix(prefix, field_buffer_, scan_start_buffer_);
                 scan_end_buffer_ = scan_start_buffer_;
-                if (!detail::increment_be_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
 
                 core::BufferArena scan_arena;
                 auto rows = engine_->scan(scan_arena, scan_start_buffer_, scan_end_buffer_);
@@ -755,7 +1000,7 @@ namespace akkaradb {
                 reset_temp_buffers();
                 make_pk_key(start_pk, scan_start_buffer_);
                 scan_end_buffer_.assign(pk_prefix_.begin(), pk_prefix_.end());
-                if (!detail::increment_be_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
                 return ScanRange{this, scan_start_buffer_, scan_end_buffer_};
             }
 
@@ -849,7 +1094,11 @@ namespace akkaradb {
                                     size_t pk_offset = index_search_prefix_size_;
                                     if (dynamic_index_pk_offset_) {
                                         if (key.size() <= 12) { continue; }
-                                        const size_t field_size = read_be32(key.data() + 8);
+                                        size_t field_size = read_le32(key.data() + 8);
+                                        if (12 + field_size >= key.size()) {
+                                            const size_t legacy_field_size = read_be32(key.data() + 8);
+                                            if (12 + legacy_field_size < key.size()) { field_size = legacy_field_size; }
+                                        }
                                         pk_offset = 12 + field_size;
                                     }
                                     if (key.size() <= pk_offset) { continue; }
@@ -1069,7 +1318,7 @@ namespace akkaradb {
                         table_->encode_index_field_value(value, table_->field_buffer_);
                         table_->make_index_search_prefix(prefix_, table_->field_buffer_, table_->scan_start_buffer_);
                         table_->scan_end_buffer_ = table_->scan_start_buffer_;
-                        if (!detail::increment_be_bytes(table_->scan_end_buffer_.data(), table_->scan_end_buffer_.size())) { table_->scan_end_buffer_.clear(); }
+                        if (!detail::increment_lexicographic_bytes(table_->scan_end_buffer_.data(), table_->scan_end_buffer_.size())) { table_->scan_end_buffer_.clear(); }
                         return FindRange{table_, table_->scan_start_buffer_.size(), table_->scan_start_buffer_, table_->scan_end_buffer_};
                     }
 
@@ -1148,6 +1397,8 @@ namespace akkaradb {
                 using E = std::remove_cvref_t<Expr>;
                 if constexpr (query::is_and_v<E>) { return try_make_index_plan(expr.lhs, plan) || try_make_index_plan(expr.rhs, plan); }
                 else if constexpr (query::is_compare_v<E>) { return try_make_compare_index_plan(expr, plan); }
+                else if constexpr (query::is_not_v<E>) { return try_make_not_index_plan(expr, plan); }
+                else if constexpr (query::is_unary_v<E>) { return try_make_unary_index_plan(expr, plan); }
                 else { return false; }
             }
 
@@ -1161,6 +1412,37 @@ namespace akkaradb {
                         query::literal_value(expr.lhs),
                         plan
                     );
+                }
+                else { return false; }
+            }
+
+            template <typename X>
+            [[nodiscard]] bool try_make_not_index_plan(const query::Not<X>& expr, QueryPlan& plan) const {
+                using E = std::remove_cvref_t<X>;
+                if constexpr (query::is_compare_v<E>) {
+                    return try_make_compare_index_source_plan(expr.x, plan);
+                }
+                else if constexpr (query::is_unary_v<E>) {
+                    return try_make_unary_index_plan(expr.x, plan);
+                }
+                else { return false; }
+            }
+
+            template <query::Op Operator, typename L, typename R>
+            [[nodiscard]] bool try_make_compare_index_source_plan(const query::Compare<Operator, L, R>&, QueryPlan& plan) const {
+                if constexpr (query::is_column_v<L> && query::is_literal_v<R>) {
+                    return try_make_field_index_source_plan<std::remove_cvref_t<L>::field_ptr>(plan);
+                }
+                else if constexpr (query::is_literal_v<L> && query::is_column_v<R>) {
+                    return try_make_field_index_source_plan<std::remove_cvref_t<R>::field_ptr>(plan);
+                }
+                else { return false; }
+            }
+
+            template <query::Op Operator, typename X>
+            [[nodiscard]] bool try_make_unary_index_plan(const query::Unary<Operator, X>&, QueryPlan& plan) const {
+                if constexpr ((Operator == query::Op::IsNull || Operator == query::Op::IsNotNull) && query::is_column_v<X>) {
+                    return try_make_null_index_plan<Operator, std::remove_cvref_t<X>::field_ptr>(plan);
                 }
                 else { return false; }
             }
@@ -1211,6 +1493,13 @@ namespace akkaradb {
                 return true;
             }
 
+            [[nodiscard]] static uint32_t read_le32(const uint8_t* src) noexcept {
+                return static_cast<uint32_t>(src[0]) |
+                    (static_cast<uint32_t>(src[1]) << 8) |
+                    (static_cast<uint32_t>(src[2]) << 16) |
+                    (static_cast<uint32_t>(src[3]) << 24);
+            }
+
             [[nodiscard]] static uint32_t read_be32(const uint8_t* src) noexcept {
                 return (static_cast<uint32_t>(src[0]) << 24) |
                     (static_cast<uint32_t>(src[1]) << 16) |
@@ -1224,12 +1513,70 @@ namespace akkaradb {
             }
 
             [[nodiscard]] bool try_make_string_prefix_index_plan(const std::array<uint8_t, 8>& index_prefix, std::string_view prefix, QueryPlan& plan) const {
+                // String fields are length-prefixed in BinPack, so a content prefix is not a contiguous byte range.
+                // Use the field index as the source and let the query predicate apply the residual string filter.
                 (void)prefix;
+                return try_make_full_field_index_plan(index_prefix, plan);
+            }
+
+            [[nodiscard]] bool try_make_full_field_index_plan(const std::array<uint8_t, 8>& index_prefix, QueryPlan& plan) const {
                 make_prefix_start_end(index_prefix, scan_start_buffer_, scan_end_buffer_);
                 plan.kind = QuerySourceKind::Index;
                 plan.ranges.clear();
                 add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 0, true, true);
                 return true;
+            }
+
+            template <auto FieldPtr>
+            [[nodiscard]] bool try_make_field_index_source_plan(QueryPlan& plan) const {
+                const IndexDef* idx = find_index_def_for<FieldPtr>();
+                if (idx == nullptr) { return false; }
+                return try_make_full_field_index_plan(idx->prefix, plan);
+            }
+
+            template <typename Field>
+            void add_equality_index_range(const IndexDef& idx, const Field& value, QueryPlan& plan, bool dedupe_index_pks = false) const {
+                field_buffer_.clear();
+                encode_index_field_value(value, field_buffer_);
+                make_index_search_prefix(idx.prefix, field_buffer_, scan_start_buffer_);
+                scan_end_buffer_ = scan_start_buffer_;
+                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, scan_start_buffer_.size(), false, dedupe_index_pks);
+            }
+
+            template <typename Field, typename Values>
+            [[nodiscard]] bool try_make_in_index_plan(const IndexDef& idx, const Values& values, QueryPlan& plan) const {
+                if constexpr (requires { std::begin(values); std::end(values); }) {
+                    plan.kind = QuerySourceKind::Index;
+                    plan.ranges.clear();
+                    for (const auto& literal : values) {
+                        Field value{};
+                        if (!literal_to_field<Field>(literal, value)) { continue; }
+                        add_equality_index_range(idx, value, plan, true);
+                    }
+                    return true;
+                }
+                else { return false; }
+            }
+
+            template <query::Op Operator, auto FieldPtr>
+            [[nodiscard]] bool try_make_null_index_plan(QueryPlan& plan) const {
+                using Field = binpack::detail::member_of<FieldPtr>;
+                if constexpr (!query::is_optional_v<Field>) { return false; }
+                else {
+                    const IndexDef* idx = find_index_def_for<FieldPtr>();
+                    if (idx == nullptr) { return false; }
+
+                    if constexpr (Operator == query::Op::IsNull) {
+                        plan.kind = QuerySourceKind::Index;
+                        plan.ranges.clear();
+                        add_equality_index_range(*idx, Field{}, plan);
+                        return true;
+                    }
+                    else {
+                        return try_make_full_field_index_plan(idx->prefix, plan);
+                    }
+                }
             }
 
             template <query::Op Operator, auto FieldPtr, typename Lit>
@@ -1241,60 +1588,58 @@ namespace akkaradb {
                 if constexpr (Operator == query::Op::Eq) {
                     Field value{};
                     if (!literal_to_field<Field>(literal, value)) { return false; }
-                    field_buffer_.clear();
-                    encode_index_field_value(value, field_buffer_);
-                    make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
-                    scan_end_buffer_ = scan_start_buffer_;
-                    if (!detail::increment_be_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
                     plan.kind = QuerySourceKind::Index;
                     plan.ranges.clear();
-                    add_query_range(plan, scan_start_buffer_, scan_end_buffer_, scan_start_buffer_.size());
+                    add_equality_index_range(*idx, value, plan);
                     return true;
                 }
-                else if constexpr (Operator == query::Op::In) {
-                    return false;
-                }
-                else if constexpr (Operator == query::Op::StartsWith) {
-                    return false;
-                }
-                else if constexpr (Operator == query::Op::Like) {
-                    return false;
-                }
-                else if constexpr ((Operator == query::Op::Gt || Operator == query::Op::Ge || Operator == query::Op::Lt || Operator == query::Op::Le) &&
-                    std::is_integral_v<Field> && std::is_unsigned_v<Field>) {
+                else if constexpr (Operator == query::Op::Ne) {
                     Field value{};
                     if (!literal_to_field<Field>(literal, value)) { return false; }
-                    make_prefix_start_end(idx->prefix, scan_start_buffer_, scan_end_buffer_);
-                    field_buffer_.clear();
-
-                    if constexpr (Operator == query::Op::Gt) {
-                        if (value == std::numeric_limits<Field>::max()) { return false; }
-                        const Field lower = static_cast<Field>(value + 1);
-                        encode_index_field_value(lower, field_buffer_);
-                        make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
+                    return try_make_full_field_index_plan(idx->prefix, plan);
+                }
+                else if constexpr (Operator == query::Op::In) {
+                    return try_make_in_index_plan<Field>(*idx, literal, plan);
+                }
+                else if constexpr (Operator == query::Op::NotIn) {
+                    if constexpr (requires { std::begin(literal); std::end(literal); }) {
+                        return try_make_full_field_index_plan(idx->prefix, plan);
                     }
-                    else if constexpr (Operator == query::Op::Ge) {
-                        encode_index_field_value(value, field_buffer_);
-                        make_index_search_prefix(idx->prefix, field_buffer_, scan_start_buffer_);
+                    else { return false; }
+                }
+                else if constexpr (Operator == query::Op::StartsWith) {
+                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
+                        return try_make_string_prefix_index_plan(idx->prefix, std::string_view{literal}, plan);
                     }
-                    else if constexpr (Operator == query::Op::Lt) {
-                        if (value == std::numeric_limits<Field>::lowest()) { return false; }
-                        encode_index_field_value(value, field_buffer_);
-                        make_index_search_prefix(idx->prefix, field_buffer_, scan_end_buffer_);
-                    }
-                    else if constexpr (Operator == query::Op::Le) {
-                        if (value != std::numeric_limits<Field>::max()) {
-                            const Field upper = static_cast<Field>(value + 1);
-                            encode_index_field_value(upper, field_buffer_);
-                            make_index_search_prefix(idx->prefix, field_buffer_, scan_end_buffer_);
+                    else { return false; }
+                }
+                else if constexpr (Operator == query::Op::Like) {
+                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
+                        const std::string_view pattern{literal};
+                        if (pattern.find_first_of("%_") == std::string_view::npos) {
+                            Field value{};
+                            if (!literal_to_field<Field>(pattern, value)) { return false; }
+                            plan.kind = QuerySourceKind::Index;
+                            plan.ranges.clear();
+                            add_equality_index_range(*idx, value, plan);
+                            return true;
                         }
-                        else { encode_index_field_value(value, field_buffer_); }
+                        std::string_view prefix;
+                        if (!like_pattern_to_prefix(pattern, prefix)) { prefix = {}; }
+                        return try_make_string_prefix_index_plan(idx->prefix, prefix, plan);
                     }
-
-                    plan.kind = QuerySourceKind::Index;
-                    plan.ranges.clear();
-                    add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 12 + field_buffer_.size());
-                    return true;
+                    else { return false; }
+                }
+                else if constexpr (Operator == query::Op::Contains) {
+                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
+                        return try_make_full_field_index_plan(idx->prefix, plan);
+                    }
+                    else { return false; }
+                }
+                else if constexpr (Operator == query::Op::Gt || Operator == query::Op::Ge || Operator == query::Op::Lt || Operator == query::Op::Le) {
+                    Field value{};
+                    if (!literal_to_field<Field>(literal, value)) { return false; }
+                    return try_make_full_field_index_plan(idx->prefix, plan);
                 }
                 else { return false; }
             }
@@ -1305,7 +1650,7 @@ namespace akkaradb {
                     out.resize(8 + sizeof(PK));
                     std::memcpy(out.data(), pk_prefix_.data(), pk_prefix_.size());
                     uint64_t v = static_cast<uint64_t>(std::make_unsigned_t<PK>(pk));
-                    for (size_t i = 0; i < sizeof(PK); ++i) { out[8 + i] = static_cast<uint8_t>(v >> ((sizeof(PK) - 1 - i) * 8)); }
+                    for (size_t i = 0; i < sizeof(PK); ++i) { out[8 + i] = static_cast<uint8_t>(v >> (i * 8)); }
                 }
                 else {
                     out.reserve(8 + binpack::BinPack::estimate_size(pk));
@@ -1336,12 +1681,12 @@ namespace akkaradb {
             static void make_prefix_start_end(const std::array<uint8_t, 8>& prefix, ArenaByteBuffer& start, ArenaByteBuffer& end) {
                 start.assign(prefix.begin(), prefix.end());
                 end.assign(prefix.begin(), prefix.end());
-                if (!detail::increment_be_bytes(end.data(), end.size())) { end.clear(); }
+                if (!detail::increment_lexicographic_bytes(end.data(), end.size())) { end.clear(); }
             }
 
             static std::array<uint8_t, 8> make_table_prefix(std::string_view name) {
                 std::array<uint8_t, 8> out{};
-                detail::write_be64(detail::fnv1a_64(name), out.data());
+                detail::write_le64(detail::fnv1a_64(name), out.data());
                 return out;
             }
 
@@ -1352,7 +1697,7 @@ namespace akkaradb {
                 input.append(":idx:");
                 input.append(field_name);
                 std::array<uint8_t, 8> out{};
-                detail::write_be64(detail::fnv1a_64(input), out.data());
+                detail::write_le64(detail::fnv1a_64(input), out.data());
                 return out;
             }
 
@@ -1360,7 +1705,7 @@ namespace akkaradb {
                 out.clear();
                 out.resize(12 + field_bytes.size());
                 std::memcpy(out.data(), prefix.data(), prefix.size());
-                detail::write_be32(static_cast<uint32_t>(field_bytes.size()), out.data() + 8);
+                detail::write_le32(static_cast<uint32_t>(field_bytes.size()), out.data() + 8);
                 if (!field_bytes.empty()) { std::memcpy(out.data() + 12, field_bytes.data(), field_bytes.size()); }
             }
 

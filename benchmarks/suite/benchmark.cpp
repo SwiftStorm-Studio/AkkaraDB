@@ -32,15 +32,8 @@ namespace {
         return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     }
 
-    void write_be64(uint64_t v, uint8_t* out) {
-        out[0] = static_cast<uint8_t>(v >> 56);
-        out[1] = static_cast<uint8_t>(v >> 48);
-        out[2] = static_cast<uint8_t>(v >> 40);
-        out[3] = static_cast<uint8_t>(v >> 32);
-        out[4] = static_cast<uint8_t>(v >> 24);
-        out[5] = static_cast<uint8_t>(v >> 16);
-        out[6] = static_cast<uint8_t>(v >> 8);
-        out[7] = static_cast<uint8_t>(v);
+    void write_le64(uint64_t v, uint8_t* out) {
+        for (size_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(v >> (8 * i)); }
     }
 
     [[nodiscard]] akkaradb::engine::AkkEngineOptions memory_options() {
@@ -74,8 +67,8 @@ namespace {
             uint8_t* k16 = key16.data() + static_cast<size_t>(i) * K16;
             uint8_t* v16 = val16.data() + static_cast<size_t>(i) * K16;
 
-            write_be64(u, k8);
-            write_be64(u, v8);
+            write_le64(u, k8);
+            write_le64(u, v8);
             std::memset(k16, 0, 8);
             std::memcpy(k16 + 8, k8, 8);
             std::memcpy(v16, v8, 8);
@@ -190,4 +183,3 @@ int main() {
     bench_binpack_and_index();
     return 0;
 }
-

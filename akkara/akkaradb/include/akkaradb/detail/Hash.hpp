@@ -19,6 +19,7 @@
 // akkaradb/include/akkaradb/detail/Hash.hpp
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -32,27 +33,19 @@ namespace akkaradb::detail {
         return h;
     }
 
-    inline void write_be32(uint32_t v, uint8_t* dst) noexcept {
-        dst[0] = static_cast<uint8_t>(v >> 24);
-        dst[1] = static_cast<uint8_t>(v >> 16);
-        dst[2] = static_cast<uint8_t>(v >> 8);
-        dst[3] = static_cast<uint8_t>(v);
+    inline void write_le32(uint32_t v, uint8_t* dst) noexcept {
+        dst[0] = static_cast<uint8_t>(v);
+        dst[1] = static_cast<uint8_t>(v >> 8);
+        dst[2] = static_cast<uint8_t>(v >> 16);
+        dst[3] = static_cast<uint8_t>(v >> 24);
     }
 
-    inline void write_be64(uint64_t v, uint8_t* dst) noexcept {
-        dst[0] = static_cast<uint8_t>(v >> 56);
-        dst[1] = static_cast<uint8_t>(v >> 48);
-        dst[2] = static_cast<uint8_t>(v >> 40);
-        dst[3] = static_cast<uint8_t>(v >> 32);
-        dst[4] = static_cast<uint8_t>(v >> 24);
-        dst[5] = static_cast<uint8_t>(v >> 16);
-        dst[6] = static_cast<uint8_t>(v >> 8);
-        dst[7] = static_cast<uint8_t>(v);
+    inline void write_le64(uint64_t v, uint8_t* dst) noexcept {
+        for (size_t i = 0; i < 8; ++i) { dst[i] = static_cast<uint8_t>(v >> (8 * i)); }
     }
 
-    [[nodiscard]] inline bool increment_be_bytes(uint8_t* data, size_t size) noexcept {
+    [[nodiscard]] inline bool increment_lexicographic_bytes(uint8_t* data, size_t size) noexcept {
         for (size_t i = size; i > 0; --i) { if (++data[i - 1] != 0) { return true; } }
         return false;
     }
 } // namespace akkaradb::detail
-

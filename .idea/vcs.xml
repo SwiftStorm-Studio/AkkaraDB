@@ -2,9 +2,9 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="$PROJECT_DIR$" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/boost_pfr-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/mbedtls-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/build/_deps/zstd-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-codex-debug/_deps/boost_pfr-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-codex-debug/_deps/mbedtls-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/cmake-build-codex-debug/_deps/zstd-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-debug/_deps/zstd-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-release/_deps/mbedtls-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/cmake-build-release/_deps/mbedtls-src/framework" vcs="Git" />
