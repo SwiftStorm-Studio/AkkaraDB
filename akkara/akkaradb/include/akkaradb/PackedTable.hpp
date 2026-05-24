@@ -1509,7 +1509,35 @@ namespace akkaradb {
 
             template <typename Field>
             static void encode_index_field_value(const Field& value, ArenaByteBuffer& out) {
-                binpack::BinPack::encode_into(value, out);
+                if constexpr (std::is_integral_v<Field> && !std::is_same_v<Field, bool>) {
+                    using Unsigned = std::make_unsigned_t<Field>;
+                    Unsigned sortable = static_cast<Unsigned>(value);
+                    if constexpr (std::is_signed_v<Field>) { sortable ^= (Unsigned{1} << (sizeof(Field) * 8 - 1)); }
+                    write_index_big_endian(sortable, out);
+                }
+                else if constexpr (std::is_same_v<Field, float>) {
+                    uint32_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    const uint32_t sign = uint32_t{1} << 31;
+                    bits = (bits & sign) != 0 ? ~bits : bits ^ sign;
+                    write_index_big_endian(bits, out);
+                }
+                else if constexpr (std::is_same_v<Field, double>) {
+                    uint64_t bits;
+                    std::memcpy(&bits, &value, sizeof(bits));
+                    const uint64_t sign = uint64_t{1} << 63;
+                    bits = (bits & sign) != 0 ? ~bits : bits ^ sign;
+                    write_index_big_endian(bits, out);
+                }
+                else {
+                    binpack::BinPack::encode_into(value, out);
+                }
+            }
+
+            template <typename UInt>
+            static void write_index_big_endian(UInt value, ArenaByteBuffer& out) {
+                static_assert(std::is_unsigned_v<UInt>);
+                for (size_t i = sizeof(UInt); i > 0; --i) { out.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8))); }
             }
 
             [[nodiscard]] bool try_make_string_prefix_index_plan(const std::array<uint8_t, 8>& index_prefix, std::string_view prefix, QueryPlan& plan) const {
@@ -1543,6 +1571,39 @@ namespace akkaradb {
                 if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
                 add_query_range(plan, scan_start_buffer_, scan_end_buffer_, scan_start_buffer_.size(), false, dedupe_index_pks);
             }
+
+            template <query::Op Operator, typename Field>
+            void add_ordered_index_range(const IndexDef& idx, const Field& value, QueryPlan& plan) const {
+                field_buffer_.clear();
+                encode_index_field_value(value, field_buffer_);
+
+                ArenaByteBuffer boundary{temp_arena_.get()};
+                make_index_search_prefix(idx.prefix, field_buffer_, boundary);
+                const size_t pk_offset = boundary.size();
+
+                make_prefix_start_end(idx.prefix, scan_start_buffer_, scan_end_buffer_);
+
+                if constexpr (Operator == query::Op::Gt) {
+                    scan_start_buffer_ = boundary;
+                    if (!detail::increment_lexicographic_bytes(scan_start_buffer_.data(), scan_start_buffer_.size())) { scan_start_buffer_.clear(); }
+                }
+                else if constexpr (Operator == query::Op::Ge) {
+                    scan_start_buffer_ = boundary;
+                }
+                else if constexpr (Operator == query::Op::Lt) {
+                    scan_end_buffer_ = boundary;
+                }
+                else if constexpr (Operator == query::Op::Le) {
+                    scan_end_buffer_ = boundary;
+                    if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                }
+
+                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, pk_offset);
+            }
+
+            template <typename Field>
+            static constexpr bool ordered_index_range_supported_v =
+                (std::is_arithmetic_v<Field> && !std::is_same_v<Field, bool>);
 
             template <typename Field, typename Values>
             [[nodiscard]] bool try_make_in_index_plan(const IndexDef& idx, const Values& values, QueryPlan& plan) const {
@@ -1637,9 +1698,17 @@ namespace akkaradb {
                     else { return false; }
                 }
                 else if constexpr (Operator == query::Op::Gt || Operator == query::Op::Ge || Operator == query::Op::Lt || Operator == query::Op::Le) {
-                    Field value{};
-                    if (!literal_to_field<Field>(literal, value)) { return false; }
-                    return try_make_full_field_index_plan(idx->prefix, plan);
+                    if constexpr (ordered_index_range_supported_v<Field>) {
+                        Field value{};
+                        if (!literal_to_field<Field>(literal, value)) { return false; }
+                        plan.kind = QuerySourceKind::Index;
+                        plan.ranges.clear();
+                        add_ordered_index_range<Operator>(*idx, value, plan);
+                        return true;
+                    }
+                    else {
+                        return try_make_full_field_index_plan(idx->prefix, plan);
+                    }
                 }
                 else { return false; }
             }

@@ -1,6 +1,7 @@
-cmake-build-debug
-cmake-build-release
+/builds/
+/build/
+/build-*/
+/cmake-build-*/
 .claude
 NUL
-*/cmake-build-debug
-build
+dist

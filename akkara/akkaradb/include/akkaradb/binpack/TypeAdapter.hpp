@@ -345,7 +345,11 @@ namespace akkaradb::binpack {
         static std::map<K, V, C, A> read(std::span<const uint8_t>& in) {
             const uint32_t count = detail::read_u32(in);
             std::map<K, V, C, A> out;
-            for (uint32_t i = 0; i < count; ++i) { out.emplace(TypeAdapter<K>::read(in), TypeAdapter<V>::read(in)); }
+            for (uint32_t i = 0; i < count; ++i) {
+                auto key = TypeAdapter<K>::read(in);
+                auto value = TypeAdapter<V>::read(in);
+                out.emplace(std::move(key), std::move(value));
+            }
             return out;
         }
 
@@ -376,7 +380,11 @@ namespace akkaradb::binpack {
             const uint32_t count = detail::read_u32(in);
             std::unordered_map<K, V, H, E, A> out;
             out.reserve(count);
-            for (uint32_t i = 0; i < count; ++i) { out.emplace(TypeAdapter<K>::read(in), TypeAdapter<V>::read(in)); }
+            for (uint32_t i = 0; i < count; ++i) {
+                auto key = TypeAdapter<K>::read(in);
+                auto value = TypeAdapter<V>::read(in);
+                out.emplace(std::move(key), std::move(value));
+            }
             return out;
         }
 

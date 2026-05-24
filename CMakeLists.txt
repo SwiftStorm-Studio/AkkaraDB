@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.1)
 
 project(AkkaraDB
         DESCRIPTION "Low-latency, crash-safe JVM KV store with WAL & stripe parity"
-        VERSION 0.6.0
+        VERSION 2026.1.1
         LANGUAGES CXX
 )
 
@@ -10,6 +10,7 @@ project(AkkaraDB
 option(BUILD_SHARED_LIBS "Build shared libraries (.so/.dll)" ON)
 option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
 option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" OFF)
+set(AKKARADB_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION_REVISION" CACHE FILEPATH "AkkaraDB release revision counter file")
 
 # ==================== C++ Standard ====================
 set(CMAKE_CXX_STANDARD 23)
@@ -27,19 +28,19 @@ set(AKKARADB_SRC_DIR ${AKKARADB_DIR}/src)
 set(INTERNAL_INCLUDE_DIR ${INTERNAL_DIR}/include)
 set(INTERNAL_SRC_DIR ${INTERNAL_DIR}/src)
 
+set(AKKARADB_RUNTIME_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
+set(AKKARADB_TEST_OUTPUT_DIR "${CMAKE_BINARY_DIR}/test")
+file(MAKE_DIRECTORY "${AKKARADB_RUNTIME_OUTPUT_DIR}")
+
 # ==================== Compiler Settings ====================
 if (MSVC)
     add_compile_options(/W4 /permissive- /utf-8)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    if (AKKARADB_BUILD_JNI)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
+    endif ()
 else ()
     add_compile_options(-Wall -Wextra -pedantic)
-endif ()
-
-# Always enable SIMD optimizations (SSE4.2 + AVX2)
-if(MSVC)
-    add_compile_options(/arch:AVX2)
-else()
-    add_compile_options(-msse4.2 -mavx2)
 endif ()
 
 # ==================== Windows-specific definitions ====================
@@ -134,6 +135,32 @@ target_sources(akkaradb PRIVATE
         ${INTERNAL_SOURCES}
 )
 
+add_custom_target(akkaradb_increment_revision
+        COMMAND ${CMAKE_COMMAND}
+        -DREVISION_FILE=${AKKARADB_REVISION_FILE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/IncrementRevision.cmake
+        COMMENT "Incrementing AkkaraDB build revision"
+        VERBATIM
+)
+add_dependencies(akkaradb akkaradb_increment_revision)
+
+# SIMD-specialized source files are compiled with per-file options so the
+# default binary remains portable and runtime dispatch can pick the best path.
+set(AKKARADB_CRC32C_AVX2_SOURCE "${INTERNAL_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp")
+set(AKKARADB_CRC32C_AVX512_SOURCE "${INTERNAL_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp")
+
+if (MSVC)
+    set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
+            PROPERTIES COMPILE_OPTIONS "-mavx2")
+    set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mvpclmulqdq")
+endif ()
+
 # ==================== Linking ====================
 target_link_libraries(akkaradb PRIVATE libzstd_static mbedtls mbedcrypto mbedx509)
 
@@ -217,7 +244,7 @@ install(FILES
 # ==================== Tests ====================
 if (AKKARADB_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+    file(MAKE_DIRECTORY "${AKKARADB_TEST_OUTPUT_DIR}")
 endif ()
 
 # ==================== Benchmarks ====================
@@ -591,24 +618,66 @@ if (WIN32 AND BUILD_SHARED_LIBS)
     )
 endif()
 
+set(AKKARADB_SMOKE_TEST_TARGETS
+        akkaradb_api_server_smoke_test
+        akkaradb_api_server_test
+        akkaradb_akkengine_smoke_test
+        akkaradb_typed_api_smoke_test
+        akkaradb_memtable_smoke_test
+        akkaradb_versionlog_smoke_test
+        akkaradb_manifest_smoke_test
+        akkaradb_cluster_smoke_test
+        akkaradb_blob_smoke_test
+        akkaradb_sstable_smoke_test
+        akkaradb_wal_smoke_test
+)
+
+if (AKKARADB_BUILD_TESTS)
+    add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS})
+
+    foreach (AKKARADB_TEST_TARGET IN LISTS AKKARADB_SMOKE_TEST_TARGETS)
+        set_target_properties(${AKKARADB_TEST_TARGET} PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${AKKARADB_TEST_OUTPUT_DIR}"
+        )
+        add_test(NAME ${AKKARADB_TEST_TARGET} COMMAND $<TARGET_FILE:${AKKARADB_TEST_TARGET}>)
+
+        if (WIN32 AND BUILD_SHARED_LIBS)
+            add_custom_command(TARGET ${AKKARADB_TEST_TARGET} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:akkaradb>
+                    $<TARGET_FILE_DIR:${AKKARADB_TEST_TARGET}>
+                    COMMENT "Copying akkaradb.dll to ${AKKARADB_TEST_TARGET} output directory"
+            )
+        endif ()
+    endforeach ()
+endif ()
+
 # ==================== JNI Bridge ====================
 if(AKKARADB_BUILD_JNI)
     find_package(JNI REQUIRED)
     add_library(akkaradb_jni SHARED
             ${AKKARA_ROOT}/jni/AkkaraJni.cpp
+            ${AKKARADB_SOURCES}
+            ${INTERNAL_SOURCES}
     )
 
-    target_link_libraries(akkaradb_jni PRIVATE akkaradb)
+    target_link_libraries(akkaradb_jni PRIVATE libzstd_static mbedtls mbedcrypto mbedx509)
     target_include_directories(akkaradb_jni PRIVATE
             ${JNI_INCLUDE_DIRS}
             ${INTERNAL_INCLUDE_DIR}
             ${AKKARADB_INCLUDE_DIR}
+            ${boost_pfr_SOURCE_DIR}/include
     )
+    target_compile_definitions(akkaradb_jni PRIVATE AKKARADB_STATIC AKKARADB_TLS_ENABLED)
 
     set_target_properties(akkaradb_jni PROPERTIES
             CXX_STANDARD 23
             CXX_STANDARD_REQUIRED ON
     )
+
+    if(WIN32)
+        target_link_libraries(akkaradb_jni PRIVATE ws2_32)
+    endif()
 
     if(WIN32)
         set_target_properties(akkaradb_jni PROPERTIES
@@ -619,4 +688,4 @@ if(AKKARADB_BUILD_JNI)
     message(STATUS "JNI bridge enabled — target: akkaradb_jni")
 endif()
 
-message(STATUS "AkkaraDB CMake configuration completed. TLS and SIMD are always enabled.")
+message(STATUS "AkkaraDB CMake configuration completed. TLS is enabled; SIMD paths are selected at runtime.")

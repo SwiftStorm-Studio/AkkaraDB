@@ -914,8 +914,12 @@ extern "C" {
                 while (cursor->it != cursor->rows.end()) {
                     const auto& row = *cursor->it;
                     const bool matched = cursor->query == nullptr || matches_query(*cursor->query, row.value);
+                    if (matched) {
+                        jobject out = make_row(env, row.key, row.value);
+                        ++cursor->it;
+                        return out;
+                    }
                     ++cursor->it;
-                    if (matched) { return make_row(env, row.key, row.value); }
                 }
                 return nullptr;
             }

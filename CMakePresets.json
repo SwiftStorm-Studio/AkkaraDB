@@ -1,0 +1,58 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "binaryDir": "${sourceDir}/builds/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "binaryDir": "${sourceDir}/builds/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "release-jni",
+      "displayName": "Release with JNI",
+      "binaryDir": "${sourceDir}/builds/release-jni",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AKKARADB_BUILD_JNI": "ON"
+      }
+    },
+    {
+      "name": "rc-126.1.1.r1-rc.1+shad667184",
+      "displayName": "126.1.1.r1-rc.1+shad667184",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/builds/126.1.1.r1-rc.1+shad667184"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release"
+    },
+    {
+      "name": "release-jni",
+      "configurePreset": "release-jni",
+      "configuration": "Release"
+    },
+    {
+      "name": "rc-126.1.1.r1-rc.1+shad667184",
+      "configurePreset": "rc-126.1.1.r1-rc.1+shad667184",
+      "configuration": "Release"
+    }
+  ]
+}

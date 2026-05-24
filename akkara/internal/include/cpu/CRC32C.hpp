@@ -27,6 +27,8 @@ namespace akkaradb::cpu {
      * @brief Compute CRC32C (Castagnoli) checksum.
      *
      * The dispatcher selects the fastest available implementation at runtime:
+     * - x86 / x64 AVX-512-capable path when available
+     * - x86 / x64 AVX2-capable path when available
      * - x86 / x64 SSE4.2 CRC instructions
      * - AArch64 CRC instructions
      * - portable slicing-by-8 fallback
