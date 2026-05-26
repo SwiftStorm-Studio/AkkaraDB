@@ -2,13 +2,13 @@
  * AkkaraDB - SST v2 smoke tests
  */
 
-#include "core/record/KeyFingerprint.hpp"
-#include "core/record/SSTHdr32.hpp"
-#include "engine/sstable/SSTManager.hpp"
-#include "engine/sstable/SSTReader.hpp"
-#include "engine/sstable/SSTWriter.hpp"
-#include "engine/memtable/MemTable.hpp"
-#include "engine/manifest/Manifest.hpp"
+#include "akk/core/record/KeyFingerprint.hpp"
+#include "akk/core/record/SSTHdr32.hpp"
+#include "akk/engine/sstable/SSTManager.hpp"
+#include "akk/engine/sstable/SSTReader.hpp"
+#include "akk/engine/sstable/SSTWriter.hpp"
+#include "akk/engine/memtable/MemTable.hpp"
+#include "akk/engine/manifest/Manifest.hpp"
 
 #include <cassert>
 #include <chrono>

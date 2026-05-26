@@ -2,7 +2,7 @@
  * AkkaraDB - Manifest smoke test
  */
 
-#include "engine/manifest/Manifest.hpp"
+#include "akk/engine/manifest/Manifest.hpp"
 
 #include <cassert>
 #include <cstdint>

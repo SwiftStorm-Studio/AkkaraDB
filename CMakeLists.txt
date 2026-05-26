@@ -11,6 +11,10 @@ option(BUILD_SHARED_LIBS "Build shared libraries (.so/.dll)" ON)
 option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
 option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" OFF)
 set(AKKARADB_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION_REVISION" CACHE FILEPATH "AkkaraDB release revision counter file")
+set(AKKARADB_DETAIL_VERSION_BASE "126.1.1" CACHE STRING "AkkaraDB detailed release version prefix")
+set(AKKARADB_PRERELEASE "rc.1" CACHE STRING "AkkaraDB prerelease label used in dist artifact names")
+set(AKKARADB_COMPAT_LINE "126.1" CACHE STRING "AkkaraDB native/JNI compatibility line used in library file names")
+set(AKKARADB_RELEASE_VERSION "${AKKARADB_DETAIL_VERSION_BASE}-${AKKARADB_PRERELEASE}")
 
 # ==================== C++ Standard ====================
 set(CMAKE_CXX_STANDARD 23)
@@ -20,17 +24,48 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ==================== Directory Configuration ====================
 set(AKKARA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/akkara)
 set(AKKARADB_DIR ${AKKARA_ROOT}/akkaradb)
-set(INTERNAL_DIR ${AKKARA_ROOT}/internal)
+set(AKKENGINE_DIR ${AKKARA_ROOT}/akkengine)
 
 set(AKKARADB_INCLUDE_DIR ${AKKARADB_DIR}/include)
 set(AKKARADB_SRC_DIR ${AKKARADB_DIR}/src)
 
-set(INTERNAL_INCLUDE_DIR ${INTERNAL_DIR}/include)
-set(INTERNAL_SRC_DIR ${INTERNAL_DIR}/src)
+set(AKKENGINE_INCLUDE_DIR ${AKKENGINE_DIR}/include)
+set(AKKENGINE_SRC_DIR ${AKKENGINE_DIR}/src)
 
 set(AKKARADB_RUNTIME_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
 set(AKKARADB_TEST_OUTPUT_DIR "${CMAKE_BINARY_DIR}/test")
 file(MAKE_DIRECTORY "${AKKARADB_RUNTIME_OUTPUT_DIR}")
+
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" AKKARADB_DIST_OS)
+if (AKKARADB_DIST_OS STREQUAL "darwin")
+    set(AKKARADB_DIST_OS "macos")
+endif ()
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" AKKARADB_DIST_ARCH)
+if (AKKARADB_DIST_ARCH MATCHES "^(amd64|x86_64)$")
+    set(AKKARADB_DIST_ARCH "x86_64")
+elseif (AKKARADB_DIST_ARCH MATCHES "^(arm64|aarch64)$")
+    set(AKKARADB_DIST_ARCH "aarch64")
+endif ()
+
+set(AKKARADB_DIST_PLATFORM "${AKKARADB_DIST_OS}-${AKKARADB_DIST_ARCH}")
+set(AKKARADB_NATIVE_OUTPUT_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_JNI_OUTPUT_NAME "akkaradb-jni-${AKKARADB_RELEASE_VERSION}")
+if (WIN32)
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}.dll")
+elseif (APPLE)
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.dylib")
+else ()
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.so")
+endif ()
+set(AKKARADB_NATIVE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_NATIVE_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native")
+set(AKKARADB_RELEASE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_SDK_PACKAGE_NAME "akkaradb-sdk-${AKKARADB_RELEASE_VERSION}-${AKKARADB_DIST_PLATFORM}")
+set(AKKARADB_SDK_EXTRACT_DIR "${CMAKE_BINARY_DIR}/sdk-package/${AKKARADB_SDK_PACKAGE_NAME}")
+set(AKKARADB_SDK_ZIP "${AKKARADB_RELEASE_DIST_DIR}/${AKKARADB_SDK_PACKAGE_NAME}.zip")
+file(MAKE_DIRECTORY "${AKKARADB_NATIVE_DIST_DIR}")
+file(MAKE_DIRECTORY "${AKKARADB_RELEASE_DIST_DIR}")
 
 # ==================== Compiler Settings ====================
 if (MSVC)
@@ -110,15 +145,15 @@ target_sources(akkaradb PUBLIC FILE_SET HEADERS
         FILES ${PUBLIC_HEADERS}
 )
 
-# ====================== Internal Headers ======================
-file(GLOB_RECURSE INTERNAL_HEADERS CONFIGURE_DEPENDS
-        "${INTERNAL_INCLUDE_DIR}/*.hpp"
-        "${INTERNAL_INCLUDE_DIR}/*.h"
+# ====================== AkkEngine Headers ======================
+file(GLOB_RECURSE AKKENGINE_HEADERS CONFIGURE_DEPENDS
+        "${AKKENGINE_INCLUDE_DIR}/*.hpp"
+        "${AKKENGINE_INCLUDE_DIR}/*.h"
 )
 
-target_sources(akkaradb PUBLIC FILE_SET internal_headers TYPE HEADERS
-        BASE_DIRS ${INTERNAL_INCLUDE_DIR}
-        FILES ${INTERNAL_HEADERS}
+target_sources(akkaradb PUBLIC FILE_SET akkengine_headers TYPE HEADERS
+        BASE_DIRS ${AKKENGINE_INCLUDE_DIR}
+        FILES ${AKKENGINE_HEADERS}
 )
 
 # ====================== Source Files ======================
@@ -126,13 +161,13 @@ file(GLOB_RECURSE AKKARADB_SOURCES CONFIGURE_DEPENDS
         "${AKKARADB_SRC_DIR}/*.cpp"
 )
 
-file(GLOB_RECURSE INTERNAL_SOURCES CONFIGURE_DEPENDS
-        "${INTERNAL_SRC_DIR}/*.cpp"
+file(GLOB_RECURSE AKKENGINE_SOURCES CONFIGURE_DEPENDS
+        "${AKKENGINE_SRC_DIR}/*.cpp"
 )
 
 target_sources(akkaradb PRIVATE
         ${AKKARADB_SOURCES}
-        ${INTERNAL_SOURCES}
+        ${AKKENGINE_SOURCES}
 )
 
 add_custom_target(akkaradb_increment_revision
@@ -146,19 +181,21 @@ add_dependencies(akkaradb akkaradb_increment_revision)
 
 # SIMD-specialized source files are compiled with per-file options so the
 # default binary remains portable and runtime dispatch can pick the best path.
-set(AKKARADB_CRC32C_AVX2_SOURCE "${INTERNAL_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp")
-set(AKKARADB_CRC32C_AVX512_SOURCE "${INTERNAL_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp")
+set(AKKARADB_CRC32C_AVX2_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp")
+set(AKKARADB_CRC32C_AVX512_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp")
 
-if (MSVC)
-    set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
-            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
-            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
-            PROPERTIES COMPILE_OPTIONS "-mavx2")
-    set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
-            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mvpclmulqdq")
+if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
+    if (MSVC)
+        set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
+                PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
+                PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
+                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mvpclmulqdq")
+    endif ()
 endif ()
 
 # ==================== Linking ====================
@@ -175,13 +212,15 @@ endif()
 target_include_directories(akkaradb
         PUBLIC
         $<BUILD_INTERFACE:${AKKARADB_INCLUDE_DIR}>
-        $<BUILD_INTERFACE:${INTERNAL_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${AKKENGINE_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${boost_pfr_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-        $<INSTALL_INTERFACE:include/internal>
 )
 
-set_target_properties(akkaradb PROPERTIES LINKER_LANGUAGE CXX)
+set_target_properties(akkaradb PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_NATIVE_OUTPUT_NAME}"
+)
 
 # ==================== Shared / Static Configuration ====================
 if (BUILD_SHARED_LIBS)
@@ -208,17 +247,18 @@ endif ()
 # ==================== Installation ====================
 install(TARGETS akkaradb
         EXPORT AkkaraDBTargets
-        LIBRARY DESTINATION lib
-        ARCHIVE DESTINATION lib
-        RUNTIME DESTINATION bin
-        FILE_SET HEADERS DESTINATION include
-        FILE_SET internal_headers DESTINATION include/internal
+        LIBRARY DESTINATION lib COMPONENT SDK
+        ARCHIVE DESTINATION lib COMPONENT SDK
+        RUNTIME DESTINATION bin COMPONENT SDK
+        FILE_SET HEADERS DESTINATION include COMPONENT SDK
+        FILE_SET akkengine_headers DESTINATION include COMPONENT SDK
 )
 
 install(EXPORT AkkaraDBTargets
         FILE AkkaraDBTargets.cmake
         NAMESPACE AkkaraDB::
         DESTINATION lib/cmake/AkkaraDB
+        COMPONENT SDK
 )
 
 # ── find_package() support ────────────────────────────────────────────────────
@@ -239,6 +279,13 @@ install(FILES
         "${CMAKE_CURRENT_BINARY_DIR}/AkkaraDBConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/AkkaraDBConfigVersion.cmake"
         DESTINATION lib/cmake/AkkaraDB
+        COMPONENT SDK
+)
+
+install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+        DESTINATION .
+        COMPONENT SDK
 )
 
 # ==================== Tests ====================
@@ -270,7 +317,7 @@ target_include_directories(akkaradb_benchmark
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_benchmark PROPERTIES
@@ -294,7 +341,7 @@ target_include_directories(akkaradb_api_server_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_api_server_smoke_test PROPERTIES
@@ -316,7 +363,7 @@ target_include_directories(akkaradb_api_server_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_api_server_test PROPERTIES
@@ -338,7 +385,7 @@ target_include_directories(akkaradb_akkengine_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_akkengine_smoke_test PROPERTIES
@@ -360,7 +407,7 @@ target_include_directories(akkaradb_typed_api_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_typed_api_smoke_test PROPERTIES
@@ -382,7 +429,7 @@ target_include_directories(akkaradb_memtable_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_memtable_smoke_test PROPERTIES
@@ -404,7 +451,7 @@ target_include_directories(akkaradb_memtable_throughput_benchmark
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_memtable_throughput_benchmark PROPERTIES
@@ -426,7 +473,7 @@ target_include_directories(akkaradb_wal_throughput_benchmark
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_wal_throughput_benchmark PROPERTIES
@@ -448,7 +495,7 @@ target_include_directories(akkaradb_sstable_throughput_benchmark
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_sstable_throughput_benchmark PROPERTIES
@@ -470,7 +517,7 @@ target_include_directories(akkaradb_sstable_bloom_negative_lookup_benchmark
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_sstable_bloom_negative_lookup_benchmark PROPERTIES
@@ -492,7 +539,7 @@ target_include_directories(akkaradb_versionlog_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_versionlog_smoke_test PROPERTIES
@@ -514,7 +561,7 @@ target_include_directories(akkaradb_manifest_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_manifest_smoke_test PROPERTIES
@@ -536,7 +583,7 @@ target_include_directories(akkaradb_cluster_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_cluster_smoke_test PROPERTIES
@@ -558,7 +605,7 @@ target_include_directories(akkaradb_blob_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_blob_smoke_test PROPERTIES
@@ -580,7 +627,7 @@ target_include_directories(akkaradb_sstable_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_sstable_smoke_test PROPERTIES
@@ -602,7 +649,7 @@ target_include_directories(akkaradb_wal_smoke_test
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
-        ${INTERNAL_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
 )
 
 set_target_properties(akkaradb_wal_smoke_test PROPERTIES
@@ -617,6 +664,26 @@ if (WIN32 AND BUILD_SHARED_LIBS)
             COMMENT "Copying akkaradb.dll to benchmark executable directory"
     )
 endif()
+
+add_custom_command(TARGET akkaradb POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:akkaradb>
+        "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
+        COMMENT "Copying akkaradb native library to dist/native/${AKKARADB_RELEASE_VERSION}"
+)
+
+add_custom_command(TARGET akkaradb POST_BUILD
+        COMMAND ${CMAKE_COMMAND}
+        -DBUILD_DIR="${CMAKE_BINARY_DIR}"
+        -DINSTALL_CONFIG=$<CONFIG>
+        -DRELEASE_DIST_DIR="${AKKARADB_RELEASE_DIST_DIR}"
+        -DEXTRACT_DIR="${AKKARADB_SDK_EXTRACT_DIR}"
+        -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
+        -DZIP_PATH="${AKKARADB_SDK_ZIP}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
+        COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
+)
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_api_server_smoke_test
@@ -658,13 +725,14 @@ if(AKKARADB_BUILD_JNI)
     add_library(akkaradb_jni SHARED
             ${AKKARA_ROOT}/jni/AkkaraJni.cpp
             ${AKKARADB_SOURCES}
-            ${INTERNAL_SOURCES}
+            ${AKKENGINE_SOURCES}
     )
+    add_dependencies(akkaradb_jni akkaradb)
 
     target_link_libraries(akkaradb_jni PRIVATE libzstd_static mbedtls mbedcrypto mbedx509)
     target_include_directories(akkaradb_jni PRIVATE
             ${JNI_INCLUDE_DIRS}
-            ${INTERNAL_INCLUDE_DIR}
+            ${AKKENGINE_INCLUDE_DIR}
             ${AKKARADB_INCLUDE_DIR}
             ${boost_pfr_SOURCE_DIR}/include
     )
@@ -673,6 +741,7 @@ if(AKKARADB_BUILD_JNI)
     set_target_properties(akkaradb_jni PROPERTIES
             CXX_STANDARD 23
             CXX_STANDARD_REQUIRED ON
+            OUTPUT_NAME "${AKKARADB_JNI_OUTPUT_NAME}"
     )
 
     if(WIN32)
@@ -685,7 +754,24 @@ if(AKKARADB_BUILD_JNI)
         )
     endif()
 
-    message(STATUS "JNI bridge enabled — target: akkaradb_jni")
+    add_custom_command(TARGET akkaradb_jni POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb_jni>
+            "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_jni>"
+            COMMAND ${CMAKE_COMMAND}
+            -DDIST_DIR="${AKKARADB_NATIVE_DIST_DIR}"
+            -DPACKAGE_DIR="${AKKARADB_NATIVE_PACKAGE_DIR}"
+            -DPLATFORM="${AKKARADB_DIST_PLATFORM}"
+            -DDETAIL_VERSION_BASE="${AKKARADB_DETAIL_VERSION_BASE}"
+            -DPRERELEASE="${AKKARADB_PRERELEASE}"
+            -DNATIVE_LIBRARY_NAME="${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
+            -DJNI_LIBRARY_NAME=$<TARGET_FILE_NAME:akkaradb_jni>
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageNativeDist.cmake"
+            COMMENT "Copying akkaradb JNI library to dist/native/${AKKARADB_RELEASE_VERSION}"
+    )
+
+    message(STATUS "JNI bridge enabled  Etarget: akkaradb_jni")
 endif()
 
 message(STATUS "AkkaraDB CMake configuration completed. TLS is enabled; SIMD paths are selected at runtime.")

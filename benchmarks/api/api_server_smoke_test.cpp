@@ -2,9 +2,9 @@
  * AkkaraDB - API server smoke test
  */
 
-#include "engine/AkkEngine.hpp"
-#include "engine/server/ApiFraming.hpp"
-#include "net/tls/TlsStream.hpp"
+#include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/server/ApiFraming.hpp"
+#include "akk/net/tls/TlsStream.hpp"
 
 #include <array>
 #include <cassert>

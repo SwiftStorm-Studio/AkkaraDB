@@ -2,7 +2,7 @@
  * AkkaraDB - API server interactive runner
  */
 
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 
 #include <cstring>
 #include <cstdio>

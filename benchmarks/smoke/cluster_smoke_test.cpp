@@ -2,12 +2,12 @@
  * AkkaraDB - Cluster smoke test
  */
 
-#include "engine/cluster/ClusterConfig.hpp"
-#include "engine/cluster/ClusterManager.hpp"
-#include "engine/cluster/ClusterRouter.hpp"
-#include "engine/cluster/ReplFraming.hpp"
-#include "engine/cluster/ReplicationClient.hpp"
-#include "engine/cluster/ReplicationServer.hpp"
+#include "akk/engine/cluster/ClusterConfig.hpp"
+#include "akk/engine/cluster/ClusterManager.hpp"
+#include "akk/engine/cluster/ClusterRouter.hpp"
+#include "akk/engine/cluster/ReplFraming.hpp"
+#include "akk/engine/cluster/ReplicationClient.hpp"
+#include "akk/engine/cluster/ReplicationServer.hpp"
 
 #include <atomic>
 #include <cassert>

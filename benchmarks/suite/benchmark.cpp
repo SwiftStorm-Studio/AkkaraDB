@@ -3,7 +3,7 @@
  */
 
 #include "akkaradb/AkkaraDB.hpp"
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 
 #include <cassert>
 #include <chrono>

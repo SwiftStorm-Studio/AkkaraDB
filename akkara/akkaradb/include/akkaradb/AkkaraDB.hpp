@@ -21,7 +21,7 @@
 
 #include "Export.hpp"
 #include "PackedTable.hpp"
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 
 #include <filesystem>
 #include <memory>

@@ -2,7 +2,7 @@
  * AkkaraDB - VersionLog smoke test
  */
 
-#include "engine/vlog/VersionLog.hpp"
+#include "akk/engine/vlog/VersionLog.hpp"
 
 #include <cassert>
 #include <cstdio>

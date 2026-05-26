@@ -38,7 +38,7 @@ cmake --build build-jni --config Release
 ## Repository Map
 
 ```text
-akkara/              Native public and internal sources
+akkara/              Native high-level AkkaraDB and low-level AkkEngine sources
 benchmarks/          Smoke tests and throughput benchmarks
 readme/en/           English documentation
 readme/ja/           Japanese documentation

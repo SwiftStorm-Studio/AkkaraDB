@@ -18,6 +18,17 @@
       }
     },
     {
+      "name": "release-linux",
+      "displayName": "Release Linux",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/builds/release-linux",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
       "name": "release-jni",
       "displayName": "Release with JNI",
       "binaryDir": "${sourceDir}/builds/release-jni",
@@ -42,6 +53,11 @@
     {
       "name": "release",
       "configurePreset": "release",
+      "configuration": "Release"
+    },
+    {
+      "name": "release-linux",
+      "configurePreset": "release-linux",
       "configuration": "Release"
     },
     {

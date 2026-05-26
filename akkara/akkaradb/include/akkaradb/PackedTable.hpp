@@ -22,9 +22,9 @@
 #include "binpack/BinPack.hpp"
 #include "binpack/detail/MemberPtrTraits.hpp"
 #include "detail/Hash.hpp"
-#include "engine/AkkEngine.hpp"
-#include "core/buffer/BufferArena.hpp"
-#include "core/record/KeyFingerprint.hpp"
+#include "akk/engine/AkkEngine.hpp"
+#include "akk/core/buffer/BufferArena.hpp"
+#include "akk/core/record/KeyFingerprint.hpp"
 
 #include <array>
 #include <cstddef>

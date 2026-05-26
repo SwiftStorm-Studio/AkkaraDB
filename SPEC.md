@@ -56,7 +56,7 @@ key/value and BinPack layouts.
 - SQL compatibility.
 - Cross-language object identity.
 - Lock-free writes at the top-level engine API. The engine serializes mutation sequence assignment.
-- Stable ABI for internal headers under `akkara/internal/include`.
+- Stable ABI for low-level AkkEngine headers under `akkara/akkengine/include/akk`.
 
 ---
 
@@ -1189,4 +1189,4 @@ When building from the source tree, the primary target is `akkaradb`.
 | `akkaradb/binpack/BinPack.hpp`     | Encode/decode facade                                    |
 | `akkaradb/binpack/TypeAdapter.hpp` | Serialization adapters                                  |
 
-Headers under `akkara/internal/include` are installed for current build integration but are not the stable public API boundary.
+Headers under `akkara/akkengine/include/akk` provide the public low-level AkkEngine API. The higher-level typed database API remains under `akkara/akkaradb/include/akkaradb`.

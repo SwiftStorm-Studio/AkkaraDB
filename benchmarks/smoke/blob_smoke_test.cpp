@@ -2,7 +2,7 @@
  * AkkaraDB - BlobManager smoke test
  */
 
-#include "engine/blob/BlobManager.hpp"
+#include "akk/engine/blob/BlobManager.hpp"
 
 #include <cassert>
 #include <chrono>

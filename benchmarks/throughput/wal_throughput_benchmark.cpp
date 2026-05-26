@@ -19,10 +19,10 @@
  *   shards       = 0 (auto, clamped to WAL's 16-shard limit)
  */
 
-#include "core/record/KeyFingerprint.hpp"
-#include "core/record/MemHdr16.hpp"
-#include "engine/wal/WalRecovery.hpp"
-#include "engine/wal/WalWriter.hpp"
+#include "akk/core/record/KeyFingerprint.hpp"
+#include "akk/core/record/MemHdr16.hpp"
+#include "akk/engine/wal/WalRecovery.hpp"
+#include "akk/engine/wal/WalWriter.hpp"
 
 #include <algorithm>
 #include <array>

@@ -1,0 +1,48 @@
+if (NOT DEFINED DIST_DIR)
+    message(FATAL_ERROR "DIST_DIR is required")
+endif ()
+if (NOT DEFINED PACKAGE_DIR)
+    message(FATAL_ERROR "PACKAGE_DIR is required")
+endif ()
+if (NOT DEFINED PLATFORM)
+    message(FATAL_ERROR "PLATFORM is required")
+endif ()
+if (NOT DEFINED DETAIL_VERSION_BASE)
+    message(FATAL_ERROR "DETAIL_VERSION_BASE is required")
+endif ()
+if (NOT DEFINED PRERELEASE)
+    message(FATAL_ERROR "PRERELEASE is required")
+endif ()
+if (NOT DEFINED NATIVE_LIBRARY_NAME)
+    message(FATAL_ERROR "NATIVE_LIBRARY_NAME is required")
+endif ()
+if (NOT DEFINED JNI_LIBRARY_NAME)
+    message(FATAL_ERROR "JNI_LIBRARY_NAME is required")
+endif ()
+
+set(DETAIL_VERSION "${DETAIL_VERSION_BASE}-${PRERELEASE}")
+set(PACKAGE_NAME "akkaradb-native-${DETAIL_VERSION}-${PLATFORM}.zip")
+file(MAKE_DIRECTORY "${PACKAGE_DIR}")
+file(GLOB OLD_PACKAGES "${PACKAGE_DIR}/akkaradb-native-*-${PLATFORM}.zip")
+foreach (OLD_PACKAGE IN LISTS OLD_PACKAGES)
+    file(REMOVE "${OLD_PACKAGE}")
+endforeach ()
+
+file(GLOB DIST_LIBRARIES "${DIST_DIR}/akkaradb*.dll" "${DIST_DIR}/libakkaradb*.so" "${DIST_DIR}/libakkaradb*.dylib")
+foreach (DIST_LIBRARY IN LISTS DIST_LIBRARIES)
+    get_filename_component(DIST_LIBRARY_NAME "${DIST_LIBRARY}" NAME)
+    if (NOT DIST_LIBRARY_NAME STREQUAL NATIVE_LIBRARY_NAME AND NOT DIST_LIBRARY_NAME STREQUAL JNI_LIBRARY_NAME)
+        file(REMOVE "${DIST_LIBRARY}")
+    endif ()
+endforeach ()
+
+execute_process(
+        COMMAND "${CMAKE_COMMAND}" -E tar cf "${PACKAGE_DIR}/${PACKAGE_NAME}" --format=zip -- "${NATIVE_LIBRARY_NAME}" "${JNI_LIBRARY_NAME}"
+        WORKING_DIRECTORY "${DIST_DIR}"
+        RESULT_VARIABLE PACKAGE_RESULT
+)
+if (NOT PACKAGE_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to create native package: ${PACKAGE_NAME}")
+endif ()
+
+message(STATUS "AkkaraDB native package created: ${PACKAGE_DIR}/${PACKAGE_NAME}")

@@ -1,12 +1,12 @@
-﻿/*
+/*
  * AkkaraDB - WAL smoke test
  */
 
-#include "core/record/MemHdr16.hpp"
-#include "engine/memtable/MemTable.hpp"
-#include "engine/wal/WalFraming.hpp"
-#include "engine/wal/WalRecovery.hpp"
-#include "engine/wal/WalWriter.hpp"
+#include "akk/core/record/MemHdr16.hpp"
+#include "akk/engine/memtable/MemTable.hpp"
+#include "akk/engine/wal/WalFraming.hpp"
+#include "akk/engine/wal/WalRecovery.hpp"
+#include "akk/engine/wal/WalWriter.hpp"
 
 #include <cassert>
 #include <cstdint>

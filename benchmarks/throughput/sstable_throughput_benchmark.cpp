@@ -19,10 +19,10 @@
  *   max payload   = 512 MiB per case unless --fixed-ops is set
  */
 
-#include "core/record/KeyFingerprint.hpp"
-#include "core/record/SSTHdr32.hpp"
-#include "engine/sstable/SSTReader.hpp"
-#include "engine/sstable/SSTWriter.hpp"
+#include "akk/core/record/KeyFingerprint.hpp"
+#include "akk/core/record/SSTHdr32.hpp"
+#include "akk/engine/sstable/SSTReader.hpp"
+#include "akk/engine/sstable/SSTWriter.hpp"
 
 #include <algorithm>
 #include <array>

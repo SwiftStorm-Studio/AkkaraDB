@@ -19,7 +19,7 @@
 // akkaradb/src/AkkaraDB.cpp
 #include "akkaradb/AkkaraDB.hpp"
 
-#include "engine/wal/WalWriter.hpp"
+#include "akk/engine/wal/WalWriter.hpp"
 
 #include <stdexcept>
 #include <utility>
