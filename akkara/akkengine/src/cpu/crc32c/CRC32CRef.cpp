@@ -100,8 +100,8 @@ namespace akkaradb::cpu {
             const uint32_t d0 = LoadU32LE(reinterpret_cast<const std::byte*>(p)) ^ crc;
             const uint32_t d1 = LoadU32LE(reinterpret_cast<const std::byte*>(p + 4));
 
-            crc = kTables[7][d0 & 0xFFu] ^ kTables[6][(d0 >> 8) & 0xFFu] ^ kTables[5][(d0 >> 16) & 0xFFu] ^ kTables[4][(d0 >> 24) & 0xFFu] ^ kTables[3][d1 &
-                0xFFu] ^ kTables[2][(d1 >> 8) & 0xFFu] ^ kTables[1][(d1 >> 16) & 0xFFu] ^ kTables[0][(d1 >> 24) & 0xFFu];
+            crc = kTables[7][d0 & 0xFFu] ^ kTables[6][(d0 >> 8) & 0xFFu] ^ kTables[5][(d0 >> 16) & 0xFFu] ^ kTables[4][(d0 >> 24) & 0xFFu] ^
+                kTables[3][d1 & 0xFFu] ^ kTables[2][(d1 >> 8) & 0xFFu] ^ kTables[1][(d1 >> 16) & 0xFFu] ^ kTables[0][(d1 >> 24) & 0xFFu];
 
             p += 8;
             length -= 8;

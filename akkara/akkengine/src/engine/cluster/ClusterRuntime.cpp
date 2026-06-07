@@ -19,11 +19,89 @@
 // akkengine/src/engine/cluster/ClusterRuntime.cpp
 #include "akk/engine/cluster/ClusterRuntime.hpp"
 
+#include <array>
+#include <charconv>
+#include <cctype>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
 #include <utility>
 
 namespace akkaradb::engine::cluster {
+    namespace {
+        std::string lower_ascii(std::string_view value) {
+            std::string out;
+            out.reserve(value.size());
+            for (const char ch : value) { out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch)))); }
+            return out;
+        }
+
+        bool parse_ipv4(std::string_view host, std::array<uint8_t, 4>& out) noexcept {
+            size_t start = 0;
+            for (size_t part = 0; part < out.size(); ++part) {
+                const size_t dot = host.find('.', start);
+                const size_t end = dot == std::string_view::npos ? host.size() : dot;
+                if (start == end) { return false; }
+
+                unsigned value = 0;
+                const auto* first = host.data() + start;
+                const auto* last = host.data() + end;
+                const auto result = std::from_chars(first, last, value);
+                if (result.ec != std::errc{} || result.ptr != last || value > 255) { return false; }
+                out[part] = static_cast<uint8_t>(value);
+
+                if (part + 1 == out.size()) { return dot == std::string_view::npos; }
+                if (dot == std::string_view::npos) { return false; }
+                start = dot + 1;
+            }
+            return true;
+        }
+
+        bool is_lan_or_loopback_host(std::string_view host) {
+            const std::string normalized = lower_ascii(host);
+            if (normalized == "localhost") { return true; }
+
+            std::array<uint8_t, 4> ipv4{};
+            if (parse_ipv4(normalized, ipv4)) {
+                if (ipv4[0] == 10) { return true; }
+                if (ipv4[0] == 127) { return true; }
+                if (ipv4[0] == 169 && ipv4[1] == 254) { return true; }
+                if (ipv4[0] == 172 && ipv4[1] >= 16 && ipv4[1] <= 31) { return true; }
+                if (ipv4[0] == 192 && ipv4[1] == 168) { return true; }
+                return false;
+            }
+
+            if (normalized.find(':') != std::string::npos) {
+                if (normalized == "::1") { return true; }
+                if (normalized.rfind("fc", 0) == 0 || normalized.rfind("fd", 0) == 0) { return true; }
+                if (normalized.rfind("fe80:", 0) == 0) { return true; }
+            }
+
+            return false;
+        }
+
+        void validate_transport_scope(const ClusterConfig& config, const ClusterRuntimeOptions& options) {
+            if (options.transport_mode != TransportMode::Plain) { return; }
+            for (const auto& node : config.nodes()) {
+                if (!is_lan_or_loopback_host(node.host)) {
+                    throw std::invalid_argument(
+                        "ClusterRuntime: Plain replication transport is only allowed for LAN or loopback node hosts; use TLS for WAN"
+                    );
+                }
+            }
+        }
+
+        void validate_runtime_mode(const ClusterConfig& config) {
+            if (config.mode() == ReplicationMode::Stripe) {
+                throw std::invalid_argument(
+                    "ClusterRuntime: Stripe mode requires distributed write routing and ownership migration, which are not implemented yet"
+                );
+            }
+        }
+    } // namespace
+
     class ClusterRuntime::Impl {
         public:
             Impl(
@@ -39,6 +117,8 @@ namespace akkaradb::engine::cluster {
                   self_node_id_{self_node_id},
                   callbacks_{std::move(callbacks)},
                   runtime_options_{std::move(runtime_options)} {
+                validate_runtime_mode(config_);
+                validate_transport_scope(config_, runtime_options_);
                 manager_->set_role_change_callback(
                     [this](NodeRole role) {
                         install_role(role);
@@ -96,7 +176,13 @@ namespace akkaradb::engine::cluster {
                     const auto* self = config_.find_by_id(self_node_id_);
                     if (!self && !config_.is_standalone()) { throw std::runtime_error("ClusterRuntime: self node is missing from config"); }
                     const uint16_t repl_port = self ? self->repl_port : 0;
-                    server_ = ReplicationServer::create(repl_port, self_node_id_, callbacks_.get_current_seq, config_.ack_policy(), runtime_options_);
+                    server_ = ReplicationServer::create(
+                        repl_port,
+                        self_node_id_,
+                        callbacks_.get_current_seq,
+                        config_.ack_policy(),
+                        runtime_options_
+                    );
                     server_->start();
                 }
                 else if (role == NodeRole::Replica) {
@@ -145,7 +231,9 @@ namespace akkaradb::engine::cluster {
         ClusterRuntimeOptions runtime_options
     ) {
         return std::unique_ptr<ClusterRuntime>(
-            new ClusterRuntime(std::make_unique<Impl>(std::move(db_dir), std::move(config), self_node_id, std::move(callbacks), std::move(runtime_options)))
+            new ClusterRuntime(
+                std::make_unique<Impl>(std::move(db_dir), std::move(config), self_node_id, std::move(callbacks), std::move(runtime_options))
+            )
         );
     }
 
@@ -170,5 +258,7 @@ namespace akkaradb::engine::cluster {
         uint64_t source_node_id
     ) { impl_->ship_entry(seq, op, key, value, record_flags, source_node_id); }
 
-    void ClusterRuntime::ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) { impl_->ship_blob(seq, blob_id, content); }
+    void ClusterRuntime::ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) {
+        impl_->ship_blob(seq, blob_id, content);
+    }
 } // namespace akkaradb::engine::cluster

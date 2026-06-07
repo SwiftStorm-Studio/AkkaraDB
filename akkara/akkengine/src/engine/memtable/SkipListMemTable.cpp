@@ -66,7 +66,9 @@ namespace akkaradb::engine {
         bytes_.store(sizeof(Node), std::memory_order_relaxed);
     }
 
-    std::span<const uint8_t> SkipListMemTable::as_u8(ByteView view) noexcept { return {reinterpret_cast<const uint8_t*>(view.data()), view.size()}; }
+    std::span<const uint8_t> SkipListMemTable::as_u8(ByteView view) noexcept {
+        return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
+    }
 
     uint64_t SkipListMemTable::next_random() noexcept {
         uint64_t x = rng_state_;
@@ -111,7 +113,9 @@ namespace akkaradb::engine {
         return record;
     }
 
-    int SkipListMemTable::compare_node_key(const Node* node, std::span<const uint8_t> key) noexcept { return node->key_record->compare_key(key); }
+    int SkipListMemTable::compare_node_key(const Node* node, std::span<const uint8_t> key) noexcept {
+        return node->key_record->compare_key(key);
+    }
 
     SkipListMemTable::Node* SkipListMemTable::find_node(
         std::span<const uint8_t> key,
@@ -205,10 +209,26 @@ namespace akkaradb::engine {
     RecordView SkipListMemTable::to_view(const core::OwnedRecord& record) noexcept {
         const auto key = record.key();
         const auto value = record.value();
-        return {key.data(), record.hdr.k_len, value.data(), record.hdr.v_len, record.hdr.seq, record.hdr.flags, record.key_fp64, record.mini_key};
+        return {
+            key.data(),
+            record.hdr.k_len,
+            value.data(),
+            record.hdr.v_len,
+            record.hdr.seq,
+            record.hdr.flags,
+            record.key_fp64,
+            record.mini_key
+        };
     }
 
-    Status SkipListMemTable::put(ByteView key, ByteView value, uint64_t seq, uint8_t flags, uint64_t precomputed_fp64, uint64_t precomputed_mk) {
+    Status SkipListMemTable::put(
+        ByteView key,
+        ByteView value,
+        uint64_t seq,
+        uint8_t flags,
+        uint64_t precomputed_fp64,
+        uint64_t precomputed_mk
+    ) {
         if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::InvalidArgument, "memtable is frozen"); }
 
         if (key.size() > std::numeric_limits<uint16_t>::max() || value.size() > std::numeric_limits<uint16_t>::max()) {

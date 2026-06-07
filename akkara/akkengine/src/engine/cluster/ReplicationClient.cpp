@@ -44,18 +44,19 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using SocketHandle = SOCKET; constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET; void shutdown_socket(SocketHandle s) noexcept {
-            if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); }
-        }
+        using SocketHandle = SOCKET;
+        constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
+        void shutdown_socket(SocketHandle s) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
         #else
-        using SocketHandle = int;
-        constexpr SocketHandle INVALID_SOCKET_HANDLE = -1;
-        void shutdown_socket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
+        using SocketHandle = int; constexpr SocketHandle INVALID_SOCKET_HANDLE = -1; void shutdown_socket(SocketHandle s) noexcept {
+            if (s >= 0) { ::shutdown(s, SHUT_RDWR); }
+        }
         #endif
 
         void ensure_socket_runtime() {
             #ifdef _WIN32
-            static std::once_flag once; std::call_once(
+            static std::once_flag once;
+            std::call_once(
                 once,
                 [] {
                     WSADATA data{};
@@ -118,8 +119,8 @@ namespace akkaradb::engine::cluster {
             uint8_t header[ReplFrameHeader::SIZE];
             if (!recv_all(s, header, sizeof(header))) { return false; }
 
-            const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(header[8]) << 16) |
-                (static_cast<uint32_t>(header[9]) << 24);
+            const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>
+                (header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
 
             std::vector<uint8_t> wire(sizeof(header) + payload_len);
             std::memcpy(wire.data(), header, sizeof(header));
@@ -132,8 +133,8 @@ namespace akkaradb::engine::cluster {
             try {
                 if (!recv_all(stream, header, sizeof(header))) { return false; }
 
-                const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(header[8]) <<
-                    16) | (static_cast<uint32_t>(header[9]) << 24);
+                const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<
+                    uint32_t>(header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
 
                 std::vector<uint8_t> wire(sizeof(header) + payload_len);
                 std::memcpy(wire.data(), header, sizeof(header));
@@ -166,7 +167,7 @@ namespace akkaradb::engine::cluster {
             ensure_socket_runtime();
 
             addrinfo hints{};
-            hints.ai_family = AF_INET;
+            hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
 
             addrinfo* result = nullptr;
@@ -295,7 +296,11 @@ namespace akkaradb::engine::cluster {
             }
 
             bool handshake(SocketHandle socket, net::TlsStream* tls) {
-                const ClientHello hello{.node_id = self_node_id_, .last_seq = get_last_seq_ ? get_last_seq_() : 0, .role = NodeRole::Replica,};
+                const ClientHello hello{
+                    .node_id = self_node_id_,
+                    .last_seq = get_last_seq_ ? get_last_seq_() : 0,
+                    .role = NodeRole::Replica,
+                };
                 const auto wire = encode_client_hello(hello);
                 if (!send_to(socket, tls, wire.data(), wire.size())) { return false; }
 
@@ -373,7 +378,13 @@ namespace akkaradb::engine::cluster {
     ) {
         return std::unique_ptr<ReplicationClient>(
             new ReplicationClient(
-                std::make_unique<Impl>(std::move(primary_host), primary_repl_port, self_node_id, std::move(get_last_seq), std::move(runtime_options))
+                std::make_unique<Impl>(
+                    std::move(primary_host),
+                    primary_repl_port,
+                    self_node_id,
+                    std::move(get_last_seq),
+                    std::move(runtime_options)
+                )
             )
         );
     }

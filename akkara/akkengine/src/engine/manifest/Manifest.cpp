@@ -49,10 +49,10 @@ namespace akkaradb::engine::manifest {
         class FileHandle {
             public:
                 #ifdef _WIN32
-                using NativeHandle = HANDLE; inline static const NativeHandle INVALID = INVALID_HANDLE_VALUE;
+                using NativeHandle = HANDLE;
+                inline static const NativeHandle INVALID = INVALID_HANDLE_VALUE;
                 #else
-                using NativeHandle = int;
-                static constexpr NativeHandle INVALID = -1;
+                using NativeHandle = int; static constexpr NativeHandle INVALID = -1;
                 #endif
 
                 FileHandle() : handle_{INVALID} {}
@@ -75,28 +75,35 @@ namespace akkaradb::engine::manifest {
                 [[nodiscard]] static FileHandle open(const std::filesystem::path& path) {
                     FileHandle fh;
                     #ifdef _WIN32
-                    fh.handle_ = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr); if (fh.
-                        handle_ == INVALID) { throw std::runtime_error("Failed to open manifest: " + path.string()); } ::SetFilePointer(
-                        fh.handle_,
-                        0,
+                    fh.handle_ = ::CreateFileW(
+                        path.c_str(),
+                        GENERIC_WRITE,
+                        FILE_SHARE_READ,
                         nullptr,
-                        FILE_END
+                        OPEN_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL,
+                        nullptr
                     );
+                    if (fh.handle_ == INVALID) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
+                    ::SetFilePointer(fh.handle_, 0, nullptr, FILE_END);
                     #else
-                    fh.handle_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-                    if (fh.handle_ < 0) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
+                    fh.handle_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644); if (fh.handle_ < 0) {
+                        throw std::runtime_error("Failed to open manifest: " + path.string());
+                    }
                     #endif
                     return fh;
                 }
 
                 void write(const uint8_t* data, size_t size) {
                     #ifdef _WIN32
-                    DWORD written = 0; if (!::WriteFile(handle_, data, static_cast<DWORD>(size), &written, nullptr)) {
+                    DWORD written = 0;
+                    if (!::WriteFile(handle_, data, static_cast<DWORD>(size), &written, nullptr)) {
                         throw std::runtime_error("Manifest write failed");
                     }
                     #else
-                    ssize_t result = ::write(handle_, data, size);
-                    if (result < 0 || static_cast<size_t>(result) != size) { throw std::runtime_error("Manifest write failed"); }
+                    ssize_t result = ::write(handle_, data, size); if (result < 0 || static_cast<size_t>(result) != size) {
+                        throw std::runtime_error("Manifest write failed");
+                    }
                     #endif
                 }
 
@@ -139,7 +146,9 @@ namespace akkaradb::engine::manifest {
 
         // Returns current time as microseconds since epoch.
         uint64_t now_us() noexcept {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count());
         }
     } // anonymous namespace
 
@@ -150,7 +159,12 @@ namespace akkaradb::engine::manifest {
     class Manifest::Impl {
         public:
             Impl(std::filesystem::path path, bool fast_mode)
-                : path_{std::move(path)}, fast_mode_{fast_mode}, running_{false}, stripes_written_{0}, current_file_size_{0}, rotation_counter_{0} {
+                : path_{std::move(path)},
+                  fast_mode_{fast_mode},
+                  running_{false},
+                  stripes_written_{0},
+                  current_file_size_{0},
+                  rotation_counter_{0} {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
                 replay_internal();
@@ -220,7 +234,11 @@ namespace akkaradb::engine::manifest {
                 deleted_sst_.erase(file);
             }
 
-            void checkpoint(const std::optional<std::string>& name, const std::optional<uint64_t>& stripe, const std::optional<uint64_t>& last_seq) {
+            void checkpoint(
+                const std::optional<std::string>& name,
+                const std::optional<uint64_t>& stripe,
+                const std::optional<uint64_t>& last_seq
+            ) {
                 const uint64_t ts = now_us();
                 append(ManifestRecordType::Checkpoint, encode_checkpoint(ts, name, stripe, last_seq));
 
@@ -244,7 +262,10 @@ namespace akkaradb::engine::manifest {
                 const std::optional<std::string>& first_key_hex,
                 const std::optional<std::string>& last_key_hex
             ) {
-                append(ManifestRecordType::CompactionEnd, encode_compaction_end(now_us(), level, output, inputs, entries, first_key_hex, last_key_hex));
+                append(
+                    ManifestRecordType::CompactionEnd,
+                    encode_compaction_end(now_us(), level, output, inputs, entries, first_key_hex, last_key_hex)
+                );
 
                 std::lock_guard lock{mutex_};
                 live_sst_.insert(output);
@@ -278,7 +299,9 @@ namespace akkaradb::engine::manifest {
                 }
             }
 
-            void truncate(const std::optional<std::string>& reason) { append(ManifestRecordType::Truncate, encode_truncate(now_us(), reason)); }
+            void truncate(const std::optional<std::string>& reason) {
+                append(ManifestRecordType::Truncate, encode_truncate(now_us(), reason));
+            }
 
             // ----------------------------------------------------------------
             // Replay
@@ -480,8 +503,8 @@ namespace akkaradb::engine::manifest {
                     ManifestFileHeader fhdr{};
                     // Deserialize manually (same field order as serialize)
                     auto read_u32 = [&](size_t off) -> uint32_t {
-                        return static_cast<uint32_t>(hdr_buf[off]) | (static_cast<uint32_t>(hdr_buf[off + 1]) << 8) | (static_cast<uint32_t>(hdr_buf[off + 2])
-                            << 16) | (static_cast<uint32_t>(hdr_buf[off + 3]) << 24);
+                        return static_cast<uint32_t>(hdr_buf[off]) | (static_cast<uint32_t>(hdr_buf[off + 1]) << 8) | (static_cast<uint32_t>
+                            (hdr_buf[off + 2]) << 16) | (static_cast<uint32_t>(hdr_buf[off + 3]) << 24);
                     };
                     auto read_u16 = [&](size_t off) -> uint16_t {
                         return static_cast<uint16_t>(hdr_buf[off]) | (static_cast<uint16_t>(hdr_buf[off + 1]) << 8);
@@ -655,9 +678,11 @@ namespace akkaradb::engine::manifest {
         const std::optional<std::string>& last_key_hex
     ) { impl_->sst_seal(level, file, entries, first_key_hex, last_key_hex); }
 
-    void Manifest::checkpoint(const std::optional<std::string>& name, const std::optional<uint64_t>& stripe, const std::optional<uint64_t>& last_seq) {
-        impl_->checkpoint(name, stripe, last_seq);
-    }
+    void Manifest::checkpoint(
+        const std::optional<std::string>& name,
+        const std::optional<uint64_t>& stripe,
+        const std::optional<uint64_t>& last_seq
+    ) { impl_->checkpoint(name, stripe, last_seq); }
 
     void Manifest::compaction_start(int level, const std::vector<std::string>& inputs) { impl_->compaction_start(level, inputs); }
 

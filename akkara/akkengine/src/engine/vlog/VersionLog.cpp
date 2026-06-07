@@ -220,7 +220,12 @@ namespace akkaradb::engine::vlog {
                     return;
                 }
 
-                const auto pos = std::lower_bound(versions.begin(), versions.end(), ve.seq, [](const VersionEntry& e, uint64_t seq) { return e.seq < seq; });
+                const auto pos = std::lower_bound(
+                    versions.begin(),
+                    versions.end(),
+                    ve.seq,
+                    [](const VersionEntry& e, uint64_t seq) { return e.seq < seq; }
+                );
                 versions.insert(pos, std::move(ve));
             }
 
@@ -231,7 +236,8 @@ namespace akkaradb::engine::vlog {
                 const uint32_t stored_header_crc = file_hdr.crc32c;
                 file_hdr.crc32c = 0;
                 const uint32_t computed_header_crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(&file_hdr), sizeof(file_hdr));
-                if (file_hdr.magic != AKVLOG_V5_MAGIC || file_hdr.version != AKVLOG_V5_VERSION || stored_header_crc != computed_header_crc) { return; }
+                if (file_hdr.magic != AKVLOG_V5_MAGIC || file_hdr.version != AKVLOG_V5_VERSION || stored_header_crc !=
+                    computed_header_crc) { return; }
 
                 std::vector<uint8_t> buf;
                 while (true) {
@@ -316,7 +322,12 @@ namespace akkaradb::engine::vlog {
         if (it == impl_->index_.end()) { return std::nullopt; }
 
         const auto& versions = it->second;
-        const auto pos = std::upper_bound(versions.begin(), versions.end(), at_seq, [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; });
+        const auto pos = std::upper_bound(
+            versions.begin(),
+            versions.end(),
+            at_seq,
+            [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; }
+        );
         if (pos == versions.begin()) { return std::nullopt; }
         return *std::prev(pos);
     }
@@ -331,7 +342,9 @@ namespace akkaradb::engine::vlog {
         return it->second;
     }
 
-    std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> VersionLog::collect_rollback_targets(uint64_t target_seq) const {
+    std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> VersionLog::collect_rollback_targets(
+        uint64_t target_seq
+    ) const {
         if (!impl_) { return {}; }
 
         std::lock_guard lock{impl_->mu_};
@@ -339,7 +352,12 @@ namespace akkaradb::engine::vlog {
         for (const auto& [key, versions] : impl_->index_) {
             if (versions.empty() || versions.back().seq <= target_seq) { continue; }
 
-            const auto pos = std::upper_bound(versions.begin(), versions.end(), target_seq, [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; });
+            const auto pos = std::upper_bound(
+                versions.begin(),
+                versions.end(),
+                target_seq,
+                [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; }
+            );
 
             std::optional<VersionEntry> prev;
             if (pos != versions.begin()) { prev = *std::prev(pos); }

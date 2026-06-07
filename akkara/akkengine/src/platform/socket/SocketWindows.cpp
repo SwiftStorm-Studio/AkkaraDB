@@ -194,13 +194,17 @@ namespace akkaradb::platform {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
-#if defined(AI_ADDRCONFIG)
-hints.ai_flags= AI_ADDRCONFIG;
-#endif
+        #if defined(AI_ADDRCONFIG)
+        hints.ai_flags = AI_ADDRCONFIG;
+        #endif
 
-char port_str[6]; const int port_len = std::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));if (port_len<0 || port_len >= static_cast<
-    int>(sizeof(port_str))) { throw std::invalid_argument("Socket::connect: invalid port"); } const int gai = getaddrinfo(host, port_str, &hints, &result);if (
-    gai!= 0) {
+        char port_str[6];
+        const int port_len = std::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));
+        if (port_len < 0 || port_len >= static_cast<int>(sizeof(port_str))) {
+            throw std::invalid_argument("Socket::connect: invalid port");
+        }
+        const int gai = getaddrinfo(host, port_str, &hints, &result);
+        if (gai != 0) {
             std::string message = "Socket::connect(";
             message += host;
             message += ':';
@@ -210,7 +214,9 @@ char port_str[6]; const int port_len = std::snprintf(port_str, sizeof(port_str),
             throw std::runtime_error(message);
         }
 
-native_handle_t connected = invalid_handle(); int last_error = 0;for (auto* rp = result; rp!= nullptr; rp= rp->ai_next) {
+        native_handle_t connected = invalid_handle();
+        int last_error = 0;
+        for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
             const SOCKET s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (s == INVALID_SOCKET) {
                 last_error = WSAGetLastError();
@@ -246,87 +252,96 @@ native_handle_t connected = invalid_handle(); int last_error = 0;for (auto* rp =
             closesocket(s);
         }
 
-freeaddrinfo (result);if (connected== invalid_handle()) {
+        freeaddrinfo(result);
+        if (connected == invalid_handle()) {
             if (last_error != 0) { throw make_connect_error(host, port, last_error); }
             throw std::runtime_error("Socket::connect failed");
         }
 
-Socket sock; sock.handle_= connected;return sock;}
-
-/**
-     * @brief Sends up to @p size bytes.
-     *
-     * @param data Input buffer.
-     * @param size Number of bytes to send.
-     * @param out_sent Number of bytes actually sent.
-     * @return Empty error_code on success, or a portable error on failure.
-     */
-std::error_code Socket::send_some(const void* data, std::size_t size, std::size_t& out_sent) noexcept {
-    out_sent = 0;
-
-    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
-
-    if (size == 0) { return {}; }
-
-    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
-
-    const auto* ptr = static_cast<const char*>(data);
-    const std::size_t chunk_size = std::min<std::size_t>(size, INT_MAX);
-
-    for (;;) {
-        const int n = send(to_socket(handle_), ptr, static_cast<int>(chunk_size), 0);
-
-        if (n >= 0) {
-            out_sent = static_cast<std::size_t>(n);
-            return {};
-        }
-
-        const int err = WSAGetLastError();
-        if (err == WSAEINTR) { continue; }
-        if (err == WSAEWOULDBLOCK) { return would_block(); }
-        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return std::make_error_code(std::errc::connection_reset); }
-
-        return {err, std::system_category()};
+        Socket sock;
+        sock.handle_ = connected;
+        return sock;
     }
-}
 
-/**
-     * @brief Receives up to @p size bytes.
-     *
-     * @param data Output buffer.
-     * @param size Maximum number of bytes to receive.
-     * @param out_recv Number of bytes actually received.
-     * @return Empty error_code on success, or a portable error on failure.
-     */
-std::error_code Socket::recv_some(void* data, std::size_t size, std::size_t& out_recv) noexcept {
-    out_recv = 0;
+    /**
+         * @brief Sends up to @p size bytes.
+         *
+         * @param data Input buffer.
+         * @param size Number of bytes to send.
+         * @param out_sent Number of bytes actually sent.
+         * @return Empty error_code on success, or a portable error on failure.
+         */
+    std::error_code Socket::send_some(const void* data, std::size_t size, std::size_t& out_sent) noexcept {
+        out_sent = 0;
 
-    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
-    if (size == 0) { return {}; }
+        if (size == 0) { return {}; }
 
-    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
 
-    auto* ptr = static_cast<char*>(data);
-    const std::size_t chunk_size = std::min<std::size_t>(size, INT_MAX);
+        const auto* ptr = static_cast<const char*>(data);
+        const std::size_t chunk_size = std::min<std::size_t>(size, INT_MAX);
 
-    for (;;) {
-        const int n = recv(to_socket(handle_), ptr, static_cast<int>(chunk_size), 0);
+        for (;;) {
+            const int n = send(to_socket(handle_), ptr, static_cast<int>(chunk_size), 0);
 
-        if (n > 0) {
-            out_recv = static_cast<std::size_t>(n);
-            return {};
+            if (n >= 0) {
+                out_sent = static_cast<std::size_t>(n);
+                return {};
+            }
+
+            const int err = WSAGetLastError();
+            if (err == WSAEINTR) { continue; }
+            if (err == WSAEWOULDBLOCK) { return would_block(); }
+            if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
+                return std::make_error_code(std::errc::connection_reset);
+            }
+
+            return {err, std::system_category()};
         }
-
-        if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
-
-        const int err = WSAGetLastError();
-        if (err == WSAEINTR) { continue; }
-        if (err == WSAEWOULDBLOCK) { return would_block(); }
-        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return std::make_error_code(std::errc::connection_reset); }
-
-        return {err, std::system_category()};
     }
-}} // namespace akkaradb::platform
+
+    /**
+         * @brief Receives up to @p size bytes.
+         *
+         * @param data Output buffer.
+         * @param size Maximum number of bytes to receive.
+         * @param out_recv Number of bytes actually received.
+         * @return Empty error_code on success, or a portable error on failure.
+         */
+    std::error_code Socket::recv_some(void* data, std::size_t size, std::size_t& out_recv) noexcept {
+        out_recv = 0;
+
+        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+
+        if (size == 0) { return {}; }
+
+        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+
+        auto* ptr = static_cast<char*>(data);
+        const std::size_t chunk_size = std::min<std::size_t>(size, INT_MAX);
+
+        for (;;) {
+            const int n = recv(to_socket(handle_), ptr, static_cast<int>(chunk_size), 0);
+
+            if (n > 0) {
+                out_recv = static_cast<std::size_t>(n);
+                return {};
+            }
+
+            if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
+
+            const int err = WSAGetLastError();
+            if (err == WSAEINTR) { continue; }
+            if (err == WSAEWOULDBLOCK) { return would_block(); }
+            if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
+                return std::make_error_code(std::errc::connection_reset);
+            }
+
+            return {err, std::system_category()};
+        }
+    }
+} // namespace akkaradb::platform
 
 #endif

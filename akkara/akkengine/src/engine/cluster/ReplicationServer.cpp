@@ -40,6 +40,7 @@
 #include <windows.h>
 #else
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -48,10 +49,13 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using socket_t = SOCKET; constexpr socket_t BAD_SOCKET = INVALID_SOCKET; void
-        shutdown_socket(socket_t s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } } void close_socket(socket_t s) noexcept {
-            if (s != BAD_SOCKET) { ::closesocket(s); }
-        } bool socket_ok(socket_t s) noexcept { return s != INVALID_SOCKET; } void net_init() {
+        using socket_t = SOCKET;
+        constexpr socket_t BAD_SOCKET = INVALID_SOCKET;
+        void shutdown_socket(socket_t s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } }
+        void close_socket(socket_t s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } }
+        bool socket_ok(socket_t s) noexcept { return s != INVALID_SOCKET; }
+
+        void net_init() {
             static std::once_flag once;
             std::call_once(
                 once,
@@ -62,12 +66,10 @@ namespace akkaradb::engine::cluster {
             );
         }
         #else
-        using socket_t = int;
-        constexpr socket_t BAD_SOCKET = -1;
-        void shutdown_socket(socket_t s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
-        void close_socket(socket_t s) noexcept { if (s >= 0) { ::close(s); } }
-        bool socket_ok(socket_t s) noexcept { return s >= 0; }
-        void net_init() {}
+        using socket_t = int; constexpr socket_t BAD_SOCKET = -1; void
+        shutdown_socket(socket_t s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } } void close_socket(socket_t s) noexcept {
+            if (s >= 0) { ::close(s); }
+        } bool socket_ok(socket_t s) noexcept { return s >= 0; } void net_init() {}
         #endif
 
         bool send_all(socket_t s, const uint8_t* data, size_t size) {
@@ -111,7 +113,8 @@ namespace akkaradb::engine::cluster {
         }
 
         uint32_t read_u32(const uint8_t* b) noexcept {
-            return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<uint32_t>(b[3]) << 24);
+            return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<
+                uint32_t>(b[3]) << 24);
         }
 
         bool recv_frame(socket_t s, DecodedFrame& out) {
@@ -156,25 +159,44 @@ namespace akkaradb::engine::cluster {
             return storage;
         }
 
-        socket_t listen_on(uint16_t port) {
+        socket_t listen_on(const std::string& host, uint16_t port) {
             net_init();
-            socket_t s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (!socket_ok(s)) { throw std::runtime_error("ReplicationServer: socket failed"); }
-            int reuse = 1;
-            ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-            sockaddr_in addr{};
-            addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            addr.sin_port = htons(port);
-            if (::bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-                close_socket(s);
-                throw std::runtime_error("ReplicationServer: bind failed");
+
+            addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_flags = AI_PASSIVE;
+
+            addrinfo* result = nullptr;
+            const auto port_text = std::to_string(port);
+            const char* host_arg = host.empty() ? nullptr : host.c_str();
+            if (::getaddrinfo(host_arg, port_text.c_str(), &hints, &result) != 0) {
+                throw std::runtime_error(
+                    "ReplicationServer: getaddrinfo failed for " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + port_text
+                );
             }
-            if (::listen(s, 16) != 0) {
+
+            socket_t out = BAD_SOCKET;
+            for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
+                socket_t s = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+                if (!socket_ok(s)) { continue; }
+
+                int reuse = 1;
+                ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+                if (::bind(s, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0 && ::listen(s, 16) == 0) {
+                    out = s;
+                    break;
+                }
                 close_socket(s);
-                throw std::runtime_error("ReplicationServer: listen failed");
             }
-            return s;
+
+            ::freeaddrinfo(result);
+            if (!socket_ok(out)) {
+                throw std::runtime_error(
+                    "ReplicationServer: bind/listen failed on " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + port_text
+                );
+            }
+            return out;
         }
 
         struct BufferedWire {
@@ -221,7 +243,7 @@ namespace akkaradb::engine::cluster {
             std::condition_variable ack_cv;
 
             void start() {
-                listen_sock = listen_on(repl_port);
+                listen_sock = listen_on(runtime_options.repl_bind_host, repl_port);
                 running.store(true);
                 accept_thread = std::thread([this] { accept_loop(); });
             }
@@ -271,7 +293,10 @@ namespace akkaradb::engine::cluster {
 
                     DecodedFrame frame;
                     ClientHello hello;
-                    if (!recv_frame_from(client, tls.get(), frame) || frame.type != ReplMsgType::ClientHello || !decode_client_hello(frame.payload, hello)) {
+                    if (!recv_frame_from(client, tls.get(), frame) || frame.type != ReplMsgType::ClientHello || !decode_client_hello(
+                        frame.payload,
+                        hello
+                    )) {
                         if (tls) { tls->close(); }
                         close_socket(client);
                         continue;
@@ -415,7 +440,7 @@ namespace akkaradb::engine::cluster {
         impl->get_current_seq = std::move(get_current_seq);
         impl->ack_policy = ack_policy;
         impl->runtime_options = std::move(runtime_options);
-        return std::unique_ptr < ReplicationServer > (new ReplicationServer(std::move(impl)));
+        return std::unique_ptr<ReplicationServer>(new ReplicationServer(std::move(impl)));
     }
 
     void ReplicationServer::start() { impl_->start(); }

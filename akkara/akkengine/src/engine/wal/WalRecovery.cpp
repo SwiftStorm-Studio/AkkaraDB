@@ -81,7 +81,12 @@ namespace akkaradb::engine::wal {
             return files;
         }
 
-        void recover_segment(const SegmentFile& segment, const WalRecoveryOptions& options, const WalRecovery::Callback& callback, WalRecoveryResult& result) {
+        void recover_segment(
+            const SegmentFile& segment,
+            const WalRecoveryOptions& options,
+            const WalRecovery::Callback& callback,
+            WalRecoveryResult& result
+        ) {
             std::ifstream file(segment.path, std::ios::binary);
             if (!file) { throw std::runtime_error("WAL recovery failed to open segment: " + segment.path.string()); }
             file.seekg(WalSegmentHeader::SIZE, std::ios::beg);

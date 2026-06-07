@@ -49,8 +49,8 @@ namespace akkaradb::engine::wal {
         }
 
         [[nodiscard]] uint32_t read_u32(const uint8_t* in, size_t off) noexcept {
-            return static_cast<uint32_t>(in[off]) | (static_cast<uint32_t>(in[off + 1]) << 8) | (static_cast<uint32_t>(in[off + 2]) << 16) | (static_cast<
-                uint32_t>(in[off + 3]) << 24);
+            return static_cast<uint32_t>(in[off]) | (static_cast<uint32_t>(in[off + 1]) << 8) | (static_cast<uint32_t>(in[off + 2]) << 16) |
+                (static_cast<uint32_t>(in[off + 3]) << 24);
         }
 
         [[nodiscard]] uint64_t read_u64(const uint8_t* in, size_t off) noexcept {
@@ -59,7 +59,9 @@ namespace akkaradb::engine::wal {
             return v;
         }
 
-        [[nodiscard]] uint32_t crc32c_bytes(const uint8_t* data, size_t size) noexcept { return cpu::CRC32C(reinterpret_cast<const std::byte*>(data), size); }
+        [[nodiscard]] uint32_t crc32c_bytes(const uint8_t* data, size_t size) noexcept {
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(data), size);
+        }
     } // namespace
 
     bool WalSegmentHeader::verify_checksum() const noexcept {
@@ -186,13 +188,25 @@ namespace akkaradb::engine::wal {
         return crc32c_bytes(buf.data(), buf.size());
     }
 
-    std::vector<uint8_t> serialize_entry(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t seq, uint64_t key_fp64, uint16_t flags) {
+    std::vector<uint8_t> serialize_entry(
+        std::span<const uint8_t> key,
+        std::span<const uint8_t> value,
+        uint64_t seq,
+        uint64_t key_fp64,
+        uint16_t flags
+    ) {
         if (key.size() > std::numeric_limits<uint16_t>::max()) { throw std::invalid_argument("WAL key too large"); }
         if (value.size() > std::numeric_limits<uint32_t>::max()) { throw std::invalid_argument("WAL value too large"); }
         const uint64_t total = static_cast<uint64_t>(WalEntryHeader::SIZE) + key.size() + value.size();
         if (total > std::numeric_limits<uint32_t>::max()) { throw std::invalid_argument("WAL entry too large"); }
 
-        WalEntryHeader hdr = WalEntryHeader::build(seq, key_fp64, static_cast<uint16_t>(key.size()), static_cast<uint32_t>(value.size()), flags);
+        WalEntryHeader hdr = WalEntryHeader::build(
+            seq,
+            key_fp64,
+            static_cast<uint16_t>(key.size()),
+            static_cast<uint32_t>(value.size()),
+            flags
+        );
 
         std::vector<uint8_t> out;
         out.resize(hdr.entry_len);

@@ -1,6 +1,23 @@
 /*
- * AkkaraDB - WAL smoke test
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+// benchmarks/smoke/wal_smoke_test.cpp
+#include "TestErrorHandlers.hpp"
 
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
@@ -186,6 +203,8 @@ namespace {
 }
 
 int main() {
+    akkara::test::install_msvc_test_error_handlers();
+
     test_sync_recovery();
     test_tombstone_recover_into_memtable();
     test_async_force_sync();

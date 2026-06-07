@@ -70,6 +70,10 @@ namespace akkaradb::engine::cluster {
              * @param self_node_id    Stable id of the local node.
              * @param callbacks       Engine callbacks used by replication.
              * @param runtime_options Transport/TLS options for replication links.
+             * @throws std::invalid_argument if Stripe mode is requested before
+             *         distributed write routing and ownership migration exist.
+             * @throws std::invalid_argument if Plain transport is requested for
+             *         a config containing non-LAN advertised node hosts.
              */
             [[nodiscard]] static std::unique_ptr<ClusterRuntime> create(
                 std::filesystem::path db_dir,

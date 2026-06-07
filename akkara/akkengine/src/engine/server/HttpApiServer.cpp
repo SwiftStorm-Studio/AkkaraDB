@@ -5,6 +5,15 @@
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
  * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 // akkengine/src/engine/server/HttpApiServer.cpp
@@ -60,10 +69,7 @@ namespace akkaradb::engine::server {
     HttpApiServer::HttpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options) : engine_{engine}, options_{std::move(options)} {}
 
     std::unique_ptr<HttpApiServer> HttpApiServer::create(AkkEngine& engine, AkkEngineOptions::ApiOptions options) {
-        return std::unique_ptr < HttpApiServer >
-        {
-            new HttpApiServer{engine, std::move(options)}
-        };
+        return std::unique_ptr<HttpApiServer>{new HttpApiServer{engine, std::move(options)}};
     }
 
     HttpApiServer::~HttpApiServer() { close(); }

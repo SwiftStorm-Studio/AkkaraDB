@@ -5,6 +5,15 @@
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
  * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 // akkengine/src/engine/server/ApiFraming.cpp
@@ -16,7 +25,9 @@
 #include <cstring>
 
 namespace akkaradb::engine::server {
-    uint32_t crc32c(std::span<const uint8_t> data) noexcept { return cpu::CRC32C(reinterpret_cast<const std::byte*>(data.data()), data.size()); }
+    uint32_t crc32c(std::span<const uint8_t> data) noexcept {
+        return cpu::CRC32C(reinterpret_cast<const std::byte*>(data.data()), data.size());
+    }
 
     uint32_t crc32c(std::span<const uint8_t> first, std::span<const uint8_t> second) {
         if (first.empty()) { return crc32c(second); }

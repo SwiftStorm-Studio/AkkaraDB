@@ -32,6 +32,14 @@
 #include <utility>
 #include <vector>
 
+#ifndef AKKARADB_JNI_COMPAT_LINE
+#define AKKARADB_JNI_COMPAT_LINE "126.1"
+#endif
+
+#ifndef AKKARADB_REQUIRED_NATIVE_GENERATION
+#define AKKARADB_REQUIRED_NATIVE_GENERATION "126"
+#endif
+
 namespace {
     using akkaradb::AkkaraDB;
     using akkaradb::Codec;
@@ -51,20 +59,49 @@ namespace {
 
     void throw_runtime(JNIEnv* env, const std::exception& ex) { throw_java(env, "java/lang/RuntimeException", ex.what()); }
 
-    [[nodiscard]] std::vector<uint8_t> read_bytes(JNIEnv* env, jbyteArray array) {
-        if (array == nullptr) { return {}; }
-        const jsize len = env->GetArrayLength(array);
-        std::vector<uint8_t> out(static_cast<size_t>(len));
-        if (len > 0) { env->GetByteArrayRegion(array, 0, len, reinterpret_cast<jbyte*>(out.data())); }
+    [[nodiscard]] std::span<const uint8_t> read_direct_buffer(JNIEnv* env, jobject buffer) {
+        if (buffer == nullptr) { return {}; }
+        void* raw = env->GetDirectBufferAddress(buffer);
+        const jlong capacity = env->GetDirectBufferCapacity(buffer);
+        if (raw == nullptr || capacity < 0) {
+            throw std::runtime_error("AkkaraDB JNI requires a direct ByteBuffer");
+        }
+        return {reinterpret_cast<const uint8_t*>(raw), static_cast<size_t>(capacity)};
+    }
+
+    [[nodiscard]] jobject make_direct_buffer(JNIEnv* env, std::span<const uint8_t> bytes) {
+        if (bytes.size() > static_cast<size_t>(std::numeric_limits<jint>::max())) {
+            throw std::runtime_error("AkkaraDB JNI buffer is too large for a JVM ByteBuffer");
+        }
+        jclass byte_buffer_cls = env->FindClass("java/nio/ByteBuffer");
+        if (byte_buffer_cls == nullptr) { return nullptr; }
+        jmethodID allocate_direct = env->GetStaticMethodID(byte_buffer_cls, "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
+        if (allocate_direct == nullptr) { return nullptr; }
+
+        jobject out = env->CallStaticObjectMethod(byte_buffer_cls, allocate_direct, static_cast<jint>(bytes.size()));
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+
+        if (!bytes.empty()) {
+            void* raw = env->GetDirectBufferAddress(out);
+            if (raw == nullptr) { throw std::runtime_error("AkkaraDB JNI failed to allocate a direct ByteBuffer"); }
+            std::memcpy(raw, bytes.data(), bytes.size());
+        }
         return out;
     }
 
-    [[nodiscard]] jbyteArray make_bytes(JNIEnv* env, std::span<const uint8_t> bytes) {
-        auto out = env->NewByteArray(static_cast<jsize>(bytes.size()));
-        if (out != nullptr && !bytes.empty()) {
-            env->SetByteArrayRegion(out, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
+    [[nodiscard]] jobject make_direct_view(JNIEnv* env, std::span<const uint8_t> bytes) {
+        if (bytes.empty()) { return make_direct_buffer(env, bytes); }
+        if (bytes.size() > static_cast<size_t>(std::numeric_limits<jint>::max())) {
+            throw std::runtime_error("AkkaraDB JNI buffer is too large for a JVM ByteBuffer");
         }
-        return out;
+        jobject direct = env->NewDirectByteBuffer(const_cast<uint8_t*>(bytes.data()), static_cast<jlong>(bytes.size()));
+        if (direct == nullptr) { return nullptr; }
+
+        jclass byte_buffer_cls = env->FindClass("java/nio/ByteBuffer");
+        if (byte_buffer_cls == nullptr) { return nullptr; }
+        jmethodID as_read_only = env->GetMethodID(byte_buffer_cls, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;");
+        if (as_read_only == nullptr) { return nullptr; }
+        return env->CallObjectMethod(direct, as_read_only);
     }
 
     [[nodiscard]] std::string read_string(JNIEnv* env, jstring value) {
@@ -688,21 +725,14 @@ namespace {
     [[nodiscard]] ScanCursor* cursor_from(jlong handle) noexcept { return reinterpret_cast<ScanCursor*>(static_cast<std::uintptr_t>(handle)); }
 
     [[nodiscard]] jobject make_row(JNIEnv* env, std::span<const uint8_t> key, std::span<const uint8_t> value) {
-        jclass byte_buffer_cls = env->FindClass("java/nio/ByteBuffer");
-        if (byte_buffer_cls == nullptr) { return nullptr; }
-        jmethodID wrap = env->GetStaticMethodID(byte_buffer_cls, "wrap", "([B)Ljava/nio/ByteBuffer;");
-        if (wrap == nullptr) { return nullptr; }
-
         jclass row_cls = env->FindClass("dev/swiftstorm/akkaradb/engine/RowView");
         if (row_cls == nullptr) { return nullptr; }
         jmethodID ctor = env->GetMethodID(row_cls, "<init>", "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Lkotlin/jvm/internal/DefaultConstructorMarker;)V");
         if (ctor == nullptr) { return nullptr; }
-        jbyteArray key_array = make_bytes(env, key);
-        if (key_array == nullptr) { return nullptr; }
-        jbyteArray value_array = make_bytes(env, value);
-        if (value_array == nullptr) { return nullptr; }
-        jobject key_buffer = env->CallStaticObjectMethod(byte_buffer_cls, wrap, key_array);
-        jobject value_buffer = env->CallStaticObjectMethod(byte_buffer_cls, wrap, value_array);
+        jobject key_buffer = make_direct_view(env, key);
+        if (key_buffer == nullptr || env->ExceptionCheck()) { return nullptr; }
+        jobject value_buffer = make_direct_view(env, value);
+        if (value_buffer == nullptr || env->ExceptionCheck()) { return nullptr; }
         return env->NewObject(row_cls, ctor, key_buffer, value_buffer, nullptr);
     }
 
@@ -721,6 +751,14 @@ namespace {
 }
 
 extern "C" {
+    JNIEXPORT jstring JNICALL Java_dev_swiftstorm_akkaradb_engine_NativeLibrary_nativeJniCompatLine(JNIEnv* env, jclass) {
+        return env->NewStringUTF(AKKARADB_JNI_COMPAT_LINE);
+    }
+
+    JNIEXPORT jstring JNICALL Java_dev_swiftstorm_akkaradb_engine_NativeLibrary_nativeRequiredNativeGeneration(JNIEnv* env, jclass) {
+        return env->NewStringUTF(AKKARADB_REQUIRED_NATIVE_GENERATION);
+    }
+
     JNIEXPORT jlong JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeOpen(
         JNIEnv* env,
         jclass,
@@ -757,54 +795,54 @@ extern "C" {
         );
     }
 
-    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativePut(JNIEnv* env, jobject, jlong handle, jbyteArray key, jbyteArray value) {
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativePut(JNIEnv* env, jobject, jlong handle, jobject key, jobject value) {
         guard(
             env,
             [&]() {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto k = read_bytes(env, key);
-                const auto v = read_bytes(env, value);
+                const auto k = read_direct_buffer(env, key);
+                const auto v = read_direct_buffer(env, value);
                 db->engine().put(k, v);
                 return 0;
             }
         );
     }
 
-    JNIEXPORT jbyteArray JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeGet(JNIEnv* env, jobject, jlong handle, jbyteArray key) {
+    JNIEXPORT jobject JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeGet(JNIEnv* env, jobject, jlong handle, jobject key) {
         return guard(
             env,
-            [&]() -> jbyteArray {
+            [&]() -> jobject {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto k = read_bytes(env, key);
+                const auto k = read_direct_buffer(env, key);
                 auto value = db->engine().get(k);
                 if (!value) { return nullptr; }
-                return make_bytes(env, *value);
+                return make_direct_buffer(env, *value);
             }
         );
     }
 
-    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRemove(JNIEnv* env, jobject, jlong handle, jbyteArray key) {
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRemove(JNIEnv* env, jobject, jlong handle, jobject key) {
         guard(
             env,
             [&]() {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto k = read_bytes(env, key);
+                const auto k = read_direct_buffer(env, key);
                 db->engine().remove(k);
                 return 0;
             }
         );
     }
 
-    JNIEXPORT jboolean JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeExists(JNIEnv* env, jobject, jlong handle, jbyteArray key) {
+    JNIEXPORT jboolean JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeExists(JNIEnv* env, jobject, jlong handle, jobject key) {
         return guard(
             env,
             [&]() -> jboolean {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto k = read_bytes(env, key);
+                const auto k = read_direct_buffer(env, key);
                 return db->engine().exists(k) ? JNI_TRUE : JNI_FALSE;
             }
         );
@@ -814,16 +852,16 @@ extern "C" {
         JNIEnv* env,
         jobject,
         jlong handle,
-        jbyteArray start_key,
-        jbyteArray end_key
+        jobject start_key,
+        jobject end_key
     ) {
         return guard(
             env,
             [&]() -> jlong {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto start = read_bytes(env, start_key);
-                const auto end = read_bytes(env, end_key);
+                const auto start = read_direct_buffer(env, start_key);
+                const auto end = read_direct_buffer(env, end_key);
                 return static_cast<jlong>(db->engine().count(start, end));
             }
         );
@@ -833,16 +871,16 @@ extern "C" {
         JNIEnv* env,
         jobject,
         jlong handle,
-        jbyteArray start_key,
-        jbyteArray end_key
+        jobject start_key,
+        jobject end_key
     ) {
         return guard(
             env,
             [&]() -> jlong {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto start = read_bytes(env, start_key);
-                const auto end = read_bytes(env, end_key);
+                const auto start = read_direct_buffer(env, start_key);
+                const auto end = read_direct_buffer(env, end_key);
 
                 auto cursor = std::make_unique<ScanCursor>();
                 cursor->db = db;
@@ -857,20 +895,20 @@ extern "C" {
         JNIEnv* env,
         jobject,
         jlong handle,
-        jbyteArray start_key,
-        jbyteArray end_key,
-        jbyteArray query_bytes,
-        jbyteArray schema_bytes
+        jobject start_key,
+        jobject end_key,
+        jobject query_bytes,
+        jobject schema_bytes
     ) {
         return guard(
             env,
             [&]() -> jlong {
                 auto* db = db_from(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-                const auto start = read_bytes(env, start_key);
-                const auto end = read_bytes(env, end_key);
-                const auto query = read_bytes(env, query_bytes);
-                const auto schema = read_bytes(env, schema_bytes);
+                const auto start = read_direct_buffer(env, start_key);
+                const auto end = read_direct_buffer(env, end_key);
+                const auto query = read_direct_buffer(env, query_bytes);
+                const auto schema = read_direct_buffer(env, schema_bytes);
 
                 auto cursor = std::make_unique<ScanCursor>();
                 cursor->db = db;

@@ -32,7 +32,9 @@ namespace akkaradb::engine::cluster {
         constexpr size_t HEADER_SIZE = 32;
 
         uint64_t now_us() noexcept {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count());
         }
 
         void write_u16(uint8_t* b, size_t off, uint16_t v) noexcept {
@@ -47,15 +49,17 @@ namespace akkaradb::engine::cluster {
             b[off + 3] = static_cast<uint8_t>(v >> 24);
         }
 
-        void write_u64(uint8_t* b, size_t off, uint64_t v) noexcept { for (size_t i = 0; i < 8; ++i) { b[off + i] = static_cast<uint8_t>(v >> (8 * i)); } }
+        void write_u64(uint8_t* b, size_t off, uint64_t v) noexcept {
+            for (size_t i = 0; i < 8; ++i) { b[off + i] = static_cast<uint8_t>(v >> (8 * i)); }
+        }
 
         uint16_t read_u16(const uint8_t* b, size_t off) noexcept {
             return static_cast<uint16_t>(b[off]) | static_cast<uint16_t>(static_cast<uint16_t>(b[off + 1]) << 8);
         }
 
         uint32_t read_u32(const uint8_t* b, size_t off) noexcept {
-            return static_cast<uint32_t>(b[off]) | (static_cast<uint32_t>(b[off + 1]) << 8) | (static_cast<uint32_t>(b[off + 2]) << 16) | (static_cast<uint32_t>
-                (b[off + 3]) << 24);
+            return static_cast<uint32_t>(b[off]) | (static_cast<uint32_t>(b[off + 1]) << 8) | (static_cast<uint32_t>(b[off + 2]) << 16) | (
+                static_cast<uint32_t>(b[off + 3]) << 24);
         }
 
         uint64_t read_u64(const uint8_t* b, size_t off) noexcept {
@@ -182,9 +186,8 @@ namespace akkaradb::engine::cluster {
         if (mode_ != ReplicationMode::Standalone && mode_ != ReplicationMode::Mirror && mode_ != ReplicationMode::Stripe) {
             throw std::invalid_argument("ClusterConfig: invalid replication mode");
         }
-        if (ack_policy_.mode != AckPolicyMode::Async && ack_policy_.mode != AckPolicyMode::All && ack_policy_.mode != AckPolicyMode::Quorum) {
-            throw std::invalid_argument("ClusterConfig: invalid ack policy");
-        }
+        if (ack_policy_.mode != AckPolicyMode::Async && ack_policy_.mode != AckPolicyMode::All && ack_policy_.mode !=
+            AckPolicyMode::Quorum) { throw std::invalid_argument("ClusterConfig: invalid ack policy"); }
         if (ack_policy_.mode == AckPolicyMode::Quorum && ack_policy_.quorum == 0) {
             throw std::invalid_argument("ClusterConfig: quorum policy requires quorum > 0");
         }
@@ -196,11 +199,15 @@ namespace akkaradb::engine::cluster {
             if (node.node_id == 0) { throw std::invalid_argument("ClusterConfig: node_id 0 is reserved"); }
             if (!ids.insert(node.node_id).second) { throw std::invalid_argument("ClusterConfig: duplicate node_id"); }
             if (node.host.empty()) { throw std::invalid_argument("ClusterConfig: empty host"); }
-            if ((node.capabilities & ~(CoordinatorEligible | DataBearing)) != 0) { throw std::invalid_argument("ClusterConfig: unknown node capability"); }
+            if ((node.capabilities & ~(CoordinatorEligible | DataBearing)) != 0) {
+                throw std::invalid_argument("ClusterConfig: unknown node capability");
+            }
             has_data_node = has_data_node || node.data_bearing();
             has_coordinator = has_coordinator || node.coordinator_eligible();
         }
-        if (mode_ != ReplicationMode::Standalone && !has_data_node) { throw std::invalid_argument("ClusterConfig: cluster mode requires a data-bearing node"); }
+        if (mode_ != ReplicationMode::Standalone && !has_data_node) {
+            throw std::invalid_argument("ClusterConfig: cluster mode requires a data-bearing node");
+        }
         if (mode_ != ReplicationMode::Standalone && !has_coordinator) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a coordinator-eligible node");
         }

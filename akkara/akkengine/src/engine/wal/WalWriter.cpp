@@ -54,7 +54,9 @@ namespace akkaradb::engine::wal {
         static constexpr uint64_t SEGMENT_BYTES = 64ULL * 1024ULL * 1024ULL;
 
         [[nodiscard]] uint64_t now_us() noexcept {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count());
         }
 
         [[nodiscard]] uint16_t resolve_auto_shard_count() noexcept {
@@ -62,7 +64,9 @@ namespace akkaradb::engine::wal {
             return static_cast<uint16_t>(std::clamp<unsigned>(hw == 0 ? 1u : hw, 1u, 16u));
         }
 
-        [[nodiscard]] uint32_t crc32c_bytes(const uint8_t* data, size_t size) noexcept { return cpu::CRC32C(reinterpret_cast<const std::byte*>(data), size); }
+        [[nodiscard]] uint32_t crc32c_bytes(const uint8_t* data, size_t size) noexcept {
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(data), size);
+        }
 
         void refresh_segment_crc(WalSegmentHeader& header) noexcept {
             header.crc32c = 0;
@@ -110,7 +114,8 @@ namespace akkaradb::engine::wal {
 
         [[nodiscard]] std::string segment_name(uint16_t shard_id, uint64_t segment_id) {
             std::ostringstream os;
-            os << std::setfill('0') << std::setw(4) << shard_id << "_" << std::hex << std::nouppercase << std::setw(16) << segment_id << ".akwal";
+            os << std::setfill('0') << std::setw(4) << shard_id << "_" << std::hex << std::nouppercase << std::setw(16) << segment_id <<
+                ".akwal";
             return os.str();
         }
 
@@ -148,7 +153,10 @@ namespace akkaradb::engine::wal {
                 std::vector<uint8_t> key(ehdr.key_len);
                 std::vector<uint8_t> value(ehdr.value_len);
                 if (!read_exact(file, key.data(), key.size()) || !read_exact(file, value.data(), value.size())) { break; }
-                if (!ehdr.verify_checksum(std::span<const uint8_t>{key.data(), key.size()}, std::span<const uint8_t>{value.data(), value.size()})) { break; }
+                if (!ehdr.verify_checksum(
+                    std::span<const uint8_t>{key.data(), key.size()},
+                    std::span<const uint8_t>{value.data(), value.size()}
+                )) { break; }
 
                 if (result.first_seq == 0 || ehdr.seq < result.first_seq) { result.first_seq = ehdr.seq; }
                 if (ehdr.seq > result.last_seq) { result.last_seq = ehdr.seq; }
@@ -217,8 +225,8 @@ namespace akkaradb::engine::wal {
                                     lock,
                                     [&] {
                                         const uint64_t pending_bytes = queue_bytes_ + in_flight_bytes_;
-                                        return async_error_ || pending_bytes + entry_bytes <= options_.async_max_pending_bytes || (queue_.empty() &&
-                                            in_flight_bytes_ == 0);
+                                        return async_error_ || pending_bytes + entry_bytes <= options_.async_max_pending_bytes || (queue_.
+                                            empty() && in_flight_bytes_ == 0);
                                     }
                                 );
                                 if (async_error_) { std::rethrow_exception(async_error_); }
@@ -264,10 +272,14 @@ namespace akkaradb::engine::wal {
                                 uint8_t hdr_buf[WalSegmentHeader::SIZE]{};
                                 if (!read_exact(file, hdr_buf, WalSegmentHeader::SIZE)) { continue; }
                                 const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdr_buf);
-                                if (!hdr.verify_magic() || !hdr.verify_version() || !hdr.verify_checksum() || hdr.shard_id != shard_id_) { continue; }
+                                if (!hdr.verify_magic() || !hdr.verify_version() || !hdr.verify_checksum() || hdr.shard_id != shard_id_) {
+                                    continue;
+                                }
 
                                 const SegmentScanResult scan = scan_segment_sequences(entry.path());
-                                if (scan.valid_header && scan.last_seq != 0 && scan.last_seq <= checkpoint_seq) { removable.push_back(entry.path()); }
+                                if (scan.valid_header && scan.last_seq != 0 && scan.last_seq <= checkpoint_seq) {
+                                    removable.push_back(entry.path());
+                                }
                             }
                         }
 
@@ -318,11 +330,13 @@ namespace akkaradb::engine::wal {
 
                         if (exists) {
                             uint8_t hdr_buf[WalSegmentHeader::SIZE]{};
-                            if (std::fseek(file_, 0, SEEK_SET) != 0 || std::fread(hdr_buf, 1, WalSegmentHeader::SIZE, file_) != WalSegmentHeader::SIZE) {
+                            if (std::fseek(file_, 0, SEEK_SET) != 0 || std::fread(hdr_buf, 1, WalSegmentHeader::SIZE, file_) !=
+                                WalSegmentHeader::SIZE) {
                                 throw std::runtime_error("WAL failed to read segment header: " + path_.string());
                             }
                             header_ = WalSegmentHeader::deserialize(hdr_buf);
-                            if (!header_.verify_magic() || !header_.verify_version() || !header_.verify_checksum() || header_.shard_id != shard_id_) {
+                            if (!header_.verify_magic() || !header_.verify_version() || !header_.verify_checksum() || header_.shard_id !=
+                                shard_id_) {
                                 close_file(file_);
                                 ++segment_id_;
                                 open_segment(segment_id_);
@@ -374,8 +388,12 @@ namespace akkaradb::engine::wal {
                     }
 
                     void write_one_locked(const PendingEntry& entry) {
-                        if (entry.bytes.size() + WalSegmentHeader::SIZE > SEGMENT_BYTES) { throw std::invalid_argument("WAL entry exceeds segment capacity"); }
-                        if (current_size_ + entry.bytes.size() > SEGMENT_BYTES && current_size_ > WalSegmentHeader::SIZE) { rotate_locked(); }
+                        if (entry.bytes.size() + WalSegmentHeader::SIZE > SEGMENT_BYTES) {
+                            throw std::invalid_argument("WAL entry exceeds segment capacity");
+                        }
+                        if (current_size_ + entry.bytes.size() > SEGMENT_BYTES && current_size_ > WalSegmentHeader::SIZE) {
+                            rotate_locked();
+                        }
 
                         if (header_.first_seq == 0 || entry.seq < header_.first_seq) { header_.first_seq = entry.seq; }
                         if (entry.seq > header_.last_seq) { header_.last_seq = entry.seq; }
@@ -399,7 +417,10 @@ namespace akkaradb::engine::wal {
                                         queue_cv_.wait_for(
                                             lock,
                                             std::chrono::microseconds(options_.group_micros),
-                                            [this] { return queue_.size() >= options_.group_n || queue_bytes_ >= options_.group_bytes || !running_; }
+                                            [this] {
+                                                return queue_.size() >= options_.group_n || queue_bytes_ >= options_.group_bytes || !
+                                                    running_;
+                                            }
                                         );
                                     }
                                     in_flight_ = true;
@@ -500,8 +521,16 @@ namespace akkaradb::engine::wal {
 
             ~Impl() { close(); }
 
-            void append(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t seq, uint8_t flags, uint64_t precomputed_fp64) {
-                const uint64_t fp64 = precomputed_fp64 != 0 ? precomputed_fp64 : (key.empty() ? 0 : core::compute_key_fp64(key.data(), key.size()));
+            void append(
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t seq,
+                uint8_t flags,
+                uint64_t precomputed_fp64
+            ) {
+                const uint64_t fp64 = precomputed_fp64 != 0
+                                          ? precomputed_fp64
+                                          : (key.empty() ? 0 : core::compute_key_fp64(key.data(), key.size()));
                 const uint16_t shard_id = shard_for(fp64, options_.shard_count);
                 PendingEntry entry{seq, serialize_entry(key, value, seq, fp64, flags)};
                 shards_[shard_id]->append(std::move(entry));
@@ -547,9 +576,13 @@ namespace akkaradb::engine::wal {
         catch (...) {}
     }
 
-    void WalWriter::append(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t seq, uint8_t flags, uint64_t precomputed_fp64) {
-        impl_->append(key, value, seq, flags, precomputed_fp64);
-    }
+    void WalWriter::append(
+        std::span<const uint8_t> key,
+        std::span<const uint8_t> value,
+        uint64_t seq,
+        uint8_t flags,
+        uint64_t precomputed_fp64
+    ) { impl_->append(key, value, seq, flags, precomputed_fp64); }
 
     void WalWriter::force_sync() { impl_->force_sync(); }
 

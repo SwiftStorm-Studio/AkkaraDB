@@ -51,6 +51,7 @@ endif ()
 set(AKKARADB_DIST_PLATFORM "${AKKARADB_DIST_OS}-${AKKARADB_DIST_ARCH}")
 set(AKKARADB_NATIVE_OUTPUT_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}")
 set(AKKARADB_JNI_OUTPUT_NAME "akkaradb-jni-${AKKARADB_RELEASE_VERSION}")
+string(REGEX MATCH "^[0-9]+" AKKARADB_NATIVE_GENERATION "${AKKARADB_COMPAT_LINE}")
 if (WIN32)
     set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}.dll")
 elseif (APPLE)
@@ -59,12 +60,14 @@ else ()
     set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.so")
 endif ()
 set(AKKARADB_NATIVE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_JNI_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/jni/${AKKARADB_RELEASE_VERSION}")
 set(AKKARADB_NATIVE_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native")
 set(AKKARADB_RELEASE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/${AKKARADB_RELEASE_VERSION}")
 set(AKKARADB_SDK_PACKAGE_NAME "akkaradb-sdk-${AKKARADB_RELEASE_VERSION}-${AKKARADB_DIST_PLATFORM}")
 set(AKKARADB_SDK_EXTRACT_DIR "${CMAKE_BINARY_DIR}/sdk-package/${AKKARADB_SDK_PACKAGE_NAME}")
 set(AKKARADB_SDK_ZIP "${AKKARADB_RELEASE_DIST_DIR}/${AKKARADB_SDK_PACKAGE_NAME}.zip")
 file(MAKE_DIRECTORY "${AKKARADB_NATIVE_DIST_DIR}")
+file(MAKE_DIRECTORY "${AKKARADB_JNI_DIST_DIR}")
 file(MAKE_DIRECTORY "${AKKARADB_RELEASE_DIST_DIR}")
 
 # ==================== Compiler Settings ====================
@@ -194,7 +197,7 @@ if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
         set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
                 PROPERTIES COMPILE_OPTIONS "-mavx2")
         set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
-                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mvpclmulqdq")
+                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mvpclmulqdq")
     endif ()
 endif ()
 
@@ -367,6 +370,31 @@ target_include_directories(akkaradb_api_server_test
 )
 
 set_target_properties(akkaradb_api_server_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ==================== TCP API Throughput Benchmark ====================
+add_executable(akkaradb_tcp_api_throughput_benchmark
+        benchmarks/api/tcp_api_throughput_benchmark.cpp
+)
+
+if(MSVC)
+    target_compile_options(akkaradb_tcp_api_throughput_benchmark PRIVATE /WX-)
+endif()
+
+target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE akkaradb)
+if(WIN32)
+    target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE ws2_32)
+endif()
+
+target_include_directories(akkaradb_tcp_api_throughput_benchmark
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
+
+set_target_properties(akkaradb_tcp_api_throughput_benchmark PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -590,6 +618,28 @@ set_target_properties(akkaradb_cluster_smoke_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# ==================== Erasure Smoke Test ====================
+add_executable(akkaradb_erasure_smoke_test
+        benchmarks/smoke/erasure_smoke_test.cpp
+)
+
+if(MSVC)
+    target_compile_options(akkaradb_erasure_smoke_test PRIVATE /WX-)
+endif()
+
+target_link_libraries(akkaradb_erasure_smoke_test PRIVATE akkaradb)
+
+target_include_directories(akkaradb_erasure_smoke_test
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
+
+set_target_properties(akkaradb_erasure_smoke_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # ==================== Blob Smoke Test ====================
 add_executable(akkaradb_blob_smoke_test
         benchmarks/smoke/blob_smoke_test.cpp
@@ -694,6 +744,7 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_versionlog_smoke_test
         akkaradb_manifest_smoke_test
         akkaradb_cluster_smoke_test
+        akkaradb_erasure_smoke_test
         akkaradb_blob_smoke_test
         akkaradb_sstable_smoke_test
         akkaradb_wal_smoke_test
@@ -736,7 +787,12 @@ if(AKKARADB_BUILD_JNI)
             ${AKKARADB_INCLUDE_DIR}
             ${boost_pfr_SOURCE_DIR}/include
     )
-    target_compile_definitions(akkaradb_jni PRIVATE AKKARADB_STATIC AKKARADB_TLS_ENABLED)
+    target_compile_definitions(akkaradb_jni PRIVATE
+            AKKARADB_STATIC
+            AKKARADB_TLS_ENABLED
+            AKKARADB_JNI_COMPAT_LINE="${AKKARADB_COMPAT_LINE}"
+            AKKARADB_REQUIRED_NATIVE_GENERATION="${AKKARADB_NATIVE_GENERATION}"
+    )
 
     set_target_properties(akkaradb_jni PROPERTIES
             CXX_STANDARD 23
@@ -755,10 +811,10 @@ if(AKKARADB_BUILD_JNI)
     endif()
 
     add_custom_command(TARGET akkaradb_jni POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_JNI_DIST_DIR}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:akkaradb_jni>
-            "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_jni>"
+            "${AKKARADB_JNI_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_jni>"
             COMMAND ${CMAKE_COMMAND}
             -DDIST_DIR="${AKKARADB_NATIVE_DIST_DIR}"
             -DPACKAGE_DIR="${AKKARADB_NATIVE_PACKAGE_DIR}"
@@ -766,9 +822,10 @@ if(AKKARADB_BUILD_JNI)
             -DDETAIL_VERSION_BASE="${AKKARADB_DETAIL_VERSION_BASE}"
             -DPRERELEASE="${AKKARADB_PRERELEASE}"
             -DNATIVE_LIBRARY_NAME="${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
+            -DJNI_DIST_DIR="${AKKARADB_JNI_DIST_DIR}"
             -DJNI_LIBRARY_NAME=$<TARGET_FILE_NAME:akkaradb_jni>
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageNativeDist.cmake"
-            COMMENT "Copying akkaradb JNI library to dist/native/${AKKARADB_RELEASE_VERSION}"
+            COMMENT "Copying akkaradb JNI library to dist/jni/${AKKARADB_RELEASE_VERSION}"
     )
 
     message(STATUS "JNI bridge enabled  Etarget: akkaradb_jni")

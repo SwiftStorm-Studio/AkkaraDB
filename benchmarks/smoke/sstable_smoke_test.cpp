@@ -1,6 +1,23 @@
 /*
- * AkkaraDB - SST v2 smoke tests
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+// benchmarks/smoke/sstable_smoke_test.cpp
+#include "TestErrorHandlers.hpp"
 
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/core/record/SSTHdr32.hpp"
@@ -249,6 +266,8 @@ namespace {
 }
 
 int main() {
+    akkara::test::install_msvc_test_error_handlers();
+
     test_writer_reader_roundtrip();
     test_memtable_flush_manager_recover();
     test_compaction_overwrite_and_tombstone();

@@ -336,9 +336,13 @@ The cluster layer supports three deployment modes:
 | `Mirror` | Writes are mirrored to all data-bearing nodes |
 | `Stripe` | Keys are assigned to data nodes by router policy |
 
+Stripe routing primitives exist, but the runtime currently rejects Stripe configs because distributed write forwarding and ownership migration are not implemented yet.
+
 Node roles are `Standalone`, `Primary`, and `Replica`. The primary accepts writes and ships records or blobs to replicas. Replicas apply replicated records and blobs through callbacks supplied by the engine.
 
 Acknowledgement policies are `Async`, `All`, and `Quorum`.
+
+`NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::TLS` wraps the TCP stream with mbedTLS, and `TransportMode::Plain` is allowed only when every node host is loopback or LAN/private address space. Hostnames other than `localhost` are treated as non-private during config validation. Primary selection is deterministic: the coordinator-eligible node with the lowest `node_id` becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not quorum consensus and does not provide split-brain-safe automatic failover.
 
 TLS support is compiled into the current native target through mbedTLS. API servers and replication links can use TLS or plain transport depending on their runtime options.
 

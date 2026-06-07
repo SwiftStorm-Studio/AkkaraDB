@@ -336,9 +336,13 @@ cluster layer は 3 つの deployment mode を持ちます。
 | `Mirror` | write を data-bearing node 全体へ mirror する |
 | `Stripe` | router policy によって key を data node に割り当てる |
 
+`Stripe` の routing primitive はありますが、runtime は現時点では Stripe config を拒否します。distributed write forwarding と ownership migration が未実装のためです。
+
 node role は `Standalone`、`Primary`、`Replica` です。Primary は write を受け取り、record や blob を replica に ship します。Replica は engine から渡された callback を使って replicated record / blob を適用します。
 
 acknowledgement policy は `Async`、`All`、`Quorum` です。
+
+cluster config の `NodeInfo.host` は peer が dial する advertise address です。primary の replication listener は runtime option の `repl_bind_host` に bind し、default は `0.0.0.0` です。replication link は TCP です。`TransportMode::TLS` は TCP stream を mbedTLS で包み、`TransportMode::Plain` は全 node host が loopback または LAN/private address の場合だけ許可されます。`localhost` 以外の hostname は config validation では non-private として扱います。primary selection は coordinator-eligible な最小 `node_id` による deterministic selection です。LAN/WAN の別マシンで同じ primary を選べますが、quorum consensus ではないため split-brain-safe な automatic failover はこの layer の対象外です。
 
 TLS support は mbedTLS によって current native target に組み込まれています。API server と replication link は、runtime option に応じて TLS または plain transport を使えます。
 
@@ -546,4 +550,3 @@ high-level `AkkaraDB::open` は `StartupMode` preset を `AkkEngineOptions` に�
 ## SPEC.md との関係
 
 この architecture document は `SPEC.md` の代替ではありません。この文書は component responsibility と data flow を理解するために使います。正確な binary layout、magic number、CRC range、protocol frame、configuration field、compatibility rule は `SPEC.md` を source of truth とします。
-

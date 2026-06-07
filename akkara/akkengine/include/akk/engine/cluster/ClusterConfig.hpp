@@ -68,7 +68,7 @@ namespace akkaradb::engine::cluster {
      */
     enum NodeCapability : uint32_t {
         CoordinatorEligible = 1u << 0,
-        ///< Node may acquire PRIMARY.lock and serve as primary.
+        ///< Node may be selected as primary by ClusterManager.
         DataBearing = 1u << 1,
         ///< Node can store key/value data and receive routed writes.
     };
@@ -113,6 +113,7 @@ namespace akkaradb::engine::cluster {
      */
     struct ClusterRuntimeOptions {
         TransportMode transport_mode = TransportMode::TLS;
+        std::string repl_bind_host = "0.0.0.0"; ///< Local address used by the primary replication listener.
         ClusterTlsOptions tls;
     };
 

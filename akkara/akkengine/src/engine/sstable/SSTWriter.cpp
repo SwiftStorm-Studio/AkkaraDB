@@ -59,7 +59,10 @@ namespace akkaradb::engine::sst {
             std::vector<uint8_t> bits;
 
             explicit BloomBuild(size_t entries, uint32_t bits_per_key) {
-                const uint64_t requested_bits = std::max<uint64_t>(512, static_cast<uint64_t>(entries) * std::max<uint32_t>(1, bits_per_key));
+                const uint64_t requested_bits = std::max<uint64_t>(
+                    512,
+                    static_cast<uint64_t>(entries) * std::max<uint32_t>(1, bits_per_key)
+                );
                 header.num_bits = next_pow2_u32(requested_bits);
                 header.num_hashes = std::max<uint32_t>(1, static_cast<uint32_t>(static_cast<double>(bits_per_key) * 0.69));
                 header.bits_size = header.num_bits / 8;
@@ -116,7 +119,9 @@ namespace akkaradb::engine::sst {
                 .mini_key = rec.mini_key()
             };
 
-            if (key.size() > UINT16_MAX || value.size() > UINT16_MAX) { throw std::invalid_argument("SSTWriter: key/value length exceeds u16"); }
+            if (key.size() > UINT16_MAX || value.size() > UINT16_MAX) {
+                throw std::invalid_argument("SSTWriter: key/value length exceeds u16");
+            }
 
             append_pod(block.raw, hdr);
             block.raw.insert(block.raw.end(), key.begin(), key.end());
@@ -154,14 +159,20 @@ namespace akkaradb::engine::sst {
         return write(path, records, Options{});
     }
 
-    SSTWriter::Result SSTWriter::write(const std::filesystem::path& path, std::span<const core::RecordView> records, const Options& options) {
+    SSTWriter::Result SSTWriter::write(
+        const std::filesystem::path& path,
+        std::span<const core::RecordView> records,
+        const Options& options
+    ) {
         if (records.empty()) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         if (options.block_size < 4096 || (options.block_size & 7u) != 0) {
             throw std::invalid_argument("SSTWriter::write: block_size must be >=4096 and 8-byte aligned");
         }
 
         for (size_t i = 1; i < records.size(); ++i) {
-            if (records[i - 1].compare_key(records[i]) > 0) { throw std::invalid_argument("SSTWriter::write: records must be sorted by key"); }
+            if (records[i - 1].compare_key(records[i]) > 0) {
+                throw std::invalid_argument("SSTWriter::write: records must be sorted by key");
+            }
         }
 
         if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }

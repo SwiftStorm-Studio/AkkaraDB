@@ -49,10 +49,10 @@
 namespace akkaradb::net {
     namespace {
         #ifdef _WIN32
-        using native_socket_t = SOCKET; constexpr native_socket_t INVALID_NATIVE_SOCKET = INVALID_SOCKET;
+        using native_socket_t = SOCKET;
+        constexpr native_socket_t INVALID_NATIVE_SOCKET = INVALID_SOCKET;
         #else
-        using native_socket_t = int;
-        constexpr native_socket_t INVALID_NATIVE_SOCKET = -1;
+        using native_socket_t = int; constexpr native_socket_t INVALID_NATIVE_SOCKET = -1;
         #endif
 
         constexpr std::array<unsigned char, 32> DEFAULT_CLUSTER_PSK{
@@ -97,7 +97,9 @@ namespace akkaradb::net {
             return buf;
         }
 
-        [[noreturn]] void throw_mbedtls(const char* what, int code) { throw std::runtime_error(std::string{what} + " failed: " + std::to_string(code)); }
+        [[noreturn]] void throw_mbedtls(const char* what, int code) {
+            throw std::runtime_error(std::string{what} + " failed: " + std::to_string(code));
+        }
 
         [[nodiscard]] bool socket_valid(native_socket_t socket) noexcept {
             #ifdef _WIN32
@@ -128,7 +130,8 @@ namespace akkaradb::net {
 
         void ensure_tls_socket_runtime() {
             #ifdef _WIN32
-            static std::once_flag once; std::call_once(
+            static std::once_flag once;
+            std::call_once(
                 once,
                 [] {
                     WSADATA data{};
@@ -192,15 +195,15 @@ namespace akkaradb::net {
             auto* bio = static_cast<SocketBio*>(ctx);
             if (bio == nullptr || !socket_valid(bio->socket)) { return MBEDTLS_ERR_NET_INVALID_CONTEXT; }
             #ifdef _WIN32
-            const int n = ::send(bio->socket, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0); if (n < 0) {
+            const int n = ::send(bio->socket, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0);
+            if (n < 0) {
                 const int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK || err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
                 if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_SEND_FAILED;
             }
             #else
-            const ssize_t n = ::send(bio->socket, buf, len, 0);
-            if (n < 0) {
+            const ssize_t n = ::send(bio->socket, buf, len, 0); if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
                 if (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_SEND_FAILED;
@@ -213,15 +216,15 @@ namespace akkaradb::net {
             auto* bio = static_cast<SocketBio*>(ctx);
             if (bio == nullptr || !socket_valid(bio->socket)) { return MBEDTLS_ERR_NET_INVALID_CONTEXT; }
             #ifdef _WIN32
-            const int n = ::recv(bio->socket, reinterpret_cast<char*>(buf), static_cast<int>(len), 0); if (n < 0) {
+            const int n = ::recv(bio->socket, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
+            if (n < 0) {
                 const int err = WSAGetLastError();
                 if (err == WSAEWOULDBLOCK || err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
                 if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_RECV_FAILED;
             }
             #else
-            const ssize_t n = ::recv(bio->socket, buf, len, 0);
-            if (n < 0) {
+            const ssize_t n = ::recv(bio->socket, buf, len, 0); if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
                 if (errno == ECONNRESET || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_RECV_FAILED;
@@ -314,7 +317,8 @@ namespace akkaradb::net {
 
         mbedtls_ssl_conf_rng(&impl_->cfg, mbedtls_ctr_drbg_random, &impl_->drbg);
 
-        const bool has_cert = config.cert_path != nullptr && config.cert_path[0] != '\0' && config.key_path != nullptr && config.key_path[0] != '\0';
+        const bool has_cert = config.cert_path != nullptr && config.cert_path[0] != '\0' && config.key_path != nullptr && config.key_path[0]
+            != '\0';
         const bool has_ca = config.ca_path != nullptr && config.ca_path[0] != '\0';
 
         if (has_ca) {
@@ -340,7 +344,9 @@ namespace akkaradb::net {
             if (ret != 0) { throw_mbedtls("mbedtls_ssl_conf_psk", ret); }
             mbedtls_ssl_conf_authmode(&impl_->cfg, MBEDTLS_SSL_VERIFY_NONE);
         }
-        else { mbedtls_ssl_conf_authmode(&impl_->cfg, config.verify_peer && has_ca ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE); }
+        else {
+            mbedtls_ssl_conf_authmode(&impl_->cfg, config.verify_peer && has_ca ? MBEDTLS_SSL_VERIFY_REQUIRED : MBEDTLS_SSL_VERIFY_NONE);
+        }
 
         ret = mbedtls_ssl_setup(&impl_->ssl, &impl_->cfg);
         if (ret != 0) { throw_mbedtls("mbedtls_ssl_setup", ret); }

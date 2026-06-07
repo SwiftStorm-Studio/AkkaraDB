@@ -54,7 +54,9 @@ namespace akkaradb::engine {
         root_.store(initial_root, std::memory_order_release);
     }
 
-    std::span<const uint8_t> BPTreeMemTable::as_u8(ByteView view) noexcept { return {reinterpret_cast<const uint8_t*>(view.data()), view.size()}; }
+    std::span<const uint8_t> BPTreeMemTable::as_u8(ByteView view) noexcept {
+        return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
+    }
 
     BPTreeMemTable::Node* BPTreeMemTable::make_node(bool leaf) {
         Node* node = arena_new<Node>(leaf);
@@ -80,7 +82,9 @@ namespace akkaradb::engine {
         uint64_t precomputed_fp64,
         uint64_t precomputed_mk
     ) {
-        const uint64_t fp64 = precomputed_fp64 != 0 ? precomputed_fp64 : (key.empty() ? 0ULL : core::compute_key_fp64(key.data(), key.size()));
+        const uint64_t fp64 = precomputed_fp64 != 0
+                                  ? precomputed_fp64
+                                  : (key.empty() ? 0ULL : core::compute_key_fp64(key.data(), key.size()));
         const uint64_t mini = precomputed_mk != 0 ? precomputed_mk : (key.empty() ? 0ULL : core::build_mini_key(key.data(), key.size()));
 
         core::OwnedRecord* record = arena_new<core::OwnedRecord>();
@@ -93,9 +97,13 @@ namespace akkaradb::engine {
 
     void BPTreeMemTable::end_write(Node* node) noexcept { node->version.fetch_add(1, std::memory_order_release); }
 
-    int BPTreeMemTable::compare_record_key(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept { return record->compare_key(key); }
+    int BPTreeMemTable::compare_record_key(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept {
+        return record->compare_key(key);
+    }
 
-    int BPTreeMemTable::compare_record_record(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept { return lhs->compare_key(*rhs); }
+    int BPTreeMemTable::compare_record_record(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept {
+        return lhs->compare_key(*rhs);
+    }
 
     uint16_t BPTreeMemTable::find_leaf_position(const Node* leaf, std::span<const uint8_t> key) noexcept {
         const uint16_t key_count = leaf->key_count.load(std::memory_order_relaxed);
@@ -187,7 +195,16 @@ namespace akkaradb::engine {
     RecordView BPTreeMemTable::to_view(const core::OwnedRecord& record) noexcept {
         const auto key = record.key();
         const auto value = record.value();
-        return {key.data(), record.hdr.k_len, value.data(), record.hdr.v_len, record.hdr.seq, record.hdr.flags, record.key_fp64, record.mini_key};
+        return {
+            key.data(),
+            record.hdr.k_len,
+            value.data(),
+            record.hdr.v_len,
+            record.hdr.seq,
+            record.hdr.flags,
+            record.key_fp64,
+            record.mini_key
+        };
     }
 
     std::optional<BPTreeMemTable::SplitResult> BPTreeMemTable::insert_recursive(Node* node, const core::OwnedRecord* record) {
@@ -309,12 +326,16 @@ namespace akkaradb::engine {
         std::array<Node*, MAX_KEYS + 2> all_children{};
 
         for (uint16_t i = 0; i < key_count; ++i) { all_keys[i] = node->keys[i].load(std::memory_order_relaxed); }
-        for (uint16_t i = 0; i < static_cast<uint16_t>(key_count + 1); ++i) { all_children[i] = node->children[i].load(std::memory_order_relaxed); }
+        for (uint16_t i = 0; i < static_cast<uint16_t>(key_count + 1); ++i) {
+            all_children[i] = node->children[i].load(std::memory_order_relaxed);
+        }
 
         for (uint16_t i = key_count; i > insert_pos; --i) { all_keys[i] = all_keys[i - 1]; }
         all_keys[insert_pos] = child_split->separator;
 
-        for (uint16_t i = static_cast<uint16_t>(key_count + 1); i > static_cast<uint16_t>(insert_pos + 1); --i) { all_children[i] = all_children[i - 1]; }
+        for (uint16_t i = static_cast<uint16_t>(key_count + 1); i > static_cast<uint16_t>(insert_pos + 1); --i) {
+            all_children[i] = all_children[i - 1];
+        }
         all_children[insert_pos + 1] = child_split->right;
 
         const uint16_t total_keys = static_cast<uint16_t>(MAX_KEYS + 1);
@@ -330,7 +351,9 @@ namespace akkaradb::engine {
         }
         node->children[mid].store(all_children[mid], std::memory_order_relaxed);
         for (uint16_t i = mid; i < MAX_KEYS; ++i) { node->keys[i].store(nullptr, std::memory_order_relaxed); }
-        for (uint16_t i = static_cast<uint16_t>(mid + 1); i < MAX_KEYS + 1; ++i) { node->children[i].store(nullptr, std::memory_order_relaxed); }
+        for (uint16_t i = static_cast<uint16_t>(mid + 1); i < MAX_KEYS + 1; ++i) {
+            node->children[i].store(nullptr, std::memory_order_relaxed);
+        }
         node->key_count.store(mid, std::memory_order_release);
 
         const uint16_t right_key_count = static_cast<uint16_t>(total_keys - mid - 1);
@@ -340,7 +363,9 @@ namespace akkaradb::engine {
         }
         right->children[right_key_count].store(all_children[total_keys], std::memory_order_relaxed);
         for (uint16_t i = right_key_count; i < MAX_KEYS; ++i) { right->keys[i].store(nullptr, std::memory_order_relaxed); }
-        for (uint16_t i = static_cast<uint16_t>(right_key_count + 1); i < MAX_KEYS + 1; ++i) { right->children[i].store(nullptr, std::memory_order_relaxed); }
+        for (uint16_t i = static_cast<uint16_t>(right_key_count + 1); i < MAX_KEYS + 1; ++i) {
+            right->children[i].store(nullptr, std::memory_order_relaxed);
+        }
         right->key_count.store(right_key_count, std::memory_order_release);
 
         const core::OwnedRecord* promoted = all_keys[mid];
@@ -370,7 +395,14 @@ namespace akkaradb::engine {
         return current;
     }
 
-    Status BPTreeMemTable::put(ByteView key, ByteView value, uint64_t seq, uint8_t flags, uint64_t precomputed_fp64, uint64_t precomputed_mk) {
+    Status BPTreeMemTable::put(
+        ByteView key,
+        ByteView value,
+        uint64_t seq,
+        uint8_t flags,
+        uint64_t precomputed_fp64,
+        uint64_t precomputed_mk
+    ) {
         if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::InvalidArgument, "memtable is frozen"); }
         if (key.size() > std::numeric_limits<uint16_t>::max() || value.size() > std::numeric_limits<uint16_t>::max()) {
             return Status::Error(Status::Code::InvalidArgument, "key/value too large for MemHdr16");

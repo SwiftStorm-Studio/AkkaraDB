@@ -40,11 +40,14 @@ namespace akkaradb::engine::cluster {
         }
     } // namespace
 
-    ClusterRouter::ClusterRouter(ClusterConfig config) : config_{std::move(config)}, data_nodes_{config_.data_nodes()} { config_.validate(); }
+    ClusterRouter::ClusterRouter(ClusterConfig config)
+        : config_{std::move(config)}, data_nodes_{config_.data_nodes()} { config_.validate(); }
 
     std::vector<NodeInfo> ClusterRouter::write_targets(std::span<const uint8_t> key) const {
         switch (config_.mode()) {
-            case ReplicationMode::Standalone: return data_nodes_.empty() ? std::vector<NodeInfo>{} : std::vector<NodeInfo>{data_nodes_.front()};
+            case ReplicationMode::Standalone: return data_nodes_.empty()
+                                                         ? std::vector<NodeInfo>{}
+                                                         : std::vector<NodeInfo>{data_nodes_.front()};
             case ReplicationMode::Mirror: return data_nodes_;
             case ReplicationMode::Stripe: return {stripe_target(key)};
         }
@@ -53,7 +56,9 @@ namespace akkaradb::engine::cluster {
 
     std::vector<NodeInfo> ClusterRouter::read_candidates(std::span<const uint8_t> key) const {
         switch (config_.mode()) {
-            case ReplicationMode::Standalone: return data_nodes_.empty() ? std::vector<NodeInfo>{} : std::vector<NodeInfo>{data_nodes_.front()};
+            case ReplicationMode::Standalone: return data_nodes_.empty()
+                                                         ? std::vector<NodeInfo>{}
+                                                         : std::vector<NodeInfo>{data_nodes_.front()};
             case ReplicationMode::Mirror: return data_nodes_;
             case ReplicationMode::Stripe: return {stripe_target(key)};
         }

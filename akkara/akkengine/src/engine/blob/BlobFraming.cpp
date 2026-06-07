@@ -37,15 +37,17 @@ namespace akkaradb::engine::blob {
             out[3] = static_cast<uint8_t>(value >> 24);
         }
 
-        inline void put_u64(uint8_t* out, uint64_t value) noexcept { for (size_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(value >> (8u * i)); } }
+        inline void put_u64(uint8_t* out, uint64_t value) noexcept {
+            for (size_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(value >> (8u * i)); }
+        }
 
         [[nodiscard]] inline uint16_t get_u16(const uint8_t* in) noexcept {
             return static_cast<uint16_t>(in[0]) | static_cast<uint16_t>(static_cast<uint16_t>(in[1]) << 8);
         }
 
         [[nodiscard]] inline uint32_t get_u32(const uint8_t* in) noexcept {
-            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (static_cast<uint32_t>(in[3]) <<
-                24);
+            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (static_cast<
+                uint32_t>(in[3]) << 24);
         }
 
         [[nodiscard]] inline uint64_t get_u64(const uint8_t* in) noexcept {
@@ -96,7 +98,13 @@ namespace akkaradb::engine::blob {
         return header;
     }
 
-    AkBlobHeaderV5 build_blob_header(uint64_t blob_id, uint64_t total_size, uint64_t stored_size, BlobCodec codec, uint32_t content_crc32c) noexcept {
+    AkBlobHeaderV5 build_blob_header(
+        uint64_t blob_id,
+        uint64_t total_size,
+        uint64_t stored_size,
+        BlobCodec codec,
+        uint32_t content_crc32c
+    ) noexcept {
         AkBlobHeaderV5 header{};
         header.magic = AKBLOB_MAGIC_V5;
         header.version = AKBLOB_VERSION_V5;
@@ -116,8 +124,12 @@ namespace akkaradb::engine::blob {
     }
 
     bool verify_blob_header(const AkBlobHeaderV5& header) noexcept {
-        if (header.magic != AKBLOB_MAGIC_V5 || header.version != AKBLOB_VERSION_V5 || header.header_size != AKBLOB_HEADER_SIZE_V5) { return false; }
-        if (header.codec != static_cast<uint32_t>(BlobCodec::None) && header.codec != static_cast<uint32_t>(BlobCodec::Zstd)) { return false; }
+        if (header.magic != AKBLOB_MAGIC_V5 || header.version != AKBLOB_VERSION_V5 || header.header_size != AKBLOB_HEADER_SIZE_V5) {
+            return false;
+        }
+        if (header.codec != static_cast<uint32_t>(BlobCodec::None) && header.codec != static_cast<uint32_t>(BlobCodec::Zstd)) {
+            return false;
+        }
 
         AkBlobHeaderV5 copy = header;
         copy.header_crc32c = 0;

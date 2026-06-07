@@ -113,7 +113,13 @@ namespace akkaradb::engine::blob {
             }
         }
 
-        void write_atomic_split(const fs::path& path, const uint8_t* header, size_t header_size, const uint8_t* payload, size_t payload_size) {
+        void write_atomic_split(
+            const fs::path& path,
+            const uint8_t* header,
+            size_t header_size,
+            const uint8_t* payload,
+            size_t payload_size
+        ) {
             fs::create_directories(path.parent_path());
 
             fs::path tmp = path;
@@ -262,7 +268,10 @@ namespace akkaradb::engine::blob {
                 write_atomic_split(path, header_buf, sizeof(header_buf), payload, payload_size);
                 blobs_written.fetch_add(1, std::memory_order_relaxed);
                 bytes_uncompressed.fetch_add(static_cast<uint64_t>(content.size()), std::memory_order_relaxed);
-                bytes_on_disk.fetch_add(static_cast<uint64_t>(sizeof(header_buf)) + static_cast<uint64_t>(payload_size), std::memory_order_relaxed);
+                bytes_on_disk.fetch_add(
+                    static_cast<uint64_t>(sizeof(header_buf)) + static_cast<uint64_t>(payload_size),
+                    std::memory_order_relaxed
+                );
             }
 
             void gc_loop() {
@@ -377,17 +386,23 @@ namespace akkaradb::engine::blob {
         if (header.blob_id != blob_id) { throw std::runtime_error("BlobManager: blob_id mismatch: " + path.string()); }
 
         const size_t payload_offset = AKBLOB_HEADER_SIZE_V5;
-        if (header.stored_size > raw.size() - payload_offset) { throw std::runtime_error("BlobManager: payload truncated: " + path.string()); }
+        if (header.stored_size > raw.size() - payload_offset) {
+            throw std::runtime_error("BlobManager: payload truncated: " + path.string());
+        }
 
         const auto* payload = raw.data() + payload_offset;
         std::vector<uint8_t> content;
         if (header.codec == static_cast<uint32_t>(BlobCodec::Zstd)) {
             content.resize(static_cast<size_t>(header.total_size));
             const size_t n = ZSTD_decompress(content.data(), content.size(), payload, static_cast<size_t>(header.stored_size));
-            if (ZSTD_isError(n) || n != header.total_size) { throw std::runtime_error("BlobManager: Zstd decompress failed: " + path.string()); }
+            if (ZSTD_isError(n) || n != header.total_size) {
+                throw std::runtime_error("BlobManager: Zstd decompress failed: " + path.string());
+            }
         }
         else {
-            if (header.stored_size != header.total_size) { throw std::runtime_error("BlobManager: uncompressed size mismatch: " + path.string()); }
+            if (header.stored_size != header.total_size) {
+                throw std::runtime_error("BlobManager: uncompressed size mismatch: " + path.string());
+            }
             content.assign(payload, payload + static_cast<size_t>(header.stored_size));
         }
 

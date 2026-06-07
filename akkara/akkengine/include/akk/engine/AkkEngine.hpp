@@ -5,6 +5,15 @@
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
  * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 // akkengine/include/akk/engine/AkkEngine.hpp
@@ -84,6 +93,8 @@ namespace akkaradb::engine {
             std::string bind_host;
             uint16_t http_port = 7070;
             uint16_t tcp_port = 7071;
+            uint32_t tcp_worker_threads = 0;
+            uint32_t tcp_accept_queue_limit = 4096;
             cluster::TransportMode transport_mode = cluster::TransportMode::TLS;
             ApiTlsOptions tls;
         } api;

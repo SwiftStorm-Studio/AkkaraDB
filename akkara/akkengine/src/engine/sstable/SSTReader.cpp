@@ -107,7 +107,8 @@ namespace akkaradb::engine::sst {
                     if (!file_) { return false; }
 
                     read_at(0, &header_, sizeof(header_));
-                    if (header_.magic != SST_MAGIC_V2 || header_.version != SST_VERSION_V2 || header_.header_size != sizeof(SSTFileHeaderV2)) { return false; }
+                    if (header_.magic != SST_MAGIC_V2 || header_.version != SST_VERSION_V2 || header_.header_size != sizeof(
+                        SSTFileHeaderV2)) { return false; }
                     const uint32_t stored = header_.crc32c;
                     header_.crc32c = 0;
                     const uint32_t computed = cpu::CRC32C(reinterpret_cast<const std::byte*>(&header_), sizeof(header_));
@@ -120,8 +121,8 @@ namespace akkaradb::engine::sst {
                     const uint32_t stored_footer = footer.footer_crc32c;
                     footer.footer_crc32c = 0;
                     const uint32_t computed_footer = cpu::CRC32C(reinterpret_cast<const std::byte*>(&footer), sizeof(footer));
-                    if (stored_footer != computed_footer || footer.magic != SST_FOOTER_MAGIC_V2 || footer.version != SST_VERSION_V2 || footer.header_crc32c !=
-                        stored) { return false; }
+                    if (stored_footer != computed_footer || footer.magic != SST_FOOTER_MAGIC_V2 || footer.version != SST_VERSION_V2 ||
+                        footer.header_crc32c != stored) { return false; }
 
                     index_.resize(static_cast<size_t>(header_.block_count));
                     if (!index_.empty()) { read_at(header_.index_offset, index_.data(), index_.size() * sizeof(SSTBlockIndexEntryV2)); }
@@ -431,7 +432,10 @@ namespace akkaradb::engine::sst {
 
     std::optional<SSTRecord> SSTReader::get(std::span<const uint8_t> key) const { return impl_->get(key); }
     std::optional<bool> SSTReader::contains(std::span<const uint8_t> key) const { return impl_->contains(key); }
-    std::optional<bool> SSTReader::get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const { return impl_->get_into(key, out); }
+
+    std::optional<bool> SSTReader::get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
+        return impl_->get_into(key, out);
+    }
 
     core::ArenaGenerator<SSTRecord> SSTReader::scan(std::span<const uint8_t> start_key, std::span<const uint8_t> end_key) const {
         return impl_->scan(std::vector<uint8_t>(start_key.begin(), start_key.end()), std::vector<uint8_t>(end_key.begin(), end_key.end()));

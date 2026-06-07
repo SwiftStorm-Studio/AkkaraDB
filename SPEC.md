@@ -653,6 +653,8 @@ bodies.
 | `Mirror`     | Writes are mirrored to all data-bearing nodes    |
 | `Stripe`     | Keys are assigned to data nodes by router policy |
 
+`Stripe` routing primitives exist, but `ClusterRuntime` currently rejects Stripe configs because distributed write forwarding and ownership migration are not implemented yet.
+
 ### 12.2 Node Roles
 
 | Role         | Description                          |
@@ -674,14 +676,19 @@ bodies.
 Cluster config is stored as `{data_dir}/cluster.akcc` by default and uses magic `0x35434B41` ("AKC5"), version 1. It stores:
 
 - node ids
-- host names
+- host names advertised to peer nodes
 - data ports
 - replication ports
 - node capabilities
 - replication mode
 - acknowledgement policy
 
-Runtime-only TLS/transport paths are not serialized in the config file. They live in `ClusterRuntimeOptions`.
+Runtime-only TLS/transport paths and the local replication bind host are not serialized in the config file. They live in `ClusterRuntimeOptions`.
+The advertised `NodeInfo.host` is the address peers dial; `ClusterRuntimeOptions::repl_bind_host` is the local address the primary listener binds to, defaulting to `0.0.0.0`.
+Replication links run over TCP. `TransportMode::TLS` wraps the TCP stream with mbedTLS; `TransportMode::Plain` is accepted only when every advertised node host is loopback or LAN/private address space.
+
+Primary selection is deterministic: the coordinator-eligible node with the lowest node id becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not a quorum consensus protocol and does not provide automatic split-brain-safe failover.
+Changing the configured primary for non-mirrored ownership requires an explicit migration plan: the new primary must not retain unrelated user data, and owned data must be moved back to the node selected by the placement policy before traffic is accepted.
 
 ### 12.5 Runtime Integration
 
@@ -769,6 +776,16 @@ If `paths.data_dir` is set, missing component paths are derived as:
 | `force_flush_on_close` | true    | Force MemTable flush during close          |
 | `force_sync_on_close`  | true    | Force WAL sync during close                |
 | `sst_promote_reads`    | false   | Promote SST read hits into MemTable        |
+
+### 14.5 Cluster Runtime Options
+
+| Field            | Default   | Description                                      |
+|------------------|-----------|--------------------------------------------------|
+| `transport_mode` | `TLS`     | Replication transport: `TLS` or `Plain`          |
+| `repl_bind_host` | `0.0.0.0` | Local address used by the primary repl listener  |
+| `tls`            | empty     | Runtime-only certificate/key/CA verification set |
+
+`Plain` replication is rejected for non-private advertised node hosts. Hostnames other than `localhost` are treated as non-private because the runtime does not resolve DNS during configuration validation.
 
 ---
 

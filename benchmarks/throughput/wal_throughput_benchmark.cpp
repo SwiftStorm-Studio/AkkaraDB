@@ -1,4 +1,25 @@
 /*
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+// benchmarks/throughput/wal_throughput_benchmark.cpp
+#include "TestErrorHandlers.hpp"
+
+/*
  * Sharded WAL throughput benchmark (size sweep).
  *
  * Measures:
@@ -452,6 +473,8 @@ namespace {
 } // namespace
 
 int main(int argc, char** argv) {
+    akkara::test::install_msvc_test_error_handlers();
+
     int ops_per_case = 200000;
     int writer_threads = 16;
     bool use_prehash = false;

@@ -1,9 +1,27 @@
 /*
- * AkkaraDB - Cluster smoke test
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+// benchmarks/smoke/cluster_smoke_test.cpp
+#include "TestErrorHandlers.hpp"
 
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterManager.hpp"
+#include "akk/engine/cluster/ClusterRuntime.hpp"
 #include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
@@ -19,6 +37,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace akkaradb::engine::cluster;
@@ -188,7 +207,8 @@ namespace {
     }
 
     void test_manager_election() {
-        const auto dir = make_temp_dir("manager");
+        const auto dir1 = make_temp_dir("manager1");
+        const auto dir2 = make_temp_dir("manager2");
         const ClusterConfig cfg{
             {
                 node(1, 19781, 19801, static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing)),
@@ -198,8 +218,8 @@ namespace {
             AckPolicy{},
         };
 
-        auto primary = ClusterManager::create(dir, cfg, 1);
-        auto replica = ClusterManager::create(dir, cfg, 2);
+        auto primary = ClusterManager::create(dir1, cfg, 1);
+        auto replica = ClusterManager::create(dir2, cfg, 2);
         std::atomic<int> primary_changes{0};
         primary->set_role_change_callback([&](NodeRole role) {
             if (role == NodeRole::Primary) {
@@ -212,6 +232,8 @@ namespace {
         replica->start();
         assert(replica->role() == NodeRole::Replica);
         assert(primary_changes.load() >= 1);
+        assert(replica->primary_host() == "127.0.0.1");
+        assert(replica->primary_repl_port() == 19801);
 
         replica->close();
         primary->close();
@@ -271,6 +293,7 @@ namespace {
     void test_transport_default() {
         ClusterRuntimeOptions options{};
         assert(options.transport_mode == TransportMode::TLS);
+        assert(options.repl_bind_host == "0.0.0.0");
 
         constexpr uint16_t port = 19972;
         const AckPolicy all{.mode = AckPolicyMode::All, .quorum = 0};
@@ -308,15 +331,72 @@ namespace {
         client->close();
         server->close();
     }
+
+    void test_plain_transport_rejects_wan_hosts() {
+        const auto dir = make_temp_dir("plain_wan_reject");
+        const ClusterConfig cfg{
+            {
+                NodeInfo{
+                    .node_id = 1,
+                    .host = "203.0.113.10",
+                    .data_port = 19791,
+                    .repl_port = 19811,
+                    .capabilities = static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing),
+                },
+                node(2, 19792, 19812, static_cast<uint32_t>(NodeCapability::DataBearing)),
+            },
+            ReplicationMode::Mirror,
+            AckPolicy{},
+        };
+
+        ClusterRuntimeOptions plain{};
+        plain.transport_mode = TransportMode::Plain;
+
+        bool rejected = false;
+        try {
+            ClusterEngineCallbacks callbacks;
+            (void)ClusterRuntime::create(dir, cfg, 1, std::move(callbacks), plain);
+        }
+        catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+
+    void test_runtime_rejects_stripe_until_routing_exists() {
+        const auto dir = make_temp_dir("stripe_runtime_reject");
+        const ClusterConfig cfg{
+            {
+                node(1, 19793, 19813, static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(2, 19794, 19814, static_cast<uint32_t>(NodeCapability::DataBearing)),
+            },
+            ReplicationMode::Stripe,
+            AckPolicy{},
+        };
+
+        bool rejected = false;
+        try {
+            ClusterEngineCallbacks callbacks;
+            (void)ClusterRuntime::create(dir, cfg, 1, std::move(callbacks), ClusterRuntimeOptions{});
+        }
+        catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
 } // namespace
 
 int main() {
+    akkara::test::install_msvc_test_error_handlers();
+
     test_config_roundtrip_and_rejection();
     test_router();
     test_framing();
     test_manager_election();
     test_plain_replication();
     test_transport_default();
+    test_plain_transport_rejects_wan_hosts();
+    test_runtime_rejects_stripe_until_routing_exists();
     std::printf("cluster smoke test passed\n");
     return 0;
 }

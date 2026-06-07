@@ -112,7 +112,9 @@ namespace akkaradb::engine::memtable {
 
             const uint32_t effective_cap = next_pow2_clamped(static_cast<uint64_t>(auto_cap == 0 ? 128 : auto_cap), 2, 256);
 
-            const size_t n = expected_concurrent_writers > 0 ? expected_concurrent_writers : std::max<size_t>(2, std::thread::hardware_concurrency());
+            const size_t n = expected_concurrent_writers > 0
+                                 ? expected_concurrent_writers
+                                 : std::max<size_t>(2, std::thread::hardware_concurrency());
 
             const uint64_t target = n <= 1 ? 1ULL : static_cast<uint64_t>(n) * 4ULL;
             return next_pow2_clamped(target, 2, effective_cap);
@@ -232,9 +234,11 @@ namespace akkaradb::engine::memtable {
 
                             std::vector<RecordView> records;
                             records.reserve(item.table->entryCount());
-                            for (const RecordView& rec : item.table->iterator(core::ByteView{}, core::ByteView{}, std::numeric_limits<uint64_t>::max())) {
-                                records.push_back(rec);
-                            }
+                            for (const RecordView& rec : item.table->iterator(
+                                     core::ByteView{},
+                                     core::ByteView{},
+                                     std::numeric_limits<uint64_t>::max()
+                                 )) { records.push_back(rec); }
                             if (callback_) { callback_(std::span<const RecordView>{records}); }
                             if (on_done_) { on_done_(item.id); }
 
@@ -258,7 +262,9 @@ namespace akkaradb::engine::memtable {
 
             explicit Impl(Options options)
                 : options_{std::move(options)},
-                  shard_count_{resolve_shard_count(options_.shard_count, options_.expected_concurrent_writers, options_.auto_shard_count_cap)},
+                  shard_count_{
+                      resolve_shard_count(options_.shard_count, options_.expected_concurrent_writers, options_.auto_shard_count_cap)
+                  },
                   threshold_bytes_per_shard_{options_.threshold_bytes_per_shard},
                   seq_gen_{1} {
                 if (!options_.backend_factory) { options_.backend_factory = []() { return std::make_unique<SkipListMemTable>(); }; }
@@ -340,11 +346,17 @@ namespace akkaradb::engine::memtable {
 
                 if (published->active && published->active->get(key_view, snapshot_seq, out)) { return true; }
 
-                for (const auto& immutable : published->immutables) { if (immutable && immutable->get(key_view, snapshot_seq, out)) { return true; } }
+                for (const auto& immutable : published->immutables) {
+                    if (immutable && immutable->get(key_view, snapshot_seq, out)) { return true; }
+                }
                 return false;
             }
 
-            [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const {
+            [[nodiscard]] std::optional<bool> get_into(
+                std::span<const uint8_t> key,
+                uint64_t snapshot_seq,
+                std::vector<uint8_t>& out
+            ) const {
                 RecordView view;
                 if (!get(key, snapshot_seq, &view, 0)) { return std::nullopt; }
                 if (view.is_tombstone()) { return false; }
@@ -454,7 +466,9 @@ namespace akkaradb::engine::memtable {
             void advance_seq(uint64_t observed_seq) noexcept {
                 uint64_t current = seq_gen_.load(std::memory_order_relaxed);
                 while (current <= observed_seq) {
-                    if (seq_gen_.compare_exchange_weak(current, observed_seq + 1, std::memory_order_relaxed, std::memory_order_relaxed)) { break; }
+                    if (seq_gen_.compare_exchange_weak(current, observed_seq + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                        break;
+                    }
                 }
             }
 
@@ -626,7 +640,9 @@ namespace akkaradb::engine::memtable {
 
     void MemTable::advance_seq(uint64_t seq) noexcept { impl_->advance_seq(seq); }
 
-    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const { return impl_->get(key, snapshot_seq, out, 0); }
+    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const {
+        return impl_->get(key, snapshot_seq, out, 0);
+    }
 
     bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const {
         return impl_->get(key, snapshot_seq, out, precomputed_fp64);
@@ -636,9 +652,13 @@ namespace akkaradb::engine::memtable {
         return impl_->get_into(key, snapshot_seq, out);
     }
 
-    std::optional<bool> MemTable::contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const { return impl_->contains(key, snapshot_seq); }
+    std::optional<bool> MemTable::contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const {
+        return impl_->contains(key, snapshot_seq);
+    }
 
-    MemTable::RangeIterator MemTable::iterator(const KeyRange& range, uint64_t snapshot_seq) const { return impl_->iterator(range, snapshot_seq); }
+    MemTable::RangeIterator MemTable::iterator(const KeyRange& range, uint64_t snapshot_seq) const {
+        return impl_->iterator(range, snapshot_seq);
+    }
 
     uint64_t MemTable::next_seq() noexcept { return impl_->next_seq(); }
 

@@ -28,7 +28,9 @@ namespace akkaradb::engine::manifest {
 
     namespace {
         uint64_t now_us() noexcept {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count());
         }
 
         // Write a little-endian u16 into a byte buffer at offset.
@@ -64,15 +66,15 @@ namespace akkaradb::engine::manifest {
 
         // Read a little-endian u32 from a byte buffer at offset.
         inline uint32_t read_u32(const uint8_t* buf, size_t off) noexcept {
-            return static_cast<uint32_t>(buf[off]) | (static_cast<uint32_t>(buf[off + 1]) << 8) | (static_cast<uint32_t>(buf[off + 2]) << 16) | (static_cast<
-                uint32_t>(buf[off + 3]) << 24);
+            return static_cast<uint32_t>(buf[off]) | (static_cast<uint32_t>(buf[off + 1]) << 8) | (static_cast<uint32_t>(buf[off + 2]) <<
+                16) | (static_cast<uint32_t>(buf[off + 3]) << 24);
         }
 
         // Read a little-endian u64 from a byte buffer at offset.
         inline uint64_t read_u64(const uint8_t* buf, size_t off) noexcept {
-            return static_cast<uint64_t>(buf[off]) | (static_cast<uint64_t>(buf[off + 1]) << 8) | (static_cast<uint64_t>(buf[off + 2]) << 16) | (static_cast<
-                uint64_t>(buf[off + 3]) << 24) | (static_cast<uint64_t>(buf[off + 4]) << 32) | (static_cast<uint64_t>(buf[off + 5]) << 40) | (static_cast<
-                uint64_t>(buf[off + 6]) << 48) | (static_cast<uint64_t>(buf[off + 7]) << 56);
+            return static_cast<uint64_t>(buf[off]) | (static_cast<uint64_t>(buf[off + 1]) << 8) | (static_cast<uint64_t>(buf[off + 2]) <<
+                16) | (static_cast<uint64_t>(buf[off + 3]) << 24) | (static_cast<uint64_t>(buf[off + 4]) << 32) | (static_cast<uint64_t>(buf
+                [off + 5]) << 40) | (static_cast<uint64_t>(buf[off + 6]) << 48) | (static_cast<uint64_t>(buf[off + 7]) << 56);
         }
 
         // Append a string with a u16 length prefix.
@@ -461,7 +463,11 @@ namespace akkaradb::engine::manifest {
         return true;
     }
 
-    std::vector<uint8_t> encode_compaction_commit(uint64_t ts_us, const std::vector<std::string>& output_files, const std::vector<std::string>& input_files) {
+    std::vector<uint8_t> encode_compaction_commit(
+        uint64_t ts_us,
+        const std::vector<std::string>& output_files,
+        const std::vector<std::string>& input_files
+    ) {
         const auto output_count = static_cast<uint8_t>(output_files.size());
         const auto input_count = static_cast<uint8_t>(input_files.size());
 

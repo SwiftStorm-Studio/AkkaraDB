@@ -28,12 +28,17 @@
 
 namespace akkaradb::engine::cluster {
     /**
-     * ClusterManager - Elects and monitors the local cluster role.
+     * ClusterManager - Selects the local cluster role.
      *
-     * ClusterManager owns the lightweight primary-election loop.  In cluster
-     * mode, coordinator-eligible nodes try to acquire PRIMARY.lock under the
-     * database directory.  The holder becomes Primary; other nodes become
-     * Replica and monitor the primary replication endpoint for failover.
+     * ClusterManager owns the lightweight primary-election loop. In cluster
+     * mode, every node selects the same primary from the durable config: the
+     * coordinator-eligible node with the lowest node_id. Other nodes become
+     * Replica and connect to that configured primary endpoint through the
+     * replication client.
+     *
+     * This is intentionally deterministic and LAN/WAN-safe, but it is not a
+     * consensus protocol. Automatic failover across network partitions requires
+     * a quorum-based coordinator above this layer.
      *
      * Thread-safety: public methods are safe to call from different threads
      * unless otherwise noted.  start() and close() are idempotent.
@@ -51,7 +56,7 @@ namespace akkaradb::engine::cluster {
             /**
              * Creates a manager for the given cluster config.
              *
-             * @param db_dir       Directory containing PRIMARY.lock.
+             * @param db_dir       Database directory retained for API compatibility.
              * @param config       Valid cluster membership and policy.
              * @param self_node_id Stable id of the local node.
              * @throws std::runtime_error if self_node_id is not present in a
@@ -69,15 +74,14 @@ namespace akkaradb::engine::cluster {
             void set_role_change_callback(RoleChangeCallback callback);
 
             /**
-             * Starts role election and primary monitoring.
+             * Starts role election.
              *
              * Standalone configs immediately move to NodeRole::Standalone.
-             * Cluster configs create db_dir if needed and start the monitor
-             * thread after the first election.
+             * Cluster configs select the primary deterministically from config.
              */
             void start();
 
-            /** Stops monitoring, releases PRIMARY.lock if held, and joins workers. */
+            /** Stops the manager. */
             void close();
 
             /** Returns the current local role. */

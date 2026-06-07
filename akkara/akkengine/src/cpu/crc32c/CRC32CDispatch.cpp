@@ -43,7 +43,9 @@ namespace akkaradb::cpu {
     #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86)
     uint32_t CRC32C_X86_SSE42(const std::byte* data, size_t length) noexcept;
     uint32_t CRC32C_X86_AVX2(const std::byte* data, size_t length) noexcept;
+    #if defined(__x86_64__) || defined(_M_X64)
     uint32_t CRC32C_X86_AVX512(const std::byte* data, size_t length) noexcept;
+    #endif
     #endif
 
     #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
@@ -63,43 +65,39 @@ namespace akkaradb::cpu {
 
         [[nodiscard]] CpuRegs Cpuid(int leaf, int subleaf = 0) noexcept {
             CpuRegs regs{};
-        #if defined(__GNUC__) || defined(__clang__)
-            unsigned int eax = 0;
-            unsigned int ebx = 0;
-            unsigned int ecx = 0;
-            unsigned int edx = 0;
-            __cpuid_count(static_cast<unsigned int>(leaf), static_cast<unsigned int>(subleaf), eax, ebx, ecx, edx);
-            regs.eax = static_cast<int>(eax);
-            regs.ebx = static_cast<int>(ebx);
-            regs.ecx = static_cast<int>(ecx);
-            regs.edx = static_cast<int>(edx);
-        #elif defined(_MSC_VER)
+            #if defined(__GNUC__) || defined(__clang__)
+            unsigned int eax = 0; unsigned int ebx = 0; unsigned int ecx = 0; unsigned int edx = 0; __cpuid_count(
+                static_cast<unsigned int>(leaf),
+                static_cast<unsigned int>(subleaf),
+                eax,
+                ebx,
+                ecx,
+                edx
+            ); regs.eax = static_cast<int>(eax); regs.ebx = static_cast<int>(ebx); regs.ecx = static_cast<int>(ecx); regs.edx = static_cast<
+                int>(edx);
+            #elif defined(_MSC_VER)
             int raw[4]{};
             __cpuidex(raw, leaf, subleaf);
             regs.eax = raw[0];
             regs.ebx = raw[1];
             regs.ecx = raw[2];
             regs.edx = raw[3];
-        #endif
+            #endif
             return regs;
         }
 
         [[nodiscard]] uint64_t Xgetbv0() noexcept {
-        #if defined(_MSC_VER)
+            #if defined(_MSC_VER)
             return _xgetbv(0);
-        #elif defined(__GNUC__) || defined(__clang__)
-            uint32_t eax = 0;
-            uint32_t edx = 0;
-            __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
-            return (static_cast<uint64_t>(edx) << 32) | eax;
-        #else
+            #elif defined(__GNUC__) || defined(__clang__)
+            uint32_t eax = 0; uint32_t edx = 0; __asm__ volatile ("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0)); return (static_cast<uint64_t>(
+                edx) << 32) | eax;
+            #else
             return 0;
-        #endif
+            #endif
         }
 
-        [[nodiscard]] bool HasBit(int value, int bit) noexcept {
-            return (static_cast<uint32_t>(value) & (uint32_t{1} << bit)) != 0;
-        }
+        [[nodiscard]] bool HasBit(int value, int bit) noexcept { return (static_cast<uint32_t>(value) & (uint32_t{1} << bit)) != 0; }
 
         [[nodiscard]] bool SupportsSSE42() noexcept {
             const auto regs = Cpuid(1);
@@ -118,16 +116,17 @@ namespace akkaradb::cpu {
             return HasBit(regs.ebx, 5);
         }
 
+        #if defined(__x86_64__) || defined(_M_X64)
         [[nodiscard]] bool SupportsAVX512() noexcept {
+            if (!SupportsSSE42()) { return false; }
             const auto leaf1 = Cpuid(1);
             if (!HasBit(leaf1.ecx, 26) || !HasBit(leaf1.ecx, 27) || !HasBit(leaf1.ecx, 28)) { return false; }
             if ((Xgetbv0() & 0xE6) != 0xE6) { return false; }
 
             const auto leaf7 = Cpuid(7, 0);
-            const bool avx512f = HasBit(leaf7.ebx, 16);
-            const bool vpclmulqdq = HasBit(leaf7.ecx, 10);
-            return avx512f && vpclmulqdq;
+            return HasBit(leaf7.ebx, 16) && HasBit(leaf7.ebx, 31) && HasBit(leaf7.ecx, 10);
         }
+        #endif
         #endif
 
         #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
@@ -152,7 +151,9 @@ namespace akkaradb::cpu {
          */
         [[nodiscard]] Fn Resolve() noexcept {
             #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86)
+            #if defined(__x86_64__) || defined(_M_X64)
             if (SupportsAVX512()) { return &CRC32C_X86_AVX512; }
+            #endif
             if (SupportsAVX2()) { return &CRC32C_X86_AVX2; }
             if (SupportsSSE42()) { return &CRC32C_X86_SSE42; }
             #endif
