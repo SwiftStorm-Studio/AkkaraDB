@@ -156,6 +156,8 @@ namespace akkaradb::engine {
 
     class AkkEngine::Impl {
         public:
+            explicit Impl(AkkEngineOptions options_in) : opts{std::move(options_in)} {}
+
             AkkEngineOptions opts;
             std::atomic<bool> closed{false};
             uint64_t node_id = 0;
@@ -284,9 +286,8 @@ namespace akkaradb::engine {
         {
             new AkkEngine()
         };
-        engine->impl_ = std::make_unique<Impl>();
+        engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
-        impl.opts = std::move(options);
         impl.node_id = load_or_create_node_id(impl.opts.paths.node_id_path);
 
         if (impl.opts.components.manifest_enabled && !impl.opts.paths.manifest_path.empty()) {
@@ -362,49 +363,100 @@ namespace akkaradb::engine {
 
     void AkkEngine::put(std::span<const uint8_t> key, std::span<const uint8_t> value) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        std::lock_guard lock(impl_->write_mu);
 
-        const uint64_t seq = impl_->memtable->reserve_seq(1);
+        uint64_t seq = 0;
         uint8_t flags = core::MemHdr16::FLAG_NORMAL;
-        std::vector<uint8_t> stored = impl_->maybe_externalize(seq, value, flags);
-        impl_->puts_total.fetch_add(1, std::memory_order_relaxed);
-        if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blob_puts_total.fetch_add(1, std::memory_order_relaxed); }
-        impl_->append_all(seq, key, stored, flags, impl_->node_id);
+        std::vector<uint8_t> stored;
+        {
+            std::lock_guard lock(impl_->write_mu);
+            seq = impl_->memtable->reserve_seq(1);
+            stored = impl_->maybe_externalize(seq, value, flags);
+            impl_->puts_total.fetch_add(1, std::memory_order_relaxed);
+            if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blob_puts_total.fetch_add(1, std::memory_order_relaxed); }
+            impl_->append_all(seq, key, stored, flags, impl_->node_id);
+        }
         if (impl_->cluster_runtime) { impl_->cluster_runtime->ship_entry(seq, cluster::ReplOpType::Put, key, stored, flags, impl_->node_id); }
     }
 
     void AkkEngine::put_hinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t mini_key) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        std::lock_guard lock(impl_->write_mu);
 
-        const uint64_t seq = impl_->memtable->reserve_seq(1);
+        uint64_t seq = 0;
         uint8_t flags = core::MemHdr16::FLAG_NORMAL;
-        std::vector<uint8_t> stored = impl_->maybe_externalize(seq, value, flags);
-        impl_->puts_total.fetch_add(1, std::memory_order_relaxed);
-        if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blob_puts_total.fetch_add(1, std::memory_order_relaxed); }
-        impl_->append_all(seq, key, stored, flags, impl_->node_id, fp64, mini_key);
+        std::vector<uint8_t> stored;
+        {
+            std::lock_guard lock(impl_->write_mu);
+            seq = impl_->memtable->reserve_seq(1);
+            stored = impl_->maybe_externalize(seq, value, flags);
+            impl_->puts_total.fetch_add(1, std::memory_order_relaxed);
+            if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blob_puts_total.fetch_add(1, std::memory_order_relaxed); }
+            impl_->append_all(seq, key, stored, flags, impl_->node_id, fp64, mini_key);
+        }
         if (impl_->cluster_runtime) { impl_->cluster_runtime->ship_entry(seq, cluster::ReplOpType::Put, key, stored, flags, impl_->node_id); }
+    }
+
+    void AkkEngine::put_batch(std::span<const BatchPutEntry> entries) {
+        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (entries.empty()) { return; }
+
+        struct PendingShip {
+            uint64_t seq = 0;
+            std::span<const uint8_t> key;
+            std::vector<uint8_t> stored;
+            uint8_t flags = core::MemHdr16::FLAG_NORMAL;
+        };
+
+        std::vector<PendingShip> pending;
+        pending.reserve(entries.size());
+
+        {
+            std::lock_guard lock(impl_->write_mu);
+            const uint64_t base_seq = impl_->memtable->reserve_seq(entries.size());
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const BatchPutEntry& entry = entries[i];
+                PendingShip item;
+                item.seq = base_seq + i;
+                item.key = entry.key;
+                item.stored = impl_->maybe_externalize(item.seq, entry.value, item.flags);
+                impl_->puts_total.fetch_add(1, std::memory_order_relaxed);
+                if ((item.flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blob_puts_total.fetch_add(1, std::memory_order_relaxed); }
+                impl_->append_all(item.seq, item.key, item.stored, item.flags, impl_->node_id);
+                pending.push_back(std::move(item));
+            }
+        }
+
+        if (impl_->cluster_runtime) {
+            for (const PendingShip& item : pending) {
+                impl_->cluster_runtime->ship_entry(item.seq, cluster::ReplOpType::Put, item.key, item.stored, item.flags, impl_->node_id);
+            }
+        }
     }
 
     void AkkEngine::remove(std::span<const uint8_t> key) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        std::lock_guard lock(impl_->write_mu);
 
-        const uint64_t seq = impl_->memtable->reserve_seq(1);
+        uint64_t seq = 0;
         constexpr uint8_t flags = core::MemHdr16::FLAG_TOMBSTONE;
-        impl_->removes_total.fetch_add(1, std::memory_order_relaxed);
-        impl_->append_all(seq, key, {}, flags, impl_->node_id);
+        {
+            std::lock_guard lock(impl_->write_mu);
+            seq = impl_->memtable->reserve_seq(1);
+            impl_->removes_total.fetch_add(1, std::memory_order_relaxed);
+            impl_->append_all(seq, key, {}, flags, impl_->node_id);
+        }
         if (impl_->cluster_runtime) { impl_->cluster_runtime->ship_entry(seq, cluster::ReplOpType::Remove, key, {}, flags, impl_->node_id); }
     }
 
     void AkkEngine::remove_hinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t mini_key) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        std::lock_guard lock(impl_->write_mu);
 
-        const uint64_t seq = impl_->memtable->reserve_seq(1);
+        uint64_t seq = 0;
         constexpr uint8_t flags = core::MemHdr16::FLAG_TOMBSTONE;
-        impl_->removes_total.fetch_add(1, std::memory_order_relaxed);
-        impl_->append_all(seq, key, {}, flags, impl_->node_id, fp64, mini_key);
+        {
+            std::lock_guard lock(impl_->write_mu);
+            seq = impl_->memtable->reserve_seq(1);
+            impl_->removes_total.fetch_add(1, std::memory_order_relaxed);
+            impl_->append_all(seq, key, {}, flags, impl_->node_id, fp64, mini_key);
+        }
         if (impl_->cluster_runtime) { impl_->cluster_runtime->ship_entry(seq, cluster::ReplOpType::Remove, key, {}, flags, impl_->node_id); }
     }
 
@@ -443,6 +495,21 @@ namespace akkaradb::engine {
         }
         impl_->gets_miss.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
+    }
+
+    std::vector<AkkEngine::BatchGetResult> AkkEngine::get_batch(std::span<const std::span<const uint8_t>> keys) const {
+        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+
+        std::vector<BatchGetResult> out;
+        out.reserve(keys.size());
+
+        for (const auto& key : keys) {
+            BatchGetResult result;
+            result.found = get_into(key, result.value);
+            out.push_back(std::move(result));
+        }
+
+        return out;
     }
 
     bool AkkEngine::exists(std::span<const uint8_t> key) const {
@@ -645,6 +712,8 @@ namespace akkaradb::engine {
         out.exists_total = impl_->exists_total.load(std::memory_order_relaxed);
         out.scans_total = impl_->scans_total.load(std::memory_order_relaxed);
         out.blob_puts_total = impl_->blob_puts_total.load(std::memory_order_relaxed);
+        out.api.enabled = impl_->opts.components.api_enabled;
+        if (impl_->api_server) { out.api = impl_->api_server->stats(); }
 
         if (impl_->memtable) {
             const auto snap = impl_->memtable->snapshot();

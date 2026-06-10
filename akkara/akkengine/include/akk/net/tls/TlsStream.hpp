@@ -60,6 +60,14 @@ namespace akkaradb::net {
              */
             void connect(const char* host, uint16_t port, const TlsConfig& config = {});
 
+            void connect(
+                const char* host,
+                uint16_t port,
+                const TlsConfig& config,
+                uint32_t read_timeout_ms,
+                uint32_t write_timeout_ms
+            );
+
             /**
              * @brief Adopt an accepted TCP socket and complete a server-side TLS handshake.
              *

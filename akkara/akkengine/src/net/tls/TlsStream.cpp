@@ -29,6 +29,7 @@
 #include <cerrno>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -128,6 +129,37 @@ namespace akkaradb::net {
             #endif
         }
 
+        void set_native_socket_timeout(native_socket_t socket, int option, uint32_t timeout_ms) noexcept {
+            if (!socket_valid(socket) || timeout_ms == 0) { return; }
+
+            #ifdef _WIN32
+            const DWORD value = timeout_ms;
+            (void)::setsockopt(socket, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
+            #else
+            timeval value{};
+            value.tv_sec = static_cast<time_t>(timeout_ms / 1000u);
+            value.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000u) * 1000u);
+            (void)::setsockopt(socket, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
+            #endif
+        }
+
+        void apply_native_socket_timeouts(native_socket_t socket, uint32_t read_timeout_ms, uint32_t write_timeout_ms) noexcept {
+            set_native_socket_timeout(socket, SO_RCVTIMEO, read_timeout_ms);
+            set_native_socket_timeout(socket, SO_SNDTIMEO, write_timeout_ms);
+        }
+
+        [[nodiscard]] int send_no_sigpipe_flags() noexcept {
+            #ifdef _WIN32
+            return 0;
+            #else
+            #ifdef MSG_NOSIGNAL
+            return MSG_NOSIGNAL;
+            #else
+            return 0;
+            #endif
+            #endif
+        }
+
         void ensure_tls_socket_runtime() {
             #ifdef _WIN32
             static std::once_flag once;
@@ -198,13 +230,16 @@ namespace akkaradb::net {
             const int n = ::send(bio->socket, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0);
             if (n < 0) {
                 const int err = WSAGetLastError();
-                if (err == WSAEWOULDBLOCK || err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
+                if (err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
+                if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) { return MBEDTLS_ERR_NET_SEND_FAILED; }
                 if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_SEND_FAILED;
             }
             #else
-            const ssize_t n = ::send(bio->socket, buf, len, 0); if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
+            const ssize_t n = ::send(bio->socket, buf, len, send_no_sigpipe_flags());
+            if (n < 0) {
+                if (errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) { return MBEDTLS_ERR_NET_SEND_FAILED; }
                 if (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_SEND_FAILED;
             }
@@ -219,13 +254,15 @@ namespace akkaradb::net {
             const int n = ::recv(bio->socket, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
             if (n < 0) {
                 const int err = WSAGetLastError();
-                if (err == WSAEWOULDBLOCK || err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
+                if (err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
+                if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) { return MBEDTLS_ERR_NET_RECV_FAILED; }
                 if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_RECV_FAILED;
             }
             #else
             const ssize_t n = ::recv(bio->socket, buf, len, 0); if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
+                if (errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) { return MBEDTLS_ERR_NET_RECV_FAILED; }
                 if (errno == ECONNRESET || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
                 return MBEDTLS_ERR_NET_RECV_FAILED;
             }
@@ -281,12 +318,23 @@ namespace akkaradb::net {
     }
 
     void TlsStream::connect(const char* host, uint16_t port, const TlsConfig& config) {
+        connect(host, port, config, 0, 0);
+    }
+
+    void TlsStream::connect(
+        const char* host,
+        uint16_t port,
+        const TlsConfig& config,
+        uint32_t read_timeout_ms,
+        uint32_t write_timeout_ms
+    ) {
         ensure_tls_socket_runtime();
         close();
         if (host == nullptr) { throw std::invalid_argument("TlsStream::connect: host is null"); }
 
         impl_ = new Impl();
         impl_->bio.socket = connect_native_socket(host, port);
+        apply_native_socket_timeouts(impl_->bio.socket, read_timeout_ms, write_timeout_ms);
 
         try { setup(config, MBEDTLS_SSL_IS_CLIENT, host); }
         catch (...) {

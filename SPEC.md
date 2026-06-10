@@ -580,14 +580,20 @@ Rollback-generated records use `ROLLBACK_NODE = UINT64_MAX` and `VLOG_FLAG_ROLLB
 
 API servers are enabled through `AkkEngineOptions::components.api_enabled`. The server set is controlled by `AkkEngineOptions::api.backends`.
 
-| Field            | Default     | Description                  |
-|------------------|-------------|------------------------------|
-| `backends`       | empty       | Values: `Http`, `Tcp`        |
-| `bind_host`      | empty       | Required when API is enabled |
-| `http_port`      | 7070        | HTTP port                    |
-| `tcp_port`       | 7071        | Binary TCP port              |
-| `transport_mode` | `TLS`       | `TLS` or `Plain`             |
-| `tls`            | empty paths | TLS/PSK options              |
+| Field                  | Default     | Description                                              |
+|------------------------|-------------|----------------------------------------------------------|
+| `backends`             | empty       | Values: `Http`, `Tcp`                                    |
+| `bind_host`            | empty       | Required when API is enabled                             |
+| `http_port`            | 7070        | HTTP port                                                |
+| `tcp_port`             | 7071        | Binary TCP port                                          |
+| `tcp_worker_threads`   | 0           | TCP worker threads. `0` uses hardware concurrency.       |
+| `tcp_accept_queue_limit` | 4096      | Max accepted TCP sockets waiting for a worker.           |
+| `tcp_accept_queue_timeout_ms` | 60000 | Max time a socket may wait in the worker queue. `0` disables it. |
+| `tcp_listen_backlog`   | 1024        | Kernel listen backlog passed to `listen`.                |
+| `tcp_read_timeout_ms`  | 60000       | TCP idle/partial-frame read timeout. `0` disables it.    |
+| `tcp_write_timeout_ms` | 30000       | TCP response write timeout. `0` disables it.             |
+| `transport_mode`       | `TLS`       | `TLS` or `Plain`                                         |
+| `tls`                  | empty paths | TLS/PSK options                                          |
 
 ### 11.2 Binary Protocol v2
 

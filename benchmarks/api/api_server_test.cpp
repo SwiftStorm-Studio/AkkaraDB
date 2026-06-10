@@ -50,6 +50,20 @@ namespace {
         return fallback;
     }
 
+    [[nodiscard]] uint32_t uint32_arg(int argc, char** argv, const char* flag, uint32_t fallback) {
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (std::strcmp(argv[i], flag) == 0) { return static_cast<uint32_t>(std::stoul(argv[i + 1])); }
+        }
+        return fallback;
+    }
+
+    [[nodiscard]] uint64_t uint64_arg(int argc, char** argv, const char* flag, uint64_t fallback) {
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (std::strcmp(argv[i], flag) == 0) { return static_cast<uint64_t>(std::stoull(argv[i + 1])); }
+        }
+        return fallback;
+    }
+
     [[nodiscard]] std::string string_arg(int argc, char** argv, const char* flag, std::string fallback) {
         for (int i = 1; i + 1 < argc; ++i) {
             if (std::strcmp(argv[i], flag) == 0) { return argv[i + 1]; }
@@ -75,6 +89,15 @@ int main(int argc, char** argv) {
 
     const uint16_t http_port = uint16_arg(argc, argv, "--http-port", 7070);
     const uint16_t tcp_port = uint16_arg(argc, argv, "--tcp-port", 7071);
+    const uint32_t tcp_worker_threads = uint32_arg(argc, argv, "--tcp-worker-threads", 0);
+    const uint32_t tcp_accept_queue_limit = uint32_arg(argc, argv, "--tcp-accept-queue-limit", 4096);
+    const uint32_t tcp_accept_queue_timeout_ms = uint32_arg(argc, argv, "--tcp-accept-queue-timeout-ms", 60000);
+    const uint32_t tcp_listen_backlog = uint32_arg(argc, argv, "--tcp-listen-backlog", 1024);
+    const uint32_t tcp_pipeline_batch_limit = uint32_arg(argc, argv, "--tcp-pipeline-batch-limit", 64);
+    const uint32_t tcp_max_batch_items = uint32_arg(argc, argv, "--tcp-max-batch-items", 4096);
+    const uint64_t tcp_max_pending_response_bytes = uint64_arg(argc, argv, "--tcp-max-pending-response-bytes", 8ULL * 1024ULL * 1024ULL);
+    const uint32_t tcp_read_timeout_ms = uint32_arg(argc, argv, "--tcp-read-timeout-ms", 60000);
+    const uint32_t tcp_write_timeout_ms = uint32_arg(argc, argv, "--tcp-write-timeout-ms", 30000);
     const std::string bind_host = string_arg(argc, argv, "--bind", "127.0.0.1");
     const std::string data_dir_arg = string_arg(argc, argv, "--data-dir", default_data_dir().string());
 
@@ -89,6 +112,15 @@ int main(int argc, char** argv) {
     options.api.bind_host = bind_host;
     options.api.http_port = http_port;
     options.api.tcp_port = tcp_port;
+    options.api.tcp_worker_threads = tcp_worker_threads;
+    options.api.tcp_accept_queue_limit = tcp_accept_queue_limit;
+    options.api.tcp_accept_queue_timeout_ms = tcp_accept_queue_timeout_ms;
+    options.api.tcp_listen_backlog = tcp_listen_backlog;
+    options.api.tcp_pipeline_batch_limit = tcp_pipeline_batch_limit;
+    options.api.tcp_max_batch_items = tcp_max_batch_items;
+    options.api.tcp_max_pending_response_bytes = tcp_max_pending_response_bytes;
+    options.api.tcp_read_timeout_ms = tcp_read_timeout_ms;
+    options.api.tcp_write_timeout_ms = tcp_write_timeout_ms;
     options.api.transport_mode = tls ? cluster::TransportMode::TLS : cluster::TransportMode::Plain;
     options.api.backends.clear();
 
@@ -111,7 +143,18 @@ int main(int argc, char** argv) {
             std::printf("  curl -s \"http://%s:%u/v1/ping\"\n", bind_host.c_str(), http_port);
         }
     }
-    if (use_tcp) { std::printf("  TCP  %s:%u (%s)\n", bind_host.c_str(), tcp_port, tls ? "TLS AK5 protocol" : "Plain AK5 protocol"); }
+    if (use_tcp) {
+        std::printf("  TCP  %s:%u (%s)\n", bind_host.c_str(), tcp_port, tls ? "TLS AK5 protocol" : "Plain AK5 protocol");
+        std::printf(
+            "       workers=%u max_batch_items=%u pipeline_batch_limit=%u accept_queue_limit=%u\n",
+            tcp_worker_threads,
+            tcp_max_batch_items,
+            tcp_pipeline_batch_limit,
+            tcp_accept_queue_limit
+        );
+        std::printf("       accept_queue_timeout_ms=%u\n", tcp_accept_queue_timeout_ms);
+        std::printf("       read_timeout_ms=%u write_timeout_ms=%u\n", tcp_read_timeout_ms, tcp_write_timeout_ms);
+    }
     std::printf("\nType \"stop\" and press Enter to shut down.\n\n");
 
     std::string line;

@@ -24,7 +24,6 @@
 #include "akk/net/tls/TlsStream.hpp"
 
 #include <array>
-#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <cstring>
@@ -33,12 +32,15 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace akkaradb::engine;
 using namespace akkaradb::engine::server;
 
 namespace {
+    constexpr uint32_t kSmokeIoTimeoutMs = 5000;
+
     [[nodiscard]] std::span<const uint8_t> bytes(std::string_view value) {
         return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
     }
@@ -97,6 +99,44 @@ namespace {
         return wire;
     }
 
+    template <typename T>
+    void append_plain(std::vector<uint8_t>& out, T value) {
+        const size_t offset = out.size();
+        out.resize(offset + sizeof(T));
+        std::memcpy(out.data() + offset, &value, sizeof(T));
+    }
+
+    void append_bytes(std::vector<uint8_t>& out, std::span<const uint8_t> bytes) {
+        const size_t offset = out.size();
+        out.resize(offset + bytes.size());
+        if (!bytes.empty()) { std::memcpy(out.data() + offset, bytes.data(), bytes.size()); }
+    }
+
+    [[nodiscard]] std::vector<uint8_t> make_batch_put_request(
+        uint32_t request_id,
+        std::span<const std::pair<std::string_view, std::string_view>> items
+    ) {
+        std::vector<uint8_t> payload;
+        append_plain(payload, static_cast<uint32_t>(items.size()));
+        for (const auto& [key, value] : items) {
+            append_plain(payload, static_cast<uint16_t>(key.size()));
+            append_plain(payload, static_cast<uint32_t>(value.size()));
+            append_bytes(payload, bytes(key));
+            append_bytes(payload, bytes(value));
+        }
+        return make_request(request_id, ApiOp::BatchPut, {}, std::span<const uint8_t>{payload.data(), payload.size()});
+    }
+
+    [[nodiscard]] std::vector<uint8_t> make_batch_get_request(uint32_t request_id, std::span<const std::string_view> keys) {
+        std::vector<uint8_t> payload;
+        append_plain(payload, static_cast<uint32_t>(keys.size()));
+        for (const auto key : keys) {
+            append_plain(payload, static_cast<uint16_t>(key.size()));
+            append_bytes(payload, bytes(key));
+        }
+        return make_request(request_id, ApiOp::BatchGet, {}, std::span<const uint8_t>{payload.data(), payload.size()});
+    }
+
     [[nodiscard]] std::vector<uint8_t> u64_le(uint64_t value) {
         std::vector<uint8_t> out(sizeof(value));
         std::memcpy(out.data(), &value, sizeof(value));
@@ -126,9 +166,43 @@ namespace {
         return response;
     }
 
+    struct BatchGetItem {
+        ApiStatus status = ApiStatus::Error;
+        std::vector<uint8_t> value;
+    };
+
+    [[nodiscard]] std::vector<BatchGetItem> decode_batch_get_response(std::span<const uint8_t> payload) {
+        size_t pos = 0;
+        uint32_t count = 0;
+        assert(payload.size() >= sizeof(count));
+        std::memcpy(&count, payload.data(), sizeof(count));
+        pos += sizeof(count);
+
+        std::vector<BatchGetItem> out;
+        out.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            assert(payload.size() - pos >= sizeof(uint8_t) + sizeof(uint32_t));
+            uint8_t status = 0;
+            uint32_t value_len = 0;
+            std::memcpy(&status, payload.data() + pos, sizeof(status));
+            pos += sizeof(status);
+            std::memcpy(&value_len, payload.data() + pos, sizeof(value_len));
+            pos += sizeof(value_len);
+            assert(payload.size() - pos >= value_len);
+
+            BatchGetItem item;
+            item.status = static_cast<ApiStatus>(status);
+            item.value.assign(payload.begin() + static_cast<std::ptrdiff_t>(pos), payload.begin() + static_cast<std::ptrdiff_t>(pos + value_len));
+            pos += value_len;
+            out.push_back(std::move(item));
+        }
+        assert(pos == payload.size());
+        return out;
+    }
+
     [[nodiscard]] std::string http_request(uint16_t port, std::string_view request) {
         akkaradb::net::TlsStream stream;
-        stream.connect("127.0.0.1", port);
+        stream.connect("127.0.0.1", port, {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
         tls_send_all(stream, reinterpret_cast<const uint8_t*>(request.data()), request.size());
 
         std::string response;
@@ -157,7 +231,7 @@ namespace {
 
     void test_tcp(uint16_t port, const std::vector<VersionEntry>& history) {
         akkaradb::net::TlsStream stream;
-        stream.connect("127.0.0.1", port);
+        stream.connect("127.0.0.1", port, {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
 
         auto put = make_request(1, ApiOp::Put, bytes("tcp"), bytes("one"));
         tls_send_all(stream, put.data(), put.size());
@@ -181,12 +255,50 @@ namespace {
         auto p2 = make_request(5, ApiOp::Put, bytes("p2"), bytes("b"));
         tls_send_all(stream, p1.data(), p1.size());
         tls_send_all(stream, p2.data(), p2.size());
-        assert(read_response(stream).status == ApiStatus::Ok);
-        assert(read_response(stream).status == ApiStatus::Ok);
+        auto p1_response = read_response(stream);
+        auto p2_response = read_response(stream);
+        assert(p1_response.status == ApiStatus::Ok);
+        assert(p2_response.status == ApiStatus::Ok);
 
         auto remove = make_request(6, ApiOp::Remove, bytes("tcp"));
         tls_send_all(stream, remove.data(), remove.size());
-        assert(read_response(stream).status == ApiStatus::Ok);
+        auto remove_response = read_response(stream);
+        assert(remove_response.status == ApiStatus::Ok);
+
+        const std::pair<std::string_view, std::string_view> batch_put_items[] = {
+            {"b1", "x"},
+            {"b2", "y"},
+            {"b3", "z"},
+        };
+        auto batch_put = make_batch_put_request(7, std::span<const std::pair<std::string_view, std::string_view>>{batch_put_items});
+        tls_send_all(stream, batch_put.data(), batch_put.size());
+        auto batch_put_response = read_response(stream);
+        assert(batch_put_response.status == ApiStatus::Ok);
+
+        const std::string_view batch_get_keys[] = {"b1", "missing", "b2", "b3"};
+        auto batch_get = make_batch_get_request(8, std::span<const std::string_view>{batch_get_keys});
+        tls_send_all(stream, batch_get.data(), batch_get.size());
+        auto batch_response = read_response(stream);
+        assert(batch_response.status == ApiStatus::Ok);
+        const auto decoded_batch = decode_batch_get_response(batch_response.value);
+        assert(decoded_batch.size() == 4);
+        assert(decoded_batch[0].status == ApiStatus::Ok && text(decoded_batch[0].value) == "x");
+        assert(decoded_batch[1].status == ApiStatus::NotFound);
+        assert(decoded_batch[2].status == ApiStatus::Ok && text(decoded_batch[2].value) == "y");
+        assert(decoded_batch[3].status == ApiStatus::Ok && text(decoded_batch[3].value) == "z");
+
+        std::vector<uint8_t> pipeline;
+        for (uint32_t request_id = 9; request_id < 17; ++request_id) {
+            auto request = make_request(request_id, ApiOp::Get, bytes("b1"));
+            pipeline.insert(pipeline.end(), request.begin(), request.end());
+        }
+        tls_send_all(stream, pipeline.data(), pipeline.size());
+        for (uint32_t request_id = 9; request_id < 17; ++request_id) {
+            auto response = read_response(stream);
+            assert(response.status == ApiStatus::Ok);
+            assert(response.request_id == request_id);
+            assert(text(response.value) == "x");
+        }
     }
 
     void test_http(uint16_t port) {
@@ -239,6 +351,8 @@ int main() {
     options.api.bind_host = "127.0.0.1";
     options.api.http_port = http_port;
     options.api.tcp_port = tcp_port;
+    options.api.tcp_read_timeout_ms = kSmokeIoTimeoutMs;
+    options.api.tcp_write_timeout_ms = kSmokeIoTimeoutMs;
 
     auto engine = AkkEngine::open(options);
     engine->put(bytes("history"), bytes("v1"));

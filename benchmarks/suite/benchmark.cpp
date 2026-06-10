@@ -22,7 +22,6 @@
 #include "akkaradb/AkkaraDB.hpp"
 #include "akk/engine/AkkEngine.hpp"
 
-#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>

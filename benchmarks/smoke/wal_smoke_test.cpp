@@ -25,7 +25,6 @@
 #include "akk/engine/wal/WalRecovery.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>

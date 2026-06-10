@@ -21,7 +21,6 @@
 
 #include "akk/engine/vlog/VersionLog.hpp"
 
-#include <cassert>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>

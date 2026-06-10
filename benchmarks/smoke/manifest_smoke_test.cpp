@@ -21,7 +21,6 @@
 
 #include "akk/engine/manifest/Manifest.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>

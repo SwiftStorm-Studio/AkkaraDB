@@ -27,7 +27,6 @@
 #include "akk/engine/memtable/MemTable.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 
-#include <cassert>
 #include <chrono>
 #include <filesystem>
 #include <format>

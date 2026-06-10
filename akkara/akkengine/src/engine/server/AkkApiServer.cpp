@@ -45,8 +45,14 @@ namespace akkaradb::engine::server {
     AkkApiServer::~AkkApiServer() { close(); }
 
     void AkkApiServer::start() {
-        if (http_) { http_->start(); }
-        if (tcp_) { tcp_->start(); }
+        try {
+            if (http_) { http_->start(); }
+            if (tcp_) { tcp_->start(); }
+        }
+        catch (...) {
+            close();
+            throw;
+        }
     }
 
     void AkkApiServer::close() {
@@ -58,5 +64,13 @@ namespace akkaradb::engine::server {
             tcp_->close();
             tcp_.reset();
         }
+    }
+
+    EngineStats::ApiStats AkkApiServer::stats() const noexcept {
+        EngineStats::ApiStats out;
+        out.enabled = true;
+        if (tcp_) { out = tcp_->stats(); }
+        out.enabled = true;
+        return out;
     }
 }

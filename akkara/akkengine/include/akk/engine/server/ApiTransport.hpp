@@ -28,7 +28,9 @@
 #else
 #include <cerrno>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -38,6 +40,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace akkaradb::engine::server::detail {
@@ -63,6 +66,32 @@ namespace akkaradb::engine::server::detail {
     inline void close_socket(socket_t s) noexcept { if (socket_ok(s)) { ::close(s); } }
     inline void shutdown_socket(socket_t s) noexcept { if (socket_ok(s)) { ::shutdown(s, SHUT_RDWR); } }
     #endif
+
+    inline bool last_accept_error_is_transient() noexcept {
+        #ifdef _WIN32
+        const int err = WSAGetLastError();
+        return err == WSAEINTR || err == WSAECONNRESET;
+        #else
+        const int err = errno;
+        if (err == EINTR || err == ECONNABORTED) { return true; }
+        #ifdef EPROTO
+        if (err == EPROTO) { return true; }
+        #endif
+        return false;
+        #endif
+    }
+
+    inline int send_no_sigpipe_flags() noexcept {
+        #ifdef _WIN32
+        return 0;
+        #else
+        #ifdef MSG_NOSIGNAL
+        return MSG_NOSIGNAL;
+        #else
+        return 0;
+        #endif
+        #endif
+    }
 
     struct TlsConfigStorage {
         std::string cert_path;
@@ -90,7 +119,73 @@ namespace akkaradb::engine::server::detail {
         return storage;
     }
 
-    inline socket_t listen_on(const std::string& host, uint16_t port, const char* label) {
+    struct SocketTuningOptions {
+        uint32_t listen_backlog = 16;
+        uint32_t recv_buffer_bytes = 0;
+        uint32_t send_buffer_bytes = 0;
+        uint32_t read_timeout_ms = 0;
+        uint32_t write_timeout_ms = 0;
+        bool no_delay = false;
+        bool keep_alive = false;
+    };
+
+    inline void set_socket_timeout(socket_t s, int option, uint32_t timeout_ms) noexcept {
+        if (!socket_ok(s) || timeout_ms == 0) { return; }
+
+        #ifdef _WIN32
+        const DWORD value = timeout_ms;
+        (void)::setsockopt(s, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
+        #else
+        timeval value{};
+        value.tv_sec = static_cast<time_t>(timeout_ms / 1000u);
+        value.tv_usec = static_cast<suseconds_t>((timeout_ms % 1000u) * 1000u);
+        (void)::setsockopt(s, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
+        #endif
+    }
+
+    inline void apply_socket_tuning(socket_t s, const SocketTuningOptions& options, bool accepted_socket) noexcept {
+        if (!socket_ok(s)) { return; }
+
+        if (options.recv_buffer_bytes > 0) {
+            const int value = static_cast<int>(options.recv_buffer_bytes);
+            (void)::setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&value), sizeof(value));
+        }
+        if (options.send_buffer_bytes > 0) {
+            const int value = static_cast<int>(options.send_buffer_bytes);
+            (void)::setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&value), sizeof(value));
+        }
+        if (accepted_socket && options.keep_alive) {
+            const int value = 1;
+            (void)::setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&value), sizeof(value));
+        }
+        if (accepted_socket) {
+            set_socket_timeout(s, SO_RCVTIMEO, options.read_timeout_ms);
+            set_socket_timeout(s, SO_SNDTIMEO, options.write_timeout_ms);
+        }
+        if (accepted_socket && options.no_delay) {
+            const int value = 1;
+            (void)::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&value), sizeof(value));
+        }
+    }
+
+    inline SocketTuningOptions make_socket_tuning(const AkkEngineOptions::ApiOptions& options) noexcept {
+        return SocketTuningOptions{
+            options.tcp_listen_backlog,
+            options.tcp_recv_buffer_bytes,
+            options.tcp_send_buffer_bytes,
+            options.tcp_read_timeout_ms,
+            options.tcp_write_timeout_ms,
+            options.tcp_no_delay,
+            options.tcp_keep_alive
+        };
+    }
+
+    inline socket_t listen_on(
+        const std::string& host,
+        uint16_t port,
+        const char* label,
+        SocketTuningOptions tuning = SocketTuningOptions{}
+    ) {
         net_init();
 
         addrinfo hints{};
@@ -111,8 +206,10 @@ namespace akkaradb::engine::server::detail {
 
             int reuse = 1;
             ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+            apply_socket_tuning(s, tuning, false);
 
-            if (::bind(s, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0 && ::listen(s, 16) == 0) {
+            const int backlog = tuning.listen_backlog == 0 ? 16 : static_cast<int>(tuning.listen_backlog);
+            if (::bind(s, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0 && ::listen(s, backlog) == 0) {
                 out = s;
                 break;
             }
@@ -129,8 +226,10 @@ namespace akkaradb::engine::server::detail {
         while (sent < size) {
             #ifdef _WIN32
             const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
+            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
             #else
-            const ssize_t rc = ::send(s, data + sent, size - sent, 0);
+            const ssize_t rc = ::send(s, data + sent, size - sent, send_no_sigpipe_flags());
+            if (rc < 0 && errno == EINTR) { continue; }
             #endif
             if (rc <= 0) { return false; }
             sent += static_cast<size_t>(rc);
@@ -143,8 +242,10 @@ namespace akkaradb::engine::server::detail {
         while (got < size) {
             #ifdef _WIN32
             const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
+            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
             #else
             const ssize_t rc = ::recv(s, data + got, size - got, 0);
+            if (rc < 0 && errno == EINTR) { continue; }
             #endif
             if (rc <= 0) { return false; }
             got += static_cast<size_t>(rc);
@@ -153,12 +254,16 @@ namespace akkaradb::engine::server::detail {
     }
 
     inline size_t recv_some(socket_t s, uint8_t* data, size_t size) {
+        for (;;) {
         #ifdef _WIN32
-        const int rc = ::recv(s, reinterpret_cast<char*>(data), static_cast<int>(size), 0);
+            const int rc = ::recv(s, reinterpret_cast<char*>(data), static_cast<int>(size), 0);
+            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
         #else
-        const ssize_t rc = ::recv(s, data, size, 0);
+            const ssize_t rc = ::recv(s, data, size, 0);
+            if (rc < 0 && errno == EINTR) { continue; }
         #endif
-        return rc > 0 ? static_cast<size_t>(rc) : 0;
+            return rc > 0 ? static_cast<size_t>(rc) : 0;
+        }
     }
 
     inline bool send_all(net::TlsStream& stream, const uint8_t* data, size_t size) {
@@ -186,9 +291,11 @@ namespace akkaradb::engine::server::detail {
 
             void enable_tls(const AkkEngineOptions::ApiTlsOptions& options) {
                 auto storage = make_tls_config(options);
-                tls_ = std::make_unique<net::TlsStream>();
-                tls_->accept(static_cast<std::uintptr_t>(socket_), storage.config);
+                auto stream = std::make_unique<net::TlsStream>();
+                const socket_t raw_socket = socket_;
                 socket_ = BAD_SOCKET_VALUE;
+                stream->accept(static_cast<std::uintptr_t>(raw_socket), storage.config);
+                tls_ = std::move(stream);
             }
 
             [[nodiscard]] bool recv_all(uint8_t* data, size_t size) {

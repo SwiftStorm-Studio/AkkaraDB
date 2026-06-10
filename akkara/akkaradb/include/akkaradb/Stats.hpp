@@ -47,6 +47,37 @@ namespace akkaradb::engine {
         uint64_t scans_total = 0;
         uint64_t blob_puts_total = 0;
 
+        struct ApiStats {
+            bool enabled = false;
+            bool tcp_enabled = false;
+            bool tcp_tls_enabled = false;
+            uint8_t tcp_io_backend = 0;
+            uint32_t tcp_worker_threads = 0;
+            uint32_t tcp_accept_queue_limit = 0;
+            uint32_t tcp_accept_queue_timeout_ms = 0;
+            uint32_t tcp_listen_backlog = 0;
+            uint32_t tcp_read_timeout_ms = 0;
+            uint32_t tcp_write_timeout_ms = 0;
+            uint64_t tcp_connections_accepted_total = 0;
+            uint64_t tcp_connections_closed_total = 0;
+            uint64_t tcp_connections_active = 0;
+            uint64_t tcp_accept_queue_depth = 0;
+            uint64_t tcp_accept_queue_peak_depth = 0;
+            uint64_t tcp_accept_queue_rejected_total = 0;
+            uint64_t tcp_accept_queue_expired_total = 0;
+            uint64_t tcp_requests_total = 0;
+            uint64_t tcp_responses_total = 0;
+            uint64_t tcp_bytes_received_total = 0;
+            uint64_t tcp_bytes_sent_total = 0;
+            uint64_t tcp_protocol_errors_total = 0;
+            uint64_t tcp_crc_errors_total = 0;
+            uint64_t tcp_pipeline_batches_total = 0;
+            uint64_t tcp_backpressure_flushes_total = 0;
+            uint64_t tcp_backpressure_disconnects_total = 0;
+            uint64_t tcp_batch_put_items_total = 0;
+            uint64_t tcp_batch_get_items_total = 0;
+        } api;
+
         struct MemTableStats {
             uint32_t shard_count = 0;
             uint64_t threshold_bytes_per_shard = 0;

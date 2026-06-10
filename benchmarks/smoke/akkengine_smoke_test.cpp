@@ -21,7 +21,6 @@
 
 #include "akk/engine/AkkEngine.hpp"
 
-#include <cassert>
 #include <filesystem>
 #include <span>
 #include <string>

@@ -16,34 +16,26 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// akkengine/include/akk/engine/server/AkkApiServer.hpp
+// akkengine/include/akk/crypto/Random.hpp
 #pragma once
 
-#include "akk/engine/AkkEngine.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <span>
 
-#include <memory>
+namespace akkaradb::crypto {
+    /**
+     * @brief Fill @p out with bytes from the operating system CSPRNG.
+     *
+     * This is intentionally a thin OS wrapper.  AkkaraDB must not derive
+     * long-term keys from unique but public machine or table identifiers.
+     *
+     * @throws std::runtime_error when the OS random source is unavailable.
+     */
+    void secure_random(std::span<std::uint8_t> out);
 
-namespace akkaradb::engine::server {
-    class HttpApiServer;
-    class TcpApiServer;
-
-    class AkkApiServer {
-        public:
-            [[nodiscard]] static std::unique_ptr<AkkApiServer> create(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options);
-
-            ~AkkApiServer();
-
-            AkkApiServer(const AkkApiServer&) = delete;
-            AkkApiServer& operator=(const AkkApiServer&) = delete;
-
-            void start();
-            void close();
-            [[nodiscard]] EngineStats::ApiStats stats() const noexcept;
-
-        private:
-            AkkApiServer() = default;
-
-            std::unique_ptr<HttpApiServer> http_;
-            std::unique_ptr<TcpApiServer> tcp_;
-    };
-}
+    /**
+     * @brief Best-effort constant-time wipe for temporary secret material.
+     */
+    void secure_wipe(std::span<std::uint8_t> secret) noexcept;
+} // namespace akkaradb::crypto

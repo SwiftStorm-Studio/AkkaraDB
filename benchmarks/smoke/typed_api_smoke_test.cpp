@@ -21,7 +21,6 @@
 
 #include "akkaradb/AkkaraDB.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <filesystem>
 #include <format>

@@ -28,7 +28,6 @@
 #include "akk/engine/cluster/ReplicationServer.hpp"
 
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>

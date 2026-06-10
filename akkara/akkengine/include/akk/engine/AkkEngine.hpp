@@ -79,6 +79,10 @@ namespace akkaradb::engine {
             Http = 0, Tcp = 1,
         };
 
+        enum class ApiIoBackend : uint8_t {
+            Auto = 0, ThreadPool = 1,
+        };
+
         struct ApiTlsOptions {
             std::filesystem::path cert_path;
             std::filesystem::path key_path;
@@ -93,8 +97,20 @@ namespace akkaradb::engine {
             std::string bind_host;
             uint16_t http_port = 7070;
             uint16_t tcp_port = 7071;
+            ApiIoBackend tcp_io_backend = ApiIoBackend::Auto;
             uint32_t tcp_worker_threads = 0;
             uint32_t tcp_accept_queue_limit = 4096;
+            uint32_t tcp_accept_queue_timeout_ms = 60000;
+            uint32_t tcp_listen_backlog = 1024;
+            uint32_t tcp_recv_buffer_bytes = 0;
+            uint32_t tcp_send_buffer_bytes = 0;
+            uint32_t tcp_pipeline_batch_limit = 64;
+            uint32_t tcp_max_batch_items = 4096;
+            uint64_t tcp_max_pending_response_bytes = 8ULL * 1024ULL * 1024ULL;
+            uint32_t tcp_read_timeout_ms = 60000;
+            uint32_t tcp_write_timeout_ms = 30000;
+            bool tcp_no_delay = true;
+            bool tcp_keep_alive = true;
             cluster::TransportMode transport_mode = cluster::TransportMode::TLS;
             ApiTlsOptions tls;
         } api;
@@ -123,6 +139,16 @@ namespace akkaradb::engine {
                 std::span<const uint8_t> value;
             };
 
+            struct BatchPutEntry {
+                std::span<const uint8_t> key;
+                std::span<const uint8_t> value;
+            };
+
+            struct BatchGetResult {
+                bool found = false;
+                std::vector<uint8_t> value;
+            };
+
             [[nodiscard]] static std::unique_ptr<AkkEngine> open(AkkEngineOptions options);
             ~AkkEngine();
 
@@ -133,10 +159,12 @@ namespace akkaradb::engine {
 
             void put(std::span<const uint8_t> key, std::span<const uint8_t> value);
             void put_hinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t mini_key);
+            void put_batch(std::span<const BatchPutEntry> entries);
             void remove(std::span<const uint8_t> key);
             void remove_hinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t mini_key);
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> get(std::span<const uint8_t> key) const;
+            [[nodiscard]] std::vector<BatchGetResult> get_batch(std::span<const std::span<const uint8_t>> keys) const;
             [[nodiscard]] bool exists(std::span<const uint8_t> key) const;
             [[nodiscard]] bool get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
             [[nodiscard]] bool get_into_arena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const;

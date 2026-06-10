@@ -116,6 +116,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(boost_pfr)
 
+FetchContent_Declare(
+        monocypher
+        GIT_REPOSITORY https://github.com/LoupVaillant/Monocypher.git
+        GIT_TAG 4.0.2
+)
+FetchContent_MakeAvailable(monocypher)
+
+if (NOT TARGET akkaradb_monocypher)
+    set_source_files_properties(${monocypher_SOURCE_DIR}/src/monocypher.c PROPERTIES LANGUAGE CXX)
+    add_library(akkaradb_monocypher STATIC
+            ${monocypher_SOURCE_DIR}/src/monocypher.c
+    )
+    target_include_directories(akkaradb_monocypher PUBLIC
+            ${monocypher_SOURCE_DIR}/src
+    )
+endif ()
+
 # ── mbedTLS (always enabled) ──────────────────────────────────────────────────
 FetchContent_Declare(
         mbedtls
@@ -195,20 +212,20 @@ if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
-                PROPERTIES COMPILE_OPTIONS "-mavx2")
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mpclmul")
         set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
                 PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mvpclmulqdq")
     endif ()
 endif ()
 
 # ==================== Linking ====================
-target_link_libraries(akkaradb PRIVATE libzstd_static mbedtls mbedcrypto mbedx509)
+target_link_libraries(akkaradb PRIVATE libzstd_static akkaradb_monocypher mbedtls mbedcrypto mbedx509)
 
 # TLS always enabled
 target_compile_definitions(akkaradb PRIVATE AKKARADB_TLS_ENABLED)
 
 if(WIN32)
-    target_link_libraries(akkaradb PRIVATE ws2_32)
+    target_link_libraries(akkaradb PRIVATE ws2_32 bcrypt)
 endif()
 
 # ==================== Include Directories ====================
@@ -417,6 +434,54 @@ target_include_directories(akkaradb_akkengine_smoke_test
 )
 
 set_target_properties(akkaradb_akkengine_smoke_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ==================== Crypto Identity Smoke Test ====================
+add_executable(akkaradb_crypto_identity_smoke_test
+        benchmarks/smoke/crypto_identity_smoke_test.cpp
+)
+
+if(MSVC)
+    target_compile_options(akkaradb_crypto_identity_smoke_test PRIVATE /WX-)
+endif()
+
+target_link_libraries(akkaradb_crypto_identity_smoke_test PRIVATE akkaradb)
+
+target_include_directories(akkaradb_crypto_identity_smoke_test
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
+
+set_target_properties(akkaradb_crypto_identity_smoke_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ==================== CRC32C Smoke Test ====================
+add_executable(akkaradb_crc32c_smoke_test
+        benchmarks/smoke/crc32c_smoke_test.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CRef.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86SSE42.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CArmCRC.cpp
+        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CDispatch.cpp
+)
+
+if(MSVC)
+    target_compile_options(akkaradb_crc32c_smoke_test PRIVATE /WX-)
+endif()
+
+target_include_directories(akkaradb_crc32c_smoke_test
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
+
+set_target_properties(akkaradb_crc32c_smoke_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -737,8 +802,9 @@ add_custom_command(TARGET akkaradb POST_BUILD
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_api_server_smoke_test
-        akkaradb_api_server_test
         akkaradb_akkengine_smoke_test
+        akkaradb_crypto_identity_smoke_test
+        akkaradb_crc32c_smoke_test
         akkaradb_typed_api_smoke_test
         akkaradb_memtable_smoke_test
         akkaradb_versionlog_smoke_test
@@ -780,7 +846,7 @@ if(AKKARADB_BUILD_JNI)
     )
     add_dependencies(akkaradb_jni akkaradb)
 
-    target_link_libraries(akkaradb_jni PRIVATE libzstd_static mbedtls mbedcrypto mbedx509)
+    target_link_libraries(akkaradb_jni PRIVATE libzstd_static akkaradb_monocypher mbedtls mbedcrypto mbedx509)
     target_include_directories(akkaradb_jni PRIVATE
             ${JNI_INCLUDE_DIRS}
             ${AKKENGINE_INCLUDE_DIR}
@@ -801,7 +867,7 @@ if(AKKARADB_BUILD_JNI)
     )
 
     if(WIN32)
-        target_link_libraries(akkaradb_jni PRIVATE ws2_32)
+        target_link_libraries(akkaradb_jni PRIVATE ws2_32 bcrypt)
     endif()
 
     if(WIN32)

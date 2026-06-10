@@ -75,9 +75,19 @@ namespace akkaradb::engine::server {
     HttpApiServer::~HttpApiServer() { close(); }
 
     void HttpApiServer::start() {
-        listen_socket_ = detail::listen_on(options_.bind_host, options_.http_port, "HttpApiServer");
-        running_.store(true, std::memory_order_release);
-        accept_thread_ = std::thread([this] { accept_loop(); });
+        if (running_.load(std::memory_order_acquire)) { return; }
+        listen_socket_ = detail::listen_on(options_.bind_host, options_.http_port, "HttpApiServer", detail::make_socket_tuning(options_));
+        try {
+            running_.store(true, std::memory_order_release);
+            accept_thread_ = std::thread([this] { accept_loop(); });
+        }
+        catch (...) {
+            running_.store(false, std::memory_order_release);
+            detail::shutdown_socket(listen_socket_);
+            detail::close_socket(listen_socket_);
+            listen_socket_ = detail::BAD_SOCKET_VALUE;
+            throw;
+        }
     }
 
     void HttpApiServer::close() {
@@ -91,7 +101,12 @@ namespace akkaradb::engine::server {
     void HttpApiServer::accept_loop() {
         while (running_.load(std::memory_order_acquire)) {
             const detail::socket_t client = ::accept(listen_socket_, nullptr, nullptr);
-            if (!detail::socket_ok(client)) { break; }
+            if (!detail::socket_ok(client)) {
+                if (!running_.load(std::memory_order_acquire)) { break; }
+                if (detail::last_accept_error_is_transient()) { continue; }
+                break;
+            }
+            detail::apply_socket_tuning(client, detail::make_socket_tuning(options_), true);
 
             std::thread(
                 [this, client] {

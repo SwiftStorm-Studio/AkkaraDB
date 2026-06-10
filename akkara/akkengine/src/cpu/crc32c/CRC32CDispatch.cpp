@@ -104,13 +104,19 @@ namespace akkaradb::cpu {
             return HasBit(regs.ecx, 20);
         }
 
+        [[nodiscard]] bool SupportsPCLMULQDQ() noexcept {
+            const auto regs = Cpuid(1);
+            return HasBit(regs.ecx, 1);
+        }
+
         [[nodiscard]] bool SupportsAVXState() noexcept {
             const auto regs = Cpuid(1);
             if (!HasBit(regs.ecx, 26) || !HasBit(regs.ecx, 27) || !HasBit(regs.ecx, 28)) { return false; }
             return (Xgetbv0() & 0x6) == 0x6;
         }
 
-        [[nodiscard]] bool SupportsAVX2() noexcept {
+        [[nodiscard]] bool SupportsAVX2PCLMULCRC() noexcept {
+            if (!SupportsSSE42() || !SupportsPCLMULQDQ()) { return false; }
             if (!SupportsAVXState()) { return false; }
             const auto regs = Cpuid(7, 0);
             return HasBit(regs.ebx, 5);
@@ -154,7 +160,7 @@ namespace akkaradb::cpu {
             #if defined(__x86_64__) || defined(_M_X64)
             if (SupportsAVX512()) { return &CRC32C_X86_AVX512; }
             #endif
-            if (SupportsAVX2()) { return &CRC32C_X86_AVX2; }
+            if (SupportsAVX2PCLMULCRC()) { return &CRC32C_X86_AVX2; }
             if (SupportsSSE42()) { return &CRC32C_X86_SSE42; }
             #endif
 

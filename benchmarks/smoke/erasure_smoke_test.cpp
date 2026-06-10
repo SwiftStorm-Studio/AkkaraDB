@@ -21,7 +21,6 @@
 
 #include "akk/engine/erasure/ErasureCodec.hpp"
 
-#include <cassert>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
