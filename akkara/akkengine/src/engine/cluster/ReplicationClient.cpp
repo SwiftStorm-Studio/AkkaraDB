@@ -46,14 +46,14 @@ namespace akkaradb::engine::cluster {
         #ifdef _WIN32
         using SocketHandle = SOCKET;
         constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
-        void shutdown_socket(SocketHandle s) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
+        void shutdownSocket(SocketHandle s) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
         #else
-        using SocketHandle = int; constexpr SocketHandle INVALID_SOCKET_HANDLE = -1; void shutdown_socket(SocketHandle s) noexcept {
+        using SocketHandle = int; constexpr SocketHandle INVALID_SOCKET_HANDLE = -1; void shutdownSocket(SocketHandle s) noexcept {
             if (s >= 0) { ::shutdown(s, SHUT_RDWR); }
         }
         #endif
 
-        void ensure_socket_runtime() {
+        void ensureSocketRuntime() {
             #ifdef _WIN32
             static std::once_flag once;
             std::call_once(
@@ -66,7 +66,7 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
-        void close_socket(SocketHandle s) noexcept {
+        void closeSocket(SocketHandle s) noexcept {
             if (s == INVALID_SOCKET_HANDLE) { return; }
             #ifdef _WIN32
             ::closesocket(s);
@@ -75,7 +75,7 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
-        bool send_all(SocketHandle s, const uint8_t* data, size_t size) {
+        bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) {
                 #ifdef _WIN32
@@ -89,7 +89,7 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool recv_all(SocketHandle s, uint8_t* data, size_t size) {
+        bool recvAll(SocketHandle s, uint8_t* data, size_t size) {
             size_t received = 0;
             while (received < size) {
                 #ifdef _WIN32
@@ -103,83 +103,83 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool send_all(net::TlsStream& stream, const uint8_t* data, size_t size) {
+        bool sendAll(net::TlsStream& stream, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) { sent += stream.send(data + sent, size - sent); }
             return true;
         }
 
-        bool recv_all(net::TlsStream& stream, uint8_t* data, size_t size) {
+        bool recvAll(net::TlsStream& stream, uint8_t* data, size_t size) {
             size_t received = 0;
             while (received < size) { received += stream.recv(data + received, size - received); }
             return true;
         }
 
-        bool recv_frame(SocketHandle s, DecodedFrame& out) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out) {
             uint8_t header[ReplFrameHeader::SIZE];
-            if (!recv_all(s, header, sizeof(header))) { return false; }
+            if (!recvAll(s, header, sizeof(header))) { return false; }
 
-            const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>
-                (header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
+            const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(
+                header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
 
-            std::vector<uint8_t> wire(sizeof(header) + payload_len);
+            std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
-            if (payload_len > 0 && !recv_all(s, wire.data() + sizeof(header), payload_len)) { return false; }
-            return decode_frame(wire, out);
+            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen)) { return false; }
+            return decodeFrame(wire, out);
         }
 
-        bool recv_frame(net::TlsStream& stream, DecodedFrame& out) {
+        bool recvFrame(net::TlsStream& stream, DecodedFrame& out) {
             uint8_t header[ReplFrameHeader::SIZE];
             try {
-                if (!recv_all(stream, header, sizeof(header))) { return false; }
+                if (!recvAll(stream, header, sizeof(header))) { return false; }
 
-                const uint32_t payload_len = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<
+                const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<
                     uint32_t>(header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
 
-                std::vector<uint8_t> wire(sizeof(header) + payload_len);
+                std::vector<uint8_t> wire(sizeof(header) + payloadLen);
                 std::memcpy(wire.data(), header, sizeof(header));
-                if (payload_len > 0 && !recv_all(stream, wire.data() + sizeof(header), payload_len)) { return false; }
-                return decode_frame(wire, out);
+                if (payloadLen > 0 && !recvAll(stream, wire.data() + sizeof(header), payloadLen)) { return false; }
+                return decodeFrame(wire, out);
             }
             catch (...) { return false; }
         }
 
         struct TlsConfigStorage {
-            std::string cert_path;
-            std::string key_path;
-            std::string ca_path;
+            std::string certPath;
+            std::string keyPath;
+            std::string caPath;
             net::TlsConfig config{};
         };
 
-        TlsConfigStorage make_tls_config(const ClusterRuntimeOptions& options) {
+        TlsConfigStorage makeTlsConfig(const ClusterRuntimeOptions& options) {
             TlsConfigStorage storage;
-            storage.cert_path = options.tls.cert_path.string();
-            storage.key_path = options.tls.key_path.string();
-            storage.ca_path = options.tls.ca_path.string();
-            storage.config.cert_path = storage.cert_path.empty() ? nullptr : storage.cert_path.c_str();
-            storage.config.key_path = storage.key_path.empty() ? nullptr : storage.key_path.c_str();
-            storage.config.ca_path = storage.ca_path.empty() ? nullptr : storage.ca_path.c_str();
-            storage.config.verify_peer = options.tls.verify_peer;
+            storage.certPath = options.tls.certPath.string();
+            storage.keyPath = options.tls.keyPath.string();
+            storage.caPath = options.tls.caPath.string();
+            storage.config.certPath = storage.certPath.empty() ? nullptr : storage.certPath.c_str();
+            storage.config.keyPath = storage.keyPath.empty() ? nullptr : storage.keyPath.c_str();
+            storage.config.caPath = storage.caPath.empty() ? nullptr : storage.caPath.c_str();
+            storage.config.verifyPeer = options.tls.verifyPeer;
             return storage;
         }
 
-        SocketHandle connect_to(const std::string& host, uint16_t port) {
-            ensure_socket_runtime();
+        SocketHandle connectTo(const std::string& host, uint16_t port) {
+            ensureSocketRuntime();
 
             addrinfo hints{};
             hints.ai_family = AF_UNSPEC;
             hints.ai_socktype = SOCK_STREAM;
 
             addrinfo* result = nullptr;
-            const auto port_text = std::to_string(port);
-            if (::getaddrinfo(host.c_str(), port_text.c_str(), &hints, &result) != 0) { return INVALID_SOCKET_HANDLE; }
+            const auto portText = std::to_string(port);
+            if (::getaddrinfo(host.c_str(), portText.c_str(), &hints, &result) != 0) { return INVALID_SOCKET_HANDLE; }
 
             SocketHandle socket = INVALID_SOCKET_HANDLE;
             for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
                 socket = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
                 if (socket == INVALID_SOCKET_HANDLE) { continue; }
                 if (::connect(socket, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0) { break; }
-                close_socket(socket);
+                closeSocket(socket);
                 socket = INVALID_SOCKET_HANDLE;
             }
 
@@ -191,28 +191,28 @@ namespace akkaradb::engine::cluster {
     class ReplicationClient::Impl {
         public:
             Impl(
-                std::string primary_host,
-                uint16_t primary_repl_port,
-                uint64_t self_node_id,
-                std::function<uint64_t()> get_last_seq,
-                ClusterRuntimeOptions runtime_options
+                std::string primaryHost,
+                uint16_t primaryReplPort,
+                uint64_t selfNodeId,
+                std::function<uint64_t()> getLastSeq,
+                ClusterRuntimeOptions runtimeOptions
             )
-                : primary_host_{std::move(primary_host)},
-                  primary_repl_port_{primary_repl_port},
-                  self_node_id_{self_node_id},
-                  get_last_seq_{std::move(get_last_seq)},
-                  runtime_options_{std::move(runtime_options)} {}
+                : primaryHost_{std::move(primaryHost)},
+                  primaryReplPort_{primaryReplPort},
+                  selfNodeId_{selfNodeId},
+                  getLastSeq_{std::move(getLastSeq)},
+                  runtimeOptions_{std::move(runtimeOptions)} {}
 
             ~Impl() { close(); }
 
-            void set_apply_callback(ApplyCallback callback) {
-                std::lock_guard lock{callback_mutex_};
-                apply_callback_ = std::move(callback);
+            void setApplyCallback(ApplyCallback callback) {
+                std::lock_guard lock{callbackMutex_};
+                applyCallback_ = std::move(callback);
             }
 
-            void set_blob_callback(BlobCallback callback) {
-                std::lock_guard lock{callback_mutex_};
-                blob_callback_ = std::move(callback);
+            void setBlobCallback(BlobCallback callback) {
+                std::lock_guard lock{callbackMutex_};
+                blobCallback_ = std::move(callback);
             }
 
             void start() {
@@ -223,15 +223,15 @@ namespace akkaradb::engine::cluster {
             void close() {
                 running_ = false;
                 {
-                    std::lock_guard lock{socket_mutex_};
+                    std::lock_guard lock{socketMutex_};
                     if (tls_) { tls_->shutdown(); }
-                    shutdown_socket(socket_);
-                    close_socket(socket_);
+                    shutdownSocket(socket_);
+                    closeSocket(socket_);
                     socket_ = INVALID_SOCKET_HANDLE;
                 }
                 if (worker_.joinable()) { worker_.join(); }
                 {
-                    std::lock_guard lock{socket_mutex_};
+                    std::lock_guard lock{socketMutex_};
                     if (tls_) {
                         tls_->close();
                         tls_.reset();
@@ -248,13 +248,13 @@ namespace akkaradb::engine::cluster {
                     SocketHandle socket = INVALID_SOCKET_HANDLE;
                     net::TlsStream* tls = nullptr;
 
-                    if (runtime_options_.transport_mode == TransportMode::TLS) {
+                    if (runtimeOptions_.transportMode == TransportMode::TLS) {
                         try {
-                            auto storage = make_tls_config(runtime_options_);
+                            auto storage = makeTlsConfig(runtimeOptions_);
                             auto stream = std::make_unique<net::TlsStream>();
-                            stream->connect(primary_host_.c_str(), primary_repl_port_, storage.config);
+                            stream->connect(primaryHost_.c_str(), primaryReplPort_, storage.config);
                             tls = stream.get();
-                            std::lock_guard lock{socket_mutex_};
+                            std::lock_guard lock{socketMutex_};
                             tls_ = std::move(stream);
                         }
                         catch (...) {
@@ -263,127 +263,123 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     else {
-                        socket = connect_to(primary_host_, primary_repl_port_);
+                        socket = connectTo(primaryHost_, primaryReplPort_);
                         if (socket == INVALID_SOCKET_HANDLE) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
                             continue;
                         }
 
                         {
-                            std::lock_guard lock{socket_mutex_};
+                            std::lock_guard lock{socketMutex_};
                             socket_ = socket;
                         }
                     }
 
                     if (handshake(socket, tls)) {
                         connected_ = true;
-                        receive_loop(socket, tls);
+                        receiveLoop(socket, tls);
                     }
 
                     connected_ = false;
                     {
-                        std::lock_guard lock{socket_mutex_};
+                        std::lock_guard lock{socketMutex_};
                         if (tls_ && tls_.get() == tls) {
                             tls_->close();
                             tls_.reset();
                         }
                         if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
                     }
-                    close_socket(socket);
+                    closeSocket(socket);
 
                     if (running_) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }
                 }
             }
 
             bool handshake(SocketHandle socket, net::TlsStream* tls) {
-                const ClientHello hello{
-                    .node_id = self_node_id_,
-                    .last_seq = get_last_seq_ ? get_last_seq_() : 0,
-                    .role = NodeRole::Replica,
-                };
-                const auto wire = encode_client_hello(hello);
-                if (!send_to(socket, tls, wire.data(), wire.size())) { return false; }
+                const ClientHello hello{.nodeId = selfNodeId_, .lastSeq = getLastSeq_ ? getLastSeq_() : 0, .role = NodeRole::REPLICA,};
+                const auto wire = encodeClientHello(hello);
+                if (!sendTo(socket, tls, wire.data(), wire.size())) { return false; }
 
                 DecodedFrame frame;
-                if (!recv_frame_from(socket, tls, frame) || frame.type != ReplMsgType::ServerHello) { return false; }
-                ServerHello server_hello;
-                return decode_server_hello(frame.payload, server_hello);
+                if (!recvFrameFrom(socket, tls, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
+                ServerHello serverHello;
+                return decodeServerHello(frame.payload, serverHello);
             }
 
-            static bool send_to(SocketHandle socket, net::TlsStream* tls, const uint8_t* data, size_t size) {
-                try { return tls != nullptr ? send_all(*tls, data, size) : send_all(socket, data, size); }
+            static bool sendTo(SocketHandle socket, net::TlsStream* tls, const uint8_t* data, size_t size) {
+                try { return tls != nullptr ? sendAll(*tls, data, size) : sendAll(socket, data, size); }
                 catch (...) { return false; }
             }
 
-            static bool recv_frame_from(SocketHandle socket, net::TlsStream* tls, DecodedFrame& frame) {
-                return tls != nullptr ? recv_frame(*tls, frame) : recv_frame(socket, frame);
+            static bool recvFrameFrom(SocketHandle socket, net::TlsStream* tls, DecodedFrame& frame) {
+                return tls != nullptr ? recvFrame(*tls, frame) : recvFrame(socket, frame);
             }
 
-            void receive_loop(SocketHandle socket, net::TlsStream* tls) {
+            void receiveLoop(SocketHandle socket, net::TlsStream* tls) {
                 while (running_) {
                     DecodedFrame frame;
-                    if (!recv_frame_from(socket, tls, frame)) { return; }
+                    if (!recvFrameFrom(socket, tls, frame)) { return; }
 
-                    if (frame.type == ReplMsgType::Entry) {
+                    if (frame.type == ReplMsgType::ENTRY) {
                         ReplEntry entry;
-                        if (!decode_entry(frame.payload, entry)) { return; }
+                        if (!decodeEntry(frame.payload, entry)) { return; }
                         ApplyCallback callback;
                         {
-                            std::lock_guard lock{callback_mutex_};
-                            callback = apply_callback_;
+                            std::lock_guard lock{callbackMutex_};
+                            callback = applyCallback_;
                         }
-                        if (callback) { callback(entry.seq, entry.op, entry.key, entry.value, entry.record_flags, entry.source_node_id); }
-                        const auto ack = encode_ack(ReplAck{.seq = entry.seq});
-                        if (!send_to(socket, tls, ack.data(), ack.size())) { return; }
+                        if (callback) { callback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId); }
+                        const auto ack = encodeAck(ReplAck{.seq = entry.seq});
+                        if (!sendTo(socket, tls, ack.data(), ack.size())) { return; }
                     }
-                    else if (frame.type == ReplMsgType::BlobPut) {
+                    else if (frame.type == ReplMsgType::BLOB_PUT) {
                         ReplBlob blob;
-                        if (!decode_blob(frame.payload, blob)) { return; }
+                        if (!decodeBlob(frame.payload, blob)) { return; }
                         BlobCallback callback;
                         {
-                            std::lock_guard lock{callback_mutex_};
-                            callback = blob_callback_;
+                            std::lock_guard lock{callbackMutex_};
+                            callback = blobCallback_;
                         }
-                        if (callback) { callback(blob.seq, blob.blob_id, blob.content); }
+                        if (callback) { callback(blob.seq, blob.blobId, blob.content); }
                     }
-                    else if (frame.type != ReplMsgType::ReadResponse) { return; }
+                    else if (frame.type != ReplMsgType::READ_RESPONSE) { return; }
                 }
             }
 
-            std::string primary_host_;
-            uint16_t primary_repl_port_;
-            uint64_t self_node_id_;
-            std::function<uint64_t()> get_last_seq_;
-            ClusterRuntimeOptions runtime_options_;
+            std::string primaryHost_;
+            uint16_t primaryReplPort_;
+            uint64_t selfNodeId_;
+            std::function<uint64_t()> getLastSeq_;
+            ClusterRuntimeOptions runtimeOptions_;
 
             std::atomic<bool> running_{false};
             std::atomic<bool> connected_{false};
             std::thread worker_;
 
-            mutable std::mutex socket_mutex_;
+            mutable std::mutex socketMutex_;
             SocketHandle socket_ = INVALID_SOCKET_HANDLE;
             std::unique_ptr<net::TlsStream> tls_;
 
-            mutable std::mutex callback_mutex_;
-            ApplyCallback apply_callback_;
-            BlobCallback blob_callback_;
+            mutable std::mutex callbackMutex_;
+            ApplyCallback applyCallback_;
+            BlobCallback blobCallback_;
     };
 
     std::unique_ptr<ReplicationClient> ReplicationClient::create(
-        std::string primary_host,
-        uint16_t primary_repl_port,
-        uint64_t self_node_id,
-        std::function<uint64_t()> get_last_seq,
-        ClusterRuntimeOptions runtime_options
+        std::string primaryHost,
+        uint16_t primaryReplPort,
+        uint64_t selfNodeId,
+        std::function<uint64_t()> getLastSeq,
+        ClusterRuntimeOptions runtimeOptions
     ) {
         return std::unique_ptr<ReplicationClient>(
             new ReplicationClient(
                 std::make_unique<Impl>(
-                    std::move(primary_host),
-                    primary_repl_port,
-                    self_node_id,
-                    std::move(get_last_seq),
-                    std::move(runtime_options)
+                    std::move(primaryHost),
+                    primaryReplPort,
+                    selfNodeId,
+                    std::move(getLastSeq),
+                    std::move(runtimeOptions)
                 )
             )
         );
@@ -393,9 +389,9 @@ namespace akkaradb::engine::cluster {
 
     ReplicationClient::~ReplicationClient() = default;
 
-    void ReplicationClient::set_apply_callback(ApplyCallback callback) { impl_->set_apply_callback(std::move(callback)); }
+    void ReplicationClient::setApplyCallback(ApplyCallback callback) { impl_->setApplyCallback(std::move(callback)); }
 
-    void ReplicationClient::set_blob_callback(BlobCallback callback) { impl_->set_blob_callback(std::move(callback)); }
+    void ReplicationClient::setBlobCallback(BlobCallback callback) { impl_->setBlobCallback(std::move(callback)); }
 
     void ReplicationClient::start() { impl_->start(); }
 

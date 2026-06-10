@@ -24,7 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <arm_acle.h>
+#include <armAcle.h>
 
 namespace akkaradb::cpu {
     /**

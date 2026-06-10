@@ -31,18 +31,18 @@ namespace akkaradb::engine::vlog {
     inline constexpr uint8_t VLOG_FLAG_ROLLBACK = 0x04;
 
     enum class VLogSyncMode : uint8_t {
-        Sync = 0, Async = 1,
+        SYNC = 0, ASYNC = 1,
     };
 
     struct VersionLogOptions {
-        std::filesystem::path log_path;
-        VLogSyncMode sync_mode = VLogSyncMode::Async;
+        std::filesystem::path logPath;
+        VLogSyncMode syncMode = VLogSyncMode::ASYNC;
     };
 
     struct VersionEntry {
         uint64_t seq = 0;
-        uint64_t source_node_id = 0;
-        uint64_t timestamp_ns = 0;
+        uint64_t sourceNodeId = 0;
+        uint64_t timestampNs = 0;
         uint8_t flags = 0;
         std::vector<uint8_t> value;
     };
@@ -61,16 +61,18 @@ namespace akkaradb::engine::vlog {
             void append(
                 std::span<const uint8_t> key,
                 uint64_t seq,
-                uint64_t source_node_id,
-                uint64_t timestamp_ns,
+                uint64_t sourceNodeId,
+                uint64_t timestampNs,
                 uint8_t flags,
                 std::span<const uint8_t> value
             );
 
-            [[nodiscard]] std::optional<VersionEntry> get_at(std::span<const uint8_t> key, uint64_t at_seq) const;
+            [[nodiscard]] std::optional<VersionEntry> getAt(std::span<const uint8_t> key, uint64_t atSeq) const;
             [[nodiscard]] std::vector<VersionEntry> history(std::span<const uint8_t> key) const;
 
-            [[nodiscard]] std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> collect_rollback_targets(uint64_t target_seq) const;
+            [[nodiscard]] std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> collectRollbackTargets(
+                uint64_t targetSeq
+            ) const;
 
             void close();
 

@@ -39,40 +39,40 @@ namespace akkaradb::cpu {
          * standalone SSE4.2 implementation and the low-overhead tail path used
          * after wider AVX2/AVX-512 folds.
          */
-        [[nodiscard]] inline uint64_t load_u64(const uint8_t* p) noexcept {
+        [[nodiscard]] inline uint64_t loadU64(const uint8_t* p) noexcept {
             uint64_t value{};
             std::memcpy(&value, p, sizeof(value));
             return value;
         }
 
-        [[nodiscard]] inline uint32_t load_u32(const uint8_t* p) noexcept {
+        [[nodiscard]] inline uint32_t loadU32(const uint8_t* p) noexcept {
             uint32_t value{};
             std::memcpy(&value, p, sizeof(value));
             return value;
         }
 
-        [[nodiscard]] inline uint32_t crc32c_sse42_update(uint32_t crc, const uint8_t* p, size_t length) noexcept {
-            uint64_t wide_crc = crc;
+        [[nodiscard]] inline uint32_t crc32cSse42Update(uint32_t crc, const uint8_t* p, size_t length) noexcept {
+            uint64_t wideCrc = crc;
 
             while (length >= 8) {
-                wide_crc = _mm_crc32_u64(wide_crc, load_u64(p));
+                wideCrc = _mm_crc32_u64(wideCrc, loadU64(p));
                 p += 8;
                 length -= 8;
             }
 
             if (length >= 4) {
-                wide_crc = _mm_crc32_u32(static_cast<uint32_t>(wide_crc), load_u32(p));
+                wideCrc = _mm_crc32_u32(static_cast<uint32_t>(wideCrc), loadU32(p));
                 p += 4;
                 length -= 4;
             }
 
             while (length != 0) {
-                wide_crc = _mm_crc32_u8(static_cast<uint32_t>(wide_crc), *p);
+                wideCrc = _mm_crc32_u8(static_cast<uint32_t>(wideCrc), *p);
                 ++p;
                 --length;
             }
 
-            return static_cast<uint32_t>(wide_crc);
+            return static_cast<uint32_t>(wideCrc);
         }
     } // namespace
 
@@ -91,7 +91,7 @@ namespace akkaradb::cpu {
         if (length == 0) { return 0u; }
 
         const auto* p = reinterpret_cast<const uint8_t*>(data);
-        const uint32_t crc = crc32c_sse42_update(0xFFFFFFFFu, p, length);
+        const uint32_t crc = crc32cSse42Update(0xFFFFFFFFu, p, length);
 
         return ~crc;
     }

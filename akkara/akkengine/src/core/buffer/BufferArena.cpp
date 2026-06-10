@@ -24,10 +24,10 @@
 #include <stdexcept>
 
 namespace akkaradb::core {
-    BufferArena::BufferArena(size_t initial_block_size, size_t max_block_size)
-        : initial_block_size_{initial_block_size == 0 ? DEFAULT_INITIAL_BLOCK_SIZE : initial_block_size},
-          next_block_size_{initial_block_size_},
-          max_block_size_{std::max(max_block_size, initial_block_size_)},
+    BufferArena::BufferArena(size_t initialBlockSize, size_t maxBlockSize)
+        : initialBlockSize_{initialBlockSize == 0 ? DEFAULT_INITIAL_BLOCK_SIZE : initialBlockSize},
+          nextBlockSize_{initialBlockSize_},
+          maxBlockSize_{std::max(maxBlockSize, initialBlockSize_)},
           head_{nullptr},
           tail_{nullptr},
           current_{nullptr} {}
@@ -37,17 +37,17 @@ namespace akkaradb::core {
     std::byte* BufferArena::allocate(size_t size, size_t align) {
         if (size == 0) { return nullptr; }
         if (align == 0) { align = 1; }
-        if (!is_power_of_two(align)) { throw std::invalid_argument("BufferArena::allocate: alignment must be power-of-two"); }
+        if (!isPowerOfTwo(align)) { throw std::invalid_argument("BufferArena::allocate: alignment must be power-of-two"); }
 
-        if (current_ != nullptr) { if (auto* ptr = try_allocate_from_block(current_, size, align); ptr != nullptr) { return ptr; } }
+        if (current_ != nullptr) { if (auto* ptr = tryAllocateFromBlock(current_, size, align); ptr != nullptr) { return ptr; } }
 
         if (size > (static_cast<size_t>(-1) - (align - 1))) { throw std::bad_alloc(); }
-        const size_t min_capacity = size + (align - 1);
-        const size_t desired_capacity = std::max(next_block_size_, min_capacity);
-        const size_t block_capacity = std::min(std::max(desired_capacity, initial_block_size_), max_block_size_);
-        const size_t block_alignment = std::max(align, alignof(std::max_align_t));
+        const size_t minCapacity = size + (align - 1);
+        const size_t desiredCapacity = std::max(nextBlockSize_, minCapacity);
+        const size_t blockCapacity = std::min(std::max(desiredCapacity, initialBlockSize_), maxBlockSize_);
+        const size_t blockAlignment = std::max(align, alignof(std::max_align_t));
 
-        Block* block = create_block(block_capacity >= min_capacity ? block_capacity : min_capacity, block_alignment);
+        Block* block = createBlock(blockCapacity >= minCapacity ? blockCapacity : minCapacity, blockAlignment);
         if (head_ == nullptr) {
             head_ = block;
             tail_ = block;
@@ -58,13 +58,13 @@ namespace akkaradb::core {
         }
         current_ = block;
 
-        if (next_block_size_ < max_block_size_) {
-            size_t doubled = next_block_size_ * 2;
-            if (doubled < next_block_size_) doubled = max_block_size_; // overflow guard
-            next_block_size_ = std::min(doubled, max_block_size_);
+        if (nextBlockSize_ < maxBlockSize_) {
+            size_t doubled = nextBlockSize_ * 2;
+            if (doubled < nextBlockSize_) doubled = maxBlockSize_; // overflow guard
+            nextBlockSize_ = std::min(doubled, maxBlockSize_);
         }
 
-        auto* ptr = try_allocate_from_block(current_, size, align);
+        auto* ptr = tryAllocateFromBlock(current_, size, align);
         if (ptr == nullptr) { throw std::bad_alloc(); }
         return ptr;
     }
@@ -86,14 +86,14 @@ namespace akkaradb::core {
         head_ = nullptr;
         tail_ = nullptr;
         current_ = nullptr;
-        next_block_size_ = initial_block_size_;
+        nextBlockSize_ = initialBlockSize_;
     }
 
-    bool BufferArena::is_power_of_two(size_t x) noexcept { return x != 0 && (x & (x - 1)) == 0; }
+    bool BufferArena::isPowerOfTwo(size_t x) noexcept { return x != 0 && (x & (x - 1)) == 0; }
 
-    size_t BufferArena::align_up(size_t x, size_t align) noexcept { return (x + (align - 1)) & ~(align - 1); }
+    size_t BufferArena::alignUp(size_t x, size_t align) noexcept { return (x + (align - 1)) & ~(align - 1); }
 
-    BufferArena::Block* BufferArena::create_block(size_t capacity, size_t alignment) {
+    BufferArena::Block* BufferArena::createBlock(size_t capacity, size_t alignment) {
         auto* block = new Block{};
         block->data = static_cast<std::byte*>(operator new(capacity, static_cast<std::align_val_t>(alignment)));
         block->capacity = capacity;
@@ -103,8 +103,8 @@ namespace akkaradb::core {
         return block;
     }
 
-    std::byte* BufferArena::try_allocate_from_block(Block* block, size_t size, size_t align) noexcept {
-        const size_t aligned = align_up(block->offset, align);
+    std::byte* BufferArena::tryAllocateFromBlock(Block* block, size_t size, size_t align) noexcept {
+        const size_t aligned = alignUp(block->offset, align);
         if (aligned > block->capacity || size > block->capacity - aligned) { return nullptr; }
 
         auto* ptr = block->data + aligned;

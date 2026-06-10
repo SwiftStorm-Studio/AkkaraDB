@@ -31,29 +31,33 @@ namespace akkaradb::engine::sst {
     class SSTWriter {
         public:
             enum class Codec : uint8_t {
-                None = 0, Zstd = 1,
+                NONE = 0, ZSTD = 1,
             };
 
             struct Options {
                 int level = 0;
-                uint32_t block_size = SST_DEFAULT_BLOCK_SIZE;
-                uint64_t target_file_size = SST_DEFAULT_TARGET_FILE_SIZE;
-                uint32_t bloom_bits_per_key = SST_DEFAULT_BLOOM_BITS_PER_KEY;
-                Codec codec = Codec::Zstd;
+                uint32_t blockSize = SST_DEFAULT_BLOCK_SIZE;
+                uint64_t targetFileSize = SST_DEFAULT_TARGET_FILE_SIZE;
+                uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
+                Codec codec = Codec::ZSTD;
             };
 
             struct Result {
                 std::filesystem::path path;
-                uint64_t entry_count = 0;
-                uint64_t file_size_bytes = 0;
-                uint64_t min_seq = UINT64_MAX;
-                uint64_t max_seq = 0;
-                std::vector<uint8_t> first_key;
-                std::vector<uint8_t> last_key;
+                uint64_t entryCount = 0;
+                uint64_t fileSizeBytes = 0;
+                uint64_t minSeq = UINT64_MAX;
+                uint64_t maxSeq = 0;
+                std::vector<uint8_t> firstKey;
+                std::vector<uint8_t> lastKey;
             };
 
             [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records);
-            [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records, const Options& options);
+            [[nodiscard]] static Result write(
+                const std::filesystem::path& path,
+                std::span<const core::RecordView> records,
+                const Options& options
+            );
 
         private:
             SSTWriter() = delete;

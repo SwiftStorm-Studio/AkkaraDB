@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/smoke/akkengine_smoke_test.cpp
+// benchmarks/smoke/akkengineSmokeTest.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
@@ -43,144 +43,144 @@ namespace {
         return {reinterpret_cast<const char*>(value.data()), value.size()};
     }
 
-    [[nodiscard]] fs::path temp_dir(std::string_view name) {
-        auto path = fs::temp_directory_path() / "akkaradb_akkengine_smoke" / std::string{name};
+    [[nodiscard]] fs::path tempDir(std::string_view name) {
+        auto path = fs::temp_directory_path() / "akkaradbAkkengineSmoke" / std::string{name};
         fs::remove_all(path);
         fs::create_directories(path);
         return path;
     }
 
-    void test_memory_basic() {
+    void testMemoryBasic() {
         AkkEngineOptions opts;
-        opts.components.wal_enabled = false;
-        opts.components.blob_enabled = false;
-        opts.components.manifest_enabled = false;
-        opts.components.sst_enabled = false;
+        opts.components.walEnabled = false;
+        opts.components.blobEnabled = false;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
 
         auto engine = AkkEngine::open(opts);
         engine->put(bytes("k"), bytes("v1"));
-        assert(text(*engine->get(bytes("k"))) == "v1");
-        assert(engine->exists(bytes("k")));
+        AKK_TEST_CHECK(text(*engine->get(bytes("k"))) == "v1");
+        AKK_TEST_CHECK(engine->exists(bytes("k")));
 
         engine->put(bytes("k"), bytes("v2"));
         std::vector<uint8_t> out;
-        assert(engine->get_into(bytes("k"), out));
-        assert(text(out) == "v2");
+        AKK_TEST_CHECK(engine->getInto(bytes("k"), out));
+        AKK_TEST_CHECK(text(out) == "v2");
 
         engine->remove(bytes("k"));
-        assert(!engine->get(bytes("k")));
-        assert(!engine->exists(bytes("k")));
+        AKK_TEST_CHECK(!engine->get(bytes("k")));
+        AKK_TEST_CHECK(!engine->exists(bytes("k")));
 
         engine->put(bytes("a"), bytes("1"));
         engine->put(bytes("b"), bytes("2"));
-        assert(engine->count(bytes("a"), bytes("c")) == 2);
+        AKK_TEST_CHECK(engine->count(bytes("a"), bytes("c")) == 2);
 
         const auto stats = engine->stats();
-        assert(stats.puts_total >= 4);
-        assert(stats.removes_total >= 1);
-        assert(stats.gets_total >= 3);
-        assert(stats.exists_total >= 2);
-        assert(stats.memtable.shard_count > 0);
+        AKK_TEST_CHECK(stats.putsTotal >= 4);
+        AKK_TEST_CHECK(stats.removesTotal >= 1);
+        AKK_TEST_CHECK(stats.getsTotal >= 3);
+        AKK_TEST_CHECK(stats.existsTotal >= 2);
+        AKK_TEST_CHECK(stats.memtable.shardCount > 0);
 
         engine->close();
         engine->close();
     }
 
-    void test_wal_recovery() {
-        const auto dir = temp_dir("wal");
+    void testWalRecovery() {
+        const auto dir = tempDir("wal");
 
         {
             AkkEngineOptions opts;
-            opts.paths.data_dir = dir;
-            opts.components.blob_enabled = false;
-            opts.components.manifest_enabled = false;
-            opts.components.sst_enabled = false;
+            opts.paths.dataDir = dir;
+            opts.components.blobEnabled = false;
+            opts.components.manifestEnabled = false;
+            opts.components.sstEnabled = false;
             auto engine = AkkEngine::open(opts);
             engine->put(bytes("a"), bytes("1"));
-            engine->force_sync();
+            engine->forceSync();
         }
 
         {
             AkkEngineOptions opts;
-            opts.paths.data_dir = dir;
-            opts.components.blob_enabled = false;
-            opts.components.manifest_enabled = false;
-            opts.components.sst_enabled = false;
+            opts.paths.dataDir = dir;
+            opts.components.blobEnabled = false;
+            opts.components.manifestEnabled = false;
+            opts.components.sstEnabled = false;
             auto engine = AkkEngine::open(opts);
-            assert(text(*engine->get(bytes("a"))) == "1");
+            AKK_TEST_CHECK(text(*engine->get(bytes("a"))) == "1");
         }
     }
 
-    void test_blob() {
-        const auto dir = temp_dir("blob");
+    void testBlob() {
+        const auto dir = tempDir("blob");
         AkkEngineOptions opts;
-        opts.paths.data_dir = dir;
-        opts.components.manifest_enabled = false;
-        opts.components.sst_enabled = false;
-        opts.blob.threshold_bytes = 4;
+        opts.paths.dataDir = dir;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
+        opts.blob.thresholdBytes = 4;
 
         auto engine = AkkEngine::open(opts);
         engine->put(bytes("blob"), bytes("large-value"));
-        assert(text(*engine->get(bytes("blob"))) == "large-value");
+        AKK_TEST_CHECK(text(*engine->get(bytes("blob"))) == "large-value");
     }
 
-    void test_flush_and_scan() {
-        const auto dir = temp_dir("flush");
+    void testFlushAndScan() {
+        const auto dir = tempDir("flush");
         AkkEngineOptions opts;
-        opts.paths.data_dir = dir;
-        opts.components.blob_enabled = false;
-        opts.memtable.threshold_bytes_per_shard = 1;
+        opts.paths.dataDir = dir;
+        opts.components.blobEnabled = false;
+        opts.memtable.thresholdBytesPerShard = 1;
 
         auto engine = AkkEngine::open(opts);
         engine->put(bytes("a"), bytes("1"));
         engine->put(bytes("b"), bytes("2"));
         engine->remove(bytes("a"));
-        engine->force_flush();
+        engine->forceFlush();
 
-        assert(!engine->get(bytes("a")));
-        assert(text(*engine->get(bytes("b"))) == "2");
+        AKK_TEST_CHECK(!engine->get(bytes("a")));
+        AKK_TEST_CHECK(text(*engine->get(bytes("b"))) == "2");
 
-        akkaradb::core::BufferArena scan_arena;
-        auto rows = engine->scan(scan_arena);
+        akkaradb::core::BufferArena scanArena;
+        auto rows = engine->scan(scanArena);
         auto it = rows.begin();
         int count = 0;
         while (!(it == rows.end())) {
             const auto& item = *it;
-            assert(text(item.key) == "b");
-            assert(text(item.value) == "2");
+            AKK_TEST_CHECK(text(item.key) == "b");
+            AKK_TEST_CHECK(text(item.value) == "2");
             ++count;
             ++it;
         }
-        assert(count == 1);
+        AKK_TEST_CHECK(count == 1);
     }
 
-    void test_version_log() {
-        const auto dir = temp_dir("vlog");
+    void testVersionLog() {
+        const auto dir = tempDir("vlog");
         AkkEngineOptions opts;
-        opts.paths.data_dir = dir;
-        opts.components.blob_enabled = false;
-        opts.components.manifest_enabled = false;
-        opts.components.sst_enabled = false;
-        opts.components.version_log_enabled = true;
+        opts.paths.dataDir = dir;
+        opts.components.blobEnabled = false;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
+        opts.components.versionLogEnabled = true;
 
         auto engine = AkkEngine::open(opts);
         engine->put(bytes("v"), bytes("one"));
         engine->put(bytes("v"), bytes("two"));
         const auto hist = engine->history(bytes("v"));
-        assert(hist.size() == 2);
-        assert(text(*engine->get_at(bytes("v"), hist[0].seq)) == "one");
-        engine->rollback_key(bytes("v"), hist[0].seq);
-        assert(text(*engine->get(bytes("v"))) == "one");
+        AKK_TEST_CHECK(hist.size() == 2);
+        AKK_TEST_CHECK(text(*engine->getAt(bytes("v"), hist[0].seq)) == "one");
+        engine->rollbackKey(bytes("v"), hist[0].seq);
+        AKK_TEST_CHECK(text(*engine->get(bytes("v"))) == "one");
     }
 }
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    test_memory_basic();
-    test_wal_recovery();
-    test_blob();
-    test_flush_and_scan();
-    test_version_log();
+    testMemoryBasic();
+    testWalRecovery();
+    testBlob();
+    testFlushAndScan();
+    testVersionLog();
     return 0;
 }

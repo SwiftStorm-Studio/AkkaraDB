@@ -19,9 +19,10 @@
 // akkengine/include/akk/core/memory/SmallBuffer.hpp
 #pragma once
 
-#include <cassert>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 
 #include "akk/core/buffer/BufferArena.hpp"
 
@@ -36,7 +37,7 @@ namespace akkaradb::core {
      *
      * Storage layout (exactly 32 bytes):
      *
-     *   [0..7]   uint8_t* active_ptr_
+     *   [0..7]   uint8_t* activePtr_
      *            ↁEAlways points to valid data
      *              - inl_  (inline storage)
      *              - arena memory
@@ -49,7 +50,7 @@ namespace akkaradb::core {
      *
      * Key design decisions:
      *   - No explicit "kind" field (inline vs arena)
-     *     ↁEDetermined via pointer comparison (active_ptr_ != inl_)
+     *     ↁEDetermined via pointer comparison (activePtr_ != inl_)
      *     ↁESaves space, preserves 32B invariant
      *
      *   - Branch-free data() access
@@ -77,7 +78,7 @@ namespace akkaradb::core {
          *   - Always non-null
          *   - Either points to inl_ or arena memory
          */
-        uint8_t* active_ptr_ = nullptr;
+        uint8_t* activePtr_ = nullptr;
 
         /**
          * Total size in bytes (key + value).
@@ -100,21 +101,21 @@ namespace akkaradb::core {
          *
          * No extra metadata needed; pointer comparison is sufficient.
          */
-        [[nodiscard]] bool is_arena() const noexcept { return active_ptr_ != inl_; }
+        [[nodiscard]] bool isArena() const noexcept { return activePtr_ != inl_; }
 
         /**
          * Branch-free data access.
          */
-        [[nodiscard]] const uint8_t* data() const noexcept { return active_ptr_; }
+        [[nodiscard]] const uint8_t* data() const noexcept { return activePtr_; }
 
-        [[nodiscard]] uint8_t* data() noexcept { return active_ptr_; }
+        [[nodiscard]] uint8_t* data() noexcept { return activePtr_; }
 
         // ==================== Constructors ====================
 
         /**
          * Default: empty inline buffer.
          */
-        SmallBuffer() noexcept : active_ptr_{inl_} {}
+        SmallBuffer() noexcept : activePtr_{inl_} {}
 
         /**
          * Construct contiguous [key | value].
@@ -123,18 +124,21 @@ namespace akkaradb::core {
          *   - <= 22 bytes ↁEinline
          *   - > 22 bytes  ↁEarena
          */
-        SmallBuffer(const uint8_t* key, size_t k_len, const uint8_t* val, size_t v_len, BufferArena& arena) {
-            const size_t n = k_len + v_len;
-            assert(n <= 0xFFFF);
+        SmallBuffer(const uint8_t* key, size_t kLen, const uint8_t* val, size_t vLen, BufferArena& arena) {
+            constexpr size_t maxSize = std::numeric_limits<uint16_t>::max();
+            if (kLen > maxSize || vLen > maxSize || kLen > maxSize - vLen) {
+                throw std::length_error("SmallBuffer: combined key/value length exceeds u16 range");
+            }
+            const size_t n = kLen + vLen;
 
             meta_ = static_cast<uint16_t>(n);
 
             // Select storage (branch happens once at construction)
-            active_ptr_ = n <= INLINE_CAP ? inl_ : reinterpret_cast<uint8_t*>(arena.allocate(n));
+            activePtr_ = n <= INLINE_CAP ? inl_ : reinterpret_cast<uint8_t*>(arena.allocate(n));
 
             // Copy payload
-            if (k_len) std::memcpy(active_ptr_, key, k_len);
-            if (v_len) std::memcpy(active_ptr_ + k_len, val, v_len);
+            if (kLen) std::memcpy(activePtr_, key, kLen);
+            if (vLen) std::memcpy(activePtr_ + kLen, val, vLen);
         }
 
         /**
@@ -153,18 +157,18 @@ namespace akkaradb::core {
          */
         SmallBuffer(SmallBuffer&& o) noexcept
             : meta_{o.meta_} {
-            if (o.is_arena()) {
+            if (o.isArena()) {
                 // Arena-backed: steal the external pointer
-                active_ptr_ = o.active_ptr_;
+                activePtr_ = o.activePtr_;
             }
             else {
-                // Inline: copy bytes to our own 'inl_' and point active_ptr_ here
-                active_ptr_ = inl_;
+                // Inline: copy bytes to our own 'inl_' and point activePtr_ here
+                activePtr_ = inl_;
                 if (meta_ > 0) { std::memcpy(inl_, o.inl_, meta_); }
             }
 
             // Ensure the source is left in a valid, empty inline state
-            o.reset_to_empty();
+            o.resetToEmpty();
         }
 
         /**
@@ -174,13 +178,13 @@ namespace akkaradb::core {
             if (this == &o) return *this;
 
             meta_ = o.meta_;
-            if (o.is_arena()) { active_ptr_ = o.active_ptr_; }
+            if (o.isArena()) { activePtr_ = o.activePtr_; }
             else {
-                active_ptr_ = inl_;
+                activePtr_ = inl_;
                 if (meta_ > 0) { std::memcpy(inl_, o.inl_, meta_); }
             }
 
-            o.reset_to_empty();
+            o.resetToEmpty();
             return *this;
         }
 
@@ -201,8 +205,8 @@ namespace akkaradb::core {
              * Resets the buffer to an empty inline state.
              * Internal helper to ensure SSO invariants after move operations.
              */
-            void reset_to_empty() noexcept {
-                active_ptr_ = inl_;
+            void resetToEmpty() noexcept {
+                activePtr_ = inl_;
                 meta_ = 0;
             }
     };

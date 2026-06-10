@@ -31,14 +31,14 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        std::string lower_ascii(std::string_view value) {
+        std::string lowerAscii(std::string_view value) {
             std::string out;
             out.reserve(value.size());
             for (const char ch : value) { out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch)))); }
             return out;
         }
 
-        bool parse_ipv4(std::string_view host, std::array<uint8_t, 4>& out) noexcept {
+        bool parseIpv4(std::string_view host, std::array<uint8_t, 4>& out) noexcept {
             size_t start = 0;
             for (size_t part = 0; part < out.size(); ++part) {
                 const size_t dot = host.find('.', start);
@@ -59,12 +59,12 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool is_lan_or_loopback_host(std::string_view host) {
-            const std::string normalized = lower_ascii(host);
+        bool isLanOrLoopbackHost(std::string_view host) {
+            const std::string normalized = lowerAscii(host);
             if (normalized == "localhost") { return true; }
 
             std::array<uint8_t, 4> ipv4{};
-            if (parse_ipv4(normalized, ipv4)) {
+            if (parseIpv4(normalized, ipv4)) {
                 if (ipv4[0] == 10) { return true; }
                 if (ipv4[0] == 127) { return true; }
                 if (ipv4[0] == 169 && ipv4[1] == 254) { return true; }
@@ -82,10 +82,10 @@ namespace akkaradb::engine::cluster {
             return false;
         }
 
-        void validate_transport_scope(const ClusterConfig& config, const ClusterRuntimeOptions& options) {
-            if (options.transport_mode != TransportMode::Plain) { return; }
+        void validateTransportScope(const ClusterConfig& config, const ClusterRuntimeOptions& options) {
+            if (options.transportMode != TransportMode::PLAIN) { return; }
             for (const auto& node : config.nodes()) {
-                if (!is_lan_or_loopback_host(node.host)) {
+                if (!isLanOrLoopbackHost(node.host)) {
                     throw std::invalid_argument(
                         "ClusterRuntime: Plain replication transport is only allowed for LAN or loopback node hosts; use TLS for WAN"
                     );
@@ -93,8 +93,8 @@ namespace akkaradb::engine::cluster {
             }
         }
 
-        void validate_runtime_mode(const ClusterConfig& config) {
-            if (config.mode() == ReplicationMode::Stripe) {
+        void validateRuntimeMode(const ClusterConfig& config) {
+            if (config.mode() == ReplicationMode::STRIPE) {
                 throw std::invalid_argument(
                     "ClusterRuntime: Stripe mode requires distributed write routing and ownership migration, which are not implemented yet"
                 );
@@ -105,24 +105,24 @@ namespace akkaradb::engine::cluster {
     class ClusterRuntime::Impl {
         public:
             Impl(
-                std::filesystem::path db_dir,
+                std::filesystem::path dbDir,
                 ClusterConfig config,
-                uint64_t self_node_id,
+                uint64_t selfNodeId,
                 ClusterEngineCallbacks callbacks,
-                ClusterRuntimeOptions runtime_options
+                ClusterRuntimeOptions runtimeOptions
             )
                 : config_{std::move(config)},
                   router_{config_},
-                  manager_{ClusterManager::create(std::move(db_dir), config_, self_node_id)},
-                  self_node_id_{self_node_id},
+                  manager_{ClusterManager::create(std::move(dbDir), config_, selfNodeId)},
+                  selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
-                  runtime_options_{std::move(runtime_options)} {
-                validate_runtime_mode(config_);
-                validate_transport_scope(config_, runtime_options_);
-                manager_->set_role_change_callback(
+                  runtimeOptions_{std::move(runtimeOptions)} {
+                validateRuntimeMode(config_);
+                validateTransportScope(config_, runtimeOptions_);
+                manager_->setRoleChangeCallback(
                     [this](NodeRole role) {
-                        install_role(role);
-                        if (callbacks_.role_change) { callbacks_.role_change(role); }
+                        installRole(role);
+                        if (callbacks_.roleChange) { callbacks_.roleChange(role); }
                     }
                 );
             }
@@ -136,12 +136,12 @@ namespace akkaradb::engine::cluster {
                     started_ = true;
                 }
                 manager_->start();
-                install_role(manager_->role());
+                installRole(manager_->role());
             }
 
             void close() {
                 std::lock_guard lock{mutex_};
-                stop_replication();
+                stopReplication();
                 manager_->close();
                 started_ = false;
             }
@@ -150,56 +150,56 @@ namespace akkaradb::engine::cluster {
 
             const ClusterRouter& router() const noexcept { return router_; }
 
-            void ship_entry(
+            void shipEntry(
                 uint64_t seq,
                 ReplOpType op,
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
-                uint8_t record_flags,
-                uint64_t source_node_id
+                uint8_t recordFlags,
+                uint64_t sourceNodeId
             ) {
                 std::lock_guard lock{mutex_};
-                if (server_) { server_->ship_entry(seq, op, key, value, record_flags, source_node_id); }
+                if (server_) { server_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
             }
 
-            void ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) {
+            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
                 std::lock_guard lock{mutex_};
-                if (server_) { server_->ship_blob(seq, blob_id, content); }
+                if (server_) { server_->shipBlob(seq, blobId, content); }
             }
 
         private:
-            void install_role(NodeRole role) {
+            void installRole(NodeRole role) {
                 std::lock_guard lock{mutex_};
-                stop_replication();
+                stopReplication();
 
-                if (role == NodeRole::Primary) {
-                    const auto* self = config_.find_by_id(self_node_id_);
-                    if (!self && !config_.is_standalone()) { throw std::runtime_error("ClusterRuntime: self node is missing from config"); }
-                    const uint16_t repl_port = self ? self->repl_port : 0;
+                if (role == NodeRole::PRIMARY) {
+                    const auto* self = config_.findById(selfNodeId_);
+                    if (!self && !config_.isStandalone()) { throw std::runtime_error("ClusterRuntime: self node is missing from config"); }
+                    const uint16_t replPort = self ? self->replPort : 0;
                     server_ = ReplicationServer::create(
-                        repl_port,
-                        self_node_id_,
-                        callbacks_.get_current_seq,
-                        config_.ack_policy(),
-                        runtime_options_
+                        replPort,
+                        selfNodeId_,
+                        callbacks_.getCurrentSeq,
+                        config_.ackPolicy(),
+                        runtimeOptions_
                     );
                     server_->start();
                 }
-                else if (role == NodeRole::Replica) {
+                else if (role == NodeRole::REPLICA) {
                     client_ = ReplicationClient::create(
-                        manager_->primary_host(),
-                        manager_->primary_repl_port(),
-                        self_node_id_,
-                        callbacks_.get_last_seq,
-                        runtime_options_
+                        manager_->primaryHost(),
+                        manager_->primaryReplPort(),
+                        selfNodeId_,
+                        callbacks_.getLastSeq,
+                        runtimeOptions_
                     );
-                    client_->set_apply_callback(callbacks_.apply);
-                    client_->set_blob_callback(callbacks_.apply_blob);
+                    client_->setApplyCallback(callbacks_.apply);
+                    client_->setBlobCallback(callbacks_.applyBlob);
                     client_->start();
                 }
             }
 
-            void stop_replication() {
+            void stopReplication() {
                 if (client_) {
                     client_->close();
                     client_.reset();
@@ -213,9 +213,9 @@ namespace akkaradb::engine::cluster {
             ClusterConfig config_;
             ClusterRouter router_;
             std::unique_ptr<ClusterManager> manager_;
-            uint64_t self_node_id_;
+            uint64_t selfNodeId_;
             ClusterEngineCallbacks callbacks_;
-            ClusterRuntimeOptions runtime_options_;
+            ClusterRuntimeOptions runtimeOptions_;
 
             mutable std::mutex mutex_;
             bool started_ = false;
@@ -224,15 +224,15 @@ namespace akkaradb::engine::cluster {
     };
 
     std::unique_ptr<ClusterRuntime> ClusterRuntime::create(
-        std::filesystem::path db_dir,
+        std::filesystem::path dbDir,
         ClusterConfig config,
-        uint64_t self_node_id,
+        uint64_t selfNodeId,
         ClusterEngineCallbacks callbacks,
-        ClusterRuntimeOptions runtime_options
+        ClusterRuntimeOptions runtimeOptions
     ) {
         return std::unique_ptr<ClusterRuntime>(
             new ClusterRuntime(
-                std::make_unique<Impl>(std::move(db_dir), std::move(config), self_node_id, std::move(callbacks), std::move(runtime_options))
+                std::make_unique<Impl>(std::move(dbDir), std::move(config), selfNodeId, std::move(callbacks), std::move(runtimeOptions))
             )
         );
     }
@@ -249,16 +249,16 @@ namespace akkaradb::engine::cluster {
 
     const ClusterRouter& ClusterRuntime::router() const noexcept { return impl_->router(); }
 
-    void ClusterRuntime::ship_entry(
+    void ClusterRuntime::shipEntry(
         uint64_t seq,
         ReplOpType op,
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
-        uint8_t record_flags,
-        uint64_t source_node_id
-    ) { impl_->ship_entry(seq, op, key, value, record_flags, source_node_id); }
+        uint8_t recordFlags,
+        uint64_t sourceNodeId
+    ) { impl_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
 
-    void ClusterRuntime::ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) {
-        impl_->ship_blob(seq, blob_id, content);
+    void ClusterRuntime::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+        impl_->shipBlob(seq, blobId, content);
     }
 } // namespace akkaradb::engine::cluster

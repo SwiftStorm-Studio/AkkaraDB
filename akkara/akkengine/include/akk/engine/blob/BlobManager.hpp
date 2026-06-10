@@ -31,17 +31,17 @@ namespace akkaradb::engine::blob {
     class BlobManager {
         public:
             struct Options {
-                std::filesystem::path blob_dir;
-                uint64_t threshold_bytes = DEFAULT_THRESHOLD_BYTES;
-                BlobCodec codec = BlobCodec::None;
+                std::filesystem::path blobDir;
+                uint64_t thresholdBytes = DEFAULT_THRESHOLD_BYTES;
+                BlobCodec codec = BlobCodec::NONE;
             };
 
             struct Snapshot {
-                uint64_t blobs_written = 0;
-                uint64_t bytes_uncompressed = 0;
-                uint64_t bytes_on_disk = 0;
-                uint64_t blobs_deleted = 0;
-                uint64_t gc_cycles = 0;
+                uint64_t blobsWritten = 0;
+                uint64_t bytesUncompressed = 0;
+                uint64_t bytesOnDisk = 0;
+                uint64_t blobsDeleted = 0;
+                uint64_t gcCycles = 0;
             };
 
             [[nodiscard]] static std::unique_ptr<BlobManager> create(Options options);
@@ -57,15 +57,15 @@ namespace akkaradb::engine::blob {
             void close();
 
             [[nodiscard]] uint64_t threshold() const noexcept;
-            [[nodiscard]] std::filesystem::path blob_path(uint64_t blob_id) const;
+            [[nodiscard]] std::filesystem::path blobPath(uint64_t blobId) const;
 
-            void write(uint64_t blob_id, std::span<const uint8_t> content);
+            void write(uint64_t blobId, std::span<const uint8_t> content);
 
-            [[nodiscard]] std::vector<uint8_t> read(uint64_t blob_id) const;
-            [[nodiscard]] std::vector<uint8_t> read(uint64_t blob_id, uint32_t expected_crc32c) const;
+            [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId) const;
+            [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId, uint32_t expectedCrc32c) const;
 
-            void schedule_delete(uint64_t blob_id);
-            void scan_orphans(std::function<bool(uint64_t)> is_referenced);
+            void scheduleDelete(uint64_t blobId);
+            void scanOrphans(std::function<bool(uint64_t)> isReferenced);
             [[nodiscard]] Snapshot snapshot() const noexcept;
 
         private:

@@ -32,10 +32,10 @@ namespace akkaradb::crypto {
      *
      * @throws std::runtime_error when the OS random source is unavailable.
      */
-    void secure_random(std::span<std::uint8_t> out);
+    void secureRandom(std::span<std::uint8_t> out);
 
     /**
      * @brief Best-effort constant-time wipe for temporary secret material.
      */
-    void secure_wipe(std::span<std::uint8_t> secret) noexcept;
+    void secureWipe(std::span<std::uint8_t> secret) noexcept;
 } // namespace akkaradb::crypto

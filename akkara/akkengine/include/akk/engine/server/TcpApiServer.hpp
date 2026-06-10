@@ -50,52 +50,53 @@ namespace akkaradb::engine::server {
         private:
             TcpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options);
 
-            void accept_loop();
-            void worker_loop();
-            void enqueue_client(detail::socket_t client);
-            void handle_connection(detail::Connection& connection);
-            [[nodiscard]] uint32_t worker_count() const;
-            [[nodiscard]] uint32_t accept_queue_limit() const noexcept;
-            [[nodiscard]] uint32_t accept_queue_timeout_ms() const noexcept;
-            [[nodiscard]] uint32_t max_batch_items() const noexcept;
-            [[nodiscard]] AkkEngineOptions::ApiIoBackend resolved_io_backend() const noexcept;
+            void acceptLoop();
+            void workerLoop();
+            void enqueueClient(detail::SocketHandle client);
+            void handleConnection(detail::Connection& connection);
+            [[nodiscard]] uint32_t workerCount() const;
+            [[nodiscard]] uint32_t acceptQueueLimit() const noexcept;
+            [[nodiscard]] uint32_t acceptQueueTimeoutMs() const noexcept;
+            [[nodiscard]] uint32_t maxBatchItems() const noexcept;
+            [[nodiscard]] AkkEngineOptions::ApiIoBackend resolvedIoBackend() const noexcept;
 
             using Clock = std::chrono::steady_clock;
+
             struct PendingClient {
-                detail::socket_t socket = detail::BAD_SOCKET_VALUE;
-                Clock::time_point enqueued_at{};
+                detail::SocketHandle socket = detail::BAD_SOCKET_VALUE;
+                Clock::time_point enqueuedAt{};
             };
 
-            void prune_expired_pending_locked(Clock::time_point now, std::vector<detail::socket_t>& expired);
-            void record_accept_queue_depth(size_t depth) noexcept;
+            void pruneExpiredPendingLocked(Clock::time_point now, std::vector<detail::SocketHandle>& expired);
+            void recordAcceptQueueDepth(size_t depth) noexcept;
 
             AkkEngine& engine_;
             AkkEngineOptions::ApiOptions options_;
             std::atomic<bool> running_{false};
-            detail::socket_t listen_socket_{detail::BAD_SOCKET_VALUE};
-            std::thread accept_thread_;
-            std::vector<std::thread> worker_threads_;
-            mutable std::mutex queue_mu_;
-            std::condition_variable queue_cv_;
-            std::deque<PendingClient> pending_clients_;
-            std::mutex active_mu_;
-            std::unordered_set<detail::socket_t> active_clients_;
-            std::atomic<uint64_t> connections_accepted_total_{0};
-            std::atomic<uint64_t> connections_closed_total_{0};
-            std::atomic<uint64_t> connections_active_{0};
-            std::atomic<uint64_t> accept_queue_peak_depth_{0};
-            std::atomic<uint64_t> accept_queue_rejected_total_{0};
-            std::atomic<uint64_t> accept_queue_expired_total_{0};
-            std::atomic<uint64_t> requests_total_{0};
-            std::atomic<uint64_t> responses_total_{0};
-            std::atomic<uint64_t> bytes_received_total_{0};
-            std::atomic<uint64_t> bytes_sent_total_{0};
-            std::atomic<uint64_t> protocol_errors_total_{0};
-            std::atomic<uint64_t> crc_errors_total_{0};
-            std::atomic<uint64_t> pipeline_batches_total_{0};
-            std::atomic<uint64_t> backpressure_flushes_total_{0};
-            std::atomic<uint64_t> backpressure_disconnects_total_{0};
-            std::atomic<uint64_t> batch_put_items_total_{0};
-            std::atomic<uint64_t> batch_get_items_total_{0};
+            detail::SocketHandle listenSocket_{detail::BAD_SOCKET_VALUE};
+            std::thread acceptThread_;
+            std::vector<std::thread> workerThreads_;
+            mutable std::mutex queueMu_;
+            std::condition_variable queueCv_;
+            std::deque<PendingClient> pendingClients_;
+            std::mutex activeMu_;
+            std::unordered_set<detail::SocketHandle> activeClients_;
+            std::atomic<uint64_t> connectionsAcceptedTotal_{0};
+            std::atomic<uint64_t> connectionsClosedTotal_{0};
+            std::atomic<uint64_t> connectionsActive_{0};
+            std::atomic<uint64_t> acceptQueuePeakDepth_{0};
+            std::atomic<uint64_t> acceptQueueRejectedTotal_{0};
+            std::atomic<uint64_t> acceptQueueExpiredTotal_{0};
+            std::atomic<uint64_t> requestsTotal_{0};
+            std::atomic<uint64_t> responsesTotal_{0};
+            std::atomic<uint64_t> bytesReceivedTotal_{0};
+            std::atomic<uint64_t> bytesSentTotal_{0};
+            std::atomic<uint64_t> protocolErrorsTotal_{0};
+            std::atomic<uint64_t> crcErrorsTotal_{0};
+            std::atomic<uint64_t> pipelineBatchesTotal_{0};
+            std::atomic<uint64_t> backpressureFlushesTotal_{0};
+            std::atomic<uint64_t> backpressureDisconnectsTotal_{0};
+            std::atomic<uint64_t> batchPutItemsTotal_{0};
+            std::atomic<uint64_t> batchGetItemsTotal_{0};
     };
 }

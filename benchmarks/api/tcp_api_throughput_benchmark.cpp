@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/api/tcp_api_throughput_benchmark.cpp
+// benchmarks/api/tcpApiThroughputBenchmark.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
@@ -52,10 +52,10 @@ using namespace akkaradb::engine::server;
 
 namespace {
     #ifdef _WIN32
-    using socket_t = SOCKET;
-    constexpr socket_t bad_socket = INVALID_SOCKET;
+    using SocketHandle = SOCKET;
+    constexpr SocketHandle badSocket = INVALID_SOCKET;
 
-    void net_init() {
+    void netInit() {
         static std::once_flag once;
         std::call_once(
             once,
@@ -66,14 +66,14 @@ namespace {
         );
     }
 
-    void close_socket(socket_t socket) {
+    void closeSocket(SocketHandle socket) {
         if (socket != INVALID_SOCKET) { ::closesocket(socket); }
     }
     #else
-    using socket_t = int;
-    constexpr socket_t bad_socket = -1;
-    void net_init() {}
-    void close_socket(socket_t socket) {
+    using SocketHandle = int;
+    constexpr SocketHandle badSocket = -1;
+    void netInit() {}
+    void closeSocket(SocketHandle socket) {
         if (socket >= 0) { ::close(socket); }
     }
     #endif
@@ -82,7 +82,7 @@ namespace {
         return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
     }
 
-    [[nodiscard]] bool socket_ok(socket_t socket) {
+    [[nodiscard]] bool socketOk(SocketHandle socket) {
         #ifdef _WIN32
         return socket != INVALID_SOCKET;
         #else
@@ -90,21 +90,21 @@ namespace {
         #endif
     }
 
-    [[nodiscard]] socket_t connect_tcp(const char* host, uint16_t port) {
-        net_init();
+    [[nodiscard]] SocketHandle connectTcp(const char* host, uint16_t port) {
+        netInit();
         addrinfo hints{};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
 
-        const std::string port_text = std::to_string(port);
+        const std::string portText = std::to_string(port);
         addrinfo* results = nullptr;
-        if (::getaddrinfo(host, port_text.c_str(), &hints, &results) != 0) { return bad_socket; }
+        if (::getaddrinfo(host, portText.c_str(), &hints, &results) != 0) { return badSocket; }
 
-        socket_t connected = bad_socket;
+        SocketHandle connected = badSocket;
         for (addrinfo* it = results; it != nullptr; it = it->ai_next) {
-            socket_t candidate = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-            if (!socket_ok(candidate)) { continue; }
+            SocketHandle candidate = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+            if (!socketOk(candidate)) { continue; }
             const int rc = ::connect(
                 candidate,
                 it->ai_addr,
@@ -118,13 +118,13 @@ namespace {
                 connected = candidate;
                 break;
             }
-            close_socket(candidate);
+            closeSocket(candidate);
         }
         ::freeaddrinfo(results);
         return connected;
     }
 
-    bool send_all(socket_t socket, const uint8_t* data, size_t size) {
+    bool sendAll(SocketHandle socket, const uint8_t* data, size_t size) {
         size_t sent = 0;
         while (sent < size) {
             #ifdef _WIN32
@@ -138,7 +138,7 @@ namespace {
         return true;
     }
 
-    bool recv_all(socket_t socket, uint8_t* data, size_t size) {
+    bool recvAll(SocketHandle socket, uint8_t* data, size_t size) {
         size_t got = 0;
         while (got < size) {
             #ifdef _WIN32
@@ -152,14 +152,14 @@ namespace {
         return true;
     }
 
-    [[nodiscard]] std::vector<uint8_t> make_request(uint32_t request_id, ApiOp op, std::span<const uint8_t> key, std::span<const uint8_t> value = {}) {
+    [[nodiscard]] std::vector<uint8_t> makeRequest(uint32_t requestId, ApiOp op, std::span<const uint8_t> key, std::span<const uint8_t> value = {}) {
         ApiRequestHeader header{};
         std::memcpy(header.magic, REQUEST_MAGIC, sizeof(header.magic));
         header.version = PROTOCOL_VERSION;
         header.opcode = op;
-        header.request_id = request_id;
-        header.key_len = static_cast<uint16_t>(key.size());
-        header.val_len = static_cast<uint32_t>(value.size());
+        header.requestId = requestId;
+        header.keyLen = static_cast<uint16_t>(key.size());
+        header.valLen = static_cast<uint32_t>(value.size());
 
         const uint32_t checksum = crc32c(key, value);
         std::vector<uint8_t> wire(sizeof(header) + key.size() + value.size() + sizeof(checksum));
@@ -178,34 +178,34 @@ namespace {
         return wire;
     }
 
-    bool read_response(socket_t socket, uint32_t expected_request_id, std::vector<uint8_t>& value) {
+    bool readResponse(SocketHandle socket, uint32_t expectedRequestId, std::vector<uint8_t>& value) {
         ApiResponseHeader header{};
-        if (!recv_all(socket, reinterpret_cast<uint8_t*>(&header), sizeof(header))) { return false; }
-        if (std::memcmp(header.magic, RESPONSE_MAGIC, sizeof(header.magic)) != 0 || header.request_id != expected_request_id) { return false; }
+        if (!recvAll(socket, reinterpret_cast<uint8_t*>(&header), sizeof(header))) { return false; }
+        if (std::memcmp(header.magic, RESPONSE_MAGIC, sizeof(header.magic)) != 0 || header.requestId != expectedRequestId) { return false; }
 
-        value.resize(header.val_len);
-        if (!value.empty() && !recv_all(socket, value.data(), value.size())) { return false; }
+        value.resize(header.valLen);
+        if (!value.empty() && !recvAll(socket, value.data(), value.size())) { return false; }
 
-        uint32_t received_crc = 0;
-        if (!recv_all(socket, reinterpret_cast<uint8_t*>(&received_crc), sizeof(received_crc))) { return false; }
-        if (received_crc != crc32c(std::span<const uint8_t>{value.data(), value.size()})) { return false; }
-        return header.status == ApiStatus::Ok;
+        uint32_t receivedCrc = 0;
+        if (!recvAll(socket, reinterpret_cast<uint8_t*>(&receivedCrc), sizeof(receivedCrc))) { return false; }
+        if (receivedCrc != crc32c(std::span<const uint8_t>{value.data(), value.size()})) { return false; }
+        return header.status == ApiStatus::OK;
     }
 
-    [[nodiscard]] std::filesystem::path temp_dir() {
-        const auto dir = std::filesystem::temp_directory_path() / "akkaradb_tcp_api_throughput";
+    [[nodiscard]] std::filesystem::path tempDir() {
+        const auto dir = std::filesystem::temp_directory_path() / "akkaradbTcpApiThroughput";
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir, ec);
         return dir;
     }
 
-    [[nodiscard]] uint16_t default_port() {
+    [[nodiscard]] uint16_t defaultPort() {
         const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
         return static_cast<uint16_t>(31000 + (ticks % 10000));
     }
 
-    [[nodiscard]] size_t size_arg(int argc, char** argv, const char* flag, size_t fallback) {
+    [[nodiscard]] size_t sizeArg(int argc, char** argv, const char* flag, size_t fallback) {
         const std::string prefix = std::string{flag} + "=";
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg{argv[i]};
@@ -215,11 +215,11 @@ namespace {
         return fallback;
     }
 
-    [[nodiscard]] uint16_t port_arg(int argc, char** argv, const char* flag, uint16_t fallback) {
-        return static_cast<uint16_t>(size_arg(argc, argv, flag, fallback));
+    [[nodiscard]] uint16_t portArg(int argc, char** argv, const char* flag, uint16_t fallback) {
+        return static_cast<uint16_t>(sizeArg(argc, argv, flag, fallback));
     }
 
-    [[nodiscard]] std::string string_arg(int argc, char** argv, const char* flag, std::string fallback) {
+    [[nodiscard]] std::string stringArg(int argc, char** argv, const char* flag, std::string fallback) {
         const std::string prefix = std::string{flag} + "=";
         for (int i = 1; i < argc; ++i) {
             const std::string_view arg{argv[i]};
@@ -238,14 +238,14 @@ namespace {
 }
 
 int main(int argc, char** argv) {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    const size_t operations = size_arg(argc, argv, "--ops", 100000);
-    const size_t clients = std::max<size_t>(1, size_arg(argc, argv, "--clients", std::thread::hardware_concurrency()));
-    const size_t payload_size = size_arg(argc, argv, "--payload", 128);
-    const size_t keyspace = std::max<size_t>(1, size_arg(argc, argv, "--keyspace", 65536));
-    const uint16_t port = port_arg(argc, argv, "--port", default_port());
-    const std::string mode = string_arg(argc, argv, "--mode", "mixed");
+    const size_t operations = sizeArg(argc, argv, "--ops", 100000);
+    const size_t clients = std::max<size_t>(1, sizeArg(argc, argv, "--clients", std::thread::hardware_concurrency()));
+    const size_t payloadSize = sizeArg(argc, argv, "--payload", 128);
+    const size_t keyspace = std::max<size_t>(1, sizeArg(argc, argv, "--keyspace", 65536));
+    const uint16_t port = portArg(argc, argv, "--port", defaultPort());
+    const std::string mode = stringArg(argc, argv, "--mode", "mixed");
     if (mode != "get" && mode != "put" && mode != "mixed") {
         std::cerr << "invalid --mode: expected get, put, or mixed\n";
         return 2;
@@ -255,23 +255,23 @@ int main(int argc, char** argv) {
     keys.reserve(keyspace);
     for (size_t i = 0; i < keyspace; ++i) { keys.push_back("key-" + std::to_string(i)); }
 
-    std::vector<uint8_t> value(payload_size);
+    std::vector<uint8_t> value(payloadSize);
     for (size_t i = 0; i < value.size(); ++i) { value[i] = static_cast<uint8_t>(i); }
 
     AkkEngineOptions options;
-    options.paths.data_dir = temp_dir();
-    options.components.wal_enabled = false;
-    options.components.blob_enabled = false;
-    options.components.manifest_enabled = false;
-    options.components.sst_enabled = false;
-    options.components.version_log_enabled = false;
-    options.components.api_enabled = true;
-    options.api.bind_host = "127.0.0.1";
-    options.api.tcp_port = port;
-    options.api.backends = {AkkEngineOptions::ApiBackend::Tcp};
-    options.api.transport_mode = cluster::TransportMode::Plain;
-    options.api.tcp_worker_threads = static_cast<uint32_t>(clients);
-    options.runtime.writer_threads = static_cast<uint32_t>(clients);
+    options.paths.dataDir = tempDir();
+    options.components.walEnabled = false;
+    options.components.blobEnabled = false;
+    options.components.manifestEnabled = false;
+    options.components.sstEnabled = false;
+    options.components.versionLogEnabled = false;
+    options.components.apiEnabled = true;
+    options.api.bindHost = "127.0.0.1";
+    options.api.tcpPort = port;
+    options.api.backends = {AkkEngineOptions::ApiBackend::TCP};
+    options.api.transportMode = cluster::TransportMode::PLAIN;
+    options.api.tcpWorkerThreads = static_cast<uint32_t>(clients);
+    options.runtime.writerThreads = static_cast<uint32_t>(clients);
 
     auto engine = AkkEngine::open(options);
     if (mode == "get" || mode == "mixed") {
@@ -285,43 +285,43 @@ int main(int argc, char** argv) {
     std::vector<std::thread> threads;
     std::vector<std::vector<uint64_t>> samples(clients);
 
-    const size_t per_client = (operations + clients - 1) / clients;
-    const auto bench_start_connect = std::chrono::steady_clock::now();
+    const size_t perClient = (operations + clients - 1) / clients;
+    const auto benchStartConnect = std::chrono::steady_clock::now();
 
-    for (size_t client_id = 0; client_id < clients; ++client_id) {
+    for (size_t clientId = 0; clientId < clients; ++clientId) {
         threads.emplace_back(
-            [&, client_id] {
-                socket_t socket = connect_tcp("127.0.0.1", port);
-                if (!socket_ok(socket)) {
+            [&, clientId] {
+                SocketHandle socket = connectTcp("127.0.0.1", port);
+                if (!socketOk(socket)) {
                     failures.fetch_add(1, std::memory_order_relaxed);
                     ready.fetch_add(1, std::memory_order_release);
                     return;
                 }
 
-                std::vector<uint8_t> response_value;
+                std::vector<uint8_t> responseValue;
                 std::vector<uint8_t> request;
-                auto& local_samples = samples[client_id];
-                local_samples.reserve((per_client + 1023) / 1024);
+                auto& localSamples = samples[clientId];
+                localSamples.reserve((perClient + 1023) / 1024);
 
                 ready.fetch_add(1, std::memory_order_release);
                 while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
 
-                const size_t begin = client_id * per_client;
-                const size_t end = std::min(operations, begin + per_client);
+                const size_t begin = clientId * perClient;
+                const size_t end = std::min(operations, begin + perClient);
                 for (size_t i = begin; i < end; ++i) {
                     const auto& key = keys[i % keys.size()];
-                    const bool put_op = mode == "put" || (mode == "mixed" && (i & 1u) == 1u);
-                    const uint32_t request_id = static_cast<uint32_t>(i + 1);
+                    const bool putOp = mode == "put" || (mode == "mixed" && (i & 1u) == 1u);
+                    const uint32_t requestId = static_cast<uint32_t>(i + 1);
 
                     const auto t0 = std::chrono::steady_clock::now();
-                    if (put_op) {
-                        request = make_request(request_id, ApiOp::Put, bytes(key), std::span<const uint8_t>{value.data(), value.size()});
+                    if (putOp) {
+                        request = makeRequest(requestId, ApiOp::PUT, bytes(key), std::span<const uint8_t>{value.data(), value.size()});
                     }
                     else {
-                        request = make_request(request_id, ApiOp::Get, bytes(key));
+                        request = makeRequest(requestId, ApiOp::GET, bytes(key));
                     }
 
-                    if (!send_all(socket, request.data(), request.size()) || !read_response(socket, request_id, response_value)) {
+                    if (!sendAll(socket, request.data(), request.size()) || !readResponse(socket, requestId, responseValue)) {
                         failures.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
@@ -329,43 +329,43 @@ int main(int argc, char** argv) {
                     completed.fetch_add(1, std::memory_order_relaxed);
                     if ((i & 1023u) == 0) {
                         const auto t1 = std::chrono::steady_clock::now();
-                        local_samples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                        localSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
                     }
                 }
-                close_socket(socket);
+                closeSocket(socket);
             }
         );
     }
 
     while (ready.load(std::memory_order_acquire) < clients) { std::this_thread::yield(); }
-    const auto bench_start = std::chrono::steady_clock::now();
+    const auto benchStart = std::chrono::steady_clock::now();
     start.store(true, std::memory_order_release);
     for (auto& thread : threads) { thread.join(); }
-    const auto bench_end = std::chrono::steady_clock::now();
+    const auto benchEnd = std::chrono::steady_clock::now();
 
-    std::vector<uint64_t> all_samples;
-    for (auto& sample_set : samples) {
-        all_samples.insert(all_samples.end(), sample_set.begin(), sample_set.end());
+    std::vector<uint64_t> allSamples;
+    for (auto& sampleSet : samples) {
+        allSamples.insert(allSamples.end(), sampleSet.begin(), sampleSet.end());
     }
 
-    const double seconds = std::chrono::duration<double>(bench_end - bench_start).count();
-    const double connect_seconds = std::chrono::duration<double>(bench_start - bench_start_connect).count();
-    const size_t completed_ops = completed.load(std::memory_order_relaxed);
+    const double seconds = std::chrono::duration<double>(benchEnd - benchStart).count();
+    const double connectSeconds = std::chrono::duration<double>(benchStart - benchStartConnect).count();
+    const size_t completedOps = completed.load(std::memory_order_relaxed);
     const size_t failed = failures.load(std::memory_order_relaxed);
 
     std::cout << "mode = " << mode << '\n';
     std::cout << "operations = " << operations << '\n';
     std::cout << "clients = " << clients << '\n';
-    std::cout << "payload_bytes = " << payload_size << '\n';
+    std::cout << "payloadBytes = " << payloadSize << '\n';
     std::cout << "keyspace = " << keyspace << '\n';
-    std::cout << "connect_setup_seconds = " << connect_seconds << '\n';
+    std::cout << "connectSetupSeconds = " << connectSeconds << '\n';
     std::cout << "seconds = " << seconds << '\n';
-    std::cout << "completed = " << completed_ops << '\n';
-    std::cout << "throughput_ops_sec = " << (seconds > 0.0 ? static_cast<double>(completed_ops) / seconds : 0.0) << '\n';
+    std::cout << "completed = " << completedOps << '\n';
+    std::cout << "throughputOpsSec = " << (seconds > 0.0 ? static_cast<double>(completedOps) / seconds : 0.0) << '\n';
     std::cout << "failures = " << failed << '\n';
-    std::cout << "sampled_latency_us_p50 = " << percentile(all_samples, 0.50) << '\n';
-    std::cout << "sampled_latency_us_p95 = " << percentile(all_samples, 0.95) << '\n';
-    std::cout << "sampled_latency_us_p99 = " << percentile(all_samples, 0.99) << '\n';
+    std::cout << "sampledLatencyUsP50 = " << percentile(allSamples, 0.50) << '\n';
+    std::cout << "sampledLatencyUsP95 = " << percentile(allSamples, 0.95) << '\n';
+    std::cout << "sampledLatencyUsP99 = " << percentile(allSamples, 0.99) << '\n';
 
     engine->close();
     return failed == 0 ? 0 : 1;

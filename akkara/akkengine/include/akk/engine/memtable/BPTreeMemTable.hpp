@@ -33,17 +33,17 @@
 #include "akk/core/record/OwnedRecord.hpp"
 #include "akk/engine/memtable/IMemTable.hpp"
 
-namespace akkaradb::engine {
+namespace akkaradb::engine::memtable {
     class BPTreeMemTable final : public IMemTable {
         public:
             static constexpr uint16_t MAX_KEYS = 63;
             static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;
 
             explicit BPTreeMemTable(
-                size_t data_arena_initial_block_size = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
-                size_t data_arena_max_block_size = core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
-                size_t generator_arena_initial_block_size = 64 * 1024,
-                size_t generator_arena_max_block_size = 2 * 1024 * 1024
+                size_t dataArenaInitialBlockSize = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
+                size_t dataArenaMaxBlockSize = core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
+                size_t generatorArenaInitialBlockSize = 64 * 1024,
+                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024
             );
 
             [[nodiscard]] Status put(
@@ -51,11 +51,11 @@ namespace akkaradb::engine {
                 ByteView value,
                 uint64_t seq,
                 uint8_t flags,
-                uint64_t precomputed_fp64 = 0,
-                uint64_t precomputed_mk = 0
+                uint64_t precomputedFp64 = 0,
+                uint64_t precomputedMk = 0
             ) override;
-            [[nodiscard]] bool get(ByteView key, uint64_t snapshot_seq, RecordView* out) const override;
-            [[nodiscard]] ArenaGenerator<RecordView> iterator(ByteView start_key, ByteView end_key, uint64_t snapshot_seq) const override;
+            [[nodiscard]] bool get(ByteView key, uint64_t snapshotSeq, RecordView* out) const override;
+            [[nodiscard]] ArenaGenerator<RecordView> iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const override;
             void freeze() override;
 
             [[nodiscard]] size_t sizeBytes() const override;
@@ -73,16 +73,16 @@ namespace akkaradb::engine {
 
             struct Node {
                 std::atomic<uint64_t> version{0};
-                bool is_leaf{true};
-                std::atomic<uint16_t> key_count{0};
+                bool isLeaf{true};
+                std::atomic<uint16_t> keyCount{0};
 
                 std::array<std::atomic<const core::OwnedRecord*>, MAX_KEYS> keys{};
                 std::array<std::atomic<VersionChain*>, MAX_KEYS> chains{};
                 std::array<std::atomic<Node*>, MAX_KEYS + 1> children{};
 
-                std::atomic<Node*> next_leaf{nullptr};
+                std::atomic<Node*> nextLeaf{nullptr};
 
-                explicit Node(bool leaf) noexcept : is_leaf{leaf} {}
+                explicit Node(bool leaf) noexcept : isLeaf{leaf} {}
             };
 
             struct SplitResult {
@@ -90,54 +90,54 @@ namespace akkaradb::engine {
                 Node* right{nullptr};
             };
 
-            core::BufferArena data_arena_;
-            mutable core::BufferArena generator_arena_;
-            mutable std::mutex generator_arena_mutex_;
+            core::BufferArena dataArena_;
+            mutable core::BufferArena generatorArena_;
+            mutable std::mutex generatorArenaMutex_;
 
             std::atomic<Node*> root_{nullptr};
             std::atomic<bool> frozen_{false};
             std::atomic<size_t> bytes_{0};
             std::atomic<size_t> entries_{0};
 
-            [[nodiscard]] static std::span<const uint8_t> as_u8(ByteView view) noexcept;
+            [[nodiscard]] static std::span<const uint8_t> asU8(ByteView view) noexcept;
 
             template <typename T, typename... Args>
-            [[nodiscard]] T* arena_new(Args&&... args) {
-                std::byte* mem = data_arena_.allocate(sizeof(T), alignof(T));
+            [[nodiscard]] T* arenaNew(Args&&... args) {
+                std::byte* mem = dataArena_.allocate(sizeof(T), alignof(T));
                 return new(mem) T(std::forward<Args>(args)...);
             }
 
-            [[nodiscard]] Node* make_node(bool leaf);
-            [[nodiscard]] VersionChain* make_chain(const core::OwnedRecord* initial);
-            [[nodiscard]] core::OwnedRecord* make_record(
+            [[nodiscard]] Node* makeNode(bool leaf);
+            [[nodiscard]] VersionChain* makeChain(const core::OwnedRecord* initial);
+            [[nodiscard]] core::OwnedRecord* makeRecord(
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
                 uint64_t seq,
                 uint8_t flags,
-                uint64_t precomputed_fp64,
-                uint64_t precomputed_mk
+                uint64_t precomputedFp64,
+                uint64_t precomputedMk
             );
 
-            static void begin_write(Node* node) noexcept;
-            static void end_write(Node* node) noexcept;
+            static void beginWrite(Node* node) noexcept;
+            static void endWrite(Node* node) noexcept;
 
-            [[nodiscard]] static int compare_record_key(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept;
-            [[nodiscard]] static int compare_record_record(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept;
-            [[nodiscard]] static uint16_t find_leaf_position(const Node* leaf, std::span<const uint8_t> key) noexcept;
-            [[nodiscard]] static uint16_t find_leaf_position(const Node* leaf, std::span<const uint8_t> key, uint16_t key_count) noexcept;
-            [[nodiscard]] static uint16_t find_child_index(const Node* internal, std::span<const uint8_t> key) noexcept;
+            [[nodiscard]] static int compareRecordKey(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept;
+            [[nodiscard]] static int compareRecordRecord(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept;
+            [[nodiscard]] static uint16_t findLeafPosition(const Node* leaf, std::span<const uint8_t> key) noexcept;
+            [[nodiscard]] static uint16_t findLeafPosition(const Node* leaf, std::span<const uint8_t> key, uint16_t keyCount) noexcept;
+            [[nodiscard]] static uint16_t findChildIndex(const Node* internal, std::span<const uint8_t> key) noexcept;
 
-            static void append_version(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
-            [[nodiscard]] static bool visible_record(VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept;
-            [[nodiscard]] static RecordView to_view(const core::OwnedRecord& record) noexcept;
+            static void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
+            [[nodiscard]] static bool visibleRecord(VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;
+            [[nodiscard]] static RecordView toView(const core::OwnedRecord& record) noexcept;
 
-            [[nodiscard]] std::optional<SplitResult> insert_recursive(Node* node, const core::OwnedRecord* record);
-            [[nodiscard]] Node* descend_to_candidate_leaf(std::span<const uint8_t> key) const noexcept;
-            [[nodiscard]] ArenaGenerator<RecordView> iterate_snapshot(uint64_t snapshot_seq) const;
-            [[nodiscard]] ArenaGenerator<RecordView> iterate_snapshot_range(
-                uint64_t snapshot_seq,
-                std::vector<uint8_t> start_key,
-                std::vector<uint8_t> end_key
+            [[nodiscard]] std::optional<SplitResult> insertRecursive(Node* node, const core::OwnedRecord* record);
+            [[nodiscard]] Node* descendToCandidateLeaf(std::span<const uint8_t> key) const noexcept;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshot(uint64_t snapshotSeq) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshotRange(
+                uint64_t snapshotSeq,
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey
             ) const;
     };
-} // namespace akkaradb::engine
+} // namespace akkaradb::engine::memtable

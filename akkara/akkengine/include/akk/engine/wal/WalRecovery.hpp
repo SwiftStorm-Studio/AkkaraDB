@@ -32,28 +32,28 @@ namespace akkaradb::engine::memtable {
 
 namespace akkaradb::engine::wal {
     struct WalRecoveryOptions {
-        std::filesystem::path wal_dir;
-        uint64_t checkpoint_seq = 0;
-        size_t max_entry_bytes = 64ULL * 1024ULL * 1024ULL;
+        std::filesystem::path walDir;
+        uint64_t checkpointSeq = 0;
+        size_t maxEntryBytes = 64ULL * 1024ULL * 1024ULL;
     };
 
     struct WalRecoveredEntry {
         std::vector<uint8_t> key;
         std::vector<uint8_t> value;
         uint64_t seq = 0;
-        uint64_t key_fp64 = 0;
+        uint64_t keyFp64 = 0;
         uint16_t flags = 0;
-        uint16_t shard_id = 0;
-        uint64_t segment_id = 0;
+        uint16_t shardId = 0;
+        uint64_t segmentId = 0;
     };
 
     struct WalRecoveryResult {
-        uint64_t segments_seen = 0;
-        uint64_t segments_replayed = 0;
-        uint64_t corrupt_segments = 0;
-        uint64_t entries_seen = 0;
-        uint64_t entries_replayed = 0;
-        uint64_t max_seq = 0;
+        uint64_t segmentsSeen = 0;
+        uint64_t segmentsReplayed = 0;
+        uint64_t corruptSegments = 0;
+        uint64_t entriesSeen = 0;
+        uint64_t entriesReplayed = 0;
+        uint64_t maxSeq = 0;
     };
 
     class WalRecovery {
@@ -61,6 +61,6 @@ namespace akkaradb::engine::wal {
             using Callback = std::function<void(const WalRecoveredEntry&)>;
 
             [[nodiscard]] static WalRecoveryResult recover(const WalRecoveryOptions& options, const Callback& callback);
-            [[nodiscard]] static WalRecoveryResult recover_into(const WalRecoveryOptions& options, memtable::MemTable& memtable);
+            [[nodiscard]] static WalRecoveryResult recoverInto(const WalRecoveryOptions& options, memtable::MemTable& memtable);
     };
 } // namespace akkaradb::engine::wal

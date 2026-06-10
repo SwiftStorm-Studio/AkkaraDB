@@ -48,14 +48,14 @@ namespace akkaradb::core {
                         ptr += 8;
                     }
 
-                    tail_len_ = static_cast<size_t>(end - ptr);
-                    std::memcpy(tail_.data(), ptr, tail_len_);
+                    tailLen_ = static_cast<size_t>(end - ptr);
+                    std::memcpy(tail_.data(), ptr, tailLen_);
                 }
 
-                [[nodiscard]] uint64_t finalize(size_t total_len) noexcept {
-                    uint64_t b = static_cast<uint64_t>(total_len) << 56;
+                [[nodiscard]] uint64_t finalize(size_t totalLen) noexcept {
+                    uint64_t b = static_cast<uint64_t>(totalLen) << 56;
 
-                    for (size_t i = 0; i < tail_len_; ++i) { b |= static_cast<uint64_t>(tail_[i]) << (i * 8); }
+                    for (size_t i = 0; i < tailLen_; ++i) { b |= static_cast<uint64_t>(tail_[i]) << (i * 8); }
 
                     compress(b);
 
@@ -96,23 +96,23 @@ namespace akkaradb::core {
 
                 uint64_t v0_, v1_, v2_, v3_;
                 std::array<uint8_t, 8> tail_{};
-                size_t tail_len_{0};
+                size_t tailLen_{0};
         };
     } // namespace
 
-    uint64_t compute_key_fp64(const uint8_t* key, size_t key_len) noexcept {
-        if (key_len == 0) { return 0ULL; }
+    uint64_t computeKeyFp64(const uint8_t* key, size_t keyLen) noexcept {
+        if (keyLen == 0) { return 0ULL; }
 
         SipHash24 hasher;
-        hasher.update(key, key_len);
-        return hasher.finalize(key_len);
+        hasher.update(key, keyLen);
+        return hasher.finalize(keyLen);
     }
 
-    uint64_t build_mini_key(const uint8_t* key, size_t key_len) noexcept {
+    uint64_t buildMiniKey(const uint8_t* key, size_t keyLen) noexcept {
         uint64_t mini = 0;
-        const size_t copy_len = std::min<size_t>(key_len, 8);
+        const size_t copyLen = std::min<size_t>(keyLen, 8);
 
-        for (size_t i = 0; i < copy_len; ++i) { mini |= static_cast<uint64_t>(key[i]) << (i * 8); }
+        for (size_t i = 0; i < copyLen; ++i) { mini |= static_cast<uint64_t>(key[i]) << (i * 8); }
 
         return mini;
     }

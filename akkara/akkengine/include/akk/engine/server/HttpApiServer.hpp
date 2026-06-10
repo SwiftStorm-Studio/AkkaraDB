@@ -25,9 +25,11 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace akkaradb::engine::server {
@@ -49,25 +51,28 @@ namespace akkaradb::engine::server {
                 std::string path;
                 std::string query;
                 std::vector<uint8_t> body;
-                bool keep_alive = true;
+                bool keepAlive = true;
             };
 
             HttpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options);
 
-            void accept_loop();
-            void handle_connection(detail::Connection& connection);
-            bool read_request(detail::Connection& connection, ParsedRequest& request);
-            bool route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& value_buffer);
-            bool send_response(detail::Connection& connection, int status_code, std::span<const uint8_t> body);
-            bool send_empty(detail::Connection& connection, int status_code);
+            void acceptLoop();
+            void handleConnection(detail::Connection& connection);
+            bool readRequest(detail::Connection& connection, ParsedRequest& request);
+            bool route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer);
+            bool sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body);
+            bool sendEmpty(detail::Connection& connection, int statusCode);
 
-            [[nodiscard]] static std::string query_param(std::string_view query, std::string_view name);
-            [[nodiscard]] static std::vector<uint8_t> url_decode(std::string_view encoded);
+            [[nodiscard]] static std::string queryParam(std::string_view query, std::string_view name);
+            [[nodiscard]] static std::vector<uint8_t> urlDecode(std::string_view encoded);
 
             AkkEngine& engine_;
             AkkEngineOptions::ApiOptions options_;
             std::atomic<bool> running_{false};
-            detail::socket_t listen_socket_{detail::BAD_SOCKET_VALUE};
-            std::thread accept_thread_;
+            detail::SocketHandle listenSocket_{detail::BAD_SOCKET_VALUE};
+            std::thread acceptThread_;
+            std::mutex clientsMu_;
+            std::unordered_set<detail::SocketHandle> activeClients_;
+            std::vector<std::thread> connectionThreads_;
     };
 }

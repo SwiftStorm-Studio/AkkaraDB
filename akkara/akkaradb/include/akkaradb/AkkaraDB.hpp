@@ -38,22 +38,22 @@ namespace akkaradb {
     class AKDB_API AkkaraDB {
         public:
             struct Options {
-                std::filesystem::path data_dir;
+                std::filesystem::path dataDir;
                 StartupMode mode = StartupMode::NORMAL;
 
                 struct Overrides {
-                    std::optional<size_t> memtable_threshold_per_shard;
-                    std::optional<bool> version_log_enabled;
-                    std::optional<engine::Codec> sst_codec;
-                    std::optional<engine::Codec> blob_codec;
-                    std::optional<uint64_t> blob_threshold_bytes;
-                    std::optional<bool> sst_promote_reads;
-                    std::optional<size_t> sst_bloom_bits_per_key;
-                    std::optional<size_t> max_l0_sst_files;
+                    std::optional<size_t> memtableThresholdPerShard;
+                    std::optional<bool> versionLogEnabled;
+                    std::optional<engine::Codec> sstCodec;
+                    std::optional<engine::Codec> blobCodec;
+                    std::optional<uint64_t> blobThresholdBytes;
+                    std::optional<bool> sstPromoteReads;
+                    std::optional<size_t> sstBloomBitsPerKey;
+                    std::optional<size_t> maxL0SstFiles;
                 } overrides;
             };
 
-            [[nodiscard]] static std::unique_ptr<AkkaraDB> open(std::filesystem::path data_dir, StartupMode mode = StartupMode::NORMAL);
+            [[nodiscard]] static std::unique_ptr<AkkaraDB> open(std::filesystem::path dataDir, StartupMode mode = StartupMode::NORMAL);
             [[nodiscard]] static std::unique_ptr<AkkaraDB> open(Options options);
 
             ~AkkaraDB();
@@ -73,8 +73,8 @@ namespace akkaradb {
                 using Table = PackedTable<PrimaryKeyPtr>;
                 Table out;
                 out.engine_ = &engine();
-                out.table_name_ = std::move(name);
-                out.pk_prefix_ = Table::make_table_prefix(out.table_name_);
+                out.tableName_ = std::move(name);
+                out.pkPrefix_ = Table::makeTablePrefix(out.tableName_);
                 return out;
             }
 

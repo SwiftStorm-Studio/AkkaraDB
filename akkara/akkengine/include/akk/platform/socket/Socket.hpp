@@ -28,7 +28,7 @@ namespace akkaradb::platform {
      * @brief Minimal TCP socket wrapper.
      *
      * The socket is configured for non-blocking I/O after connection establishment.
-     * send_some() and recv_some() never block; they report would-block via std::error_code.
+     * sendSome() and recvSome() never block; they report would-block via std::error_code.
      */
     class Socket {
         public:
@@ -74,24 +74,24 @@ namespace akkaradb::platform {
              *
              * @param data Input buffer.
              * @param size Maximum number of bytes to send.
-             * @param out_sent Number of bytes sent on success.
-             * @return std::error_code{} on success, operation_would_block if the socket would block.
+             * @param outSent Number of bytes sent on success.
+             * @return std::error_code{} on success, operationWouldBlock if the socket would block.
              */
-            std::error_code send_some(const void* data, std::size_t size, std::size_t& out_sent) noexcept;
+            std::error_code sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept;
 
             /**
              * @brief Receive up to @p size bytes without blocking.
              *
              * @param data Output buffer.
              * @param size Maximum number of bytes to receive.
-             * @param out_recv Number of bytes received on success.
-             * @return std::error_code{} on success, operation_would_block if the socket would block.
+             * @param outRecv Number of bytes received on success.
+             * @return std::error_code{} on success, operationWouldBlock if the socket would block.
              */
-            std::error_code recv_some(void* data, std::size_t size, std::size_t& out_recv) noexcept;
+            std::error_code recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept;
 
         private:
-            typedef std::uintptr_t native_handle_t;
+            typedef std::uintptr_t NativeHandle;
 
-            native_handle_t handle_;
+            NativeHandle handle_;
     };
 } //akkaradb::socket

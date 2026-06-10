@@ -39,9 +39,11 @@ namespace akkaradb::engine::sst {
     inline constexpr uint8_t SST_RECORD_FLAG_TOMBSTONE = 0x01u;
     inline constexpr uint8_t SST_RECORD_FLAG_BLOB = 0x02u;
 
-    [[nodiscard]] constexpr uint64_t align_up_u64(uint64_t value, uint64_t alignment) noexcept { return (value + alignment - 1u) & ~(alignment - 1u); }
+    [[nodiscard]] constexpr uint64_t alignUpU64(uint64_t value, uint64_t alignment) noexcept {
+        return (value + alignment - 1u) & ~(alignment - 1u);
+    }
 
-    [[nodiscard]] constexpr uint32_t align_up_u32(uint32_t value, uint32_t alignment) noexcept {
+    [[nodiscard]] constexpr uint32_t alignUpU32(uint32_t value, uint32_t alignment) noexcept {
         return static_cast<uint32_t>((static_cast<uint64_t>(value) + alignment - 1u) & ~(static_cast<uint64_t>(alignment) - 1u));
     }
 
@@ -49,73 +51,73 @@ namespace akkaradb::engine::sst {
     struct SSTFileHeaderV2 {
         uint32_t magic;
         uint16_t version;
-        uint16_t header_size;
+        uint16_t headerSize;
         uint32_t flags;
         uint32_t level;
         uint64_t file_size;
-        uint64_t entry_count;
-        uint64_t block_count;
-        uint64_t data_offset;
-        uint64_t index_offset;
-        uint64_t index_size;
-        uint64_t key_arena_offset;
-        uint64_t key_arena_size;
-        uint64_t bloom_offset;
-        uint64_t bloom_size;
-        uint64_t footer_offset;
-        uint64_t min_seq;
-        uint64_t max_seq;
-        uint32_t block_size;
+        uint64_t entryCount;
+        uint64_t blockCount;
+        uint64_t dataOffset;
+        uint64_t indexOffset;
+        uint64_t indexSize;
+        uint64_t keyArenaOffset;
+        uint64_t keyArenaSize;
+        uint64_t bloomOffset;
+        uint64_t bloomSize;
+        uint64_t footerOffset;
+        uint64_t minSeq;
+        uint64_t maxSeq;
+        uint32_t blockSize;
         uint32_t reserved0;
         uint8_t reserved[124];
         uint32_t crc32c;
     };
 
     struct SSTBlockHeaderV2 {
-        uint32_t header_size;
+        uint32_t headerSize;
         uint32_t flags;
-        uint32_t record_count;
-        uint32_t compressed_size;
-        uint32_t uncompressed_size;
-        uint32_t offsets_size;
-        uint64_t first_seq;
-        uint64_t last_seq;
-        uint64_t first_key_fp64;
-        uint64_t last_key_fp64;
+        uint32_t recordCount;
+        uint32_t compressedSize;
+        uint32_t uncompressedSize;
+        uint32_t offsetsSize;
+        uint64_t firstSeq;
+        uint64_t lastSeq;
+        uint64_t firstKeyFp64;
+        uint64_t lastKeyFp64;
         uint32_t crc32c;
         uint32_t reserved;
     };
 
     struct SSTBlockIndexEntryV2 {
-        uint64_t block_offset;
-        uint32_t block_size;
-        uint32_t uncompressed_size;
-        uint64_t first_mini_key;
-        uint64_t last_mini_key;
-        uint64_t first_key_fp64;
-        uint64_t last_key_fp64;
-        uint32_t first_key_offset;
-        uint32_t first_key_len;
-        uint32_t last_key_offset;
-        uint32_t last_key_len;
-        uint32_t record_count;
+        uint64_t blockOffset;
+        uint32_t blockSize;
+        uint32_t uncompressedSize;
+        uint64_t firstMiniKey;
+        uint64_t lastMiniKey;
+        uint64_t firstKeyFp64;
+        uint64_t lastKeyFp64;
+        uint32_t firstKeyOffset;
+        uint32_t firstKeyLen;
+        uint32_t lastKeyOffset;
+        uint32_t lastKeyLen;
+        uint32_t recordCount;
         uint32_t flags;
     };
 
     struct SSTBloomHeaderV2 {
-        uint32_t num_bits;
-        uint32_t num_hashes;
-        uint32_t bits_size;
+        uint32_t numBits;
+        uint32_t numHashes;
+        uint32_t bitsSize;
         uint32_t reserved;
     };
 
     struct SSTFooterV2 {
         uint64_t file_size;
-        uint64_t index_offset;
-        uint64_t key_arena_offset;
-        uint64_t bloom_offset;
-        uint32_t header_crc32c;
-        uint32_t footer_crc32c;
+        uint64_t indexOffset;
+        uint64_t keyArenaOffset;
+        uint64_t bloomOffset;
+        uint32_t headerCrc32c;
+        uint32_t footerCrc32c;
         uint32_t magic;
         uint32_t version;
     };

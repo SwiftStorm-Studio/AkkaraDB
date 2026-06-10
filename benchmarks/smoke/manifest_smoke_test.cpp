@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/smoke/manifest_smoke_test.cpp
+// benchmarks/smoke/manifestSmokeTest.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/manifest/Manifest.hpp"
@@ -32,16 +32,16 @@
 using namespace akkaradb::engine::manifest;
 
 namespace {
-    static std::filesystem::path make_temp_dir(const std::string& suffix) {
-        auto dir = std::filesystem::temp_directory_path() / ("akkaradb_manifest_smoke_" + suffix);
+    static std::filesystem::path makeTempDir(const std::string& suffix) {
+        auto dir = std::filesystem::temp_directory_path() / ("akkaradbManifestSmoke_" + suffix);
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir, ec);
-        assert(!ec);
+        AKK_TEST_CHECK(!ec);
         return dir;
     }
 
-    static std::filesystem::path latest_manifest_file(const std::filesystem::path& base) {
+    static std::filesystem::path latestManifestFile(const std::filesystem::path& base) {
         if (std::filesystem::exists(base)) {
             return base;
         }
@@ -54,75 +54,75 @@ namespace {
         return base;
     }
 
-    static void test_basic_state_and_replay() {
-        const auto dir = make_temp_dir("basic");
+    static void testBasicStateAndReplay() {
+        const auto dir = makeTempDir("basic");
         const auto path = dir / "manifest.akmf";
 
         {
             auto mf = Manifest::create(path, false);
             mf->start();
             mf->advance(42);
-            mf->sst_seal(0, "L0_0001.aksst", 100, std::optional<std::string>{"aa"}, std::optional<std::string>{"ff"});
-            mf->sst_delete("L0_0001.aksst");
-            mf->sst_seal(0, "L0_0002.aksst", 200, std::nullopt, std::nullopt);
+            mf->sstSeal(0, "L0_0001.aksst", 100, std::optional<std::string>{"aa"}, std::optional<std::string>{"ff"});
+            mf->sstDelete("L0_0001.aksst");
+            mf->sstSeal(0, "L0_0002.aksst", 200, std::nullopt, std::nullopt);
             mf->checkpoint(std::optional<std::string>{"cp1"}, std::optional<uint64_t>{42}, std::optional<uint64_t>{1000});
             mf->close();
         }
 
         {
             auto mf = Manifest::create(path, false);
-            const auto live = mf->live_sst();
-            assert(live.size() == 1);
-            assert(live[0] == "L0_0002.aksst");
+            const auto live = mf->liveSst();
+            AKK_TEST_CHECK(live.size() == 1);
+            AKK_TEST_CHECK(live[0] == "L0_0002.aksst");
 
-            const auto deleted = mf->deleted_sst();
-            assert(deleted.empty());
+            const auto deleted = mf->deletedSst();
+            AKK_TEST_CHECK(deleted.empty());
 
-            const auto cp = mf->last_checkpoint();
-            assert(cp.has_value());
-            assert(cp->name.has_value() && cp->name.value() == "cp1");
-            assert(cp->stripe.has_value() && cp->stripe.value() == 42);
-            assert(cp->last_seq.has_value() && cp->last_seq.value() == 1000);
-            assert(mf->stripes_written() == 42);
+            const auto cp = mf->lastCheckpoint();
+            AKK_TEST_CHECK(cp.has_value());
+            AKK_TEST_CHECK(cp->name.has_value() && cp->name.value() == "cp1");
+            AKK_TEST_CHECK(cp->stripe.has_value() && cp->stripe.value() == 42);
+            AKK_TEST_CHECK(cp->lastSeq.has_value() && cp->lastSeq.value() == 1000);
+            AKK_TEST_CHECK(mf->stripesWritten() == 42);
         }
     }
 
-    static void test_compaction_commit() {
-        const auto dir = make_temp_dir("commit");
+    static void testCompactionCommit() {
+        const auto dir = makeTempDir("commit");
         const auto path = dir / "manifest.akmf";
 
         auto mf = Manifest::create(path, false);
-        mf->sst_seal(0, "in1.aksst", 10, std::nullopt, std::nullopt);
-        mf->sst_seal(0, "in2.aksst", 20, std::nullopt, std::nullopt);
-        mf->compaction_commit({"out1.aksst", "out2.aksst"}, {"in1.aksst", "in2.aksst"});
+        mf->sstSeal(0, "in1.aksst", 10, std::nullopt, std::nullopt);
+        mf->sstSeal(0, "in2.aksst", 20, std::nullopt, std::nullopt);
+        mf->compactionCommit({"out1.aksst", "out2.aksst"}, {"in1.aksst", "in2.aksst"});
 
-        const auto live = mf->live_sst();
-        bool has_out1 = false;
-        bool has_out2 = false;
-        bool has_in1 = false;
+        const auto live = mf->liveSst();
+        bool hasOut1 = false;
+        bool hasOut2 = false;
+        bool hasIn1 = false;
         for (const auto& f : live) {
-            if (f == "out1.aksst") has_out1 = true;
-            if (f == "out2.aksst") has_out2 = true;
-            if (f == "in1.aksst") has_in1 = true;
+            if (f == "out1.aksst") hasOut1 = true;
+            if (f == "out2.aksst") hasOut2 = true;
+            if (f == "in1.aksst") hasIn1 = true;
         }
-        assert(has_out1 && has_out2);
-        assert(!has_in1);
+        AKK_TEST_CHECK(hasOut1 && hasOut2);
+        AKK_TEST_CHECK(!hasIn1);
     }
 
-    static void test_crc_stop_on_corruption() {
-        const auto dir = make_temp_dir("crc");
+    static void testCrcStopOnCorruption() {
+        const auto dir = makeTempDir("crc");
         const auto path = dir / "manifest.akmf";
 
         {
             auto mf = Manifest::create(path, false);
-            mf->sst_seal(0, "a.aksst", 1, std::nullopt, std::nullopt);
-            mf->sst_seal(0, "b.aksst", 1, std::nullopt, std::nullopt);
+            mf->sstSeal(0, "a.aksst", 1, std::nullopt, std::nullopt);
+            mf->sstSeal(0, "b.aksst", 1, std::nullopt, std::nullopt);
             mf->close();
         }
 
         {
-            std::fstream file(latest_manifest_file(path), std::ios::in | std::ios::out | std::ios::binary);
-            assert(file.good());
+            std::fstream file(latestManifestFile(path), std::ios::in | std::ios::out | std::ios::binary);
+            AKK_TEST_CHECK(file.good());
             // Corrupt first record payload byte after 32B file header + 8B rec header.
             file.seekp(40, std::ios::beg);
             char bad = '\x7f';
@@ -132,17 +132,17 @@ namespace {
         {
             auto mf = Manifest::create(path, false);
             // replay stops at first CRC mismatch; no valid SST state should be rebuilt.
-            assert(mf->live_sst().empty());
+            AKK_TEST_CHECK(mf->liveSst().empty());
         }
     }
 } // namespace
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    test_basic_state_and_replay();
-    test_compaction_commit();
-    test_crc_stop_on_corruption();
+    testBasicStateAndReplay();
+    testCompactionCommit();
+    testCrcStopOnCorruption();
     std::printf("manifest smoke test passed\n");
     return 0;
 }

@@ -33,64 +33,64 @@ namespace akkaradb::engine::server {
         constexpr uint32_t kDefaultMaxBatchItems = 4096u;
         constexpr size_t kReadBufferBytes = 64u * 1024u;
 
-        [[nodiscard]] bool valid_header(const ApiRequestHeader& header) {
+        [[nodiscard]] bool validHeader(const ApiRequestHeader& header) {
             return std::memcmp(header.magic, REQUEST_MAGIC, sizeof(header.magic)) == 0 && header.version == PROTOCOL_VERSION && header.
-                val_len <= kMaxValueBytes;
+                valLen <= kMaxValueBytes;
         }
 
-        [[nodiscard]] bool read_batch_count(std::span<const uint8_t> payload, uint32_t& out) noexcept {
+        [[nodiscard]] bool readBatchCount(std::span<const uint8_t> payload, uint32_t& out) noexcept {
             if (payload.size() < sizeof(uint32_t)) { return false; }
             std::memcpy(&out, payload.data(), sizeof(uint32_t));
             return true;
         }
 
-        void close_client_socket(detail::socket_t client) noexcept {
-            detail::shutdown_socket(client);
-            detail::close_socket(client);
+        void closeClientSocket(detail::SocketHandle client) noexcept {
+            detail::shutdownSocket(client);
+            detail::closeSocket(client);
         }
 
         struct RequestFrame {
             ApiRequestHeader header{};
             std::span<const uint8_t> key;
             std::span<const uint8_t> value;
-            uint32_t received_crc = 0;
-            size_t wire_size = 0;
+            uint32_t receivedCrc = 0;
+            size_t wireSize = 0;
         };
 
         enum class FrameReadStatus : uint8_t {
-            Ok, NeedMore, Closed, Invalid,
+            OK, NEED_MORE, CLOSED, INVALID,
         };
 
         class BufferedInput {
             public:
                 BufferedInput() { buffer_.reserve(kReadBufferBytes); }
 
-                FrameReadStatus read_frame(detail::Connection& connection, RequestFrame& out, bool blocking) {
+                FrameReadStatus readFrame(detail::Connection& connection, RequestFrame& out, bool blocking) {
                     if (!ensure(connection, sizeof(ApiRequestHeader), blocking)) {
-                        return blocking ? FrameReadStatus::Closed : FrameReadStatus::NeedMore;
+                        return blocking ? FrameReadStatus::CLOSED : FrameReadStatus::NEED_MORE;
                     }
 
                     std::memcpy(&out.header, buffer_.data() + pos_, sizeof(out.header));
-                    if (!valid_header(out.header)) { return FrameReadStatus::Invalid; }
+                    if (!validHeader(out.header)) { return FrameReadStatus::INVALID; }
 
-                    const size_t key_len = out.header.key_len;
-                    const size_t value_len = out.header.val_len;
-                    if (value_len > kMaxValueBytes) { return FrameReadStatus::Invalid; }
-                    if (key_len > std::numeric_limits<size_t>::max() - sizeof(ApiRequestHeader) - sizeof(uint32_t) - value_len) {
-                        return FrameReadStatus::Invalid;
+                    const size_t keyLen = out.header.keyLen;
+                    const size_t valueLen = out.header.valLen;
+                    if (valueLen > kMaxValueBytes) { return FrameReadStatus::INVALID; }
+                    if (keyLen > std::numeric_limits<size_t>::max() - sizeof(ApiRequestHeader) - sizeof(uint32_t) - valueLen) {
+                        return FrameReadStatus::INVALID;
                     }
 
-                    const size_t total = sizeof(ApiRequestHeader) + key_len + value_len + sizeof(uint32_t);
-                    if (!ensure(connection, total, blocking)) { return blocking ? FrameReadStatus::Closed : FrameReadStatus::NeedMore; }
+                    const size_t total = sizeof(ApiRequestHeader) + keyLen + valueLen + sizeof(uint32_t);
+                    if (!ensure(connection, total, blocking)) { return blocking ? FrameReadStatus::CLOSED : FrameReadStatus::NEED_MORE; }
 
                     const uint8_t* p = buffer_.data() + pos_ + sizeof(ApiRequestHeader);
-                    out.key = {p, key_len};
-                    p += key_len;
-                    out.value = {p, value_len};
-                    p += value_len;
-                    std::memcpy(&out.received_crc, p, sizeof(out.received_crc));
-                    out.wire_size = total;
-                    return FrameReadStatus::Ok;
+                    out.key = {p, keyLen};
+                    p += keyLen;
+                    out.value = {p, valueLen};
+                    p += valueLen;
+                    std::memcpy(&out.receivedCrc, p, sizeof(out.receivedCrc));
+                    out.wireSize = total;
+                    return FrameReadStatus::OK;
                 }
 
                 void consume(size_t size) noexcept {
@@ -129,7 +129,7 @@ namespace akkaradb::engine::server {
                     compact();
                     const size_t offset = buffer_.size();
                     buffer_.resize(offset + kReadBufferBytes);
-                    const size_t got = connection.recv_some(buffer_.data() + offset, kReadBufferBytes);
+                    const size_t got = connection.recvSome(buffer_.data() + offset, kReadBufferBytes);
                     if (got == 0) {
                         buffer_.resize(offset);
                         return false;
@@ -153,382 +153,378 @@ namespace akkaradb::engine::server {
 
     void TcpApiServer::start() {
         if (running_.load(std::memory_order_acquire)) { return; }
-        listen_socket_ = detail::listen_on(options_.bind_host, options_.tcp_port, "TcpApiServer", detail::make_socket_tuning(options_));
+        listenSocket_ = detail::listenOn(options_.bindHost, options_.tcpPort, "TcpApiServer", detail::makeSocketTuning(options_));
         try {
-            const uint32_t workers = worker_count();
-            worker_threads_.reserve(workers);
+            const uint32_t workers = workerCount();
+            workerThreads_.reserve(workers);
             running_.store(true, std::memory_order_release);
-            for (uint32_t i = 0; i < workers; ++i) { worker_threads_.emplace_back([this] { worker_loop(); }); }
-            accept_thread_ = std::thread([this] { accept_loop(); });
+            for (uint32_t i = 0; i < workers; ++i) { workerThreads_.emplace_back([this] { workerLoop(); }); }
+            acceptThread_ = std::thread([this] { acceptLoop(); });
         }
         catch (...) {
             running_.store(false, std::memory_order_release);
-            detail::shutdown_socket(listen_socket_);
-            detail::close_socket(listen_socket_);
-            listen_socket_ = detail::BAD_SOCKET_VALUE;
-            queue_cv_.notify_all();
-            if (accept_thread_.joinable()) { accept_thread_.join(); }
-            for (auto& worker : worker_threads_) {
-                if (worker.joinable()) { worker.join(); }
-            }
-            worker_threads_.clear();
+            detail::shutdownSocket(listenSocket_);
+            detail::closeSocket(listenSocket_);
+            listenSocket_ = detail::BAD_SOCKET_VALUE;
+            queueCv_.notify_all();
+            if (acceptThread_.joinable()) { acceptThread_.join(); }
+            for (auto& worker : workerThreads_) { if (worker.joinable()) { worker.join(); } }
+            workerThreads_.clear();
             throw;
         }
     }
 
     void TcpApiServer::close() {
         if (!running_.exchange(false, std::memory_order_acq_rel)) { return; }
-        detail::shutdown_socket(listen_socket_);
-        detail::close_socket(listen_socket_);
-        listen_socket_ = detail::BAD_SOCKET_VALUE;
+        detail::shutdownSocket(listenSocket_);
+        detail::closeSocket(listenSocket_);
+        listenSocket_ = detail::BAD_SOCKET_VALUE;
         {
-            std::lock_guard lock(queue_mu_);
-            for (const PendingClient& pending : pending_clients_) { close_client_socket(pending.socket); }
-            pending_clients_.clear();
+            std::lock_guard lock(queueMu_);
+            for (const PendingClient& pending : pendingClients_) { closeClientSocket(pending.socket); }
+            pendingClients_.clear();
         }
         {
-            std::lock_guard lock(active_mu_);
-            for (const detail::socket_t client : active_clients_) { detail::shutdown_socket(client); }
+            std::lock_guard lock(activeMu_);
+            for (const detail::SocketHandle client : activeClients_) { detail::shutdownSocket(client); }
         }
-        queue_cv_.notify_all();
-        if (accept_thread_.joinable()) { accept_thread_.join(); }
-        for (auto& worker : worker_threads_) {
-            if (worker.joinable()) { worker.join(); }
-        }
-        worker_threads_.clear();
+        queueCv_.notify_all();
+        if (acceptThread_.joinable()) { acceptThread_.join(); }
+        for (auto& worker : workerThreads_) { if (worker.joinable()) { worker.join(); } }
+        workerThreads_.clear();
     }
 
-    void TcpApiServer::accept_loop() {
+    void TcpApiServer::acceptLoop() {
         while (running_.load(std::memory_order_acquire)) {
-            const detail::socket_t client = ::accept(listen_socket_, nullptr, nullptr);
-            if (!detail::socket_ok(client)) {
+            const detail::SocketHandle client = ::accept(listenSocket_, nullptr, nullptr);
+            if (!detail::socketOk(client)) {
                 if (!running_.load(std::memory_order_acquire)) { break; }
-                if (detail::last_accept_error_is_transient()) { continue; }
+                if (detail::lastAcceptErrorIsTransient()) { continue; }
                 break;
             }
-            detail::apply_socket_tuning(client, detail::make_socket_tuning(options_), true);
-            connections_accepted_total_.fetch_add(1, std::memory_order_relaxed);
+            detail::applySocketTuning(client, detail::makeSocketTuning(options_), true);
+            connectionsAcceptedTotal_.fetch_add(1, std::memory_order_relaxed);
 
-            enqueue_client(client);
+            enqueueClient(client);
         }
     }
 
-    void TcpApiServer::enqueue_client(detail::socket_t client) {
+    void TcpApiServer::enqueueClient(detail::SocketHandle client) {
         if (!running_.load(std::memory_order_acquire)) {
-            close_client_socket(client);
+            closeClientSocket(client);
             return;
         }
 
-        std::vector<detail::socket_t> expired;
+        std::vector<detail::SocketHandle> expired;
         {
-            std::lock_guard lock(queue_mu_);
+            std::lock_guard lock(queueMu_);
             const Clock::time_point now = Clock::now();
-            prune_expired_pending_locked(now, expired);
-            const uint32_t limit = accept_queue_limit();
-            if (pending_clients_.size() >= limit) {
-                accept_queue_rejected_total_.fetch_add(1, std::memory_order_relaxed);
+            pruneExpiredPendingLocked(now, expired);
+            const uint32_t limit = acceptQueueLimit();
+            if (pendingClients_.size() >= limit) {
+                acceptQueueRejectedTotal_.fetch_add(1, std::memory_order_relaxed);
                 expired.push_back(client);
             }
             else {
-                pending_clients_.push_back(PendingClient{client, now});
-                record_accept_queue_depth(pending_clients_.size());
+                pendingClients_.push_back(PendingClient{client, now});
+                recordAcceptQueueDepth(pendingClients_.size());
             }
         }
 
-        for (const detail::socket_t expired_client : expired) { close_client_socket(expired_client); }
+        for (const detail::SocketHandle expiredClient : expired) { closeClientSocket(expiredClient); }
         if (!expired.empty() && expired.back() == client) { return; }
-        queue_cv_.notify_one();
+        queueCv_.notify_one();
     }
 
-    void TcpApiServer::worker_loop() {
+    void TcpApiServer::workerLoop() {
         for (;;) {
-            detail::socket_t client = detail::BAD_SOCKET_VALUE;
-            std::vector<detail::socket_t> expired;
+            detail::SocketHandle client = detail::BAD_SOCKET_VALUE;
+            std::vector<detail::SocketHandle> expired;
             {
-                std::unique_lock lock(queue_mu_);
+                std::unique_lock lock(queueMu_);
                 for (;;) {
-                    queue_cv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire) || !pending_clients_.empty(); });
+                    queueCv_.wait(lock, [this] { return !running_.load(std::memory_order_acquire) || !pendingClients_.empty(); });
                     if (!running_.load(std::memory_order_acquire)) { break; }
-                    prune_expired_pending_locked(Clock::now(), expired);
-                    if (!pending_clients_.empty()) {
-                        client = pending_clients_.front().socket;
-                        pending_clients_.pop_front();
+                    pruneExpiredPendingLocked(Clock::now(), expired);
+                    if (!pendingClients_.empty()) {
+                        client = pendingClients_.front().socket;
+                        pendingClients_.pop_front();
                         break;
                     }
                 }
             }
 
-            for (const detail::socket_t expired_client : expired) { close_client_socket(expired_client); }
-            if (!detail::socket_ok(client)) { return; }
+            for (const detail::SocketHandle expiredClient : expired) { closeClientSocket(expiredClient); }
+            if (!detail::socketOk(client)) { return; }
 
             {
-                std::lock_guard lock(active_mu_);
-                active_clients_.insert(client);
+                std::lock_guard lock(activeMu_);
+                activeClients_.insert(client);
             }
-            connections_active_.fetch_add(1, std::memory_order_relaxed);
+            connectionsActive_.fetch_add(1, std::memory_order_relaxed);
 
             {
                 detail::Connection connection{client};
-                if (options_.transport_mode == cluster::TransportMode::TLS) {
-                    try { connection.enable_tls(options_.tls); }
+                if (options_.transportMode == cluster::TransportMode::TLS) {
+                    try { connection.enableTls(options_.tls); }
                     catch (...) {
-                        std::lock_guard lock(active_mu_);
-                        active_clients_.erase(client);
-                        connections_active_.fetch_sub(1, std::memory_order_relaxed);
-                        connections_closed_total_.fetch_add(1, std::memory_order_relaxed);
+                        std::lock_guard lock(activeMu_);
+                        activeClients_.erase(client);
+                        connectionsActive_.fetch_sub(1, std::memory_order_relaxed);
+                        connectionsClosedTotal_.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                 }
-                handle_connection(connection);
+                handleConnection(connection);
                 connection.shutdown();
             }
 
             {
-                std::lock_guard lock(active_mu_);
-                active_clients_.erase(client);
+                std::lock_guard lock(activeMu_);
+                activeClients_.erase(client);
             }
-            connections_active_.fetch_sub(1, std::memory_order_relaxed);
-            connections_closed_total_.fetch_add(1, std::memory_order_relaxed);
+            connectionsActive_.fetch_sub(1, std::memory_order_relaxed);
+            connectionsClosedTotal_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    void TcpApiServer::handle_connection(detail::Connection& connection) {
+    void TcpApiServer::handleConnection(detail::Connection& connection) {
         BufferedInput reader;
-        std::vector<uint8_t> output_buffer;
-        std::vector<uint8_t> response_buffer;
-        std::vector<uint8_t> write_buffer;
-        std::vector<ApiBatchPutItem> batch_put_items;
-        std::vector<AkkEngine::BatchPutEntry> engine_put_items;
-        std::vector<std::span<const uint8_t>> batch_get_keys;
-        std::vector<AkkEngine::BatchGetResult> engine_get_results;
-        std::vector<ApiBatchGetResult> wire_get_results;
+        std::vector<uint8_t> outputBuffer;
+        std::vector<uint8_t> responseBuffer;
+        std::vector<uint8_t> writeBuffer;
+        std::vector<ApiBatchPutItem> batchPutItems;
+        std::vector<AkkEngine::BatchPutEntry> enginePutItems;
+        std::vector<std::span<const uint8_t>> batchGetKeys;
+        std::vector<AkkEngine::BatchGetResult> engineGetResults;
+        std::vector<ApiBatchGetResult> wireGetResults;
 
-        const auto flush_pending = [&]() -> bool {
-            if (write_buffer.empty()) { return true; }
-            const size_t bytes = write_buffer.size();
-            if (!connection.send_all(write_buffer.data(), write_buffer.size())) {
-                backpressure_disconnects_total_.fetch_add(1, std::memory_order_relaxed);
+        const auto flushPending = [&]() -> bool {
+            if (writeBuffer.empty()) { return true; }
+            const size_t bytes = writeBuffer.size();
+            if (!connection.sendAll(writeBuffer.data(), writeBuffer.size())) {
+                backpressureDisconnectsTotal_.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
-            bytes_sent_total_.fetch_add(bytes, std::memory_order_relaxed);
-            write_buffer.clear();
+            bytesSentTotal_.fetch_add(bytes, std::memory_order_relaxed);
+            writeBuffer.clear();
             return true;
         };
 
-        const auto append_response = [&](const std::vector<uint8_t>& response) -> bool {
+        const auto appendResponse = [&](const std::vector<uint8_t>& response) -> bool {
             if (response.empty()) { return true; }
 
-            const uint64_t max_pending = options_.tcp_max_pending_response_bytes;
-            if (max_pending > 0 && !write_buffer.empty() && write_buffer.size() + response.size() > max_pending) {
-                backpressure_flushes_total_.fetch_add(1, std::memory_order_relaxed);
-                if (!flush_pending()) { return false; }
+            const uint64_t maxPending = options_.tcpMaxPendingResponseBytes;
+            if (maxPending > 0 && !writeBuffer.empty() && writeBuffer.size() + response.size() > maxPending) {
+                backpressureFlushesTotal_.fetch_add(1, std::memory_order_relaxed);
+                if (!flushPending()) { return false; }
             }
 
-            responses_total_.fetch_add(1, std::memory_order_relaxed);
-            if (max_pending > 0 && response.size() > max_pending) {
-                if (!connection.send_all(response.data(), response.size())) {
-                    backpressure_disconnects_total_.fetch_add(1, std::memory_order_relaxed);
+            responsesTotal_.fetch_add(1, std::memory_order_relaxed);
+            if (maxPending > 0 && response.size() > maxPending) {
+                if (!connection.sendAll(response.data(), response.size())) {
+                    backpressureDisconnectsTotal_.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
-                bytes_sent_total_.fetch_add(response.size(), std::memory_order_relaxed);
+                bytesSentTotal_.fetch_add(response.size(), std::memory_order_relaxed);
                 return true;
             }
 
-            write_buffer.insert(write_buffer.end(), response.begin(), response.end());
-            if (max_pending > 0 && write_buffer.size() >= max_pending) {
-                backpressure_flushes_total_.fetch_add(1, std::memory_order_relaxed);
-                return flush_pending();
+            writeBuffer.insert(writeBuffer.end(), response.begin(), response.end());
+            if (maxPending > 0 && writeBuffer.size() >= maxPending) {
+                backpressureFlushesTotal_.fetch_add(1, std::memory_order_relaxed);
+                return flushPending();
             }
             return true;
         };
 
-        const auto process_frame = [&](const RequestFrame& frame) -> bool {
-            requests_total_.fetch_add(1, std::memory_order_relaxed);
-            bytes_received_total_.fetch_add(frame.wire_size, std::memory_order_relaxed);
+        const auto processFrame = [&](const RequestFrame& frame) -> bool {
+            requestsTotal_.fetch_add(1, std::memory_order_relaxed);
+            bytesReceivedTotal_.fetch_add(frame.wireSize, std::memory_order_relaxed);
 
-            if (frame.received_crc != crc32c(frame.key, frame.value)) {
-                crc_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                encode_error(frame.header.request_id, response_buffer);
+            if (frame.receivedCrc != crc32c(frame.key, frame.value)) {
+                crcErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                encodeError(frame.header.requestId, responseBuffer);
                 return false;
             }
 
             try {
                 switch (frame.header.opcode) {
-                case ApiOp::Put:
-                    engine_.put(frame.key, frame.value);
-                    encode_response(ApiStatus::Ok, frame.header.request_id, {}, response_buffer);
-                    break;
-                case ApiOp::Get:
-                    output_buffer.clear();
-                    if (engine_.get_into(frame.key, output_buffer)) {
-                        encode_response(
-                            ApiStatus::Ok,
-                            frame.header.request_id,
-                            std::span<const uint8_t>{output_buffer.data(), output_buffer.size()},
-                            response_buffer
-                        );
+                    case ApiOp::PUT: engine_.put(frame.key, frame.value);
+                        encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
+                        break;
+                    case ApiOp::GET: outputBuffer.clear();
+                        if (engine_.getInto(frame.key, outputBuffer)) {
+                            encodeResponse(
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()},
+                                responseBuffer
+                            );
+                        }
+                        else { encodeResponse(ApiStatus::NOT_FOUND, frame.header.requestId, {}, responseBuffer); }
+                        break;
+                    case ApiOp::REMOVE: engine_.remove(frame.key);
+                        encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
+                        break;
+                    case ApiOp::GET_AT: {
+                        if (frame.value.size() != sizeof(uint64_t)) {
+                            protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                            encodeError(frame.header.requestId, responseBuffer);
+                            return false;
+                        }
+                        uint64_t seq = 0;
+                        std::memcpy(&seq, frame.value.data(), sizeof(seq));
+                        auto historicalValue = engine_.getAt(frame.key, seq);
+                        if (historicalValue) {
+                            encodeResponse(
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{historicalValue->data(), historicalValue->size()},
+                                responseBuffer
+                            );
+                        }
+                        else { encodeResponse(ApiStatus::NOT_FOUND, frame.header.requestId, {}, responseBuffer); }
+                        break;
                     }
-                    else { encode_response(ApiStatus::NotFound, frame.header.request_id, {}, response_buffer); }
-                    break;
-                case ApiOp::Remove:
-                    engine_.remove(frame.key);
-                    encode_response(ApiStatus::Ok, frame.header.request_id, {}, response_buffer);
-                    break;
-                case ApiOp::GetAt: {
-                    if (frame.value.size() != sizeof(uint64_t)) {
-                        protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                        encode_error(frame.header.request_id, response_buffer);
-                        return false;
-                    }
-                    uint64_t seq = 0;
-                    std::memcpy(&seq, frame.value.data(), sizeof(seq));
-                    auto historical_value = engine_.get_at(frame.key, seq);
-                    if (historical_value) {
-                        encode_response(
-                            ApiStatus::Ok,
-                            frame.header.request_id,
-                            std::span<const uint8_t>{historical_value->data(), historical_value->size()},
-                            response_buffer
-                        );
-                    }
-                    else { encode_response(ApiStatus::NotFound, frame.header.request_id, {}, response_buffer); }
-                    break;
-                }
-                case ApiOp::BatchPut: {
-                    uint32_t count = 0;
-                    const uint32_t max_batch = max_batch_items();
-                    if (frame.header.key_len != 0 || !read_batch_count(frame.value, count) || count > max_batch ||
-                        !decode_batch_put(frame.value, max_batch, batch_put_items)) {
-                        protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                        encode_error(frame.header.request_id, response_buffer);
-                        return false;
-                    }
+                    case ApiOp::BATCH_PUT: {
+                        uint32_t count = 0;
+                        const uint32_t maxBatch = maxBatchItems();
+                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch || !decodeBatchPut(
+                            frame.value,
+                            maxBatch,
+                            batchPutItems
+                        )) {
+                            protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                            encodeError(frame.header.requestId, responseBuffer);
+                            return false;
+                        }
 
-                    engine_put_items.clear();
-                    engine_put_items.reserve(batch_put_items.size());
-                    for (const ApiBatchPutItem& item : batch_put_items) { engine_put_items.push_back({item.key, item.value}); }
-                    engine_.put_batch(std::span<const AkkEngine::BatchPutEntry>{engine_put_items.data(), engine_put_items.size()});
-                    batch_put_items_total_.fetch_add(batch_put_items.size(), std::memory_order_relaxed);
-                    encode_response(ApiStatus::Ok, frame.header.request_id, {}, response_buffer);
-                    break;
-                }
-                case ApiOp::BatchGet: {
-                    uint32_t count = 0;
-                    const uint32_t max_batch = max_batch_items();
-                    if (frame.header.key_len != 0 || !read_batch_count(frame.value, count) || count > max_batch ||
-                        !decode_batch_get(frame.value, max_batch, batch_get_keys)) {
-                        protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                        encode_error(frame.header.request_id, response_buffer);
-                        return false;
+                        enginePutItems.clear();
+                        enginePutItems.reserve(batchPutItems.size());
+                        for (const ApiBatchPutItem& item : batchPutItems) { enginePutItems.push_back({item.key, item.value}); }
+                        engine_.putBatch(std::span<const AkkEngine::BatchPutEntry>{enginePutItems.data(), enginePutItems.size()});
+                        batchPutItemsTotal_.fetch_add(batchPutItems.size(), std::memory_order_relaxed);
+                        encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
+                        break;
                     }
+                    case ApiOp::BATCH_GET: {
+                        uint32_t count = 0;
+                        const uint32_t maxBatch = maxBatchItems();
+                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch || !decodeBatchGet(
+                            frame.value,
+                            maxBatch,
+                            batchGetKeys
+                        )) {
+                            protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                            encodeError(frame.header.requestId, responseBuffer);
+                            return false;
+                        }
 
-                    engine_get_results = engine_.get_batch(
-                        std::span<const std::span<const uint8_t>>{batch_get_keys.data(), batch_get_keys.size()}
-                    );
-                    wire_get_results.clear();
-                    wire_get_results.reserve(engine_get_results.size());
-                    for (const auto& result : engine_get_results) {
-                        wire_get_results.push_back(
-                            ApiBatchGetResult{
-                                result.found ? ApiStatus::Ok : ApiStatus::NotFound,
-                                std::span<const uint8_t>{result.value.data(), result.value.size()}
-                            }
+                        engineGetResults = engine_.getBatch(
+                            std::span<const std::span<const uint8_t>>{batchGetKeys.data(), batchGetKeys.size()}
                         );
+                        wireGetResults.clear();
+                        wireGetResults.reserve(engineGetResults.size());
+                        for (const auto& result : engineGetResults) {
+                            wireGetResults.push_back(
+                                ApiBatchGetResult{
+                                    result.found ? ApiStatus::OK : ApiStatus::NOT_FOUND,
+                                    std::span<const uint8_t>{result.value.data(), result.value.size()}
+                                }
+                            );
+                        }
+                        batchGetItemsTotal_.fetch_add(batchGetKeys.size(), std::memory_order_relaxed);
+                        encodeBatchGetResponse(
+                            frame.header.requestId,
+                            std::span<const ApiBatchGetResult>{wireGetResults.data(), wireGetResults.size()},
+                            responseBuffer
+                        );
+                        break;
                     }
-                    batch_get_items_total_.fetch_add(batch_get_keys.size(), std::memory_order_relaxed);
-                    encode_batch_get_response(
-                        frame.header.request_id,
-                        std::span<const ApiBatchGetResult>{wire_get_results.data(), wire_get_results.size()},
-                        response_buffer
-                    );
-                    break;
-                }
-                default:
-                    protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                    encode_error(frame.header.request_id, response_buffer);
-                    break;
+                    default: protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                        encodeError(frame.header.requestId, responseBuffer);
+                        break;
                 }
             }
             catch (...) {
-                protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                encode_error(frame.header.request_id, response_buffer);
+                protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                encodeError(frame.header.requestId, responseBuffer);
                 return false;
             }
 
             return true;
         };
 
-        const uint32_t pipeline_limit = std::max<uint32_t>(1, options_.tcp_pipeline_batch_limit);
+        const uint32_t pipelineLimit = std::max<uint32_t>(1, options_.tcpPipelineBatchLimit);
         while (running_.load(std::memory_order_relaxed)) {
             RequestFrame frame;
-            FrameReadStatus status = reader.read_frame(connection, frame, true);
-            if (status == FrameReadStatus::Closed || status == FrameReadStatus::NeedMore) { break; }
-            if (status == FrameReadStatus::Invalid) {
-                protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                encode_error(frame.header.request_id, response_buffer);
-                (void)append_response(response_buffer);
-                (void)flush_pending();
+            FrameReadStatus status = reader.readFrame(connection, frame, true);
+            if (status == FrameReadStatus::CLOSED || status == FrameReadStatus::NEED_MORE) { break; }
+            if (status == FrameReadStatus::INVALID) {
+                protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                encodeError(frame.header.requestId, responseBuffer);
+                (void)appendResponse(responseBuffer);
+                (void)flushPending();
                 break;
             }
 
-            bool keep_connection = process_frame(frame);
-            reader.consume(frame.wire_size);
-            if (!append_response(response_buffer)) { break; }
+            bool keepConnection = processFrame(frame);
+            reader.consume(frame.wireSize);
+            if (!appendResponse(responseBuffer)) { break; }
 
-            uint32_t frames_in_batch = 1;
-            while (keep_connection && frames_in_batch < pipeline_limit) {
+            uint32_t framesInBatch = 1;
+            while (keepConnection && framesInBatch < pipelineLimit) {
                 RequestFrame pipelined;
-                status = reader.read_frame(connection, pipelined, false);
-                if (status == FrameReadStatus::NeedMore || status == FrameReadStatus::Closed) { break; }
-                if (status == FrameReadStatus::Invalid) {
-                    protocol_errors_total_.fetch_add(1, std::memory_order_relaxed);
-                    encode_error(pipelined.header.request_id, response_buffer);
-                    keep_connection = false;
-                    (void)append_response(response_buffer);
+                status = reader.readFrame(connection, pipelined, false);
+                if (status == FrameReadStatus::NEED_MORE || status == FrameReadStatus::CLOSED) { break; }
+                if (status == FrameReadStatus::INVALID) {
+                    protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                    encodeError(pipelined.header.requestId, responseBuffer);
+                    keepConnection = false;
+                    (void)appendResponse(responseBuffer);
                     break;
                 }
 
-                keep_connection = process_frame(pipelined);
-                reader.consume(pipelined.wire_size);
-                if (!append_response(response_buffer)) { return; }
-                ++frames_in_batch;
+                keepConnection = processFrame(pipelined);
+                reader.consume(pipelined.wireSize);
+                if (!appendResponse(responseBuffer)) { return; }
+                ++framesInBatch;
             }
 
-            if (frames_in_batch > 1) { pipeline_batches_total_.fetch_add(1, std::memory_order_relaxed); }
-            if (!flush_pending() || !keep_connection) { break; }
+            if (framesInBatch > 1) { pipelineBatchesTotal_.fetch_add(1, std::memory_order_relaxed); }
+            if (!flushPending() || !keepConnection) { break; }
         }
     }
 
-    uint32_t TcpApiServer::worker_count() const {
-        if (options_.tcp_worker_threads > 0) { return options_.tcp_worker_threads; }
+    uint32_t TcpApiServer::workerCount() const {
+        if (options_.tcpWorkerThreads > 0) { return options_.tcpWorkerThreads; }
         const unsigned hw = std::thread::hardware_concurrency();
         const uint32_t base = hw == 0 ? 4u : hw;
         return std::max(2u, base);
     }
 
-    uint32_t TcpApiServer::accept_queue_limit() const noexcept {
-        return options_.tcp_accept_queue_limit == 0 ? 4096u : options_.tcp_accept_queue_limit;
+    uint32_t TcpApiServer::acceptQueueLimit() const noexcept {
+        return options_.tcpAcceptQueueLimit == 0 ? 4096u : options_.tcpAcceptQueueLimit;
     }
 
-    uint32_t TcpApiServer::accept_queue_timeout_ms() const noexcept {
-        return options_.tcp_accept_queue_timeout_ms;
-    }
+    uint32_t TcpApiServer::acceptQueueTimeoutMs() const noexcept { return options_.tcpAcceptQueueTimeoutMs; }
 
-    void TcpApiServer::prune_expired_pending_locked(Clock::time_point now, std::vector<detail::socket_t>& expired) {
-        const uint32_t timeout_ms = accept_queue_timeout_ms();
-        if (timeout_ms == 0) { return; }
+    void TcpApiServer::pruneExpiredPendingLocked(Clock::time_point now, std::vector<detail::SocketHandle>& expired) {
+        const uint32_t timeoutMs = acceptQueueTimeoutMs();
+        if (timeoutMs == 0) { return; }
 
-        const auto timeout = std::chrono::milliseconds{timeout_ms};
-        while (!pending_clients_.empty() && now - pending_clients_.front().enqueued_at >= timeout) {
-            expired.push_back(pending_clients_.front().socket);
-            pending_clients_.pop_front();
-            accept_queue_expired_total_.fetch_add(1, std::memory_order_relaxed);
+        const auto timeout = std::chrono::milliseconds{timeoutMs};
+        while (!pendingClients_.empty() && now - pendingClients_.front().enqueuedAt >= timeout) {
+            expired.push_back(pendingClients_.front().socket);
+            pendingClients_.pop_front();
+            acceptQueueExpiredTotal_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
-    void TcpApiServer::record_accept_queue_depth(size_t depth) noexcept {
-        uint64_t observed = accept_queue_peak_depth_.load(std::memory_order_relaxed);
-        while (depth > observed && !accept_queue_peak_depth_.compare_exchange_weak(
+    void TcpApiServer::recordAcceptQueueDepth(size_t depth) noexcept {
+        uint64_t observed = acceptQueuePeakDepth_.load(std::memory_order_relaxed);
+        while (depth > observed && !acceptQueuePeakDepth_.compare_exchange_weak(
             observed,
             static_cast<uint64_t>(depth),
             std::memory_order_relaxed,
@@ -536,48 +532,48 @@ namespace akkaradb::engine::server {
         )) {}
     }
 
-    uint32_t TcpApiServer::max_batch_items() const noexcept {
-        return options_.tcp_max_batch_items == 0 ? kDefaultMaxBatchItems : options_.tcp_max_batch_items;
+    uint32_t TcpApiServer::maxBatchItems() const noexcept {
+        return options_.tcpMaxBatchItems == 0 ? kDefaultMaxBatchItems : options_.tcpMaxBatchItems;
     }
 
-    AkkEngineOptions::ApiIoBackend TcpApiServer::resolved_io_backend() const noexcept {
-        if (options_.tcp_io_backend != AkkEngineOptions::ApiIoBackend::Auto) { return options_.tcp_io_backend; }
-        return AkkEngineOptions::ApiIoBackend::ThreadPool;
+    AkkEngineOptions::ApiIoBackend TcpApiServer::resolvedIoBackend() const noexcept {
+        if (options_.tcpIoBackend != AkkEngineOptions::ApiIoBackend::AUTO) { return options_.tcpIoBackend; }
+        return AkkEngineOptions::ApiIoBackend::THREAD_POOL;
     }
 
     EngineStats::ApiStats TcpApiServer::stats() const noexcept {
         EngineStats::ApiStats out;
         out.enabled = true;
-        out.tcp_enabled = true;
-        out.tcp_tls_enabled = options_.transport_mode == cluster::TransportMode::TLS;
-        out.tcp_io_backend = static_cast<uint8_t>(resolved_io_backend());
-        out.tcp_worker_threads = worker_count();
-        out.tcp_accept_queue_limit = accept_queue_limit();
-        out.tcp_accept_queue_timeout_ms = accept_queue_timeout_ms();
-        out.tcp_listen_backlog = options_.tcp_listen_backlog;
-        out.tcp_read_timeout_ms = options_.tcp_read_timeout_ms;
-        out.tcp_write_timeout_ms = options_.tcp_write_timeout_ms;
-        out.tcp_connections_accepted_total = connections_accepted_total_.load(std::memory_order_relaxed);
-        out.tcp_connections_closed_total = connections_closed_total_.load(std::memory_order_relaxed);
-        out.tcp_connections_active = connections_active_.load(std::memory_order_relaxed);
+        out.tcpEnabled = true;
+        out.tcpTlsEnabled = options_.transportMode == cluster::TransportMode::TLS;
+        out.tcpIoBackend = static_cast<uint8_t>(resolvedIoBackend());
+        out.tcpWorkerThreads = workerCount();
+        out.tcpAcceptQueueLimit = acceptQueueLimit();
+        out.tcpAcceptQueueTimeoutMs = acceptQueueTimeoutMs();
+        out.tcpListenBacklog = options_.tcpListenBacklog;
+        out.tcpReadTimeoutMs = options_.tcpReadTimeoutMs;
+        out.tcpWriteTimeoutMs = options_.tcpWriteTimeoutMs;
+        out.tcpConnectionsAcceptedTotal = connectionsAcceptedTotal_.load(std::memory_order_relaxed);
+        out.tcpConnectionsClosedTotal = connectionsClosedTotal_.load(std::memory_order_relaxed);
+        out.tcpConnectionsActive = connectionsActive_.load(std::memory_order_relaxed);
         {
-            std::lock_guard lock(queue_mu_);
-            out.tcp_accept_queue_depth = pending_clients_.size();
+            std::lock_guard lock(queueMu_);
+            out.tcpAcceptQueueDepth = pendingClients_.size();
         }
-        out.tcp_accept_queue_peak_depth = accept_queue_peak_depth_.load(std::memory_order_relaxed);
-        out.tcp_accept_queue_rejected_total = accept_queue_rejected_total_.load(std::memory_order_relaxed);
-        out.tcp_accept_queue_expired_total = accept_queue_expired_total_.load(std::memory_order_relaxed);
-        out.tcp_requests_total = requests_total_.load(std::memory_order_relaxed);
-        out.tcp_responses_total = responses_total_.load(std::memory_order_relaxed);
-        out.tcp_bytes_received_total = bytes_received_total_.load(std::memory_order_relaxed);
-        out.tcp_bytes_sent_total = bytes_sent_total_.load(std::memory_order_relaxed);
-        out.tcp_protocol_errors_total = protocol_errors_total_.load(std::memory_order_relaxed);
-        out.tcp_crc_errors_total = crc_errors_total_.load(std::memory_order_relaxed);
-        out.tcp_pipeline_batches_total = pipeline_batches_total_.load(std::memory_order_relaxed);
-        out.tcp_backpressure_flushes_total = backpressure_flushes_total_.load(std::memory_order_relaxed);
-        out.tcp_backpressure_disconnects_total = backpressure_disconnects_total_.load(std::memory_order_relaxed);
-        out.tcp_batch_put_items_total = batch_put_items_total_.load(std::memory_order_relaxed);
-        out.tcp_batch_get_items_total = batch_get_items_total_.load(std::memory_order_relaxed);
+        out.tcpAcceptQueuePeakDepth = acceptQueuePeakDepth_.load(std::memory_order_relaxed);
+        out.tcpAcceptQueueRejectedTotal = acceptQueueRejectedTotal_.load(std::memory_order_relaxed);
+        out.tcpAcceptQueueExpiredTotal = acceptQueueExpiredTotal_.load(std::memory_order_relaxed);
+        out.tcpRequestsTotal = requestsTotal_.load(std::memory_order_relaxed);
+        out.tcpResponsesTotal = responsesTotal_.load(std::memory_order_relaxed);
+        out.tcpBytesReceivedTotal = bytesReceivedTotal_.load(std::memory_order_relaxed);
+        out.tcpBytesSentTotal = bytesSentTotal_.load(std::memory_order_relaxed);
+        out.tcpProtocolErrorsTotal = protocolErrorsTotal_.load(std::memory_order_relaxed);
+        out.tcpCrcErrorsTotal = crcErrorsTotal_.load(std::memory_order_relaxed);
+        out.tcpPipelineBatchesTotal = pipelineBatchesTotal_.load(std::memory_order_relaxed);
+        out.tcpBackpressureFlushesTotal = backpressureFlushesTotal_.load(std::memory_order_relaxed);
+        out.tcpBackpressureDisconnectsTotal = backpressureDisconnectsTotal_.load(std::memory_order_relaxed);
+        out.tcpBatchPutItemsTotal = batchPutItemsTotal_.load(std::memory_order_relaxed);
+        out.tcpBatchGetItemsTotal = batchGetItemsTotal_.load(std::memory_order_relaxed);
         return out;
     }
 }

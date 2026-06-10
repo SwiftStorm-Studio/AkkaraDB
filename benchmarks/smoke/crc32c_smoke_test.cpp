@@ -53,7 +53,7 @@ namespace {
         int edx = 0;
     };
 
-    [[nodiscard]] bool has_bit(int value, int bit) noexcept {
+    [[nodiscard]] bool hasBit(int value, int bit) noexcept {
         return (static_cast<uint32_t>(value) & (uint32_t{1} << bit)) != 0;
     }
 
@@ -95,43 +95,43 @@ namespace {
         #endif
     }
 
-    [[nodiscard]] bool supports_sse42() noexcept {
+    [[nodiscard]] bool supportsSse42() noexcept {
         const auto regs = cpuid(1);
-        return has_bit(regs.ecx, 20);
+        return hasBit(regs.ecx, 20);
     }
 
-    [[nodiscard]] bool supports_pclmulqdq() noexcept {
+    [[nodiscard]] bool supportsPclmulqdq() noexcept {
         const auto regs = cpuid(1);
-        return has_bit(regs.ecx, 1);
+        return hasBit(regs.ecx, 1);
     }
 
-    [[nodiscard]] bool supports_avx_state() noexcept {
+    [[nodiscard]] bool supportsAvxState() noexcept {
         const auto regs = cpuid(1);
-        if (!has_bit(regs.ecx, 26) || !has_bit(regs.ecx, 27) || !has_bit(regs.ecx, 28)) { return false; }
+        if (!hasBit(regs.ecx, 26) || !hasBit(regs.ecx, 27) || !hasBit(regs.ecx, 28)) { return false; }
         return (xgetbv0() & 0x6) == 0x6;
     }
 
-    [[nodiscard]] bool supports_avx2_pclmul_crc() noexcept {
-        if (!supports_sse42() || !supports_pclmulqdq() || !supports_avx_state()) { return false; }
+    [[nodiscard]] bool supportsAvx2PclmulCrc() noexcept {
+        if (!supportsSse42() || !supportsPclmulqdq() || !supportsAvxState()) { return false; }
         const auto regs = cpuid(7, 0);
-        return has_bit(regs.ebx, 5);
+        return hasBit(regs.ebx, 5);
     }
 
-    [[nodiscard]] bool supports_avx512_crc() noexcept {
+    [[nodiscard]] bool supportsAvx512Crc() noexcept {
         #if defined(__x86_64__) || defined(_M_X64)
-        if (!supports_sse42()) { return false; }
+        if (!supportsSse42()) { return false; }
         const auto leaf1 = cpuid(1);
-        if (!has_bit(leaf1.ecx, 26) || !has_bit(leaf1.ecx, 27) || !has_bit(leaf1.ecx, 28)) { return false; }
+        if (!hasBit(leaf1.ecx, 26) || !hasBit(leaf1.ecx, 27) || !hasBit(leaf1.ecx, 28)) { return false; }
         if ((xgetbv0() & 0xE6) != 0xE6) { return false; }
 
         const auto leaf7 = cpuid(7, 0);
-        return has_bit(leaf7.ebx, 16) && has_bit(leaf7.ebx, 31) && has_bit(leaf7.ecx, 10);
+        return hasBit(leaf7.ebx, 16) && hasBit(leaf7.ebx, 31) && hasBit(leaf7.ecx, 10);
         #else
         return false;
         #endif
     }
 
-    [[nodiscard]] std::vector<size_t> test_sizes() {
+    [[nodiscard]] std::vector<size_t> testSizes() {
         std::vector<size_t> sizes;
         sizes.reserve(4108);
         for (size_t size = 0; size <= 4096; ++size) { sizes.push_back(size); }
@@ -141,7 +141,7 @@ namespace {
         return sizes;
     }
 
-    [[nodiscard]] std::vector<uint8_t> test_bytes() {
+    [[nodiscard]] std::vector<uint8_t> testBytes() {
         std::vector<uint8_t> bytes((1 << 20) + 64);
         uint32_t state = 0x12345678u;
         for (auto& byte : bytes) {
@@ -153,8 +153,8 @@ namespace {
 } // namespace
 
 int main() {
-    const auto bytes = test_bytes();
-    const auto sizes = test_sizes();
+    const auto bytes = testBytes();
+    const auto sizes = testSizes();
 
     for (size_t offset = 0; offset < 64; ++offset) {
         for (const size_t size : sizes) {
@@ -172,12 +172,12 @@ int main() {
             if (!check("dispatch", akkaradb::cpu::CRC32C(data, size))) { return 1; }
 
             #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86)
-            if (supports_sse42() && !check("sse4.2", akkaradb::cpu::CRC32C_X86_SSE42(data, size))) { return 1; }
-            if (supports_avx2_pclmul_crc() && !check("avx2", akkaradb::cpu::CRC32C_X86_AVX2(data, size))) { return 1; }
+            if (supportsSse42() && !check("sse4.2", akkaradb::cpu::CRC32C_X86_SSE42(data, size))) { return 1; }
+            if (supportsAvx2PclmulCrc() && !check("avx2", akkaradb::cpu::CRC32C_X86_AVX2(data, size))) { return 1; }
             #endif
 
             #if defined(__x86_64__) || defined(_M_X64)
-            if (supports_avx512_crc() && !check("avx512", akkaradb::cpu::CRC32C_X86_AVX512(data, size))) { return 1; }
+            if (supportsAvx512Crc() && !check("avx512", akkaradb::cpu::CRC32C_X86_AVX512(data, size))) { return 1; }
             #endif
         }
     }

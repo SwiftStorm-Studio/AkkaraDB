@@ -50,7 +50,21 @@ namespace akkaradb {
         struct ProxyTag {};
 
         enum class Op {
-            Eq, Ne, Gt, Ge, Lt, Le, And, Or, In, NotIn, StartsWith, Contains, Like, IsNull, IsNotNull
+            EQ,
+            NE,
+            GT,
+            GE,
+            LT,
+            LE,
+            AND,
+            OR,
+            IN_LIST,
+            NOT_IN,
+            STARTS_WITH,
+            CONTAINS,
+            LIKE,
+            IS_NULL,
+            IS_NOT_NULL
         };
 
         struct AlwaysTrue {};
@@ -66,13 +80,13 @@ namespace akkaradb {
 
         template <auto FieldPtr>
         struct Column {
-            static constexpr auto field_ptr = FieldPtr;
+            static constexpr auto fieldPtr = FieldPtr;
 
             template <auto NestedFieldPtr>
             [[nodiscard]] auto field() const;
 
             template <typename R>
-            [[nodiscard]] auto map_get(R&& key) const;
+            [[nodiscard]] auto mapGet(R&& key) const;
 
             template <typename R>
             [[nodiscard]] auto get(R&& key) const;
@@ -84,13 +98,13 @@ namespace akkaradb {
             [[nodiscard]] auto in(std::initializer_list<T> rhs) const;
 
             template <typename R>
-            [[nodiscard]] auto not_in(R&& rhs) const;
+            [[nodiscard]] auto notIn(R&& rhs) const;
 
             template <typename T>
-            [[nodiscard]] auto not_in(std::initializer_list<T> rhs) const;
+            [[nodiscard]] auto notIn(std::initializer_list<T> rhs) const;
 
             template <typename R>
-            [[nodiscard]] auto starts_with(R&& rhs) const;
+            [[nodiscard]] auto startsWith(R&& rhs) const;
 
             template <typename R>
             [[nodiscard]] auto contains(R&& rhs) const;
@@ -98,9 +112,9 @@ namespace akkaradb {
             template <typename R>
             [[nodiscard]] auto like(R&& rhs) const;
 
-            [[nodiscard]] auto is_null() const;
+            [[nodiscard]] auto isNull() const;
 
-            [[nodiscard]] auto is_not_null() const;
+            [[nodiscard]] auto isNotNull() const;
         };
 
         template <typename T>
@@ -135,21 +149,21 @@ namespace akkaradb {
 
         template <typename Parent, auto FieldPtr>
         struct FieldPath {
-            static constexpr auto field_ptr = FieldPtr;
+            static constexpr auto fieldPtr = FieldPtr;
             Parent parent;
 
             template <auto NestedFieldPtr>
             [[nodiscard]] auto field() const;
 
             template <typename R>
-            [[nodiscard]] auto map_get(R&& key) const;
+            [[nodiscard]] auto mapGet(R&& key) const;
 
             template <typename R>
             [[nodiscard]] auto get(R&& key) const;
 
-            [[nodiscard]] auto is_null() const;
+            [[nodiscard]] auto isNull() const;
 
-            [[nodiscard]] auto is_not_null() const;
+            [[nodiscard]] auto isNotNull() const;
         };
 
         template <typename Map, typename Key>
@@ -158,55 +172,55 @@ namespace akkaradb {
             Key key;
 
             template <typename R>
-            [[nodiscard]] auto map_get(R&& nested_key) const;
+            [[nodiscard]] auto mapGet(R&& nestedKey) const;
 
             template <typename R>
-            [[nodiscard]] auto get(R&& nested_key) const;
+            [[nodiscard]] auto get(R&& nestedKey) const;
 
-            [[nodiscard]] auto is_null() const;
+            [[nodiscard]] auto isNull() const;
 
-            [[nodiscard]] auto is_not_null() const;
+            [[nodiscard]] auto isNotNull() const;
         };
 
         template <typename T>
-        struct is_expr : std::false_type {};
+        struct IsExpr : std::false_type {};
 
         template <>
-        struct is_expr<AlwaysTrue> : std::true_type {};
+        struct IsExpr<AlwaysTrue> : std::true_type {};
 
         template <auto FieldPtr>
-        struct is_expr<Column<FieldPtr>> : std::true_type {};
+        struct IsExpr<Column<FieldPtr>> : std::true_type {};
 
         template <typename Parent, auto FieldPtr>
-        struct is_expr<FieldPath<Parent, FieldPtr>> : std::true_type {};
+        struct IsExpr<FieldPath<Parent, FieldPtr>> : std::true_type {};
 
         template <typename Map, typename Key>
-        struct is_expr<MapGet<Map, Key>> : std::true_type {};
+        struct IsExpr<MapGet<Map, Key>> : std::true_type {};
 
         template <typename T>
-        struct is_expr<Literal<T>> : std::true_type {};
+        struct IsExpr<Literal<T>> : std::true_type {};
 
         template <Op Operator, typename L, typename R>
-        struct is_expr<Compare<Operator, L, R>> : std::true_type {};
+        struct IsExpr<Compare<Operator, L, R>> : std::true_type {};
 
         template <Op Operator, typename L, typename R>
-        struct is_expr<Logical<Operator, L, R>> : std::true_type {};
+        struct IsExpr<Logical<Operator, L, R>> : std::true_type {};
 
         template <typename X>
-        struct is_expr<Not<X>> : std::true_type {};
+        struct IsExpr<Not<X>> : std::true_type {};
 
         template <Op Operator, typename X>
-        struct is_expr<Unary<Operator, X>> : std::true_type {};
+        struct IsExpr<Unary<Operator, X>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_expr_v = is_expr<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isExpr = IsExpr<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        using literal_storage_t = std::conditional_t<std::is_convertible_v<T, std::string_view> && !std::is_arithmetic_v<std::remove_cvref_t<T>>, std::string,
-                                                     std::remove_cvref_t<T>>;
+        using LiteralStorage = std::conditional_t<std::is_convertible_v<T, std::string_view> && !std::is_arithmetic_v<std::remove_cvref_t<
+            T>>, std::string, std::remove_cvref_t<T>>;
 
         template <typename T>
-        [[nodiscard]] auto normalize_literal(T&& value) {
+        [[nodiscard]] auto normalizeLiteral(T&& value) {
             if constexpr (std::is_convertible_v<T, std::string_view> && !std::is_arithmetic_v<std::remove_cvref_t<T>>) {
                 return std::string{std::string_view{value}};
             }
@@ -214,356 +228,308 @@ namespace akkaradb {
         }
 
         template <typename T>
-        [[nodiscard]] auto as_expr(T&& value) {
-            if constexpr (is_expr_v<T>) { return std::forward<T>(value); }
-            else { return Literal<literal_storage_t<T>>{normalize_literal(std::forward<T>(value))}; }
+        [[nodiscard]] auto asExpr(T&& value) {
+            if constexpr (isExpr<T>) { return std::forward<T>(value); }
+            else { return Literal<LiteralStorage<T>>{normalizeLiteral(std::forward<T>(value))}; }
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator==(L&& lhs, R&& rhs) {
-            return Compare<Op::Eq, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::EQ, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator!=(L&& lhs, R&& rhs) {
-            return Compare<Op::Ne, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::NE, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator>(L&& lhs, R&& rhs) {
-            return Compare<Op::Gt, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::GT, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator>=(L&& lhs, R&& rhs) {
-            return Compare<Op::Ge, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::GE, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator<(L&& lhs, R&& rhs) {
-            return Compare<Op::Lt, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::LT, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto operator<=(L&& lhs, R&& rhs) {
-            return Compare<Op::Le, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::LE, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> && is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> && isExpr<R>)
         [[nodiscard]] auto operator&&(L&& lhs, R&& rhs) {
-            return Logical<Op::And, std::remove_cvref_t<L>, std::remove_cvref_t<R>>{std::forward<L>(lhs), std::forward<R>(rhs)};
+            return Logical<Op::AND, std::remove_cvref_t<L>, std::remove_cvref_t<R>>{std::forward<L>(lhs), std::forward<R>(rhs)};
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> && is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> && isExpr<R>)
         [[nodiscard]] auto operator||(L&& lhs, R&& rhs) {
-            return Logical<Op::Or, std::remove_cvref_t<L>, std::remove_cvref_t<R>>{std::forward<L>(lhs), std::forward<R>(rhs)};
+            return Logical<Op::OR, std::remove_cvref_t<L>, std::remove_cvref_t<R>>{std::forward<L>(lhs), std::forward<R>(rhs)};
         }
 
-        template <typename X> requires(is_expr_v<X>)
+        template <typename X> requires(isExpr<X>)
         [[nodiscard]] auto operator!(X&& x) { return Not<std::remove_cvref_t<X>>{std::forward<X>(x)}; }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto in(L&& lhs, R&& rhs) {
-            return Compare<Op::In, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::IN_LIST, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename T> requires(is_expr_v<L>)
+        template <typename L, typename T> requires(isExpr<L>)
         [[nodiscard]] auto in(L&& lhs, std::initializer_list<T> rhs) {
-            return in(std::forward<L>(lhs), std::vector<literal_storage_t<T>>{rhs.begin(), rhs.end()});
+            return in(std::forward<L>(lhs), std::vector<LiteralStorage<T>>{rhs.begin(), rhs.end()});
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
-        [[nodiscard]] auto not_in(L&& lhs, R&& rhs) {
-            return Compare<Op::NotIn, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
+        [[nodiscard]] auto notIn(L&& lhs, R&& rhs) {
+            return Compare<Op::NOT_IN, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename T> requires(is_expr_v<L>)
-        [[nodiscard]] auto not_in(L&& lhs, std::initializer_list<T> rhs) {
-            return not_in(std::forward<L>(lhs), std::vector<literal_storage_t<T>>{rhs.begin(), rhs.end()});
+        template <typename L, typename T> requires(isExpr<L>)
+        [[nodiscard]] auto notIn(L&& lhs, std::initializer_list<T> rhs) {
+            return notIn(std::forward<L>(lhs), std::vector<LiteralStorage<T>>{rhs.begin(), rhs.end()});
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
-        [[nodiscard]] auto starts_with(L&& lhs, R&& rhs) {
-            return Compare<Op::StartsWith, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
+        [[nodiscard]] auto startsWith(L&& lhs, R&& rhs) {
+            return Compare<Op::STARTS_WITH, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto contains(L&& lhs, R&& rhs) {
-            return Compare<Op::Contains, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::CONTAINS, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename L, typename R> requires(is_expr_v<L> || is_expr_v<R>)
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto like(L&& lhs, R&& rhs) {
-            return Compare<Op::Like, decltype(as_expr(std::forward<L>(lhs))), decltype(as_expr(std::forward<R>(rhs)))>{
-                as_expr(std::forward<L>(lhs)),
-                as_expr(std::forward<R>(rhs))
+            return Compare<Op::LIKE, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
             };
         }
 
-        template <typename X> requires(is_expr_v<X>)
-        [[nodiscard]] auto is_null(X&& x) {
-            return Unary<Op::IsNull, std::remove_cvref_t<X>>{std::forward<X>(x)};
-        }
+        template <typename X> requires(isExpr<X>)
+        [[nodiscard]] auto isNull(X&& x) { return Unary<Op::IS_NULL, std::remove_cvref_t<X>>{std::forward<X>(x)}; }
 
-        template <typename X> requires(is_expr_v<X>)
-        [[nodiscard]] auto is_not_null(X&& x) {
-            return Unary<Op::IsNotNull, std::remove_cvref_t<X>>{std::forward<X>(x)};
-        }
+        template <typename X> requires(isExpr<X>)
+        [[nodiscard]] auto isNotNull(X&& x) { return Unary<Op::IS_NOT_NULL, std::remove_cvref_t<X>>{std::forward<X>(x)}; }
 
-        template <auto FieldPtr, typename X> requires(is_expr_v<X>)
-        [[nodiscard]] auto field(X&& x) {
-            return FieldPath<std::remove_cvref_t<X>, FieldPtr>{std::forward<X>(x)};
-        }
+        template <auto FieldPtr, typename X> requires(isExpr<X>)
+        [[nodiscard]] auto field(X&& x) { return FieldPath<std::remove_cvref_t<X>, FieldPtr>{std::forward<X>(x)}; }
 
-        template <typename M, typename K> requires(is_expr_v<M>)
-        [[nodiscard]] auto map_get(M&& map, K&& key) {
-            return MapGet<std::remove_cvref_t<M>, decltype(as_expr(std::forward<K>(key)))>{
+        template <typename M, typename K> requires(isExpr<M>)
+        [[nodiscard]] auto mapGet(M&& map, K&& key) {
+            return MapGet<std::remove_cvref_t<M>, decltype(asExpr(std::forward<K>(key)))>{
                 std::forward<M>(map),
-                as_expr(std::forward<K>(key))
+                asExpr(std::forward<K>(key))
             };
         }
 
         template <auto FieldPtr>
         template <auto NestedFieldPtr>
-        [[nodiscard]] auto Column<FieldPtr>::field() const {
-            return query::field<NestedFieldPtr>(*this);
-        }
+        [[nodiscard]] auto Column<FieldPtr>::field() const { return query::field<NestedFieldPtr>(*this); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::map_get(R&& key) const {
-            return query::map_get(*this, std::forward<R>(key));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::mapGet(R&& key) const { return query::mapGet(*this, std::forward<R>(key)); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::get(R&& key) const {
-            return query::map_get(*this, std::forward<R>(key));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::get(R&& key) const { return query::mapGet(*this, std::forward<R>(key)); }
 
         template <typename Parent, auto FieldPtr>
         template <auto NestedFieldPtr>
-        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::field() const {
-            return query::field<NestedFieldPtr>(*this);
-        }
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::field() const { return query::field<NestedFieldPtr>(*this); }
 
         template <typename Parent, auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::map_get(R&& key) const {
-            return query::map_get(*this, std::forward<R>(key));
-        }
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::mapGet(R&& key) const { return query::mapGet(*this, std::forward<R>(key)); }
 
         template <typename Parent, auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::get(R&& key) const {
-            return query::map_get(*this, std::forward<R>(key));
-        }
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::get(R&& key) const { return query::mapGet(*this, std::forward<R>(key)); }
 
         template <typename Parent, auto FieldPtr>
-        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::is_null() const {
-            return query::is_null(*this);
-        }
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::isNull() const { return query::isNull(*this); }
 
         template <typename Parent, auto FieldPtr>
-        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::is_not_null() const {
-            return query::is_not_null(*this);
-        }
+        [[nodiscard]] auto FieldPath<Parent, FieldPtr>::isNotNull() const { return query::isNotNull(*this); }
 
         template <typename Map, typename Key>
         template <typename R>
-        [[nodiscard]] auto MapGet<Map, Key>::map_get(R&& nested_key) const {
-            return query::map_get(*this, std::forward<R>(nested_key));
-        }
+        [[nodiscard]] auto MapGet<Map, Key>::mapGet(R&& nestedKey) const { return query::mapGet(*this, std::forward<R>(nestedKey)); }
 
         template <typename Map, typename Key>
         template <typename R>
-        [[nodiscard]] auto MapGet<Map, Key>::get(R&& nested_key) const {
-            return query::map_get(*this, std::forward<R>(nested_key));
-        }
+        [[nodiscard]] auto MapGet<Map, Key>::get(R&& nestedKey) const { return query::mapGet(*this, std::forward<R>(nestedKey)); }
 
         template <typename Map, typename Key>
-        [[nodiscard]] auto MapGet<Map, Key>::is_null() const {
-            return query::is_null(*this);
-        }
+        [[nodiscard]] auto MapGet<Map, Key>::isNull() const { return query::isNull(*this); }
 
         template <typename Map, typename Key>
-        [[nodiscard]] auto MapGet<Map, Key>::is_not_null() const {
-            return query::is_not_null(*this);
-        }
+        [[nodiscard]] auto MapGet<Map, Key>::isNotNull() const { return query::isNotNull(*this); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::in(R&& rhs) const {
-            return query::in(*this, std::forward<R>(rhs));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::in(R&& rhs) const { return query::in(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
         template <typename T>
-        [[nodiscard]] auto Column<FieldPtr>::in(std::initializer_list<T> rhs) const {
-            return query::in(*this, rhs);
-        }
+        [[nodiscard]] auto Column<FieldPtr>::in(std::initializer_list<T> rhs) const { return query::in(*this, rhs); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::not_in(R&& rhs) const {
-            return query::not_in(*this, std::forward<R>(rhs));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::notIn(R&& rhs) const { return query::notIn(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
         template <typename T>
-        [[nodiscard]] auto Column<FieldPtr>::not_in(std::initializer_list<T> rhs) const {
-            return query::not_in(*this, rhs);
-        }
+        [[nodiscard]] auto Column<FieldPtr>::notIn(std::initializer_list<T> rhs) const { return query::notIn(*this, rhs); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::starts_with(R&& rhs) const {
-            return query::starts_with(*this, std::forward<R>(rhs));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::startsWith(R&& rhs) const { return query::startsWith(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::contains(R&& rhs) const {
-            return query::contains(*this, std::forward<R>(rhs));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::contains(R&& rhs) const { return query::contains(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
         template <typename R>
-        [[nodiscard]] auto Column<FieldPtr>::like(R&& rhs) const {
-            return query::like(*this, std::forward<R>(rhs));
-        }
+        [[nodiscard]] auto Column<FieldPtr>::like(R&& rhs) const { return query::like(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
-        [[nodiscard]] auto Column<FieldPtr>::is_null() const {
-            return query::is_null(*this);
-        }
+        [[nodiscard]] auto Column<FieldPtr>::isNull() const { return query::isNull(*this); }
 
         template <auto FieldPtr>
-        [[nodiscard]] auto Column<FieldPtr>::is_not_null() const {
-            return query::is_not_null(*this);
-        }
+        [[nodiscard]] auto Column<FieldPtr>::isNotNull() const { return query::isNotNull(*this); }
 
         template <typename Entity>
-        [[nodiscard]] auto make_proxy() { return akkaradb_query_proxy(ProxyTag<Entity>{}); }
+        [[nodiscard]] auto makeProxy() { return akkaradbQueryProxy(ProxyTag<Entity>{}); }
 
         template <typename Entity>
-        using QueryProxy = decltype(make_proxy<Entity>());
+        using QueryProxy = decltype(makeProxy<Entity>());
 
         template <typename T>
-        struct is_column : std::false_type {};
+        struct IsColumn : std::false_type {};
 
         template <auto FieldPtr>
-        struct is_column<Column<FieldPtr>> : std::true_type {};
+        struct IsColumn<Column<FieldPtr>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_column_v = is_column<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isColumn = IsColumn<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        struct is_literal : std::false_type {};
+        struct IsLiteral : std::false_type {};
 
         template <typename T>
-        struct is_literal<Literal<T>> : std::true_type {};
+        struct IsLiteral<Literal<T>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_literal_v = is_literal<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isLiteral = IsLiteral<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        struct is_compare : std::false_type {};
+        struct IsCompare : std::false_type {};
 
         template <Op Operator, typename L, typename R>
-        struct is_compare<Compare<Operator, L, R>> : std::true_type {};
+        struct IsCompare<Compare<Operator, L, R>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_compare_v = is_compare<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isCompare = IsCompare<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        struct is_not : std::false_type {};
+        struct IsNot : std::false_type {};
 
         template <typename X>
-        struct is_not<Not<X>> : std::true_type {};
+        struct IsNot<Not<X>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_not_v = is_not<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isNot = IsNot<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        struct is_unary : std::false_type {};
+        struct IsUnary : std::false_type {};
 
         template <Op Operator, typename X>
-        struct is_unary<Unary<Operator, X>> : std::true_type {};
+        struct IsUnary<Unary<Operator, X>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_unary_v = is_unary<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isUnary = IsUnary<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        struct is_optional : std::false_type {};
+        struct IsOptional : std::false_type {};
 
         template <typename T>
-        struct is_optional<std::optional<T>> : std::true_type {};
+        struct IsOptional<std::optional<T>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_optional_v = is_optional<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isOptional = IsOptional<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        inline constexpr bool is_string_like_v = requires(const std::remove_cvref_t<T>& value) {
+        inline constexpr bool isStringLikeV = requires(const std::remove_cvref_t<T>& value) {
             std::string_view{value};
         };
 
         template <typename T>
-        struct is_and : std::false_type {};
+        struct IsAnd : std::false_type {};
 
         template <typename L, typename R>
-        struct is_and<Logical<Op::And, L, R>> : std::true_type {};
+        struct IsAnd<Logical<Op::AND, L, R>> : std::true_type {};
 
         template <typename T>
-        inline constexpr bool is_and_v = is_and<std::remove_cvref_t<T>>::value;
+        inline constexpr bool isAnd = IsAnd<std::remove_cvref_t<T>>::value;
 
         template <Op Operator>
-        inline constexpr Op swapped_compare_op = Operator;
+        inline constexpr Op swappedCompareOp = Operator;
 
         template <>
-        inline constexpr Op swapped_compare_op<Op::Gt> = Op::Lt;
+        inline constexpr Op swappedCompareOp<Op::GT> = Op::LT;
 
         template <>
-        inline constexpr Op swapped_compare_op<Op::Ge> = Op::Le;
+        inline constexpr Op swappedCompareOp<Op::GE> = Op::LE;
 
         template <>
-        inline constexpr Op swapped_compare_op<Op::Lt> = Op::Gt;
+        inline constexpr Op swappedCompareOp<Op::LT> = Op::GT;
 
         template <>
-        inline constexpr Op swapped_compare_op<Op::Le> = Op::Ge;
+        inline constexpr Op swappedCompareOp<Op::LE> = Op::GE;
 
         template <typename T>
-        [[nodiscard]] const auto& literal_value(const Literal<T>& literal) noexcept { return literal.value; }
+        [[nodiscard]] const auto& literalValue(const Literal<T>& literal) noexcept { return literal.value; }
 
         template <typename Entity>
         [[nodiscard]] bool eval(const AlwaysTrue&, const Entity&) { return true; }
@@ -590,35 +556,31 @@ namespace akkaradb {
         [[nodiscard]] const T& eval(const Literal<T>& literal, const Entity&) { return literal.value; }
 
         template <typename Needle, typename Haystack>
-        [[nodiscard]] bool contains_value(const Haystack& haystack, const Needle& needle) {
-            for (const auto& value : haystack) {
-                if (value == needle) { return true; }
-            }
+        [[nodiscard]] bool containsValue(const Haystack& haystack, const Needle& needle) {
+            for (const auto& value : haystack) { if (value == needle) { return true; } }
             return false;
         }
 
         template <typename Value, typename Pattern>
-        [[nodiscard]] bool string_starts_with(const Value& value, const Pattern& pattern) {
+        [[nodiscard]] bool stringStartsWith(const Value& value, const Pattern& pattern) {
             std::string_view haystack{value};
             std::string_view needle{pattern};
             return haystack.starts_with(needle);
         }
 
         template <typename Value, typename Pattern>
-        [[nodiscard]] bool string_contains(const Value& value, const Pattern& pattern) {
+        [[nodiscard]] bool stringContains(const Value& value, const Pattern& pattern) {
             std::string_view haystack{value};
             std::string_view needle{pattern};
             return haystack.find(needle) != std::string_view::npos;
         }
 
-        [[nodiscard]] inline bool like_match(std::string_view value, size_t vi, std::string_view pattern, size_t pi) {
+        [[nodiscard]] inline bool likeMatch(std::string_view value, size_t vi, std::string_view pattern, size_t pi) {
             while (pi < pattern.size()) {
                 if (pattern[pi] == '%') {
                     while (pi + 1 < pattern.size() && pattern[pi + 1] == '%') { ++pi; }
                     if (pi + 1 == pattern.size()) { return true; }
-                    for (size_t next = vi; next <= value.size(); ++next) {
-                        if (like_match(value, next, pattern, pi + 1)) { return true; }
-                    }
+                    for (size_t next = vi; next <= value.size(); ++next) { if (likeMatch(value, next, pattern, pi + 1)) { return true; } }
                     return false;
                 }
                 if (pattern[pi] == '_') {
@@ -635,13 +597,13 @@ namespace akkaradb {
         }
 
         template <typename Value, typename Pattern>
-        [[nodiscard]] bool string_like(const Value& value, const Pattern& pattern) {
-            return like_match(std::string_view{value}, 0, std::string_view{pattern}, 0);
+        [[nodiscard]] bool stringLike(const Value& value, const Pattern& pattern) {
+            return likeMatch(std::string_view{value}, 0, std::string_view{pattern}, 0);
         }
 
         template <typename Value>
-        [[nodiscard]] bool value_is_null(const Value& value) {
-            if constexpr (is_optional_v<Value>) { return !value.has_value(); }
+        [[nodiscard]] bool valueIsNull(const Value& value) {
+            if constexpr (isOptional<Value>) { return !value.has_value(); }
             else {
                 (void)value;
                 return false;
@@ -649,13 +611,13 @@ namespace akkaradb {
         }
 
         template <typename L, typename R>
-        [[nodiscard]] bool value_eq(const L& lhs, const R& rhs) {
+        [[nodiscard]] bool valueEq(const L& lhs, const R& rhs) {
             if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_equal(lhs, rhs); }
             else { return lhs == rhs; }
         }
 
         template <typename L, typename R>
-        [[nodiscard]] bool value_lt(const L& lhs, const R& rhs) {
+        [[nodiscard]] bool valueLt(const L& lhs, const R& rhs) {
             if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_less(lhs, rhs); }
             else { return lhs < rhs; }
         }
@@ -664,22 +626,22 @@ namespace akkaradb {
         [[nodiscard]] bool eval(const Compare<Operator, L, R>& expr, const Entity& entity) {
             const auto lhs = eval(expr.lhs, entity);
             const auto rhs = eval(expr.rhs, entity);
-            if constexpr (Operator == Op::Eq) { return value_eq(lhs, rhs); }
-            else if constexpr (Operator == Op::Ne) { return !value_eq(lhs, rhs); }
-            else if constexpr (Operator == Op::Gt) { return value_lt(rhs, lhs); }
-            else if constexpr (Operator == Op::Ge) { return !value_lt(lhs, rhs); }
-            else if constexpr (Operator == Op::Lt) { return value_lt(lhs, rhs); }
-            else if constexpr (Operator == Op::Le) { return !value_lt(rhs, lhs); }
-            else if constexpr (Operator == Op::In) { return contains_value(rhs, lhs); }
-            else if constexpr (Operator == Op::NotIn) { return !contains_value(rhs, lhs); }
-            else if constexpr (Operator == Op::StartsWith) { return string_starts_with(lhs, rhs); }
-            else if constexpr (Operator == Op::Contains) { return string_contains(lhs, rhs); }
-            else if constexpr (Operator == Op::Like) { return string_like(lhs, rhs); }
+            if constexpr (Operator == Op::EQ) { return valueEq(lhs, rhs); }
+            else if constexpr (Operator == Op::NE) { return !valueEq(lhs, rhs); }
+            else if constexpr (Operator == Op::GT) { return valueLt(rhs, lhs); }
+            else if constexpr (Operator == Op::GE) { return !valueLt(lhs, rhs); }
+            else if constexpr (Operator == Op::LT) { return valueLt(lhs, rhs); }
+            else if constexpr (Operator == Op::LE) { return !valueLt(rhs, lhs); }
+            else if constexpr (Operator == Op::IN_LIST) { return containsValue(rhs, lhs); }
+            else if constexpr (Operator == Op::NOT_IN) { return !containsValue(rhs, lhs); }
+            else if constexpr (Operator == Op::STARTS_WITH) { return stringStartsWith(lhs, rhs); }
+            else if constexpr (Operator == Op::CONTAINS) { return stringContains(lhs, rhs); }
+            else if constexpr (Operator == Op::LIKE) { return stringLike(lhs, rhs); }
         }
 
         template <Op Operator, typename L, typename R, typename Entity>
         [[nodiscard]] bool eval(const Logical<Operator, L, R>& expr, const Entity& entity) {
-            if constexpr (Operator == Op::And) { return eval(expr.lhs, entity) && eval(expr.rhs, entity); }
+            if constexpr (Operator == Op::AND) { return eval(expr.lhs, entity) && eval(expr.rhs, entity); }
             else { return eval(expr.lhs, entity) || eval(expr.rhs, entity); }
         }
 
@@ -689,14 +651,14 @@ namespace akkaradb {
         template <Op Operator, typename X, typename Entity>
         [[nodiscard]] bool eval(const Unary<Operator, X>& expr, const Entity& entity) {
             const auto value = eval(expr.x, entity);
-            if constexpr (Operator == Op::IsNull) { return value_is_null(value); }
-            else { return !value_is_null(value); }
+            if constexpr (Operator == Op::IS_NULL) { return valueIsNull(value); }
+            else { return !valueIsNull(value); }
         }
     } // namespace query
 
     #define AKKARADB_QUERYABLE_FIELD(Type, Field) ::akkaradb::query::Column<&Type::Field> Field{};
     #define AKKARADB_QUERYABLE(Type, A, B, C, D) \
-        [[nodiscard]] inline auto akkaradb_query_proxy(::akkaradb::query::ProxyTag<Type>) { \
+        [[nodiscard]] inline auto akkaradbQueryProxy(::akkaradb::query::ProxyTag<Type>) { \
             struct Proxy { \
                 AKKARADB_QUERYABLE_FIELD(Type, A) \
                 AKKARADB_QUERYABLE_FIELD(Type, B) \
@@ -739,7 +701,7 @@ namespace akkaradb {
 
                 void reserve(size_t capacity) {
                     if (capacity <= capacity_) { return; }
-                    ensure_arena();
+                    ensureArena();
                     std::byte* raw = arena_->allocate(capacity, alignof(uint8_t));
                     auto* next = reinterpret_cast<uint8_t*>(raw);
                     if (data_ != nullptr && size_ != 0) { std::memcpy(next, data_, size_); }
@@ -748,9 +710,9 @@ namespace akkaradb {
                 }
 
                 void resize(size_t size) {
-                    const size_t old_size = size_;
+                    const size_t oldSize = size_;
                     reserve(size);
-                    if (size > old_size) { std::memset(data_ + old_size, 0, size - old_size); }
+                    if (size > oldSize) { std::memset(data_ + oldSize, 0, size - oldSize); }
                     size_ = size;
                 }
 
@@ -785,7 +747,7 @@ namespace akkaradb {
                 [[nodiscard]] operator std::span<const uint8_t>() const noexcept { return {data_, size_}; }
 
             private:
-                void ensure_arena() const { if (arena_ == nullptr) { throw std::logic_error("PackedTable: arena buffer is not bound"); } }
+                void ensureArena() const { if (arena_ == nullptr) { throw std::logic_error("PackedTable: arena buffer is not bound"); } }
 
                 core::BufferArena* arena_ = nullptr;
                 uint8_t* data_ = nullptr;
@@ -794,8 +756,8 @@ namespace akkaradb {
         };
 
         public:
-            using Entity = binpack::detail::class_of<PrimaryKeyPtr>;
-            using PK = binpack::detail::member_of<PrimaryKeyPtr>;
+            using Entity = binpack::detail::classOf<PrimaryKeyPtr>;
+            using PK = binpack::detail::memberOf<PrimaryKeyPtr>;
 
             struct Entry {
                 PK id;
@@ -812,19 +774,19 @@ namespace akkaradb {
 
             template <auto FieldPtr>
             [[nodiscard]] Index<FieldPtr> index() {
-                static_assert(std::is_same_v<binpack::detail::class_of<FieldPtr>, Entity>, "index field must belong to the table entity");
-                const std::string_view field_name = binpack::detail::member_name<FieldPtr>();
-                const auto prefix = make_index_prefix(table_name_, field_name);
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "index field must belong to the table entity");
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                const auto prefix = makeIndexPrefix(tableName_, fieldName);
 
-                for (const auto& idx : indexes_) { if (idx.field_name == field_name) { return Index<FieldPtr>{this, prefix}; } }
+                for (const auto& idx : indexes_) { if (idx.fieldName == fieldName) { return Index<FieldPtr>{this, prefix}; } }
 
                 indexes_.push_back(
                     IndexDef{
                         prefix,
-                        std::string(field_name),
+                        std::string(fieldName),
                         [](const Entity& entity, ArenaByteBuffer& out) {
                             out.clear();
-                            encode_index_field_value(entity.*FieldPtr, out);
+                            encodeIndexFieldValue(entity.*FieldPtr, out);
                         }
                     }
                 );
@@ -838,59 +800,59 @@ namespace akkaradb {
             }
 
             void put(const Entity& entity) {
-                reset_temp_buffers();
+                resetTempBuffers();
                 const PK& pk = entity.*PrimaryKeyPtr;
-                make_pk_key(pk, pk_key_buffer_);
+                makePkKey(pk, pkKeyBuffer_);
 
                 if (!indexes_.empty()) {
-                    std::span<const uint8_t> old_bytes;
-                    if (engine_->get_into_arena(pk_key_buffer_, *temp_arena_, old_bytes)) {
-                        const Entity old_entity = binpack::BinPack::decode<Entity>(old_bytes);
-                        remove_index_entries(old_entity, pk_key_buffer_);
+                    std::span<const uint8_t> oldBytes;
+                    if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
+                        const Entity oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
+                        removeIndexEntries(oldEntity, pkKeyBuffer_);
                     }
                 }
 
-                value_buffer_.clear();
-                value_buffer_.reserve(binpack::BinPack::estimate_size(entity));
-                binpack::BinPack::encode_into(entity, value_buffer_);
+                valueBuffer_.clear();
+                valueBuffer_.reserve(binpack::BinPack::estimateSize(entity));
+                binpack::BinPack::encodeInto(entity, valueBuffer_);
 
-                put_hinted(pk_key_buffer_, value_buffer_);
-                if (!indexes_.empty()) { write_index_entries(entity, pk_key_buffer_); }
+                putHinted(pkKeyBuffer_, valueBuffer_);
+                if (!indexes_.empty()) { writeIndexEntries(entity, pkKeyBuffer_); }
             }
 
             [[nodiscard]] std::optional<Entity> get(const PK& pk) const {
                 Entity out{};
-                if (!get_into(pk, out)) { return std::nullopt; }
+                if (!getInto(pk, out)) { return std::nullopt; }
                 return out;
             }
 
-            [[nodiscard]] bool get_into(const PK& pk, Entity& out) const {
-                reset_temp_buffers();
-                make_pk_key(pk, pk_key_buffer_);
+            [[nodiscard]] bool getInto(const PK& pk, Entity& out) const {
+                resetTempBuffers();
+                makePkKey(pk, pkKeyBuffer_);
                 std::span<const uint8_t> bytes;
-                if (!engine_->get_into_arena(pk_key_buffer_, *temp_arena_, bytes)) { return false; }
-                return binpack::BinPack::decode_into<Entity>(bytes, out);
+                if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, bytes)) { return false; }
+                return binpack::BinPack::decodeInto<Entity>(bytes, out);
             }
 
             void remove(const PK& pk) {
-                reset_temp_buffers();
-                make_pk_key(pk, pk_key_buffer_);
+                resetTempBuffers();
+                makePkKey(pk, pkKeyBuffer_);
 
                 if (!indexes_.empty()) {
-                    std::span<const uint8_t> old_bytes;
-                    if (engine_->get_into_arena(pk_key_buffer_, *temp_arena_, old_bytes)) {
-                        const Entity old_entity = binpack::BinPack::decode<Entity>(old_bytes);
-                        remove_index_entries(old_entity, pk_key_buffer_);
+                    std::span<const uint8_t> oldBytes;
+                    if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
+                        const Entity oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
+                        removeIndexEntries(oldEntity, pkKeyBuffer_);
                     }
                 }
 
-                remove_hinted(pk_key_buffer_);
+                removeHinted(pkKeyBuffer_);
             }
 
             [[nodiscard]] bool exists(const PK& pk) const {
-                reset_temp_buffers();
-                make_pk_key(pk, pk_key_buffer_);
-                return engine_->exists(pk_key_buffer_);
+                resetTempBuffers();
+                makePkKey(pk, pkKeyBuffer_);
+                return engine_->exists(pkKeyBuffer_);
             }
 
             void upsert(const PK& pk, std::function<void(Entity&)> update) {
@@ -901,45 +863,45 @@ namespace akkaradb {
             }
 
             template <auto FieldPtr>
-            [[nodiscard]] std::optional<Entity> find_by(const binpack::detail::member_of<FieldPtr>& value) const {
-                static_assert(std::is_same_v<binpack::detail::class_of<FieldPtr>, Entity>, "find_by field must belong to the table entity");
-                const std::string_view field_name = binpack::detail::member_name<FieldPtr>();
-                const auto prefix = make_index_prefix(table_name_, field_name);
+            [[nodiscard]] std::optional<Entity> findBy(const binpack::detail::memberOf<FieldPtr>& value) const {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "findBy field must belong to the table entity");
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                const auto prefix = makeIndexPrefix(tableName_, fieldName);
 
                 bool registered = false;
                 for (const auto& idx : indexes_) {
-                    if (idx.field_name == field_name) {
+                    if (idx.fieldName == fieldName) {
                         registered = true;
                         break;
                     }
                 }
-                if (!registered) { throw std::runtime_error("PackedTable::find_by: index is not registered for this field"); }
+                if (!registered) { throw std::runtime_error("PackedTable::findBy: index is not registered for this field"); }
 
-                reset_temp_buffers();
-                field_buffer_.clear();
-                encode_index_field_value(value, field_buffer_);
-                make_index_search_prefix(prefix, field_buffer_, scan_start_buffer_);
-                scan_end_buffer_ = scan_start_buffer_;
-                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                resetTempBuffers();
+                fieldBuffer_.clear();
+                encodeIndexFieldValue(value, fieldBuffer_);
+                makeIndexSearchPrefix(prefix, fieldBuffer_, scanStartBuffer_);
+                scanEndBuffer_ = scanStartBuffer_;
+                if (!detail::incrementLexicographicBytes(scanEndBuffer_.data(), scanEndBuffer_.size())) { scanEndBuffer_.clear(); }
 
-                core::BufferArena scan_arena;
-                auto rows = engine_->scan(scan_arena, scan_start_buffer_, scan_end_buffer_);
+                core::BufferArena scanArena;
+                auto rows = engine_->scan(scanArena, scanStartBuffer_, scanEndBuffer_);
                 for (auto it = rows.begin(); !(it == rows.end()); ++it) {
                     const auto& raw = *it;
                     const auto key = raw.key;
-                    if (key.size() <= scan_start_buffer_.size()) { continue; }
+                    if (key.size() <= scanStartBuffer_.size()) { continue; }
 
                     Entry entry;
-                    const std::span<const uint8_t> pk_bytes{key.data() + scan_start_buffer_.size(), key.size() - scan_start_buffer_.size()};
-                    if (get_by_pk_bytes(pk_bytes, entry)) { return entry.value; }
+                    const std::span<const uint8_t> pkBytes{key.data() + scanStartBuffer_.size(), key.size() - scanStartBuffer_.size()};
+                    if (getByPkBytes(pkBytes, entry)) { return entry.value; }
                 }
                 return std::nullopt;
             }
 
             [[nodiscard]] size_t count() const {
-                reset_temp_buffers();
-                make_prefix_start_end(pk_prefix_, scan_start_buffer_, scan_end_buffer_);
-                return engine_->count(scan_start_buffer_, scan_end_buffer_);
+                resetTempBuffers();
+                makePrefixStartEnd(pkPrefix_, scanStartBuffer_, scanEndBuffer_);
+                return engine_->count(scanStartBuffer_, scanEndBuffer_);
             }
 
             class ScanRange {
@@ -949,7 +911,7 @@ namespace akkaradb {
                     ScanRange(const ScanRange&) = delete;
                     ScanRange& operator=(const ScanRange&) = delete;
 
-                    [[nodiscard]] bool has_next() const noexcept { return pending_.has_value(); }
+                    [[nodiscard]] bool hasNext() const noexcept { return pending_.has_value(); }
 
                     [[nodiscard]] Entry next() {
                         if (!pending_) { throw std::out_of_range("PackedTable::ScanRange: no next entry"); }
@@ -961,10 +923,10 @@ namespace akkaradb {
                 private:
                     friend class PackedTable;
 
-                    ScanRange(const PackedTable* table, std::span<const uint8_t> start_key, std::span<const uint8_t> end_key)
+                    ScanRange(const PackedTable* table, std::span<const uint8_t> startKey, std::span<const uint8_t> endKey)
                         : table_{table},
-                          scan_arena_{std::make_unique<core::BufferArena>()},
-                          rows_{table_->engine_->scan(*scan_arena_, start_key, end_key)},
+                          scanArena_{std::make_unique<core::BufferArena>()},
+                          rows_{table_->engine_->scan(*scanArena_, startKey, endKey)},
                           it_{rows_.begin()} { advance(); }
 
                     void advance() {
@@ -972,59 +934,61 @@ namespace akkaradb {
                         while (!(it_ == rows_.end())) {
                             const auto& raw = *it_;
                             const auto key = raw.key;
-                            if (key.size() < table_->pk_prefix_.size() || std::memcmp(key.data(), table_->pk_prefix_.data(), table_->pk_prefix_.size()) != 0) {
-                                return;
-                            }
+                            if (key.size() < table_->pkPrefix_.size() || std::memcmp(
+                                key.data(),
+                                table_->pkPrefix_.data(),
+                                table_->pkPrefix_.size()
+                            ) != 0) { return; }
 
-                            std::span<const uint8_t> pk_bytes{key.data() + table_->pk_prefix_.size(), key.size() - table_->pk_prefix_.size()};
-                            pending_ = Entry{binpack::BinPack::decode<PK>(pk_bytes), binpack::BinPack::decode<Entity>(raw.value)};
+                            std::span<const uint8_t> pkBytes{key.data() + table_->pkPrefix_.size(), key.size() - table_->pkPrefix_.size()};
+                            pending_ = Entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                             ++it_;
                             return;
                         }
                     }
 
                     const PackedTable* table_;
-                    std::unique_ptr<core::BufferArena> scan_arena_;
+                    std::unique_ptr<core::BufferArena> scanArena_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView> rows_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView>::iterator it_;
                     std::optional<Entry> pending_;
             };
 
-            [[nodiscard]] ScanRange scan_all() const {
-                reset_temp_buffers();
-                make_prefix_start_end(pk_prefix_, scan_start_buffer_, scan_end_buffer_);
-                return ScanRange{this, scan_start_buffer_, scan_end_buffer_};
+            [[nodiscard]] ScanRange scanAll() const {
+                resetTempBuffers();
+                makePrefixStartEnd(pkPrefix_, scanStartBuffer_, scanEndBuffer_);
+                return ScanRange{this, scanStartBuffer_, scanEndBuffer_};
             }
 
-            [[nodiscard]] ScanRange scan(const PK& start_pk) const {
-                reset_temp_buffers();
-                make_pk_key(start_pk, scan_start_buffer_);
-                scan_end_buffer_.assign(pk_prefix_.begin(), pk_prefix_.end());
-                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
-                return ScanRange{this, scan_start_buffer_, scan_end_buffer_};
+            [[nodiscard]] ScanRange scan(const PK& startPk) const {
+                resetTempBuffers();
+                makePkKey(startPk, scanStartBuffer_);
+                scanEndBuffer_.assign(pkPrefix_.begin(), pkPrefix_.end());
+                if (!detail::incrementLexicographicBytes(scanEndBuffer_.data(), scanEndBuffer_.size())) { scanEndBuffer_.clear(); }
+                return ScanRange{this, scanStartBuffer_, scanEndBuffer_};
             }
 
-            [[nodiscard]] ScanRange scan(const PK& start_pk, const PK& end_pk) const {
-                reset_temp_buffers();
-                make_pk_key(start_pk, scan_start_buffer_);
-                make_pk_key(end_pk, scan_end_buffer_);
-                return ScanRange{this, scan_start_buffer_, scan_end_buffer_};
+            [[nodiscard]] ScanRange scan(const PK& startPk, const PK& endPk) const {
+                resetTempBuffers();
+                makePkKey(startPk, scanStartBuffer_);
+                makePkKey(endPk, scanEndBuffer_);
+                return ScanRange{this, scanStartBuffer_, scanEndBuffer_};
             }
 
             enum class QuerySourceKind {
-                Table, Index
+                TABLE, INDEX
             };
 
             struct QueryRange {
-                std::vector<uint8_t> start_key;
-                std::vector<uint8_t> end_key;
-                size_t index_search_prefix_size = 0;
-                bool dynamic_index_pk_offset = false;
-                bool dedupe_index_pks = false;
+                std::vector<uint8_t> startKey;
+                std::vector<uint8_t> endKey;
+                size_t indexSearchPrefixSize = 0;
+                bool dynamicIndexPkOffset = false;
+                bool dedupeIndexPks = false;
             };
 
             struct QueryPlan {
-                QuerySourceKind kind = QuerySourceKind::Table;
+                QuerySourceKind kind = QuerySourceKind::TABLE;
                 std::vector<QueryRange> ranges;
             };
 
@@ -1035,7 +999,7 @@ namespace akkaradb {
                     QuerySource(const QuerySource&) = delete;
                     QuerySource& operator=(const QuerySource&) = delete;
 
-                    [[nodiscard]] bool has_next() const noexcept { return pending_.has_value(); }
+                    [[nodiscard]] bool hasNext() const noexcept { return pending_.has_value(); }
 
                     [[nodiscard]] Entry next() {
                         if (!pending_) { throw std::out_of_range("PackedTable::QuerySource: no next entry"); }
@@ -1051,21 +1015,21 @@ namespace akkaradb {
                         : table_{table},
                           kind_{plan.kind},
                           ranges_{std::move(plan.ranges)},
-                          scan_arena_{std::make_unique<core::BufferArena>()} {
-                        open_next_range();
+                          scanArena_{std::make_unique<core::BufferArena>()} {
+                        openNextRange();
                         advance();
                     }
 
-                    void open_next_range() {
-                        while (range_index_ < ranges_.size()) {
-                            const auto& range = ranges_[range_index_++];
-                            index_search_prefix_size_ = range.index_search_prefix_size;
-                            dynamic_index_pk_offset_ = range.dynamic_index_pk_offset;
-                            dedupe_index_pks_ = range.dedupe_index_pks;
+                    void openNextRange() {
+                        while (rangeIndex_ < ranges_.size()) {
+                            const auto& range = ranges_[rangeIndex_++];
+                            indexSearchPrefixSize_ = range.indexSearchPrefixSize;
+                            dynamicIndexPkOffset_ = range.dynamicIndexPkOffset;
+                            dedupeIndexPks_ = range.dedupeIndexPks;
                             it_ = {};
                             rows_ = {};
-                            scan_arena_->reset();
-                            rows_ = table_->engine_->scan(*scan_arena_, range.start_key, range.end_key);
+                            scanArena_->reset();
+                            rows_ = table_->engine_->scan(*scanArena_, range.startKey, range.endKey);
                             it_ = rows_.begin();
                             return;
                         }
@@ -1073,59 +1037,74 @@ namespace akkaradb {
 
                     void advance() {
                         pending_.reset();
-                        while (range_index_ <= ranges_.size()) {
+                        while (rangeIndex_ <= ranges_.size()) {
                             while (!(it_ == rows_.end())) {
                                 const auto& raw = *it_;
-                                ++it_;
                                 Entry entry;
-                                if (kind_ == QuerySourceKind::Table) {
+                                if (kind_ == QuerySourceKind::TABLE) {
                                     const auto key = raw.key;
-                                    if (key.size() < table_->pk_prefix_.size() || std::memcmp(
+                                    if (key.size() < table_->pkPrefix_.size() || std::memcmp(
                                         key.data(),
-                                        table_->pk_prefix_.data(),
-                                        table_->pk_prefix_.size()
+                                        table_->pkPrefix_.data(),
+                                        table_->pkPrefix_.size()
                                     ) != 0) { return; }
 
-                                    std::span<const uint8_t> pk_bytes{key.data() + table_->pk_prefix_.size(), key.size() - table_->pk_prefix_.size()};
-                                    entry = Entry{binpack::BinPack::decode<PK>(pk_bytes), binpack::BinPack::decode<Entity>(raw.value)};
+                                    std::span<const uint8_t> pkBytes{
+                                        key.data() + table_->pkPrefix_.size(),
+                                        key.size() - table_->pkPrefix_.size()
+                                    };
+                                    entry = Entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                                 }
                                 else {
                                     const auto key = raw.key;
-                                    size_t pk_offset = index_search_prefix_size_;
-                                    if (dynamic_index_pk_offset_) {
-                                        if (key.size() <= 12) { continue; }
-                                        size_t field_size = read_le32(key.data() + 8);
-                                        if (12 + field_size >= key.size()) {
-                                            const size_t legacy_field_size = read_be32(key.data() + 8);
-                                            if (12 + legacy_field_size < key.size()) { field_size = legacy_field_size; }
+                                    size_t pkOffset = indexSearchPrefixSize_;
+                                    if (dynamicIndexPkOffset_) {
+                                        if (key.size() <= 12) {
+                                            ++it_;
+                                            continue;
                                         }
-                                        pk_offset = 12 + field_size;
+                                        size_t fieldSize = readLe32(key.data() + 8);
+                                        if (12 + fieldSize >= key.size()) {
+                                            const size_t legacyFieldSize = readBe32(key.data() + 8);
+                                            if (12 + legacyFieldSize < key.size()) { fieldSize = legacyFieldSize; }
+                                        }
+                                        pkOffset = 12 + fieldSize;
                                     }
-                                    if (key.size() <= pk_offset) { continue; }
-                                    const std::span<const uint8_t> pk_bytes{key.data() + pk_offset, key.size() - pk_offset};
-                                    if (dedupe_index_pks_) {
-                                        std::string pk_key{reinterpret_cast<const char*>(pk_bytes.data()), pk_bytes.size()};
-                                        if (!seen_index_pks_.insert(std::move(pk_key)).second) { continue; }
+                                    if (key.size() <= pkOffset) {
+                                        ++it_;
+                                        continue;
                                     }
-                                    if (!table_->get_by_pk_bytes(pk_bytes, entry)) { continue; }
+                                    const std::span<const uint8_t> pkBytes{key.data() + pkOffset, key.size() - pkOffset};
+                                    if (dedupeIndexPks_) {
+                                        std::string pkKey{reinterpret_cast<const char*>(pkBytes.data()), pkBytes.size()};
+                                        if (!seenIndexPks_.insert(std::move(pkKey)).second) {
+                                            ++it_;
+                                            continue;
+                                        }
+                                    }
+                                    if (!table_->getByPkBytes(pkBytes, entry)) {
+                                        ++it_;
+                                        continue;
+                                    }
                                 }
                                 pending_ = std::move(entry);
+                                ++it_;
                                 return;
                             }
-                            if (range_index_ >= ranges_.size()) { return; }
-                            open_next_range();
+                            if (rangeIndex_ >= ranges_.size()) { return; }
+                            openNextRange();
                         }
                     }
 
                     const PackedTable* table_;
                     QuerySourceKind kind_;
-                    size_t index_search_prefix_size_;
-                    bool dynamic_index_pk_offset_ = false;
-                    bool dedupe_index_pks_ = false;
-                    std::unordered_set<std::string> seen_index_pks_;
+                    size_t indexSearchPrefixSize_;
+                    bool dynamicIndexPkOffset_ = false;
+                    bool dedupeIndexPks_ = false;
+                    std::unordered_set<std::string> seenIndexPks_;
                     std::vector<QueryRange> ranges_;
-                    size_t range_index_ = 0;
-                    std::unique_ptr<core::BufferArena> scan_arena_;
+                    size_t rangeIndex_ = 0;
+                    std::unique_ptr<core::BufferArena> scanArena_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView> rows_;
                     core::ArenaGenerator<engine::AkkEngine::ScanRecordView>::iterator it_;
                     std::optional<Entry> pending_;
@@ -1161,7 +1140,7 @@ namespace akkaradb {
 
                             void advance() {
                                 current_.reset();
-                                while (source_.has_next()) {
+                                while (source_.hasNext()) {
                                     if (limit_ && matched_ >= *limit_) { return; }
                                     auto entry = source_.next();
                                     if (query::eval(expr_, entry.value)) {
@@ -1181,23 +1160,19 @@ namespace akkaradb {
 
                     [[nodiscard]] Iterator begin() const {
                         QueryPlan plan;
-                        table_->make_query_plan(expr_, plan);
-                        return Iterator{
-                            QuerySource{table_, std::move(plan)},
-                            expr_,
-                            limit_
-                        };
+                        table_->makeQueryPlan(expr_, plan);
+                        return Iterator{QuerySource{table_, std::move(plan)}, expr_, limit_};
                     }
 
                     [[nodiscard]] typename Iterator::Sentinel end() const noexcept { return {}; }
 
                     template <typename Pred>
                     [[nodiscard]] auto where(Pred&& predicate) const {
-                        auto next = std::forward<Pred>(predicate)(query::make_proxy<Entity>());
+                        auto next = std::forward<Pred>(predicate)(query::makeProxy<Entity>());
                         using NextExpr = decltype(next);
-                        return QueryView<query::Logical<query::Op::And, Expr, NextExpr>>{
+                        return QueryView<query::Logical<query::Op::AND, Expr, NextExpr>>{
                             table_,
-                            query::Logical<query::Op::And, Expr, NextExpr>{expr_, std::move(next)},
+                            query::Logical<query::Op::AND, Expr, NextExpr>{expr_, std::move(next)},
                             limit_
                         };
                     }
@@ -1226,7 +1201,7 @@ namespace akkaradb {
                         return n;
                     }
 
-                    [[nodiscard]] std::vector<Entry> to_vector() const {
+                    [[nodiscard]] std::vector<Entry> toVector() const {
                         std::vector<Entry> out;
                         for (const auto& entry : *this) { out.push_back(entry); }
                         return out;
@@ -1248,14 +1223,14 @@ namespace akkaradb {
             template <typename Pred>
             [[nodiscard]] auto query(Pred&& predicate) const { return query().where(std::forward<Pred>(predicate)); }
 
-            [[nodiscard]] std::string_view table_name() const noexcept { return table_name_; }
+            [[nodiscard]] std::string_view tableName() const noexcept { return tableName_; }
             [[nodiscard]] engine::AkkEngine& engine() noexcept { return *engine_; }
             [[nodiscard]] const engine::AkkEngine& engine() const noexcept { return *engine_; }
 
             template <auto FieldPtr>
             class Index {
                 public:
-                    using Field = binpack::detail::member_of<FieldPtr>;
+                    using Field = binpack::detail::memberOf<FieldPtr>;
 
                     class FindRange {
                         public:
@@ -1264,7 +1239,7 @@ namespace akkaradb {
                             FindRange(const FindRange&) = delete;
                             FindRange& operator=(const FindRange&) = delete;
 
-                            [[nodiscard]] bool has_next() const noexcept { return pending_.has_value(); }
+                            [[nodiscard]] bool hasNext() const noexcept { return pending_.has_value(); }
 
                             [[nodiscard]] Entry next() {
                                 if (!pending_) { throw std::out_of_range("PackedTable::Index::FindRange: no next entry"); }
@@ -1276,11 +1251,16 @@ namespace akkaradb {
                         private:
                             friend class Index;
 
-                            FindRange(PackedTable* table, size_t search_prefix_size, std::span<const uint8_t> start_key, std::span<const uint8_t> end_key)
+                            FindRange(
+                                PackedTable* table,
+                                size_t searchPrefixSize,
+                                std::span<const uint8_t> startKey,
+                                std::span<const uint8_t> endKey
+                            )
                                 : table_{table},
-                                  search_prefix_size_{search_prefix_size},
-                                  scan_arena_{std::make_unique<core::BufferArena>()},
-                                  rows_{table_->engine_->scan(*scan_arena_, start_key, end_key)},
+                                  searchPrefixSize_{searchPrefixSize},
+                                  scanArena_{std::make_unique<core::BufferArena>()},
+                                  rows_{table_->engine_->scan(*scanArena_, startKey, endKey)},
                                   it_{rows_.begin()} { advance(); }
 
                             void advance() {
@@ -1288,14 +1268,14 @@ namespace akkaradb {
                                 while (!(it_ == rows_.end())) {
                                     const auto& raw = *it_;
                                     const auto key = raw.key;
-                                    if (key.size() <= search_prefix_size_) {
+                                    if (key.size() <= searchPrefixSize_) {
                                         ++it_;
                                         continue;
                                     }
 
-                                    std::span pk_bytes{key.data() + search_prefix_size_, key.size() - search_prefix_size_};
+                                    std::span pkBytes{key.data() + searchPrefixSize_, key.size() - searchPrefixSize_};
                                     Entry entry;
-                                    if (table_->get_by_pk_bytes(pk_bytes, entry)) {
+                                    if (table_->getByPkBytes(pkBytes, entry)) {
                                         pending_ = std::move(entry);
                                         ++it_;
                                         return;
@@ -1305,21 +1285,23 @@ namespace akkaradb {
                             }
 
                             PackedTable* table_;
-                            size_t search_prefix_size_;
-                            std::unique_ptr<core::BufferArena> scan_arena_;
+                            size_t searchPrefixSize_;
+                            std::unique_ptr<core::BufferArena> scanArena_;
                             core::ArenaGenerator<engine::AkkEngine::ScanRecordView> rows_;
                             core::ArenaGenerator<engine::AkkEngine::ScanRecordView>::iterator it_;
                             std::optional<Entry> pending_;
                     };
 
                     [[nodiscard]] FindRange find(const Field& value) const {
-                        table_->reset_temp_buffers();
-                        table_->field_buffer_.clear();
-                        table_->encode_index_field_value(value, table_->field_buffer_);
-                        table_->make_index_search_prefix(prefix_, table_->field_buffer_, table_->scan_start_buffer_);
-                        table_->scan_end_buffer_ = table_->scan_start_buffer_;
-                        if (!detail::increment_lexicographic_bytes(table_->scan_end_buffer_.data(), table_->scan_end_buffer_.size())) { table_->scan_end_buffer_.clear(); }
-                        return FindRange{table_, table_->scan_start_buffer_.size(), table_->scan_start_buffer_, table_->scan_end_buffer_};
+                        table_->resetTempBuffers();
+                        table_->fieldBuffer_.clear();
+                        table_->encodeIndexFieldValue(value, table_->fieldBuffer_);
+                        table_->makeIndexSearchPrefix(prefix_, table_->fieldBuffer_, table_->scanStartBuffer_);
+                        table_->scanEndBuffer_ = table_->scanStartBuffer_;
+                        if (!detail::incrementLexicographicBytes(table_->scanEndBuffer_.data(), table_->scanEndBuffer_.size())) {
+                            table_->scanEndBuffer_.clear();
+                        }
+                        return FindRange{table_, table_->scanStartBuffer_.size(), table_->scanStartBuffer_, table_->scanEndBuffer_};
                     }
 
                 private:
@@ -1335,81 +1317,81 @@ namespace akkaradb {
 
             struct IndexDef {
                 std::array<uint8_t, 8> prefix;
-                std::string field_name;
-                void (*encode_field)(const Entity&, ArenaByteBuffer&);
+                std::string fieldName;
+                void (*encodeField)(const Entity&, ArenaByteBuffer&);
             };
 
             engine::AkkEngine* engine_ = nullptr;
-            std::string table_name_;
-            std::array<uint8_t, 8> pk_prefix_{};
+            std::string tableName_;
+            std::array<uint8_t, 8> pkPrefix_{};
             std::vector<IndexDef> indexes_;
 
-            mutable std::unique_ptr<core::BufferArena> temp_arena_ = std::make_unique<core::BufferArena>();
-            mutable ArenaByteBuffer pk_key_buffer_{temp_arena_.get()};
-            mutable ArenaByteBuffer value_buffer_{temp_arena_.get()};
-            mutable ArenaByteBuffer index_key_buffer_{temp_arena_.get()};
-            mutable ArenaByteBuffer field_buffer_{temp_arena_.get()};
-            mutable ArenaByteBuffer scan_start_buffer_{temp_arena_.get()};
-            mutable ArenaByteBuffer scan_end_buffer_{temp_arena_.get()};
+            mutable std::unique_ptr<core::BufferArena> tempArena_ = std::make_unique<core::BufferArena>();
+            mutable ArenaByteBuffer pkKeyBuffer_{tempArena_.get()};
+            mutable ArenaByteBuffer valueBuffer_{tempArena_.get()};
+            mutable ArenaByteBuffer indexKeyBuffer_{tempArena_.get()};
+            mutable ArenaByteBuffer fieldBuffer_{tempArena_.get()};
+            mutable ArenaByteBuffer scanStartBuffer_{tempArena_.get()};
+            mutable ArenaByteBuffer scanEndBuffer_{tempArena_.get()};
 
             PackedTable() = default;
 
-            void reset_temp_buffers() const {
-                temp_arena_->reset();
-                pk_key_buffer_.bind(temp_arena_.get());
-                value_buffer_.bind(temp_arena_.get());
-                index_key_buffer_.bind(temp_arena_.get());
-                field_buffer_.bind(temp_arena_.get());
-                scan_start_buffer_.bind(temp_arena_.get());
-                scan_end_buffer_.bind(temp_arena_.get());
+            void resetTempBuffers() const {
+                tempArena_->reset();
+                pkKeyBuffer_.bind(tempArena_.get());
+                valueBuffer_.bind(tempArena_.get());
+                indexKeyBuffer_.bind(tempArena_.get());
+                fieldBuffer_.bind(tempArena_.get());
+                scanStartBuffer_.bind(tempArena_.get());
+                scanEndBuffer_.bind(tempArena_.get());
             }
 
             template <typename Expr>
-            void make_query_plan(const Expr& expr, QueryPlan& plan) const {
-                reset_temp_buffers();
-                if (try_make_index_plan(expr, plan)) { return; }
+            void makeQueryPlan(const Expr& expr, QueryPlan& plan) const {
+                resetTempBuffers();
+                if (tryMakeIndexPlan(expr, plan)) { return; }
 
-                plan.kind = QuerySourceKind::Table;
+                plan.kind = QuerySourceKind::TABLE;
                 plan.ranges.clear();
-                make_prefix_start_end(pk_prefix_, scan_start_buffer_, scan_end_buffer_);
-                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 0);
+                makePrefixStartEnd(pkPrefix_, scanStartBuffer_, scanEndBuffer_);
+                addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, 0);
             }
 
-            void add_query_range(
+            void addQueryRange(
                 QueryPlan& plan,
-                std::span<const uint8_t> start_key,
-                std::span<const uint8_t> end_key,
-                size_t index_search_prefix_size,
-                bool dynamic_index_pk_offset = false,
-                bool dedupe_index_pks = false
+                std::span<const uint8_t> startKey,
+                std::span<const uint8_t> endKey,
+                size_t indexSearchPrefixSize,
+                bool dynamicIndexPkOffset = false,
+                bool dedupeIndexPks = false
             ) const {
                 QueryRange range;
-                range.start_key.assign(start_key.begin(), start_key.end());
-                range.end_key.assign(end_key.begin(), end_key.end());
-                range.index_search_prefix_size = index_search_prefix_size;
-                range.dynamic_index_pk_offset = dynamic_index_pk_offset;
-                range.dedupe_index_pks = dedupe_index_pks;
+                range.startKey.assign(startKey.begin(), startKey.end());
+                range.endKey.assign(endKey.begin(), endKey.end());
+                range.indexSearchPrefixSize = indexSearchPrefixSize;
+                range.dynamicIndexPkOffset = dynamicIndexPkOffset;
+                range.dedupeIndexPks = dedupeIndexPks;
                 plan.ranges.push_back(std::move(range));
             }
 
             template <typename Expr>
-            [[nodiscard]] bool try_make_index_plan(const Expr& expr, QueryPlan& plan) const {
+            [[nodiscard]] bool tryMakeIndexPlan(const Expr& expr, QueryPlan& plan) const {
                 using E = std::remove_cvref_t<Expr>;
-                if constexpr (query::is_and_v<E>) { return try_make_index_plan(expr.lhs, plan) || try_make_index_plan(expr.rhs, plan); }
-                else if constexpr (query::is_compare_v<E>) { return try_make_compare_index_plan(expr, plan); }
-                else if constexpr (query::is_not_v<E>) { return try_make_not_index_plan(expr, plan); }
-                else if constexpr (query::is_unary_v<E>) { return try_make_unary_index_plan(expr, plan); }
+                if constexpr (query::isAnd<E>) { return tryMakeIndexPlan(expr.lhs, plan) || tryMakeIndexPlan(expr.rhs, plan); }
+                else if constexpr (query::isCompare<E>) { return tryMakeCompareIndexPlan(expr, plan); }
+                else if constexpr (query::isNot<E>) { return tryMakeNotIndexPlan(expr, plan); }
+                else if constexpr (query::isUnary<E>) { return tryMakeUnaryIndexPlan(expr, plan); }
                 else { return false; }
             }
 
             template <query::Op Operator, typename L, typename R>
-            [[nodiscard]] bool try_make_compare_index_plan(const query::Compare<Operator, L, R>& expr, QueryPlan& plan) const {
-                if constexpr (query::is_column_v<L> && query::is_literal_v<R>) {
-                    return try_make_field_index_plan<Operator, std::remove_cvref_t<L>::field_ptr>(query::literal_value(expr.rhs), plan);
+            [[nodiscard]] bool tryMakeCompareIndexPlan(const query::Compare<Operator, L, R>& expr, QueryPlan& plan) const {
+                if constexpr (query::isColumn<L> && query::isLiteral<R>) {
+                    return tryMakeFieldIndexPlan<Operator, std::remove_cvref_t<L>::fieldPtr>(query::literalValue(expr.rhs), plan);
                 }
-                else if constexpr (query::is_literal_v<L> && query::is_column_v<R>) {
-                    return try_make_field_index_plan<query::swapped_compare_op<Operator>, std::remove_cvref_t<R>::field_ptr>(
-                        query::literal_value(expr.lhs),
+                else if constexpr (query::isLiteral<L> && query::isColumn<R>) {
+                    return tryMakeFieldIndexPlan<query::swappedCompareOp<Operator>, std::remove_cvref_t<R>::fieldPtr>(
+                        query::literalValue(expr.lhs),
                         plan
                     );
                 }
@@ -1417,45 +1399,41 @@ namespace akkaradb {
             }
 
             template <typename X>
-            [[nodiscard]] bool try_make_not_index_plan(const query::Not<X>& expr, QueryPlan& plan) const {
+            [[nodiscard]] bool tryMakeNotIndexPlan(const query::Not<X>& expr, QueryPlan& plan) const {
                 using E = std::remove_cvref_t<X>;
-                if constexpr (query::is_compare_v<E>) {
-                    return try_make_compare_index_source_plan(expr.x, plan);
-                }
-                else if constexpr (query::is_unary_v<E>) {
-                    return try_make_unary_index_plan(expr.x, plan);
-                }
+                if constexpr (query::isCompare<E>) { return tryMakeCompareIndexSourcePlan(expr.x, plan); }
+                else if constexpr (query::isUnary<E>) { return tryMakeUnaryIndexPlan(expr.x, plan); }
                 else { return false; }
             }
 
             template <query::Op Operator, typename L, typename R>
-            [[nodiscard]] bool try_make_compare_index_source_plan(const query::Compare<Operator, L, R>&, QueryPlan& plan) const {
-                if constexpr (query::is_column_v<L> && query::is_literal_v<R>) {
-                    return try_make_field_index_source_plan<std::remove_cvref_t<L>::field_ptr>(plan);
+            [[nodiscard]] bool tryMakeCompareIndexSourcePlan(const query::Compare<Operator, L, R>&, QueryPlan& plan) const {
+                if constexpr (query::isColumn<L> && query::isLiteral<R>) {
+                    return tryMakeFieldIndexSourcePlan<std::remove_cvref_t<L>::fieldPtr>(plan);
                 }
-                else if constexpr (query::is_literal_v<L> && query::is_column_v<R>) {
-                    return try_make_field_index_source_plan<std::remove_cvref_t<R>::field_ptr>(plan);
+                else if constexpr (query::isLiteral<L> && query::isColumn<R>) {
+                    return tryMakeFieldIndexSourcePlan<std::remove_cvref_t<R>::fieldPtr>(plan);
                 }
                 else { return false; }
             }
 
             template <query::Op Operator, typename X>
-            [[nodiscard]] bool try_make_unary_index_plan(const query::Unary<Operator, X>&, QueryPlan& plan) const {
-                if constexpr ((Operator == query::Op::IsNull || Operator == query::Op::IsNotNull) && query::is_column_v<X>) {
-                    return try_make_null_index_plan<Operator, std::remove_cvref_t<X>::field_ptr>(plan);
+            [[nodiscard]] bool tryMakeUnaryIndexPlan(const query::Unary<Operator, X>&, QueryPlan& plan) const {
+                if constexpr ((Operator == query::Op::IS_NULL || Operator == query::Op::IS_NOT_NULL) && query::isColumn<X>) {
+                    return tryMakeNullIndexPlan<Operator, std::remove_cvref_t<X>::fieldPtr>(plan);
                 }
                 else { return false; }
             }
 
             template <auto FieldPtr>
-            [[nodiscard]] const IndexDef* find_index_def_for() const {
-                const std::string_view field_name = binpack::detail::member_name<FieldPtr>();
-                for (const auto& idx : indexes_) { if (idx.field_name == field_name) { return &idx; } }
+            [[nodiscard]] const IndexDef* findIndexDefFor() const {
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                for (const auto& idx : indexes_) { if (idx.fieldName == fieldName) { return &idx; } }
                 return nullptr;
             }
 
             template <typename Field, typename Lit>
-            [[nodiscard]] static bool literal_to_field(const Lit& literal, Field& out) {
+            [[nodiscard]] static bool literalToField(const Lit& literal, Field& out) {
                 if constexpr (std::is_same_v<Field, std::string>) {
                     if constexpr (std::is_convertible_v<Lit, std::string_view>) {
                         out = std::string{std::string_view{literal}};
@@ -1466,8 +1444,8 @@ namespace akkaradb {
                 else if constexpr (std::is_arithmetic_v<Field> && std::is_arithmetic_v<Lit>) {
                     if constexpr (std::is_unsigned_v<Field> && std::is_signed_v<Lit>) { if (literal < 0) { return false; } }
                     const auto value = static_cast<long double>(literal);
-                    if (value < static_cast<long double>(std::numeric_limits<Field>::lowest()) || value > static_cast<long double>(std::numeric_limits<
-                        Field>::max())) { return false; }
+                    if (value < static_cast<long double>(std::numeric_limits<Field>::lowest()) || value > static_cast<long double>(
+                        std::numeric_limits<Field>::max())) { return false; }
                     out = static_cast<Field>(literal);
                     return true;
                 }
@@ -1482,7 +1460,7 @@ namespace akkaradb {
                 else { return false; }
             }
 
-            [[nodiscard]] static bool like_pattern_to_prefix(std::string_view pattern, std::string_view& prefix) {
+            [[nodiscard]] static bool likePatternToPrefix(std::string_view pattern, std::string_view& prefix) {
                 const size_t wildcard = pattern.find_first_of("%_");
                 if (wildcard == std::string_view::npos) {
                     prefix = pattern;
@@ -1493,127 +1471,122 @@ namespace akkaradb {
                 return true;
             }
 
-            [[nodiscard]] static uint32_t read_le32(const uint8_t* src) noexcept {
-                return static_cast<uint32_t>(src[0]) |
-                    (static_cast<uint32_t>(src[1]) << 8) |
-                    (static_cast<uint32_t>(src[2]) << 16) |
-                    (static_cast<uint32_t>(src[3]) << 24);
+            [[nodiscard]] static uint32_t readLe32(const uint8_t* src) noexcept {
+                return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) | (static_cast<uint32_t>(src[2]) << 16) | (
+                    static_cast<uint32_t>(src[3]) << 24);
             }
 
-            [[nodiscard]] static uint32_t read_be32(const uint8_t* src) noexcept {
-                return (static_cast<uint32_t>(src[0]) << 24) |
-                    (static_cast<uint32_t>(src[1]) << 16) |
-                    (static_cast<uint32_t>(src[2]) << 8) |
-                    static_cast<uint32_t>(src[3]);
+            [[nodiscard]] static uint32_t readBe32(const uint8_t* src) noexcept {
+                return (static_cast<uint32_t>(src[0]) << 24) | (static_cast<uint32_t>(src[1]) << 16) | (static_cast<uint32_t>(src[2]) << 8)
+                    | static_cast<uint32_t>(src[3]);
             }
 
             template <typename Field>
-            static void encode_index_field_value(const Field& value, ArenaByteBuffer& out) {
+            static void encodeIndexFieldValue(const Field& value, ArenaByteBuffer& out) {
                 if constexpr (std::is_integral_v<Field> && !std::is_same_v<Field, bool>) {
                     using Unsigned = std::make_unsigned_t<Field>;
                     Unsigned sortable = static_cast<Unsigned>(value);
                     if constexpr (std::is_signed_v<Field>) { sortable ^= (Unsigned{1} << (sizeof(Field) * 8 - 1)); }
-                    write_index_big_endian(sortable, out);
+                    writeIndexBigEndian(sortable, out);
                 }
                 else if constexpr (std::is_same_v<Field, float>) {
                     uint32_t bits;
                     std::memcpy(&bits, &value, sizeof(bits));
                     const uint32_t sign = uint32_t{1} << 31;
                     bits = (bits & sign) != 0 ? ~bits : bits ^ sign;
-                    write_index_big_endian(bits, out);
+                    writeIndexBigEndian(bits, out);
                 }
                 else if constexpr (std::is_same_v<Field, double>) {
                     uint64_t bits;
                     std::memcpy(&bits, &value, sizeof(bits));
                     const uint64_t sign = uint64_t{1} << 63;
                     bits = (bits & sign) != 0 ? ~bits : bits ^ sign;
-                    write_index_big_endian(bits, out);
+                    writeIndexBigEndian(bits, out);
                 }
-                else {
-                    binpack::BinPack::encode_into(value, out);
-                }
+                else { binpack::BinPack::encodeInto(value, out); }
             }
 
             template <typename UInt>
-            static void write_index_big_endian(UInt value, ArenaByteBuffer& out) {
+            static void writeIndexBigEndian(UInt value, ArenaByteBuffer& out) {
                 static_assert(std::is_unsigned_v<UInt>);
                 for (size_t i = sizeof(UInt); i > 0; --i) { out.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8))); }
             }
 
-            [[nodiscard]] bool try_make_string_prefix_index_plan(const std::array<uint8_t, 8>& index_prefix, std::string_view prefix, QueryPlan& plan) const {
+            [[nodiscard]] bool tryMakeStringPrefixIndexPlan(
+                const std::array<uint8_t, 8>& indexPrefix,
+                std::string_view prefix,
+                QueryPlan& plan
+            ) const {
                 // String fields are length-prefixed in BinPack, so a content prefix is not a contiguous byte range.
                 // Use the field index as the source and let the query predicate apply the residual string filter.
                 (void)prefix;
-                return try_make_full_field_index_plan(index_prefix, plan);
+                return tryMakeFullFieldIndexPlan(indexPrefix, plan);
             }
 
-            [[nodiscard]] bool try_make_full_field_index_plan(const std::array<uint8_t, 8>& index_prefix, QueryPlan& plan) const {
-                make_prefix_start_end(index_prefix, scan_start_buffer_, scan_end_buffer_);
-                plan.kind = QuerySourceKind::Index;
+            [[nodiscard]] bool tryMakeFullFieldIndexPlan(const std::array<uint8_t, 8>& indexPrefix, QueryPlan& plan) const {
+                makePrefixStartEnd(indexPrefix, scanStartBuffer_, scanEndBuffer_);
+                plan.kind = QuerySourceKind::INDEX;
                 plan.ranges.clear();
-                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, 0, true, true);
+                addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, 0, true, true);
                 return true;
             }
 
             template <auto FieldPtr>
-            [[nodiscard]] bool try_make_field_index_source_plan(QueryPlan& plan) const {
-                const IndexDef* idx = find_index_def_for<FieldPtr>();
+            [[nodiscard]] bool tryMakeFieldIndexSourcePlan(QueryPlan& plan) const {
+                const IndexDef* idx = findIndexDefFor<FieldPtr>();
                 if (idx == nullptr) { return false; }
-                return try_make_full_field_index_plan(idx->prefix, plan);
+                return tryMakeFullFieldIndexPlan(idx->prefix, plan);
             }
 
             template <typename Field>
-            void add_equality_index_range(const IndexDef& idx, const Field& value, QueryPlan& plan, bool dedupe_index_pks = false) const {
-                field_buffer_.clear();
-                encode_index_field_value(value, field_buffer_);
-                make_index_search_prefix(idx.prefix, field_buffer_, scan_start_buffer_);
-                scan_end_buffer_ = scan_start_buffer_;
-                if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
-                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, scan_start_buffer_.size(), false, dedupe_index_pks);
+            void addEqualityIndexRange(const IndexDef& idx, const Field& value, QueryPlan& plan, bool dedupeIndexPks = false) const {
+                fieldBuffer_.clear();
+                encodeIndexFieldValue(value, fieldBuffer_);
+                makeIndexSearchPrefix(idx.prefix, fieldBuffer_, scanStartBuffer_);
+                scanEndBuffer_ = scanStartBuffer_;
+                if (!detail::incrementLexicographicBytes(scanEndBuffer_.data(), scanEndBuffer_.size())) { scanEndBuffer_.clear(); }
+                addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, scanStartBuffer_.size(), false, dedupeIndexPks);
             }
 
             template <query::Op Operator, typename Field>
-            void add_ordered_index_range(const IndexDef& idx, const Field& value, QueryPlan& plan) const {
-                field_buffer_.clear();
-                encode_index_field_value(value, field_buffer_);
+            void addOrderedIndexRange(const IndexDef& idx, const Field& value, QueryPlan& plan) const {
+                fieldBuffer_.clear();
+                encodeIndexFieldValue(value, fieldBuffer_);
 
-                ArenaByteBuffer boundary{temp_arena_.get()};
-                make_index_search_prefix(idx.prefix, field_buffer_, boundary);
-                const size_t pk_offset = boundary.size();
+                ArenaByteBuffer boundary{tempArena_.get()};
+                makeIndexSearchPrefix(idx.prefix, fieldBuffer_, boundary);
+                const size_t pkOffset = boundary.size();
 
-                make_prefix_start_end(idx.prefix, scan_start_buffer_, scan_end_buffer_);
+                makePrefixStartEnd(idx.prefix, scanStartBuffer_, scanEndBuffer_);
 
-                if constexpr (Operator == query::Op::Gt) {
-                    scan_start_buffer_ = boundary;
-                    if (!detail::increment_lexicographic_bytes(scan_start_buffer_.data(), scan_start_buffer_.size())) { scan_start_buffer_.clear(); }
+                if constexpr (Operator == query::Op::GT) {
+                    scanStartBuffer_ = boundary;
+                    if (!detail::incrementLexicographicBytes(scanStartBuffer_.data(), scanStartBuffer_.size())) {
+                        scanStartBuffer_.clear();
+                    }
                 }
-                else if constexpr (Operator == query::Op::Ge) {
-                    scan_start_buffer_ = boundary;
-                }
-                else if constexpr (Operator == query::Op::Lt) {
-                    scan_end_buffer_ = boundary;
-                }
-                else if constexpr (Operator == query::Op::Le) {
-                    scan_end_buffer_ = boundary;
-                    if (!detail::increment_lexicographic_bytes(scan_end_buffer_.data(), scan_end_buffer_.size())) { scan_end_buffer_.clear(); }
+                else if constexpr (Operator == query::Op::GE) { scanStartBuffer_ = boundary; }
+                else if constexpr (Operator == query::Op::LT) { scanEndBuffer_ = boundary; }
+                else if constexpr (Operator == query::Op::LE) {
+                    scanEndBuffer_ = boundary;
+                    if (!detail::incrementLexicographicBytes(scanEndBuffer_.data(), scanEndBuffer_.size())) { scanEndBuffer_.clear(); }
                 }
 
-                add_query_range(plan, scan_start_buffer_, scan_end_buffer_, pk_offset);
+                addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, pkOffset);
             }
 
             template <typename Field>
-            static constexpr bool ordered_index_range_supported_v =
-                (std::is_arithmetic_v<Field> && !std::is_same_v<Field, bool>);
+            static constexpr bool orderedIndexRangeSupportedV = (std::is_arithmetic_v<Field> && !std::is_same_v<Field, bool>);
 
             template <typename Field, typename Values>
-            [[nodiscard]] bool try_make_in_index_plan(const IndexDef& idx, const Values& values, QueryPlan& plan) const {
+            [[nodiscard]] bool tryMakeInIndexPlan(const IndexDef& idx, const Values& values, QueryPlan& plan) const {
                 if constexpr (requires { std::begin(values); std::end(values); }) {
-                    plan.kind = QuerySourceKind::Index;
+                    plan.kind = QuerySourceKind::INDEX;
                     plan.ranges.clear();
                     for (const auto& literal : values) {
                         Field value{};
-                        if (!literal_to_field<Field>(literal, value)) { continue; }
-                        add_equality_index_range(idx, value, plan, true);
+                        if (!literalToField<Field>(literal, value)) { continue; }
+                        addEqualityIndexRange(idx, value, plan, true);
                     }
                     return true;
                 }
@@ -1621,188 +1594,187 @@ namespace akkaradb {
             }
 
             template <query::Op Operator, auto FieldPtr>
-            [[nodiscard]] bool try_make_null_index_plan(QueryPlan& plan) const {
-                using Field = binpack::detail::member_of<FieldPtr>;
-                if constexpr (!query::is_optional_v<Field>) { return false; }
+            [[nodiscard]] bool tryMakeNullIndexPlan(QueryPlan& plan) const {
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                if constexpr (!query::isOptional<Field>) { return false; }
                 else {
-                    const IndexDef* idx = find_index_def_for<FieldPtr>();
+                    const IndexDef* idx = findIndexDefFor<FieldPtr>();
                     if (idx == nullptr) { return false; }
 
-                    if constexpr (Operator == query::Op::IsNull) {
-                        plan.kind = QuerySourceKind::Index;
+                    if constexpr (Operator == query::Op::IS_NULL) {
+                        plan.kind = QuerySourceKind::INDEX;
                         plan.ranges.clear();
-                        add_equality_index_range(*idx, Field{}, plan);
+                        addEqualityIndexRange(*idx, Field{}, plan);
                         return true;
                     }
-                    else {
-                        return try_make_full_field_index_plan(idx->prefix, plan);
-                    }
+                    else { return tryMakeFullFieldIndexPlan(idx->prefix, plan); }
                 }
             }
 
             template <query::Op Operator, auto FieldPtr, typename Lit>
-            [[nodiscard]] bool try_make_field_index_plan(const Lit& literal, QueryPlan& plan) const {
-                using Field = binpack::detail::member_of<FieldPtr>;
-                const IndexDef* idx = find_index_def_for<FieldPtr>();
+            [[nodiscard]] bool tryMakeFieldIndexPlan(const Lit& literal, QueryPlan& plan) const {
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                const IndexDef* idx = findIndexDefFor<FieldPtr>();
                 if (idx == nullptr) { return false; }
 
-                if constexpr (Operator == query::Op::Eq) {
+                if constexpr (Operator == query::Op::EQ) {
                     Field value{};
-                    if (!literal_to_field<Field>(literal, value)) { return false; }
-                    plan.kind = QuerySourceKind::Index;
+                    if (!literalToField<Field>(literal, value)) { return false; }
+                    plan.kind = QuerySourceKind::INDEX;
                     plan.ranges.clear();
-                    add_equality_index_range(*idx, value, plan);
+                    addEqualityIndexRange(*idx, value, plan);
                     return true;
                 }
-                else if constexpr (Operator == query::Op::Ne) {
+                else if constexpr (Operator == query::Op::NE) {
                     Field value{};
-                    if (!literal_to_field<Field>(literal, value)) { return false; }
-                    return try_make_full_field_index_plan(idx->prefix, plan);
+                    if (!literalToField<Field>(literal, value)) { return false; }
+                    return tryMakeFullFieldIndexPlan(idx->prefix, plan);
                 }
-                else if constexpr (Operator == query::Op::In) {
-                    return try_make_in_index_plan<Field>(*idx, literal, plan);
-                }
-                else if constexpr (Operator == query::Op::NotIn) {
+                else if constexpr (Operator == query::Op::IN_LIST) { return tryMakeInIndexPlan<Field>(*idx, literal, plan); }
+                else if constexpr (Operator == query::Op::NOT_IN) {
                     if constexpr (requires { std::begin(literal); std::end(literal); }) {
-                        return try_make_full_field_index_plan(idx->prefix, plan);
+                        return tryMakeFullFieldIndexPlan(idx->prefix, plan);
                     }
                     else { return false; }
                 }
-                else if constexpr (Operator == query::Op::StartsWith) {
-                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
-                        return try_make_string_prefix_index_plan(idx->prefix, std::string_view{literal}, plan);
+                else if constexpr (Operator == query::Op::STARTS_WITH) {
+                    if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
+                        return tryMakeStringPrefixIndexPlan(idx->prefix, std::string_view{literal}, plan);
                     }
                     else { return false; }
                 }
-                else if constexpr (Operator == query::Op::Like) {
-                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
+                else if constexpr (Operator == query::Op::LIKE) {
+                    if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
                         const std::string_view pattern{literal};
                         if (pattern.find_first_of("%_") == std::string_view::npos) {
                             Field value{};
-                            if (!literal_to_field<Field>(pattern, value)) { return false; }
-                            plan.kind = QuerySourceKind::Index;
+                            if (!literalToField<Field>(pattern, value)) { return false; }
+                            plan.kind = QuerySourceKind::INDEX;
                             plan.ranges.clear();
-                            add_equality_index_range(*idx, value, plan);
+                            addEqualityIndexRange(*idx, value, plan);
                             return true;
                         }
                         std::string_view prefix;
-                        if (!like_pattern_to_prefix(pattern, prefix)) { prefix = {}; }
-                        return try_make_string_prefix_index_plan(idx->prefix, prefix, plan);
+                        if (!likePatternToPrefix(pattern, prefix)) { prefix = {}; }
+                        return tryMakeStringPrefixIndexPlan(idx->prefix, prefix, plan);
                     }
                     else { return false; }
                 }
-                else if constexpr (Operator == query::Op::Contains) {
-                    if constexpr (query::is_string_like_v<Field> && query::is_string_like_v<Lit>) {
-                        return try_make_full_field_index_plan(idx->prefix, plan);
+                else if constexpr (Operator == query::Op::CONTAINS) {
+                    if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
+                        return tryMakeFullFieldIndexPlan(idx->prefix, plan);
                     }
                     else { return false; }
                 }
-                else if constexpr (Operator == query::Op::Gt || Operator == query::Op::Ge || Operator == query::Op::Lt || Operator == query::Op::Le) {
-                    if constexpr (ordered_index_range_supported_v<Field>) {
+                else if constexpr (Operator == query::Op::GT || Operator == query::Op::GE || Operator == query::Op::LT || Operator ==
+                    query::Op::LE) {
+                    if constexpr (orderedIndexRangeSupportedV<Field>) {
                         Field value{};
-                        if (!literal_to_field<Field>(literal, value)) { return false; }
-                        plan.kind = QuerySourceKind::Index;
+                        if (!literalToField<Field>(literal, value)) { return false; }
+                        plan.kind = QuerySourceKind::INDEX;
                         plan.ranges.clear();
-                        add_ordered_index_range<Operator>(*idx, value, plan);
+                        addOrderedIndexRange<Operator>(*idx, value, plan);
                         return true;
                     }
-                    else {
-                        return try_make_full_field_index_plan(idx->prefix, plan);
-                    }
+                    else { return false; }
                 }
                 else { return false; }
             }
 
-            void make_pk_key(const PK& pk, ArenaByteBuffer& out) const {
+            void makePkKey(const PK& pk, ArenaByteBuffer& out) const {
                 out.clear();
                 if constexpr (std::is_integral_v<PK> && sizeof(PK) <= 8) {
                     out.resize(8 + sizeof(PK));
-                    std::memcpy(out.data(), pk_prefix_.data(), pk_prefix_.size());
+                    std::memcpy(out.data(), pkPrefix_.data(), pkPrefix_.size());
                     uint64_t v = static_cast<uint64_t>(std::make_unsigned_t<PK>(pk));
                     for (size_t i = 0; i < sizeof(PK); ++i) { out[8 + i] = static_cast<uint8_t>(v >> (i * 8)); }
                 }
                 else {
-                    out.reserve(8 + binpack::BinPack::estimate_size(pk));
-                    out.insert(out.end(), pk_prefix_.begin(), pk_prefix_.end());
-                    binpack::BinPack::encode_into(pk, out);
+                    out.reserve(8 + binpack::BinPack::estimateSize(pk));
+                    out.insert(out.end(), pkPrefix_.begin(), pkPrefix_.end());
+                    binpack::BinPack::encodeInto(pk, out);
                 }
             }
 
-            [[nodiscard]] bool get_by_pk_bytes(std::span<const uint8_t> pk_bytes, Entry& out) const {
-                pk_key_buffer_.clear();
-                pk_key_buffer_.reserve(8 + pk_bytes.size());
-                pk_key_buffer_.insert(pk_key_buffer_.end(), pk_prefix_.begin(), pk_prefix_.end());
-                pk_key_buffer_.insert(pk_key_buffer_.end(), pk_bytes.begin(), pk_bytes.end());
+            [[nodiscard]] bool getByPkBytes(std::span<const uint8_t> pkBytes, Entry& out) const {
+                pkKeyBuffer_.clear();
+                pkKeyBuffer_.reserve(8 + pkBytes.size());
+                pkKeyBuffer_.insert(pkKeyBuffer_.end(), pkPrefix_.begin(), pkPrefix_.end());
+                pkKeyBuffer_.insert(pkKeyBuffer_.end(), pkBytes.begin(), pkBytes.end());
 
-                std::span<const uint8_t> value_span;
-                if (!engine_->get_into_arena(pk_key_buffer_, *temp_arena_, value_span)) { return false; }
-                std::span pk_span{pk_bytes.data(), pk_bytes.size()};
-                out = Entry{binpack::BinPack::decode<PK>(pk_span), binpack::BinPack::decode<Entity>(value_span)};
+                std::span<const uint8_t> valueSpan;
+                if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, valueSpan)) { return false; }
+                std::span pkSpan{pkBytes.data(), pkBytes.size()};
+                out = Entry{binpack::BinPack::decode<PK>(pkSpan), binpack::BinPack::decode<Entity>(valueSpan)};
                 return true;
             }
 
-            void put_hinted(std::span<const uint8_t> key, std::span<const uint8_t> value) {
-                engine_->put_hinted(key, value, compute_key_fp64(key), build_mini_key(key));
+            void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value) {
+                engine_->putHinted(key, value, computeKeyFp64(key), buildMiniKey(key));
             }
 
-            void remove_hinted(std::span<const uint8_t> key) { engine_->remove_hinted(key, compute_key_fp64(key), build_mini_key(key)); }
+            void removeHinted(std::span<const uint8_t> key) { engine_->removeHinted(key, computeKeyFp64(key), buildMiniKey(key)); }
 
-            static void make_prefix_start_end(const std::array<uint8_t, 8>& prefix, ArenaByteBuffer& start, ArenaByteBuffer& end) {
+            static void makePrefixStartEnd(const std::array<uint8_t, 8>& prefix, ArenaByteBuffer& start, ArenaByteBuffer& end) {
                 start.assign(prefix.begin(), prefix.end());
                 end.assign(prefix.begin(), prefix.end());
-                if (!detail::increment_lexicographic_bytes(end.data(), end.size())) { end.clear(); }
+                if (!detail::incrementLexicographicBytes(end.data(), end.size())) { end.clear(); }
             }
 
-            static std::array<uint8_t, 8> make_table_prefix(std::string_view name) {
+            static std::array<uint8_t, 8> makeTablePrefix(std::string_view name) {
                 std::array<uint8_t, 8> out{};
-                detail::write_le64(detail::fnv1a_64(name), out.data());
+                detail::writeLe64(detail::fnv1a64(name), out.data());
                 return out;
             }
 
-            static std::array<uint8_t, 8> make_index_prefix(std::string_view table_name, std::string_view field_name) {
+            static std::array<uint8_t, 8> makeIndexPrefix(std::string_view tableName, std::string_view fieldName) {
                 std::string input;
-                input.reserve(table_name.size() + 5 + field_name.size());
-                input.append(table_name);
+                input.reserve(tableName.size() + 5 + fieldName.size());
+                input.append(tableName);
                 input.append(":idx:");
-                input.append(field_name);
+                input.append(fieldName);
                 std::array<uint8_t, 8> out{};
-                detail::write_le64(detail::fnv1a_64(input), out.data());
+                detail::writeLe64(detail::fnv1a64(input), out.data());
                 return out;
             }
 
-            void make_index_search_prefix(const std::array<uint8_t, 8>& prefix, std::span<const uint8_t> field_bytes, ArenaByteBuffer& out) const {
-                out.clear();
-                out.resize(12 + field_bytes.size());
-                std::memcpy(out.data(), prefix.data(), prefix.size());
-                detail::write_le32(static_cast<uint32_t>(field_bytes.size()), out.data() + 8);
-                if (!field_bytes.empty()) { std::memcpy(out.data() + 12, field_bytes.data(), field_bytes.size()); }
-            }
-
-            void make_index_key(
+            void makeIndexSearchPrefix(
                 const std::array<uint8_t, 8>& prefix,
-                std::span<const uint8_t> field_bytes,
-                std::span<const uint8_t> pk_key,
+                std::span<const uint8_t> fieldBytes,
                 ArenaByteBuffer& out
             ) const {
-                if (pk_key.size() < pk_prefix_.size()) { throw std::invalid_argument("PackedTable: malformed primary key"); }
-                make_index_search_prefix(prefix, field_bytes, out);
-                out.insert(out.end(), pk_key.begin() + static_cast<std::ptrdiff_t>(pk_prefix_.size()), pk_key.end());
+                out.clear();
+                out.resize(12 + fieldBytes.size());
+                std::memcpy(out.data(), prefix.data(), prefix.size());
+                detail::writeLe32(static_cast<uint32_t>(fieldBytes.size()), out.data() + 8);
+                if (!fieldBytes.empty()) { std::memcpy(out.data() + 12, fieldBytes.data(), fieldBytes.size()); }
             }
 
-            void write_index_entries(const Entity& entity, std::span<const uint8_t> pk_key) {
-                constexpr std::span<const uint8_t> empty_value{};
+            void makeIndexKey(
+                const std::array<uint8_t, 8>& prefix,
+                std::span<const uint8_t> fieldBytes,
+                std::span<const uint8_t> pkKey,
+                ArenaByteBuffer& out
+            ) const {
+                if (pkKey.size() < pkPrefix_.size()) { throw std::invalid_argument("PackedTable: malformed primary key"); }
+                makeIndexSearchPrefix(prefix, fieldBytes, out);
+                out.insert(out.end(), pkKey.begin() + static_cast<std::ptrdiff_t>(pkPrefix_.size()), pkKey.end());
+            }
+
+            void writeIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
+                constexpr std::span<const uint8_t> emptyValue{};
                 for (const auto& idx : indexes_) {
-                    idx.encode_field(entity, field_buffer_);
-                    make_index_key(idx.prefix, field_buffer_, pk_key, index_key_buffer_);
-                    put_hinted(index_key_buffer_, empty_value);
+                    idx.encodeField(entity, fieldBuffer_);
+                    makeIndexKey(idx.prefix, fieldBuffer_, pkKey, indexKeyBuffer_);
+                    putHinted(indexKeyBuffer_, emptyValue);
                 }
             }
 
-            void remove_index_entries(const Entity& entity, std::span<const uint8_t> pk_key) {
+            void removeIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
                 for (const auto& idx : indexes_) {
-                    idx.encode_field(entity, field_buffer_);
-                    make_index_key(idx.prefix, field_buffer_, pk_key, index_key_buffer_);
-                    remove_hinted(index_key_buffer_);
+                    idx.encodeField(entity, fieldBuffer_);
+                    makeIndexKey(idx.prefix, fieldBuffer_, pkKey, indexKeyBuffer_);
+                    removeHinted(indexKeyBuffer_);
                 }
             }
     };

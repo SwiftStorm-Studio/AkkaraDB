@@ -107,7 +107,7 @@ namespace akkaradb::engine::manifest {
                     #endif
                 }
 
-                void fsync_data() {
+                void fsyncData() {
                     #ifdef _WIN32
                     if (!::FlushFileBuffers(handle_)) { throw std::runtime_error("Manifest fsync failed"); }
                     #elif defined(__APPLE__)
@@ -117,7 +117,7 @@ namespace akkaradb::engine::manifest {
                     #endif
                 }
 
-                void fsync_full() {
+                void fsyncFull() {
                     #ifdef _WIN32
                     if (!::FlushFileBuffers(handle_)) { throw std::runtime_error("Manifest fsync failed"); }
                     #elif defined(__APPLE__)
@@ -138,14 +138,14 @@ namespace akkaradb::engine::manifest {
                     }
                 }
 
-                [[nodiscard]] bool is_open() const noexcept { return handle_ != INVALID; }
+                [[nodiscard]] bool isOpen() const noexcept { return handle_ != INVALID; }
 
             private:
                 NativeHandle handle_;
         };
 
         // Returns current time as microseconds since epoch.
-        uint64_t now_us() noexcept {
+        uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count());
@@ -158,26 +158,26 @@ namespace akkaradb::engine::manifest {
 
     class Manifest::Impl {
         public:
-            Impl(std::filesystem::path path, bool fast_mode)
+            Impl(std::filesystem::path path, bool fastMode)
                 : path_{std::move(path)},
-                  fast_mode_{fast_mode},
+                  fastMode_{fastMode},
                   running_{false},
-                  stripes_written_{0},
-                  current_file_size_{0},
-                  rotation_counter_{0} {
+                  stripesWritten_{0},
+                  currentFileSize_{0},
+                  rotationCounter_{0} {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
-                replay_internal();
+                replayInternal();
 
-                rotation_counter_ = find_last_rotation_number() + 1;
+                rotationCounter_ = findLastRotationNumber() + 1;
 
-                current_path_ = make_manifest_path(rotation_counter_);
-                file_handle_ = FileHandle::open(current_path_);
+                currentPath_ = makeManifestPath(rotationCounter_);
+                fileHandle_ = FileHandle::open(currentPath_);
 
-                current_file_size_ = std::filesystem::file_size(current_path_);
-                const bool is_new_file = (current_file_size_ == 0);
+                currentFileSize_ = std::filesystem::file_size(currentPath_);
+                const bool isNewFile = (currentFileSize_ == 0);
 
-                if (is_new_file) { write_file_header(rotation_counter_); }
+                if (isNewFile) { writeFileHeader(rotationCounter_); }
             }
 
             ~Impl() { close(); }
@@ -187,152 +187,152 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             void start() {
-                if (!fast_mode_ || running_) { return; }
+                if (!fastMode_ || running_) { return; }
                 running_ = true;
-                last_strong_sync_ = std::chrono::steady_clock::now();
-                flusher_thread_ = std::thread([this] { run_flusher(); });
+                lastStrongSync_ = std::chrono::steady_clock::now();
+                flusherThread_ = std::thread([this] { runFlusher(); });
             }
 
             void close() {
-                if (fast_mode_ && running_) {
+                if (fastMode_ && running_) {
                     running_ = false;
-                    queue_cv_.notify_one();
-                    if (flusher_thread_.joinable()) { flusher_thread_.join(); }
-                    if (term_write_error_) { std::rethrow_exception(term_write_error_); }
+                    queueCv_.notify_one();
+                    if (flusherThread_.joinable()) { flusherThread_.join(); }
+                    if (termWriteError_) { std::rethrow_exception(termWriteError_); }
                 }
-                file_handle_.close();
+                fileHandle_.close();
             }
 
             // ----------------------------------------------------------------
             // Write API
             // ----------------------------------------------------------------
 
-            void advance(uint64_t new_count) {
+            void advance(uint64_t newCount) {
                 {
-                    std::lock_guard lock{advance_mutex_};
-                    if (new_count < stripes_written_.load(std::memory_order_relaxed)) {
+                    std::lock_guard lock{advanceMutex_};
+                    if (newCount < stripesWritten_.load(std::memory_order_relaxed)) {
                         throw std::invalid_argument("Manifest: stripe counter must be monotonic");
                     }
-                    stripes_written_.store(new_count, std::memory_order_relaxed);
+                    stripesWritten_.store(newCount, std::memory_order_relaxed);
                 }
-                append(ManifestRecordType::StripeCommit, encode_stripe_commit(now_us(), new_count));
+                append(ManifestRecordType::STRIPE_COMMIT, encodeStripeCommit(nowUs(), newCount));
             }
 
-            void sst_seal(
+            void sstSeal(
                 int level,
                 const std::string& file,
                 uint64_t entries,
-                const std::optional<std::string>& first_key_hex,
-                const std::optional<std::string>& last_key_hex
+                const std::optional<std::string>& firstKeyHex,
+                const std::optional<std::string>& lastKeyHex
             ) {
-                const uint64_t ts = now_us();
-                append(ManifestRecordType::SSTSeal, encode_sst_seal(ts, level, file, entries, first_key_hex, last_key_hex));
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::SST_SEAL, encodeSstSeal(ts, level, file, entries, firstKeyHex, lastKeyHex));
 
                 std::lock_guard lock{mutex_};
-                sst_seals_.push_back(SSTSealEvent{level, file, entries, first_key_hex, last_key_hex, ts});
-                live_sst_.insert(file);
-                deleted_sst_.erase(file);
+                sstSeals_.push_back(SSTSealEvent{level, file, entries, firstKeyHex, lastKeyHex, ts});
+                liveSst_.insert(file);
+                deletedSst_.erase(file);
             }
 
             void checkpoint(
                 const std::optional<std::string>& name,
                 const std::optional<uint64_t>& stripe,
-                const std::optional<uint64_t>& last_seq
+                const std::optional<uint64_t>& lastSeq
             ) {
-                const uint64_t ts = now_us();
-                append(ManifestRecordType::Checkpoint, encode_checkpoint(ts, name, stripe, last_seq));
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::CHECKPOINT, encodeCheckpoint(ts, name, stripe, lastSeq));
 
                 std::lock_guard lock{mutex_};
-                last_checkpoint_ = CheckpointEvent{name, stripe, last_seq, ts};
+                lastCheckpoint_ = CheckpointEvent{name, stripe, lastSeq, ts};
 
-                deleted_sst_.clear();
+                deletedSst_.clear();
 
-                std::erase_if(sst_seals_, [this](const SSTSealEvent& e) { return live_sst_.find(e.file) == live_sst_.end(); });
+                std::erase_if(sstSeals_, [this](const SSTSealEvent& e) { return liveSst_.find(e.file) == liveSst_.end(); });
             }
 
-            void compaction_start(int level, const std::vector<std::string>& inputs) {
-                append(ManifestRecordType::CompactionStart, encode_compaction_start(now_us(), level, inputs));
+            void compactionStart(int level, const std::vector<std::string>& inputs) {
+                append(ManifestRecordType::COMPACTION_START, encodeCompactionStart(nowUs(), level, inputs));
             }
 
-            void compaction_end(
+            void compactionEnd(
                 int level,
                 const std::string& output,
                 const std::vector<std::string>& inputs,
                 uint64_t entries,
-                const std::optional<std::string>& first_key_hex,
-                const std::optional<std::string>& last_key_hex
+                const std::optional<std::string>& firstKeyHex,
+                const std::optional<std::string>& lastKeyHex
             ) {
                 append(
-                    ManifestRecordType::CompactionEnd,
-                    encode_compaction_end(now_us(), level, output, inputs, entries, first_key_hex, last_key_hex)
+                    ManifestRecordType::COMPACTION_END,
+                    encodeCompactionEnd(nowUs(), level, output, inputs, entries, firstKeyHex, lastKeyHex)
                 );
 
                 std::lock_guard lock{mutex_};
-                live_sst_.insert(output);
+                liveSst_.insert(output);
                 for (const auto& inp : inputs) {
-                    live_sst_.erase(inp);
-                    deleted_sst_.insert(inp);
+                    liveSst_.erase(inp);
+                    deletedSst_.insert(inp);
                 }
             }
 
-            void sst_delete(const std::string& file) {
-                append(ManifestRecordType::SSTDelete, encode_sst_delete(now_us(), file));
+            void sstDelete(const std::string& file) {
+                append(ManifestRecordType::SST_DELETE, encodeSstDelete(nowUs(), file));
 
                 std::lock_guard lock{mutex_};
-                live_sst_.erase(file);
-                deleted_sst_.insert(file);
+                liveSst_.erase(file);
+                deletedSst_.insert(file);
             }
 
-            void compaction_commit(const std::vector<std::string>& output_files, const std::vector<std::string>& input_files) {
+            void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles) {
                 // Single append call ↁEsingle CRC-protected record.
                 // Either fully applied on replay or entirely absent (CRC mismatch).
-                append(ManifestRecordType::CompactionCommit, encode_compaction_commit(now_us(), output_files, input_files));
+                append(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), outputFiles, inputFiles));
 
                 std::lock_guard lock{mutex_};
-                for (const auto& f : output_files) {
-                    live_sst_.insert(f);
-                    deleted_sst_.erase(f);
+                for (const auto& f : outputFiles) {
+                    liveSst_.insert(f);
+                    deletedSst_.erase(f);
                 }
-                for (const auto& f : input_files) {
-                    live_sst_.erase(f);
-                    deleted_sst_.insert(f);
+                for (const auto& f : inputFiles) {
+                    liveSst_.erase(f);
+                    deletedSst_.insert(f);
                 }
             }
 
             void truncate(const std::optional<std::string>& reason) {
-                append(ManifestRecordType::Truncate, encode_truncate(now_us(), reason));
+                append(ManifestRecordType::TRUNCATE, encodeTruncate(nowUs(), reason));
             }
 
             // ----------------------------------------------------------------
             // Replay
             // ----------------------------------------------------------------
 
-            void replay() { replay_internal(); }
+            void replay() { replayInternal(); }
 
             // ----------------------------------------------------------------
             // Queries
             // ----------------------------------------------------------------
 
-            uint64_t stripes_written() const noexcept { return stripes_written_; }
+            uint64_t stripesWritten() const noexcept { return stripesWritten_; }
 
-            std::optional<CheckpointEvent> last_checkpoint() const noexcept {
+            std::optional<CheckpointEvent> lastCheckpoint() const noexcept {
                 std::lock_guard lock{mutex_};
-                return last_checkpoint_;
+                return lastCheckpoint_;
             }
 
-            std::vector<std::string> live_sst() const {
+            std::vector<std::string> liveSst() const {
                 std::lock_guard lock{mutex_};
-                return {live_sst_.begin(), live_sst_.end()};
+                return {liveSst_.begin(), liveSst_.end()};
             }
 
-            std::vector<std::string> deleted_sst() const {
+            std::vector<std::string> deletedSst() const {
                 std::lock_guard lock{mutex_};
-                return {deleted_sst_.begin(), deleted_sst_.end()};
+                return {deletedSst_.begin(), deletedSst_.end()};
             }
 
-            std::vector<SSTSealEvent> sst_seals() const {
+            std::vector<SSTSealEvent> sstSeals() const {
                 std::lock_guard lock{mutex_};
-                return sst_seals_;
+                return sstSeals_;
             }
 
         private:
@@ -342,49 +342,49 @@ namespace akkaradb::engine::manifest {
             // Path helpers
             // ----------------------------------------------------------------
 
-            [[nodiscard]] std::filesystem::path make_manifest_path(size_t rotation_number) const {
-                if (rotation_number == 0) { return path_; }
-                return path_.parent_path() / (path_.filename().string() + "." + std::to_string(rotation_number));
+            [[nodiscard]] std::filesystem::path makeManifestPath(size_t rotationNumber) const {
+                if (rotationNumber == 0) { return path_; }
+                return path_.parent_path() / (path_.filename().string() + "." + std::to_string(rotationNumber));
             }
 
-            [[nodiscard]] size_t find_last_rotation_number() const {
-                size_t max_rotation = 0;
-                if (std::filesystem::exists(path_)) { max_rotation = 0; }
+            [[nodiscard]] size_t findLastRotationNumber() const {
+                size_t maxRotation = 0;
+                if (std::filesystem::exists(path_)) { maxRotation = 0; }
                 for (size_t i = 1; i < 10000; ++i) {
-                    if (std::filesystem::exists(make_manifest_path(i))) { max_rotation = i; }
+                    if (std::filesystem::exists(makeManifestPath(i))) { maxRotation = i; }
                     else { break; }
                 }
-                return max_rotation;
+                return maxRotation;
             }
 
             // ----------------------------------------------------------------
             // File header
             // ----------------------------------------------------------------
 
-            void write_file_header(size_t rotation_counter) {
-                const ManifestFileHeader fhdr = ManifestFileHeader::build(static_cast<uint32_t>(rotation_counter));
+            void writeFileHeader(size_t rotationCounter) {
+                const ManifestFileHeader fhdr = ManifestFileHeader::build(static_cast<uint32_t>(rotationCounter));
 
                 uint8_t buf[ManifestFileHeader::SIZE];
                 fhdr.serialize(buf);
-                file_handle_.write(buf, ManifestFileHeader::SIZE);
-                file_handle_.fsync_data();
-                current_file_size_ += ManifestFileHeader::SIZE;
+                fileHandle_.write(buf, ManifestFileHeader::SIZE);
+                fileHandle_.fsyncData();
+                currentFileSize_ += ManifestFileHeader::SIZE;
             }
 
             // ----------------------------------------------------------------
             // Rotation
             // ----------------------------------------------------------------
 
-            void check_rotation() {
-                if (current_file_size_ < ROTATION_THRESHOLD) { return; }
+            void checkRotation() {
+                if (currentFileSize_ < ROTATION_THRESHOLD) { return; }
 
-                file_handle_.close();
-                ++rotation_counter_;
-                current_path_ = make_manifest_path(rotation_counter_);
-                file_handle_ = FileHandle::open(current_path_);
-                current_file_size_ = 0;
+                fileHandle_.close();
+                ++rotationCounter_;
+                currentPath_ = makeManifestPath(rotationCounter_);
+                fileHandle_ = FileHandle::open(currentPath_);
+                currentFileSize_ = 0;
 
-                write_file_header(rotation_counter_);
+                writeFileHeader(rotationCounter_);
             }
 
             // ----------------------------------------------------------------
@@ -398,29 +398,29 @@ namespace akkaradb::engine::manifest {
                 std::memmove(payload.data() + ManifestRecordHeader::SIZE, payload.data(), plen);
                 rhdr.serialize(payload.data());
 
-                if (fast_mode_) {
-                    bool was_empty;
+                if (fastMode_) {
+                    bool wasEmpty;
                     {
-                        std::lock_guard lock{queue_mutex_};
-                        was_empty = queue_.empty();
+                        std::lock_guard lock{queueMutex_};
+                        wasEmpty = queue_.empty();
                         queue_.push_back(std::move(payload));
                     }
-                    if (was_empty) queue_cv_.notify_one();
+                    if (wasEmpty) queueCv_.notify_one();
                 }
                 else {
-                    std::lock_guard lock{rotation_mutex_};
-                    check_rotation();
-                    file_handle_.write(payload.data(), payload.size());
-                    file_handle_.fsync_data();
-                    current_file_size_ += payload.size();
+                    std::lock_guard lock{rotationMutex_};
+                    checkRotation();
+                    fileHandle_.write(payload.data(), payload.size());
+                    fileHandle_.fsyncData();
+                    currentFileSize_ += payload.size();
                 }
             }
 
             // ----------------------------------------------------------------
-            // Background flusher (fast_mode only)
+            // Background flusher (fastMode only)
             // ----------------------------------------------------------------
 
-            void run_flusher() {
+            void runFlusher() {
                 constexpr auto MAX_WAIT = std::chrono::microseconds(500);
 
                 std::vector<std::vector<uint8_t>> batch;
@@ -429,193 +429,193 @@ namespace akkaradb::engine::manifest {
                 try {
                     while (true) {
                         {
-                            std::unique_lock lock{queue_mutex_};
-                            queue_cv_.wait_for(lock, MAX_WAIT, [this] { return !queue_.empty() || !running_; });
+                            std::unique_lock lock{queueMutex_};
+                            queueCv_.wait_for(lock, MAX_WAIT, [this] { return !queue_.empty() || !running_; });
 
                             if (!running_ && queue_.empty()) { break; }
                             std::swap(batch, queue_);
                         }
 
                         if (!batch.empty()) {
-                            std::lock_guard rotation_lock{rotation_mutex_};
+                            std::lock_guard rotationLock{rotationMutex_};
                             for (const auto& record : batch) {
-                                check_rotation();
-                                file_handle_.write(record.data(), record.size());
-                                current_file_size_ += record.size();
+                                checkRotation();
+                                fileHandle_.write(record.data(), record.size());
+                                currentFileSize_ += record.size();
                             }
-                            file_handle_.fsync_data();
+                            fileHandle_.fsyncData();
                             batch.clear();
                         }
 
                         auto now = std::chrono::steady_clock::now();
-                        if (now - last_strong_sync_ > std::chrono::seconds(5)) {
-                            std::lock_guard rotation_lock{rotation_mutex_};
-                            file_handle_.fsync_full();
-                            last_strong_sync_ = now;
+                        if (now - lastStrongSync_ > std::chrono::seconds(5)) {
+                            std::lock_guard rotationLock{rotationMutex_};
+                            fileHandle_.fsyncFull();
+                            lastStrongSync_ = now;
                         }
                     }
                 }
-                catch (...) { term_write_error_ = std::current_exception(); }
+                catch (...) { termWriteError_ = std::current_exception(); }
             }
 
             // ----------------------------------------------------------------
             // Replay
             // ----------------------------------------------------------------
 
-            void replay_internal() {
+            void replayInternal() {
                 {
                     std::lock_guard lock{mutex_};
-                    sst_seals_.clear();
-                    live_sst_.clear();
-                    deleted_sst_.clear();
-                    last_checkpoint_.reset();
+                    sstSeals_.clear();
+                    liveSst_.clear();
+                    deletedSst_.clear();
+                    lastCheckpoint_.reset();
                 }
-                stripes_written_.store(0, std::memory_order_relaxed);
+                stripesWritten_.store(0, std::memory_order_relaxed);
 
                 std::vector<std::filesystem::path> files;
 
                 if (std::filesystem::exists(path_)) { files.push_back(path_); }
                 for (size_t i = 1; i < 10000; ++i) {
-                    auto p = make_manifest_path(i);
+                    auto p = makeManifestPath(i);
                     if (std::filesystem::exists(p)) { files.push_back(p); }
                     else { break; }
                 }
 
-                for (const auto& f : files) { replay_single_file(f); }
+                for (const auto& f : files) { replaySingleFile(f); }
             }
 
-            void replay_single_file(const std::filesystem::path& file_path) {
-                if (!std::filesystem::exists(file_path)) { return; }
-                const auto file_size = std::filesystem::file_size(file_path);
+            void replaySingleFile(const std::filesystem::path& filePath) {
+                if (!std::filesystem::exists(filePath)) { return; }
+                const auto file_size = std::filesystem::file_size(filePath);
                 if (file_size == 0) { return; }
 
-                std::ifstream file(file_path, std::ios::binary);
-                if (!file) { throw std::runtime_error("Failed to open manifest for replay: " + file_path.string()); }
+                std::ifstream file(filePath, std::ios::binary);
+                if (!file) { throw std::runtime_error("Failed to open manifest for replay: " + filePath.string()); }
 
                 // --- Read and validate file header ---
                 {
-                    uint8_t hdr_buf[ManifestFileHeader::SIZE];
-                    file.read(reinterpret_cast<char*>(hdr_buf), ManifestFileHeader::SIZE);
+                    uint8_t hdrBuf[ManifestFileHeader::SIZE];
+                    file.read(reinterpret_cast<char*>(hdrBuf), ManifestFileHeader::SIZE);
                     if (!file || file.gcount() < static_cast<std::streamsize>(ManifestFileHeader::SIZE)) {
                         return; // Too short to have a valid header
                     }
 
                     ManifestFileHeader fhdr{};
                     // Deserialize manually (same field order as serialize)
-                    auto read_u32 = [&](size_t off) -> uint32_t {
-                        return static_cast<uint32_t>(hdr_buf[off]) | (static_cast<uint32_t>(hdr_buf[off + 1]) << 8) | (static_cast<uint32_t>
-                            (hdr_buf[off + 2]) << 16) | (static_cast<uint32_t>(hdr_buf[off + 3]) << 24);
+                    auto readU32 = [&](size_t off) -> uint32_t {
+                        return static_cast<uint32_t>(hdrBuf[off]) | (static_cast<uint32_t>(hdrBuf[off + 1]) << 8) | (static_cast<uint32_t>(
+                            hdrBuf[off + 2]) << 16) | (static_cast<uint32_t>(hdrBuf[off + 3]) << 24);
                     };
-                    auto read_u16 = [&](size_t off) -> uint16_t {
-                        return static_cast<uint16_t>(hdr_buf[off]) | (static_cast<uint16_t>(hdr_buf[off + 1]) << 8);
+                    auto readU16 = [&](size_t off) -> uint16_t {
+                        return static_cast<uint16_t>(hdrBuf[off]) | (static_cast<uint16_t>(hdrBuf[off + 1]) << 8);
                     };
-                    auto read_u64 = [&](size_t off) -> uint64_t {
+                    auto readU64 = [&](size_t off) -> uint64_t {
                         uint64_t v = 0;
-                        for (int i = 7; i >= 0; --i) { v = (v << 8) | hdr_buf[off + i]; }
+                        for (int i = 7; i >= 0; --i) { v = (v << 8) | hdrBuf[off + i]; }
                         return v;
                     };
 
-                    fhdr.magic = read_u32(0);
-                    fhdr.version = read_u16(4);
-                    fhdr.flags = read_u16(6);
-                    fhdr.file_seq = read_u32(8);
-                    fhdr.created_at_us = read_u64(12);
-                    fhdr.crc32c = read_u32(20);
-                    std::memcpy(fhdr.reserved, hdr_buf + 24, 8);
+                    fhdr.magic = readU32(0);
+                    fhdr.version = readU16(4);
+                    fhdr.flags = readU16(6);
+                    fhdr.fileSeq = readU32(8);
+                    fhdr.createdAtUs = readU64(12);
+                    fhdr.crc32c = readU32(20);
+                    std::memcpy(fhdr.reserved, hdrBuf + 24, 8);
 
-                    if (!fhdr.verify_magic() || !fhdr.verify_version()) { return; }
-                    if (!fhdr.verify_checksum()) { return; }
+                    if (!fhdr.verifyMagic() || !fhdr.verifyVersion()) { return; }
+                    if (!fhdr.verifyChecksum()) { return; }
                 }
 
                 // --- Read records ---
                 std::vector<uint8_t> payload; // reused across records  Eavoids per-record heap alloc
                 while (file) {
-                    uint8_t rhdr_buf[ManifestRecordHeader::SIZE];
-                    file.read(reinterpret_cast<char*>(rhdr_buf), ManifestRecordHeader::SIZE);
+                    uint8_t rhdrBuf[ManifestRecordHeader::SIZE];
+                    file.read(reinterpret_cast<char*>(rhdrBuf), ManifestRecordHeader::SIZE);
                     if (!file || file.gcount() < static_cast<std::streamsize>(ManifestRecordHeader::SIZE)) { break; }
 
-                    const ManifestRecordHeader rhdr = ManifestRecordHeader::deserialize(rhdr_buf);
+                    const ManifestRecordHeader rhdr = ManifestRecordHeader::deserialize(rhdrBuf);
 
-                    if (rhdr.payload_len > 0) {
-                        payload.resize(rhdr.payload_len);
-                        file.read(reinterpret_cast<char*>(payload.data()), rhdr.payload_len);
-                        if (!file || file.gcount() < rhdr.payload_len) { break; }
+                    if (rhdr.payloadLen > 0) {
+                        payload.resize(rhdr.payloadLen);
+                        file.read(reinterpret_cast<char*>(payload.data()), rhdr.payloadLen);
+                        if (!file || file.gcount() < rhdr.payloadLen) { break; }
 
-                        if (!rhdr.verify_payload(payload.data(), rhdr.payload_len)) {
+                        if (!rhdr.verifyPayload(payload.data(), rhdr.payloadLen)) {
                             break; // CRC mismatch  Estop replay
                         }
 
-                        apply_event(static_cast<ManifestRecordType>(rhdr.type), payload.data(), rhdr.payload_len);
+                        applyEvent(static_cast<ManifestRecordType>(rhdr.type), payload.data(), rhdr.payloadLen);
                     }
                 }
             }
 
-            void apply_event(ManifestRecordType type, const uint8_t* payload, uint16_t len) {
+            void applyEvent(ManifestRecordType type, const uint8_t* payload, uint16_t len) {
                 switch (type) {
-                    case ManifestRecordType::StripeCommit: {
+                    case ManifestRecordType::STRIPE_COMMIT: {
                         DecodedStripeCommit d;
-                        if (!decode_stripe_commit(payload, len, d)) { return; }
-                        if (d.stripe_count >= stripes_written_) { stripes_written_ = d.stripe_count; }
+                        if (!decodeStripeCommit(payload, len, d)) { return; }
+                        if (d.stripeCount >= stripesWritten_) { stripesWritten_ = d.stripeCount; }
                         break;
                     }
-                    case ManifestRecordType::SSTSeal: {
+                    case ManifestRecordType::SST_SEAL: {
                         DecodedSSTSeal d;
-                        if (!decode_sst_seal(payload, len, d)) { return; }
+                        if (!decodeSstSeal(payload, len, d)) { return; }
                         std::lock_guard lock{mutex_};
-                        sst_seals_.push_back(SSTSealEvent{d.level, d.name, d.entries, d.first_key_hex, d.last_key_hex, d.ts_us});
-                        live_sst_.insert(d.name);
-                        deleted_sst_.erase(d.name);
+                        sstSeals_.push_back(SSTSealEvent{d.level, d.name, d.entries, d.firstKeyHex, d.lastKeyHex, d.tsUs});
+                        liveSst_.insert(d.name);
+                        deletedSst_.erase(d.name);
                         break;
                     }
-                    case ManifestRecordType::SSTDelete: {
+                    case ManifestRecordType::SST_DELETE: {
                         DecodedSSTDelete d;
-                        if (!decode_sst_delete(payload, len, d)) { return; }
+                        if (!decodeSstDelete(payload, len, d)) { return; }
                         std::lock_guard lock{mutex_};
-                        live_sst_.erase(d.name);
-                        deleted_sst_.insert(d.name);
+                        liveSst_.erase(d.name);
+                        deletedSst_.insert(d.name);
                         break;
                     }
-                    case ManifestRecordType::CompactionEnd: {
+                    case ManifestRecordType::COMPACTION_END: {
                         DecodedCompactionEnd d;
-                        if (!decode_compaction_end(payload, len, d)) { return; }
+                        if (!decodeCompactionEnd(payload, len, d)) { return; }
                         std::lock_guard lock{mutex_};
-                        live_sst_.insert(d.output);
+                        liveSst_.insert(d.output);
                         for (const auto& inp : d.inputs) {
-                            live_sst_.erase(inp);
-                            deleted_sst_.insert(inp);
+                            liveSst_.erase(inp);
+                            deletedSst_.insert(inp);
                         }
                         break;
                     }
-                    case ManifestRecordType::Checkpoint: {
+                    case ManifestRecordType::CHECKPOINT: {
                         DecodedCheckpoint d;
-                        if (!decode_checkpoint(payload, len, d)) { return; }
+                        if (!decodeCheckpoint(payload, len, d)) { return; }
                         std::lock_guard lock{mutex_};
-                        last_checkpoint_ = CheckpointEvent{d.name, d.stripe, d.last_seq, d.ts_us};
-                        deleted_sst_.clear();
-                        std::erase_if(sst_seals_, [this](const SSTSealEvent& e) { return live_sst_.find(e.file) == live_sst_.end(); });
+                        lastCheckpoint_ = CheckpointEvent{d.name, d.stripe, d.lastSeq, d.tsUs};
+                        deletedSst_.clear();
+                        std::erase_if(sstSeals_, [this](const SSTSealEvent& e) { return liveSst_.find(e.file) == liveSst_.end(); });
                         break;
                     }
-                    case ManifestRecordType::CompactionCommit: {
+                    case ManifestRecordType::COMPACTION_COMMIT: {
                         // Atomic multi-file compaction commit.
                         // Adds all outputs and removes all inputs in one operation.
                         DecodedCompactionCommit d;
-                        if (!decode_compaction_commit(payload, len, d)) { return; }
+                        if (!decodeCompactionCommit(payload, len, d)) { return; }
                         std::lock_guard lock{mutex_};
-                        for (const auto& f : d.output_files) {
-                            live_sst_.insert(f);
-                            deleted_sst_.erase(f);
+                        for (const auto& f : d.outputFiles) {
+                            liveSst_.insert(f);
+                            deletedSst_.erase(f);
                         }
-                        for (const auto& f : d.input_files) {
-                            live_sst_.erase(f);
-                            deleted_sst_.insert(f);
+                        for (const auto& f : d.inputFiles) {
+                            liveSst_.erase(f);
+                            deletedSst_.insert(f);
                         }
                         break;
                     }
-                    case ManifestRecordType::CompactionStart:
-                    case ManifestRecordType::NodeJoin:
-                    case ManifestRecordType::NodeLeave:
-                    case ManifestRecordType::PrimaryLease:
-                    case ManifestRecordType::Truncate:
+                    case ManifestRecordType::COMPACTION_START:
+                    case ManifestRecordType::NODE_JOIN:
+                    case ManifestRecordType::NODE_LEAVE:
+                    case ManifestRecordType::PRIMARY_LEASE:
+                    case ManifestRecordType::TRUNCATE:
                         // Informational only  Eno state change
                         break;
                 }
@@ -626,92 +626,92 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             std::filesystem::path path_;
-            bool fast_mode_;
+            bool fastMode_;
             std::atomic<bool> running_;
-            FileHandle file_handle_;
+            FileHandle fileHandle_;
 
             // Durable state
-            std::atomic<uint64_t> stripes_written_;
-            std::mutex advance_mutex_;
+            std::atomic<uint64_t> stripesWritten_;
+            std::mutex advanceMutex_;
             mutable std::mutex mutex_;
-            std::vector<SSTSealEvent> sst_seals_;
-            std::unordered_set<std::string> live_sst_;
-            std::unordered_set<std::string> deleted_sst_;
-            std::optional<CheckpointEvent> last_checkpoint_;
+            std::vector<SSTSealEvent> sstSeals_;
+            std::unordered_set<std::string> liveSst_;
+            std::unordered_set<std::string> deletedSst_;
+            std::optional<CheckpointEvent> lastCheckpoint_;
 
             // Fast-mode flusher
-            std::thread flusher_thread_;
-            std::mutex queue_mutex_;
-            std::condition_variable queue_cv_;
+            std::thread flusherThread_;
+            std::mutex queueMutex_;
+            std::condition_variable queueCv_;
             std::vector<std::vector<uint8_t>> queue_;
-            std::chrono::steady_clock::time_point last_strong_sync_;
-            std::exception_ptr term_write_error_;
+            std::chrono::steady_clock::time_point lastStrongSync_;
+            std::exception_ptr termWriteError_;
 
             // Rotation
-            std::mutex rotation_mutex_;
-            std::filesystem::path current_path_;
-            size_t current_file_size_;
-            size_t rotation_counter_;
+            std::mutex rotationMutex_;
+            std::filesystem::path currentPath_;
+            size_t currentFileSize_;
+            size_t rotationCounter_;
     };
 
     // ============================================================================
     // Manifest public API  Ethin forwarding layer
     // ============================================================================
 
-    std::unique_ptr<Manifest> Manifest::create(const std::filesystem::path& path, bool fast_mode) {
-        return std::unique_ptr<Manifest>(new Manifest(path, fast_mode));
+    std::unique_ptr<Manifest> Manifest::create(const std::filesystem::path& path, bool fastMode) {
+        return std::unique_ptr<Manifest>(new Manifest(path, fastMode));
     }
 
-    Manifest::Manifest(const std::filesystem::path& path, bool fast_mode) : impl_{std::make_unique<Impl>(path, fast_mode)} {}
+    Manifest::Manifest(const std::filesystem::path& path, bool fastMode) : impl_{std::make_unique<Impl>(path, fastMode)} {}
 
     Manifest::~Manifest() = default;
 
     void Manifest::start() { impl_->start(); }
 
-    void Manifest::advance(uint64_t new_count) { impl_->advance(new_count); }
+    void Manifest::advance(uint64_t newCount) { impl_->advance(newCount); }
 
-    void Manifest::sst_seal(
+    void Manifest::sstSeal(
         int level,
         const std::string& file,
         uint64_t entries,
-        const std::optional<std::string>& first_key_hex,
-        const std::optional<std::string>& last_key_hex
-    ) { impl_->sst_seal(level, file, entries, first_key_hex, last_key_hex); }
+        const std::optional<std::string>& firstKeyHex,
+        const std::optional<std::string>& lastKeyHex
+    ) { impl_->sstSeal(level, file, entries, firstKeyHex, lastKeyHex); }
 
     void Manifest::checkpoint(
         const std::optional<std::string>& name,
         const std::optional<uint64_t>& stripe,
-        const std::optional<uint64_t>& last_seq
-    ) { impl_->checkpoint(name, stripe, last_seq); }
+        const std::optional<uint64_t>& lastSeq
+    ) { impl_->checkpoint(name, stripe, lastSeq); }
 
-    void Manifest::compaction_start(int level, const std::vector<std::string>& inputs) { impl_->compaction_start(level, inputs); }
+    void Manifest::compactionStart(int level, const std::vector<std::string>& inputs) { impl_->compactionStart(level, inputs); }
 
-    void Manifest::compaction_end(
+    void Manifest::compactionEnd(
         int level,
         const std::string& output,
         const std::vector<std::string>& inputs,
         uint64_t entries,
-        const std::optional<std::string>& first_key_hex,
-        const std::optional<std::string>& last_key_hex
-    ) { impl_->compaction_end(level, output, inputs, entries, first_key_hex, last_key_hex); }
+        const std::optional<std::string>& firstKeyHex,
+        const std::optional<std::string>& lastKeyHex
+    ) { impl_->compactionEnd(level, output, inputs, entries, firstKeyHex, lastKeyHex); }
 
-    void Manifest::sst_delete(const std::string& file) { impl_->sst_delete(file); }
+    void Manifest::sstDelete(const std::string& file) { impl_->sstDelete(file); }
 
-    void Manifest::compaction_commit(const std::vector<std::string>& output_files, const std::vector<std::string>& input_files) {
-        impl_->compaction_commit(output_files, input_files);
+    void Manifest::compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles) {
+        impl_->compactionCommit(outputFiles, inputFiles);
     }
 
     void Manifest::truncate(const std::optional<std::string>& reason) { impl_->truncate(reason); }
 
     void Manifest::replay() { impl_->replay(); }
 
-    uint64_t Manifest::stripes_written() const noexcept { return impl_->stripes_written(); }
+    uint64_t Manifest::stripesWritten() const noexcept { return impl_->stripesWritten(); }
 
-    std::optional<Manifest::CheckpointEvent> Manifest::last_checkpoint() const noexcept { return impl_->last_checkpoint(); }
+    std::optional<Manifest::CheckpointEvent> Manifest::lastCheckpoint() const noexcept { return impl_->lastCheckpoint(); }
 
-    std::vector<std::string> Manifest::live_sst() const { return impl_->live_sst(); }
-    std::vector<std::string> Manifest::deleted_sst() const { return impl_->deleted_sst(); }
-    std::vector<Manifest::SSTSealEvent> Manifest::sst_seals() const { return impl_->sst_seals(); }
+    std::vector<std::string> Manifest::liveSst() const { return impl_->liveSst(); }
+    std::vector<std::string> Manifest::deletedSst() const { return impl_->deletedSst(); }
+    std::vector<Manifest::SSTSealEvent> Manifest::sstSeals() const { return impl_->sstSeals(); }
 
     void Manifest::close() { impl_->close(); }
 } // namespace akkaradb::engine::manifest

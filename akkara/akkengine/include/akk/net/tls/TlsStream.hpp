@@ -24,13 +24,13 @@
 
 namespace akkaradb::net {
     struct TlsConfig {
-        const char* cert_path = nullptr;
-        const char* key_path = nullptr;
-        const char* ca_path = nullptr;
+        const char* certPath = nullptr;
+        const char* keyPath = nullptr;
+        const char* caPath = nullptr;
         const unsigned char* psk = nullptr;
-        std::size_t psk_len = 0;
-        const char* psk_identity = nullptr;
-        bool verify_peer = true;
+        std::size_t pskLen = 0;
+        const char* pskIdentity = nullptr;
+        bool verifyPeer = true;
     };
 
     /**
@@ -60,20 +60,14 @@ namespace akkaradb::net {
              */
             void connect(const char* host, uint16_t port, const TlsConfig& config = {});
 
-            void connect(
-                const char* host,
-                uint16_t port,
-                const TlsConfig& config,
-                uint32_t read_timeout_ms,
-                uint32_t write_timeout_ms
-            );
+            void connect(const char* host, uint16_t port, const TlsConfig& config, uint32_t readTimeoutMs, uint32_t writeTimeoutMs);
 
             /**
              * @brief Adopt an accepted TCP socket and complete a server-side TLS handshake.
              *
-             * The stream owns @p native_socket after this call starts, even if the handshake fails.
+             * The stream owns @p nativeSocket after this call starts, even if the handshake fails.
              */
-            void accept(std::uintptr_t native_socket, const TlsConfig& config = {});
+            void accept(std::uintptr_t nativeSocket, const TlsConfig& config = {});
 
             /**
              * @brief Send data over TLS.

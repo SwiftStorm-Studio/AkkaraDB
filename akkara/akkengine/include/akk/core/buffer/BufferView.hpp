@@ -43,7 +43,7 @@ namespace akkaradb::core {
      * The underlying memory is NOT owned. The data is only valid while the source
      * buffer remains alive.
      *
-     * If you need to retain the data, call to_owned().
+     * If you need to retain the data, call toOwned().
      */
     class BufferView {
         public:
@@ -79,7 +79,7 @@ namespace akkaradb::core {
              *
              * @return A span referencing the same underlying storage.
              */
-            [[nodiscard]] constexpr std::span<const std::byte> as_span() const noexcept { return {data_, size_}; }
+            [[nodiscard]] constexpr std::span<const std::byte> asSpan() const noexcept { return {data_, size_}; }
 
             /**
              * @brief Returns a typed span view (byte-compatible types only).
@@ -88,8 +88,11 @@ namespace akkaradb::core {
              * strict aliasing violations.
              */
             template <typename T>
-            [[nodiscard]] constexpr std::span<const T> as_span() const noexcept {
-                static_assert(std::is_same_v<T, std::byte> || std::is_same_v<T, char> || std::is_same_v<T, unsigned char>, "T must be a byte-like type");
+            [[nodiscard]] constexpr std::span<const T> asSpan() const noexcept {
+                static_assert(
+                    std::is_same_v<T, std::byte> || std::is_same_v<T, char> || std::is_same_v<T, unsigned char>,
+                    "T must be a byte-like type"
+                );
                 return {reinterpret_cast<const T*>(data_), size_ / sizeof(T)};
             }
 
@@ -123,7 +126,7 @@ namespace akkaradb::core {
              *
              * @return A newly allocated buffer containing the same bytes.
              */
-            [[nodiscard]] OwnedBuffer to_owned() const;
+            [[nodiscard]] OwnedBuffer toOwned() const;
 
             // ==================== Little-Endian Reads ====================
 
@@ -134,7 +137,7 @@ namespace akkaradb::core {
              * @return The byte value at @p offset.
              * @throws std::out_of_range If the read would exceed the view.
              */
-            [[nodiscard]] uint8_t read_u8(size_t offset) const;
+            [[nodiscard]] uint8_t readU8(size_t offset) const;
 
             /**
              * @brief Reads an unsigned 16-bit little-endian value at the given offset.
@@ -143,7 +146,7 @@ namespace akkaradb::core {
              * @return A 16-bit little-endian integer decoded from the buffer.
              * @throws std::out_of_range If the read would exceed the view.
              */
-            [[nodiscard]] uint16_t read_u16_le(size_t offset) const;
+            [[nodiscard]] uint16_t readU16Le(size_t offset) const;
 
             /**
              * @brief Reads an unsigned 32-bit little-endian value at the given offset.
@@ -152,7 +155,7 @@ namespace akkaradb::core {
              * @return A 32-bit little-endian integer decoded from the buffer.
              * @throws std::out_of_range If the read would exceed the view.
              */
-            [[nodiscard]] uint32_t read_u32_le(size_t offset) const;
+            [[nodiscard]] uint32_t readU32Le(size_t offset) const;
 
             /**
              * @brief Reads an unsigned 64-bit little-endian value at the given offset.
@@ -161,7 +164,7 @@ namespace akkaradb::core {
              * @return A 64-bit little-endian integer decoded from the buffer.
              * @throws std::out_of_range If the read would exceed the view.
              */
-            [[nodiscard]] uint64_t read_u64_le(size_t offset) const;
+            [[nodiscard]] uint64_t readU64Le(size_t offset) const;
 
             // ==================== CRC ====================
 
@@ -190,14 +193,14 @@ namespace akkaradb::core {
              * @return A non-owning string view referencing the same storage.
              * @throws std::out_of_range If the requested range exceeds the current view.
              */
-            [[nodiscard]] std::string_view as_string_view(size_t offset, size_t length) const;
+            [[nodiscard]] std::string_view asStringView(size_t offset, size_t length) const;
 
             /**
              * @brief Creates a string_view over the entire buffer.
              *
              * @warning Not null-terminated. Lifetime follows BufferView.
              */
-            [[nodiscard]] std::string_view as_string_view() const noexcept { return {reinterpret_cast<const char*>(data_), size_}; }
+            [[nodiscard]] std::string_view asStringView() const noexcept { return {reinterpret_cast<const char*>(data_), size_}; }
 
         private:
             const std::byte* data_;
@@ -210,14 +213,14 @@ namespace akkaradb::core {
              * @param length Number of bytes to cover.
              * @throws std::out_of_range If the range exceeds the current view.
              */
-            void check_bounds(size_t offset, size_t length) const;
+            void checkBounds(size_t offset, size_t length) const;
 
             /**
-             * @brief Fast path wrapper around @ref check_bounds.
+             * @brief Fast path wrapper around @ref checkBounds.
              *
              * The validation is always enforced, including release builds.
              */
-            void check_bounds_inline(size_t offset, size_t length) const { check_bounds(offset, length); }
+            void checkBoundsInline(size_t offset, size_t length) const { checkBounds(offset, length); }
     };
 
     static_assert(std::is_trivially_copyable_v<BufferView>);

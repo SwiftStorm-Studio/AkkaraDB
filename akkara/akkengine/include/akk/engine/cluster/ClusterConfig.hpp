@@ -34,18 +34,18 @@ namespace akkaradb::engine::cluster {
      * using rendezvous hashing.
      */
     enum class ReplicationMode : uint8_t {
-        Standalone = 0, Mirror = 1, Stripe = 2,
+        STANDALONE = 0, MIRROR = 1, STRIPE = 2,
     };
 
     /**
      * AckPolicyMode - Durability policy for primary-to-replica shipping.
      */
     enum class AckPolicyMode : uint8_t {
-        Async = 0,
+        ASYNC = 0,
         ///< Return without waiting for replica acknowledgements.
-        All = 1,
+        ALL = 1,
         ///< Wait until all currently live replicas acknowledge.
-        Quorum = 2,
+        QUORUM = 2,
         ///< Wait until at least AckPolicy::quorum replicas acknowledge.
     };
 
@@ -53,23 +53,23 @@ namespace akkaradb::engine::cluster {
      * TransportMode - Network transport used by replication links.
      */
     enum class TransportMode : uint8_t {
-        TLS = 0, Plain = 1,
+        TLS = 0, PLAIN = 1,
     };
 
     /**
      * NodeRole - Runtime role selected by ClusterManager.
      */
     enum class NodeRole : uint8_t {
-        Standalone = 0, Primary = 1, Replica = 2,
+        STANDALONE = 0, PRIMARY = 1, REPLICA = 2,
     };
 
     /**
      * NodeCapability - Bit flags describing what a node may do.
      */
     enum NodeCapability : uint32_t {
-        CoordinatorEligible = 1u << 0,
+        COORDINATOR_ELIGIBLE = 1u << 0,
         ///< Node may be selected as primary by ClusterManager.
-        DataBearing = 1u << 1,
+        DATA_BEARING = 1u << 1,
         ///< Node can store key/value data and receive routed writes.
     };
 
@@ -77,43 +77,43 @@ namespace akkaradb::engine::cluster {
      * AckPolicy - Acknowledgement rule applied by ReplicationServer.
      */
     struct AckPolicy {
-        AckPolicyMode mode = AckPolicyMode::Async;
-        uint16_t quorum = 0; ///< Required replica count when mode == AckPolicyMode::Quorum.
+        AckPolicyMode mode = AckPolicyMode::ASYNC;
+        uint16_t quorum = 0; ///< Required replica count when mode == AckPolicyMode::QUORUM.
     };
 
     /**
      * NodeInfo - Persistent identity and connection endpoints for one node.
      */
     struct NodeInfo {
-        uint64_t node_id = 0; ///< Stable node id.  Zero is reserved.
+        uint64_t nodeId = 0; ///< Stable node id.  Zero is reserved.
         std::string host; ///< Hostname or address used by peer nodes.
-        uint16_t data_port = 0; ///< Public data API port.
-        uint16_t repl_port = 0; ///< Replication listener port.
-        uint32_t capabilities = DataBearing; ///< OR-ed NodeCapability flags.
+        uint16_t dataPort = 0; ///< Public data API port.
+        uint16_t replPort = 0; ///< Replication listener port.
+        uint32_t capabilities = DATA_BEARING; ///< OR-ed NodeCapability flags.
 
         /** Returns true if this node may become primary. */
-        [[nodiscard]] bool coordinator_eligible() const noexcept { return (capabilities & CoordinatorEligible) != 0; }
+        [[nodiscard]] bool coordinatorEligible() const noexcept { return (capabilities & COORDINATOR_ELIGIBLE) != 0; }
 
         /** Returns true if this node participates in data placement. */
-        [[nodiscard]] bool data_bearing() const noexcept { return (capabilities & DataBearing) != 0; }
+        [[nodiscard]] bool dataBearing() const noexcept { return (capabilities & DATA_BEARING) != 0; }
     };
 
     /**
      * ClusterTlsOptions - TLS certificate configuration for replication links.
      */
     struct ClusterTlsOptions {
-        std::filesystem::path cert_path; ///< Local certificate path.
-        std::filesystem::path key_path; ///< Local private-key path.
-        std::filesystem::path ca_path; ///< CA bundle used for peer verification.
-        bool verify_peer = true; ///< Whether TLS peers must validate against ca_path.
+        std::filesystem::path certPath; ///< Local certificate path.
+        std::filesystem::path keyPath; ///< Local private-key path.
+        std::filesystem::path caPath; ///< CA bundle used for peer verification.
+        bool verifyPeer = true; ///< Whether TLS peers must validate against caPath.
     };
 
     /**
      * ClusterRuntimeOptions - Runtime-only network options.
      */
     struct ClusterRuntimeOptions {
-        TransportMode transport_mode = TransportMode::TLS;
-        std::string repl_bind_host = "0.0.0.0"; ///< Local address used by the primary replication listener.
+        TransportMode transportMode = TransportMode::TLS;
+        std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
         ClusterTlsOptions tls;
     };
 
@@ -138,7 +138,7 @@ namespace akkaradb::engine::cluster {
              * @throws std::invalid_argument if node ids, capabilities, mode, or
              *         acknowledgement policy are invalid.
              */
-            ClusterConfig(std::vector<NodeInfo> nodes, ReplicationMode mode, AckPolicy ack_policy);
+            ClusterConfig(std::vector<NodeInfo> nodes, ReplicationMode mode, AckPolicy ackPolicy);
 
             /**
              * Loads and validates a cluster config file.
@@ -164,22 +164,22 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] ReplicationMode mode() const noexcept { return mode_; }
 
             /** Returns the configured replica acknowledgement policy. */
-            [[nodiscard]] AckPolicy ack_policy() const noexcept { return ack_policy_; }
+            [[nodiscard]] AckPolicy ackPolicy() const noexcept { return ackPolicy_; }
 
             /** Returns reserved config flags from the file header. */
             [[nodiscard]] uint16_t flags() const noexcept { return flags_; }
 
             /** Returns the node with the given id, or nullptr if absent. */
-            [[nodiscard]] const NodeInfo* find_by_id(uint64_t node_id) const noexcept;
+            [[nodiscard]] const NodeInfo* findById(uint64_t nodeId) const noexcept;
 
-            /** Returns nodes with NodeCapability::DataBearing set. */
-            [[nodiscard]] std::vector<NodeInfo> data_nodes() const;
+            /** Returns nodes with NodeCapability::DATA_BEARING set. */
+            [[nodiscard]] std::vector<NodeInfo> dataNodes() const;
 
-            /** Returns nodes with NodeCapability::CoordinatorEligible set. */
-            [[nodiscard]] std::vector<NodeInfo> coordinator_nodes() const;
+            /** Returns nodes with NodeCapability::COORDINATOR_ELIGIBLE set. */
+            [[nodiscard]] std::vector<NodeInfo> coordinatorNodes() const;
 
             /** Returns true when the config should run without replication. */
-            [[nodiscard]] bool is_standalone() const noexcept;
+            [[nodiscard]] bool isStandalone() const noexcept;
 
             /**
              * Validates internal consistency.
@@ -192,8 +192,8 @@ namespace akkaradb::engine::cluster {
 
         private:
             std::vector<NodeInfo> nodes_;
-            ReplicationMode mode_ = ReplicationMode::Standalone;
-            AckPolicy ack_policy_{};
+            ReplicationMode mode_ = ReplicationMode::STANDALONE;
+            AckPolicy ackPolicy_{};
             uint16_t flags_ = 0;
     };
 } // namespace akkaradb::engine::cluster

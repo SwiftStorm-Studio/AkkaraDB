@@ -174,12 +174,12 @@ Offset  Size  Field     Description
 Offset  Size  Field       Description
 ------  ----  ----------  ---------------------------------------------
 0       16    MemHdr16    Sequence, lengths, flags
-16      8     key_fp64    SipHash-2-4 fingerprint for fast rejection
-24      8     mini_key    First up to 8 key bytes, little-endian packed
+16      8     keyFp64    SipHash-2-4 fingerprint for fast rejection
+24      8     miniKey    First up to 8 key bytes, little-endian packed
 32      32    SmallBuffer Inline or arena-backed [key][value] payload
 ```
 
-`OwnedRecord` is exactly 64 bytes and is optimized for one-cache-line metadata access. The full key comparison remains authoritative; `key_fp64` and `mini_key`
+`OwnedRecord` is exactly 64 bytes and is optimized for one-cache-line metadata access. The full key comparison remains authoritative; `keyFp64` and `miniKey`
 are only acceleration hints.
 
 ### 3.3 SSTHdr32 - On-Disk SST Record Header
@@ -195,8 +195,8 @@ Offset  Size  Field       Description
 12      1     flags       0x00 normal, 0x01 tombstone, 0x02 blob
 13      1     reserved0   Reserved
 14      2     reserved1   Reserved
-16      8     key_fp64    64-bit key fingerprint
-24      8     mini_key    First up to 8 key bytes, little-endian packed
+16      8     keyFp64    64-bit key fingerprint
+24      8     miniKey    First up to 8 key bytes, little-endian packed
 ```
 
 The SST record payload is:
@@ -298,7 +298,7 @@ The MemTable owns the monotonic sequence allocator used by `AkkEngine` writes:
 `MemTable::get` returns a `RecordView` when a key exists in memory at the requested snapshot. Tombstones are returned as records so the caller can suppress
 older SST values.
 
-`MemTable::get_into` and `contains` return `std::optional<bool>`:
+`MemTable::getInto` and `contains` return `std::optional<bool>`:
 
 | Value     | Meaning                                        |
 |-----------|------------------------------------------------|
@@ -319,7 +319,7 @@ When a shard crosses `threshold_bytes_per_shard`, it can be sealed and flushed. 
 
 | Field                     | Default                                                  | Description                                                                             |
 |---------------------------|----------------------------------------------------------|-----------------------------------------------------------------------------------------|
-| `wal_dir`                 | `{data_dir}/wal`                                         | Segment directory                                                                       |
+| `walDir`                 | `{dataDir}/wal`                                         | Segment directory                                                                       |
 | `sync_mode`               | `Sync` at engine level, changed by `StartupMode` presets | `Sync`, `Async`, or `Off`                                                               |
 | `shard_count`             | 0                                                        | Auto, one shard per hardware thread capped by implementation; engine writer auto cap 64 |
 | `group_n`                 | 128                                                      | Async batch entry trigger                                                               |
@@ -358,7 +358,7 @@ Each entry is serialized as:
 Offset  Size  Field       Description
 ------  ----  ----------  ---------------------------------------------
 0       8     seq         Record sequence
-8       8     key_fp64    Key fingerprint
+8       8     keyFp64    Key fingerprint
 16      4     entry_len   Header + key + value bytes
 20      4     value_len   Value length
 24      2     key_len     Key length
@@ -389,7 +389,7 @@ small while preserving transparent reads at the engine API.
 
 | Field             | Default            | Description               |
 |-------------------|--------------------|---------------------------|
-| `blob_dir`        | `{data_dir}/blobs` | Blob directory            |
+| `blobDir`        | `{dataDir}/blobs` | Blob directory            |
 | `threshold_bytes` | 16 KiB             | Externalization threshold |
 | `codec`           | `None`             | `None` or `Zstd`          |
 
@@ -422,7 +422,7 @@ Blob reads validate the header and content CRC before returning bytes.
 
 | Field                   | Default              | Description                 |
 |-------------------------|----------------------|-----------------------------|
-| `sst_dir`               | `{data_dir}/sstable` | SST root directory          |
+| `sstDir`               | `{dataDir}/sstable` | SST root directory          |
 | `max_levels`            | 7                    | Levels L0..L6 by default    |
 | `max_l0_files`          | 4                    | L0 compaction trigger       |
 | `l1_max_bytes`          | 64 MiB               | L1 budget                   |
@@ -484,7 +484,7 @@ SST lookup uses:
 1. File-level min/max key checks.
 2. Bloom filter negative check.
 3. Block index binary search by first/last key.
-4. In-block binary search using `SSTHdr32`, `mini_key`, and full key comparison.
+4. In-block binary search using `SSTHdr32`, `miniKey`, and full key comparison.
 
 L0 may contain overlapping files; newer files are checked first by manager policy. Higher levels are expected to be non-overlapping after compaction.
 
@@ -548,16 +548,16 @@ The record CRC covers payload bytes only.
 
 The VersionLog records per-key history when enabled. It powers:
 
-- `AkkEngine::get_at(key, seq)`
+- `AkkEngine::getAt(key, seq)`
 - `AkkEngine::history(key)`
-- `AkkEngine::rollback_to(seq)`
+- `AkkEngine::rollbackTo(seq)`
 - `AkkEngine::rollback_key(key, seq)`
 
 ### 10.2 Options
 
 | Field       | Default                     | Description       |
 |-------------|-----------------------------|-------------------|
-| `log_path`  | `{data_dir}/history.akvlog` | Version log file  |
+| `logPath`  | `{dataDir}/history.akvlog` | Version log file  |
 | `sync_mode` | `Async`                     | `Sync` or `Async` |
 
 ### 10.3 VersionEntry
@@ -645,7 +645,7 @@ bodies.
 | `POST`   | `/v1/put`    | `key`        | Store request body as value                                 |
 | `GET`    | `/v1/get`    | `key`        | Return current value                                        |
 | `DELETE` | `/v1/remove` | `key`        | Write tombstone                                             |
-| `GET`    | `/v1/get_at` | `key`, `seq` | Return value visible at sequence when VersionLog is enabled |
+| `GET`    | `/v1/getAt` | `key`, `seq` | Return value visible at sequence when VersionLog is enabled |
 
 ---
 
@@ -679,7 +679,7 @@ bodies.
 
 ### 12.4 Cluster Config
 
-Cluster config is stored as `{data_dir}/cluster.akcc` by default and uses magic `0x35434B41` ("AKC5"), version 1. It stores:
+Cluster config is stored as `{dataDir}/cluster.akcc` by default and uses magic `0x35434B41` ("AKC5"), version 1. It stores:
 
 - node ids
 - host names advertised to peer nodes
@@ -750,7 +750,7 @@ High-level `AkkaraDB::open` converts `StartupMode` into `AkkEngineOptions`.
 |--------------------------------|--------------------------------------|
 | `memtable_threshold_per_shard` | `memtable.threshold_bytes_per_shard` |
 | `version_log_enabled`          | `components.version_log_enabled`     |
-| `sst_codec`                    | `sst.codec`                          |
+| `sstCodec`                    | `sst.codec`                          |
 | `blob_codec`                   | `blob.codec`                         |
 | `blob_threshold_bytes`         | `blob.threshold_bytes`               |
 | `sst_promote_reads`            | `runtime.sst_promote_reads`          |
@@ -759,17 +759,17 @@ High-level `AkkaraDB::open` converts `StartupMode` into `AkkEngineOptions`.
 
 ### 14.3 Path Defaults
 
-If `paths.data_dir` is set, missing component paths are derived as:
+If `paths.dataDir` is set, missing component paths are derived as:
 
 | Path                  | Default                     |
 |-----------------------|-----------------------------|
-| `wal_dir`             | `{data_dir}/wal`            |
-| `blob_dir`            | `{data_dir}/blobs`          |
-| `sst_dir`             | `{data_dir}/sstable`        |
-| `manifest_path`       | `{data_dir}/manifest.akmf`  |
-| `version_log_path`    | `{data_dir}/history.akvlog` |
-| `cluster_config_path` | `{data_dir}/cluster.akcc`   |
-| `node_id_path`        | `{data_dir}/node.id`        |
+| `walDir`             | `{dataDir}/wal`            |
+| `blobDir`            | `{dataDir}/blobs`          |
+| `sstDir`             | `{dataDir}/sstable`        |
+| `manifestPath`       | `{dataDir}/manifest.akmf`  |
+| `versionLogPath`    | `{dataDir}/history.akvlog` |
+| `clusterConfigPath` | `{dataDir}/cluster.akcc`   |
+| `nodeIdPath`        | `{dataDir}/node.id`        |
 
 ### 14.4 Runtime Options
 
@@ -779,8 +779,8 @@ If `paths.data_dir` is set, missing component paths are derived as:
 | `recover_wal`          | true    | Replay WAL at startup                      |
 | `recover_sst`          | true    | Recover SST state at startup               |
 | `prune_wal_on_flush`   | true    | Prune WAL after SST checkpoint             |
-| `force_flush_on_close` | true    | Force MemTable flush during close          |
-| `force_sync_on_close`  | true    | Force WAL sync during close                |
+| `forceFlush_on_close` | true    | Force MemTable flush during close          |
+| `forceSync_on_close`  | true    | Force WAL sync during close                |
 | `sst_promote_reads`    | false   | Promote SST read hits into MemTable        |
 
 ### 14.5 Cluster Runtime Options
@@ -805,10 +805,10 @@ If `paths.data_dir` is set, missing component paths are derived as:
 auto db = akkaradb::AkkaraDB::open("/var/lib/akkaradb", akkaradb::StartupMode::NORMAL);
 
 akkaradb::AkkaraDB::Options opts;
-opts.data_dir = "/var/lib/akkaradb";
+opts.dataDir = "/var/lib/akkaradb";
 opts.mode = akkaradb::StartupMode::FAST;
 opts.overrides.blob_threshold_bytes = 32 * 1024;
-opts.overrides.sst_codec = akkaradb::Codec::Zstd;
+opts.overrides.sstCodec = akkaradb::Codec::ZSTD;
 auto tuned = akkaradb::AkkaraDB::open(std::move(opts));
 
 auto& engine = tuned->engine();
@@ -823,7 +823,7 @@ std::vector<uint8_t> value = {'v'};
 
 engine.put(key, value);
 auto got = engine.get(key);                 // optional<vector<uint8_t>>
-bool ok = engine.get_into(key, value);      // reuse output vector
+bool ok = engine.getInto(key, value);      // reuse output vector
 bool exists = engine.exists(key);
 engine.remove(key);
 
@@ -834,13 +834,13 @@ for (auto it = rows.begin(); it != rows.end(); ++it) {
 }
 
 auto hist = engine.history(key);
-auto old = engine.get_at(key, 42);
+auto old = engine.getAt(key, 42);
 engine.rollback_key(key, 42);
-engine.force_flush();
-engine.force_sync();
+engine.forceFlush();
+engine.forceSync();
 ```
 
-`put_hinted` and `remove_hinted` are available for callers that already computed `key_fp64` and `mini_key`.
+`putHinted` and `removeHinted` are available for callers that already computed `keyFp64` and `miniKey`.
 
 ### 15.3 PackedTable
 
@@ -862,11 +862,11 @@ users.put(User{1, "a@example.test", "Alice", 30});
 auto alice = users.get(1);
 
 User out{};
-bool found = users.get_into(1, out);
+bool found = users.getInto(1, out);
 
-auto email_hits = by_email.find(std::string{"a@example.test"});
-while (email_hits.has_next()) {
-    auto [id, user] = email_hits.next();
+auto emailHits = by_email.find(std::string{"a@example.test"});
+while (emailHits.hasNext()) {
+    auto [id, user] = emailHits.next();
 }
 
 auto adults = users
@@ -1121,7 +1121,7 @@ Unrecoverable I/O, corrupt-file, invalid-configuration, and closed-engine cases 
 
 On `AkkEngine::open`:
 
-1. Missing component paths are derived from `data_dir`.
+1. Missing component paths are derived from `dataDir`.
 2. Required directories are created.
 3. Node id is loaded or generated.
 4. Manifest is opened and replay-capable.

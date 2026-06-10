@@ -31,16 +31,16 @@ namespace akkaradb::crypto {
     using NodeId = std::array<std::uint8_t, 16>;
 
     struct NodeIdentity {
-        SecretKey secret_key{};
-        PublicKey public_key{};
+        SecretKey secretKey{};
+        PublicKey publicKey{};
         Fingerprint fingerprint{};
-        NodeId node_id{};
+        NodeId nodeId{};
     };
 
     /**
      * @brief Generate a fresh raw-public-key identity for one AkkaraDB node.
      */
-    [[nodiscard]] NodeIdentity generate_node_identity();
+    [[nodiscard]] NodeIdentity generateNodeIdentity();
 
     /**
      * @brief Deterministically derive a node identity from a secret random seed.
@@ -48,13 +48,13 @@ namespace akkaradb::crypto {
      * The seed must be secret and high entropy.  This is useful for persistent
      * load/create flows, not for deriving keys from public instance IDs.
      */
-    [[nodiscard]] NodeIdentity node_identity_from_seed(const SecretKey& seed);
+    [[nodiscard]] NodeIdentity nodeIdentityFromSeed(const SecretKey& seed);
 
-    [[nodiscard]] Fingerprint fingerprint_public_key(const PublicKey& public_key);
-    [[nodiscard]] NodeId node_id_from_public_key(const PublicKey& public_key);
-    [[nodiscard]] std::string public_key_to_hex(const PublicKey& bytes);
-    [[nodiscard]] std::string fingerprint_to_hex(const Fingerprint& bytes);
-    [[nodiscard]] std::string node_id_to_hex(const NodeId& bytes);
+    [[nodiscard]] Fingerprint fingerprintPublicKey(const PublicKey& publicKey);
+    [[nodiscard]] NodeId nodeIdFromPublicKey(const PublicKey& publicKey);
+    [[nodiscard]] std::string publicKeyToHex(const PublicKey& bytes);
+    [[nodiscard]] std::string fingerprintToHex(const Fingerprint& bytes);
+    [[nodiscard]] std::string nodeIdToHex(const NodeId& bytes);
 
     /**
      * @brief Load or create the local node identity seed file.
@@ -67,9 +67,9 @@ namespace akkaradb::crypto {
             explicit IdentityStore(std::filesystem::path path);
 
             [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
-            [[nodiscard]] NodeIdentity load_or_create() const;
-            void save_seed(const SecretKey& seed) const;
-            [[nodiscard]] SecretKey load_seed() const;
+            [[nodiscard]] NodeIdentity loadOrCreate() const;
+            void saveSeed(const SecretKey& seed) const;
+            [[nodiscard]] SecretKey loadSeed() const;
 
         private:
             std::filesystem::path path_;

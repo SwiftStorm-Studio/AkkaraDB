@@ -31,8 +31,8 @@ namespace akkaradb::core {
     /**
      * @brief Reusable variable-size byte buffer pool (size-class based).
      *
-     * Size classes are powers of two in [min_class_size, max_class_size].
-     * Requests beyond max_class_size fall back to heap allocation.
+     * Size classes are powers of two in [minClassSize, maxClassSize].
+     * Requests beyond maxClassSize fall back to heap allocation.
      *
      * Fast path:
      * - Optional thread-local cache (single active pool per thread)
@@ -49,9 +49,9 @@ namespace akkaradb::core {
             static constexpr size_t DEFAULT_TLS_CACHE_LIMIT = 16;
 
             explicit BufferPool(
-                size_t min_class_size = DEFAULT_MIN_CLASS_SIZE,
-                size_t max_class_size = DEFAULT_MAX_CLASS_SIZE,
-                size_t tls_cache_limit = DEFAULT_TLS_CACHE_LIMIT
+                size_t minClassSize = DEFAULT_MIN_CLASS_SIZE,
+                size_t maxClassSize = DEFAULT_MAX_CLASS_SIZE,
+                size_t tlsCacheLimit = DEFAULT_TLS_CACHE_LIMIT
             );
 
             ~BufferPool() noexcept;
@@ -74,8 +74,8 @@ namespace akkaradb::core {
 
             struct Header {
                 union {
-                    uint32_t class_index;
-                    std::max_align_t align_guard;
+                    uint32_t classIndex;
+                    std::max_align_t alignGuard;
                 };
             };
 
@@ -93,23 +93,23 @@ namespace akkaradb::core {
                 FreeNode* head = nullptr;
             };
 
-            size_t min_class_size_;
-            size_t max_class_size_;
-            size_t tls_cache_limit_;
-            size_t class_count_;
+            size_t minClassSize_;
+            size_t maxClassSize_;
+            size_t tlsCacheLimit_;
+            size_t classCount_;
             std::unique_ptr<SizeClass[]> classes_;
 
-            [[nodiscard]] static bool is_power_of_two(size_t x) noexcept;
-            [[nodiscard]] static size_t ceil_pow2(size_t x) noexcept;
-            [[nodiscard]] int class_index_for(size_t size) const noexcept;
-            [[nodiscard]] size_t class_size_for(int class_index) const noexcept;
+            [[nodiscard]] static bool isPowerOfTwo(size_t x) noexcept;
+            [[nodiscard]] static size_t ceilPow2(size_t x) noexcept;
+            [[nodiscard]] int classIndexFor(size_t size) const noexcept;
+            [[nodiscard]] size_t classSizeFor(int classIndex) const noexcept;
 
-            [[nodiscard]] std::byte* acquire_raw(size_t size);
-            void release_raw(void* ptr) noexcept;
+            [[nodiscard]] std::byte* acquireRaw(size_t size);
+            void releaseRaw(void* ptr) noexcept;
 
-            static void owned_deleter(void* ptr, size_t size, void* ctx) noexcept;
+            static void ownedDeleter(void* ptr, size_t size, void* ctx) noexcept;
 
-            [[nodiscard]] FreeNode* pop_global(int class_index) noexcept;
-            void push_global(int class_index, FreeNode* node) noexcept;
+            [[nodiscard]] FreeNode* popGlobal(int classIndex) noexcept;
+            void pushGlobal(int classIndex, FreeNode* node) noexcept;
     };
 } // namespace akkaradb::core

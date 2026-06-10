@@ -42,13 +42,12 @@
 namespace akkaradb::crypto {
     namespace {
         #ifndef _WIN32
-        void fill_from_urandom(std::span<std::uint8_t> out) {
+        void fillFromUrandom(std::span<std::uint8_t> out) {
             int fd = -1;
-            do {
-                fd = ::open("/dev/urandom", O_RDONLY);
-            } while (fd < 0 && errno == EINTR);
+            do { fd = ::open("/dev/urandom", O_RDONLY); }
+            while (fd < 0 && errno == EINTR);
 
-            if (fd < 0) { throw std::runtime_error("secure_random: failed to open /dev/urandom"); }
+            if (fd < 0) { throw std::runtime_error("secureRandom: failed to open /dev/urandom"); }
 
             std::size_t offset = 0;
             while (offset < out.size()) {
@@ -59,11 +58,11 @@ namespace akkaradb::crypto {
                     if (errno == EINTR) { continue; }
                     const int saved = errno;
                     (void)::close(fd);
-                    throw std::runtime_error("secure_random: failed to read /dev/urandom: " + std::to_string(saved));
+                    throw std::runtime_error("secureRandom: failed to read /dev/urandom: " + std::to_string(saved));
                 }
                 if (n == 0) {
                     (void)::close(fd);
-                    throw std::runtime_error("secure_random: /dev/urandom returned EOF");
+                    throw std::runtime_error("secureRandom: /dev/urandom returned EOF");
                 }
                 offset += static_cast<std::size_t>(n);
             }
@@ -73,50 +72,42 @@ namespace akkaradb::crypto {
         #endif
     } // namespace
 
-    void secure_random(std::span<std::uint8_t> out) {
+    void secureRandom(std::span<std::uint8_t> out) {
         if (out.empty()) { return; }
 
         #ifdef _WIN32
         while (!out.empty()) {
             const auto chunk = std::min<std::size_t>(out.size(), static_cast<std::size_t>(ULONG_MAX));
-            const NTSTATUS status = ::BCryptGenRandom(
-                nullptr,
-                out.data(),
-                static_cast<ULONG>(chunk),
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG
-            );
-            if (status != 0) { throw std::runtime_error("secure_random: BCryptGenRandom failed"); }
+            const NTSTATUS status = ::BCryptGenRandom(nullptr, out.data(), static_cast<ULONG>(chunk), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (status != 0) { throw std::runtime_error("secureRandom: BCryptGenRandom failed"); }
             out = out.subspan(chunk);
         }
         #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
         ::arc4random_buf(out.data(), out.size());
         #elif defined(__linux__)
-        std::size_t offset = 0;
-        while (offset < out.size()) {
+        std::size_t offset = 0; while (offset < out.size()) {
             const auto remaining = out.size() - offset;
             const auto request = std::min<std::size_t>(remaining, 1u << 20);
             const ssize_t n = ::getrandom(out.data() + offset, request, 0);
             if (n < 0) {
                 if (errno == EINTR) { continue; }
                 if (errno == ENOSYS) { break; }
-                throw std::runtime_error("secure_random: getrandom failed: " + std::to_string(errno));
+                throw std::runtime_error("secureRandom: getrandom failed: " + std::to_string(errno));
             }
             offset += static_cast<std::size_t>(n);
-        }
-        if (offset < out.size()) { fill_from_urandom(out.subspan(offset)); }
+        } if (offset < out.size()) { fillFromUrandom(out.subspan(offset)); }
         #else
-        fill_from_urandom(out);
+        fillFromUrandom(out);
         #endif
     }
 
-    void secure_wipe(std::span<std::uint8_t> secret) noexcept {
+    void secureWipe(std::span<std::uint8_t> secret) noexcept {
         if (secret.empty()) { return; }
 
         #ifdef _WIN32
         (void)::SecureZeroMemory(secret.data(), secret.size());
         #else
-        volatile std::uint8_t* p = secret.data();
-        for (std::size_t i = 0; i < secret.size(); ++i) { p[i] = 0; }
+        volatile std::uint8_t* p = secret.data(); for (std::size_t i = 0; i < secret.size(); ++i) { p[i] = 0; }
         #endif
     }
 } // namespace akkaradb::crypto

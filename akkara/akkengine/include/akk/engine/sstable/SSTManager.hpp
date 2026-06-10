@@ -40,31 +40,31 @@ namespace akkaradb::engine::sst {
 
         public:
             struct Options {
-                std::filesystem::path sst_dir;
-                int max_levels = 7;
-                int max_l0_files = 4;
-                uint64_t l1_max_bytes = 64ULL * 1024ULL * 1024ULL;
-                double level_size_multiplier = 10.0;
-                uint64_t target_file_size = SST_DEFAULT_TARGET_FILE_SIZE;
-                uint32_t block_size = SST_DEFAULT_BLOCK_SIZE;
-                uint32_t bloom_bits_per_key = SST_DEFAULT_BLOOM_BITS_PER_KEY;
-                uint64_t block_cache_bytes = 64ULL * 1024ULL * 1024ULL;
-                int compact_threads = 2;
-                SSTWriter::Codec codec = SSTWriter::Codec::Zstd;
+                std::filesystem::path sstDir;
+                int maxLevels = 7;
+                int maxL0Files = 4;
+                uint64_t l1MaxBytes = 64ULL * 1024ULL * 1024ULL;
+                double levelSizeMultiplier = 10.0;
+                uint64_t targetFileSize = SST_DEFAULT_TARGET_FILE_SIZE;
+                uint32_t blockSize = SST_DEFAULT_BLOCK_SIZE;
+                uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
+                uint64_t blockCacheBytes = 64ULL * 1024ULL * 1024ULL;
+                int compactThreads = 2;
+                SSTWriter::Codec codec = SSTWriter::Codec::ZSTD;
             };
 
             struct LevelStats {
                 int level = 0;
-                size_t file_count = 0;
+                size_t fileCount = 0;
                 uint64_t bytes = 0;
-                uint64_t budget_bytes = 0;
+                uint64_t budgetBytes = 0;
             };
 
             struct CompactionSnapshot {
-                uint64_t compactions_completed = 0;
-                uint64_t files_compacted = 0;
-                uint64_t bytes_compacted_in = 0;
-                uint64_t bytes_compacted_out = 0;
+                uint64_t compactionsCompleted = 0;
+                uint64_t filesCompacted = 0;
+                uint64_t bytesCompactedIn = 0;
+                uint64_t bytesCompactedOut = 0;
             };
 
             class Iterator {
@@ -76,7 +76,7 @@ namespace akkaradb::engine::sst {
                     Iterator(const Iterator&) = delete;
                     Iterator& operator=(const Iterator&) = delete;
 
-                    [[nodiscard]] bool has_next() const noexcept;
+                    [[nodiscard]] bool hasNext() const noexcept;
                     [[nodiscard]] std::optional<SSTRecord> next();
 
                 private:
@@ -98,12 +98,12 @@ namespace akkaradb::engine::sst {
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const;
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
-            [[nodiscard]] Iterator scan_iter(std::span<const uint8_t> start_key = {}, std::span<const uint8_t> end_key = {}) const;
+            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
+            [[nodiscard]] Iterator scanIter(std::span<const uint8_t> startKey = {}, std::span<const uint8_t> endKey = {}) const;
 
-            [[nodiscard]] std::vector<LevelStats> level_stats() const;
-            [[nodiscard]] bool compaction_pending() const noexcept;
-            [[nodiscard]] CompactionSnapshot compaction_snapshot() const noexcept;
+            [[nodiscard]] std::vector<LevelStats> levelStats() const;
+            [[nodiscard]] bool compactionPending() const noexcept;
+            [[nodiscard]] CompactionSnapshot compactionSnapshot() const noexcept;
 
         private:
             SSTManager(Options options, manifest::Manifest* manifest);

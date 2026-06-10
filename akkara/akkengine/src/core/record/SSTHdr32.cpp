@@ -19,24 +19,25 @@
 // akkengine/src/core/record/SSTHdr32.cpp
 #include "akk/core/record/SSTHdr32.hpp"
 
-#include <cassert>
+#include <limits>
+#include <stdexcept>
 
 namespace akkaradb::core {
     // ==================== SSTHdr32 Implementation ====================
-    SSTHdr32 SSTHdr32::create(const uint8_t* key, size_t key_len, size_t value_len, uint64_t seq, uint8_t flags) noexcept {
-        assert(key_len <= 0xFFFFu && "SSTHdr32::create: key_len exceeds u16 range");
-        assert(value_len <= 0xFFFFu && "SSTHdr32::create: value_len exceeds u16 range");
-        assert((flags & ~(FLAG_TOMBSTONE | FLAG_BLOB)) == 0 && "SSTHdr32::create: invalid flags");
+    SSTHdr32 SSTHdr32::create(const uint8_t* key, size_t keyLen, size_t valueLen, uint64_t seq, uint8_t flags) {
+        if (keyLen > std::numeric_limits<uint16_t>::max()) { throw std::length_error("SSTHdr32::create: keyLen exceeds u16 range"); }
+        if (valueLen > std::numeric_limits<uint16_t>::max()) { throw std::length_error("SSTHdr32::create: valueLen exceeds u16 range"); }
+        if ((flags & ~(FLAG_TOMBSTONE | FLAG_BLOB)) != 0) { throw std::invalid_argument("SSTHdr32::create: invalid flags"); }
 
         return SSTHdr32{
             .seq = seq,
-            .k_len = static_cast<uint16_t>(key_len),
-            .v_len = static_cast<uint16_t>(value_len),
+            .kLen = static_cast<uint16_t>(keyLen),
+            .vLen = static_cast<uint16_t>(valueLen),
             .flags = flags,
             .reserved0 = 0,
             .reserved1 = 0,
-            .key_fp64 = compute_key_fp64(key, key_len),
-            .mini_key = build_mini_key(key, key_len)
+            .keyFp64 = computeKeyFp64(key, keyLen),
+            .miniKey = buildMiniKey(key, keyLen)
         };
     }
 } // namespace akkaradb::core

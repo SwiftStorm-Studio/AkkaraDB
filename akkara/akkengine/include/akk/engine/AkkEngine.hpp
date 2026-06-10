@@ -41,33 +41,33 @@ namespace akkaradb::engine {
     using VersionEntry = vlog::VersionEntry;
 
     enum class Codec : uint8_t {
-        None = 0, Zstd = 1,
+        NONE = 0, ZSTD = 1,
     };
 
     struct AkkEngineOptions {
         struct Paths {
-            std::filesystem::path data_dir;
-            std::filesystem::path wal_dir;
-            std::filesystem::path blob_dir;
-            std::filesystem::path sst_dir;
-            std::filesystem::path manifest_path;
-            std::filesystem::path version_log_path;
-            std::filesystem::path cluster_config_path;
-            std::filesystem::path node_id_path;
+            std::filesystem::path dataDir;
+            std::filesystem::path walDir;
+            std::filesystem::path blobDir;
+            std::filesystem::path sstDir;
+            std::filesystem::path manifestPath;
+            std::filesystem::path versionLogPath;
+            std::filesystem::path clusterConfigPath;
+            std::filesystem::path nodeIdPath;
         } paths;
 
         struct Components {
-            bool wal_enabled = true;
-            bool blob_enabled = true;
-            bool manifest_enabled = true;
-            bool sst_enabled = true;
-            bool version_log_enabled = false;
-            bool cluster_enabled = false;
-            bool api_enabled = false;
+            bool walEnabled = true;
+            bool blobEnabled = true;
+            bool manifestEnabled = true;
+            bool sstEnabled = true;
+            bool versionLogEnabled = false;
+            bool clusterEnabled = false;
+            bool apiEnabled = false;
         } components;
 
         struct ManifestOptions {
-            bool fast_mode = false;
+            bool fastMode = false;
         } manifest;
 
         struct ClusterOptions {
@@ -76,53 +76,53 @@ namespace akkaradb::engine {
         } cluster;
 
         enum class ApiBackend : uint8_t {
-            Http = 0, Tcp = 1,
+            HTTP = 0, TCP = 1,
         };
 
         enum class ApiIoBackend : uint8_t {
-            Auto = 0, ThreadPool = 1,
+            AUTO = 0, THREAD_POOL = 1,
         };
 
         struct ApiTlsOptions {
-            std::filesystem::path cert_path;
-            std::filesystem::path key_path;
-            std::filesystem::path ca_path;
+            std::filesystem::path certPath;
+            std::filesystem::path keyPath;
+            std::filesystem::path caPath;
             std::vector<uint8_t> psk;
-            std::string psk_identity;
-            bool verify_peer = true;
+            std::string pskIdentity;
+            bool verifyPeer = true;
         };
 
         struct ApiOptions {
             std::vector<ApiBackend> backends;
-            std::string bind_host;
-            uint16_t http_port = 7070;
-            uint16_t tcp_port = 7071;
-            ApiIoBackend tcp_io_backend = ApiIoBackend::Auto;
-            uint32_t tcp_worker_threads = 0;
-            uint32_t tcp_accept_queue_limit = 4096;
-            uint32_t tcp_accept_queue_timeout_ms = 60000;
-            uint32_t tcp_listen_backlog = 1024;
-            uint32_t tcp_recv_buffer_bytes = 0;
-            uint32_t tcp_send_buffer_bytes = 0;
-            uint32_t tcp_pipeline_batch_limit = 64;
-            uint32_t tcp_max_batch_items = 4096;
-            uint64_t tcp_max_pending_response_bytes = 8ULL * 1024ULL * 1024ULL;
-            uint32_t tcp_read_timeout_ms = 60000;
-            uint32_t tcp_write_timeout_ms = 30000;
-            bool tcp_no_delay = true;
-            bool tcp_keep_alive = true;
-            cluster::TransportMode transport_mode = cluster::TransportMode::TLS;
+            std::string bindHost;
+            uint16_t httpPort = 7070;
+            uint16_t tcpPort = 7071;
+            ApiIoBackend tcpIoBackend = ApiIoBackend::AUTO;
+            uint32_t tcpWorkerThreads = 0;
+            uint32_t tcpAcceptQueueLimit = 4096;
+            uint32_t tcpAcceptQueueTimeoutMs = 60000;
+            uint32_t tcpListenBacklog = 1024;
+            uint32_t tcpRecvBufferBytes = 0;
+            uint32_t tcpSendBufferBytes = 0;
+            uint32_t tcpPipelineBatchLimit = 64;
+            uint32_t tcpMaxBatchItems = 4096;
+            uint64_t tcpMaxPendingResponseBytes = 8ULL * 1024ULL * 1024ULL;
+            uint32_t tcpReadTimeoutMs = 60000;
+            uint32_t tcpWriteTimeoutMs = 30000;
+            bool tcpNoDelay = true;
+            bool tcpKeepAlive = true;
+            cluster::TransportMode transportMode = cluster::TransportMode::TLS;
             ApiTlsOptions tls;
         } api;
 
         struct RuntimeOptions {
-            uint32_t writer_threads = 0;
-            bool recover_wal = true;
-            bool recover_sst = true;
-            bool prune_wal_on_flush = true;
-            bool force_flush_on_close = true;
-            bool force_sync_on_close = true;
-            bool sst_promote_reads = false;
+            uint32_t writerThreads = 0;
+            bool recoverWal = true;
+            bool recoverSst = true;
+            bool pruneWalOnFlush = true;
+            bool forceFlushOnClose = true;
+            bool forceSyncOnClose = true;
+            bool sstPromoteReads = false;
         } runtime;
 
         memtable::MemTable::Options memtable;
@@ -158,32 +158,32 @@ namespace akkaradb::engine {
             AkkEngine& operator=(AkkEngine&&) = delete;
 
             void put(std::span<const uint8_t> key, std::span<const uint8_t> value);
-            void put_hinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t mini_key);
-            void put_batch(std::span<const BatchPutEntry> entries);
+            void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey);
+            void putBatch(std::span<const BatchPutEntry> entries);
             void remove(std::span<const uint8_t> key);
-            void remove_hinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t mini_key);
+            void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey);
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> get(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::vector<BatchGetResult> get_batch(std::span<const std::span<const uint8_t>> keys) const;
+            [[nodiscard]] std::vector<BatchGetResult> getBatch(std::span<const std::span<const uint8_t>> keys) const;
             [[nodiscard]] bool exists(std::span<const uint8_t> key) const;
-            [[nodiscard]] bool get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
-            [[nodiscard]] bool get_into_arena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const;
-            [[nodiscard]] size_t count(std::span<const uint8_t> start_key = {}, std::span<const uint8_t> end_key = {}) const;
+            [[nodiscard]] bool getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
+            [[nodiscard]] bool getIntoArena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const;
+            [[nodiscard]] size_t count(std::span<const uint8_t> startKey = {}, std::span<const uint8_t> endKey = {}) const;
             [[nodiscard]] core::ArenaGenerator<ScanRecordView> scan(
                 core::BufferArena& arena,
-                std::span<const uint8_t> start_key = {},
-                std::span<const uint8_t> end_key = {}
+                std::span<const uint8_t> startKey = {},
+                std::span<const uint8_t> endKey = {}
             ) const;
 
-            [[nodiscard]] std::optional<std::vector<uint8_t>> get_at(std::span<const uint8_t> key, uint64_t at_seq) const;
+            [[nodiscard]] std::optional<std::vector<uint8_t>> getAt(std::span<const uint8_t> key, uint64_t atSeq) const;
             [[nodiscard]] std::vector<VersionEntry> history(std::span<const uint8_t> key) const;
-            void rollback_to(uint64_t target_seq);
-            void rollback_key(std::span<const uint8_t> key, uint64_t target_seq);
+            void rollbackTo(uint64_t targetSeq);
+            void rollbackKey(std::span<const uint8_t> key, uint64_t targetSeq);
 
             [[nodiscard]] EngineStats stats() const noexcept;
 
-            void force_sync();
-            void force_flush();
+            void forceSync();
+            void forceFlush();
             void close();
 
         private:

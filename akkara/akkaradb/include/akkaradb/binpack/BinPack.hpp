@@ -29,25 +29,27 @@ namespace akkaradb::binpack {
         template <typename T>
         [[nodiscard]] static std::vector<uint8_t> encode(const T& value) {
             std::vector<uint8_t> out;
-            out.reserve(TypeAdapter<T>::estimate_size(value));
+            out.reserve(TypeAdapter<T>::estimateSize(value));
             TypeAdapter<T>::write(value, out);
             return out;
         }
 
         template <typename T, typename Out>
-        static void encode_into(const T& value, Out& out) { TypeAdapter<T>::write(value, out); }
+        static void encodeInto(const T& value, Out& out) { TypeAdapter<T>::write(value, out); }
 
         template <typename T>
         [[nodiscard]] static T decode(std::span<const uint8_t> bytes) { return TypeAdapter<T>::read(bytes); }
 
         template <typename T>
-        [[nodiscard]] static T decode(const std::vector<uint8_t>& bytes) { return decode<T>(std::span<const uint8_t>{bytes.data(), bytes.size()}); }
+        [[nodiscard]] static T decode(const std::vector<uint8_t>& bytes) {
+            return decode<T>(std::span<const uint8_t>{bytes.data(), bytes.size()});
+        }
 
         template <typename T>
-        static bool decode_into(std::span<const uint8_t> bytes, T& out) { return TypeAdapter<T>::read_into(bytes, out); }
+        static bool decodeInto(std::span<const uint8_t> bytes, T& out) { return TypeAdapter<T>::readInto(bytes, out); }
 
         template <typename T>
-        [[nodiscard]] static size_t estimate_size(const T& value) { return TypeAdapter<T>::estimate_size(value); }
+        [[nodiscard]] static size_t estimateSize(const T& value) { return TypeAdapter<T>::estimateSize(value); }
 
         BinPack() = delete;
     };

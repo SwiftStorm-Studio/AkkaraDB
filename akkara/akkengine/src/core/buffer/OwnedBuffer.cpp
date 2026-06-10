@@ -26,7 +26,7 @@ namespace akkaradb::core {
     namespace {
         // ==================== Heap Deleter ====================
 
-        void heap_deleter(void* ptr, size_t /*size*/, void* /*ctx*/) { operator delete(ptr); }
+        void heapDeleter(void* ptr, size_t /*size*/, void* /*ctx*/) { operator delete(ptr); }
     }
 
     // ==================== Factory ====================
@@ -36,10 +36,10 @@ namespace akkaradb::core {
 
         void* ptr = operator new(size);
 
-        return {static_cast<std::byte*>(ptr), size, &heap_deleter, nullptr};
+        return {static_cast<std::byte*>(ptr), size, &heapDeleter, nullptr};
     }
 
     // ==================== View ====================
 
-    BufferView OwnedBuffer::as_view() const noexcept { return BufferView{data_, size_}; }
+    BufferView OwnedBuffer::asView() const noexcept { return BufferView{data_, size_}; }
 } // namespace akkaradb::core

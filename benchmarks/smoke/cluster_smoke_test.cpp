@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/smoke/cluster_smoke_test.cpp
+// benchmarks/smoke/clusterSmokeTest.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/cluster/ClusterConfig.hpp"
@@ -42,30 +42,30 @@
 using namespace akkaradb::engine::cluster;
 
 namespace {
-    std::filesystem::path make_temp_dir(const std::string& suffix) {
-        const auto dir = std::filesystem::temp_directory_path() / ("akkaradb_cluster_smoke_" + suffix);
+    std::filesystem::path makeTempDir(const std::string& suffix) {
+        const auto dir = std::filesystem::temp_directory_path() / ("akkaradbClusterSmoke_" + suffix);
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir, ec);
-        assert(!ec);
+        AKK_TEST_CHECK(!ec);
         return dir;
     }
 
-    NodeInfo node(uint64_t id, uint16_t data_port, uint16_t repl_port, uint32_t capabilities) {
+    NodeInfo node(uint64_t id, uint16_t dataPort, uint16_t replPort, uint32_t capabilities) {
         return NodeInfo{
-            .node_id = id,
+            .nodeId = id,
             .host = "127.0.0.1",
-            .data_port = data_port,
-            .repl_port = repl_port,
+            .dataPort = dataPort,
+            .replPort = replPort,
             .capabilities = capabilities,
         };
     }
 
-    std::span<const uint8_t> bytes_of(const std::string& value) {
+    std::span<const uint8_t> bytesOf(const std::string& value) {
         return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
     }
 
-    void expect_throw_load(const std::filesystem::path& path) {
+    void expectThrowLoad(const std::filesystem::path& path) {
         bool threw = false;
         try {
             (void)ClusterConfig::load(path);
@@ -73,31 +73,31 @@ namespace {
         catch (const std::runtime_error&) {
             threw = true;
         }
-        assert(threw);
+        AKK_TEST_CHECK(threw);
     }
 
-    void test_config_roundtrip_and_rejection() {
-        const auto dir = make_temp_dir("config");
+    void testConfigRoundtripAndRejection() {
+        const auto dir = makeTempDir("config");
         const auto path = dir / "cluster.akcc";
-        const AckPolicy ack{.mode = AckPolicyMode::Quorum, .quorum = 2};
+        const AckPolicy ack{.mode = AckPolicyMode::QUORUM, .quorum = 2};
         const ClusterConfig cfg{
             {
-                node(1, 0, 19601, static_cast<uint32_t>(NodeCapability::CoordinatorEligible)),
-                node(2, 19702, 19602, static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(3, 19703, 19603, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(1, 0, 19601, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE)),
+                node(2, 19702, 19602, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(3, 19703, 19603, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Stripe,
+            ReplicationMode::STRIPE,
             ack,
         };
 
         ClusterConfig::save(path, cfg);
         const auto loaded = ClusterConfig::load(path);
-        assert(loaded.mode() == ReplicationMode::Stripe);
-        assert(loaded.ack_policy().mode == AckPolicyMode::Quorum);
-        assert(loaded.ack_policy().quorum == 2);
-        assert(loaded.find_by_id(2) != nullptr);
-        assert(loaded.data_nodes().size() == 2);
-        assert(loaded.coordinator_nodes().size() == 1);
+        AKK_TEST_CHECK(loaded.mode() == ReplicationMode::STRIPE);
+        AKK_TEST_CHECK(loaded.ackPolicy().mode == AckPolicyMode::QUORUM);
+        AKK_TEST_CHECK(loaded.ackPolicy().quorum == 2);
+        AKK_TEST_CHECK(loaded.findById(2) != nullptr);
+        AKK_TEST_CHECK(loaded.dataNodes().size() == 2);
+        AKK_TEST_CHECK(loaded.coordinatorNodes().size() == 1);
 
         {
             auto corrupt = path;
@@ -108,7 +108,7 @@ namespace {
             char bad = '\x7f';
             file.write(&bad, 1);
             file.close();
-            expect_throw_load(corrupt);
+            expectThrowLoad(corrupt);
         }
 
         {
@@ -119,237 +119,237 @@ namespace {
             char bad = '\0';
             file.write(&bad, 1);
             file.close();
-            expect_throw_load(corrupt);
+            expectThrowLoad(corrupt);
         }
 
-        bool invalid_capability = false;
+        bool invalidCapability = false;
         try {
-            (void)ClusterConfig{{node(9, 19709, 19609, 0x80)}, ReplicationMode::Mirror, AckPolicy{}};
+            (void)ClusterConfig{{node(9, 19709, 19609, 0x80)}, ReplicationMode::MIRROR, AckPolicy{}};
         }
         catch (const std::invalid_argument&) {
-            invalid_capability = true;
+            invalidCapability = true;
         }
-        assert(invalid_capability);
+        AKK_TEST_CHECK(invalidCapability);
     }
 
-    void test_router() {
+    void testRouter() {
         const ClusterConfig mirror{
             {
-                node(1, 0, 19611, static_cast<uint32_t>(NodeCapability::CoordinatorEligible)),
-                node(2, 19712, 19612, static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(3, 19713, 19613, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(1, 0, 19611, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE)),
+                node(2, 19712, 19612, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(3, 19713, 19613, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Mirror,
+            ReplicationMode::MIRROR,
             AckPolicy{},
         };
-        ClusterRouter mirror_router{mirror};
+        ClusterRouter mirrorRouter{mirror};
         const std::string key = "customer:42";
-        assert(mirror_router.write_targets(bytes_of(key)).size() == 2);
+        AKK_TEST_CHECK(mirrorRouter.writeTargets(bytesOf(key)).size() == 2);
 
-        const ClusterConfig stripe_a{
+        const ClusterConfig stripeA{
             {
-                node(1, 0, 19621, static_cast<uint32_t>(NodeCapability::CoordinatorEligible)),
-                node(2, 19722, 19622, static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(3, 19723, 19623, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(1, 0, 19621, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE)),
+                node(2, 19722, 19622, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(3, 19723, 19623, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Stripe,
+            ReplicationMode::STRIPE,
             AckPolicy{},
         };
-        const ClusterConfig stripe_b{
+        const ClusterConfig stripeB{
             {
-                node(3, 19723, 19623, static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(1, 0, 19621, static_cast<uint32_t>(NodeCapability::CoordinatorEligible)),
-                node(2, 19722, 19622, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(3, 19723, 19623, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(1, 0, 19621, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE)),
+                node(2, 19722, 19622, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Stripe,
+            ReplicationMode::STRIPE,
             AckPolicy{},
         };
-        ClusterRouter router_a{stripe_a};
-        ClusterRouter router_b{stripe_b};
-        const auto target_a = router_a.write_targets(bytes_of(key));
-        const auto target_b = router_b.write_targets(bytes_of(key));
-        assert(target_a.size() == 1);
-        assert(target_b.size() == 1);
-        assert(target_a[0].node_id == target_b[0].node_id);
-        assert(router_a.read_candidates(bytes_of(key))[0].node_id == target_a[0].node_id);
+        ClusterRouter routerA{stripeA};
+        ClusterRouter routerB{stripeB};
+        const auto targetA = routerA.writeTargets(bytesOf(key));
+        const auto targetB = routerB.writeTargets(bytesOf(key));
+        AKK_TEST_CHECK(targetA.size() == 1);
+        AKK_TEST_CHECK(targetB.size() == 1);
+        AKK_TEST_CHECK(targetA[0].nodeId == targetB[0].nodeId);
+        AKK_TEST_CHECK(routerA.readCandidates(bytesOf(key))[0].nodeId == targetA[0].nodeId);
     }
 
-    void test_framing() {
+    void testFraming() {
         const std::vector<uint8_t> key{'k'};
         const std::vector<uint8_t> value{'v'};
-        const auto entry_wire = encode_entry(ReplEntry{
+        const auto entryWire = encodeEntry(ReplEntry{
             .seq = 9,
-            .source_node_id = 1,
-            .op = ReplOpType::Put,
-            .record_flags = 7,
+            .sourceNodeId = 1,
+            .op = ReplOpType::PUT,
+            .recordFlags = 7,
             .key = key,
             .value = value,
         });
 
         DecodedFrame frame;
-        assert(decode_frame(entry_wire, frame));
-        assert(frame.type == ReplMsgType::Entry);
+        AKK_TEST_CHECK(decodeFrame(entryWire, frame));
+        AKK_TEST_CHECK(frame.type == ReplMsgType::ENTRY);
         ReplEntry entry;
-        assert(decode_entry(frame.payload, entry));
-        assert(entry.seq == 9);
-        assert(entry.record_flags == 7);
-        assert(entry.key == key);
-        assert(entry.value == value);
+        AKK_TEST_CHECK(decodeEntry(frame.payload, entry));
+        AKK_TEST_CHECK(entry.seq == 9);
+        AKK_TEST_CHECK(entry.recordFlags == 7);
+        AKK_TEST_CHECK(entry.key == key);
+        AKK_TEST_CHECK(entry.value == value);
 
-        auto corrupt = entry_wire;
+        auto corrupt = entryWire;
         corrupt.back() ^= 0x55;
-        assert(!decode_frame(corrupt, frame));
+        AKK_TEST_CHECK(!decodeFrame(corrupt, frame));
 
-        auto truncated = entry_wire;
+        auto truncated = entryWire;
         truncated.pop_back();
-        assert(!decode_frame(truncated, frame));
+        AKK_TEST_CHECK(!decodeFrame(truncated, frame));
     }
 
-    void test_manager_election() {
-        const auto dir1 = make_temp_dir("manager1");
-        const auto dir2 = make_temp_dir("manager2");
+    void testManagerElection() {
+        const auto dir1 = makeTempDir("manager1");
+        const auto dir2 = makeTempDir("manager2");
         const ClusterConfig cfg{
             {
-                node(1, 19781, 19801, static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(2, 19782, 19802, static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(1, 19781, 19801, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE) | static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(2, 19782, 19802, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE) | static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Mirror,
+            ReplicationMode::MIRROR,
             AckPolicy{},
         };
 
         auto primary = ClusterManager::create(dir1, cfg, 1);
         auto replica = ClusterManager::create(dir2, cfg, 2);
-        std::atomic<int> primary_changes{0};
-        primary->set_role_change_callback([&](NodeRole role) {
-            if (role == NodeRole::Primary) {
-                ++primary_changes;
+        std::atomic<int> primaryChanges{0};
+        primary->setRoleChangeCallback([&](NodeRole role) {
+            if (role == NodeRole::PRIMARY) {
+                ++primaryChanges;
             }
         });
 
         primary->start();
-        assert(primary->role() == NodeRole::Primary);
+        AKK_TEST_CHECK(primary->role() == NodeRole::PRIMARY);
         replica->start();
-        assert(replica->role() == NodeRole::Replica);
-        assert(primary_changes.load() >= 1);
-        assert(replica->primary_host() == "127.0.0.1");
-        assert(replica->primary_repl_port() == 19801);
+        AKK_TEST_CHECK(replica->role() == NodeRole::REPLICA);
+        AKK_TEST_CHECK(primaryChanges.load() >= 1);
+        AKK_TEST_CHECK(replica->primaryHost() == "127.0.0.1");
+        AKK_TEST_CHECK(replica->primaryReplPort() == 19801);
 
         replica->close();
         primary->close();
     }
 
-    void test_plain_replication() {
+    void testPlainReplication() {
         constexpr uint16_t port = 19971;
         ClusterRuntimeOptions plain{};
-        plain.transport_mode = TransportMode::Plain;
-        const AckPolicy all{.mode = AckPolicyMode::All, .quorum = 0};
+        plain.transportMode = TransportMode::PLAIN;
+        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
 
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, plain);
         std::atomic<int> applied{0};
         std::atomic<int> blobs{0};
 
         auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, plain);
-        client->set_apply_callback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
-            assert(seq == 1);
-            assert(op == ReplOpType::Put);
-            assert(source == 1);
-            assert(flags == 3);
-            assert(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "k");
-            assert(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "v");
+        client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
+            AKK_TEST_CHECK(seq == 1);
+            AKK_TEST_CHECK(op == ReplOpType::PUT);
+            AKK_TEST_CHECK(source == 1);
+            AKK_TEST_CHECK(flags == 3);
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "k");
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "v");
             ++applied;
         });
-        client->set_blob_callback([&](uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) {
-            assert(seq == 1);
-            assert(blob_id == 99);
-            assert(std::string(reinterpret_cast<const char*>(content.data()), content.size()) == "blob");
+        client->setBlobCallback([&](uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+            AKK_TEST_CHECK(seq == 1);
+            AKK_TEST_CHECK(blobId == 99);
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(content.data()), content.size()) == "blob");
             ++blobs;
         });
 
         server->start();
         client->start();
 
-        for (int i = 0; i < 50 && server->replica_count() == 0; ++i) {
+        for (int i = 0; i < 50 && server->replicaCount() == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        assert(server->replica_count() == 1);
+        AKK_TEST_CHECK(server->replicaCount() == 1);
 
         const std::string key = "k";
         const std::string value = "v";
         const std::string blob = "blob";
-        server->ship_blob(1, 99, bytes_of(blob));
-        server->ship_entry(1, ReplOpType::Put, bytes_of(key), bytes_of(value), 3, 1);
+        server->shipBlob(1, 99, bytesOf(blob));
+        server->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 3, 1);
 
         for (int i = 0; i < 50 && (applied.load() == 0 || blobs.load() == 0); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        assert(applied.load() == 1);
-        assert(blobs.load() == 1);
+        AKK_TEST_CHECK(applied.load() == 1);
+        AKK_TEST_CHECK(blobs.load() == 1);
 
         client->close();
         server->close();
     }
 
-    void test_transport_default() {
+    void testTransportDefault() {
         ClusterRuntimeOptions options{};
-        assert(options.transport_mode == TransportMode::TLS);
-        assert(options.repl_bind_host == "0.0.0.0");
+        AKK_TEST_CHECK(options.transportMode == TransportMode::TLS);
+        AKK_TEST_CHECK(options.replBindHost == "0.0.0.0");
 
         constexpr uint16_t port = 19972;
-        const AckPolicy all{.mode = AckPolicyMode::All, .quorum = 0};
+        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, options);
         std::atomic<int> applied{0};
 
         auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, options);
-        client->set_apply_callback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
-            assert(seq == 2);
-            assert(op == ReplOpType::Put);
-            assert(source == 1);
-            assert(flags == 4);
-            assert(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "tls-k");
-            assert(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "tls-v");
+        client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
+            AKK_TEST_CHECK(seq == 2);
+            AKK_TEST_CHECK(op == ReplOpType::PUT);
+            AKK_TEST_CHECK(source == 1);
+            AKK_TEST_CHECK(flags == 4);
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "tls-k");
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "tls-v");
             ++applied;
         });
 
         server->start();
         client->start();
 
-        for (int i = 0; i < 50 && server->replica_count() == 0; ++i) {
+        for (int i = 0; i < 50 && server->replicaCount() == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        assert(server->replica_count() == 1);
+        AKK_TEST_CHECK(server->replicaCount() == 1);
 
         const std::string key = "tls-k";
         const std::string value = "tls-v";
-        server->ship_entry(2, ReplOpType::Put, bytes_of(key), bytes_of(value), 4, 1);
+        server->shipEntry(2, ReplOpType::PUT, bytesOf(key), bytesOf(value), 4, 1);
 
         for (int i = 0; i < 50 && applied.load() == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        assert(applied.load() == 1);
+        AKK_TEST_CHECK(applied.load() == 1);
 
         client->close();
         server->close();
     }
 
-    void test_plain_transport_rejects_wan_hosts() {
-        const auto dir = make_temp_dir("plain_wan_reject");
+    void testPlainTransportRejectsWanHosts() {
+        const auto dir = makeTempDir("plainWanReject");
         const ClusterConfig cfg{
             {
                 NodeInfo{
-                    .node_id = 1,
+                    .nodeId = 1,
                     .host = "203.0.113.10",
-                    .data_port = 19791,
-                    .repl_port = 19811,
-                    .capabilities = static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing),
+                    .dataPort = 19791,
+                    .replPort = 19811,
+                    .capabilities = static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE) | static_cast<uint32_t>(NodeCapability::DATA_BEARING),
                 },
-                node(2, 19792, 19812, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(2, 19792, 19812, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Mirror,
+            ReplicationMode::MIRROR,
             AckPolicy{},
         };
 
         ClusterRuntimeOptions plain{};
-        plain.transport_mode = TransportMode::Plain;
+        plain.transportMode = TransportMode::PLAIN;
 
         bool rejected = false;
         try {
@@ -359,17 +359,17 @@ namespace {
         catch (const std::invalid_argument&) {
             rejected = true;
         }
-        assert(rejected);
+        AKK_TEST_CHECK(rejected);
     }
 
-    void test_runtime_rejects_stripe_until_routing_exists() {
-        const auto dir = make_temp_dir("stripe_runtime_reject");
+    void testRuntimeRejectsStripeUntilRoutingExists() {
+        const auto dir = makeTempDir("stripeRuntimeReject");
         const ClusterConfig cfg{
             {
-                node(1, 19793, 19813, static_cast<uint32_t>(NodeCapability::CoordinatorEligible) | static_cast<uint32_t>(NodeCapability::DataBearing)),
-                node(2, 19794, 19814, static_cast<uint32_t>(NodeCapability::DataBearing)),
+                node(1, 19793, 19813, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE) | static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
+                node(2, 19794, 19814, static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
             },
-            ReplicationMode::Stripe,
+            ReplicationMode::STRIPE,
             AckPolicy{},
         };
 
@@ -381,21 +381,21 @@ namespace {
         catch (const std::invalid_argument&) {
             rejected = true;
         }
-        assert(rejected);
+        AKK_TEST_CHECK(rejected);
     }
 } // namespace
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    test_config_roundtrip_and_rejection();
-    test_router();
-    test_framing();
-    test_manager_election();
-    test_plain_replication();
-    test_transport_default();
-    test_plain_transport_rejects_wan_hosts();
-    test_runtime_rejects_stripe_until_routing_exists();
+    testConfigRoundtripAndRejection();
+    testRouter();
+    testFraming();
+    testManagerElection();
+    testPlainReplication();
+    testTransportDefault();
+    testPlainTransportRejectsWanHosts();
+    testRuntimeRejectsStripeUntilRoutingExists();
     std::printf("cluster smoke test passed\n");
     return 0;
 }

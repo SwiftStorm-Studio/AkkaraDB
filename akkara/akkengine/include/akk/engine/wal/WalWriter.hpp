@@ -27,27 +27,27 @@
 
 namespace akkaradb::engine::wal {
     enum class WalSyncMode : uint8_t {
-        Sync = 0, Async = 1, Off = 2,
+        SYNC = 0, ASYNC = 1, OFF = 2,
     };
 
     struct WalOptions {
-        std::filesystem::path wal_dir;
-        WalSyncMode sync_mode = WalSyncMode::Sync;
+        std::filesystem::path walDir;
+        WalSyncMode syncMode = WalSyncMode::SYNC;
         // 0 means auto: one shard per hardware thread, capped at 16.
-        uint16_t shard_count = 0;
-        uint32_t group_n = 128;
-        uint32_t group_micros = 100;
-        uint64_t group_bytes = 4ULL * 1024ULL * 1024ULL;
-        uint64_t async_max_pending_bytes = 64ULL * 1024ULL * 1024ULL;
+        uint16_t shardCount = 0;
+        uint32_t groupN = 128;
+        uint32_t groupMicros = 100;
+        uint64_t groupBytes = 4ULL * 1024ULL * 1024ULL;
+        uint64_t asyncMaxPendingBytes = 64ULL * 1024ULL * 1024ULL;
     };
 
     struct WalWriterSnapshot {
-        uint32_t shard_count = 0;
-        uint64_t entries_written = 0;
-        uint64_t bytes_written = 0;
-        uint64_t batches_flushed = 0;
-        uint64_t syncs_executed = 0;
-        uint64_t segment_rotations = 0;
+        uint32_t shardCount = 0;
+        uint64_t entriesWritten = 0;
+        uint64_t bytesWritten = 0;
+        uint64_t batchesFlushed = 0;
+        uint64_t syncsExecuted = 0;
+        uint64_t segmentRotations = 0;
     };
 
     class WalWriter {
@@ -60,10 +60,16 @@ namespace akkaradb::engine::wal {
             WalWriter(WalWriter&&) = delete;
             WalWriter& operator=(WalWriter&&) = delete;
 
-            void append(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t seq, uint8_t flags, uint64_t precomputed_fp64 = 0);
+            void append(
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t seq,
+                uint8_t flags,
+                uint64_t precomputedFp64 = 0
+            );
 
-            void force_sync();
-            void prune_until(uint64_t checkpoint_seq);
+            void forceSync();
+            void pruneUntil(uint64_t checkpointSeq);
             [[nodiscard]] WalWriterSnapshot snapshot() const noexcept;
             void close();
 

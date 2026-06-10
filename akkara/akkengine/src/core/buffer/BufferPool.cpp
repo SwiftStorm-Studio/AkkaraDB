@@ -47,7 +47,7 @@ namespace akkaradb::core {
 
         struct ThreadLocalPoolCache {
             const BufferPool* pool{nullptr};
-            size_t class_count{0};
+            size_t classCount{0};
             std::unique_ptr<ThreadLocalClassCache[]> bins{};
 
             ThreadLocalPoolCache() = default;
@@ -58,7 +58,7 @@ namespace akkaradb::core {
 
             void clear() noexcept {
                 if (!bins) { return; }
-                for (size_t i = 0; i < class_count; ++i) {
+                for (size_t i = 0; i < classCount; ++i) {
                     auto& [entries, count] = bins[i];
                     while (count > 0) {
                         auto& [raw, payload] = entries[--count];
@@ -72,64 +72,64 @@ namespace akkaradb::core {
             ~ThreadLocalPoolCache() { clear(); }
         };
 
-        thread_local std::vector<ThreadLocalPoolCache> tls_pools;
+        thread_local std::vector<ThreadLocalPoolCache> tlsPools;
 
-        ThreadLocalPoolCache* find_tls_pool_cache(const BufferPool* pool) noexcept {
-            for (auto& cache : tls_pools) { if (cache.pool == pool) { return &cache; } }
+        ThreadLocalPoolCache* findTlsPoolCache(const BufferPool* pool) noexcept {
+            for (auto& cache : tlsPools) { if (cache.pool == pool) { return &cache; } }
             return nullptr;
         }
 
-        ThreadLocalPoolCache* get_or_create_tls_pool_cache(const BufferPool* pool, size_t class_count) {
-            if (auto* found = find_tls_pool_cache(pool); found != nullptr) { return found; }
-            if (tls_pools.size() >= TLS_MAX_POOLS_PER_THREAD) { return nullptr; }
+        ThreadLocalPoolCache* getOrCreateTlsPoolCache(const BufferPool* pool, size_t classCount) {
+            if (auto* found = findTlsPoolCache(pool); found != nullptr) { return found; }
+            if (tlsPools.size() >= TLS_MAX_POOLS_PER_THREAD) { return nullptr; }
 
             ThreadLocalPoolCache cache;
             cache.pool = pool;
-            cache.class_count = class_count;
-            cache.bins = std::make_unique<ThreadLocalClassCache[]>(class_count);
-            tls_pools.push_back(std::move(cache));
-            return &tls_pools.back();
+            cache.classCount = classCount;
+            cache.bins = std::make_unique<ThreadLocalClassCache[]>(classCount);
+            tlsPools.push_back(std::move(cache));
+            return &tlsPools.back();
         }
 
-        void erase_tls_pool_cache_for_current_thread(const BufferPool* pool) noexcept {
-            for (size_t i = 0; i < tls_pools.size(); ++i) {
-                if (tls_pools[i].pool == pool) {
-                    if (i + 1 != tls_pools.size()) { std::swap(tls_pools[i], tls_pools.back()); }
-                    tls_pools.pop_back();
+        void eraseTlsPoolCacheForCurrentThread(const BufferPool* pool) noexcept {
+            for (size_t i = 0; i < tlsPools.size(); ++i) {
+                if (tlsPools[i].pool == pool) {
+                    if (i + 1 != tlsPools.size()) { std::swap(tlsPools[i], tlsPools.back()); }
+                    tlsPools.pop_back();
                     return;
                 }
             }
         }
     } // namespace
 
-    BufferPool::BufferPool(size_t min_class_size, size_t max_class_size, size_t tls_cache_limit)
-        : min_class_size_{ceil_pow2(min_class_size < sizeof(FreeNode) ? sizeof(FreeNode) : min_class_size)},
-          max_class_size_{ceil_pow2(max_class_size < min_class_size_ ? min_class_size_ : max_class_size)},
-          tls_cache_limit_{tls_cache_limit},
-          class_count_{0} {
-        if (tls_cache_limit_ > TLS_MAX_ENTRIES_PER_CLASS) { tls_cache_limit_ = TLS_MAX_ENTRIES_PER_CLASS; }
+    BufferPool::BufferPool(size_t minClassSize, size_t maxClassSize, size_t tlsCacheLimit)
+        : minClassSize_{ceilPow2(minClassSize < sizeof(FreeNode) ? sizeof(FreeNode) : minClassSize)},
+          maxClassSize_{ceilPow2(maxClassSize < minClassSize_ ? minClassSize_ : maxClassSize)},
+          tlsCacheLimit_{tlsCacheLimit},
+          classCount_{0} {
+        if (tlsCacheLimit_ > TLS_MAX_ENTRIES_PER_CLASS) { tlsCacheLimit_ = TLS_MAX_ENTRIES_PER_CLASS; }
 
-        size_t size = min_class_size_;
-        while (size <= max_class_size_) {
-            ++class_count_;
+        size_t size = minClassSize_;
+        while (size <= maxClassSize_) {
+            ++classCount_;
             if (size > (static_cast<size_t>(-1) >> 1)) { break; }
             size <<= 1;
         }
 
-        if (class_count_ == 0 || class_count_ > TLS_MAX_CLASSES) {
+        if (classCount_ == 0 || classCount_ > TLS_MAX_CLASSES) {
             throw std::invalid_argument("BufferPool: invalid size class configuration");
         }
 
-        classes_ = std::make_unique<SizeClass[]>(class_count_);
+        classes_ = std::make_unique<SizeClass[]>(classCount_);
     }
 
     BufferPool::~BufferPool() noexcept {
         // Only this thread's TLS cache is directly reachable here.
         // Other threads keep independent TLS caches and release their cached blocks
         // to heap on thread exit (ThreadLocalPoolCache::~ThreadLocalPoolCache).
-        erase_tls_pool_cache_for_current_thread(this);
+        eraseTlsPoolCacheForCurrentThread(this);
 
-        for (size_t i = 0; i < class_count_; ++i) {
+        for (size_t i = 0; i < classCount_; ++i) {
             std::lock_guard lock(classes_[i].mutex);
             auto* node = classes_[i].head;
             while (node != nullptr) {
@@ -142,19 +142,19 @@ namespace akkaradb::core {
         }
     }
 
-    std::byte* BufferPool::acquire_raw(size_t size) {
+    std::byte* BufferPool::acquireRaw(size_t size) {
         if (size == 0) { return nullptr; }
 
-        const int idx = class_index_for(size);
+        const int idx = classIndexFor(size);
         if (idx < 0) {
             auto* raw = static_cast<std::byte*>(operator new(sizeof(Header) + size, static_cast<std::align_val_t>(alignof(Header))));
             auto* h = reinterpret_cast<Header*>(raw);
-            h->class_index = HEAP_CLASS_INDEX;
+            h->classIndex = HEAP_CLASS_INDEX;
             return reinterpret_cast<std::byte*>(h + 1);
         }
 
-        if (tls_cache_limit_ != 0) {
-            if (auto* cache = get_or_create_tls_pool_cache(this, class_count_); cache != nullptr) {
+        if (tlsCacheLimit_ != 0) {
+            if (auto* cache = getOrCreateTlsPoolCache(this, classCount_); cache != nullptr) {
                 auto& [entries, count] = cache->bins[idx];
                 if (count > 0) {
                     auto& [raw, payload] = entries[--count];
@@ -164,27 +164,27 @@ namespace akkaradb::core {
             }
         }
 
-        if (auto* node = pop_global(idx); node != nullptr) { return reinterpret_cast<std::byte*>(node); }
+        if (auto* node = popGlobal(idx); node != nullptr) { return reinterpret_cast<std::byte*>(node); }
 
-        const size_t class_size = class_size_for(idx);
-        auto* raw = static_cast<std::byte*>(operator new(sizeof(Header) + class_size, static_cast<std::align_val_t>(alignof(Header))));
+        const size_t classSize = classSizeFor(idx);
+        auto* raw = static_cast<std::byte*>(operator new(sizeof(Header) + classSize, static_cast<std::align_val_t>(alignof(Header))));
         auto* h = reinterpret_cast<Header*>(raw);
-        h->class_index = static_cast<uint32_t>(idx);
+        h->classIndex = static_cast<uint32_t>(idx);
         return reinterpret_cast<std::byte*>(h + 1);
     }
 
-    void BufferPool::release_raw(void* ptr) noexcept {
+    void BufferPool::releaseRaw(void* ptr) noexcept {
         if (ptr == nullptr) { return; }
 
         auto* h = static_cast<Header*>(ptr) - 1;
-        const uint32_t class_index = h->class_index;
-        if (class_index == HEAP_CLASS_INDEX) {
+        const uint32_t classIndex = h->classIndex;
+        if (classIndex == HEAP_CLASS_INDEX) {
             operator delete(h, static_cast<std::align_val_t>(alignof(Header)));
             return;
         }
 
-        const int idx = static_cast<int>(class_index);
-        if (idx < 0 || static_cast<size_t>(idx) >= class_count_) {
+        const int idx = static_cast<int>(classIndex);
+        if (idx < 0 || static_cast<size_t>(idx) >= classCount_) {
             operator delete(h, static_cast<std::align_val_t>(alignof(Header)));
             return;
         }
@@ -192,42 +192,42 @@ namespace akkaradb::core {
         auto* payload = static_cast<std::byte*>(ptr);
         auto* node = reinterpret_cast<FreeNode*>(payload);
 
-        if (tls_cache_limit_ != 0) {
-            if (auto* cache = get_or_create_tls_pool_cache(this, class_count_); cache != nullptr) {
+        if (tlsCacheLimit_ != 0) {
+            if (auto* cache = getOrCreateTlsPoolCache(this, classCount_); cache != nullptr) {
                 auto& bin = cache->bins[idx];
-                if (bin.count < tls_cache_limit_) {
-                    auto& [raw, payload_ref] = bin.entries[bin.count++];
+                if (bin.count < tlsCacheLimit_) {
+                    auto& [raw, payloadRef] = bin.entries[bin.count++];
                     raw = h;
-                    payload_ref = payload;
+                    payloadRef = payload;
                     return;
                 }
 
-                size_t spill = tls_cache_limit_ / 2;
+                size_t spill = tlsCacheLimit_ / 2;
                 if (spill == 0) { spill = 1; }
                 while (spill-- > 0 && bin.count > 0) {
-                    auto& [raw, spill_payload] = bin.entries[--bin.count];
-                    auto* spill_node = reinterpret_cast<FreeNode*>(spill_payload);
+                    auto& [raw, spillPayload] = bin.entries[--bin.count];
+                    auto* spillNode = reinterpret_cast<FreeNode*>(spillPayload);
                     raw = nullptr;
-                    spill_payload = nullptr;
-                    push_global(idx, spill_node);
+                    spillPayload = nullptr;
+                    pushGlobal(idx, spillNode);
                 }
 
-                auto& [raw, payload_ref] = bin.entries[bin.count++];
+                auto& [raw, payloadRef] = bin.entries[bin.count++];
                 raw = h;
-                payload_ref = payload;
+                payloadRef = payload;
                 return;
             }
         }
 
-        push_global(idx, node);
+        pushGlobal(idx, node);
     }
 
     OwnedBuffer BufferPool::allocate(size_t size) {
         if (size == 0) { return OwnedBuffer{}; }
-        return OwnedBuffer{acquire_raw(size), size, &BufferPool::owned_deleter, this};
+        return OwnedBuffer{acquireRaw(size), size, &BufferPool::ownedDeleter, this};
     }
 
-    void BufferPool::owned_deleter(void* ptr, size_t size, void* ctx) noexcept {
+    void BufferPool::ownedDeleter(void* ptr, size_t size, void* ctx) noexcept {
         (void)size;
         if (ptr == nullptr) { return; }
 
@@ -237,12 +237,12 @@ namespace akkaradb::core {
             return;
         }
 
-        static_cast<BufferPool*>(ctx)->release_raw(ptr);
+        static_cast<BufferPool*>(ctx)->releaseRaw(ptr);
     }
 
-    bool BufferPool::is_power_of_two(size_t x) noexcept { return x != 0 && (x & (x - 1)) == 0; }
+    bool BufferPool::isPowerOfTwo(size_t x) noexcept { return x != 0 && (x & (x - 1)) == 0; }
 
-    size_t BufferPool::ceil_pow2(size_t x) noexcept {
+    size_t BufferPool::ceilPow2(size_t x) noexcept {
         if (x <= 1) { return 1; }
 
         --x;
@@ -257,20 +257,20 @@ namespace akkaradb::core {
         return x + 1;
     }
 
-    int BufferPool::class_index_for(size_t size) const noexcept {
-        if (size == 0 || size > max_class_size_) { return -1; }
+    int BufferPool::classIndexFor(size_t size) const noexcept {
+        if (size == 0 || size > maxClassSize_) { return -1; }
 
-        const size_t v = ceil_pow2(size);
-        const unsigned log2_v = static_cast<unsigned>(std::bit_width(v) - 1);
-        const unsigned log2_min = static_cast<unsigned>(std::bit_width(min_class_size_) - 1);
+        const size_t v = ceilPow2(size);
+        const unsigned log2V = static_cast<unsigned>(std::bit_width(v) - 1);
+        const unsigned log2Min = static_cast<unsigned>(std::bit_width(minClassSize_) - 1);
 
-        return static_cast<int>(log2_v - log2_min);
+        return static_cast<int>(log2V - log2Min);
     }
 
-    size_t BufferPool::class_size_for(int class_index) const noexcept { return min_class_size_ << class_index; }
+    size_t BufferPool::classSizeFor(int classIndex) const noexcept { return minClassSize_ << classIndex; }
 
-    BufferPool::FreeNode* BufferPool::pop_global(int class_index) noexcept {
-        auto& [mutex, head] = classes_[class_index];
+    BufferPool::FreeNode* BufferPool::popGlobal(int classIndex) noexcept {
+        auto& [mutex, head] = classes_[classIndex];
         std::lock_guard lock(mutex);
 
         auto* node = head;
@@ -281,8 +281,8 @@ namespace akkaradb::core {
         return node;
     }
 
-    void BufferPool::push_global(int class_index, FreeNode* node) noexcept {
-        auto& [mutex, head] = classes_[class_index];
+    void BufferPool::pushGlobal(int classIndex, FreeNode* node) noexcept {
+        auto& [mutex, head] = classes_[classIndex];
         std::lock_guard lock(mutex);
         node->next = head;
         head = node;

@@ -39,9 +39,9 @@ namespace akkaradb::engine::manifest {
      * Thread-safety: All public methods are thread-safe.
      *
      * Modes:
-     *   - Sync mode (fast_mode=false): Every write is followed by fdatasync.
+     *   - Sync mode (fastMode=false): Every write is followed by fdatasync.
      *     Suitable for correctness-critical paths.
-     *   - Fast mode (fast_mode=true): Writes are batched by a background
+     *   - Fast mode (fastMode=true): Writes are batched by a background
      *     flusher thread and fsynced periodically.  Lower latency but
      *     relaxed durability guarantee.
      */
@@ -55,16 +55,16 @@ namespace akkaradb::engine::manifest {
                 int level;
                 std::string file;
                 uint64_t entries;
-                std::optional<std::string> first_key_hex;
-                std::optional<std::string> last_key_hex;
-                uint64_t ts_us; ///< Timestamp at seal time (μs since epoch)
+                std::optional<std::string> firstKeyHex;
+                std::optional<std::string> lastKeyHex;
+                uint64_t tsUs; ///< Timestamp at seal time (μs since epoch)
             };
 
             struct CheckpointEvent {
                 std::optional<std::string> name;
                 std::optional<uint64_t> stripe;
-                std::optional<uint64_t> last_seq;
-                uint64_t ts_us;
+                std::optional<uint64_t> lastSeq;
+                uint64_t tsUs;
             };
 
             // ================================================================
@@ -76,10 +76,10 @@ namespace akkaradb::engine::manifest {
              *
              * @param path      Base path for the manifest file (e.g. "db/MANIFEST.akmf").
              *                  Rotated files are stored as "<path>.1", "<path>.2", etc.
-             * @param fast_mode Enable background-flusher (batched fsync) mode.
+             * @param fastMode Enable background-flusher (batched fsync) mode.
              * @throws std::runtime_error on I/O failure.
              */
-            [[nodiscard]] static std::unique_ptr<Manifest> create(const std::filesystem::path& path, bool fast_mode = false);
+            [[nodiscard]] static std::unique_ptr<Manifest> create(const std::filesystem::path& path, bool fastMode = false);
 
             ~Manifest();
 
@@ -87,7 +87,7 @@ namespace akkaradb::engine::manifest {
             Manifest& operator=(const Manifest&) = delete;
 
             /**
-             * Starts the background flusher thread (fast_mode only).
+             * Starts the background flusher thread (fastMode only).
              * No-op in sync mode.  Must be called before first write.
              */
             void start();
@@ -98,48 +98,52 @@ namespace akkaradb::engine::manifest {
 
             /**
              * Records a stripe-counter advance.
-             * @throws std::invalid_argument if new_count < current count.
+             * @throws std::invalid_argument if newCount < current count.
              */
-            void advance(uint64_t new_count);
+            void advance(uint64_t newCount);
 
             /**
              * Records that a new SST file has been sealed.
              */
-            void sst_seal(
+            void sstSeal(
                 int level,
                 const std::string& file,
                 uint64_t entries,
-                const std::optional<std::string>& first_key_hex,
-                const std::optional<std::string>& last_key_hex
+                const std::optional<std::string>& firstKeyHex,
+                const std::optional<std::string>& lastKeyHex
             );
 
             /**
              * Records a checkpoint marker.
              */
-            void checkpoint(const std::optional<std::string>& name, const std::optional<uint64_t>& stripe, const std::optional<uint64_t>& last_seq);
+            void checkpoint(
+                const std::optional<std::string>& name,
+                const std::optional<uint64_t>& stripe,
+                const std::optional<uint64_t>& lastSeq
+            );
 
             /**
              * Records that a compaction has started on a set of input SSTs.
              */
-            void compaction_start(int level, const std::vector<std::string>& inputs);
+            void compactionStart(int level, const std::vector<std::string>& inputs);
 
             /**
              * Records that a compaction has completed, producing one output SST.
              */
-            void compaction_end(
+            void compactionEnd(
                 int level,
                 const std::string& output,
                 const std::vector<std::string>& inputs,
                 uint64_t entries,
-                const std::optional<std::string>& first_key_hex,
-                const std::optional<std::string>& last_key_hex
+                const std::optional<std::string>& firstKeyHex,
+                const std::optional<std::string>& lastKeyHex
             );
 
             /**
              * Records that an SST file has been deleted.
-             * @deprecated Use compaction_commit() for compaction-driven deletions.
+             * @deprecated Use compactionCommit() for compaction-driven deletions.
              */
-            void sst_delete(const std::string& file);
+            void sstDelete(const std::string& file);
 
             /**
              * Atomically records all outputs produced and all inputs consumed by a
@@ -150,10 +154,10 @@ namespace akkaradb::engine::manifest {
              * all inputs removed) or it is absent (CRC mismatch from partial write),
              * in which case the pre-compaction state is preserved exactly.
              *
-             * @param output_files  Filenames of new SST files written by the compaction.
-             * @param input_files   Filenames of SST files consumed by the compaction.
+             * @param outputFiles  Filenames of new SST files written by the compaction.
+             * @param inputFiles   Filenames of SST files consumed by the compaction.
              */
-            void compaction_commit(const std::vector<std::string>& output_files, const std::vector<std::string>& input_files);
+            void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles);
 
             /**
              * Records a truncation marker (informational).
@@ -175,18 +179,18 @@ namespace akkaradb::engine::manifest {
             // State queries
             // ================================================================
 
-            [[nodiscard]] uint64_t stripes_written() const noexcept;
+            [[nodiscard]] uint64_t stripesWritten() const noexcept;
 
-            [[nodiscard]] std::optional<CheckpointEvent> last_checkpoint() const noexcept;
+            [[nodiscard]] std::optional<CheckpointEvent> lastCheckpoint() const noexcept;
 
             /** Returns all currently live SST file names. */
-            [[nodiscard]] std::vector<std::string> live_sst() const;
+            [[nodiscard]] std::vector<std::string> liveSst() const;
 
             /** Returns all SST file names that have been deleted. */
-            [[nodiscard]] std::vector<std::string> deleted_sst() const;
+            [[nodiscard]] std::vector<std::string> deletedSst() const;
 
             /** Returns all SSTSeal events in replay order. */
-            [[nodiscard]] std::vector<SSTSealEvent> sst_seals() const;
+            [[nodiscard]] std::vector<SSTSealEvent> sstSeals() const;
 
             // ================================================================
             // Shutdown
@@ -199,7 +203,7 @@ namespace akkaradb::engine::manifest {
             void close();
 
         private:
-            explicit Manifest(const std::filesystem::path& path, bool fast_mode);
+            explicit Manifest(const std::filesystem::path& path, bool fastMode);
 
             class Impl;
             std::unique_ptr<Impl> impl_;

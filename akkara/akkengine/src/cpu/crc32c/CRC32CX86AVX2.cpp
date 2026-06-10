@@ -42,47 +42,47 @@ namespace akkaradb::cpu {
          * the same corsix/fast-crc32 generated constant family used by the
          * AVX-512 path in CRC32CX86AVX512.cpp.
          */
-        #define clmul_lo(a, b) (_mm_clmulepi64_si128((a), (b), 0x00))
-        #define clmul_hi(a, b) (_mm_clmulepi64_si128((a), (b), 0x11))
+        #define clmulLo(a, b) (_mm_clmulepi64_si128((a), (b), 0x00))
+        #define clmulHi(a, b) (_mm_clmulepi64_si128((a), (b), 0x11))
 
-        [[nodiscard]] inline uint64_t load_u64(const uint8_t* p) noexcept {
+        [[nodiscard]] inline uint64_t loadU64(const uint8_t* p) noexcept {
             uint64_t value{};
             std::memcpy(&value, p, sizeof(value));
             return value;
         }
 
-        [[nodiscard]] inline uint32_t load_u32(const uint8_t* p) noexcept {
+        [[nodiscard]] inline uint32_t loadU32(const uint8_t* p) noexcept {
             uint32_t value{};
             std::memcpy(&value, p, sizeof(value));
             return value;
         }
 
-        [[nodiscard]] inline uint32_t crc32c_sse42(uint32_t crc, const uint8_t* p, size_t length) noexcept {
-            uint64_t wide_crc = crc;
+        [[nodiscard]] inline uint32_t crc32cSse42(uint32_t crc, const uint8_t* p, size_t length) noexcept {
+            uint64_t wideCrc = crc;
 
             while (length >= 8) {
-                wide_crc = _mm_crc32_u64(wide_crc, load_u64(p));
+                wideCrc = _mm_crc32_u64(wideCrc, loadU64(p));
                 p += 8;
                 length -= 8;
             }
 
             if (length >= 4) {
-                wide_crc = _mm_crc32_u32(static_cast<uint32_t>(wide_crc), load_u32(p));
+                wideCrc = _mm_crc32_u32(static_cast<uint32_t>(wideCrc), loadU32(p));
                 p += 4;
                 length -= 4;
             }
 
             while (length != 0) {
-                wide_crc = _mm_crc32_u8(static_cast<uint32_t>(wide_crc), *p);
+                wideCrc = _mm_crc32_u8(static_cast<uint32_t>(wideCrc), *p);
                 ++p;
                 --length;
             }
 
-            return static_cast<uint32_t>(wide_crc);
+            return static_cast<uint32_t>(wideCrc);
         }
 
-        [[nodiscard]] inline __m128i fold_16(__m128i value, __m128i next, __m128i k) noexcept {
-            return _mm_xor_si128(_mm_xor_si128(clmul_lo(value, k), clmul_hi(value, k)), next);
+        [[nodiscard]] inline __m128i fold16(__m128i value, __m128i next, __m128i k) noexcept {
+            return _mm_xor_si128(_mm_xor_si128(clmulLo(value, k), clmulHi(value, k)), next);
         }
     } // namespace
 
@@ -101,7 +101,7 @@ namespace akkaradb::cpu {
             }
 
             while ((reinterpret_cast<std::uintptr_t>(p) & 24u) != 0 && length >= 8) {
-                crc = static_cast<uint32_t>(_mm_crc32_u64(crc, load_u64(p)));
+                crc = static_cast<uint32_t>(_mm_crc32_u64(crc, loadU64(p)));
                 p += 8;
                 length -= 8;
             }
@@ -124,19 +124,19 @@ namespace akkaradb::cpu {
             while (p <= limit) {
                 v01 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
                 v23 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
-                x0 = fold_16(x0, _mm256_castsi256_si128(v01), k64);
-                x1 = fold_16(x1, _mm256_extracti128_si256(v01, 1), k64);
-                x2 = fold_16(x2, _mm256_castsi256_si128(v23), k64);
-                x3 = fold_16(x3, _mm256_extracti128_si256(v23, 1), k64);
+                x0 = fold16(x0, _mm256_castsi256_si128(v01), k64);
+                x1 = fold16(x1, _mm256_extracti128_si256(v01, 1), k64);
+                x2 = fold16(x2, _mm256_castsi256_si128(v23), k64);
+                x3 = fold16(x3, _mm256_extracti128_si256(v23, 1), k64);
                 p += 64;
             }
 
             const __m128i k0 = _mm_setr_epi32(0x1c291d04, 0, 0xddc0152b, 0);
             const __m128i k1 = _mm_setr_epi32(0x3da6d0cb, 0, 0xba4fc28e, 0);
             const __m128i k2 = _mm_setr_epi32(0xf20c0dfe, 0, 0x493c7d27, 0);
-            const __m128i y0 = _mm_xor_si128(clmul_lo(x0, k0), clmul_hi(x0, k0));
-            const __m128i y1 = _mm_xor_si128(clmul_lo(x1, k1), clmul_hi(x1, k1));
-            const __m128i y2 = _mm_xor_si128(clmul_lo(x2, k2), clmul_hi(x2, k2));
+            const __m128i y0 = _mm_xor_si128(clmulLo(x0, k0), clmulHi(x0, k0));
+            const __m128i y1 = _mm_xor_si128(clmulLo(x1, k1), clmulHi(x1, k1));
+            const __m128i y2 = _mm_xor_si128(clmulLo(x2, k2), clmulHi(x2, k2));
             const __m128i folded = _mm_xor_si128(_mm_xor_si128(_mm_xor_si128(y0, y1), y2), x3);
 
             crc = static_cast<uint32_t>(_mm_crc32_u64(0, static_cast<uint64_t>(_mm_cvtsi128_si64(folded))));
@@ -144,12 +144,12 @@ namespace akkaradb::cpu {
             length = static_cast<size_t>(end - p);
         }
 
-        return ~crc32c_sse42(crc, p, length);
+        return ~crc32cSse42(crc, p, length);
     }
 } // namespace akkaradb::cpu
 
-#undef clmul_lo
-#undef clmul_hi
+#undef clmulLo
+#undef clmulHi
 #undef AKKARADB_TARGET_AVX2
 
 #endif

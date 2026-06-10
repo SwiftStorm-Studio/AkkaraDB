@@ -27,15 +27,15 @@ namespace akkaradb::engine::server {
         auto server = std::unique_ptr<AkkApiServer>{new AkkApiServer()};
         auto backends = options.backends;
         if (backends.empty()) {
-            backends.push_back(AkkEngineOptions::ApiBackend::Http);
-            backends.push_back(AkkEngineOptions::ApiBackend::Tcp);
+            backends.push_back(AkkEngineOptions::ApiBackend::HTTP);
+            backends.push_back(AkkEngineOptions::ApiBackend::TCP);
         }
 
         for (const auto backend : backends) {
             switch (backend) {
-                case AkkEngineOptions::ApiBackend::Http: server->http_ = HttpApiServer::create(engine, options);
+                case AkkEngineOptions::ApiBackend::HTTP: server->http_ = HttpApiServer::create(engine, options);
                     break;
-                case AkkEngineOptions::ApiBackend::Tcp: server->tcp_ = TcpApiServer::create(engine, options);
+                case AkkEngineOptions::ApiBackend::TCP: server->tcp_ = TcpApiServer::create(engine, options);
                     break;
             }
         }

@@ -38,30 +38,24 @@
 
 namespace akkaradb::crypto {
     namespace {
-        constexpr std::array<std::uint8_t, 8> IDENTITY_FILE_MAGIC{
-            'A', 'K', 'K', 'I', 'D', '0', '1', '\0',
-        };
+        constexpr std::array<std::uint8_t, 8> IDENTITY_FILE_MAGIC{'A', 'K', 'K', 'I', 'D', '0', '1', '\0',};
         constexpr std::string_view NODE_IDENTITY_CONTEXT = "AkkaraDB node identity v1";
 
-        void derive_keyed_blake2b(
-            std::span<std::uint8_t> out,
-            const SecretKey& key,
-            std::string_view context
-        ) {
-            auto mutable_key = key;
+        void deriveKeyedBlake2b(std::span<std::uint8_t> out, const SecretKey& key, std::string_view context) {
+            auto mutableKey = key;
             crypto_blake2b_keyed(
                 out.data(),
                 out.size(),
-                mutable_key.data(),
-                mutable_key.size(),
+                mutableKey.data(),
+                mutableKey.size(),
                 reinterpret_cast<const std::uint8_t*>(context.data()),
                 context.size()
             );
-            secure_wipe(mutable_key);
+            secureWipe(mutableKey);
         }
 
         template <typename T>
-        [[nodiscard]] std::string bytes_to_hex(const T& bytes) {
+        [[nodiscard]] std::string bytesToHex(const T& bytes) {
             std::ostringstream out;
             out << std::hex << std::setfill('0');
             for (const auto byte : bytes) { out << std::setw(2) << static_cast<unsigned>(byte); }
@@ -69,54 +63,54 @@ namespace akkaradb::crypto {
         }
     } // namespace
 
-    NodeIdentity generate_node_identity() {
+    NodeIdentity generateNodeIdentity() {
         SecretKey seed{};
-        secure_random(seed);
-        auto identity = node_identity_from_seed(seed);
-        secure_wipe(seed);
+        secureRandom(seed);
+        auto identity = nodeIdentityFromSeed(seed);
+        secureWipe(seed);
         return identity;
     }
 
-    NodeIdentity node_identity_from_seed(const SecretKey& seed) {
+    NodeIdentity nodeIdentityFromSeed(const SecretKey& seed) {
         NodeIdentity identity{};
-        derive_keyed_blake2b(identity.secret_key, seed, NODE_IDENTITY_CONTEXT);
-        crypto_x25519_public_key(identity.public_key.data(), identity.secret_key.data());
-        identity.fingerprint = fingerprint_public_key(identity.public_key);
-        std::copy_n(identity.fingerprint.begin(), identity.node_id.size(), identity.node_id.begin());
+        deriveKeyedBlake2b(identity.secretKey, seed, NODE_IDENTITY_CONTEXT);
+        crypto_x25519_public_key(identity.publicKey.data(), identity.secretKey.data());
+        identity.fingerprint = fingerprintPublicKey(identity.publicKey);
+        std::copy_n(identity.fingerprint.begin(), identity.nodeId.size(), identity.nodeId.begin());
         return identity;
     }
 
-    Fingerprint fingerprint_public_key(const PublicKey& public_key) {
+    Fingerprint fingerprintPublicKey(const PublicKey& publicKey) {
         Fingerprint fp{};
-        crypto_blake2b(fp.data(), fp.size(), public_key.data(), public_key.size());
+        crypto_blake2b(fp.data(), fp.size(), publicKey.data(), publicKey.size());
         return fp;
     }
 
-    NodeId node_id_from_public_key(const PublicKey& public_key) {
-        const auto fp = fingerprint_public_key(public_key);
+    NodeId nodeIdFromPublicKey(const PublicKey& publicKey) {
+        const auto fp = fingerprintPublicKey(publicKey);
         NodeId id{};
         std::copy_n(fp.begin(), id.size(), id.begin());
         return id;
     }
 
-    std::string public_key_to_hex(const PublicKey& bytes) { return bytes_to_hex(bytes); }
-    std::string fingerprint_to_hex(const Fingerprint& bytes) { return bytes_to_hex(bytes); }
-    std::string node_id_to_hex(const NodeId& bytes) { return bytes_to_hex(bytes); }
+    std::string publicKeyToHex(const PublicKey& bytes) { return bytesToHex(bytes); }
+    std::string fingerprintToHex(const Fingerprint& bytes) { return bytesToHex(bytes); }
+    std::string nodeIdToHex(const NodeId& bytes) { return bytesToHex(bytes); }
 
     IdentityStore::IdentityStore(std::filesystem::path path) : path_(std::move(path)) {}
 
-    NodeIdentity IdentityStore::load_or_create() const {
-        if (std::filesystem::exists(path_)) { return node_identity_from_seed(load_seed()); }
+    NodeIdentity IdentityStore::loadOrCreate() const {
+        if (std::filesystem::exists(path_)) { return nodeIdentityFromSeed(loadSeed()); }
 
         SecretKey seed{};
-        secure_random(seed);
-        save_seed(seed);
-        auto identity = node_identity_from_seed(seed);
-        secure_wipe(seed);
+        secureRandom(seed);
+        saveSeed(seed);
+        auto identity = nodeIdentityFromSeed(seed);
+        secureWipe(seed);
         return identity;
     }
 
-    void IdentityStore::save_seed(const SecretKey& seed) const {
+    void IdentityStore::saveSeed(const SecretKey& seed) const {
         const auto parent = path_.parent_path();
         if (!parent.empty()) { std::filesystem::create_directories(parent); }
 
@@ -136,7 +130,7 @@ namespace akkaradb::crypto {
         std::filesystem::rename(tmp, path_);
     }
 
-    SecretKey IdentityStore::load_seed() const {
+    SecretKey IdentityStore::loadSeed() const {
         std::ifstream in(path_, std::ios::binary);
         if (!in) { throw std::runtime_error("IdentityStore: failed to open seed file"); }
 

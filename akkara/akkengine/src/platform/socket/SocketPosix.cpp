@@ -41,9 +41,7 @@ namespace akkaradb::platform {
          *
          * @return Sentinel value that represents an invalid socket.
          */
-        [[nodiscard]] static native_handle_t invalid_handle() noexcept {
-            return static_cast<native_handle_t>(~static_cast<native_handle_t>(0));
-        }
+        [[nodiscard]] static NativeHandle invalidHandle() noexcept { return static_cast<NativeHandle>(~static_cast<NativeHandle>(0)); }
 
         /**
          * @brief Converts a native handle to a POSIX file descriptor.
@@ -51,7 +49,7 @@ namespace akkaradb::platform {
          * @param handle Native socket handle.
          * @return POSIX file descriptor.
          */
-        [[nodiscard]] static int to_fd(native_handle_t handle) noexcept { return static_cast<int>(handle); }
+        [[nodiscard]] static int toFd(NativeHandle handle) noexcept { return static_cast<int>(handle); }
 
         /**
          * @brief Converts a POSIX file descriptor to a native handle.
@@ -59,7 +57,7 @@ namespace akkaradb::platform {
          * @param fd POSIX file descriptor.
          * @return Native socket handle.
          */
-        [[nodiscard]] static native_handle_t from_fd(int fd) noexcept { return static_cast<native_handle_t>(fd); }
+        [[nodiscard]] static NativeHandle fromFd(int fd) noexcept { return static_cast<NativeHandle>(fd); }
 
         /**
          * @brief Sets or clears O_NONBLOCK on a file descriptor.
@@ -68,7 +66,7 @@ namespace akkaradb::platform {
          * @param enabled true to enable non-blocking mode, false to disable it.
          * @return true on success.
          */
-        [[nodiscard]] static bool set_nonblocking(int fd, bool enabled) noexcept {
+        [[nodiscard]] static bool setNonblocking(int fd, bool enabled) noexcept {
             int flags = ::fcntl(fd, F_GETFL, 0);
             if (flags < 0) { return false; }
 
@@ -84,7 +82,7 @@ namespace akkaradb::platform {
          * @param fd File descriptor.
          * @return true on success.
          */
-        [[nodiscard]] static bool set_close_on_exec(int fd) noexcept {
+        [[nodiscard]] static bool setCloseOnExec(int fd) noexcept {
             int flags = ::fcntl(fd, F_GETFD, 0);
             if (flags < 0) { return false; }
 
@@ -97,7 +95,7 @@ namespace akkaradb::platform {
          * @param fd Connected socket candidate.
          * @return 0 on success, otherwise an errno-compatible error value.
          */
-        [[nodiscard]] static int wait_connect_complete(int fd) noexcept {
+        [[nodiscard]] static int waitConnectComplete(int fd) noexcept {
             for (;;) {
                 struct pollfd pfd{};
                 pfd.fd = fd;
@@ -109,27 +107,27 @@ namespace akkaradb::platform {
                     return errno;
                 }
 
-                int so_error = 0;
-                socklen_t len = static_cast<socklen_t>(sizeof(so_error));
-                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0) { return errno; }
+                int soError = 0;
+                socklen_t len = static_cast<socklen_t>(sizeof(soError));
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len) < 0) { return errno; }
 
-                return so_error;
+                return soError;
             }
         }
 
         /**
          * @brief Returns a POSIX would-block error code.
          *
-         * @return operation_would_block.
+         * @return operationWouldBlock.
          */
-        [[nodiscard]] static std::error_code would_block() noexcept { return std::make_error_code(std::errc::operation_would_block); }
+        [[nodiscard]] static std::error_code wouldBlock() noexcept { return std::make_error_code(std::errc::operation_would_block); }
 
         /**
          * @brief Returns the platform send flags.
          *
          * @return MSG_NOSIGNAL when available, otherwise 0.
          */
-        [[nodiscard]] static int send_flags() noexcept {
+        [[nodiscard]] static int sendFlags() noexcept {
 #if defined(MSG_NOSIGNAL)
 return MSG_NOSIGNAL;
 #else
@@ -145,7 +143,7 @@ return 0;
 * @param err Error code.
 * @return Exception object.
 */
-[[nodiscard]] static std::system_error make_connect_error(const char* host, uint16_t port, int err) {
+[[nodiscard]] static std::system_error makeConnectError(const char* host, uint16_t port, int err) {
     std::string message = "Socket::connect(";
     message += (host != nullptr) ? host : "(null)";
     message += ':';
@@ -157,7 +155,7 @@ return 0;
 /**
 * @brief Constructs an invalid socket.
 */
-Socket::Socket() noexcept : handle_(invalid_handle()) {}
+Socket::Socket() noexcept : handle_(invalidHandle()) {}
 
 /**
 * @brief Destroys the socket and closes the underlying handle.
@@ -169,7 +167,7 @@ Socket::~Socket() { close(); }
 *
 * @param other Source socket.
 */
-Socket::Socket(Socket&& other) noexcept : handle_(other.handle_) { other.handle_ = invalid_handle(); }
+Socket::Socket(Socket&& other) noexcept : handle_(other.handle_) { other.handle_ = invalidHandle(); }
 
 /**
 * @brief Move-assigns a socket.
@@ -181,7 +179,7 @@ Socket& Socket::operator=(Socket&& other) noexcept {
     if (this != &other) {
         close();
         handle_ = other.handle_;
-        other.handle_ = invalid_handle();
+        other.handle_ = invalidHandle();
     }
     return *this;
 }
@@ -191,15 +189,15 @@ Socket& Socket::operator=(Socket&& other) noexcept {
 *
 * @return true when the socket owns a live file descriptor.
 */
-bool Socket::valid() const noexcept { return handle_ != invalid_handle(); }
+bool Socket::valid() const noexcept { return handle_ != invalidHandle(); }
 
 /**
 * @brief Closes the socket if it is valid.
 */
 void Socket::close() noexcept {
     if (valid()) {
-        ::close(to_fd(handle_));
-        handle_ = invalid_handle();
+        ::close(toFd(handle_));
+        handle_ = invalidHandle();
     }
 }
 
@@ -228,33 +226,37 @@ Socket Socket::connect(const char* host, uint16_t port) {
 hints.ai_flags= AI_ADDRCONFIG;
 #endif
 
-char port_str[6]; const int port_len = std::snprintf(port_str, sizeof(port_str), "%u", static_cast<unsigned>(port));if (port_len<0 ||
-    port_len >= static_cast<int>(sizeof(port_str))) { throw std::invalid_argument("Socket::connect: invalid port"); } const int gai =
-    ::getaddrinfo(host, port_str, &hints, &result);if (gai!= 0) {
+char portStr[6]; const int portLen = std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port));if (portLen<0 || portLen >=
+    static_cast<int>(sizeof(portStr))) { throw std::invalid_argument("Socket::connect: invalid port"); } const int gai = ::getaddrinfo(
+    host,
+    portStr,
+    &hints,
+    &result
+);if (gai!= 0) {
             std::string message = "Socket::connect(";
             message += host;
             message += ':';
-            message += port_str;
+            message += portStr;
             message += ") getaddrinfo failed: ";
             message += ::gai_strerror(gai);
             throw std::runtime_error(message);
         }
 
-native_handle_t connected = invalid_handle(); int last_error = 0;for (struct addrinfo* rp = result; rp!= nullptr; rp= rp->ai_next) {
+NativeHandle connected = invalidHandle(); int lastError = 0;for (struct addrinfo* rp = result; rp!= nullptr; rp= rp->ai_next) {
             const int fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd < 0) {
-                last_error = errno;
+                lastError = errno;
                 continue;
             }
 
-            if (!set_close_on_exec(fd)) {
-                last_error = errno;
+            if (!setCloseOnExec(fd)) {
+                lastError = errno;
                 ::close(fd);
                 continue;
             }
 
-            if (!set_nonblocking(fd, true)) {
-                last_error = errno;
+            if (!setNonblocking(fd, true)) {
+                lastError = errno;
                 ::close(fd);
                 continue;
             }
@@ -267,26 +269,26 @@ native_handle_t connected = invalid_handle(); int last_error = 0;for (struct add
 #endif
 
 const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);if (rc== 0) {
-                connected = from_fd(fd);
+                connected = fromFd(fd);
                 break;
             }
 
             if (errno== EINPROGRESS || errno== EALREADY || errno== EWOULDBLOCK) {
-                const int wait_rc = wait_connect_complete(fd);
-                if (wait_rc == 0) {
-                    connected = from_fd(fd);
+                const int waitRc = waitConnectComplete(fd);
+                if (waitRc == 0) {
+                    connected = fromFd(fd);
                     break;
                 }
 
-                last_error = wait_rc;
+                lastError = waitRc;
                 ::close(fd);
                 continue;
             }
 
-last_error= errno; ::close (fd);}
+lastError= errno; ::close (fd);}
 
-::freeaddrinfo (result);if (connected== invalid_handle()) {
-            if (last_error != 0) { throw make_connect_error(host, port, last_error); }
+::freeaddrinfo (result);if (connected== invalidHandle()) {
+            if (lastError != 0) { throw makeConnectError(host, port, lastError); }
             throw std::runtime_error("Socket::connect failed");
         }
 
@@ -297,11 +299,11 @@ Socket sock; sock.handle_= connected;return sock;}
 *
 * @param data Buffer to send.
 * @param size Number of bytes to send.
-* @param out_sent Number of bytes actually sent.
+* @param outSent Number of bytes actually sent.
 * @return Empty error_code on success, would-block or a POSIX error otherwise.
 */
-std::error_code Socket::send_some(const void* data, std::size_t size, std::size_t& out_sent) noexcept {
-    out_sent = 0;
+std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept {
+    outSent = 0;
 
     if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
@@ -312,15 +314,15 @@ std::error_code Socket::send_some(const void* data, std::size_t size, std::size_
     const auto* ptr = static_cast<const unsigned char*>(data);
 
     for (;;) {
-        const ssize_t n = ::send(to_fd(handle_), ptr, size, send_flags());
+        const ssize_t n = ::send(toFd(handle_), ptr, size, sendFlags());
         if (n >= 0) {
-            out_sent = static_cast<std::size_t>(n);
+            outSent = static_cast<std::size_t>(n);
             return {};
         }
 
         if (errno == EINTR) { continue; }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { return would_block(); }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
 
         if (errno == EPIPE) { return std::make_error_code(std::errc::broken_pipe); }
 
@@ -333,11 +335,11 @@ std::error_code Socket::send_some(const void* data, std::size_t size, std::size_
 *
 * @param data Destination buffer.
 * @param size Maximum number of bytes to receive.
-* @param out_recv Number of bytes actually received.
+* @param outRecv Number of bytes actually received.
 * @return Empty error_code on success, would-block or a POSIX error otherwise.
 */
-std::error_code Socket::recv_some(void* data, std::size_t size, std::size_t& out_recv) noexcept {
-    out_recv = 0;
+std::error_code Socket::recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept {
+    outRecv = 0;
 
     if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
@@ -348,10 +350,10 @@ std::error_code Socket::recv_some(void* data, std::size_t size, std::size_t& out
     auto* ptr = static_cast<unsigned char*>(data);
 
     for (;;) {
-        const ssize_t n = ::recv(to_fd(handle_), ptr, size, 0);
+        const ssize_t n = ::recv(toFd(handle_), ptr, size, 0);
 
         if (n > 0) {
-            out_recv = static_cast<std::size_t>(n);
+            outRecv = static_cast<std::size_t>(n);
             return {};
         }
 
@@ -359,7 +361,7 @@ std::error_code Socket::recv_some(void* data, std::size_t size, std::size_t& out
 
         if (errno == EINTR) { continue; }
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { return would_block(); }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
 
         return std::error_code(errno, std::generic_category());
     }

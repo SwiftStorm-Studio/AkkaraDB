@@ -39,12 +39,12 @@ namespace akkaradb::engine::memtable {
             using MemTableFactory = std::function<std::unique_ptr<IMemTable>()>;
 
             struct Options {
-                size_t shard_count = 0;
-                size_t expected_concurrent_writers = 0;
-                size_t auto_shard_count_cap = 128;
-                size_t threshold_bytes_per_shard = 64ULL * 1024 * 1024;
-                MemTableFactory backend_factory = nullptr;
-                FlushCallback on_flush = nullptr;
+                size_t shardCount = 0;
+                size_t expectedConcurrentWriters = 0;
+                size_t autoShardCountCap = 128;
+                size_t thresholdBytesPerShard = 64ULL * 1024 * 1024;
+                MemTableFactory backendFactory = nullptr;
+                FlushCallback onFlush = nullptr;
             };
 
             struct KeyRange {
@@ -53,12 +53,12 @@ namespace akkaradb::engine::memtable {
             };
 
             struct MemTableSnapshot {
-                uint32_t shard_count = 0;
-                uint64_t threshold_bytes_per_shard = 0;
-                uint64_t approx_bytes = 0;
-                uint64_t puts_applied = 0;
-                uint64_t removes_applied = 0;
-                uint64_t flushes_completed = 0;
+                uint32_t shardCount = 0;
+                uint64_t thresholdBytesPerShard = 0;
+                uint64_t approxBytes = 0;
+                uint64_t putsApplied = 0;
+                uint64_t removesApplied = 0;
+                uint64_t flushesCompleted = 0;
             };
 
             class RangeIterator {
@@ -70,7 +70,7 @@ namespace akkaradb::engine::memtable {
                     RangeIterator(const RangeIterator&) = delete;
                     RangeIterator& operator=(const RangeIterator&) = delete;
 
-                    [[nodiscard]] bool has_next() const noexcept;
+                    [[nodiscard]] bool hasNext() const noexcept;
                     [[nodiscard]] std::optional<RecordView> next() noexcept;
 
                 private:
@@ -95,32 +95,32 @@ namespace akkaradb::engine::memtable {
                 std::span<const uint8_t> value,
                 uint64_t seq,
                 uint8_t flags = core::MemHdr16::FLAG_NORMAL,
-                uint64_t precomputed_fp64 = 0,
-                uint64_t precomputed_mk = 0
+                uint64_t precomputedFp64 = 0,
+                uint64_t precomputedMk = 0
             );
 
-            void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputed_fp64 = 0, uint64_t precomputed_mk = 0);
+            void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputedFp64 = 0, uint64_t precomputedMk = 0);
 
-            void advance_seq(uint64_t seq) noexcept;
+            void advanceSeq(uint64_t seq) noexcept;
 
-            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const;
-            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const;
+            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const;
+            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const;
 
-            [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const;
+            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, uint64_t snapshotSeq, std::vector<uint8_t>& out) const;
 
-            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const;
+            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const;
 
-            [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshot_seq) const;
+            [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshotSeq) const;
 
-            [[nodiscard]] uint64_t next_seq() noexcept;
-            [[nodiscard]] uint64_t reserve_seq(uint64_t count);
-            [[nodiscard]] uint64_t last_seq() const noexcept;
+            [[nodiscard]] uint64_t nextSeq() noexcept;
+            [[nodiscard]] uint64_t reserveSeq(uint64_t count);
+            [[nodiscard]] uint64_t lastSeq() const noexcept;
 
-            void flush_hint();
-            void force_flush();
-            void set_flush_callback(const FlushCallback& cb);
+            void flushHint();
+            void forceFlush();
+            void setFlushCallback(const FlushCallback& cb);
 
-            [[nodiscard]] size_t approx_size() const noexcept;
+            [[nodiscard]] size_t approxSize() const noexcept;
             [[nodiscard]] MemTableSnapshot snapshot() const noexcept;
 
         private:

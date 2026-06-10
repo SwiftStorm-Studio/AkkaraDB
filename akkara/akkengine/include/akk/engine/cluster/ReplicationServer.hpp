@@ -32,12 +32,12 @@ namespace akkaradb::engine::cluster {
      * ReplicationServer - Primary-side replication fan-out server.
      *
      * The server listens on the primary replication port, accepts replica
-     * handshakes, sends buffered entries newer than each replica's last_seq,
+     * handshakes, sends buffered entries newer than each replica's lastSeq,
      * streams new entries/blobs to all live replicas, and waits for entry
      * acknowledgements according to AckPolicy.
      *
-     * Thread-safety: start(), close(), ship_entry(), ship_blob(), and
-     * replica_count() may be called concurrently.  close() is idempotent.
+     * Thread-safety: start(), close(), shipEntry(), shipBlob(), and
+     * replicaCount() may be called concurrently.  close() is idempotent.
      */
     class ReplicationServer {
         public:
@@ -52,18 +52,18 @@ namespace akkaradb::engine::cluster {
             /**
              * Creates a primary replication server.
              *
-             * @param repl_port       Local replication listener port.
-             * @param self_node_id    Primary node id advertised in ServerHello.
-             * @param get_current_seq Returns current primary seq for ServerHello.
-             * @param ack_policy      Entry acknowledgement policy.
-             * @param runtime_options Transport/TLS options.
+             * @param replPort       Local replication listener port.
+             * @param selfNodeId    Primary node id advertised in ServerHello.
+             * @param getCurrentSeq Returns current primary seq for ServerHello.
+             * @param ackPolicy      Entry acknowledgement policy.
+             * @param runtimeOptions Transport/TLS options.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationServer> create(
-                uint16_t repl_port,
-                uint64_t self_node_id,
-                std::function<uint64_t()> get_current_seq,
-                AckPolicy ack_policy,
-                ClusterRuntimeOptions runtime_options = {}
+                uint16_t replPort,
+                uint64_t selfNodeId,
+                std::function<uint64_t()> getCurrentSeq,
+                AckPolicy ackPolicy,
+                ClusterRuntimeOptions runtimeOptions = {}
             );
 
             ~ReplicationServer();
@@ -87,13 +87,13 @@ namespace akkaradb::engine::cluster {
              * Depending on AckPolicy, this call may wait for replica acknowledgements
              * before returning.
              */
-            void ship_entry(
+            void shipEntry(
                 uint64_t seq,
                 ReplOpType op,
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
-                uint8_t record_flags,
-                uint64_t source_node_id
+                uint8_t recordFlags,
+                uint64_t sourceNodeId
             );
 
             /**
@@ -102,10 +102,10 @@ namespace akkaradb::engine::cluster {
              * Blob frames are sent with an internal buffer seq of zero and are not
              * waited on by the acknowledgement policy.
              */
-            void ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content);
+            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
 
             /** Returns the number of currently live replica connections. */
-            [[nodiscard]] size_t replica_count() const noexcept;
+            [[nodiscard]] size_t replicaCount() const noexcept;
 
         private:
             class Impl;

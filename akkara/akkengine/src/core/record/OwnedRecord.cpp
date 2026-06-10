@@ -23,7 +23,7 @@
 namespace akkaradb::core {
     // ==================== Factory ====================
 
-    void OwnedRecord::create_inplace(
+    void OwnedRecord::createInplace(
         OwnedRecord& dst,
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
@@ -33,13 +33,13 @@ namespace akkaradb::core {
         uint64_t fp64,
         uint64_t mk
     ) {
-        dst.hdr.k_len = static_cast<uint16_t>(key.size());
-        dst.hdr.v_len = static_cast<uint16_t>(value.size());
+        dst.hdr.kLen = static_cast<uint16_t>(key.size());
+        dst.hdr.vLen = static_cast<uint16_t>(value.size());
         dst.hdr.seq = seq;
         dst.hdr.flags = flags;
 
-        dst.key_fp64 = fp64;
-        dst.mini_key = (mk != 0) ? mk : build_mini_key(key);
+        dst.keyFp64 = fp64;
+        dst.miniKey = (mk != 0) ? mk : buildMiniKey(key);
 
         dst.data = SmallBuffer(key.data(), key.size(), value.data(), value.size(), arena);
     }
@@ -54,7 +54,7 @@ namespace akkaradb::core {
         uint64_t mk
     ) {
         OwnedRecord r;
-        create_inplace(r, key, value, seq, flags, arena, fp64, mk);
+        createInplace(r, key, value, seq, flags, arena, fp64, mk);
         return r;
     }
 

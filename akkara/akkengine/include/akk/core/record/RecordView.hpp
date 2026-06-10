@@ -44,14 +44,14 @@ namespace akkaradb::core {
      *
      * Layout (no fixed memory layout; logical structure):
      *
-     *   key_ptr_   ↁEkey bytes
-     *   val_ptr_   ↁEvalue bytes
-     *   k_len_     ↁEkey length
-     *   v_len_     ↁEvalue length
+     *   keyPtr_   ↁEkey bytes
+     *   valPtr_   ↁEvalue bytes
+     *   kLen_     ↁEkey length
+     *   vLen_     ↁEvalue length
      *   seq_       ↁEsequence number
      *   flags_     ↁEtombstone etc.
-     *   key_fp64_  ↁEhash fingerprint
-     *   mini_key_  ↁEfirst ≤8 bytes of key (LE packed)
+     *   keyFp64_  ↁEhash fingerprint
+     *   miniKey_  ↁEfirst ≤8 bytes of key (LE packed)
      *
      * Lifetime:
      *   - MemTable: tied to BufferArena lifetime
@@ -68,7 +68,7 @@ namespace akkaradb::core {
                 return (v << 32) | (v >> 32);
             }
 
-            [[nodiscard]] static uint64_t load_u64_unaligned(const uint8_t* p) noexcept {
+            [[nodiscard]] static uint64_t loadU64Unaligned(const uint8_t* p) noexcept {
                 uint64_t v = 0;
                 v |= static_cast<uint64_t>(p[0]);
                 v |= static_cast<uint64_t>(p[1]) << 8;
@@ -93,37 +93,38 @@ namespace akkaradb::core {
              */
             constexpr RecordView(
                 const uint8_t* key,
-                uint16_t k_len,
+                uint16_t kLen,
                 const uint8_t* value,
-                uint16_t v_len,
+                uint16_t vLen,
                 uint64_t seq,
                 uint8_t flags,
-                uint64_t key_fp64,
-                uint64_t mini_key
-            ) noexcept : key_{key}, value_{value}, k_len_{k_len}, v_len_{v_len}, seq_{seq}, flags_{flags}, key_fp64_{key_fp64}, mini_key_{mini_key} {}
+                uint64_t keyFp64,
+                uint64_t miniKey
+            ) noexcept
+                : key_{key}, value_{value}, kLen_{kLen}, vLen_{vLen}, seq_{seq}, flags_{flags}, keyFp64_{keyFp64}, miniKey_{miniKey} {}
 
             // ==================== Accessors ====================
 
             [[nodiscard]] bool empty() const noexcept { return key_ == nullptr; }
 
-            [[nodiscard]] std::span<const uint8_t> key() const noexcept { return {key_, k_len_}; }
+            [[nodiscard]] std::span<const uint8_t> key() const noexcept { return {key_, kLen_}; }
 
-            [[nodiscard]] std::span<const uint8_t> value() const noexcept { return {value_, v_len_}; }
+            [[nodiscard]] std::span<const uint8_t> value() const noexcept { return {value_, vLen_}; }
 
-            [[nodiscard]] std::string_view key_string() const noexcept { return {reinterpret_cast<const char*>(key_), k_len_}; }
+            [[nodiscard]] std::string_view keyString() const noexcept { return {reinterpret_cast<const char*>(key_), kLen_}; }
 
-            [[nodiscard]] std::string_view value_string() const noexcept { return {reinterpret_cast<const char*>(value_), v_len_}; }
+            [[nodiscard]] std::string_view valueString() const noexcept { return {reinterpret_cast<const char*>(value_), vLen_}; }
 
-            [[nodiscard]] uint16_t key_size() const noexcept { return k_len_; }
-            [[nodiscard]] uint16_t value_size() const noexcept { return v_len_; }
+            [[nodiscard]] uint16_t keySize() const noexcept { return kLen_; }
+            [[nodiscard]] uint16_t valueSize() const noexcept { return vLen_; }
 
             [[nodiscard]] uint64_t seq() const noexcept { return seq_; }
             [[nodiscard]] uint8_t flags() const noexcept { return flags_; }
 
-            [[nodiscard]] bool is_tombstone() const noexcept { return (flags_ & FLAG_TOMBSTONE) != 0; }
+            [[nodiscard]] bool isTombstone() const noexcept { return (flags_ & FLAG_TOMBSTONE) != 0; }
 
-            [[nodiscard]] uint64_t key_fp64() const noexcept { return key_fp64_; }
-            [[nodiscard]] uint64_t mini_key() const noexcept { return mini_key_; }
+            [[nodiscard]] uint64_t keyFp64() const noexcept { return keyFp64_; }
+            [[nodiscard]] uint64_t miniKey() const noexcept { return miniKey_; }
 
             // ==================== Comparison ====================
 
@@ -131,64 +132,64 @@ namespace akkaradb::core {
              * Lexicographic key comparison (fast-path optimized).
              *
              * Fast path:
-             *   - Compare mini_key (≤8 bytes, register-only)
+             *   - Compare miniKey (≤8 bytes, register-only)
              *
              * Slow path:
              *   - memcmp remaining bytes
              */
-            [[nodiscard]] int compare_key(const RecordView& other) const noexcept {
-                const size_t min_len = std::min(k_len_, other.k_len_);
-                if (min_len >= 8) {
-                    const uint64_t lhs8 = bswap64(mini_key_);
-                    const uint64_t rhs8 = bswap64(other.mini_key_);
+            [[nodiscard]] int compareKey(const RecordView& other) const noexcept {
+                const size_t minLen = std::min(kLen_, other.kLen_);
+                if (minLen >= 8) {
+                    const uint64_t lhs8 = bswap64(miniKey_);
+                    const uint64_t rhs8 = bswap64(other.miniKey_);
                     if (lhs8 != rhs8) { return lhs8 < rhs8 ? -1 : 1; }
                 }
-                else if (min_len > 0) { if (int c = std::memcmp(&mini_key_, &other.mini_key_, min_len); c != 0) { return c < 0 ? -1 : 1; } }
+                else if (minLen > 0) { if (int c = std::memcmp(&miniKey_, &other.miniKey_, minLen); c != 0) { return c < 0 ? -1 : 1; } }
 
-                if (min_len > 8) { if (int c = std::memcmp(key_ + 8, other.key_ + 8, min_len - 8); c != 0) return c < 0 ? -1 : 1; }
+                if (minLen > 8) { if (int c = std::memcmp(key_ + 8, other.key_ + 8, minLen - 8); c != 0) return c < 0 ? -1 : 1; }
 
-                if (k_len_ < other.k_len_) return -1;
-                if (k_len_ > other.k_len_) return 1;
+                if (kLen_ < other.kLen_) return -1;
+                if (kLen_ > other.kLen_) return 1;
                 return 0;
             }
 
             /**
              * Compare with raw key.
              */
-            [[nodiscard]] int compare_key(std::span<const uint8_t> other) const noexcept {
-                const size_t min_len = std::min<size_t>(k_len_, other.size());
-                if (min_len >= 8) {
-                    const uint64_t lhs8 = bswap64(mini_key_);
-                    const uint64_t rhs8 = bswap64(load_u64_unaligned(other.data()));
+            [[nodiscard]] int compareKey(std::span<const uint8_t> other) const noexcept {
+                const size_t minLen = std::min<size_t>(kLen_, other.size());
+                if (minLen >= 8) {
+                    const uint64_t lhs8 = bswap64(miniKey_);
+                    const uint64_t rhs8 = bswap64(loadU64Unaligned(other.data()));
                     if (lhs8 != rhs8) { return lhs8 < rhs8 ? -1 : 1; }
                 }
-                else if (min_len > 0) { if (int c = std::memcmp(&mini_key_, other.data(), min_len); c != 0) { return c < 0 ? -1 : 1; } }
+                else if (minLen > 0) { if (int c = std::memcmp(&miniKey_, other.data(), minLen); c != 0) { return c < 0 ? -1 : 1; } }
 
-                if (min_len > 8) { if (int c = std::memcmp(key_ + 8, other.data() + 8, min_len - 8); c != 0) return c < 0 ? -1 : 1; }
+                if (minLen > 8) { if (int c = std::memcmp(key_ + 8, other.data() + 8, minLen - 8); c != 0) return c < 0 ? -1 : 1; }
 
-                if (k_len_ < other.size()) return -1;
-                if (k_len_ > other.size()) return 1;
+                if (kLen_ < other.size()) return -1;
+                if (kLen_ > other.size()) return 1;
                 return 0;
             }
 
             /**
              * Equality check.
              */
-            [[nodiscard]] bool key_equals(const RecordView& other) const noexcept {
-                if (k_len_ != other.k_len_) return false;
-                if (k_len_ == 0) return true;
+            [[nodiscard]] bool keyEquals(const RecordView& other) const noexcept {
+                if (kLen_ != other.kLen_) return false;
+                if (kLen_ == 0) return true;
 
-                if (mini_key_ != other.mini_key_) return false;
-                if (k_len_ <= 8) return true;
+                if (miniKey_ != other.miniKey_) return false;
+                if (kLen_ <= 8) return true;
 
-                return std::memcmp(key_ + 8, other.key_ + 8, k_len_ - 8) == 0;
+                return std::memcmp(key_ + 8, other.key_ + 8, kLen_ - 8) == 0;
             }
 
             // ==================== Operators ====================
 
-            [[nodiscard]] bool operator<(const RecordView& o) const noexcept { return compare_key(o) < 0; }
+            [[nodiscard]] bool operator<(const RecordView& o) const noexcept { return compareKey(o) < 0; }
 
-            [[nodiscard]] bool operator==(const RecordView& o) const noexcept { return key_equals(o); }
+            [[nodiscard]] bool operator==(const RecordView& o) const noexcept { return keyEquals(o); }
 
             // ==================== Flags ====================
 
@@ -198,13 +199,13 @@ namespace akkaradb::core {
             const uint8_t* key_{nullptr};
             const uint8_t* value_{nullptr};
 
-            uint16_t k_len_{0};
-            uint16_t v_len_{0};
+            uint16_t kLen_{0};
+            uint16_t vLen_{0};
 
             uint64_t seq_{0};
             uint8_t flags_{0};
 
-            uint64_t key_fp64_{0};
-            uint64_t mini_key_{0};
+            uint64_t keyFp64_{0};
+            uint64_t miniKey_{0};
     };
 } // namespace akkaradb::core

@@ -32,7 +32,7 @@ namespace akkaradb::engine::cluster {
      *
      * ClusterManager owns the lightweight primary-election loop. In cluster
      * mode, every node selects the same primary from the durable config: the
-     * coordinator-eligible node with the lowest node_id. Other nodes become
+     * coordinator-eligible node with the lowest nodeId. Other nodes become
      * Replica and connect to that configured primary endpoint through the
      * replication client.
      *
@@ -56,14 +56,18 @@ namespace akkaradb::engine::cluster {
             /**
              * Creates a manager for the given cluster config.
              *
-             * @param db_dir       Database directory retained for API compatibility.
+             * @param dbDir       Database directory retained for API compatibility.
              * @param config       Valid cluster membership and policy.
-             * @param self_node_id Stable id of the local node.
-             * @throws std::runtime_error if self_node_id is not present in a
+             * @param selfNodeId Stable id of the local node.
+             * @throws std::runtime_error if selfNodeId is not present in a
              *         non-standalone config.
              * @throws std::invalid_argument if config is invalid.
              */
-            [[nodiscard]] static std::unique_ptr<ClusterManager> create(std::filesystem::path db_dir, ClusterConfig config, uint64_t self_node_id);
+            [[nodiscard]] static std::unique_ptr<ClusterManager> create(
+                std::filesystem::path dbDir,
+                ClusterConfig config,
+                uint64_t selfNodeId
+            );
 
             ~ClusterManager();
 
@@ -71,12 +75,12 @@ namespace akkaradb::engine::cluster {
             ClusterManager& operator=(const ClusterManager&) = delete;
 
             /** Installs or replaces the role-change callback. */
-            void set_role_change_callback(RoleChangeCallback callback);
+            void setRoleChangeCallback(RoleChangeCallback callback);
 
             /**
              * Starts role election.
              *
-             * Standalone configs immediately move to NodeRole::Standalone.
+             * Standalone configs immediately move to NodeRole::STANDALONE.
              * Cluster configs select the primary deterministically from config.
              */
             void start();
@@ -88,16 +92,16 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] NodeRole role() const noexcept;
 
             /** Returns the configured local node id. */
-            [[nodiscard]] uint64_t self_node_id() const noexcept;
+            [[nodiscard]] uint64_t selfNodeId() const noexcept;
 
             /** Returns the currently known primary host, or empty if unknown. */
-            [[nodiscard]] std::string primary_host() const;
+            [[nodiscard]] std::string primaryHost() const;
 
             /** Returns the currently known primary replication port, or 0 if unknown. */
-            [[nodiscard]] uint16_t primary_repl_port() const;
+            [[nodiscard]] uint16_t primaryReplPort() const;
 
             /** Returns true when the cluster config resolves to standalone mode. */
-            [[nodiscard]] bool is_standalone() const noexcept;
+            [[nodiscard]] bool isStandalone() const noexcept;
 
         private:
             class Impl;

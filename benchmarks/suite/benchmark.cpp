@@ -44,28 +44,28 @@ namespace {
         uint32_t group;
     };
 
-    [[nodiscard]] double elapsed_ms(Clock::time_point start) {
+    [[nodiscard]] double elapsedMs(Clock::time_point start) {
         return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     }
 
-    void write_le64(uint64_t v, uint8_t* out) {
+    void writeLe64(uint64_t v, uint8_t* out) {
         for (size_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(v >> (8 * i)); }
     }
 
-    [[nodiscard]] akkaradb::engine::AkkEngineOptions memory_options() {
+    [[nodiscard]] akkaradb::engine::AkkEngineOptions memoryOptions() {
         akkaradb::engine::AkkEngineOptions opts;
-        opts.components.wal_enabled = false;
-        opts.components.blob_enabled = false;
-        opts.components.manifest_enabled = false;
-        opts.components.sst_enabled = false;
-        opts.components.version_log_enabled = false;
-        opts.runtime.force_flush_on_close = false;
-        opts.runtime.force_sync_on_close = false;
-        opts.memtable.threshold_bytes_per_shard = 512ULL * 1024ULL * 1024ULL;
+        opts.components.walEnabled = false;
+        opts.components.blobEnabled = false;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
+        opts.components.versionLogEnabled = false;
+        opts.runtime.forceFlushOnClose = false;
+        opts.runtime.forceSyncOnClose = false;
+        opts.memtable.thresholdBytesPerShard = 512ULL * 1024ULL * 1024ULL;
         return opts;
     }
 
-    void bench_api_comparison() {
+    void benchApiComparison() {
         constexpr int N = 1'000'000;
         constexpr size_t K8 = 8;
         constexpr size_t K16 = 16;
@@ -83,8 +83,8 @@ namespace {
             uint8_t* k16 = key16.data() + static_cast<size_t>(i) * K16;
             uint8_t* v16 = val16.data() + static_cast<size_t>(i) * K16;
 
-            write_le64(u, k8);
-            write_le64(u, v8);
+            writeLe64(u, k8);
+            writeLe64(u, v8);
             std::memset(k16, 0, 8);
             std::memcpy(k16 + 8, k8, 8);
             std::memcpy(v16, v8, 8);
@@ -92,71 +92,71 @@ namespace {
             trivial[static_cast<size_t>(i)] = {u, static_cast<int64_t>(u)};
         }
 
-        auto s_k8 = [&](int i) { return std::span<const uint8_t>{key8.data() + static_cast<size_t>(i) * K8, K8}; };
-        auto s_v8 = [&](int i) { return std::span<const uint8_t>{val8.data() + static_cast<size_t>(i) * K8, K8}; };
-        auto s_k16 = [&](int i) { return std::span<const uint8_t>{key16.data() + static_cast<size_t>(i) * K16, K16}; };
-        auto s_v16 = [&](int i) { return std::span<const uint8_t>{val16.data() + static_cast<size_t>(i) * K16, K16}; };
+        auto sK8 = [&](int i) { return std::span<const uint8_t>{key8.data() + static_cast<size_t>(i) * K8, K8}; };
+        auto sV8 = [&](int i) { return std::span<const uint8_t>{val8.data() + static_cast<size_t>(i) * K8, K8}; };
+        auto sK16 = [&](int i) { return std::span<const uint8_t>{key16.data() + static_cast<size_t>(i) * K16, K16}; };
+        auto sV16 = [&](int i) { return std::span<const uint8_t>{val16.data() + static_cast<size_t>(i) * K16, K16}; };
 
-        double raw8_w = 0.0;
-        double raw8_r = 0.0;
+        double raw8W = 0.0;
+        double raw8R = 0.0;
         {
-            auto eng = akkaradb::engine::AkkEngine::open(memory_options());
+            auto eng = akkaradb::engine::AkkEngine::open(memoryOptions());
             auto t0 = Clock::now();
-            for (int i = 0; i < N; ++i) { eng->put(s_k8(i), s_v8(i)); }
-            raw8_w = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
+            for (int i = 0; i < N; ++i) { eng->put(sK8(i), sV8(i)); }
+            raw8W = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
 
             std::vector<uint8_t> out;
             out.reserve(K8);
             int found = 0;
             t0 = Clock::now();
-            for (int i = 0; i < N; ++i) { if (eng->get_into(s_k8(i), out)) { ++found; } }
-            raw8_r = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
-            assert(found == N);
+            for (int i = 0; i < N; ++i) { if (eng->getInto(sK8(i), out)) { ++found; } }
+            raw8R = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
+            AKK_TEST_CHECK(found == N);
         }
 
-        double raw16_w = 0.0;
-        double raw16_r = 0.0;
+        double raw16W = 0.0;
+        double raw16R = 0.0;
         {
-            auto eng = akkaradb::engine::AkkEngine::open(memory_options());
+            auto eng = akkaradb::engine::AkkEngine::open(memoryOptions());
             auto t0 = Clock::now();
-            for (int i = 0; i < N; ++i) { eng->put(s_k16(i), s_v16(i)); }
-            raw16_w = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
+            for (int i = 0; i < N; ++i) { eng->put(sK16(i), sV16(i)); }
+            raw16W = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
 
             std::vector<uint8_t> out;
             out.reserve(K16);
             int found = 0;
             t0 = Clock::now();
-            for (int i = 0; i < N; ++i) { if (eng->get_into(s_k16(i), out)) { ++found; } }
-            raw16_r = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
-            assert(found == N);
+            for (int i = 0; i < N; ++i) { if (eng->getInto(sK16(i), out)) { ++found; } }
+            raw16R = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
+            AKK_TEST_CHECK(found == N);
         }
 
-        double typed_w = 0.0;
-        double typed_r = 0.0;
+        double typedW = 0.0;
+        double typedR = 0.0;
         {
             auto db = akkaradb::AkkaraDB::open({}, akkaradb::StartupMode::ULTRA_FAST);
-            auto table = db->table<&TrivialRecord::id>("bench_trivial");
+            auto table = db->table<&TrivialRecord::id>("benchTrivial");
 
             auto t0 = Clock::now();
             for (int i = 0; i < N; ++i) { table.put(trivial[static_cast<size_t>(i)]); }
-            typed_w = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
+            typedW = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
 
             TrivialRecord out{};
             int found = 0;
             t0 = Clock::now();
-            for (int i = 0; i < N; ++i) { if (table.get_into(static_cast<uint64_t>(i), out)) { ++found; } }
-            typed_r = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
-            assert(found == N);
+            for (int i = 0; i < N; ++i) { if (table.getInto(static_cast<uint64_t>(i), out)) { ++found; } }
+            typedR = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
+            AKK_TEST_CHECK(found == N);
         }
 
         std::printf("AkkaraDB SPECv5 typed API benchmark\n");
-        std::printf("  [raw-inline     ] k= 8B v= 8B total=16B  write %10.0f read %10.0f ops/s\n", raw8_w, raw8_r);
-        std::printf("  [raw-heap       ] k=16B v=16B total=32B  write %10.0f read %10.0f ops/s\n", raw16_w, raw16_r);
-        std::printf("  [typed-trivial  ] k=16B v=%2zuB           write %10.0f read %10.0f ops/s\n", sizeof(TrivialRecord), typed_w, typed_r);
-        std::printf("  typed vs raw-heap: write %.2fx read %.2fx slower (target <= 1.25x)\n", raw16_w / typed_w, raw16_r / typed_r);
+        std::printf("  [raw-inline     ] k= 8B v= 8B total=16B  write %10.0f read %10.0f ops/s\n", raw8W, raw8R);
+        std::printf("  [raw-heap       ] k=16B v=16B total=32B  write %10.0f read %10.0f ops/s\n", raw16W, raw16R);
+        std::printf("  [typed-trivial  ] k=16B v=%2zuB           write %10.0f read %10.0f ops/s\n", sizeof(TrivialRecord), typedW, typedR);
+        std::printf("  typed vs raw-heap: write %.2fx read %.2fx slower (target <= 1.25x)\n", raw16W / typedW, raw16R / typedR);
     }
 
-    void bench_binpack_and_index() {
+    void benchBinpackAndIndex() {
         constexpr int N = 100'000;
         std::vector<BinPackRecord> records;
         records.reserve(N);
@@ -165,39 +165,39 @@ namespace {
         }
 
         auto db = akkaradb::AkkaraDB::open({}, akkaradb::StartupMode::ULTRA_FAST);
-        auto table = db->table<&BinPackRecord::id>("bench_binpack");
+        auto table = db->table<&BinPackRecord::id>("benchBinpack");
 
         auto t0 = Clock::now();
         for (const auto& record : records) { table.put(record); }
-        const double no_index_w = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
+        const double noIndexW = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
 
-        auto indexed = db->table<&BinPackRecord::id>("bench_indexed");
+        auto indexed = db->table<&BinPackRecord::id>("benchIndexed");
         auto group = indexed.index<&BinPackRecord::group>();
 
         t0 = Clock::now();
         for (const auto& record : records) { indexed.put(record); }
-        const double index_w = static_cast<double>(N) / (elapsed_ms(t0) / 1000.0);
+        const double indexW = static_cast<double>(N) / (elapsedMs(t0) / 1000.0);
 
         size_t hits = 0;
         t0 = Clock::now();
         auto range = group.find(42U);
-        while (range.has_next()) {
+        while (range.hasNext()) {
             auto entry = range.next();
-            assert(entry.value.group == 42U);
+            AKK_TEST_CHECK(entry.value.group == 42U);
             ++hits;
         }
-        const double index_lookup = static_cast<double>(hits) / (elapsed_ms(t0) / 1000.0);
+        const double indexLookup = static_cast<double>(hits) / (elapsedMs(t0) / 1000.0);
 
-        std::printf("  [typed-binpack  ] string entity           write %10.0f ops/s\n", no_index_w);
-        std::printf("  [typed-index-put] one non-unique index    write %10.0f ops/s\n", index_w);
-        std::printf("  [index-lookup   ] exact non-unique hits=%zu read %10.0f rows/s\n", hits, index_lookup);
+        std::printf("  [typed-binpack  ] string entity           write %10.0f ops/s\n", noIndexW);
+        std::printf("  [typed-index-put] one non-unique index    write %10.0f ops/s\n", indexW);
+        std::printf("  [index-lookup   ] exact non-unique hits=%zu read %10.0f rows/s\n", hits, indexLookup);
     }
 } // namespace
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    bench_api_comparison();
-    bench_binpack_and_index();
+    benchApiComparison();
+    benchBinpackAndIndex();
     return 0;
 }

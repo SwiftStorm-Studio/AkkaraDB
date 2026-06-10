@@ -26,71 +26,75 @@
 
 namespace akkaradb {
     namespace {
-        [[nodiscard]] engine::sst::SSTWriter::Codec to_sst_codec(engine::Codec codec) noexcept {
+        [[nodiscard]] engine::sst::SSTWriter::Codec toSstCodec(engine::Codec codec) noexcept {
             switch (codec) {
-                case engine::Codec::None: return engine::sst::SSTWriter::Codec::None;
-                case engine::Codec::Zstd: return engine::sst::SSTWriter::Codec::Zstd;
+                case engine::Codec::NONE: return engine::sst::SSTWriter::Codec::NONE;
+                case engine::Codec::ZSTD: return engine::sst::SSTWriter::Codec::ZSTD;
             }
-            return engine::sst::SSTWriter::Codec::None;
+            return engine::sst::SSTWriter::Codec::NONE;
         }
 
-        [[nodiscard]] engine::blob::BlobCodec to_blob_codec(engine::Codec codec) noexcept {
+        [[nodiscard]] engine::blob::BlobCodec toBlobCodec(engine::Codec codec) noexcept {
             switch (codec) {
-                case engine::Codec::None: return engine::blob::BlobCodec::None;
-                case engine::Codec::Zstd: return engine::blob::BlobCodec::Zstd;
+                case engine::Codec::NONE: return engine::blob::BlobCodec::NONE;
+                case engine::Codec::ZSTD: return engine::blob::BlobCodec::ZSTD;
             }
-            return engine::blob::BlobCodec::None;
+            return engine::blob::BlobCodec::NONE;
         }
 
-        [[nodiscard]] engine::AkkEngineOptions make_engine_options(AkkaraDB::Options options) {
+        [[nodiscard]] engine::AkkEngineOptions makeEngineOptions(AkkaraDB::Options options) {
             engine::AkkEngineOptions out;
-            out.paths.data_dir = std::move(options.data_dir);
+            out.paths.dataDir = std::move(options.dataDir);
 
             switch (options.mode) {
-                case StartupMode::ULTRA_FAST: out.components.wal_enabled = false;
-                    out.components.blob_enabled = false;
-                    out.components.manifest_enabled = false;
-                    out.components.sst_enabled = false;
-                    out.components.version_log_enabled = false;
-                    out.runtime.force_flush_on_close = false;
-                    out.runtime.force_sync_on_close = false;
-                    out.memtable.threshold_bytes_per_shard = 512ULL * 1024ULL * 1024ULL;
+                case StartupMode::ULTRA_FAST: out.components.walEnabled = false;
+                    out.components.blobEnabled = false;
+                    out.components.manifestEnabled = false;
+                    out.components.sstEnabled = false;
+                    out.components.versionLogEnabled = false;
+                    out.runtime.forceFlushOnClose = false;
+                    out.runtime.forceSyncOnClose = false;
+                    out.memtable.thresholdBytesPerShard = 512ULL * 1024ULL * 1024ULL;
                     break;
-                case StartupMode::FAST: out.wal.sync_mode = engine::wal::WalSyncMode::Async;
-                    out.components.version_log_enabled = false;
-                    out.runtime.sst_promote_reads = true;
-                    out.memtable.threshold_bytes_per_shard = 256ULL * 1024ULL * 1024ULL;
+                case StartupMode::FAST: out.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+                    out.components.versionLogEnabled = false;
+                    out.runtime.sstPromoteReads = true;
+                    out.memtable.thresholdBytesPerShard = 256ULL * 1024ULL * 1024ULL;
                     break;
-                case StartupMode::NORMAL: out.wal.sync_mode = engine::wal::WalSyncMode::Async;
+                case StartupMode::NORMAL: out.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
                     break;
-                case StartupMode::DURABLE: out.wal.sync_mode = engine::wal::WalSyncMode::Sync;
-                    out.components.version_log_enabled = true;
+                case StartupMode::DURABLE: out.wal.syncMode = engine::wal::WalSyncMode::SYNC;
+                    out.components.versionLogEnabled = true;
                     break;
             }
 
-            if (options.overrides.memtable_threshold_per_shard) { out.memtable.threshold_bytes_per_shard = *options.overrides.memtable_threshold_per_shard; }
-            if (options.overrides.version_log_enabled) { out.components.version_log_enabled = *options.overrides.version_log_enabled; }
-            if (options.overrides.sst_codec) { out.sst.codec = to_sst_codec(*options.overrides.sst_codec); }
-            if (options.overrides.blob_codec) { out.blob.codec = to_blob_codec(*options.overrides.blob_codec); }
-            if (options.overrides.blob_threshold_bytes) { out.blob.threshold_bytes = *options.overrides.blob_threshold_bytes; }
-            if (options.overrides.sst_promote_reads) { out.runtime.sst_promote_reads = *options.overrides.sst_promote_reads; }
-            if (options.overrides.sst_bloom_bits_per_key) { out.sst.bloom_bits_per_key = static_cast<uint32_t>(*options.overrides.sst_bloom_bits_per_key); }
-            if (options.overrides.max_l0_sst_files) { out.sst.max_l0_files = static_cast<int>(*options.overrides.max_l0_sst_files); }
+            if (options.overrides.memtableThresholdPerShard) {
+                out.memtable.thresholdBytesPerShard = *options.overrides.memtableThresholdPerShard;
+            }
+            if (options.overrides.versionLogEnabled) { out.components.versionLogEnabled = *options.overrides.versionLogEnabled; }
+            if (options.overrides.sstCodec) { out.sst.codec = toSstCodec(*options.overrides.sstCodec); }
+            if (options.overrides.blobCodec) { out.blob.codec = toBlobCodec(*options.overrides.blobCodec); }
+            if (options.overrides.blobThresholdBytes) { out.blob.thresholdBytes = *options.overrides.blobThresholdBytes; }
+            if (options.overrides.sstPromoteReads) { out.runtime.sstPromoteReads = *options.overrides.sstPromoteReads; }
+            if (options.overrides.sstBloomBitsPerKey) {
+                out.sst.bloomBitsPerKey = static_cast<uint32_t>(*options.overrides.sstBloomBitsPerKey);
+            }
+            if (options.overrides.maxL0SstFiles) { out.sst.maxL0Files = static_cast<int>(*options.overrides.maxL0SstFiles); }
 
             return out;
         }
     } // namespace
 
-    std::unique_ptr<AkkaraDB> AkkaraDB::open(std::filesystem::path data_dir, StartupMode mode) {
+    std::unique_ptr<AkkaraDB> AkkaraDB::open(std::filesystem::path dataDir, StartupMode mode) {
         Options options;
-        options.data_dir = std::move(data_dir);
+        options.dataDir = std::move(dataDir);
         options.mode = mode;
         return open(std::move(options));
     }
 
     std::unique_ptr<AkkaraDB> AkkaraDB::open(Options options) {
         auto db = std::unique_ptr<AkkaraDB>{new AkkaraDB()};
-        db->engine_ = engine::AkkEngine::open(make_engine_options(std::move(options)));
+        db->engine_ = engine::AkkEngine::open(makeEngineOptions(std::move(options)));
         return db;
     }
 

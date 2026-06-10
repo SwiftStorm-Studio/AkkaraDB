@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/throughput/sstable_throughput_benchmark.cpp
+// benchmarks/throughput/sstableThroughputBenchmark.cpp
 #include "TestErrorHandlers.hpp"
 
 /*
@@ -28,13 +28,13 @@
  *  - SSTReader scan throughput
  *
  * Usage:
- *   akkaradb_sstable_throughput_benchmark [ops_per_case]
+ *   akkaradbSstableThroughputBenchmark [opsPerCase]
  *       [--readers=N|--writers=N] [--codec=none|zstd]
  *       [--block-size=N] [--cache-bytes=N|NKiB|NMiB|NGiB]
  *       [--max-case-bytes=N|NKiB|NMiB|NGiB] [--fixed-ops|--same-ops]
  *
  * Default:
- *   ops_per_case = 500000
+ *   opsPerCase = 500000
  *   readers      = 16
  *   codec        = zstd
  *   max payload   = 512 MiB per case unless --fixed-ops is set
@@ -71,48 +71,48 @@ namespace {
     constexpr size_t kScanSampleWindow = 32; // amortize clock resolution/overhead for iterator scan()
 
     struct CaseSpec {
-        int key_size;
-        int value_size;
+        int keySize;
+        int valueSize;
     };
 
     struct LatencyPercentiles {
-        double p50_us = 0.0;
-        double p90_us = 0.0;
-        double p99_us = 0.0;
-        double p999_us = 0.0;
-        uint32_t sample_count = 0;
+        double p50Us = 0.0;
+        double p90Us = 0.0;
+        double p99Us = 0.0;
+        double p999Us = 0.0;
+        uint32_t sampleCount = 0;
     };
 
     struct BenchConfig {
-        int ops_per_case = 500000;
-        int reader_threads = 16;
-        uint32_t block_size = sst::SST_DEFAULT_BLOCK_SIZE;
-        uint64_t block_cache_bytes = 64ULL * 1024ULL * 1024ULL;
-        uint64_t max_case_payload_bytes = 512ULL * 1024ULL * 1024ULL;
-        bool fixed_ops = false;
-        sst::SSTWriter::Codec codec = sst::SSTWriter::Codec::Zstd;
+        int opsPerCase = 500000;
+        int readerThreads = 16;
+        uint32_t blockSize = sst::SST_DEFAULT_BLOCK_SIZE;
+        uint64_t blockCacheBytes = 64ULL * 1024ULL * 1024ULL;
+        uint64_t maxCasePayloadBytes = 512ULL * 1024ULL * 1024ULL;
+        bool fixedOps = false;
+        sst::SSTWriter::Codec codec = sst::SSTWriter::Codec::ZSTD;
     };
 
     struct ThroughputResult {
         int ops = 0;
-        double write_ops_per_sec = 0.0;
-        double open_ms = 0.0;
-        double get_ops_per_sec = 0.0;
-        double scan_ops_per_sec = 0.0;
-        double write_ms = 0.0;
-        double get_ms = 0.0;
-        double scan_ms = 0.0;
-        uint64_t file_bytes = 0;
-        uint64_t scan_records = 0;
-        LatencyPercentiles get_latency;
-        LatencyPercentiles scan_latency;
+        double writeOpsPerSec = 0.0;
+        double openMs = 0.0;
+        double getOpsPerSec = 0.0;
+        double scanOpsPerSec = 0.0;
+        double writeMs = 0.0;
+        double getMs = 0.0;
+        double scanMs = 0.0;
+        uint64_t fileBytes = 0;
+        uint64_t scanRecords = 0;
+        LatencyPercentiles getLatency;
+        LatencyPercentiles scanLatency;
     };
 
-    [[nodiscard]] static std::span<const uint8_t> as_u8(const std::string& s) {
+    [[nodiscard]] static std::span<const uint8_t> asU8(const std::string& s) {
         return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
     }
 
-    [[nodiscard]] static std::string lower_ascii(std::string s) {
+    [[nodiscard]] static std::string lowerAscii(std::string s) {
         for (char& ch : s) {
             if (ch >= 'A' && ch <= 'Z') {
                 ch = static_cast<char>(ch - 'A' + 'a');
@@ -121,7 +121,7 @@ namespace {
         return s;
     }
 
-    [[nodiscard]] static bool parse_u64_with_suffix(const std::string& text, uint64_t* out) {
+    [[nodiscard]] static bool parseU64WithSuffix(const std::string& text, uint64_t* out) {
         if (text.empty() || out == nullptr) {
             return false;
         }
@@ -132,7 +132,7 @@ namespace {
             return false;
         }
 
-        const std::string suffix = lower_ascii(std::string{end});
+        const std::string suffix = lowerAscii(std::string{end});
         uint64_t multiplier = 1;
         if (suffix.empty() || suffix == "b") {
             multiplier = 1;
@@ -153,50 +153,50 @@ namespace {
         return true;
     }
 
-    [[nodiscard]] static double bytes_to_mib(uint64_t bytes) {
+    [[nodiscard]] static double bytesToMib(uint64_t bytes) {
         return static_cast<double>(bytes) / (1024.0 * 1024.0);
     }
 
-    [[nodiscard]] static double mib_per_sec(uint64_t bytes, double ms) {
+    [[nodiscard]] static double mibPerSec(uint64_t bytes, double ms) {
         if (ms <= 0.0) {
             return 0.0;
         }
-        return bytes_to_mib(bytes) * 1000.0 / ms;
+        return bytesToMib(bytes) * 1000.0 / ms;
     }
 
-    [[nodiscard]] static double payload_mib_per_sec(size_t bytes_per_op, int ops, double ms) {
+    [[nodiscard]] static double payloadMibPerSec(size_t bytesPerOp, int ops, double ms) {
         if (ms <= 0.0) {
             return 0.0;
         }
-        const double total_mib = static_cast<double>(bytes_per_op) * static_cast<double>(ops) / (1024.0 * 1024.0);
-        return total_mib * 1000.0 / ms;
+        const double totalMib = static_cast<double>(bytesPerOp) * static_cast<double>(ops) / (1024.0 * 1024.0);
+        return totalMib * 1000.0 / ms;
     }
 
-    [[nodiscard]] static double quantile_from_sorted(const std::vector<uint32_t>& sorted_ns, double q) {
-        if (sorted_ns.empty()) {
+    [[nodiscard]] static double quantileFromSorted(const std::vector<uint32_t>& sortedNs, double q) {
+        if (sortedNs.empty()) {
             return 0.0;
         }
-        const double q_clamped = std::clamp(q, 0.0, 1.0);
-        const size_t idx = static_cast<size_t>(q_clamped * static_cast<double>(sorted_ns.size() - 1));
-        return static_cast<double>(sorted_ns[idx]) / 1000.0;
+        const double qClamped = std::clamp(q, 0.0, 1.0);
+        const size_t idx = static_cast<size_t>(qClamped * static_cast<double>(sortedNs.size() - 1));
+        return static_cast<double>(sortedNs[idx]) / 1000.0;
     }
 
-    [[nodiscard]] static LatencyPercentiles build_percentiles(std::vector<uint32_t>& samples_ns) {
+    [[nodiscard]] static LatencyPercentiles buildPercentiles(std::vector<uint32_t>& samplesNs) {
         LatencyPercentiles out{};
-        if (samples_ns.empty()) {
+        if (samplesNs.empty()) {
             return out;
         }
 
-        std::sort(samples_ns.begin(), samples_ns.end());
-        out.sample_count = static_cast<uint32_t>(samples_ns.size());
-        out.p50_us = quantile_from_sorted(samples_ns, 0.50);
-        out.p90_us = quantile_from_sorted(samples_ns, 0.90);
-        out.p99_us = quantile_from_sorted(samples_ns, 0.99);
-        out.p999_us = quantile_from_sorted(samples_ns, 0.999);
+        std::sort(samplesNs.begin(), samplesNs.end());
+        out.sampleCount = static_cast<uint32_t>(samplesNs.size());
+        out.p50Us = quantileFromSorted(samplesNs, 0.50);
+        out.p90Us = quantileFromSorted(samplesNs, 0.90);
+        out.p99Us = quantileFromSorted(samplesNs, 0.99);
+        out.p999Us = quantileFromSorted(samplesNs, 0.999);
         return out;
     }
 
-    [[nodiscard]] static std::string make_fixed_bytes(int size, uint64_t seed) {
+    [[nodiscard]] static std::string makeFixedBytes(int size, uint64_t seed) {
         std::string out;
         out.resize(static_cast<size_t>(size));
         uint64_t x = seed ^ 0x9e3779b97f4a7c15ULL;
@@ -209,8 +209,8 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] static fs::path make_temp_dir(const std::string& suffix) {
-        auto dir = fs::temp_directory_path() / ("akkaradb_sstable_bench_" + suffix);
+    [[nodiscard]] static fs::path makeTempDir(const std::string& suffix) {
+        auto dir = fs::temp_directory_path() / ("akkaradbSstableBench_" + suffix);
         std::error_code ec;
         fs::remove_all(dir, ec);
         fs::create_directories(dir, ec);
@@ -221,12 +221,12 @@ namespace {
         return dir;
     }
 
-    static void remove_temp_dir(const fs::path& dir) {
+    static void removeTempDir(const fs::path& dir) {
         std::error_code ec;
         fs::remove_all(dir, ec);
     }
 
-    [[nodiscard]] static int resolve_reader_threads(int requested) {
+    [[nodiscard]] static int resolveReaderThreads(int requested) {
         if (requested > 0) {
             return requested;
         }
@@ -240,17 +240,17 @@ namespace {
         std::vector<RecordView> views;
     };
 
-    [[nodiscard]] static Records make_records(CaseSpec spec, int count) {
+    [[nodiscard]] static Records makeRecords(CaseSpec spec, int count) {
         Records records;
         records.keys.reserve(static_cast<size_t>(count));
         records.views.reserve(static_cast<size_t>(count));
-        records.value = make_fixed_bytes(spec.value_size, 0xA11CEULL);
+        records.value = makeFixedBytes(spec.valueSize, 0xA11CEULL);
 
         for (int i = 0; i < count; ++i) {
-            std::string key = make_fixed_bytes(spec.key_size, static_cast<uint64_t>(i) + 1);
-            if (spec.key_size >= 10) {
+            std::string key = makeFixedBytes(spec.keySize, static_cast<uint64_t>(i) + 1);
+            if (spec.keySize >= 10) {
                 const auto tail = std::format("{:010d}", i);
-                std::memcpy(key.data() + (spec.key_size - 10), tail.data(), 10);
+                std::memcpy(key.data() + (spec.keySize - 10), tail.data(), 10);
             }
             records.keys.emplace_back(std::move(key));
         }
@@ -259,12 +259,12 @@ namespace {
 
         for (int i = 0; i < count; ++i) {
             const auto& key = records.keys[static_cast<size_t>(i)];
-            const auto key_span = as_u8(key);
-            const uint64_t fp = compute_key_fp64(key_span.data(), key_span.size());
-            const uint64_t mk = build_mini_key(key_span.data(), key_span.size());
+            const auto keySpan = asU8(key);
+            const uint64_t fp = computeKeyFp64(keySpan.data(), keySpan.size());
+            const uint64_t mk = buildMiniKey(keySpan.data(), keySpan.size());
             records.views.emplace_back(
-                key_span.data(),
-                static_cast<uint16_t>(key_span.size()),
+                keySpan.data(),
+                static_cast<uint16_t>(keySpan.size()),
                 reinterpret_cast<const uint8_t*>(records.value.data()),
                 static_cast<uint16_t>(records.value.size()),
                 static_cast<uint64_t>(i + 1),
@@ -276,57 +276,57 @@ namespace {
         return records;
     }
 
-    static void run_get_parallel(
+    static void runGetParallel(
         const sst::SSTReader& reader,
         const std::vector<std::string>& keys,
-        int reader_threads,
-        std::vector<uint32_t>* latency_samples_ns
+        int readerThreads,
+        std::vector<uint32_t>* latencySamplesNs
     ) {
-        if (latency_samples_ns) {
-            latency_samples_ns->clear();
+        if (latencySamplesNs) {
+            latencySamplesNs->clear();
         }
 
-        if (reader_threads <= 1) {
+        if (readerThreads <= 1) {
             std::vector<uint8_t> out;
-            if (latency_samples_ns) {
-                latency_samples_ns->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
+            if (latencySamplesNs) {
+                latencySamplesNs->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
             }
             for (size_t i = 0; i < keys.size(); ++i) {
-                const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                const auto found = reader.get_into(as_u8(keys[i]), out);
+                const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                const auto found = reader.getInto(asU8(keys[i]), out);
                 if (!found.has_value() || !*found) {
                     std::fprintf(stderr, "GET miss at i=%zu\n", i);
                     std::exit(3);
                 }
-                if (do_sample && latency_samples_ns) {
+                if (doSample && latencySamplesNs) {
                     const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
-                    latency_samples_ns->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
+                    latencySamplesNs->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                 }
             }
             return;
         }
 
         std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(reader_threads));
-        std::vector<std::vector<uint32_t>> local_samples(static_cast<size_t>(reader_threads));
-        for (auto& v : local_samples) {
-            v.reserve((keys.size() / static_cast<size_t>(reader_threads) + kLatencySampleMask) / (kLatencySampleMask + 1));
+        threads.reserve(static_cast<size_t>(readerThreads));
+        std::vector<std::vector<uint32_t>> localSamples(static_cast<size_t>(readerThreads));
+        for (auto& v : localSamples) {
+            v.reserve((keys.size() / static_cast<size_t>(readerThreads) + kLatencySampleMask) / (kLatencySampleMask + 1));
         }
 
-        for (int tid = 0; tid < reader_threads; ++tid) {
+        for (int tid = 0; tid < readerThreads; ++tid) {
             threads.emplace_back([&, tid]() {
                 std::vector<uint8_t> out;
-                auto& samples = local_samples[static_cast<size_t>(tid)];
-                for (size_t i = static_cast<size_t>(tid); i < keys.size(); i += static_cast<size_t>(reader_threads)) {
-                    const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                    const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                    const auto found = reader.get_into(as_u8(keys[i]), out);
+                auto& samples = localSamples[static_cast<size_t>(tid)];
+                for (size_t i = static_cast<size_t>(tid); i < keys.size(); i += static_cast<size_t>(readerThreads)) {
+                    const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                    const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                    const auto found = reader.getInto(asU8(keys[i]), out);
                     if (!found.has_value() || !*found) {
                         std::fprintf(stderr, "GET miss at i=%zu (tid=%d)\n", i, tid);
                         std::exit(3);
                     }
-                    if (do_sample) {
+                    if (doSample) {
                         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
                         samples.push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                     }
@@ -338,26 +338,26 @@ namespace {
             th.join();
         }
 
-        if (latency_samples_ns) {
+        if (latencySamplesNs) {
             size_t total = 0;
-            for (const auto& v : local_samples) {
+            for (const auto& v : localSamples) {
                 total += v.size();
             }
-            latency_samples_ns->reserve(total);
-            for (auto& v : local_samples) {
-                latency_samples_ns->insert(latency_samples_ns->end(), v.begin(), v.end());
+            latencySamplesNs->reserve(total);
+            for (auto& v : localSamples) {
+                latencySamplesNs->insert(latencySamplesNs->end(), v.begin(), v.end());
             }
         }
     }
 
-    [[nodiscard]] static uint64_t run_scan(
+    [[nodiscard]] static uint64_t runScan(
         const sst::SSTReader& reader,
-        size_t expected_records,
-        std::vector<uint32_t>* latency_samples_ns
+        size_t expectedRecords,
+        std::vector<uint32_t>* latencySamplesNs
     ) {
-        if (latency_samples_ns) {
-            latency_samples_ns->clear();
-            latency_samples_ns->reserve((expected_records + kLatencySampleMask) / (kLatencySampleMask + 1));
+        if (latencySamplesNs) {
+            latencySamplesNs->clear();
+            latencySamplesNs->reserve((expectedRecords + kLatencySampleMask) / (kLatencySampleMask + 1));
         }
 
         uint64_t scanned = 0;
@@ -365,22 +365,22 @@ namespace {
         auto it = rows.begin();
         const auto end = rows.end();
         while (it != end) {
-            const bool do_sample = ((static_cast<uint32_t>(scanned) & kLatencySampleMask) == 0);
-            if (do_sample && latency_samples_ns) {
+            const bool doSample = ((static_cast<uint32_t>(scanned) & kLatencySampleMask) == 0);
+            if (doSample && latencySamplesNs) {
                 const auto t0 = Clock::now();
-                size_t window_count = 0;
-                while (window_count < kScanSampleWindow && it != end) {
+                size_t windowCount = 0;
+                while (windowCount < kScanSampleWindow && it != end) {
                     if (it->key.empty()) {
                         std::fprintf(stderr, "SCAN returned an empty key at i=%llu\n", static_cast<unsigned long long>(scanned));
                         std::exit(5);
                     }
                     ++it;
-                    ++window_count;
+                    ++windowCount;
                     ++scanned;
                 }
                 const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
-                const int64_t per_record_ns = window_count > 0 ? (dt / static_cast<int64_t>(window_count)) : 0;
-                latency_samples_ns->push_back(static_cast<uint32_t>(std::min<int64_t>(per_record_ns, INT32_MAX)));
+                const int64_t perRecordNs = windowCount > 0 ? (dt / static_cast<int64_t>(windowCount)) : 0;
+                latencySamplesNs->push_back(static_cast<uint32_t>(std::min<int64_t>(perRecordNs, INT32_MAX)));
                 continue;
             }
 
@@ -391,11 +391,11 @@ namespace {
             ++it;
             ++scanned;
         }
-        if (scanned != expected_records) {
+        if (scanned != expectedRecords) {
             std::fprintf(
                 stderr,
                 "SCAN count mismatch: expected=%zu actual=%llu\n",
-                expected_records,
+                expectedRecords,
                 static_cast<unsigned long long>(scanned)
             );
             std::exit(4);
@@ -403,96 +403,96 @@ namespace {
         return scanned;
     }
 
-    [[nodiscard]] static sst::SSTWriter::Options writer_options(const BenchConfig& config) {
+    [[nodiscard]] static sst::SSTWriter::Options writerOptions(const BenchConfig& config) {
         sst::SSTWriter::Options opts;
-        opts.block_size = config.block_size;
+        opts.blockSize = config.blockSize;
         opts.codec = config.codec;
         return opts;
     }
 
-    [[nodiscard]] static int resolve_case_ops(CaseSpec spec, const BenchConfig& config) {
-        if (config.fixed_ops || config.max_case_payload_bytes == 0) {
-            return config.ops_per_case;
+    [[nodiscard]] static int resolveCaseOps(CaseSpec spec, const BenchConfig& config) {
+        if (config.fixedOps || config.maxCasePayloadBytes == 0) {
+            return config.opsPerCase;
         }
-        const uint64_t bytes_per_op = static_cast<uint64_t>(spec.key_size) + static_cast<uint64_t>(spec.value_size);
-        if (bytes_per_op == 0) {
-            return config.ops_per_case;
+        const uint64_t bytesPerOp = static_cast<uint64_t>(spec.keySize) + static_cast<uint64_t>(spec.valueSize);
+        if (bytesPerOp == 0) {
+            return config.opsPerCase;
         }
-        const uint64_t capped = std::max<uint64_t>(1000, config.max_case_payload_bytes / bytes_per_op);
-        return static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(config.ops_per_case), capped));
+        const uint64_t capped = std::max<uint64_t>(1000, config.maxCasePayloadBytes / bytesPerOp);
+        return static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(config.opsPerCase), capped));
     }
 
-    [[nodiscard]] static ThroughputResult run_case(CaseSpec spec, int ops_per_case, const BenchConfig& config, int reader_threads) {
-        const int warmup_ops = std::min(ops_per_case, 50000);
-        const auto warmup_dir = make_temp_dir(std::format("warmup_k{}_v{}", spec.key_size, spec.value_size));
+    [[nodiscard]] static ThroughputResult runCase(CaseSpec spec, int opsPerCase, const BenchConfig& config, int readerThreads) {
+        const int warmupOps = std::min(opsPerCase, 50000);
+        const auto warmupDir = makeTempDir(std::format("warmupK{}_v{}", spec.keySize, spec.valueSize));
         {
-            auto warmup_records = make_records(spec, warmup_ops);
-            const auto warmup_path = warmup_dir / "warmup.aksst";
-            (void)sst::SSTWriter::write(warmup_path, warmup_records.views, writer_options(config));
-            auto warmup_reader = sst::SSTReader::open(warmup_path, sst::SSTReader::Options{config.block_cache_bytes});
-            if (!warmup_reader) {
+            auto warmupRecords = makeRecords(spec, warmupOps);
+            const auto warmupPath = warmupDir / "warmup.aksst";
+            (void)sst::SSTWriter::write(warmupPath, warmupRecords.views, writerOptions(config));
+            auto warmupReader = sst::SSTReader::open(warmupPath, sst::SSTReader::Options{config.blockCacheBytes});
+            if (!warmupReader) {
                 std::fprintf(stderr, "failed to open warmup SST\n");
                 std::exit(7);
             }
-            run_get_parallel(*warmup_reader, warmup_records.keys, reader_threads, nullptr);
-            auto warmup_scan = warmup_reader->scan();
-            for (auto&& row : warmup_scan) {
+            runGetParallel(*warmupReader, warmupRecords.keys, readerThreads, nullptr);
+            auto warmupScan = warmupReader->scan();
+            for (auto&& row : warmupScan) {
                 (void)row;
             }
-            warmup_reader.reset();
+            warmupReader.reset();
         }
-        remove_temp_dir(warmup_dir);
+        removeTempDir(warmupDir);
 
-        auto records = make_records(spec, ops_per_case);
-        const auto dir = make_temp_dir(std::format("k{}_v{}_r{}", spec.key_size, spec.value_size, reader_threads));
+        auto records = makeRecords(spec, opsPerCase);
+        const auto dir = makeTempDir(std::format("k{}_v{}_r{}", spec.keySize, spec.valueSize, readerThreads));
         const auto path = dir / "bench.aksst";
 
-        const auto write_t0 = Clock::now();
-        const auto write_result = sst::SSTWriter::write(path, records.views, writer_options(config));
-        const auto write_ms = std::chrono::duration<double, std::milli>(Clock::now() - write_t0).count();
+        const auto writeT0 = Clock::now();
+        const auto writeResult = sst::SSTWriter::write(path, records.views, writerOptions(config));
+        const auto writeMs = std::chrono::duration<double, std::milli>(Clock::now() - writeT0).count();
 
-        const auto open_t0 = Clock::now();
-        auto reader = sst::SSTReader::open(path, sst::SSTReader::Options{config.block_cache_bytes});
-        const auto open_ms = std::chrono::duration<double, std::milli>(Clock::now() - open_t0).count();
+        const auto openT0 = Clock::now();
+        auto reader = sst::SSTReader::open(path, sst::SSTReader::Options{config.blockCacheBytes});
+        const auto openMs = std::chrono::duration<double, std::milli>(Clock::now() - openT0).count();
         if (!reader) {
             std::fprintf(stderr, "failed to open SST: %s\n", path.string().c_str());
             std::exit(8);
         }
 
-        std::vector<uint32_t> get_latency_ns;
-        const auto get_t0 = Clock::now();
-        run_get_parallel(*reader, records.keys, reader_threads, &get_latency_ns);
-        const auto get_ms = std::chrono::duration<double, std::milli>(Clock::now() - get_t0).count();
+        std::vector<uint32_t> getLatencyNs;
+        const auto getT0 = Clock::now();
+        runGetParallel(*reader, records.keys, readerThreads, &getLatencyNs);
+        const auto getMs = std::chrono::duration<double, std::milli>(Clock::now() - getT0).count();
 
-        std::vector<uint32_t> scan_latency_ns;
-        const auto scan_t0 = Clock::now();
-        const uint64_t scanned = run_scan(*reader, records.keys.size(), &scan_latency_ns);
-        const auto scan_ms = std::chrono::duration<double, std::milli>(Clock::now() - scan_t0).count();
+        std::vector<uint32_t> scanLatencyNs;
+        const auto scanT0 = Clock::now();
+        const uint64_t scanned = runScan(*reader, records.keys.size(), &scanLatencyNs);
+        const auto scanMs = std::chrono::duration<double, std::milli>(Clock::now() - scanT0).count();
 
         reader.reset();
-        remove_temp_dir(dir);
+        removeTempDir(dir);
 
         return {
-            .ops = ops_per_case,
-            .write_ops_per_sec = static_cast<double>(ops_per_case) * 1000.0 / write_ms,
-            .open_ms = open_ms,
-            .get_ops_per_sec = static_cast<double>(ops_per_case) * 1000.0 / get_ms,
-            .scan_ops_per_sec = static_cast<double>(scanned) * 1000.0 / scan_ms,
-            .write_ms = write_ms,
-            .get_ms = get_ms,
-            .scan_ms = scan_ms,
-            .file_bytes = write_result.file_size_bytes,
-            .scan_records = scanned,
-            .get_latency = build_percentiles(get_latency_ns),
-            .scan_latency = build_percentiles(scan_latency_ns)
+            .ops = opsPerCase,
+            .writeOpsPerSec = static_cast<double>(opsPerCase) * 1000.0 / writeMs,
+            .openMs = openMs,
+            .getOpsPerSec = static_cast<double>(opsPerCase) * 1000.0 / getMs,
+            .scanOpsPerSec = static_cast<double>(scanned) * 1000.0 / scanMs,
+            .writeMs = writeMs,
+            .getMs = getMs,
+            .scanMs = scanMs,
+            .fileBytes = writeResult.fileSizeBytes,
+            .scanRecords = scanned,
+            .getLatency = buildPercentiles(getLatencyNs),
+            .scanLatency = buildPercentiles(scanLatencyNs)
         };
     }
 
-    [[nodiscard]] static const char* codec_name(sst::SSTWriter::Codec codec) {
+    [[nodiscard]] static const char* codecName(sst::SSTWriter::Codec codec) {
         switch (codec) {
-            case sst::SSTWriter::Codec::None:
+            case sst::SSTWriter::Codec::NONE:
                 return "none";
-            case sst::SSTWriter::Codec::Zstd:
+            case sst::SSTWriter::Codec::ZSTD:
                 return "zstd";
         }
         return "unknown";
@@ -500,24 +500,24 @@ namespace {
 } // namespace
 
 int main(int argc, char** argv) {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
     BenchConfig config;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg.rfind("--readers=", 0) == 0 || arg.rfind("--writers=", 0) == 0) {
-            config.reader_threads = std::max(0, std::atoi(arg.substr(10).c_str()));
+            config.readerThreads = std::max(0, std::atoi(arg.substr(10).c_str()));
             continue;
         }
         if (arg.rfind("--codec=", 0) == 0) {
             const std::string codec = arg.substr(8);
             if (codec == "none") {
-                config.codec = sst::SSTWriter::Codec::None;
+                config.codec = sst::SSTWriter::Codec::NONE;
                 continue;
             }
             if (codec == "zstd") {
-                config.codec = sst::SSTWriter::Codec::Zstd;
+                config.codec = sst::SSTWriter::Codec::ZSTD;
                 continue;
             }
             std::fprintf(stderr, "Unknown codec: %s (use none|zstd)\n", codec.c_str());
@@ -525,36 +525,36 @@ int main(int argc, char** argv) {
         }
         if (arg.rfind("--block-size=", 0) == 0) {
             uint64_t parsed = 0;
-            if (!parse_u64_with_suffix(arg.substr(13), &parsed) || parsed > std::numeric_limits<uint32_t>::max()) {
+            if (!parseU64WithSuffix(arg.substr(13), &parsed) || parsed > std::numeric_limits<uint32_t>::max()) {
                 std::fprintf(stderr, "Invalid --block-size value: %s\n", arg.substr(13).c_str());
                 return 2;
             }
-            config.block_size = static_cast<uint32_t>(parsed);
+            config.blockSize = static_cast<uint32_t>(parsed);
             continue;
         }
         if (arg.rfind("--cache-bytes=", 0) == 0) {
             uint64_t parsed = 0;
-            if (!parse_u64_with_suffix(arg.substr(14), &parsed)) {
+            if (!parseU64WithSuffix(arg.substr(14), &parsed)) {
                 std::fprintf(stderr, "Invalid --cache-bytes value: %s\n", arg.substr(14).c_str());
                 return 2;
             }
-            config.block_cache_bytes = parsed;
+            config.blockCacheBytes = parsed;
             continue;
         }
         if (arg.rfind("--max-case-bytes=", 0) == 0) {
             uint64_t parsed = 0;
-            if (!parse_u64_with_suffix(arg.substr(17), &parsed)) {
+            if (!parseU64WithSuffix(arg.substr(17), &parsed)) {
                 std::fprintf(stderr, "Invalid --max-case-bytes value: %s\n", arg.substr(17).c_str());
                 return 2;
             }
-            config.max_case_payload_bytes = parsed;
+            config.maxCasePayloadBytes = parsed;
             continue;
         }
         if (arg == "--fixed-ops" || arg == "--same-ops") {
-            config.fixed_ops = true;
+            config.fixedOps = true;
             continue;
         }
-        config.ops_per_case = std::max(1, std::atoi(arg.c_str()));
+        config.opsPerCase = std::max(1, std::atoi(arg.c_str()));
     }
 
     const std::array<CaseSpec, 6> cases{{
@@ -566,65 +566,65 @@ int main(int argc, char** argv) {
         {64, 16384}
     }};
 
-    const int effective_readers = resolve_reader_threads(config.reader_threads);
+    const int effectiveReaders = resolveReaderThreads(config.readerThreads);
 
     std::printf("SSTable throughput benchmark\n");
-    std::printf("ops_per_case = %d\n", config.ops_per_case);
-    std::printf("codec = %s\n", codec_name(config.codec));
-    std::printf("block_size = %u\n", config.block_size);
-    std::printf("block_cache_bytes = %.2f MiB\n", bytes_to_mib(config.block_cache_bytes));
-    if (config.fixed_ops || config.max_case_payload_bytes == 0) {
-        std::printf("max_case_payload_bytes = disabled (--fixed-ops/--same-ops)\n");
+    std::printf("opsPerCase = %d\n", config.opsPerCase);
+    std::printf("codec = %s\n", codecName(config.codec));
+    std::printf("blockSize = %u\n", config.blockSize);
+    std::printf("blockCacheBytes = %.2f MiB\n", bytesToMib(config.blockCacheBytes));
+    if (config.fixedOps || config.maxCasePayloadBytes == 0) {
+        std::printf("maxCasePayloadBytes = disabled (--fixed-ops/--same-ops)\n");
     } else {
-        std::printf("max_case_payload_bytes = %.2f MiB\n", bytes_to_mib(config.max_case_payload_bytes));
+        std::printf("maxCasePayloadBytes = %.2f MiB\n", bytesToMib(config.maxCasePayloadBytes));
     }
-    if (config.reader_threads == 0) {
-        std::printf("reader_threads = auto (%d from hw_threads)\n", effective_readers);
+    if (config.readerThreads == 0) {
+        std::printf("readerThreads = auto (%d from hwThreads)\n", effectiveReaders);
     } else {
-        std::printf("reader_threads = %d\n", config.reader_threads);
+        std::printf("readerThreads = %d\n", config.readerThreads);
     }
-    std::printf("warmup_ops = %d\n\n", std::min(config.ops_per_case, 50000));
+    std::printf("warmupOps = %d\n\n", std::min(config.opsPerCase, 50000));
     std::printf("%-10s %-12s %-10s %-8s %-14s %-14s %-14s %-12s %-8s %-8s\n",
-                "key", "value", "ops", "readers", "write(ops/s)", "get(ops/s)", "scan(ops/s)", "sst_bytes", "get_smp", "scan_smp");
+                "key", "value", "ops", "readers", "write(ops/s)", "get(ops/s)", "scan(ops/s)", "sstBytes", "getSmp", "scanSmp");
     std::printf("%-10s %-12s %-10s %-8s %-14s %-14s %-14s %-12s %-8s %-8s\n",
                 "", "", "", "", "", "", "", "", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)");
     std::printf("------------------------------------------------------------------------------------------------\n");
 
     for (const auto& spec : cases) {
-        const int case_ops = resolve_case_ops(spec, config);
-        const ThroughputResult result = run_case(spec, case_ops, config, effective_readers);
+        const int caseOps = resolveCaseOps(spec, config);
+        const ThroughputResult result = runCase(spec, caseOps, config, effectiveReaders);
         std::printf("%-10d %-12d %-10d %-8d %-14.0f %-14.0f %-14.0f %-12llu %-8u %-8u\n",
-                    spec.key_size,
-                    spec.value_size,
+                    spec.keySize,
+                    spec.valueSize,
                     result.ops,
-                    effective_readers,
-                    result.write_ops_per_sec,
-                    result.get_ops_per_sec,
-                    result.scan_ops_per_sec,
-                    static_cast<unsigned long long>(result.file_bytes),
-                    result.get_latency.sample_count,
-                    result.scan_latency.sample_count);
+                    effectiveReaders,
+                    result.writeOpsPerSec,
+                    result.getOpsPerSec,
+                    result.scanOpsPerSec,
+                    static_cast<unsigned long long>(result.fileBytes),
+                    result.getLatency.sampleCount,
+                    result.scanLatency.sampleCount);
         std::printf("%-10s %-12s %-10s %-8s %-14s %-14s %-14s %-12s %4.2f/%4.2f/%4.2f/%4.2f %4.2f/%4.2f/%4.2f/%4.2f\n",
                     "", "", "", "", "", "", "", "",
-                    result.get_latency.p50_us,
-                    result.get_latency.p90_us,
-                    result.get_latency.p99_us,
-                    result.get_latency.p999_us,
-                    result.scan_latency.p50_us,
-                    result.scan_latency.p90_us,
-                    result.scan_latency.p99_us,
-                    result.scan_latency.p999_us);
+                    result.getLatency.p50Us,
+                    result.getLatency.p90Us,
+                    result.getLatency.p99Us,
+                    result.getLatency.p999Us,
+                    result.scanLatency.p50Us,
+                    result.scanLatency.p90Us,
+                    result.scanLatency.p99Us,
+                    result.scanLatency.p999Us);
         std::printf("  timings(ms): write=%8.2f open=%8.2f get=%8.2f scan=%8.2f   file(MiB/s): write=%8.2f get=%8.2f scan=%8.2f   payload(MiB/s): write=%8.2f get=%8.2f scan=%8.2f\n",
-                    result.write_ms,
-                    result.open_ms,
-                    result.get_ms,
-                    result.scan_ms,
-                    mib_per_sec(result.file_bytes, result.write_ms),
-                    mib_per_sec(result.file_bytes, result.get_ms),
-                    mib_per_sec(result.file_bytes, result.scan_ms),
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), result.ops, result.write_ms),
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), result.ops, result.get_ms),
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), result.ops, result.scan_ms));
+                    result.writeMs,
+                    result.openMs,
+                    result.getMs,
+                    result.scanMs,
+                    mibPerSec(result.fileBytes, result.writeMs),
+                    mibPerSec(result.fileBytes, result.getMs),
+                    mibPerSec(result.fileBytes, result.scanMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), result.ops, result.writeMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), result.ops, result.getMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), result.ops, result.scanMs));
         std::printf("------------------------------------------------------------------------------------------------\n");
         std::fflush(stdout);
     }

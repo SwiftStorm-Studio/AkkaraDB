@@ -51,9 +51,9 @@ namespace akkaradb::engine::vlog {
         struct AkvlogV5FileHeader {
             uint32_t magic;
             uint16_t version;
-            uint8_t sync_mode_hint;
+            uint8_t syncModeHint;
             uint8_t reserved0;
-            uint64_t created_ns;
+            uint64_t createdNs;
             uint64_t reserved1;
             uint32_t crc32c;
             uint32_t reserved2;
@@ -62,14 +62,14 @@ namespace akkaradb::engine::vlog {
 
         #pragma pack(push, 1)
         struct AkvlogV5EntryHeader {
-            uint32_t entry_len;
+            uint32_t entryLen;
             uint64_t seq;
-            uint64_t source_node_id;
-            uint64_t timestamp_ns;
+            uint64_t sourceNodeId;
+            uint64_t timestampNs;
             uint8_t flags;
-            uint64_t key_fp64;
-            uint16_t key_len;
-            uint32_t value_len;
+            uint64_t keyFp64;
+            uint16_t keyLen;
+            uint32_t valueLen;
         };
         #pragma pack(pop)
 
@@ -81,9 +81,9 @@ namespace akkaradb::engine::vlog {
         static constexpr size_t MIN_ENTRY_SIZE = ENTRY_HDR_SIZE + CRC_SIZE;
         static constexpr size_t MAX_ENTRY_SIZE = 32u * 1024u * 1024u;
 
-        [[nodiscard]] static uint64_t now_ns_fallback() noexcept { return 0; }
+        [[nodiscard]] static uint64_t nowNsFallback() noexcept { return 0; }
 
-        static void do_fdatasync(FILE* f) {
+        static void doFdatasync(FILE* f) {
             #ifdef _WIN32
             _commit(_fileno(f));
             #else
@@ -105,75 +105,75 @@ namespace akkaradb::engine::vlog {
 
             std::unordered_map<std::string, std::vector<VersionEntry>, StringViewHash, std::equal_to<>> index_;
             FILE* file_ = nullptr;
-            std::vector<uint8_t> write_buf_;
+            std::vector<uint8_t> writeBuf_;
 
-            void serialize_and_write(
+            void serializeAndWrite(
                 FILE* f,
-                const uint8_t* key_data,
-                size_t key_len,
+                const uint8_t* keyData,
+                size_t keyLen,
                 uint64_t seq,
-                uint64_t source_node_id,
-                uint64_t timestamp_ns,
+                uint64_t sourceNodeId,
+                uint64_t timestampNs,
                 uint8_t flags,
-                const uint8_t* value_data,
-                size_t value_len
+                const uint8_t* valueData,
+                size_t valueLen
             ) {
-                const size_t total = ENTRY_HDR_SIZE + key_len + value_len + CRC_SIZE;
+                const size_t total = ENTRY_HDR_SIZE + keyLen + valueLen + CRC_SIZE;
                 if (total > MAX_ENTRY_SIZE) { throw std::invalid_argument("VersionLog: entry too large"); }
-                if (key_len > std::numeric_limits<uint16_t>::max()) { throw std::invalid_argument("VersionLog: key too large"); }
-                if (value_len > std::numeric_limits<uint32_t>::max()) { throw std::invalid_argument("VersionLog: value too large"); }
+                if (keyLen > std::numeric_limits<uint16_t>::max()) { throw std::invalid_argument("VersionLog: key too large"); }
+                if (valueLen > std::numeric_limits<uint32_t>::max()) { throw std::invalid_argument("VersionLog: value too large"); }
 
-                const uint32_t entry_len = static_cast<uint32_t>(total);
-                write_buf_.resize(entry_len);
-                uint8_t* p = write_buf_.data();
+                const uint32_t entryLen = static_cast<uint32_t>(total);
+                writeBuf_.resize(entryLen);
+                uint8_t* p = writeBuf_.data();
 
                 auto& hdr = *reinterpret_cast<AkvlogV5EntryHeader*>(p);
-                hdr.entry_len = entry_len;
+                hdr.entryLen = entryLen;
                 hdr.seq = seq;
-                hdr.source_node_id = source_node_id;
-                hdr.timestamp_ns = timestamp_ns;
+                hdr.sourceNodeId = sourceNodeId;
+                hdr.timestampNs = timestampNs;
                 hdr.flags = flags;
-                hdr.key_fp64 = key_len == 0 ? 0ULL : core::compute_key_fp64(key_data, key_len);
-                hdr.key_len = static_cast<uint16_t>(key_len);
-                hdr.value_len = static_cast<uint32_t>(value_len);
+                hdr.keyFp64 = keyLen == 0 ? 0ULL : core::computeKeyFp64(keyData, keyLen);
+                hdr.keyLen = static_cast<uint16_t>(keyLen);
+                hdr.valueLen = static_cast<uint32_t>(valueLen);
                 p += ENTRY_HDR_SIZE;
 
-                if (key_len > 0) {
-                    std::memcpy(p, key_data, key_len);
-                    p += key_len;
+                if (keyLen > 0) {
+                    std::memcpy(p, keyData, keyLen);
+                    p += keyLen;
                 }
-                if (value_len > 0) {
-                    std::memcpy(p, value_data, value_len);
-                    p += value_len;
+                if (valueLen > 0) {
+                    std::memcpy(p, valueData, valueLen);
+                    p += valueLen;
                 }
 
                 std::memset(p, 0, CRC_SIZE);
-                const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(write_buf_.data()), entry_len - CRC_SIZE);
+                const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(writeBuf_.data()), entryLen - CRC_SIZE);
                 std::memcpy(p, &crc, CRC_SIZE);
 
-                if (fwrite(write_buf_.data(), 1, entry_len, f) != entry_len) { throw std::runtime_error("VersionLog: fwrite failed"); }
+                if (fwrite(writeBuf_.data(), 1, entryLen, f) != entryLen) { throw std::runtime_error("VersionLog: fwrite failed"); }
             }
 
-            void write_entry(
+            void writeEntry(
                 std::span<const uint8_t> key,
                 uint64_t seq,
-                uint64_t source_node_id,
-                uint64_t timestamp_ns,
+                uint64_t sourceNodeId,
+                uint64_t timestampNs,
                 uint8_t flags,
                 std::span<const uint8_t> value
             ) {
-                serialize_and_write(file_, key.data(), key.size(), seq, source_node_id, timestamp_ns, flags, value.data(), value.size());
+                serializeAndWrite(file_, key.data(), key.size(), seq, sourceNodeId, timestampNs, flags, value.data(), value.size());
                 fflush(file_);
-                if (opts_.sync_mode == VLogSyncMode::Sync) { do_fdatasync(file_); }
+                if (opts_.syncMode == VLogSyncMode::SYNC) { doFdatasync(file_); }
             }
 
-            void write_file_header(FILE* wf) {
+            void writeFileHeader(FILE* wf) {
                 AkvlogV5FileHeader hdr{};
                 hdr.magic = AKVLOG_V5_MAGIC;
                 hdr.version = AKVLOG_V5_VERSION;
-                hdr.sync_mode_hint = static_cast<uint8_t>(opts_.sync_mode);
+                hdr.syncModeHint = static_cast<uint8_t>(opts_.syncMode);
                 hdr.reserved0 = 0;
-                hdr.created_ns = now_ns_fallback();
+                hdr.createdNs = nowNsFallback();
                 hdr.reserved1 = 0;
                 hdr.crc32c = 0;
                 hdr.reserved2 = 0;
@@ -181,11 +181,11 @@ namespace akkaradb::engine::vlog {
 
                 if (fwrite(&hdr, sizeof(hdr), 1, wf) != 1) { throw std::runtime_error("VersionLog: failed to write header"); }
                 fflush(wf);
-                do_fdatasync(wf);
+                doFdatasync(wf);
             }
 
-            void open_or_create() {
-                const auto& path = opts_.log_path;
+            void openOrCreate() {
+                const auto& path = opts_.logPath;
                 const auto parent = path.parent_path();
                 if (!parent.empty()) { fs::create_directories(parent); }
 
@@ -210,10 +210,10 @@ namespace akkaradb::engine::vlog {
                 #endif
                 if (!file_) { throw std::runtime_error("VersionLog: cannot open file: " + path.string()); }
 
-                if (!existed || fs::file_size(path) == 0) { write_file_header(file_); }
+                if (!existed || fs::file_size(path) == 0) { writeFileHeader(file_); }
             }
 
-            void insert_sorted(const std::string& key, VersionEntry ve) {
+            void insertSorted(const std::string& key, VersionEntry ve) {
                 auto& versions = index_[key];
                 if (versions.empty() || versions.back().seq <= ve.seq) {
                     versions.push_back(std::move(ve));
@@ -230,49 +230,50 @@ namespace akkaradb::engine::vlog {
             }
 
             void recover(FILE* rf) {
-                AkvlogV5FileHeader file_hdr{};
-                if (fread(&file_hdr, sizeof(file_hdr), 1, rf) != 1) { return; }
+                AkvlogV5FileHeader fileHdr{};
+                if (fread(&fileHdr, sizeof(fileHdr), 1, rf) != 1) { return; }
 
-                const uint32_t stored_header_crc = file_hdr.crc32c;
-                file_hdr.crc32c = 0;
-                const uint32_t computed_header_crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(&file_hdr), sizeof(file_hdr));
-                if (file_hdr.magic != AKVLOG_V5_MAGIC || file_hdr.version != AKVLOG_V5_VERSION || stored_header_crc !=
-                    computed_header_crc) { return; }
+                const uint32_t storedHeaderCrc = fileHdr.crc32c;
+                fileHdr.crc32c = 0;
+                const uint32_t computedHeaderCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(&fileHdr), sizeof(fileHdr));
+                if (fileHdr.magic != AKVLOG_V5_MAGIC || fileHdr.version != AKVLOG_V5_VERSION || storedHeaderCrc != computedHeaderCrc) {
+                    return;
+                }
 
                 std::vector<uint8_t> buf;
                 while (true) {
-                    uint32_t entry_len = 0;
-                    if (fread(&entry_len, sizeof(entry_len), 1, rf) != 1) { break; }
-                    if (entry_len < MIN_ENTRY_SIZE || entry_len > MAX_ENTRY_SIZE) { break; }
+                    uint32_t entryLen = 0;
+                    if (fread(&entryLen, sizeof(entryLen), 1, rf) != 1) { break; }
+                    if (entryLen < MIN_ENTRY_SIZE || entryLen > MAX_ENTRY_SIZE) { break; }
 
-                    buf.resize(entry_len);
-                    std::memcpy(buf.data(), &entry_len, sizeof(entry_len));
+                    buf.resize(entryLen);
+                    std::memcpy(buf.data(), &entryLen, sizeof(entryLen));
 
-                    const size_t rest = entry_len - sizeof(entry_len);
-                    if (fread(buf.data() + sizeof(entry_len), 1, rest, rf) != rest) { break; }
+                    const size_t rest = entryLen - sizeof(entryLen);
+                    if (fread(buf.data() + sizeof(entryLen), 1, rest, rf) != rest) { break; }
 
-                    uint32_t stored_entry_crc = 0;
-                    std::memcpy(&stored_entry_crc, buf.data() + entry_len - CRC_SIZE, CRC_SIZE);
-                    std::memset(buf.data() + entry_len - CRC_SIZE, 0, CRC_SIZE);
-                    const uint32_t computed_entry_crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(buf.data()), entry_len - CRC_SIZE);
-                    if (stored_entry_crc != computed_entry_crc) { continue; }
+                    uint32_t storedEntryCrc = 0;
+                    std::memcpy(&storedEntryCrc, buf.data() + entryLen - CRC_SIZE, CRC_SIZE);
+                    std::memset(buf.data() + entryLen - CRC_SIZE, 0, CRC_SIZE);
+                    const uint32_t computedEntryCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(buf.data()), entryLen - CRC_SIZE);
+                    if (storedEntryCrc != computedEntryCrc) { continue; }
 
                     if (buf.size() < ENTRY_HDR_SIZE) { continue; }
                     const auto& ehdr = *reinterpret_cast<const AkvlogV5EntryHeader*>(buf.data());
-                    const size_t expected_size = ENTRY_HDR_SIZE + ehdr.key_len + ehdr.value_len + CRC_SIZE;
-                    if (expected_size != entry_len) { continue; }
+                    const size_t expectedSize = ENTRY_HDR_SIZE + ehdr.keyLen + ehdr.valueLen + CRC_SIZE;
+                    if (expectedSize != entryLen) { continue; }
 
                     const uint8_t* p = buf.data() + ENTRY_HDR_SIZE;
-                    std::string key(reinterpret_cast<const char*>(p), ehdr.key_len);
-                    p += ehdr.key_len;
+                    std::string key(reinterpret_cast<const char*>(p), ehdr.keyLen);
+                    p += ehdr.keyLen;
 
                     VersionEntry ve;
                     ve.seq = ehdr.seq;
-                    ve.source_node_id = ehdr.source_node_id;
-                    ve.timestamp_ns = ehdr.timestamp_ns;
+                    ve.sourceNodeId = ehdr.sourceNodeId;
+                    ve.timestampNs = ehdr.timestampNs;
                     ve.flags = ehdr.flags;
-                    ve.value.assign(p, p + ehdr.value_len);
-                    insert_sorted(key, std::move(ve));
+                    ve.value.assign(p, p + ehdr.valueLen);
+                    insertSorted(key, std::move(ve));
                 }
             }
     };
@@ -281,8 +282,8 @@ namespace akkaradb::engine::vlog {
         auto log = std::unique_ptr<VersionLog>(new VersionLog{});
         log->impl_ = std::make_unique<Impl>();
         log->impl_->opts_ = std::move(opts);
-        log->impl_->write_buf_.reserve(4096);
-        log->impl_->open_or_create();
+        log->impl_->writeBuf_.reserve(4096);
+        log->impl_->openOrCreate();
         return log;
     }
 
@@ -291,8 +292,8 @@ namespace akkaradb::engine::vlog {
     void VersionLog::append(
         std::span<const uint8_t> key,
         uint64_t seq,
-        uint64_t source_node_id,
-        uint64_t timestamp_ns,
+        uint64_t sourceNodeId,
+        uint64_t timestampNs,
         uint8_t flags,
         std::span<const uint8_t> value
     ) {
@@ -301,31 +302,31 @@ namespace akkaradb::engine::vlog {
         std::lock_guard lock{impl_->mu_};
         if (!impl_->file_) { return; }
 
-        impl_->write_entry(key, seq, source_node_id, timestamp_ns, flags, value);
+        impl_->writeEntry(key, seq, sourceNodeId, timestampNs, flags, value);
 
-        const std::string key_str(reinterpret_cast<const char*>(key.data()), key.size());
+        const std::string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
         VersionEntry ve;
         ve.seq = seq;
-        ve.source_node_id = source_node_id;
-        ve.timestamp_ns = timestamp_ns;
+        ve.sourceNodeId = sourceNodeId;
+        ve.timestampNs = timestampNs;
         ve.flags = flags;
         ve.value.assign(value.begin(), value.end());
-        impl_->insert_sorted(key_str, std::move(ve));
+        impl_->insertSorted(keyStr, std::move(ve));
     }
 
-    std::optional<VersionEntry> VersionLog::get_at(std::span<const uint8_t> key, uint64_t at_seq) const {
+    std::optional<VersionEntry> VersionLog::getAt(std::span<const uint8_t> key, uint64_t atSeq) const {
         if (!impl_) { return std::nullopt; }
 
         std::lock_guard lock{impl_->mu_};
-        const std::string_view key_sv(reinterpret_cast<const char*>(key.data()), key.size());
-        const auto it = impl_->index_.find(key_sv);
+        const std::string_view keySv(reinterpret_cast<const char*>(key.data()), key.size());
+        const auto it = impl_->index_.find(keySv);
         if (it == impl_->index_.end()) { return std::nullopt; }
 
         const auto& versions = it->second;
         const auto pos = std::upper_bound(
             versions.begin(),
             versions.end(),
-            at_seq,
+            atSeq,
             [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; }
         );
         if (pos == versions.begin()) { return std::nullopt; }
@@ -336,34 +337,32 @@ namespace akkaradb::engine::vlog {
         if (!impl_) { return {}; }
 
         std::lock_guard lock{impl_->mu_};
-        const std::string_view key_sv(reinterpret_cast<const char*>(key.data()), key.size());
-        const auto it = impl_->index_.find(key_sv);
+        const std::string_view keySv(reinterpret_cast<const char*>(key.data()), key.size());
+        const auto it = impl_->index_.find(keySv);
         if (it == impl_->index_.end()) { return {}; }
         return it->second;
     }
 
-    std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> VersionLog::collect_rollback_targets(
-        uint64_t target_seq
-    ) const {
+    std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> VersionLog::collectRollbackTargets(uint64_t targetSeq) const {
         if (!impl_) { return {}; }
 
         std::lock_guard lock{impl_->mu_};
         std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> result;
         for (const auto& [key, versions] : impl_->index_) {
-            if (versions.empty() || versions.back().seq <= target_seq) { continue; }
+            if (versions.empty() || versions.back().seq <= targetSeq) { continue; }
 
             const auto pos = std::upper_bound(
                 versions.begin(),
                 versions.end(),
-                target_seq,
+                targetSeq,
                 [](uint64_t seq, const VersionEntry& e) { return seq < e.seq; }
             );
 
             std::optional<VersionEntry> prev;
             if (pos != versions.begin()) { prev = *std::prev(pos); }
 
-            std::vector<uint8_t> key_bytes(key.begin(), key.end());
-            result.emplace_back(std::move(key_bytes), std::move(prev));
+            std::vector<uint8_t> keyBytes(key.begin(), key.end());
+            result.emplace_back(std::move(keyBytes), std::move(prev));
         }
 
         return result;

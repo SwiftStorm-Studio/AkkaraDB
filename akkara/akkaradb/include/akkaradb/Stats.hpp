@@ -28,98 +28,98 @@
 namespace akkaradb::engine {
     struct LevelStats {
         int level = 0;
-        size_t file_count = 0;
+        size_t fileCount = 0;
         uint64_t bytes = 0;
-        uint64_t budget_bytes = 0;
+        uint64_t budgetBytes = 0;
     };
 
     struct AKDB_API EngineStats {
-        uint64_t current_seq = 0;
-        uint64_t node_id = 0;
+        uint64_t currentSeq = 0;
+        uint64_t nodeId = 0;
 
-        uint64_t puts_total = 0;
-        uint64_t removes_total = 0;
-        uint64_t gets_total = 0;
-        uint64_t gets_memtable_hit = 0;
-        uint64_t gets_sst_hit = 0;
-        uint64_t gets_miss = 0;
-        uint64_t exists_total = 0;
-        uint64_t scans_total = 0;
-        uint64_t blob_puts_total = 0;
+        uint64_t putsTotal = 0;
+        uint64_t removesTotal = 0;
+        uint64_t getsTotal = 0;
+        uint64_t getsMemtableHit = 0;
+        uint64_t getsSstHit = 0;
+        uint64_t getsMiss = 0;
+        uint64_t existsTotal = 0;
+        uint64_t scansTotal = 0;
+        uint64_t blobPutsTotal = 0;
 
         struct ApiStats {
             bool enabled = false;
-            bool tcp_enabled = false;
-            bool tcp_tls_enabled = false;
-            uint8_t tcp_io_backend = 0;
-            uint32_t tcp_worker_threads = 0;
-            uint32_t tcp_accept_queue_limit = 0;
-            uint32_t tcp_accept_queue_timeout_ms = 0;
-            uint32_t tcp_listen_backlog = 0;
-            uint32_t tcp_read_timeout_ms = 0;
-            uint32_t tcp_write_timeout_ms = 0;
-            uint64_t tcp_connections_accepted_total = 0;
-            uint64_t tcp_connections_closed_total = 0;
-            uint64_t tcp_connections_active = 0;
-            uint64_t tcp_accept_queue_depth = 0;
-            uint64_t tcp_accept_queue_peak_depth = 0;
-            uint64_t tcp_accept_queue_rejected_total = 0;
-            uint64_t tcp_accept_queue_expired_total = 0;
-            uint64_t tcp_requests_total = 0;
-            uint64_t tcp_responses_total = 0;
-            uint64_t tcp_bytes_received_total = 0;
-            uint64_t tcp_bytes_sent_total = 0;
-            uint64_t tcp_protocol_errors_total = 0;
-            uint64_t tcp_crc_errors_total = 0;
-            uint64_t tcp_pipeline_batches_total = 0;
-            uint64_t tcp_backpressure_flushes_total = 0;
-            uint64_t tcp_backpressure_disconnects_total = 0;
-            uint64_t tcp_batch_put_items_total = 0;
-            uint64_t tcp_batch_get_items_total = 0;
+            bool tcpEnabled = false;
+            bool tcpTlsEnabled = false;
+            uint8_t tcpIoBackend = 0;
+            uint32_t tcpWorkerThreads = 0;
+            uint32_t tcpAcceptQueueLimit = 0;
+            uint32_t tcpAcceptQueueTimeoutMs = 0;
+            uint32_t tcpListenBacklog = 0;
+            uint32_t tcpReadTimeoutMs = 0;
+            uint32_t tcpWriteTimeoutMs = 0;
+            uint64_t tcpConnectionsAcceptedTotal = 0;
+            uint64_t tcpConnectionsClosedTotal = 0;
+            uint64_t tcpConnectionsActive = 0;
+            uint64_t tcpAcceptQueueDepth = 0;
+            uint64_t tcpAcceptQueuePeakDepth = 0;
+            uint64_t tcpAcceptQueueRejectedTotal = 0;
+            uint64_t tcpAcceptQueueExpiredTotal = 0;
+            uint64_t tcpRequestsTotal = 0;
+            uint64_t tcpResponsesTotal = 0;
+            uint64_t tcpBytesReceivedTotal = 0;
+            uint64_t tcpBytesSentTotal = 0;
+            uint64_t tcpProtocolErrorsTotal = 0;
+            uint64_t tcpCrcErrorsTotal = 0;
+            uint64_t tcpPipelineBatchesTotal = 0;
+            uint64_t tcpBackpressureFlushesTotal = 0;
+            uint64_t tcpBackpressureDisconnectsTotal = 0;
+            uint64_t tcpBatchPutItemsTotal = 0;
+            uint64_t tcpBatchGetItemsTotal = 0;
         } api;
 
         struct MemTableStats {
-            uint32_t shard_count = 0;
-            uint64_t threshold_bytes_per_shard = 0;
-            uint64_t approx_bytes = 0;
-            uint64_t puts_applied = 0;
-            uint64_t removes_applied = 0;
-            uint64_t flushes_completed = 0;
-            uint64_t bytes_flushed = 0;
+            uint32_t shardCount = 0;
+            uint64_t thresholdBytesPerShard = 0;
+            uint64_t approxBytes = 0;
+            uint64_t putsApplied = 0;
+            uint64_t removesApplied = 0;
+            uint64_t flushesCompleted = 0;
+            uint64_t bytesFlushed = 0;
         } memtable;
 
         struct WalStats {
             bool enabled = false;
-            uint32_t shard_count = 0;
-            uint64_t entries_written = 0;
-            uint64_t bytes_written = 0;
-            uint64_t batches_flushed = 0;
-            uint64_t syncs_executed = 0;
-            uint64_t segment_rotations = 0;
+            uint32_t shardCount = 0;
+            uint64_t entriesWritten = 0;
+            uint64_t bytesWritten = 0;
+            uint64_t batchesFlushed = 0;
+            uint64_t syncsExecuted = 0;
+            uint64_t segmentRotations = 0;
         } wal;
 
         struct BlobStats {
             bool enabled = false;
-            uint64_t threshold_bytes = 0;
-            uint64_t blobs_written = 0;
-            uint64_t bytes_uncompressed = 0;
-            uint64_t bytes_on_disk = 0;
-            uint64_t blobs_deleted = 0;
-            uint64_t gc_cycles = 0;
+            uint64_t thresholdBytes = 0;
+            uint64_t blobsWritten = 0;
+            uint64_t bytesUncompressed = 0;
+            uint64_t bytesOnDisk = 0;
+            uint64_t blobsDeleted = 0;
+            uint64_t gcCycles = 0;
         } blob;
 
         struct SstStats {
             bool enabled = false;
             std::vector<LevelStats> levels;
-            size_t file_count = 0;
+            size_t fileCount = 0;
             uint64_t bytes = 0;
-            size_t l0_file_count = 0;
-            bool compaction_pending = false;
-            uint64_t compactions_completed = 0;
-            uint64_t files_compacted = 0;
-            uint64_t bytes_compacted_in = 0;
-            uint64_t bytes_compacted_out = 0;
-            uint64_t l0_stalls = 0;
+            size_t l0FileCount = 0;
+            bool compactionPending = false;
+            uint64_t compactionsCompleted = 0;
+            uint64_t filesCompacted = 0;
+            uint64_t bytesCompactedIn = 0;
+            uint64_t bytesCompactedOut = 0;
+            uint64_t l0Stalls = 0;
         } sst;
 
         struct VLogStats {

@@ -30,19 +30,19 @@ namespace akkaradb::engine::cluster {
      * ReplMsgType - Replication wire message discriminator.
      */
     enum class ReplMsgType : uint8_t {
-        ClientHello = 0x01,
+        CLIENT_HELLO = 0x01,
         ///< Replica -> primary handshake with last applied seq.
-        ServerHello = 0x02,
+        SERVER_HELLO = 0x02,
         ///< Primary -> replica handshake response.
-        Entry = 0x10,
+        ENTRY = 0x10,
         ///< Replicated put/remove entry.
-        BlobPut = 0x11,
+        BLOB_PUT = 0x11,
         ///< Replicated external blob payload.
-        Ack = 0x12,
+        ACK = 0x12,
         ///< Replica acknowledgement for an Entry seq.
-        ReadRequest = 0x20,
+        READ_REQUEST = 0x20,
         ///< Reserved point-in-time read request.
-        ReadResponse = 0x21,
+        READ_RESPONSE = 0x21,
         ///< Reserved point-in-time read response.
     };
 
@@ -50,23 +50,23 @@ namespace akkaradb::engine::cluster {
      * ReplOpType - Storage mutation represented by ReplEntry.
      */
     enum class ReplOpType : uint8_t {
-        Put = 1, Remove = 2,
+        PUT = 1, REMOVE = 2,
     };
 
     /**
      * ReadStatus - Result code for replicated read responses.
      */
     enum class ReadStatus : uint8_t {
-        Found = 0, NotFound = 1, Error = 2,
+        FOUND = 0, NOT_FOUND = 1, ERROR_STATUS = 2,
     };
 
     /**
      * ReplFrameHeader - Fixed replication frame header.
      *
      * Wire layout, little-endian:
-     *   [magic:u32][type:u8][flags:u8][payload_len:u32][payload_crc32c:u32]
+     *   [magic:u32][type:u8][flags:u8][payloadLen:u32][payloadCrc32c:u32]
      *
-     * The header is followed by payload_len bytes.  CRC covers only the
+     * The header is followed by payloadLen bytes.  CRC covers only the
      * payload, not the header.
      */
     struct ReplFrameHeader {
@@ -75,12 +75,12 @@ namespace akkaradb::engine::cluster {
 
         ReplMsgType type{}; ///< Message discriminator.
         uint8_t flags = 0; ///< Reserved per-frame flags.
-        uint32_t payload_len = 0; ///< Payload byte length.
+        uint32_t payloadLen = 0; ///< Payload byte length.
         uint32_t crc32c = 0; ///< CRC32C of the payload bytes.
     };
 
     /**
-     * DecodedFrame - Validated frame returned by decode_frame().
+     * DecodedFrame - Validated frame returned by decodeFrame().
      */
     struct DecodedFrame {
         ReplMsgType type{};
@@ -90,24 +90,24 @@ namespace akkaradb::engine::cluster {
 
     /** Replica-to-primary handshake payload. */
     struct ClientHello {
-        uint64_t node_id = 0; ///< Replica node id.
-        uint64_t last_seq = 0; ///< Last sequence already applied by the replica.
-        NodeRole role = NodeRole::Replica; ///< Expected to be NodeRole::Replica.
+        uint64_t nodeId = 0; ///< Replica node id.
+        uint64_t lastSeq = 0; ///< Last sequence already applied by the replica.
+        NodeRole role = NodeRole::REPLICA; ///< Expected to be NodeRole::REPLICA.
     };
 
     /** Primary-to-replica handshake response payload. */
     struct ServerHello {
-        uint64_t node_id = 0; ///< Primary node id.
-        uint64_t current_seq = 0; ///< Primary's current sequence at handshake time.
-        NodeRole role = NodeRole::Primary; ///< Expected to be NodeRole::Primary.
+        uint64_t nodeId = 0; ///< Primary node id.
+        uint64_t currentSeq = 0; ///< Primary's current sequence at handshake time.
+        NodeRole role = NodeRole::PRIMARY; ///< Expected to be NodeRole::PRIMARY.
     };
 
     /** Replicated key/value mutation payload. */
     struct ReplEntry {
         uint64_t seq = 0; ///< Monotonic sequence assigned by the source engine.
-        uint64_t source_node_id = 0; ///< Node that originally produced the entry.
-        ReplOpType op = ReplOpType::Put; ///< Mutation type.
-        uint8_t record_flags = 0; ///< Record flags preserved for storage apply.
+        uint64_t sourceNodeId = 0; ///< Node that originally produced the entry.
+        ReplOpType op = ReplOpType::PUT; ///< Mutation type.
+        uint8_t recordFlags = 0; ///< Record flags preserved for storage apply.
         std::vector<uint8_t> key; ///< Raw key bytes.
         std::vector<uint8_t> value; ///< Raw value bytes, empty for Remove.
     };
@@ -115,7 +115,7 @@ namespace akkaradb::engine::cluster {
     /** Replicated blob payload. */
     struct ReplBlob {
         uint64_t seq = 0; ///< Sequence associated with the blob reference.
-        uint64_t blob_id = 0; ///< Stable blob identifier.
+        uint64_t blobId = 0; ///< Stable blob identifier.
         std::vector<uint8_t> content; ///< Raw blob content.
     };
 
@@ -126,16 +126,16 @@ namespace akkaradb::engine::cluster {
 
     /** Reserved point-in-time read request payload. */
     struct ReadRequest {
-        uint64_t request_id = 0;
-        uint64_t snapshot_seq = 0;
+        uint64_t requestId = 0;
+        uint64_t snapshotSeq = 0;
         std::vector<uint8_t> key;
     };
 
     /** Reserved point-in-time read response payload. */
     struct ReadResponse {
-        uint64_t request_id = 0;
-        ReadStatus status = ReadStatus::Error;
-        uint8_t record_flags = 0;
+        uint64_t requestId = 0;
+        ReadStatus status = ReadStatus::ERROR_STATUS;
+        uint8_t recordFlags = 0;
         uint64_t seq = 0;
         std::vector<uint8_t> value;
     };
@@ -143,54 +143,54 @@ namespace akkaradb::engine::cluster {
     /**
      * Encodes a complete frame with header, payload, and payload CRC32C.
      */
-    [[nodiscard]] std::vector<uint8_t> encode_frame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags = 0);
+    [[nodiscard]] std::vector<uint8_t> encodeFrame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags = 0);
 
     /**
      * Decodes and validates a complete frame.
      *
      * @return false on short input, bad magic, length mismatch, or CRC mismatch.
      */
-    [[nodiscard]] bool decode_frame(std::span<const uint8_t> wire, DecodedFrame& out);
+    [[nodiscard]] bool decodeFrame(std::span<const uint8_t> wire, DecodedFrame& out);
 
     /** Encodes a ClientHello frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_client_hello(const ClientHello& hello);
+    [[nodiscard]] std::vector<uint8_t> encodeClientHello(const ClientHello& hello);
 
     /** Encodes a ServerHello frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_server_hello(const ServerHello& hello);
+    [[nodiscard]] std::vector<uint8_t> encodeServerHello(const ServerHello& hello);
 
     /** Encodes a ReplEntry frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_entry(const ReplEntry& entry);
+    [[nodiscard]] std::vector<uint8_t> encodeEntry(const ReplEntry& entry);
 
     /** Encodes a ReplBlob frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_blob(const ReplBlob& blob);
+    [[nodiscard]] std::vector<uint8_t> encodeBlob(const ReplBlob& blob);
 
     /** Encodes a ReplAck frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_ack(const ReplAck& ack);
+    [[nodiscard]] std::vector<uint8_t> encodeAck(const ReplAck& ack);
 
     /** Encodes a ReadRequest frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_read_request(const ReadRequest& request);
+    [[nodiscard]] std::vector<uint8_t> encodeReadRequest(const ReadRequest& request);
 
     /** Encodes a ReadResponse frame. */
-    [[nodiscard]] std::vector<uint8_t> encode_read_response(const ReadResponse& response);
+    [[nodiscard]] std::vector<uint8_t> encodeReadResponse(const ReadResponse& response);
 
     /** Decodes a ClientHello payload. */
-    [[nodiscard]] bool decode_client_hello(std::span<const uint8_t> payload, ClientHello& out);
+    [[nodiscard]] bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out);
 
     /** Decodes a ServerHello payload. */
-    [[nodiscard]] bool decode_server_hello(std::span<const uint8_t> payload, ServerHello& out);
+    [[nodiscard]] bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out);
 
     /** Decodes a ReplEntry payload. */
-    [[nodiscard]] bool decode_entry(std::span<const uint8_t> payload, ReplEntry& out);
+    [[nodiscard]] bool decodeEntry(std::span<const uint8_t> payload, ReplEntry& out);
 
     /** Decodes a ReplBlob payload. */
-    [[nodiscard]] bool decode_blob(std::span<const uint8_t> payload, ReplBlob& out);
+    [[nodiscard]] bool decodeBlob(std::span<const uint8_t> payload, ReplBlob& out);
 
     /** Decodes a ReplAck payload. */
-    [[nodiscard]] bool decode_ack(std::span<const uint8_t> payload, ReplAck& out);
+    [[nodiscard]] bool decodeAck(std::span<const uint8_t> payload, ReplAck& out);
 
     /** Decodes a ReadRequest payload. */
-    [[nodiscard]] bool decode_read_request(std::span<const uint8_t> payload, ReadRequest& out);
+    [[nodiscard]] bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out);
 
     /** Decodes a ReadResponse payload. */
-    [[nodiscard]] bool decode_read_response(std::span<const uint8_t> payload, ReadResponse& out);
+    [[nodiscard]] bool decodeReadResponse(std::span<const uint8_t> payload, ReadResponse& out);
 } // namespace akkaradb::engine::cluster

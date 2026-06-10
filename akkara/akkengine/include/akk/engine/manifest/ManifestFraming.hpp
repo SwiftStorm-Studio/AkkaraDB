@@ -36,19 +36,19 @@ namespace akkaradb::engine::manifest {
      * ManifestRecordType - Discriminator for manifest record payload.
      */
     enum class ManifestRecordType : uint8_t {
-        StripeCommit = 0x01,
+        STRIPE_COMMIT = 0x01,
         ///< Stripe counter advance
-        SSTSeal = 0x02,
+        SST_SEAL = 0x02,
         ///< New SST file sealed (L0 flush only)
-        SSTDelete = 0x03,
+        SST_DELETE = 0x03,
         ///< SST file deleted (legacy; superseded by CompactionCommit)
-        CompactionStart = 0x04,
+        COMPACTION_START = 0x04,
         ///< Compaction began (informational hint)
-        CompactionEnd = 0x05,
+        COMPACTION_END = 0x05,
         ///< Compaction completed (legacy single-output format)
-        Checkpoint = 0x06,
+        CHECKPOINT = 0x06,
         ///< Checkpoint marker
-        Truncate = 0x07,
+        TRUNCATE = 0x07,
         ///< Manifest truncate marker
         /**
          * Atomic compaction commit  Ereplaces CompactionEnd + SSTDelete.
@@ -58,15 +58,15 @@ namespace akkaradb::engine::manifest {
          * (e.g. process killed mid-write, detected by CRC mismatch), replay treats
          * the old input files as still live and discards the orphan output files.
          */
-        CompactionCommit = 0x08,
+        COMPACTION_COMMIT = 0x08,
 
         // ── Cluster events (v4) ──────────────────────────────────────────
-        NodeJoin = 0x10,
+        NODE_JOIN = 0x10,
         ///< A node joined the cluster
-        NodeLeave = 0x11,
+        NODE_LEAVE = 0x11,
         ///< A node left the cluster
-        PrimaryLease = 0x12,
-        ///< Primary lease record (node_id + expiry)
+        PRIMARY_LEASE = 0x12,
+        ///< Primary lease record (nodeId + expiry)
     };
 
     // ============================================================================
@@ -77,13 +77,13 @@ namespace akkaradb::engine::manifest {
      * ManifestFileHeader - Fixed 32-byte header at the start of every .akmf file.
      *
      * On-disk layout (32 bytes, all fields LE):
-     * [magic:u32][version:u16][flags:u16][file_seq:u32][created_at_us:u64][crc32c:u32][reserved:u8ÁE]
+     * [magic:u32][version:u16][flags:u16][fileSeq:u32][createdAtUs:u64][crc32c:u32][reserved:u8ÁE]
      *
      * Design:
      * - magic: Format / corruption detection
      * - version: Forward-compatibility
-     * - file_seq: Rotation counter (0 = base file, N = Nth rotated file)
-     * - created_at_us: Microseconds since epoch
+     * - fileSeq: Rotation counter (0 = base file, N = Nth rotated file)
+     * - createdAtUs: Microseconds since epoch
      * - crc32c: CRC32C of this header with crc32c field zeroed
      */
     #pragma pack(push, 1)
@@ -94,27 +94,27 @@ namespace akkaradb::engine::manifest {
         uint32_t magic;
         uint16_t version;
         uint16_t flags;
-        uint32_t file_seq; ///< Rotation counter
-        uint64_t created_at_us; ///< Creation timestamp (μs since epoch)
+        uint32_t fileSeq; ///< Rotation counter
+        uint64_t createdAtUs; ///< Creation timestamp (μs since epoch)
         uint32_t crc32c;
         uint8_t reserved[8];
 
         static constexpr size_t SIZE = 32;
 
-        [[nodiscard]] bool verify_magic() const noexcept { return magic == MAGIC; }
-        [[nodiscard]] bool verify_version() const noexcept { return version == VERSION; }
+        [[nodiscard]] bool verifyMagic() const noexcept { return magic == MAGIC; }
+        [[nodiscard]] bool verifyVersion() const noexcept { return version == VERSION; }
 
         /**
          * Verifies the header checksum.
          * Recomputes CRC with crc32c field zeroed and compares.
          */
-        [[nodiscard]] bool verify_checksum() const noexcept;
+        [[nodiscard]] bool verifyChecksum() const noexcept;
 
         /**
          * Builds and returns a valid header as a byte array.
          * Computes and fills crc32c automatically.
          */
-        [[nodiscard]] static ManifestFileHeader build(uint32_t file_seq) noexcept;
+        [[nodiscard]] static ManifestFileHeader build(uint32_t fileSeq) noexcept;
 
         /**
          * Serializes this header to a 32-byte output buffer.
@@ -133,19 +133,19 @@ namespace akkaradb::engine::manifest {
      * ManifestRecordHeader - 8-byte header preceding each manifest record payload.
      *
      * On-disk layout (8 bytes, all fields LE):
-     * [type:u8][flags:u8][payload_len:u16][crc32c:u32]
+     * [type:u8][flags:u8][payloadLen:u16][crc32c:u32]
      *
      * Design:
      * - type: ManifestRecordType discriminator
      * - flags: Reserved (0 for now)
-     * - payload_len: Byte length of the payload that follows
+     * - payloadLen: Byte length of the payload that follows
      * - crc32c: CRC32C of payload bytes only
      */
     #pragma pack(push, 1)
     struct ManifestRecordHeader {
         uint8_t type;
         uint8_t flags;
-        uint16_t payload_len;
+        uint16_t payloadLen;
         uint32_t crc32c;
 
         static constexpr size_t SIZE = 8;
@@ -153,7 +153,7 @@ namespace akkaradb::engine::manifest {
         /**
          * Builds a header for a given payload.
          */
-        [[nodiscard]] static ManifestRecordHeader build(ManifestRecordType type, const uint8_t* payload, uint16_t payload_len) noexcept;
+        [[nodiscard]] static ManifestRecordHeader build(ManifestRecordType type, const uint8_t* payload, uint16_t payloadLen) noexcept;
 
         /**
          * Serializes this header to an 8-byte output buffer.
@@ -168,7 +168,7 @@ namespace akkaradb::engine::manifest {
         /**
          * Verifies the payload CRC.
          */
-        [[nodiscard]] bool verify_payload(const uint8_t* payload, uint16_t len) const noexcept {
+        [[nodiscard]] bool verifyPayload(const uint8_t* payload, uint16_t len) const noexcept {
             return crc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(payload), len);
         }
     };
@@ -188,100 +188,100 @@ namespace akkaradb::engine::manifest {
 
     /**
      * Encodes a StripeCommit payload.
-     * Payload (16 bytes): [ts_us:u64][stripe_count:u64]
+     * Payload (16 bytes): [tsUs:u64][stripeCount:u64]
      */
-    [[nodiscard]] std::vector<uint8_t> encode_stripe_commit(uint64_t ts_us, uint64_t stripe_count);
+    [[nodiscard]] std::vector<uint8_t> encodeStripeCommit(uint64_t tsUs, uint64_t stripeCount);
 
     /**
      * Encodes an SSTSeal payload.
      *
      * Payload fixed (24 bytes):
-     *   [ts_us:u64][entries:u64][level:u8][key_flags:u8][name_len:u16][fk_len:u16][lk_len:u16]
-     * Variable: name bytes, first_key bytes (if key_flags bit0), last_key bytes (if key_flags bit1)
+     *   [tsUs:u64][entries:u64][level:u8][keyFlags:u8][nameLen:u16][fkLen:u16][lkLen:u16]
+     * Variable: name bytes, firstKey bytes (if keyFlags bit0), lastKey bytes (if keyFlags bit1)
      */
-    [[nodiscard]] std::vector<uint8_t> encode_sst_seal(
-        uint64_t ts_us,
+    [[nodiscard]] std::vector<uint8_t> encodeSstSeal(
+        uint64_t tsUs,
         int level,
         const std::string& name,
         uint64_t entries,
-        const std::optional<std::string>& first_key_hex,
-        const std::optional<std::string>& last_key_hex
+        const std::optional<std::string>& firstKeyHex,
+        const std::optional<std::string>& lastKeyHex
     );
 
     /**
      * Encodes an SSTDelete payload.
-     * Payload fixed (10 bytes): [ts_us:u64][name_len:u16]
+     * Payload fixed (10 bytes): [tsUs:u64][nameLen:u16]
      * Variable: name bytes
      */
-    [[nodiscard]] std::vector<uint8_t> encode_sst_delete(uint64_t ts_us, const std::string& name);
+    [[nodiscard]] std::vector<uint8_t> encodeSstDelete(uint64_t tsUs, const std::string& name);
 
     /**
      * Encodes a CompactionStart payload.
-     * Payload fixed (12 bytes): [ts_us:u64][level:u8][input_count:u8][reserved:u16]
+     * Payload fixed (12 bytes): [tsUs:u64][level:u8][inputCount:u8][reserved:u16]
      * Variable: [len:u16][bytes] ÁEinput_count
      */
-    [[nodiscard]] std::vector<uint8_t> encode_compaction_start(uint64_t ts_us, int level, const std::vector<std::string>& inputs);
+    [[nodiscard]] std::vector<uint8_t> encodeCompactionStart(uint64_t tsUs, int level, const std::vector<std::string>& inputs);
 
     /**
      * Encodes a CompactionEnd payload.
      *
      * Payload fixed (28 bytes):
-     *   [ts_us:u64][entries:u64][level:u8][key_flags:u8][input_count:u8][reserved:u8]
-     *   [out_len:u16][fk_len:u16][lk_len:u16][reserved:u16]
-     * Variable: output bytes, first_key bytes, last_key bytes, [len:u16 + bytes] ÁEinput_count
+     *   [tsUs:u64][entries:u64][level:u8][keyFlags:u8][inputCount:u8][reserved:u8]
+     *   [outLen:u16][fkLen:u16][lkLen:u16][reserved:u16]
+     * Variable: output bytes, firstKey bytes, lastKey bytes, [len:u16 + bytes] ÁEinput_count
      */
-    [[nodiscard]] std::vector<uint8_t> encode_compaction_end(
-        uint64_t ts_us,
+    [[nodiscard]] std::vector<uint8_t> encodeCompactionEnd(
+        uint64_t tsUs,
         int level,
         const std::string& output,
         const std::vector<std::string>& inputs,
         uint64_t entries,
-        const std::optional<std::string>& first_key_hex,
-        const std::optional<std::string>& last_key_hex
+        const std::optional<std::string>& firstKeyHex,
+        const std::optional<std::string>& lastKeyHex
     );
 
     /**
      * Encodes a Checkpoint payload.
      *
-     * Payload fixed (26 bytes): [ts_us:u64][stripe:u64][last_seq:u64][name_len:u16]
+     * Payload fixed (26 bytes): [tsUs:u64][stripe:u64][lastSeq:u64][nameLen:u16]
      * Variable: name bytes
      *
-     * stripe / last_seq use MANIFEST_ABSENT_U64 when not present.
-     * name_len = 0 when no name.
+     * stripe / lastSeq use MANIFEST_ABSENT_U64 when not present.
+     * nameLen = 0 when no name.
      */
-    [[nodiscard]] std::vector<uint8_t> encode_checkpoint(
-        uint64_t ts_us,
+    [[nodiscard]] std::vector<uint8_t> encodeCheckpoint(
+        uint64_t tsUs,
         const std::optional<std::string>& name,
         const std::optional<uint64_t>& stripe,
-        const std::optional<uint64_t>& last_seq
+        const std::optional<uint64_t>& lastSeq
     );
 
     /**
      * Encodes a Truncate payload.
-     * Payload fixed (10 bytes): [ts_us:u64][reason_len:u16]
+     * Payload fixed (10 bytes): [tsUs:u64][reasonLen:u16]
      * Variable: reason bytes
      */
-    [[nodiscard]] std::vector<uint8_t> encode_truncate(uint64_t ts_us, const std::optional<std::string>& reason);
+    [[nodiscard]] std::vector<uint8_t> encodeTruncate(uint64_t tsUs, const std::optional<std::string>& reason);
 
     /**
      * Encodes a CompactionCommit payload (atomic multi-file compaction result).
      *
      * Payload fixed (12 bytes):
-     *   [ts_us:u64][output_count:u8][input_count:u8][reserved:u16]
+     *   [tsUs:u64][outputCount:u8][inputCount:u8][reserved:u16]
      * Variable:
-     *   output_count ÁE[name_len:u16][name bytes]
-     *   input_count  ÁE[name_len:u16][name bytes]
+     *   outputCount ÁE[nameLen:u16][name bytes]
+     *   inputCount  ÁE[nameLen:u16][name bytes]
      *
      * During replay, this record atomically:
-     *   - Adds all output_files to the live set
-     *   - Removes all input_files from the live set
+     *   - Adds all outputFiles to the live set
+     *   - Removes all inputFiles from the live set
      * If this record is absent (CRC mismatch = interrupted write), the live set
      * is left unchanged (old input files remain live; orphan outputs are ignored).
      */
-    [[nodiscard]] std::vector<uint8_t> encode_compaction_commit(
-        uint64_t ts_us,
-        const std::vector<std::string>& output_files,
-        const std::vector<std::string>& input_files
+    [[nodiscard]] std::vector<uint8_t> encodeCompactionCommit(
+        uint64_t tsUs,
+        const std::vector<std::string>& outputFiles,
+        const std::vector<std::string>& inputFiles
     );
 
     // ============================================================================
@@ -289,69 +289,69 @@ namespace akkaradb::engine::manifest {
     // ============================================================================
 
     struct DecodedStripeCommit {
-        uint64_t ts_us;
-        uint64_t stripe_count;
+        uint64_t tsUs;
+        uint64_t stripeCount;
     };
 
     struct DecodedSSTSeal {
-        uint64_t ts_us;
+        uint64_t tsUs;
         uint64_t entries;
         int level;
         std::string name;
-        std::optional<std::string> first_key_hex;
-        std::optional<std::string> last_key_hex;
+        std::optional<std::string> firstKeyHex;
+        std::optional<std::string> lastKeyHex;
     };
 
     struct DecodedSSTDelete {
-        uint64_t ts_us;
+        uint64_t tsUs;
         std::string name;
     };
 
     struct DecodedCompactionStart {
-        uint64_t ts_us;
+        uint64_t tsUs;
         int level;
         std::vector<std::string> inputs;
     };
 
     struct DecodedCompactionEnd {
-        uint64_t ts_us;
+        uint64_t tsUs;
         uint64_t entries;
         int level;
         std::string output;
         std::vector<std::string> inputs;
-        std::optional<std::string> first_key_hex;
-        std::optional<std::string> last_key_hex;
+        std::optional<std::string> firstKeyHex;
+        std::optional<std::string> lastKeyHex;
     };
 
     struct DecodedCheckpoint {
-        uint64_t ts_us;
+        uint64_t tsUs;
         std::optional<uint64_t> stripe;
-        std::optional<uint64_t> last_seq;
+        std::optional<uint64_t> lastSeq;
         std::optional<std::string> name;
     };
 
     struct DecodedTruncate {
-        uint64_t ts_us;
+        uint64_t tsUs;
         std::optional<std::string> reason;
     };
 
     struct DecodedCompactionCommit {
-        uint64_t ts_us;
-        std::vector<std::string> output_files;
-        std::vector<std::string> input_files;
+        uint64_t tsUs;
+        std::vector<std::string> outputFiles;
+        std::vector<std::string> inputFiles;
     };
 
     /**
      * Decode functions.  Return false if payload is malformed / too short.
      */
-    [[nodiscard]] bool decode_stripe_commit(const uint8_t* payload, uint16_t len, DecodedStripeCommit& out);
-    [[nodiscard]] bool decode_sst_seal(const uint8_t* payload, uint16_t len, DecodedSSTSeal& out);
-    [[nodiscard]] bool decode_sst_delete(const uint8_t* payload, uint16_t len, DecodedSSTDelete& out);
-    [[nodiscard]] bool decode_compaction_start(const uint8_t* payload, uint16_t len, DecodedCompactionStart& out);
-    [[nodiscard]] bool decode_compaction_end(const uint8_t* payload, uint16_t len, DecodedCompactionEnd& out);
-    [[nodiscard]] bool decode_checkpoint(const uint8_t* payload, uint16_t len, DecodedCheckpoint& out);
-    [[nodiscard]] bool decode_truncate(const uint8_t* payload, uint16_t len, DecodedTruncate& out);
-    [[nodiscard]] bool decode_compaction_commit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out);
+    [[nodiscard]] bool decodeStripeCommit(const uint8_t* payload, uint16_t len, DecodedStripeCommit& out);
+    [[nodiscard]] bool decodeSstSeal(const uint8_t* payload, uint16_t len, DecodedSSTSeal& out);
+    [[nodiscard]] bool decodeSstDelete(const uint8_t* payload, uint16_t len, DecodedSSTDelete& out);
+    [[nodiscard]] bool decodeCompactionStart(const uint8_t* payload, uint16_t len, DecodedCompactionStart& out);
+    [[nodiscard]] bool decodeCompactionEnd(const uint8_t* payload, uint16_t len, DecodedCompactionEnd& out);
+    [[nodiscard]] bool decodeCheckpoint(const uint8_t* payload, uint16_t len, DecodedCheckpoint& out);
+    [[nodiscard]] bool decodeTruncate(const uint8_t* payload, uint16_t len, DecodedTruncate& out);
+    [[nodiscard]] bool decodeCompactionCommit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out);
 
     // ========================================================================
     // Cluster event encode / decode (v4)
@@ -359,41 +359,41 @@ namespace akkaradb::engine::manifest {
 
     /**
      * Encodes a NodeJoin payload.
-     * Payload: [ts_us:u64][node_id:u64][repl_port:u16][host_len:u16][host bytes]
+     * Payload: [tsUs:u64][nodeId:u64][replPort:u16][hostLen:u16][host bytes]
      */
-    [[nodiscard]] std::vector<uint8_t> encode_node_join(uint64_t ts_us, uint64_t node_id, uint16_t repl_port, const std::string& host);
+    [[nodiscard]] std::vector<uint8_t> encodeNodeJoin(uint64_t tsUs, uint64_t nodeId, uint16_t replPort, const std::string& host);
 
     /**
      * Encodes a NodeLeave payload.
-     * Payload (16 bytes): [ts_us:u64][node_id:u64]
+     * Payload (16 bytes): [tsUs:u64][nodeId:u64]
      */
-    [[nodiscard]] std::vector<uint8_t> encode_node_leave(uint64_t ts_us, uint64_t node_id);
+    [[nodiscard]] std::vector<uint8_t> encodeNodeLeave(uint64_t tsUs, uint64_t nodeId);
 
     /**
      * Encodes a PrimaryLease payload.
-     * Payload (24 bytes): [ts_us:u64][node_id:u64][lease_until_us:u64]
+     * Payload (24 bytes): [tsUs:u64][nodeId:u64][leaseUntilUs:u64]
      */
-    [[nodiscard]] std::vector<uint8_t> encode_primary_lease(uint64_t ts_us, uint64_t node_id, uint64_t lease_until_us);
+    [[nodiscard]] std::vector<uint8_t> encodePrimaryLease(uint64_t tsUs, uint64_t nodeId, uint64_t leaseUntilUs);
 
     struct DecodedNodeJoin {
-        uint64_t ts_us;
-        uint64_t node_id;
-        uint16_t repl_port;
+        uint64_t tsUs;
+        uint64_t nodeId;
+        uint16_t replPort;
         std::string host;
     };
 
     struct DecodedNodeLeave {
-        uint64_t ts_us;
-        uint64_t node_id;
+        uint64_t tsUs;
+        uint64_t nodeId;
     };
 
     struct DecodedPrimaryLease {
-        uint64_t ts_us;
-        uint64_t node_id;
-        uint64_t lease_until_us;
+        uint64_t tsUs;
+        uint64_t nodeId;
+        uint64_t leaseUntilUs;
     };
 
-    [[nodiscard]] bool decode_node_join(const uint8_t* payload, uint16_t len, DecodedNodeJoin& out);
-    [[nodiscard]] bool decode_node_leave(const uint8_t* payload, uint16_t len, DecodedNodeLeave& out);
-    [[nodiscard]] bool decode_primary_lease(const uint8_t* payload, uint16_t len, DecodedPrimaryLease& out);
+    [[nodiscard]] bool decodeNodeJoin(const uint8_t* payload, uint16_t len, DecodedNodeJoin& out);
+    [[nodiscard]] bool decodeNodeLeave(const uint8_t* payload, uint16_t len, DecodedNodeLeave& out);
+    [[nodiscard]] bool decodePrimaryLease(const uint8_t* payload, uint16_t len, DecodedPrimaryLease& out);
 } // namespace akkaradb::engine::manifest

@@ -49,13 +49,13 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using socket_t = SOCKET;
-        constexpr socket_t BAD_SOCKET = INVALID_SOCKET;
-        void shutdown_socket(socket_t s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } }
-        void close_socket(socket_t s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } }
-        bool socket_ok(socket_t s) noexcept { return s != INVALID_SOCKET; }
+        using SocketHandle = SOCKET;
+        constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET;
+        void shutdownSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } }
+        void closeSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } }
+        bool socketOk(SocketHandle s) noexcept { return s != INVALID_SOCKET; }
 
-        void net_init() {
+        void netInit() {
             static std::once_flag once;
             std::call_once(
                 once,
@@ -66,13 +66,13 @@ namespace akkaradb::engine::cluster {
             );
         }
         #else
-        using socket_t = int; constexpr socket_t BAD_SOCKET = -1; void
-        shutdown_socket(socket_t s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } } void close_socket(socket_t s) noexcept {
+        using SocketHandle = int; constexpr SocketHandle BAD_SOCKET = -1; void
+        shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } } void closeSocket(SocketHandle s) noexcept {
             if (s >= 0) { ::close(s); }
-        } bool socket_ok(socket_t s) noexcept { return s >= 0; } void net_init() {}
+        } bool socketOk(SocketHandle s) noexcept { return s >= 0; } void netInit() {}
         #endif
 
-        bool send_all(socket_t s, const uint8_t* data, size_t size) {
+        bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) {
                 #ifdef _WIN32
@@ -86,7 +86,7 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool recv_all(socket_t s, uint8_t* data, size_t size) {
+        bool recvAll(SocketHandle s, uint8_t* data, size_t size) {
             size_t got = 0;
             while (got < size) {
                 #ifdef _WIN32
@@ -100,67 +100,67 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool send_all(net::TlsStream& stream, const uint8_t* data, size_t size) {
+        bool sendAll(net::TlsStream& stream, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) { sent += stream.send(data + sent, size - sent); }
             return true;
         }
 
-        bool recv_all(net::TlsStream& stream, uint8_t* data, size_t size) {
+        bool recvAll(net::TlsStream& stream, uint8_t* data, size_t size) {
             size_t got = 0;
             while (got < size) { got += stream.recv(data + got, size - got); }
             return true;
         }
 
-        uint32_t read_u32(const uint8_t* b) noexcept {
+        uint32_t readU32(const uint8_t* b) noexcept {
             return static_cast<uint32_t>(b[0]) | (static_cast<uint32_t>(b[1]) << 8) | (static_cast<uint32_t>(b[2]) << 16) | (static_cast<
                 uint32_t>(b[3]) << 24);
         }
 
-        bool recv_frame(socket_t s, DecodedFrame& out) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out) {
             uint8_t header[ReplFrameHeader::SIZE];
-            if (!recv_all(s, header, sizeof(header))) { return false; }
-            const uint32_t payload_len = read_u32(header + 6);
-            std::vector<uint8_t> wire(sizeof(header) + payload_len);
+            if (!recvAll(s, header, sizeof(header))) { return false; }
+            const uint32_t payloadLen = readU32(header + 6);
+            std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
-            if (payload_len > 0 && !recv_all(s, wire.data() + sizeof(header), payload_len)) { return false; }
-            return decode_frame(wire, out);
+            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen)) { return false; }
+            return decodeFrame(wire, out);
         }
 
-        bool recv_frame(net::TlsStream& stream, DecodedFrame& out) {
+        bool recvFrame(net::TlsStream& stream, DecodedFrame& out) {
             uint8_t header[ReplFrameHeader::SIZE];
             try {
-                if (!recv_all(stream, header, sizeof(header))) { return false; }
-                const uint32_t payload_len = read_u32(header + 6);
-                std::vector<uint8_t> wire(sizeof(header) + payload_len);
+                if (!recvAll(stream, header, sizeof(header))) { return false; }
+                const uint32_t payloadLen = readU32(header + 6);
+                std::vector<uint8_t> wire(sizeof(header) + payloadLen);
                 std::memcpy(wire.data(), header, sizeof(header));
-                if (payload_len > 0 && !recv_all(stream, wire.data() + sizeof(header), payload_len)) { return false; }
-                return decode_frame(wire, out);
+                if (payloadLen > 0 && !recvAll(stream, wire.data() + sizeof(header), payloadLen)) { return false; }
+                return decodeFrame(wire, out);
             }
             catch (...) { return false; }
         }
 
         struct TlsConfigStorage {
-            std::string cert_path;
-            std::string key_path;
-            std::string ca_path;
+            std::string certPath;
+            std::string keyPath;
+            std::string caPath;
             net::TlsConfig config{};
         };
 
-        TlsConfigStorage make_tls_config(const ClusterRuntimeOptions& options) {
+        TlsConfigStorage makeTlsConfig(const ClusterRuntimeOptions& options) {
             TlsConfigStorage storage;
-            storage.cert_path = options.tls.cert_path.string();
-            storage.key_path = options.tls.key_path.string();
-            storage.ca_path = options.tls.ca_path.string();
-            storage.config.cert_path = storage.cert_path.empty() ? nullptr : storage.cert_path.c_str();
-            storage.config.key_path = storage.key_path.empty() ? nullptr : storage.key_path.c_str();
-            storage.config.ca_path = storage.ca_path.empty() ? nullptr : storage.ca_path.c_str();
-            storage.config.verify_peer = options.tls.verify_peer;
+            storage.certPath = options.tls.certPath.string();
+            storage.keyPath = options.tls.keyPath.string();
+            storage.caPath = options.tls.caPath.string();
+            storage.config.certPath = storage.certPath.empty() ? nullptr : storage.certPath.c_str();
+            storage.config.keyPath = storage.keyPath.empty() ? nullptr : storage.keyPath.c_str();
+            storage.config.caPath = storage.caPath.empty() ? nullptr : storage.caPath.c_str();
+            storage.config.verifyPeer = options.tls.verifyPeer;
             return storage;
         }
 
-        socket_t listen_on(const std::string& host, uint16_t port) {
-            net_init();
+        SocketHandle listenOn(const std::string& host, uint16_t port) {
+            netInit();
 
             addrinfo hints{};
             hints.ai_family = AF_UNSPEC;
@@ -168,18 +168,18 @@ namespace akkaradb::engine::cluster {
             hints.ai_flags = AI_PASSIVE;
 
             addrinfo* result = nullptr;
-            const auto port_text = std::to_string(port);
-            const char* host_arg = host.empty() ? nullptr : host.c_str();
-            if (::getaddrinfo(host_arg, port_text.c_str(), &hints, &result) != 0) {
+            const auto portText = std::to_string(port);
+            const char* hostArg = host.empty() ? nullptr : host.c_str();
+            if (::getaddrinfo(hostArg, portText.c_str(), &hints, &result) != 0) {
                 throw std::runtime_error(
-                    "ReplicationServer: getaddrinfo failed for " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + port_text
+                    "ReplicationServer: getaddrinfo failed for " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + portText
                 );
             }
 
-            socket_t out = BAD_SOCKET;
+            SocketHandle out = BAD_SOCKET;
             for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
-                socket_t s = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-                if (!socket_ok(s)) { continue; }
+                SocketHandle s = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+                if (!socketOk(s)) { continue; }
 
                 int reuse = 1;
                 ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
@@ -187,13 +187,13 @@ namespace akkaradb::engine::cluster {
                     out = s;
                     break;
                 }
-                close_socket(s);
+                closeSocket(s);
             }
 
             ::freeaddrinfo(result);
-            if (!socket_ok(out)) {
+            if (!socketOk(out)) {
                 throw std::runtime_error(
-                    "ReplicationServer: bind/listen failed on " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + port_text
+                    "ReplicationServer: bind/listen failed on " + (host.empty() ? std::string{"0.0.0.0"} : host) + ":" + portText
                 );
             }
             return out;
@@ -205,221 +205,221 @@ namespace akkaradb::engine::cluster {
         };
 
         struct ReplicaState {
-            socket_t sock = BAD_SOCKET;
+            SocketHandle sock = BAD_SOCKET;
             std::unique_ptr<net::TlsStream> tls;
-            uint64_t node_id = 0;
-            std::atomic<uint64_t> last_acked_seq{0};
+            uint64_t nodeId = 0;
+            std::atomic<uint64_t> lastAckedSeq{0};
             std::atomic<bool> dead{false};
-            std::mutex queue_mutex;
-            std::condition_variable queue_cv;
+            std::mutex queueMutex;
+            std::condition_variable queueCv;
             std::deque<std::vector<uint8_t>> queue;
-            std::thread send_thread;
-            std::thread recv_thread;
+            std::thread sendThread;
+            std::thread recvThread;
 
             ~ReplicaState() {
                 if (tls) { tls->close(); }
-                close_socket(sock);
+                closeSocket(sock);
             }
         };
     } // namespace
 
     class ReplicationServer::Impl {
         public:
-            uint16_t repl_port = 0;
-            uint64_t self_node_id = 0;
-            std::function<uint64_t()> get_current_seq;
-            AckPolicy ack_policy;
-            ClusterRuntimeOptions runtime_options;
+            uint16_t replPort = 0;
+            uint64_t selfNodeId = 0;
+            std::function<uint64_t()> getCurrentSeq;
+            AckPolicy ackPolicy;
+            ClusterRuntimeOptions runtimeOptions;
 
-            socket_t listen_sock = BAD_SOCKET;
+            SocketHandle listenSock = BAD_SOCKET;
             std::atomic<bool> running{false};
-            std::thread accept_thread;
+            std::thread acceptThread;
 
-            mutable std::mutex replicas_mutex;
+            mutable std::mutex replicasMutex;
             std::vector<std::shared_ptr<ReplicaState>> replicas;
-            std::deque<BufferedWire> entry_buffer;
+            std::deque<BufferedWire> entryBuffer;
 
-            std::mutex ack_mutex;
-            std::condition_variable ack_cv;
+            std::mutex ackMutex;
+            std::condition_variable ackCv;
 
             void start() {
-                listen_sock = listen_on(runtime_options.repl_bind_host, repl_port);
+                listenSock = listenOn(runtimeOptions.replBindHost, replPort);
                 running.store(true);
-                accept_thread = std::thread([this] { accept_loop(); });
+                acceptThread = std::thread([this] { acceptLoop(); });
             }
 
             void close() {
                 running.store(false);
-                shutdown_socket(listen_sock);
-                close_socket(listen_sock);
-                listen_sock = BAD_SOCKET;
+                shutdownSocket(listenSock);
+                closeSocket(listenSock);
+                listenSock = BAD_SOCKET;
 
                 std::vector<std::shared_ptr<ReplicaState>> copy;
                 {
-                    std::lock_guard lock{replicas_mutex};
+                    std::lock_guard lock{replicasMutex};
                     copy = replicas;
                     replicas.clear();
                 }
                 for (auto& replica : copy) {
                     replica->dead.store(true);
-                    close_replica(replica);
-                    replica->queue_cv.notify_all();
+                    closeReplica(replica);
+                    replica->queueCv.notify_all();
                 }
-                if (accept_thread.joinable()) { accept_thread.join(); }
+                if (acceptThread.joinable()) { acceptThread.join(); }
                 for (auto& replica : copy) {
-                    if (replica->send_thread.joinable()) { replica->send_thread.join(); }
-                    if (replica->recv_thread.joinable()) { replica->recv_thread.join(); }
+                    if (replica->sendThread.joinable()) { replica->sendThread.join(); }
+                    if (replica->recvThread.joinable()) { replica->recvThread.join(); }
                 }
             }
 
-            void accept_loop() {
+            void acceptLoop() {
                 while (running.load()) {
-                    socket_t client = ::accept(listen_sock, nullptr, nullptr);
-                    if (!socket_ok(client)) { break; }
+                    SocketHandle client = ::accept(listenSock, nullptr, nullptr);
+                    if (!socketOk(client)) { break; }
 
                     std::unique_ptr<net::TlsStream> tls;
-                    if (runtime_options.transport_mode == TransportMode::TLS) {
+                    if (runtimeOptions.transportMode == TransportMode::TLS) {
                         try {
-                            auto storage = make_tls_config(runtime_options);
+                            auto storage = makeTlsConfig(runtimeOptions);
                             tls = std::make_unique<net::TlsStream>();
                             tls->accept(static_cast<std::uintptr_t>(client), storage.config);
                             client = BAD_SOCKET;
                         }
                         catch (...) {
-                            close_socket(client);
+                            closeSocket(client);
                             continue;
                         }
                     }
 
                     DecodedFrame frame;
                     ClientHello hello;
-                    if (!recv_frame_from(client, tls.get(), frame) || frame.type != ReplMsgType::ClientHello || !decode_client_hello(
+                    if (!recvFrameFrom(client, tls.get(), frame) || frame.type != ReplMsgType::CLIENT_HELLO || !decodeClientHello(
                         frame.payload,
                         hello
                     )) {
                         if (tls) { tls->close(); }
-                        close_socket(client);
+                        closeSocket(client);
                         continue;
                     }
 
                     ServerHello response{};
-                    response.node_id = self_node_id;
-                    response.current_seq = get_current_seq ? get_current_seq() : 0;
-                    response.role = NodeRole::Primary;
-                    auto hello_wire = encode_server_hello(response);
-                    if (!send_to(client, tls.get(), hello_wire.data(), hello_wire.size())) {
+                    response.nodeId = selfNodeId;
+                    response.currentSeq = getCurrentSeq ? getCurrentSeq() : 0;
+                    response.role = NodeRole::PRIMARY;
+                    auto helloWire = encodeServerHello(response);
+                    if (!sendTo(client, tls.get(), helloWire.data(), helloWire.size())) {
                         if (tls) { tls->close(); }
-                        close_socket(client);
+                        closeSocket(client);
                         continue;
                     }
 
                     auto replica = std::make_shared<ReplicaState>();
                     replica->sock = client;
                     replica->tls = std::move(tls);
-                    replica->node_id = hello.node_id;
-                    replica->last_acked_seq.store(hello.last_seq);
+                    replica->nodeId = hello.nodeId;
+                    replica->lastAckedSeq.store(hello.lastSeq);
 
                     {
-                        std::lock_guard lock{replicas_mutex};
-                        for (const auto& buffered : entry_buffer) {
-                            if (buffered.seq == 0 || buffered.seq > hello.last_seq) { replica->queue.push_back(buffered.wire); }
+                        std::lock_guard lock{replicasMutex};
+                        for (const auto& buffered : entryBuffer) {
+                            if (buffered.seq == 0 || buffered.seq > hello.lastSeq) { replica->queue.push_back(buffered.wire); }
                         }
                         replicas.push_back(replica);
                     }
-                    replica->send_thread = std::thread([this, replica] { send_loop(replica); });
-                    replica->recv_thread = std::thread([this, replica] { recv_loop(replica); });
-                    replica->queue_cv.notify_one();
+                    replica->sendThread = std::thread([this, replica] { sendLoop(replica); });
+                    replica->recvThread = std::thread([this, replica] { recvLoop(replica); });
+                    replica->queueCv.notify_one();
                 }
             }
 
-            static bool send_to(socket_t sock, net::TlsStream* tls, const uint8_t* data, size_t size) {
-                try { return tls != nullptr ? send_all(*tls, data, size) : send_all(sock, data, size); }
+            static bool sendTo(SocketHandle sock, net::TlsStream* tls, const uint8_t* data, size_t size) {
+                try { return tls != nullptr ? sendAll(*tls, data, size) : sendAll(sock, data, size); }
                 catch (...) { return false; }
             }
 
-            static bool recv_frame_from(socket_t sock, net::TlsStream* tls, DecodedFrame& out) {
-                return tls != nullptr ? recv_frame(*tls, out) : recv_frame(sock, out);
+            static bool recvFrameFrom(SocketHandle sock, net::TlsStream* tls, DecodedFrame& out) {
+                return tls != nullptr ? recvFrame(*tls, out) : recvFrame(sock, out);
             }
 
-            static void close_replica(const std::shared_ptr<ReplicaState>& replica) {
+            static void closeReplica(const std::shared_ptr<ReplicaState>& replica) {
                 if (replica->tls) { replica->tls->shutdown(); }
                 else {
-                    shutdown_socket(replica->sock);
-                    close_socket(replica->sock);
+                    shutdownSocket(replica->sock);
+                    closeSocket(replica->sock);
                 }
                 replica->sock = BAD_SOCKET;
             }
 
-            void send_loop(const std::shared_ptr<ReplicaState>& replica) {
+            void sendLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
                     std::vector<uint8_t> wire;
                     {
-                        std::unique_lock lock{replica->queue_mutex};
-                        replica->queue_cv.wait(lock, [&] { return replica->dead.load() || !replica->queue.empty(); });
+                        std::unique_lock lock{replica->queueMutex};
+                        replica->queueCv.wait(lock, [&] { return replica->dead.load() || !replica->queue.empty(); });
                         if (replica->dead.load() && replica->queue.empty()) { break; }
                         wire = std::move(replica->queue.front());
                         replica->queue.pop_front();
                     }
-                    if (!send_to(replica->sock, replica->tls.get(), wire.data(), wire.size())) {
+                    if (!sendTo(replica->sock, replica->tls.get(), wire.data(), wire.size())) {
                         replica->dead.store(true);
-                        close_replica(replica);
+                        closeReplica(replica);
                         break;
                     }
                 }
             }
 
-            void recv_loop(const std::shared_ptr<ReplicaState>& replica) {
+            void recvLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
                     DecodedFrame frame;
-                    if (!recv_frame_from(replica->sock, replica->tls.get(), frame)) { break; }
-                    if (frame.type != ReplMsgType::Ack) { break; }
+                    if (!recvFrameFrom(replica->sock, replica->tls.get(), frame)) { break; }
+                    if (frame.type != ReplMsgType::ACK) { break; }
                     ReplAck ack;
-                    if (!decode_ack(frame.payload, ack)) { break; }
-                    replica->last_acked_seq.store(ack.seq);
-                    ack_cv.notify_all();
+                    if (!decodeAck(frame.payload, ack)) { break; }
+                    replica->lastAckedSeq.store(ack.seq);
+                    ackCv.notify_all();
                 }
                 replica->dead.store(true);
-                close_replica(replica);
-                replica->queue_cv.notify_all();
+                closeReplica(replica);
+                replica->queueCv.notify_all();
             }
 
-            void enqueue_wire(uint64_t seq, std::vector<uint8_t> wire) {
+            void enqueueWire(uint64_t seq, std::vector<uint8_t> wire) {
                 {
-                    std::lock_guard lock{replicas_mutex};
-                    entry_buffer.push_back(BufferedWire{seq, wire});
-                    while (entry_buffer.size() > ENTRY_BUFFER_SIZE) { entry_buffer.pop_front(); }
+                    std::lock_guard lock{replicasMutex};
+                    entryBuffer.push_back(BufferedWire{seq, wire});
+                    while (entryBuffer.size() > ENTRY_BUFFER_SIZE) { entryBuffer.pop_front(); }
                     for (auto& replica : replicas) {
                         if (!replica->dead.load()) {
-                            std::lock_guard qlock{replica->queue_mutex};
+                            std::lock_guard qlock{replica->queueMutex};
                             replica->queue.push_back(wire);
-                            replica->queue_cv.notify_one();
+                            replica->queueCv.notify_one();
                         }
                     }
                 }
-                wait_for_acks(seq);
+                waitForAcks(seq);
             }
 
-            void wait_for_acks(uint64_t seq) {
-                if (ack_policy.mode == AckPolicyMode::Async || seq == 0) { return; }
+            void waitForAcks(uint64_t seq) {
+                if (ackPolicy.mode == AckPolicyMode::ASYNC || seq == 0) { return; }
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (std::chrono::steady_clock::now() < deadline) {
                     size_t live = 0;
                     size_t acked = 0;
                     {
-                        std::lock_guard lock{replicas_mutex};
+                        std::lock_guard lock{replicasMutex};
                         for (const auto& replica : replicas) {
                             if (!replica->dead.load()) {
                                 ++live;
-                                if (replica->last_acked_seq.load() >= seq) { ++acked; }
+                                if (replica->lastAckedSeq.load() >= seq) { ++acked; }
                             }
                         }
                     }
 
-                    const bool ok = ack_policy.mode == AckPolicyMode::All ? acked >= live : acked >= ack_policy.quorum;
+                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL ? acked >= live : acked >= ackPolicy.quorum;
                     if (ok) { return; }
 
-                    std::unique_lock lock{ack_mutex};
-                    ack_cv.wait_for(lock, std::chrono::milliseconds(50));
+                    std::unique_lock lock{ackMutex};
+                    ackCv.wait_for(lock, std::chrono::milliseconds(50));
                 }
             }
     };
@@ -428,52 +428,52 @@ namespace akkaradb::engine::cluster {
     ReplicationServer::~ReplicationServer() { close(); }
 
     std::unique_ptr<ReplicationServer> ReplicationServer::create(
-        uint16_t repl_port,
-        uint64_t self_node_id,
-        std::function<uint64_t()> get_current_seq,
-        AckPolicy ack_policy,
-        ClusterRuntimeOptions runtime_options
+        uint16_t replPort,
+        uint64_t selfNodeId,
+        std::function<uint64_t()> getCurrentSeq,
+        AckPolicy ackPolicy,
+        ClusterRuntimeOptions runtimeOptions
     ) {
         auto impl = std::make_unique<Impl>();
-        impl->repl_port = repl_port;
-        impl->self_node_id = self_node_id;
-        impl->get_current_seq = std::move(get_current_seq);
-        impl->ack_policy = ack_policy;
-        impl->runtime_options = std::move(runtime_options);
+        impl->replPort = replPort;
+        impl->selfNodeId = selfNodeId;
+        impl->getCurrentSeq = std::move(getCurrentSeq);
+        impl->ackPolicy = ackPolicy;
+        impl->runtimeOptions = std::move(runtimeOptions);
         return std::unique_ptr<ReplicationServer>(new ReplicationServer(std::move(impl)));
     }
 
     void ReplicationServer::start() { impl_->start(); }
     void ReplicationServer::close() { if (impl_) { impl_->close(); } }
 
-    void ReplicationServer::ship_entry(
+    void ReplicationServer::shipEntry(
         uint64_t seq,
         ReplOpType op,
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
-        uint8_t record_flags,
-        uint64_t source_node_id
+        uint8_t recordFlags,
+        uint64_t sourceNodeId
     ) {
         ReplEntry entry;
         entry.seq = seq;
-        entry.source_node_id = source_node_id;
+        entry.sourceNodeId = sourceNodeId;
         entry.op = op;
-        entry.record_flags = record_flags;
+        entry.recordFlags = recordFlags;
         entry.key.assign(key.begin(), key.end());
         entry.value.assign(value.begin(), value.end());
-        impl_->enqueue_wire(seq, encode_entry(entry));
+        impl_->enqueueWire(seq, encodeEntry(entry));
     }
 
-    void ReplicationServer::ship_blob(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content) {
+    void ReplicationServer::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
         ReplBlob blob;
         blob.seq = seq;
-        blob.blob_id = blob_id;
+        blob.blobId = blobId;
         blob.content.assign(content.begin(), content.end());
-        impl_->enqueue_wire(0, encode_blob(blob));
+        impl_->enqueueWire(0, encodeBlob(blob));
     }
 
-    size_t ReplicationServer::replica_count() const noexcept {
-        std::lock_guard lock{impl_->replicas_mutex};
+    size_t ReplicationServer::replicaCount() const noexcept {
+        std::lock_guard lock{impl_->replicasMutex};
         size_t count = 0;
         for (const auto& replica : impl_->replicas) { if (!replica->dead.load()) { ++count; } }
         return count;

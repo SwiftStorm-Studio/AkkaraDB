@@ -25,7 +25,7 @@
 
 namespace akkaradb::engine::blob {
     enum class BlobCodec : uint32_t {
-        None = 0, Zstd = 1,
+        NONE = 0, ZSTD = 1,
     };
 
     inline constexpr size_t BLOB_REF_SIZE = 20;
@@ -37,42 +37,42 @@ namespace akkaradb::engine::blob {
     inline constexpr uint32_t AKBLOB_FLAG_ZSTD = 0x00000001u;
 
     struct BlobRef {
-        uint64_t blob_id = 0;
-        uint64_t total_size = 0;
-        uint32_t content_crc32c = 0;
+        uint64_t blobId = 0;
+        uint64_t totalSize = 0;
+        uint32_t contentCrc32c = 0;
     };
 
     #pragma pack(push, 1)
     struct AkBlobHeaderV5 {
         uint32_t magic = AKBLOB_MAGIC_V5;
         uint16_t version = AKBLOB_VERSION_V5;
-        uint16_t header_size = AKBLOB_HEADER_SIZE_V5;
+        uint16_t headerSize = AKBLOB_HEADER_SIZE_V5;
         uint32_t flags = 0;
-        uint32_t codec = static_cast<uint32_t>(BlobCodec::None);
-        uint64_t blob_id = 0;
-        uint64_t total_size = 0;
-        uint64_t stored_size = 0;
-        uint32_t content_crc32c = 0;
-        uint32_t header_crc32c = 0;
+        uint32_t codec = static_cast<uint32_t>(BlobCodec::NONE);
+        uint64_t blobId = 0;
+        uint64_t totalSize = 0;
+        uint64_t storedSize = 0;
+        uint32_t contentCrc32c = 0;
+        uint32_t headerCrc32c = 0;
     };
     #pragma pack(pop)
 
     static_assert(sizeof(AkBlobHeaderV5) == AKBLOB_HEADER_SIZE_V5);
 
-    void encode_blob_ref(uint8_t* out, BlobRef ref) noexcept;
-    [[nodiscard]] BlobRef decode_blob_ref(const uint8_t* data) noexcept;
+    void encodeBlobRef(uint8_t* out, BlobRef ref) noexcept;
+    [[nodiscard]] BlobRef decodeBlobRef(const uint8_t* data) noexcept;
 
-    [[nodiscard]] AkBlobHeaderV5 build_blob_header(
-        uint64_t blob_id,
-        uint64_t total_size,
-        uint64_t stored_size,
+    [[nodiscard]] AkBlobHeaderV5 buildBlobHeader(
+        uint64_t blobId,
+        uint64_t totalSize,
+        uint64_t storedSize,
         BlobCodec codec,
-        uint32_t content_crc32c
+        uint32_t contentCrc32c
     ) noexcept;
 
-    void serialize_blob_header(const AkBlobHeaderV5& header, uint8_t out[AKBLOB_HEADER_SIZE_V5]) noexcept;
-    [[nodiscard]] AkBlobHeaderV5 deserialize_blob_header(const uint8_t in[AKBLOB_HEADER_SIZE_V5]) noexcept;
-    [[nodiscard]] bool verify_blob_header(const AkBlobHeaderV5& header) noexcept;
+    void serializeBlobHeader(const AkBlobHeaderV5& header, uint8_t out[AKBLOB_HEADER_SIZE_V5]) noexcept;
+    [[nodiscard]] AkBlobHeaderV5 deserializeBlobHeader(const uint8_t in[AKBLOB_HEADER_SIZE_V5]) noexcept;
+    [[nodiscard]] bool verifyBlobHeader(const AkBlobHeaderV5& header) noexcept;
 
     [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> bytes) noexcept;
 } // namespace akkaradb::engine::blob

@@ -25,11 +25,11 @@
 
 namespace akkaradb::engine::server {
     enum class ApiOp : uint8_t {
-        Get = 0x01, Put = 0x02, Remove = 0x03, GetAt = 0x04, BatchPut = 0x05, BatchGet = 0x06,
+        GET = 0x01, PUT = 0x02, REMOVE = 0x03, GET_AT = 0x04, BATCH_PUT = 0x05, BATCH_GET = 0x06,
     };
 
     enum class ApiStatus : uint8_t {
-        Ok = 0x00, NotFound = 0x01, Error = 0xFF,
+        OK = 0x00, NOT_FOUND = 0x01, ERROR_STATUS = 0xFF,
     };
 
     #pragma pack(push, 1)
@@ -37,16 +37,16 @@ namespace akkaradb::engine::server {
         char magic[4];
         uint8_t version;
         ApiOp opcode;
-        uint32_t request_id;
-        uint16_t key_len;
-        uint32_t val_len;
+        uint32_t requestId;
+        uint16_t keyLen;
+        uint32_t valLen;
     };
 
     struct ApiResponseHeader {
         char magic[4];
         ApiStatus status;
-        uint32_t request_id;
-        uint32_t val_len;
+        uint32_t requestId;
+        uint32_t valLen;
     };
     #pragma pack(pop)
 
@@ -63,16 +63,16 @@ namespace akkaradb::engine::server {
     };
 
     struct ApiBatchGetResult {
-        ApiStatus status = ApiStatus::Error;
+        ApiStatus status = ApiStatus::ERROR_STATUS;
         std::span<const uint8_t> value;
     };
 
     [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> data) noexcept;
     [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> first, std::span<const uint8_t> second);
 
-    [[nodiscard]] bool decode_batch_put(std::span<const uint8_t> payload, uint32_t max_items, std::vector<ApiBatchPutItem>& out);
-    [[nodiscard]] bool decode_batch_get(std::span<const uint8_t> payload, uint32_t max_items, std::vector<std::span<const uint8_t>>& out);
-    void encode_response(ApiStatus status, uint32_t request_id, std::span<const uint8_t> value, std::vector<uint8_t>& out);
-    void encode_batch_get_response(uint32_t request_id, std::span<const ApiBatchGetResult> results, std::vector<uint8_t>& out);
-    void encode_error(uint32_t request_id, std::vector<uint8_t>& out);
+    [[nodiscard]] bool decodeBatchPut(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<ApiBatchPutItem>& out);
+    [[nodiscard]] bool decodeBatchGet(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<std::span<const uint8_t>>& out);
+    void encodeResponse(ApiStatus status, uint32_t requestId, std::span<const uint8_t> value, std::vector<uint8_t>& out);
+    void encodeBatchGetResponse(uint32_t requestId, std::span<const ApiBatchGetResult> results, std::vector<uint8_t>& out);
+    void encodeError(uint32_t requestId, std::vector<uint8_t>& out);
 }

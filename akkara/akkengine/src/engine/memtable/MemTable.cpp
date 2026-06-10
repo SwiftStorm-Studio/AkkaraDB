@@ -44,23 +44,23 @@
 
 namespace akkaradb::engine::memtable {
     namespace {
-        [[nodiscard]] core::ByteView to_byte_view(std::span<const uint8_t> bytes) noexcept {
+        [[nodiscard]] core::ByteView toByteView(std::span<const uint8_t> bytes) noexcept {
             return {reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()};
         }
 
-        [[nodiscard]] uint64_t compute_fp64(std::span<const uint8_t> key, uint64_t precomputed_fp64) noexcept {
-            if (precomputed_fp64 != 0) { return precomputed_fp64; }
+        [[nodiscard]] uint64_t computeFp64(std::span<const uint8_t> key, uint64_t precomputedFp64) noexcept {
+            if (precomputedFp64 != 0) { return precomputedFp64; }
             if (key.empty()) { return 0; }
-            return core::compute_key_fp64(key.data(), key.size());
+            return core::computeKeyFp64(key.data(), key.size());
         }
 
-        [[nodiscard]] uint64_t compute_mini(std::span<const uint8_t> key, uint64_t precomputed_mk) noexcept {
-            if (precomputed_mk != 0) { return precomputed_mk; }
+        [[nodiscard]] uint64_t computeMini(std::span<const uint8_t> key, uint64_t precomputedMk) noexcept {
+            if (precomputedMk != 0) { return precomputedMk; }
             if (key.empty()) { return 0; }
-            return core::build_mini_key(key.data(), key.size());
+            return core::buildMiniKey(key.data(), key.size());
         }
 
-        [[nodiscard]] uint64_t load_u64_le(const uint8_t* p) noexcept {
+        [[nodiscard]] uint64_t loadU64Le(const uint8_t* p) noexcept {
             uint64_t v = 0;
             std::memcpy(&v, p, sizeof(v));
             return v;
@@ -75,13 +75,13 @@ namespace akkaradb::engine::memtable {
             return x;
         }
 
-        [[nodiscard]] uint64_t compute_shard_hash(std::span<const uint8_t> key) noexcept {
+        [[nodiscard]] uint64_t computeShardHash(std::span<const uint8_t> key) noexcept {
             const auto* p = key.data();
             size_t n = key.size();
             uint64_t h = 0x9e3779b97f4a7c15ULL ^ (static_cast<uint64_t>(n) * 0xbf58476d1ce4e5b9ULL);
 
             while (n >= 8) {
-                uint64_t lane = load_u64_le(p);
+                uint64_t lane = loadU64Le(p);
                 lane *= 0x9ddfea08eb382d69ULL;
                 lane ^= lane >> 32;
                 h ^= lane;
@@ -97,35 +97,35 @@ namespace akkaradb::engine::memtable {
             return avalanche64(h);
         }
 
-        [[nodiscard]] uint32_t next_pow2_clamped(uint64_t n, uint32_t min_value, uint32_t max_value) noexcept {
+        [[nodiscard]] uint32_t nextPow2Clamped(uint64_t n, uint32_t minValue, uint32_t maxValue) noexcept {
             uint32_t p = 1;
-            while (p < n && p < max_value) { p <<= 1; }
-            if (p < min_value) { p = min_value; }
-            if (p > max_value) { p = max_value; }
+            while (p < n && p < maxValue) { p <<= 1; }
+            if (p < minValue) { p = minValue; }
+            if (p > maxValue) { p = maxValue; }
             return p;
         }
 
-        [[nodiscard]] uint32_t resolve_shard_count(size_t requested, size_t expected_concurrent_writers, size_t auto_cap) {
+        [[nodiscard]] uint32_t resolveShardCount(size_t requested, size_t expectedConcurrentWriters, size_t autoCap) {
             if (requested == 1) { return 1; }
 
-            if (requested > 1) { return next_pow2_clamped(static_cast<uint64_t>(requested), 2, 256); }
+            if (requested > 1) { return nextPow2Clamped(static_cast<uint64_t>(requested), 2, 256); }
 
-            const uint32_t effective_cap = next_pow2_clamped(static_cast<uint64_t>(auto_cap == 0 ? 128 : auto_cap), 2, 256);
+            const uint32_t effectiveCap = nextPow2Clamped(static_cast<uint64_t>(autoCap == 0 ? 128 : autoCap), 2, 256);
 
-            const size_t n = expected_concurrent_writers > 0
-                                 ? expected_concurrent_writers
+            const size_t n = expectedConcurrentWriters > 0
+                                 ? expectedConcurrentWriters
                                  : std::max<size_t>(2, std::thread::hardware_concurrency());
 
             const uint64_t target = n <= 1 ? 1ULL : static_cast<uint64_t>(n) * 4ULL;
-            return next_pow2_clamped(target, 2, effective_cap);
+            return nextPow2Clamped(target, 2, effectiveCap);
         }
 
-        [[nodiscard]] uint32_t shard_for_hash(uint64_t hash, uint32_t shard_count) noexcept {
-            if (shard_count <= 1) { return 0; }
-            return static_cast<uint32_t>(hash & static_cast<uint64_t>(shard_count - 1));
+        [[nodiscard]] uint32_t shardForHash(uint64_t hash, uint32_t shardCount) noexcept {
+            if (shardCount <= 1) { return 0; }
+            return static_cast<uint32_t>(hash & static_cast<uint64_t>(shardCount - 1));
         }
 
-        [[noreturn]] void throw_status_error(const char* op, const core::Status& st) {
+        [[noreturn]] void throwStatusError(const char* op, const core::Status& st) {
             std::string msg = op;
             msg += " failed";
             if (!st.message().empty()) {
@@ -141,10 +141,10 @@ namespace akkaradb::engine::memtable {
             explicit Impl(std::vector<RecordView> records, std::vector<std::shared_ptr<const IMemTable>> sources)
                 : records_{std::move(records)}, sources_{std::move(sources)} {}
 
-            [[nodiscard]] bool has_next() const noexcept { return index_ < records_.size(); }
+            [[nodiscard]] bool hasNext() const noexcept { return index_ < records_.size(); }
 
             [[nodiscard]] std::optional<RecordView> next() noexcept {
-                if (!has_next()) { return std::nullopt; }
+                if (!hasNext()) { return std::nullopt; }
                 return records_[index_++];
             }
 
@@ -159,8 +159,8 @@ namespace akkaradb::engine::memtable {
             struct Shard {
                 mutable std::shared_mutex mutex;
                 std::shared_ptr<IMemTable> active;
-                std::atomic<IMemTable*> active_raw{nullptr};
-                std::atomic<uint32_t> immutable_count{0};
+                std::atomic<IMemTable*> activeRaw{nullptr};
+                std::atomic<uint32_t> immutableCount{0};
 
                 struct Immutable {
                     uint64_t id;
@@ -175,11 +175,11 @@ namespace akkaradb::engine::memtable {
 
                 std::deque<Immutable> immutables;
                 std::atomic<std::shared_ptr<const PublishedTables>> published;
-                std::atomic<size_t> approx_bytes{0};
-                std::atomic<uint64_t> puts_applied{0};
-                std::atomic<uint64_t> removes_applied{0};
-                size_t active_bytes{0};
-                uint64_t next_immutable_id{1};
+                std::atomic<size_t> approxBytes{0};
+                std::atomic<uint64_t> putsApplied{0};
+                std::atomic<uint64_t> removesApplied{0};
+                size_t activeBytes{0};
+                uint64_t nextImmutableId{1};
             };
 
             class Flusher {
@@ -192,7 +192,7 @@ namespace akkaradb::engine::memtable {
                     using FlushDone = std::function<void(uint64_t)>;
 
                     Flusher(FlushCallback callback, FlushDone done)
-                        : callback_{std::move(callback)}, on_done_{std::move(done)}, running_{true}, thread_{[this]() { run(); }} {}
+                        : callback_{std::move(callback)}, onDone_{std::move(done)}, running_{true}, thread_{[this]() { run(); }} {}
 
                     ~Flusher() {
                         {
@@ -216,7 +216,7 @@ namespace akkaradb::engine::memtable {
 
                     void drain() {
                         std::unique_lock<std::mutex> lock{mutex_};
-                        cv_.wait(lock, [this]() { return queue_.empty() && in_flight_ == 0; });
+                        cv_.wait(lock, [this]() { return queue_.empty() && inFlight_ == 0; });
                     }
 
                 private:
@@ -229,7 +229,7 @@ namespace akkaradb::engine::memtable {
                                 if (!running_ && queue_.empty()) { break; }
                                 item = std::move(queue_.front());
                                 queue_.pop();
-                                ++in_flight_;
+                                ++inFlight_;
                             }
 
                             std::vector<RecordView> records;
@@ -240,48 +240,46 @@ namespace akkaradb::engine::memtable {
                                      std::numeric_limits<uint64_t>::max()
                                  )) { records.push_back(rec); }
                             if (callback_) { callback_(std::span<const RecordView>{records}); }
-                            if (on_done_) { on_done_(item.id); }
+                            if (onDone_) { onDone_(item.id); }
 
                             {
                                 std::lock_guard<std::mutex> lock{mutex_};
-                                --in_flight_;
+                                --inFlight_;
                             }
                             cv_.notify_all();
                         }
                     }
 
                     FlushCallback callback_;
-                    FlushDone on_done_;
+                    FlushDone onDone_;
                     std::mutex mutex_;
                     std::condition_variable cv_;
                     std::queue<Item> queue_;
                     bool running_;
-                    size_t in_flight_{0};
+                    size_t inFlight_{0};
                     std::thread thread_;
             };
 
             explicit Impl(Options options)
                 : options_{std::move(options)},
-                  shard_count_{
-                      resolve_shard_count(options_.shard_count, options_.expected_concurrent_writers, options_.auto_shard_count_cap)
-                  },
-                  threshold_bytes_per_shard_{options_.threshold_bytes_per_shard},
-                  seq_gen_{1} {
-                if (!options_.backend_factory) { options_.backend_factory = []() { return std::make_unique<SkipListMemTable>(); }; }
+                  shardCount_{resolveShardCount(options_.shardCount, options_.expectedConcurrentWriters, options_.autoShardCountCap)},
+                  thresholdBytesPerShard_{options_.thresholdBytesPerShard},
+                  seqGen_{1} {
+                if (!options_.backendFactory) { options_.backendFactory = []() { return std::make_unique<SkipListMemTable>(); }; }
 
-                shards_.resize(shard_count_);
-                for (uint32_t i = 0; i < shard_count_; ++i) {
+                shards_.resize(shardCount_);
+                for (uint32_t i = 0; i < shardCount_; ++i) {
                     shards_[i] = std::make_unique<Shard>();
-                    auto table = options_.backend_factory();
-                    if (!table) { throw std::invalid_argument("MemTable backend_factory returned null"); }
+                    auto table = options_.backendFactory();
+                    if (!table) { throw std::invalid_argument("MemTable backendFactory returned null"); }
                     shards_[i]->active = std::shared_ptr<IMemTable>{std::move(table)};
-                    shards_[i]->active_raw.store(shards_[i]->active.get(), std::memory_order_relaxed);
-                    shards_[i]->active_bytes = shards_[i]->active->sizeBytes();
-                    shards_[i]->approx_bytes.store(shards_[i]->active_bytes, std::memory_order_relaxed);
-                    publish_tables_locked(*shards_[i]);
+                    shards_[i]->activeRaw.store(shards_[i]->active.get(), std::memory_order_relaxed);
+                    shards_[i]->activeBytes = shards_[i]->active->sizeBytes();
+                    shards_[i]->approxBytes.store(shards_[i]->activeBytes, std::memory_order_relaxed);
+                    publishTablesLocked(*shards_[i]);
                 }
 
-                if (options_.on_flush) { set_flush_callback(options_.on_flush); }
+                if (options_.onFlush) { setFlushCallback(options_.onFlush); }
             }
 
             void put(
@@ -289,101 +287,97 @@ namespace akkaradb::engine::memtable {
                 std::span<const uint8_t> value,
                 uint64_t seq,
                 uint8_t flags,
-                uint64_t precomputed_fp64,
-                uint64_t precomputed_mk
+                uint64_t precomputedFp64,
+                uint64_t precomputedMk
             ) {
-                const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
-                const uint64_t mini = compute_mini(key, precomputed_mk);
-                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
+                const uint64_t fp64 = computeFp64(key, precomputedFp64);
+                const uint64_t mini = computeMini(key, precomputedMk);
+                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
 
-                auto& shard = *shards_[shard_index];
-                bool should_flush = false;
+                auto& shard = *shards_[shardIndex];
+                bool shouldFlush = false;
 
                 {
                     std::unique_lock<std::shared_mutex> lock{shard.mutex};
-                    const core::Status st = shard.active->put(to_byte_view(key), to_byte_view(value), seq, flags, fp64, mini);
-                    if (!st.ok()) { throw_status_error("MemTable::put", st); }
-                    const size_t new_active_bytes = shard.active->sizeBytes();
-                    const size_t previous_active_bytes = shard.active_bytes;
-                    shard.active_bytes = new_active_bytes;
+                    const core::Status st = shard.active->put(toByteView(key), toByteView(value), seq, flags, fp64, mini);
+                    if (!st.ok()) { throwStatusError("MemTable::put", st); }
+                    const size_t newActiveBytes = shard.active->sizeBytes();
+                    const size_t previousActiveBytes = shard.activeBytes;
+                    shard.activeBytes = newActiveBytes;
 
-                    size_t total_bytes = shard.approx_bytes.load(std::memory_order_relaxed);
-                    total_bytes = total_bytes - previous_active_bytes + new_active_bytes;
-                    shard.approx_bytes.store(total_bytes, std::memory_order_relaxed);
-                    should_flush = threshold_bytes_per_shard_ > 0 && new_active_bytes > threshold_bytes_per_shard_;
+                    size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                    totalBytes = totalBytes - previousActiveBytes + newActiveBytes;
+                    shard.approxBytes.store(totalBytes, std::memory_order_relaxed);
+                    shouldFlush = thresholdBytesPerShard_ > 0 && newActiveBytes > thresholdBytesPerShard_;
                 }
 
-                shard.puts_applied.fetch_add(1, std::memory_order_relaxed);
-                advance_seq(seq);
-                if (should_flush) { trigger_flush(shard_index); }
+                shard.putsApplied.fetch_add(1, std::memory_order_relaxed);
+                advanceSeq(seq);
+                if (shouldFlush) { triggerFlush(shardIndex); }
             }
 
-            void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputed_fp64, uint64_t precomputed_mk) {
-                const uint64_t fp64 = compute_fp64(key, precomputed_fp64);
-                const uint64_t mini = compute_mini(key, precomputed_mk);
-                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
+            void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputedFp64, uint64_t precomputedMk) {
+                const uint64_t fp64 = computeFp64(key, precomputedFp64);
+                const uint64_t mini = computeMini(key, precomputedMk);
+                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
 
                 put(key, {}, seq, RecordView::FLAG_TOMBSTONE, fp64, mini);
-                shards_[shard_index]->puts_applied.fetch_sub(1, std::memory_order_relaxed);
-                shards_[shard_index]->removes_applied.fetch_add(1, std::memory_order_relaxed);
+                shards_[shardIndex]->putsApplied.fetch_sub(1, std::memory_order_relaxed);
+                shards_[shardIndex]->removesApplied.fetch_add(1, std::memory_order_relaxed);
             }
 
-            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const {
+            [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const {
                 if (out == nullptr) { return false; }
 
-                const core::ByteView key_view = to_byte_view(key);
-                (void)precomputed_fp64;
-                const uint32_t shard_index = shard_for_hash(compute_shard_hash(key), shard_count_);
-                const auto& shard = *shards_[shard_index];
+                const core::ByteView keyView = toByteView(key);
+                (void)precomputedFp64;
+                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
+                const auto& shard = *shards_[shardIndex];
 
-                if (raw_active_get_enabled_.load(std::memory_order_acquire) && shard.immutable_count.load(std::memory_order_acquire) == 0) {
-                    const IMemTable* active = shard.active_raw.load(std::memory_order_acquire);
-                    return active != nullptr && active->get(key_view, snapshot_seq, out);
+                if (rawActiveGetEnabled_.load(std::memory_order_acquire) && shard.immutableCount.load(std::memory_order_acquire) == 0) {
+                    const IMemTable* active = shard.activeRaw.load(std::memory_order_acquire);
+                    return active != nullptr && active->get(keyView, snapshotSeq, out);
                 }
 
                 const auto published = shard.published.load(std::memory_order_acquire);
                 if (!published) { return false; }
 
-                if (published->active && published->active->get(key_view, snapshot_seq, out)) { return true; }
+                if (published->active && published->active->get(keyView, snapshotSeq, out)) { return true; }
 
                 for (const auto& immutable : published->immutables) {
-                    if (immutable && immutable->get(key_view, snapshot_seq, out)) { return true; }
+                    if (immutable && immutable->get(keyView, snapshotSeq, out)) { return true; }
                 }
                 return false;
             }
 
-            [[nodiscard]] std::optional<bool> get_into(
-                std::span<const uint8_t> key,
-                uint64_t snapshot_seq,
-                std::vector<uint8_t>& out
-            ) const {
+            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, uint64_t snapshotSeq, std::vector<uint8_t>& out) const {
                 RecordView view;
-                if (!get(key, snapshot_seq, &view, 0)) { return std::nullopt; }
-                if (view.is_tombstone()) { return false; }
+                if (!get(key, snapshotSeq, &view, 0)) { return std::nullopt; }
+                if (view.isTombstone()) { return false; }
                 const auto value = view.value();
                 out.assign(value.begin(), value.end());
                 return true;
             }
 
-            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const {
+            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
                 RecordView view;
-                if (!get(key, snapshot_seq, &view, 0)) { return std::nullopt; }
-                return !view.is_tombstone();
+                if (!get(key, snapshotSeq, &view, 0)) { return std::nullopt; }
+                return !view.isTombstone();
             }
 
-            [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshot_seq) const {
+            [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshotSeq) const {
                 std::vector<std::shared_ptr<const IMemTable>> sources;
-                sources.reserve(shard_count_ * 2);
+                sources.reserve(shardCount_ * 2);
 
-                for (const auto& shard_ptr : shards_) {
-                    const auto published = shard_ptr->published.load(std::memory_order_acquire);
+                for (const auto& shardPtr : shards_) {
+                    const auto published = shardPtr->published.load(std::memory_order_acquire);
                     if (!published) { continue; }
                     if (published->active) { sources.push_back(published->active); }
                     for (const auto& immutable : published->immutables) { if (immutable) { sources.push_back(immutable); } }
                 }
 
-                const core::ByteView start_view = to_byte_view(std::span<const uint8_t>{range.start.data(), range.start.size()});
-                const core::ByteView end_view = to_byte_view(std::span<const uint8_t>{range.end.data(), range.end.size()});
+                const core::ByteView startView = toByteView(std::span<const uint8_t>{range.start.data(), range.start.size()});
+                const core::ByteView endView = toByteView(std::span<const uint8_t>{range.end.data(), range.end.size()});
 
                 std::vector<RecordView> deduped;
 
@@ -393,8 +387,8 @@ namespace akkaradb::engine::memtable {
                     RecordView current{};
                 };
 
-                auto advance_filtered = [&](SourceCursor& cursor, bool consume_current) -> bool {
-                    if (consume_current) { ++cursor.it; }
+                auto advanceFiltered = [&](SourceCursor& cursor, bool consumeCurrent) -> bool {
+                    if (consumeCurrent) { ++cursor.it; }
                     if (cursor.it == cursor.generator.end()) { return false; }
                     cursor.current = *cursor.it;
                     return true;
@@ -405,109 +399,109 @@ namespace akkaradb::engine::memtable {
 
                 for (const auto& table : sources) {
                     SourceCursor cursor;
-                    cursor.generator = table->iterator(start_view, end_view, snapshot_seq);
+                    cursor.generator = table->iterator(startView, endView, snapshotSeq);
                     cursor.it = cursor.generator.begin();
                     if (cursor.it == cursor.generator.end()) { continue; }
-                    if (!advance_filtered(cursor, false)) { continue; }
+                    if (!advanceFiltered(cursor, false)) { continue; }
                     cursors.push_back(std::move(cursor));
                 }
 
                 if (!cursors.empty()) {
-                    auto min_key_cmp = [&](size_t lhs, size_t rhs) {
+                    auto minKeyCmp = [&](size_t lhs, size_t rhs) {
                         const RecordView& a = cursors[lhs].current;
                         const RecordView& b = cursors[rhs].current;
-                        const int key_cmp = a.compare_key(b);
-                        if (key_cmp != 0) { return key_cmp > 0; }
+                        const int keyCmp = a.compareKey(b);
+                        if (keyCmp != 0) { return keyCmp > 0; }
                         return a.seq() < b.seq();
                     };
 
-                    std::priority_queue<size_t, std::vector<size_t>, decltype(min_key_cmp)> heap(min_key_cmp);
+                    std::priority_queue<size_t, std::vector<size_t>, decltype(minKeyCmp)> heap(minKeyCmp);
                     for (size_t i = 0; i < cursors.size(); ++i) { heap.push(i); }
 
-                    std::vector<size_t> same_key_indices;
-                    same_key_indices.reserve(cursors.size());
+                    std::vector<size_t> sameKeyIndices;
+                    sameKeyIndices.reserve(cursors.size());
 
                     while (!heap.empty()) {
-                        same_key_indices.clear();
+                        sameKeyIndices.clear();
 
-                        const size_t first_idx = heap.top();
+                        const size_t firstIdx = heap.top();
                         heap.pop();
 
-                        RecordView best = cursors[first_idx].current;
-                        same_key_indices.push_back(first_idx);
+                        RecordView best = cursors[firstIdx].current;
+                        sameKeyIndices.push_back(firstIdx);
 
                         while (!heap.empty()) {
                             const size_t idx = heap.top();
-                            if (cursors[idx].current.compare_key(best) != 0) { break; }
+                            if (cursors[idx].current.compareKey(best) != 0) { break; }
                             heap.pop();
                             const RecordView candidate = cursors[idx].current;
                             if (candidate.seq() > best.seq()) { best = candidate; }
-                            same_key_indices.push_back(idx);
+                            sameKeyIndices.push_back(idx);
                         }
 
                         deduped.push_back(best);
 
-                        for (const size_t idx : same_key_indices) { if (advance_filtered(cursors[idx], true)) { heap.push(idx); } }
+                        for (const size_t idx : sameKeyIndices) { if (advanceFiltered(cursors[idx], true)) { heap.push(idx); } }
                     }
                 }
 
                 return RangeIterator{std::make_unique<RangeIterator::Impl>(std::move(deduped), std::move(sources))};
             }
 
-            [[nodiscard]] uint64_t next_seq() noexcept { return seq_gen_.fetch_add(1, std::memory_order_relaxed); }
+            [[nodiscard]] uint64_t nextSeq() noexcept { return seqGen_.fetch_add(1, std::memory_order_relaxed); }
 
-            [[nodiscard]] uint64_t reserve_seq(uint64_t count) {
-                if (count == 0) { return seq_gen_.load(std::memory_order_relaxed); }
-                return seq_gen_.fetch_add(count, std::memory_order_relaxed);
+            [[nodiscard]] uint64_t reserveSeq(uint64_t count) {
+                if (count == 0) { return seqGen_.load(std::memory_order_relaxed); }
+                return seqGen_.fetch_add(count, std::memory_order_relaxed);
             }
 
-            [[nodiscard]] uint64_t last_seq() const noexcept { return seq_gen_.load(std::memory_order_relaxed); }
+            [[nodiscard]] uint64_t lastSeq() const noexcept { return seqGen_.load(std::memory_order_relaxed); }
 
-            void advance_seq(uint64_t observed_seq) noexcept {
-                uint64_t current = seq_gen_.load(std::memory_order_relaxed);
-                while (current <= observed_seq) {
-                    if (seq_gen_.compare_exchange_weak(current, observed_seq + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
+            void advanceSeq(uint64_t observedSeq) noexcept {
+                uint64_t current = seqGen_.load(std::memory_order_relaxed);
+                while (current <= observedSeq) {
+                    if (seqGen_.compare_exchange_weak(current, observedSeq + 1, std::memory_order_relaxed, std::memory_order_relaxed)) {
                         break;
                     }
                 }
             }
 
-            void flush_hint() {
-                for (uint32_t i = 0; i < shard_count_; ++i) {
-                    bool over_threshold = false;
+            void flushHint() {
+                for (uint32_t i = 0; i < shardCount_; ++i) {
+                    bool overThreshold = false;
                     {
                         std::shared_lock<std::shared_mutex> lock{shards_[i]->mutex};
-                        over_threshold = shards_[i]->active_bytes > threshold_bytes_per_shard_;
+                        overThreshold = shards_[i]->activeBytes > thresholdBytesPerShard_;
                     }
-                    if (over_threshold) { trigger_flush(i); }
+                    if (overThreshold) { triggerFlush(i); }
                 }
             }
 
-            void force_flush() {
-                for (uint32_t i = 0; i < shard_count_; ++i) { trigger_flush(i); }
+            void forceFlush() {
+                for (uint32_t i = 0; i < shardCount_; ++i) { triggerFlush(i); }
                 for (auto& worker : flushers_) { if (worker) { worker->drain(); } }
             }
 
-            void set_flush_callback(const FlushCallback& cb) {
-                raw_active_get_enabled_.store(false, std::memory_order_release);
+            void setFlushCallback(const FlushCallback& cb) {
+                rawActiveGetEnabled_.store(false, std::memory_order_release);
                 for (auto& worker : flushers_) { if (worker) { worker->drain(); } }
 
                 flushers_.clear();
-                flushers_.resize(shard_count_);
+                flushers_.resize(shardCount_);
 
                 if (!cb) {
-                    raw_active_get_enabled_.store(true, std::memory_order_release);
+                    rawActiveGetEnabled_.store(true, std::memory_order_release);
                     return;
                 }
 
-                for (uint32_t i = 0; i < shard_count_; ++i) {
-                    flushers_[i] = std::make_unique<Flusher>(cb, [this, i](uint64_t immutable_id) { on_flushed(i, immutable_id); });
+                for (uint32_t i = 0; i < shardCount_; ++i) {
+                    flushers_[i] = std::make_unique<Flusher>(cb, [this, i](uint64_t immutableId) { onFlushed(i, immutableId); });
                 }
             }
 
-            [[nodiscard]] size_t approx_size() const noexcept {
+            [[nodiscard]] size_t approxSize() const noexcept {
                 size_t total = 0;
-                for (const auto& shard : shards_) { total += shard->approx_bytes.load(std::memory_order_relaxed); }
+                for (const auto& shard : shards_) { total += shard->approxBytes.load(std::memory_order_relaxed); }
                 return total;
             }
 
@@ -515,39 +509,39 @@ namespace akkaradb::engine::memtable {
                 uint64_t puts = 0;
                 uint64_t removes = 0;
                 for (const auto& shard : shards_) {
-                    puts += shard->puts_applied.load(std::memory_order_relaxed);
-                    removes += shard->removes_applied.load(std::memory_order_relaxed);
+                    puts += shard->putsApplied.load(std::memory_order_relaxed);
+                    removes += shard->removesApplied.load(std::memory_order_relaxed);
                 }
                 return {
-                    shard_count_,
-                    static_cast<uint64_t>(threshold_bytes_per_shard_),
-                    static_cast<uint64_t>(approx_size()),
+                    shardCount_,
+                    static_cast<uint64_t>(thresholdBytesPerShard_),
+                    static_cast<uint64_t>(approxSize()),
                     puts,
                     removes,
-                    flushes_completed_.load(std::memory_order_relaxed),
+                    flushesCompleted_.load(std::memory_order_relaxed),
                 };
             }
 
         private:
-            static void publish_tables_locked(Shard& shard) {
+            static void publishTablesLocked(Shard& shard) {
                 auto published = std::make_shared<Shard::PublishedTables>();
                 published->active = std::const_pointer_cast<const IMemTable>(shard.active);
                 published->immutables.reserve(shard.immutables.size());
                 for (auto it = shard.immutables.rbegin(); it != shard.immutables.rend(); ++it) {
                     published->immutables.push_back(std::const_pointer_cast<const IMemTable>(it->table));
                 }
-                shard.immutable_count.store(static_cast<uint32_t>(published->immutables.size()), std::memory_order_release);
-                std::shared_ptr<const Shard::PublishedTables> published_const = std::move(published);
-                shard.published.store(std::move(published_const), std::memory_order_release);
+                shard.immutableCount.store(static_cast<uint32_t>(published->immutables.size()), std::memory_order_release);
+                std::shared_ptr<const Shard::PublishedTables> publishedConst = std::move(published);
+                shard.published.store(std::move(publishedConst), std::memory_order_release);
             }
 
-            void trigger_flush(uint32_t shard_index) {
-                if (shard_index >= flushers_.size() || !flushers_[shard_index]) { return; }
+            void triggerFlush(uint32_t shardIndex) {
+                if (shardIndex >= flushers_.size() || !flushers_[shardIndex]) { return; }
 
-                auto& shard = *shards_[shard_index];
+                auto& shard = *shards_[shardIndex];
                 std::shared_ptr<IMemTable> sealed;
-                uint64_t immutable_id = 0;
-                size_t sealed_bytes = 0;
+                uint64_t immutableId = 0;
+                size_t sealedBytes = 0;
 
                 {
                     std::unique_lock<std::shared_mutex> lock{shard.mutex};
@@ -555,53 +549,53 @@ namespace akkaradb::engine::memtable {
 
                     shard.active->freeze();
                     sealed = shard.active;
-                    sealed_bytes = shard.active_bytes;
+                    sealedBytes = shard.activeBytes;
 
-                    auto new_active = options_.backend_factory();
-                    if (!new_active) { throw std::invalid_argument("MemTable backend_factory returned null"); }
-                    immutable_id = shard.next_immutable_id++;
-                    shard.immutables.emplace_back(Shard::Immutable{immutable_id, sealed, sealed_bytes});
-                    shard.immutable_count.store(static_cast<uint32_t>(shard.immutables.size()), std::memory_order_release);
+                    auto newActive = options_.backendFactory();
+                    if (!newActive) { throw std::invalid_argument("MemTable backendFactory returned null"); }
+                    immutableId = shard.nextImmutableId++;
+                    shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes});
+                    shard.immutableCount.store(static_cast<uint32_t>(shard.immutables.size()), std::memory_order_release);
 
-                    shard.active = std::shared_ptr<IMemTable>{std::move(new_active)};
-                    shard.active_raw.store(shard.active.get(), std::memory_order_release);
-                    shard.active_bytes = shard.active->sizeBytes();
+                    shard.active = std::shared_ptr<IMemTable>{std::move(newActive)};
+                    shard.activeRaw.store(shard.active.get(), std::memory_order_release);
+                    shard.activeBytes = shard.active->sizeBytes();
 
-                    size_t total_bytes = shard.approx_bytes.load(std::memory_order_relaxed);
-                    total_bytes = total_bytes - sealed_bytes + shard.active_bytes + sealed_bytes;
-                    shard.approx_bytes.store(total_bytes, std::memory_order_relaxed);
+                    size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                    totalBytes = totalBytes - sealedBytes + shard.activeBytes + sealedBytes;
+                    shard.approxBytes.store(totalBytes, std::memory_order_relaxed);
 
-                    publish_tables_locked(shard);
+                    publishTablesLocked(shard);
                 }
 
-                flushers_[shard_index]->enqueue(Flusher::Item{immutable_id, std::move(sealed)});
+                flushers_[shardIndex]->enqueue(Flusher::Item{immutableId, std::move(sealed)});
             }
 
-            void on_flushed(uint32_t shard_index, uint64_t immutable_id) {
-                auto& shard = *shards_[shard_index];
+            void onFlushed(uint32_t shardIndex, uint64_t immutableId) {
+                auto& shard = *shards_[shardIndex];
                 std::unique_lock<std::shared_mutex> lock{shard.mutex};
                 std::erase_if(
                     shard.immutables,
                     [&](const Shard::Immutable& item) {
-                        if (item.id != immutable_id) { return false; }
-                        const size_t total = shard.approx_bytes.load(std::memory_order_relaxed);
-                        shard.approx_bytes.store(total >= item.bytes ? total - item.bytes : 0, std::memory_order_relaxed);
+                        if (item.id != immutableId) { return false; }
+                        const size_t total = shard.approxBytes.load(std::memory_order_relaxed);
+                        shard.approxBytes.store(total >= item.bytes ? total - item.bytes : 0, std::memory_order_relaxed);
                         return true;
                     }
                 );
-                publish_tables_locked(shard);
-                flushes_completed_.fetch_add(1, std::memory_order_relaxed);
+                publishTablesLocked(shard);
+                flushesCompleted_.fetch_add(1, std::memory_order_relaxed);
             }
 
             Options options_;
-            uint32_t shard_count_;
-            size_t threshold_bytes_per_shard_;
+            uint32_t shardCount_;
+            size_t thresholdBytesPerShard_;
             std::vector<std::unique_ptr<Shard>> shards_;
             std::vector<std::unique_ptr<Flusher>> flushers_;
 
-            std::atomic<uint64_t> seq_gen_;
-            std::atomic<uint64_t> flushes_completed_{0};
-            std::atomic<bool> raw_active_get_enabled_{true};
+            std::atomic<uint64_t> seqGen_;
+            std::atomic<uint64_t> flushesCompleted_{0};
+            std::atomic<bool> rawActiveGetEnabled_{true};
     };
 
     MemTable::RangeIterator::RangeIterator(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
@@ -610,7 +604,7 @@ namespace akkaradb::engine::memtable {
     MemTable::RangeIterator::RangeIterator(RangeIterator&&) noexcept = default;
     MemTable::RangeIterator& MemTable::RangeIterator::operator=(RangeIterator&&) noexcept = default;
 
-    bool MemTable::RangeIterator::has_next() const noexcept { return impl_ && impl_->has_next(); }
+    bool MemTable::RangeIterator::hasNext() const noexcept { return impl_ && impl_->hasNext(); }
 
     std::optional<RecordView> MemTable::RangeIterator::next() noexcept {
         if (!impl_) { return std::nullopt; }
@@ -630,49 +624,49 @@ namespace akkaradb::engine::memtable {
         std::span<const uint8_t> value,
         uint64_t seq,
         uint8_t flags,
-        uint64_t precomputed_fp64,
-        uint64_t precomputed_mk
-    ) { impl_->put(key, value, seq, flags, precomputed_fp64, precomputed_mk); }
+        uint64_t precomputedFp64,
+        uint64_t precomputedMk
+    ) { impl_->put(key, value, seq, flags, precomputedFp64, precomputedMk); }
 
-    void MemTable::remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputed_fp64, uint64_t precomputed_mk) {
-        impl_->remove(key, seq, precomputed_fp64, precomputed_mk);
+    void MemTable::remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputedFp64, uint64_t precomputedMk) {
+        impl_->remove(key, seq, precomputedFp64, precomputedMk);
     }
 
-    void MemTable::advance_seq(uint64_t seq) noexcept { impl_->advance_seq(seq); }
+    void MemTable::advanceSeq(uint64_t seq) noexcept { impl_->advanceSeq(seq); }
 
-    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out) const {
-        return impl_->get(key, snapshot_seq, out, 0);
+    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const {
+        return impl_->get(key, snapshotSeq, out, 0);
     }
 
-    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshot_seq, RecordView* out, uint64_t precomputed_fp64) const {
-        return impl_->get(key, snapshot_seq, out, precomputed_fp64);
+    bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const {
+        return impl_->get(key, snapshotSeq, out, precomputedFp64);
     }
 
-    std::optional<bool> MemTable::get_into(std::span<const uint8_t> key, uint64_t snapshot_seq, std::vector<uint8_t>& out) const {
-        return impl_->get_into(key, snapshot_seq, out);
+    std::optional<bool> MemTable::getInto(std::span<const uint8_t> key, uint64_t snapshotSeq, std::vector<uint8_t>& out) const {
+        return impl_->getInto(key, snapshotSeq, out);
     }
 
-    std::optional<bool> MemTable::contains(std::span<const uint8_t> key, uint64_t snapshot_seq) const {
-        return impl_->contains(key, snapshot_seq);
+    std::optional<bool> MemTable::contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+        return impl_->contains(key, snapshotSeq);
     }
 
-    MemTable::RangeIterator MemTable::iterator(const KeyRange& range, uint64_t snapshot_seq) const {
-        return impl_->iterator(range, snapshot_seq);
+    MemTable::RangeIterator MemTable::iterator(const KeyRange& range, uint64_t snapshotSeq) const {
+        return impl_->iterator(range, snapshotSeq);
     }
 
-    uint64_t MemTable::next_seq() noexcept { return impl_->next_seq(); }
+    uint64_t MemTable::nextSeq() noexcept { return impl_->nextSeq(); }
 
-    uint64_t MemTable::reserve_seq(uint64_t count) { return impl_->reserve_seq(count); }
+    uint64_t MemTable::reserveSeq(uint64_t count) { return impl_->reserveSeq(count); }
 
-    uint64_t MemTable::last_seq() const noexcept { return impl_->last_seq(); }
+    uint64_t MemTable::lastSeq() const noexcept { return impl_->lastSeq(); }
 
-    void MemTable::flush_hint() { impl_->flush_hint(); }
+    void MemTable::flushHint() { impl_->flushHint(); }
 
-    void MemTable::force_flush() { impl_->force_flush(); }
+    void MemTable::forceFlush() { impl_->forceFlush(); }
 
-    void MemTable::set_flush_callback(const FlushCallback& cb) { impl_->set_flush_callback(cb); }
+    void MemTable::setFlushCallback(const FlushCallback& cb) { impl_->setFlushCallback(cb); }
 
-    size_t MemTable::approx_size() const noexcept { return impl_->approx_size(); }
+    size_t MemTable::approxSize() const noexcept { return impl_->approxSize(); }
 
     MemTable::MemTableSnapshot MemTable::snapshot() const noexcept { return impl_->snapshot(); }
 } // namespace akkaradb::engine::memtable

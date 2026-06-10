@@ -66,7 +66,7 @@ namespace akkaradb::engine::blob {
             return out;
         }
 
-        [[nodiscard]] bool parse_hex16(std::string_view text, uint64_t& out) noexcept {
+        [[nodiscard]] bool parseHex16(std::string_view text, uint64_t& out) noexcept {
             if (text.size() != 16) { return false; }
             uint64_t value = 0;
             const auto* first = text.data();
@@ -77,7 +77,7 @@ namespace akkaradb::engine::blob {
             return true;
         }
 
-        [[nodiscard]] FILE* open_file_write(const fs::path& path) {
+        [[nodiscard]] FILE* openFileWrite(const fs::path& path) {
             #ifdef _WIN32
             FILE* f = _wfopen(path.wstring().c_str(), L"wb");
             #else
@@ -86,7 +86,7 @@ namespace akkaradb::engine::blob {
             return f;
         }
 
-        [[nodiscard]] FILE* open_file_read(const fs::path& path) {
+        [[nodiscard]] FILE* openFileRead(const fs::path& path) {
             #ifdef _WIN32
             FILE* f = _wfopen(path.wstring().c_str(), L"rb");
             #else
@@ -95,7 +95,7 @@ namespace akkaradb::engine::blob {
             return f;
         }
 
-        void sync_file(FILE* f) {
+        void syncFile(FILE* f) {
             fflush(f);
             #ifdef _WIN32
             if (_commit(_fileno(f)) != 0) { throw std::runtime_error("BlobManager: _commit failed"); }
@@ -104,7 +104,7 @@ namespace akkaradb::engine::blob {
             #endif
         }
 
-        void write_all(FILE* f, const uint8_t* data, size_t size) {
+        void writeAll(FILE* f, const uint8_t* data, size_t size) {
             while (size > 0) {
                 const size_t n = fwrite(data, 1, size, f);
                 if (n == 0) { throw std::runtime_error("BlobManager: fwrite failed"); }
@@ -113,24 +113,18 @@ namespace akkaradb::engine::blob {
             }
         }
 
-        void write_atomic_split(
-            const fs::path& path,
-            const uint8_t* header,
-            size_t header_size,
-            const uint8_t* payload,
-            size_t payload_size
-        ) {
+        void writeAtomicSplit(const fs::path& path, const uint8_t* header, size_t headerSize, const uint8_t* payload, size_t payloadSize) {
             fs::create_directories(path.parent_path());
 
             fs::path tmp = path;
             tmp += ".tmp";
             {
-                FILE* f = open_file_write(tmp);
+                FILE* f = openFileWrite(tmp);
                 if (!f) { throw std::runtime_error("BlobManager: cannot open tmp file: " + tmp.string()); }
                 try {
-                    write_all(f, header, header_size);
-                    if (payload_size > 0) { write_all(f, payload, payload_size); }
-                    sync_file(f);
+                    writeAll(f, header, headerSize);
+                    if (payloadSize > 0) { writeAll(f, payload, payloadSize); }
+                    syncFile(f);
                     fclose(f);
                 }
                 catch (...) {
@@ -154,8 +148,8 @@ namespace akkaradb::engine::blob {
             }
         }
 
-        [[nodiscard]] std::vector<uint8_t> read_file(const fs::path& path) {
-            FILE* f = open_file_read(path);
+        [[nodiscard]] std::vector<uint8_t> readFile(const fs::path& path) {
+            FILE* f = openFileRead(path);
             if (!f) { throw std::runtime_error("BlobManager: cannot open file: " + path.string()); }
             try {
                 if (fseek(f, 0, SEEK_END) != 0) { throw std::runtime_error("BlobManager: seek failed"); }
@@ -179,12 +173,12 @@ namespace akkaradb::engine::blob {
             }
         }
 
-        [[nodiscard]] bool remove_quiet(const fs::path& path) noexcept {
+        [[nodiscard]] bool removeQuiet(const fs::path& path) noexcept {
             std::error_code ec;
             return fs::remove(path, ec);
         }
 
-        [[nodiscard]] bool rename_quiet(const fs::path& src, const fs::path& dst) noexcept {
+        [[nodiscard]] bool renameQuiet(const fs::path& src, const fs::path& dst) noexcept {
             std::error_code ec;
             fs::rename(src, dst, ec);
             if (!ec) { return true; }
@@ -197,139 +191,139 @@ namespace akkaradb::engine::blob {
 
     class BlobManager::Impl {
         public:
-            explicit Impl(Options options_value) : options(std::move(options_value)) {}
+            explicit Impl(Options optionsValue) : options(std::move(optionsValue)) {}
 
             Options options;
-            mutable std::mutex write_mu;
-            std::mutex del_mu;
-            std::condition_variable del_cv;
-            std::vector<uint64_t> del_queue;
-            std::thread gc_thread;
+            mutable std::mutex writeMu;
+            std::mutex delMu;
+            std::condition_variable delCv;
+            std::vector<uint64_t> delQueue;
+            std::thread gcThread;
             std::atomic<bool> running{false};
             std::atomic<bool> started{false};
-            mutable std::atomic<uint64_t> blobs_written{0};
-            mutable std::atomic<uint64_t> bytes_uncompressed{0};
-            mutable std::atomic<uint64_t> bytes_on_disk{0};
-            mutable std::atomic<uint64_t> blobs_deleted{0};
-            mutable std::atomic<uint64_t> gc_cycles{0};
+            mutable std::atomic<uint64_t> blobsWritten{0};
+            mutable std::atomic<uint64_t> bytesUncompressed{0};
+            mutable std::atomic<uint64_t> bytesOnDisk{0};
+            mutable std::atomic<uint64_t> blobsDeleted{0};
+            mutable std::atomic<uint64_t> gcCycles{0};
 
-            [[nodiscard]] fs::path path_for(uint64_t blob_id) const {
-                const uint8_t hi = static_cast<uint8_t>(blob_id >> 56u);
-                return options.blob_dir / hex2(hi) / (hex16(blob_id) + ".akblob");
+            [[nodiscard]] fs::path pathFor(uint64_t blobId) const {
+                const uint8_t hi = static_cast<uint8_t>(blobId >> 56u);
+                return options.blobDir / hex2(hi) / (hex16(blobId) + ".akblob");
             }
 
-            void create_shards() const {
-                fs::create_directories(options.blob_dir);
-                for (uint32_t i = 0; i < 256; ++i) { fs::create_directories(options.blob_dir / hex2(static_cast<uint8_t>(i))); }
+            void createShards() const {
+                fs::create_directories(options.blobDir);
+                for (uint32_t i = 0; i < 256; ++i) { fs::create_directories(options.blobDir / hex2(static_cast<uint8_t>(i))); }
             }
 
-            void startup_cleanup() const {
+            void startupCleanup() const {
                 std::error_code ec;
-                if (!fs::exists(options.blob_dir, ec)) { return; }
-                for (const auto& entry : fs::recursive_directory_iterator(options.blob_dir, ec)) {
+                if (!fs::exists(options.blobDir, ec)) { return; }
+                for (const auto& entry : fs::recursive_directory_iterator(options.blobDir, ec)) {
                     if (ec) { break; }
                     if (!entry.is_regular_file(ec)) { continue; }
                     const auto name = entry.path().filename().string();
-                    if (name.ends_with(".akblob.tmp") || name.ends_with(".akblob.del")) { (void)remove_quiet(entry.path()); }
+                    if (name.ends_with(".akblob.tmp") || name.ends_with(".akblob.del")) { (void)removeQuiet(entry.path()); }
                 }
             }
 
-            [[nodiscard]] std::vector<uint8_t> maybe_compress(std::span<const uint8_t> content, BlobCodec& actual_codec) const {
-                actual_codec = BlobCodec::None;
-                if (options.codec != BlobCodec::Zstd || content.empty()) { return {}; }
+            [[nodiscard]] std::vector<uint8_t> maybeCompress(std::span<const uint8_t> content, BlobCodec& actualCodec) const {
+                actualCodec = BlobCodec::NONE;
+                if (options.codec != BlobCodec::ZSTD || content.empty()) { return {}; }
 
                 const size_t bound = ZSTD_compressBound(content.size());
                 std::vector<uint8_t> compressed(bound);
                 const size_t n = ZSTD_compress(compressed.data(), compressed.size(), content.data(), content.size(), ZSTD_CLEVEL_DEFAULT);
                 if (ZSTD_isError(n) || n >= content.size()) { return {}; }
                 compressed.resize(n);
-                actual_codec = BlobCodec::Zstd;
+                actualCodec = BlobCodec::ZSTD;
                 return compressed;
             }
 
-            void write_blob(uint64_t blob_id, std::span<const uint8_t> content, const fs::path& path) const {
-                BlobCodec actual_codec = BlobCodec::None;
-                std::vector<uint8_t> compressed = maybe_compress(content, actual_codec);
+            void writeBlob(uint64_t blobId, std::span<const uint8_t> content, const fs::path& path) const {
+                BlobCodec actualCodec = BlobCodec::NONE;
+                std::vector<uint8_t> compressed = maybeCompress(content, actualCodec);
 
                 const uint8_t* payload = content.data();
-                size_t payload_size = content.size();
-                if (actual_codec == BlobCodec::Zstd) {
+                size_t payloadSize = content.size();
+                if (actualCodec == BlobCodec::ZSTD) {
                     payload = compressed.data();
-                    payload_size = compressed.size();
+                    payloadSize = compressed.size();
                 }
-                if (payload_size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                if (payloadSize > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
                     throw std::invalid_argument("BlobManager: payload too large");
                 }
 
-                const uint32_t content_crc = crc32c(content);
-                const auto header = build_blob_header(blob_id, content.size(), payload_size, actual_codec, content_crc);
-                uint8_t header_buf[AKBLOB_HEADER_SIZE_V5]{};
-                serialize_blob_header(header, header_buf);
-                write_atomic_split(path, header_buf, sizeof(header_buf), payload, payload_size);
-                blobs_written.fetch_add(1, std::memory_order_relaxed);
-                bytes_uncompressed.fetch_add(static_cast<uint64_t>(content.size()), std::memory_order_relaxed);
-                bytes_on_disk.fetch_add(
-                    static_cast<uint64_t>(sizeof(header_buf)) + static_cast<uint64_t>(payload_size),
+                const uint32_t contentCrc = crc32c(content);
+                const auto header = buildBlobHeader(blobId, content.size(), payloadSize, actualCodec, contentCrc);
+                uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+                serializeBlobHeader(header, headerBuf);
+                writeAtomicSplit(path, headerBuf, sizeof(headerBuf), payload, payloadSize);
+                blobsWritten.fetch_add(1, std::memory_order_relaxed);
+                bytesUncompressed.fetch_add(static_cast<uint64_t>(content.size()), std::memory_order_relaxed);
+                bytesOnDisk.fetch_add(
+                    static_cast<uint64_t>(sizeof(headerBuf)) + static_cast<uint64_t>(payloadSize),
                     std::memory_order_relaxed
                 );
             }
 
-            void gc_loop() {
+            void gcLoop() {
                 while (running.load(std::memory_order_acquire)) {
                     std::vector<uint64_t> batch;
                     {
-                        std::unique_lock lock(del_mu);
-                        del_cv.wait_for(
+                        std::unique_lock lock(delMu);
+                        delCv.wait_for(
                             lock,
                             std::chrono::milliseconds(200),
-                            [this] { return !running.load(std::memory_order_acquire) || !del_queue.empty(); }
+                            [this] { return !running.load(std::memory_order_acquire) || !delQueue.empty(); }
                         );
-                        batch.swap(del_queue);
+                        batch.swap(delQueue);
                     }
 
-                    if (!batch.empty()) { gc_cycles.fetch_add(1, std::memory_order_relaxed); }
+                    if (!batch.empty()) { gcCycles.fetch_add(1, std::memory_order_relaxed); }
                     for (uint64_t id : batch) {
-                        const auto src = path_for(id);
+                        const auto src = pathFor(id);
                         auto dst = src;
                         dst += ".del";
-                        if (rename_quiet(src, dst)) {
-                            (void)remove_quiet(dst);
-                            blobs_deleted.fetch_add(1, std::memory_order_relaxed);
+                        if (renameQuiet(src, dst)) {
+                            (void)removeQuiet(dst);
+                            blobsDeleted.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
                 }
 
-                std::vector<uint64_t> final_batch;
+                std::vector<uint64_t> finalBatch;
                 {
-                    std::lock_guard lock(del_mu);
-                    final_batch.swap(del_queue);
+                    std::lock_guard lock(delMu);
+                    finalBatch.swap(delQueue);
                 }
-                if (!final_batch.empty()) { gc_cycles.fetch_add(1, std::memory_order_relaxed); }
-                for (uint64_t id : final_batch) {
-                    const auto src = path_for(id);
+                if (!finalBatch.empty()) { gcCycles.fetch_add(1, std::memory_order_relaxed); }
+                for (uint64_t id : finalBatch) {
+                    const auto src = pathFor(id);
                     auto dst = src;
                     dst += ".del";
-                    if (rename_quiet(src, dst)) {
-                        (void)remove_quiet(dst);
-                        blobs_deleted.fetch_add(1, std::memory_order_relaxed);
+                    if (renameQuiet(src, dst)) {
+                        (void)removeQuiet(dst);
+                        blobsDeleted.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }
 
             [[nodiscard]] Snapshot snapshot() const noexcept {
                 return {
-                    blobs_written.load(std::memory_order_relaxed),
-                    bytes_uncompressed.load(std::memory_order_relaxed),
-                    bytes_on_disk.load(std::memory_order_relaxed),
-                    blobs_deleted.load(std::memory_order_relaxed),
-                    gc_cycles.load(std::memory_order_relaxed)
+                    blobsWritten.load(std::memory_order_relaxed),
+                    bytesUncompressed.load(std::memory_order_relaxed),
+                    bytesOnDisk.load(std::memory_order_relaxed),
+                    blobsDeleted.load(std::memory_order_relaxed),
+                    gcCycles.load(std::memory_order_relaxed)
                 };
             }
     };
 
     std::unique_ptr<BlobManager> BlobManager::create(Options options) {
-        if (options.blob_dir.empty()) { throw std::invalid_argument("BlobManager: blob_dir is required"); }
-        if (options.threshold_bytes == 0) { throw std::invalid_argument("BlobManager: threshold_bytes must be > 0"); }
+        if (options.blobDir.empty()) { throw std::invalid_argument("BlobManager: blobDir is required"); }
+        if (options.thresholdBytes == 0) { throw std::invalid_argument("BlobManager: thresholdBytes must be > 0"); }
 
         auto manager = std::unique_ptr<BlobManager>(new BlobManager{});
         manager->impl_ = std::make_unique<Impl>(std::move(options));
@@ -343,107 +337,107 @@ namespace akkaradb::engine::blob {
         bool expected = false;
         if (!impl_->started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) { return; }
 
-        impl_->create_shards();
-        impl_->startup_cleanup();
+        impl_->createShards();
+        impl_->startupCleanup();
         impl_->running.store(true, std::memory_order_release);
-        impl_->gc_thread = std::thread([this] { impl_->gc_loop(); });
+        impl_->gcThread = std::thread([this] { impl_->gcLoop(); });
     }
 
     void BlobManager::close() {
         if (!impl_) { return; }
         if (!impl_->started.load(std::memory_order_acquire)) { return; }
         impl_->running.store(false, std::memory_order_release);
-        impl_->del_cv.notify_all();
-        if (impl_->gc_thread.joinable()) { impl_->gc_thread.join(); }
+        impl_->delCv.notify_all();
+        if (impl_->gcThread.joinable()) { impl_->gcThread.join(); }
         impl_->started.store(false, std::memory_order_release);
     }
 
-    uint64_t BlobManager::threshold() const noexcept { return impl_ ? impl_->options.threshold_bytes : DEFAULT_THRESHOLD_BYTES; }
+    uint64_t BlobManager::threshold() const noexcept { return impl_ ? impl_->options.thresholdBytes : DEFAULT_THRESHOLD_BYTES; }
 
-    fs::path BlobManager::blob_path(uint64_t blob_id) const {
+    fs::path BlobManager::blobPath(uint64_t blobId) const {
         if (!impl_) { return {}; }
-        return impl_->path_for(blob_id);
+        return impl_->pathFor(blobId);
     }
 
-    void BlobManager::write(uint64_t blob_id, std::span<const uint8_t> content) {
+    void BlobManager::write(uint64_t blobId, std::span<const uint8_t> content) {
         if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
-        const auto path = impl_->path_for(blob_id);
+        const auto path = impl_->pathFor(blobId);
         if (fs::exists(path)) { return; }
 
-        std::lock_guard lock(impl_->write_mu);
+        std::lock_guard lock(impl_->writeMu);
         if (fs::exists(path)) { return; }
-        impl_->write_blob(blob_id, content, path);
+        impl_->writeBlob(blobId, content, path);
     }
 
-    std::vector<uint8_t> BlobManager::read(uint64_t blob_id) const {
+    std::vector<uint8_t> BlobManager::read(uint64_t blobId) const {
         if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
-        const auto path = impl_->path_for(blob_id);
-        auto raw = read_file(path);
+        const auto path = impl_->pathFor(blobId);
+        auto raw = readFile(path);
         if (raw.size() < AKBLOB_HEADER_SIZE_V5) { throw std::runtime_error("BlobManager: file too small: " + path.string()); }
 
-        const auto header = deserialize_blob_header(raw.data());
-        if (!verify_blob_header(header)) { throw std::runtime_error("BlobManager: header corrupt: " + path.string()); }
-        if (header.blob_id != blob_id) { throw std::runtime_error("BlobManager: blob_id mismatch: " + path.string()); }
+        const auto header = deserializeBlobHeader(raw.data());
+        if (!verifyBlobHeader(header)) { throw std::runtime_error("BlobManager: header corrupt: " + path.string()); }
+        if (header.blobId != blobId) { throw std::runtime_error("BlobManager: blobId mismatch: " + path.string()); }
 
-        const size_t payload_offset = AKBLOB_HEADER_SIZE_V5;
-        if (header.stored_size > raw.size() - payload_offset) {
+        const size_t payloadOffset = AKBLOB_HEADER_SIZE_V5;
+        if (header.storedSize > raw.size() - payloadOffset) {
             throw std::runtime_error("BlobManager: payload truncated: " + path.string());
         }
 
-        const auto* payload = raw.data() + payload_offset;
+        const auto* payload = raw.data() + payloadOffset;
         std::vector<uint8_t> content;
-        if (header.codec == static_cast<uint32_t>(BlobCodec::Zstd)) {
-            content.resize(static_cast<size_t>(header.total_size));
-            const size_t n = ZSTD_decompress(content.data(), content.size(), payload, static_cast<size_t>(header.stored_size));
-            if (ZSTD_isError(n) || n != header.total_size) {
+        if (header.codec == static_cast<uint32_t>(BlobCodec::ZSTD)) {
+            content.resize(static_cast<size_t>(header.totalSize));
+            const size_t n = ZSTD_decompress(content.data(), content.size(), payload, static_cast<size_t>(header.storedSize));
+            if (ZSTD_isError(n) || n != header.totalSize) {
                 throw std::runtime_error("BlobManager: Zstd decompress failed: " + path.string());
             }
         }
         else {
-            if (header.stored_size != header.total_size) {
+            if (header.storedSize != header.totalSize) {
                 throw std::runtime_error("BlobManager: uncompressed size mismatch: " + path.string());
             }
-            content.assign(payload, payload + static_cast<size_t>(header.stored_size));
+            content.assign(payload, payload + static_cast<size_t>(header.storedSize));
         }
 
-        if (crc32c(content) != header.content_crc32c) { throw std::runtime_error("BlobManager: content crc mismatch: " + path.string()); }
+        if (crc32c(content) != header.contentCrc32c) { throw std::runtime_error("BlobManager: content crc mismatch: " + path.string()); }
         return content;
     }
 
-    std::vector<uint8_t> BlobManager::read(uint64_t blob_id, uint32_t expected_crc32c) const {
-        auto content = read(blob_id);
-        if (crc32c(content) != expected_crc32c) { throw std::runtime_error("BlobManager: expected crc mismatch"); }
+    std::vector<uint8_t> BlobManager::read(uint64_t blobId, uint32_t expectedCrc32c) const {
+        auto content = read(blobId);
+        if (crc32c(content) != expectedCrc32c) { throw std::runtime_error("BlobManager: expected crc mismatch"); }
         return content;
     }
 
-    void BlobManager::schedule_delete(uint64_t blob_id) {
+    void BlobManager::scheduleDelete(uint64_t blobId) {
         if (!impl_) { return; }
         {
-            std::lock_guard lock(impl_->del_mu);
-            impl_->del_queue.push_back(blob_id);
+            std::lock_guard lock(impl_->delMu);
+            impl_->delQueue.push_back(blobId);
         }
-        impl_->del_cv.notify_one();
+        impl_->delCv.notify_one();
     }
 
-    void BlobManager::scan_orphans(std::function<bool(uint64_t)> is_referenced) {
+    void BlobManager::scanOrphans(std::function<bool(uint64_t)> isReferenced) {
         if (!impl_) { return; }
         std::vector<uint64_t> orphans;
         std::error_code ec;
-        for (const auto& entry : fs::recursive_directory_iterator(impl_->options.blob_dir, ec)) {
+        for (const auto& entry : fs::recursive_directory_iterator(impl_->options.blobDir, ec)) {
             if (ec) { break; }
             if (!entry.is_regular_file(ec) || entry.path().extension() != ".akblob") { continue; }
 
-            uint64_t blob_id = 0;
-            if (!parse_hex16(entry.path().stem().string(), blob_id)) { continue; }
-            if (!is_referenced(blob_id)) { orphans.push_back(blob_id); }
+            uint64_t blobId = 0;
+            if (!parseHex16(entry.path().stem().string(), blobId)) { continue; }
+            if (!isReferenced(blobId)) { orphans.push_back(blobId); }
         }
         if (orphans.empty()) { return; }
 
         {
-            std::lock_guard lock(impl_->del_mu);
-            impl_->del_queue.insert(impl_->del_queue.end(), orphans.begin(), orphans.end());
+            std::lock_guard lock(impl_->delMu);
+            impl_->delQueue.insert(impl_->delQueue.end(), orphans.begin(), orphans.end());
         }
-        impl_->del_cv.notify_one();
+        impl_->delCv.notify_one();
     }
 
     BlobManager::Snapshot BlobManager::snapshot() const noexcept { return impl_ ? impl_->snapshot() : Snapshot{}; }

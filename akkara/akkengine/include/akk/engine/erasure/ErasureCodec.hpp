@@ -26,25 +26,24 @@
 
 namespace akkaradb::engine::erasure {
     enum class ErasureCodecKind : uint8_t {
-        Xor = 1,
-        DualXor = 2,
+        XOR = 1, DUAL_XOR = 2,
     };
 
     struct ErasureLayout {
-        uint16_t data_shards = 0;
-        uint16_t parity_shards = 1;
+        uint16_t dataShards = 0;
+        uint16_t parityShards = 1;
 
-        [[nodiscard]] uint16_t total_shards() const noexcept;
+        [[nodiscard]] uint16_t totalShards() const noexcept;
     };
 
     struct ErasureShard {
         uint16_t index = 0;
-        uint64_t original_size = 0;
-        ErasureCodecKind codec = ErasureCodecKind::Xor;
+        uint64_t originalSize = 0;
+        ErasureCodecKind codec = ErasureCodecKind::XOR;
         std::vector<uint8_t> payload;
         uint32_t crc32c = 0;
 
-        [[nodiscard]] bool verify_crc() const noexcept;
+        [[nodiscard]] bool verifyCrc() const noexcept;
     };
 
     class XorErasureCodec {
@@ -53,7 +52,7 @@ namespace akkaradb::engine::erasure {
              * Encodes value into k data shards and one XOR parity shard.
              *
              * XOR repair can recover at most one missing shard. Payloads are
-             * fixed-width and zero-padded; original_size records the logical
+             * fixed-width and zero-padded; originalSize records the logical
              * value length for decode trimming.
              */
             [[nodiscard]] static std::vector<ErasureShard> encode(std::span<const uint8_t> value, ErasureLayout layout);
@@ -70,12 +69,12 @@ namespace akkaradb::engine::erasure {
             /**
              * Repairs one missing data or parity shard.
              *
-             * @throws std::invalid_argument when missing_index is out of range
+             * @throws std::invalid_argument when missingIndex is out of range
              *         or the input set is malformed.
              * @throws std::runtime_error on CRC mismatch or insufficient shards.
              */
-            [[nodiscard]] static ErasureShard repair_one(uint16_t missing_index, std::span<const ErasureShard> shards, ErasureLayout layout);
+            [[nodiscard]] static ErasureShard repairOne(uint16_t missingIndex, std::span<const ErasureShard> shards, ErasureLayout layout);
 
-            [[nodiscard]] static size_t shard_payload_size(uint64_t original_size, uint16_t data_shards);
+            [[nodiscard]] static size_t shardPayloadSize(uint64_t originalSize, uint16_t dataShards);
     };
 } // namespace akkaradb::engine::erasure

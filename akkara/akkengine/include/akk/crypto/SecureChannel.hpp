@@ -32,13 +32,13 @@ namespace akkaradb::crypto {
     using AeadTag = std::array<std::uint8_t, 16>;
 
     struct ClientHello {
-        PublicKey static_public_key{};
-        PublicKey ephemeral_public_key{};
+        PublicKey staticPublicKey{};
+        PublicKey ephemeralPublicKey{};
     };
 
     struct ServerHello {
-        PublicKey static_public_key{};
-        PublicKey ephemeral_public_key{};
+        PublicKey staticPublicKey{};
+        PublicKey ephemeralPublicKey{};
         AeadTag authenticator{};
     };
 
@@ -67,29 +67,31 @@ namespace akkaradb::crypto {
         private:
             friend class NoiseInitiator;
             friend struct ResponderHandshake;
-            friend ResponderHandshake accept_responder(
-                const NodeIdentity& local_identity,
+            friend ResponderHandshake acceptResponder(
+                const NodeIdentity& localIdentity,
                 const ClientHello& hello,
-                const std::optional<PublicKey>& expected_remote
+                const std::optional<PublicKey>& expectedRemote
             );
 
-            enum class Role : std::uint8_t { Initiator, Responder };
+            enum class Role : std::uint8_t {
+                INITIATOR, RESPONDER
+            };
 
-            SecureSession(SecretKey initiator_to_responder, SecretKey responder_to_initiator, Role role);
+            SecureSession(SecretKey initiatorToResponder, SecretKey responderToInitiator, Role role);
 
-            SecretKey send_key_{};
-            SecretKey recv_key_{};
-            std::uint64_t send_counter_ = 0;
-            std::uint64_t recv_counter_ = 0;
+            SecretKey sendKey_{};
+            SecretKey recvKey_{};
+            std::uint64_t sendCounter_ = 0;
+            std::uint64_t recvCounter_ = 0;
             bool valid_ = false;
     };
 
     struct ResponderHandshake {
         ServerHello hello{};
         SecureSession session;
-        PublicKey remote_static_public_key{};
-        Fingerprint remote_fingerprint{};
-        NodeId remote_node_id{};
+        PublicKey remoteStaticPublicKey{};
+        Fingerprint remoteFingerprint{};
+        NodeId remoteNodeId{};
     };
 
     /**
@@ -100,14 +102,14 @@ namespace akkaradb::crypto {
      */
     class NoiseInitiator {
         public:
-            explicit NoiseInitiator(const NodeIdentity& local_identity);
+            explicit NoiseInitiator(const NodeIdentity& localIdentity);
 
             [[nodiscard]] const ClientHello& hello() const noexcept { return hello_; }
-            [[nodiscard]] SecureSession finish(const ServerHello& hello, const std::optional<PublicKey>& expected_remote = std::nullopt);
+            [[nodiscard]] SecureSession finish(const ServerHello& hello, const std::optional<PublicKey>& expectedRemote = std::nullopt);
 
         private:
-            NodeIdentity local_identity_{};
-            SecretKey ephemeral_secret_{};
+            NodeIdentity localIdentity_{};
+            SecretKey ephemeralSecret_{};
             ClientHello hello_{};
             bool finished_ = false;
     };
@@ -115,13 +117,13 @@ namespace akkaradb::crypto {
     /**
      * @brief Accept an initiator hello and return the responder hello + session.
      *
-     * If @p expected_remote is present, the initiator static public key must
+     * If @p expectedRemote is present, the initiator static public key must
      * match it.  Without it this is suitable for enrollment, where the caller
      * must authenticate the join request through another mechanism.
      */
-    [[nodiscard]] ResponderHandshake accept_responder(
-        const NodeIdentity& local_identity,
+    [[nodiscard]] ResponderHandshake acceptResponder(
+        const NodeIdentity& localIdentity,
         const ClientHello& hello,
-        const std::optional<PublicKey>& expected_remote = std::nullopt
+        const std::optional<PublicKey>& expectedRemote = std::nullopt
     );
 } // namespace akkaradb::crypto

@@ -28,12 +28,12 @@
 
 #include "akk/core/record/KeyFingerprint.hpp"
 
-namespace akkaradb::engine {
+namespace akkaradb::engine::memtable {
     namespace {
-        [[nodiscard]] int compare_key_bytes(std::span<const uint8_t> lhs, std::span<const uint8_t> rhs) noexcept {
-            const size_t min_len = std::min(lhs.size(), rhs.size());
-            if (min_len > 0) {
-                const int cmp = std::memcmp(lhs.data(), rhs.data(), min_len);
+        [[nodiscard]] int compareKeyBytes(std::span<const uint8_t> lhs, std::span<const uint8_t> rhs) noexcept {
+            const size_t minLen = std::min(lhs.size(), rhs.size());
+            if (minLen > 0) {
+                const int cmp = std::memcmp(lhs.data(), rhs.data(), minLen);
                 if (cmp != 0) { return cmp < 0 ? -1 : 1; }
             }
             if (lhs.size() < rhs.size()) { return -1; }
@@ -43,29 +43,29 @@ namespace akkaradb::engine {
     } // namespace
 
     BPTreeMemTable::BPTreeMemTable(
-        size_t data_arena_initial_block_size,
-        size_t data_arena_max_block_size,
-        size_t generator_arena_initial_block_size,
-        size_t generator_arena_max_block_size
+        size_t dataArenaInitialBlockSize,
+        size_t dataArenaMaxBlockSize,
+        size_t generatorArenaInitialBlockSize,
+        size_t generatorArenaMaxBlockSize
     )
-        : data_arena_{data_arena_initial_block_size, data_arena_max_block_size},
-          generator_arena_{generator_arena_initial_block_size, generator_arena_max_block_size} {
-        Node* initial_root = make_node(true);
-        root_.store(initial_root, std::memory_order_release);
+        : dataArena_{dataArenaInitialBlockSize, dataArenaMaxBlockSize},
+          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize} {
+        Node* initialRoot = makeNode(true);
+        root_.store(initialRoot, std::memory_order_release);
     }
 
-    std::span<const uint8_t> BPTreeMemTable::as_u8(ByteView view) noexcept {
+    std::span<const uint8_t> BPTreeMemTable::asU8(ByteView view) noexcept {
         return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
     }
 
-    BPTreeMemTable::Node* BPTreeMemTable::make_node(bool leaf) {
-        Node* node = arena_new<Node>(leaf);
+    BPTreeMemTable::Node* BPTreeMemTable::makeNode(bool leaf) {
+        Node* node = arenaNew<Node>(leaf);
         bytes_.fetch_add(sizeof(Node), std::memory_order_relaxed);
         return node;
     }
 
-    BPTreeMemTable::VersionChain* BPTreeMemTable::make_chain(const core::OwnedRecord* initial) {
-        VersionChain* chain = arena_new<VersionChain>();
+    BPTreeMemTable::VersionChain* BPTreeMemTable::makeChain(const core::OwnedRecord* initial) {
+        VersionChain* chain = arenaNew<VersionChain>();
         chain->ring[0].store(initial, std::memory_order_relaxed);
         chain->head.store(0, std::memory_order_relaxed);
         chain->count.store(1, std::memory_order_relaxed);
@@ -74,90 +74,88 @@ namespace akkaradb::engine {
         return chain;
     }
 
-    core::OwnedRecord* BPTreeMemTable::make_record(
+    core::OwnedRecord* BPTreeMemTable::makeRecord(
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
         uint64_t seq,
         uint8_t flags,
-        uint64_t precomputed_fp64,
-        uint64_t precomputed_mk
+        uint64_t precomputedFp64,
+        uint64_t precomputedMk
     ) {
-        const uint64_t fp64 = precomputed_fp64 != 0
-                                  ? precomputed_fp64
-                                  : (key.empty() ? 0ULL : core::compute_key_fp64(key.data(), key.size()));
-        const uint64_t mini = precomputed_mk != 0 ? precomputed_mk : (key.empty() ? 0ULL : core::build_mini_key(key.data(), key.size()));
+        const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : (key.empty() ? 0ULL : core::computeKeyFp64(key.data(), key.size()));
+        const uint64_t mini = precomputedMk != 0 ? precomputedMk : (key.empty() ? 0ULL : core::buildMiniKey(key.data(), key.size()));
 
-        core::OwnedRecord* record = arena_new<core::OwnedRecord>();
-        core::OwnedRecord::create_inplace(*record, key, value, seq, flags, data_arena_, fp64, mini);
+        core::OwnedRecord* record = arenaNew<core::OwnedRecord>();
+        core::OwnedRecord::createInplace(*record, key, value, seq, flags, dataArena_, fp64, mini);
         bytes_.fetch_add(sizeof(core::OwnedRecord) + key.size() + value.size(), std::memory_order_relaxed);
         return record;
     }
 
-    void BPTreeMemTable::begin_write(Node* node) noexcept { node->version.fetch_add(1, std::memory_order_acq_rel); }
+    void BPTreeMemTable::beginWrite(Node* node) noexcept { node->version.fetch_add(1, std::memory_order_acq_rel); }
 
-    void BPTreeMemTable::end_write(Node* node) noexcept { node->version.fetch_add(1, std::memory_order_release); }
+    void BPTreeMemTable::endWrite(Node* node) noexcept { node->version.fetch_add(1, std::memory_order_release); }
 
-    int BPTreeMemTable::compare_record_key(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept {
-        return record->compare_key(key);
+    int BPTreeMemTable::compareRecordKey(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept {
+        return record->compareKey(key);
     }
 
-    int BPTreeMemTable::compare_record_record(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept {
-        return lhs->compare_key(*rhs);
+    int BPTreeMemTable::compareRecordRecord(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept {
+        return lhs->compareKey(*rhs);
     }
 
-    uint16_t BPTreeMemTable::find_leaf_position(const Node* leaf, std::span<const uint8_t> key) noexcept {
-        const uint16_t key_count = leaf->key_count.load(std::memory_order_relaxed);
-        return find_leaf_position(leaf, key, key_count);
+    uint16_t BPTreeMemTable::findLeafPosition(const Node* leaf, std::span<const uint8_t> key) noexcept {
+        const uint16_t keyCount = leaf->keyCount.load(std::memory_order_relaxed);
+        return findLeafPosition(leaf, key, keyCount);
     }
 
-    uint16_t BPTreeMemTable::find_leaf_position(const Node* leaf, std::span<const uint8_t> key, uint16_t key_count) noexcept {
+    uint16_t BPTreeMemTable::findLeafPosition(const Node* leaf, std::span<const uint8_t> key, uint16_t keyCount) noexcept {
         uint16_t lo = 0;
-        uint16_t hi = key_count;
+        uint16_t hi = keyCount;
         while (lo < hi) {
             const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
             const core::OwnedRecord* pivot = leaf->keys[mid].load(std::memory_order_relaxed);
-            const int cmp = compare_record_key(pivot, key);
+            const int cmp = compareRecordKey(pivot, key);
             if (cmp < 0) { lo = static_cast<uint16_t>(mid + 1); }
             else { hi = mid; }
         }
         return lo;
     }
 
-    uint16_t BPTreeMemTable::find_child_index(const Node* internal, std::span<const uint8_t> key) noexcept {
-        const uint16_t key_count = internal->key_count.load(std::memory_order_relaxed);
+    uint16_t BPTreeMemTable::findChildIndex(const Node* internal, std::span<const uint8_t> key) noexcept {
+        const uint16_t keyCount = internal->keyCount.load(std::memory_order_relaxed);
         uint16_t lo = 0;
-        uint16_t hi = key_count;
+        uint16_t hi = keyCount;
         while (lo < hi) {
             const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
             const core::OwnedRecord* pivot = internal->keys[mid].load(std::memory_order_relaxed);
-            const int cmp = compare_record_key(pivot, key);
+            const int cmp = compareRecordKey(pivot, key);
             if (cmp <= 0) { lo = static_cast<uint16_t>(mid + 1); }
             else { hi = mid; }
         }
         return lo;
     }
 
-    void BPTreeMemTable::append_version(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept {
+    void BPTreeMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept {
         if (chain == nullptr) { return; }
 
         chain->version.fetch_add(1, std::memory_order_acq_rel);
 
-        const uint8_t prev_head = chain->head.load(std::memory_order_relaxed);
-        const uint8_t prev_count = chain->count.load(std::memory_order_relaxed);
-        const uint8_t next_head = static_cast<uint8_t>((prev_head + 1) & (MAX_VERSIONS_PER_KEY - 1));
+        const uint8_t prevHead = chain->head.load(std::memory_order_relaxed);
+        const uint8_t prevCount = chain->count.load(std::memory_order_relaxed);
+        const uint8_t nextHead = static_cast<uint8_t>((prevHead + 1) & (MAX_VERSIONS_PER_KEY - 1));
 
-        chain->ring[next_head].store(record, std::memory_order_release);
+        chain->ring[nextHead].store(record, std::memory_order_release);
 
-        if (prev_count < MAX_VERSIONS_PER_KEY) {
-            chain->count.store(static_cast<uint8_t>(prev_count + 1), std::memory_order_relaxed);
+        if (prevCount < MAX_VERSIONS_PER_KEY) {
+            chain->count.store(static_cast<uint8_t>(prevCount + 1), std::memory_order_relaxed);
             entries.fetch_add(1, std::memory_order_relaxed);
         }
-        chain->head.store(next_head, std::memory_order_release);
+        chain->head.store(nextHead, std::memory_order_release);
 
         chain->version.fetch_add(1, std::memory_order_release);
     }
 
-    bool BPTreeMemTable::visible_record(VersionChain* chain, uint64_t snapshot_seq, RecordView* out) noexcept {
+    bool BPTreeMemTable::visibleRecord(VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
 
         for (;;) {
@@ -170,12 +168,12 @@ namespace akkaradb::engine {
             const core::OwnedRecord* selected = nullptr;
             if (count > 0) {
                 const core::OwnedRecord* newest = chain->ring[head].load(std::memory_order_relaxed);
-                if (newest != nullptr && newest->seq() <= snapshot_seq) { selected = newest; }
+                if (newest != nullptr && newest->seq() <= snapshotSeq) { selected = newest; }
                 else {
                     for (uint8_t i = 1; i < count; ++i) {
                         const uint8_t index = static_cast<uint8_t>((head - i) & (MAX_VERSIONS_PER_KEY - 1));
                         const core::OwnedRecord* candidate = chain->ring[index].load(std::memory_order_relaxed);
-                        if (candidate != nullptr && candidate->seq() <= snapshot_seq) {
+                        if (candidate != nullptr && candidate->seq() <= snapshotSeq) {
                             selected = candidate;
                             break;
                         }
@@ -186,110 +184,110 @@ namespace akkaradb::engine {
             const uint64_t end = chain->version.load(std::memory_order_acquire);
             if (begin == end && (end & 1ULL) == 0ULL) {
                 if (selected == nullptr) { return false; }
-                *out = to_view(*selected);
+                *out = toView(*selected);
                 return true;
             }
         }
     }
 
-    RecordView BPTreeMemTable::to_view(const core::OwnedRecord& record) noexcept {
+    RecordView BPTreeMemTable::toView(const core::OwnedRecord& record) noexcept {
         const auto key = record.key();
         const auto value = record.value();
         return {
             key.data(),
-            record.hdr.k_len,
+            record.hdr.kLen,
             value.data(),
-            record.hdr.v_len,
+            record.hdr.vLen,
             record.hdr.seq,
             record.hdr.flags,
-            record.key_fp64,
-            record.mini_key
+            record.keyFp64,
+            record.miniKey
         };
     }
 
-    std::optional<BPTreeMemTable::SplitResult> BPTreeMemTable::insert_recursive(Node* node, const core::OwnedRecord* record) {
+    std::optional<BPTreeMemTable::SplitResult> BPTreeMemTable::insertRecursive(Node* node, const core::OwnedRecord* record) {
         const std::span<const uint8_t> key = record->key();
 
-        if (node->is_leaf) {
-            const uint16_t pos = find_leaf_position(node, key);
-            const uint16_t key_count = node->key_count.load(std::memory_order_relaxed);
+        if (node->isLeaf) {
+            const uint16_t pos = findLeafPosition(node, key);
+            const uint16_t keyCount = node->keyCount.load(std::memory_order_relaxed);
 
-            if (pos < key_count) {
+            if (pos < keyCount) {
                 const core::OwnedRecord* existing = node->keys[pos].load(std::memory_order_relaxed);
-                if (compare_record_key(existing, key) == 0) {
-                    append_version(node->chains[pos].load(std::memory_order_relaxed), record, entries_);
+                if (compareRecordKey(existing, key) == 0) {
+                    appendVersion(node->chains[pos].load(std::memory_order_relaxed), record, entries_);
                     return std::nullopt;
                 }
             }
 
-            VersionChain* chain = make_chain(record);
+            VersionChain* chain = makeChain(record);
 
-            if (key_count < MAX_KEYS) {
-                begin_write(node);
-                for (uint16_t i = key_count; i > pos; --i) {
+            if (keyCount < MAX_KEYS) {
+                beginWrite(node);
+                for (uint16_t i = keyCount; i > pos; --i) {
                     node->keys[i].store(node->keys[i - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
                     node->chains[i].store(node->chains[i - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
                 }
                 node->keys[pos].store(record, std::memory_order_release);
                 node->chains[pos].store(chain, std::memory_order_release);
-                node->key_count.store(static_cast<uint16_t>(key_count + 1), std::memory_order_release);
-                end_write(node);
+                node->keyCount.store(static_cast<uint16_t>(keyCount + 1), std::memory_order_release);
+                endWrite(node);
                 return std::nullopt;
             }
 
-            std::array<const core::OwnedRecord*, MAX_KEYS + 1> all_keys{};
-            std::array<VersionChain*, MAX_KEYS + 1> all_chains{};
+            std::array<const core::OwnedRecord*, MAX_KEYS + 1> allKeys{};
+            std::array<VersionChain*, MAX_KEYS + 1> allChains{};
 
             uint16_t wi = 0;
-            for (uint16_t i = 0; i < key_count; ++i) {
+            for (uint16_t i = 0; i < keyCount; ++i) {
                 if (wi == pos) {
-                    all_keys[wi] = record;
-                    all_chains[wi] = chain;
+                    allKeys[wi] = record;
+                    allChains[wi] = chain;
                     ++wi;
                 }
-                all_keys[wi] = node->keys[i].load(std::memory_order_relaxed);
-                all_chains[wi] = node->chains[i].load(std::memory_order_relaxed);
+                allKeys[wi] = node->keys[i].load(std::memory_order_relaxed);
+                allChains[wi] = node->chains[i].load(std::memory_order_relaxed);
                 ++wi;
             }
             if (wi == pos) {
-                all_keys[wi] = record;
-                all_chains[wi] = chain;
+                allKeys[wi] = record;
+                allChains[wi] = chain;
                 ++wi;
             }
 
-            Node* right = make_node(true);
+            Node* right = makeNode(true);
 
             const uint16_t total = static_cast<uint16_t>(MAX_KEYS + 1);
-            const uint16_t left_count = static_cast<uint16_t>(total / 2);
-            const uint16_t right_count = static_cast<uint16_t>(total - left_count);
+            const uint16_t leftCount = static_cast<uint16_t>(total / 2);
+            const uint16_t rightCount = static_cast<uint16_t>(total - leftCount);
 
-            begin_write(node);
+            beginWrite(node);
 
-            for (uint16_t i = 0; i < left_count; ++i) {
-                node->keys[i].store(all_keys[i], std::memory_order_relaxed);
-                node->chains[i].store(all_chains[i], std::memory_order_relaxed);
+            for (uint16_t i = 0; i < leftCount; ++i) {
+                node->keys[i].store(allKeys[i], std::memory_order_relaxed);
+                node->chains[i].store(allChains[i], std::memory_order_relaxed);
             }
-            for (uint16_t i = left_count; i < MAX_KEYS; ++i) {
+            for (uint16_t i = leftCount; i < MAX_KEYS; ++i) {
                 node->keys[i].store(nullptr, std::memory_order_relaxed);
                 node->chains[i].store(nullptr, std::memory_order_relaxed);
             }
-            node->key_count.store(left_count, std::memory_order_release);
+            node->keyCount.store(leftCount, std::memory_order_release);
 
-            for (uint16_t i = 0; i < right_count; ++i) {
-                right->keys[i].store(all_keys[left_count + i], std::memory_order_relaxed);
-                right->chains[i].store(all_chains[left_count + i], std::memory_order_relaxed);
+            for (uint16_t i = 0; i < rightCount; ++i) {
+                right->keys[i].store(allKeys[leftCount + i], std::memory_order_relaxed);
+                right->chains[i].store(allChains[leftCount + i], std::memory_order_relaxed);
             }
-            for (uint16_t i = right_count; i < MAX_KEYS; ++i) {
+            for (uint16_t i = rightCount; i < MAX_KEYS; ++i) {
                 right->keys[i].store(nullptr, std::memory_order_relaxed);
                 right->chains[i].store(nullptr, std::memory_order_relaxed);
             }
-            right->key_count.store(right_count, std::memory_order_release);
+            right->keyCount.store(rightCount, std::memory_order_release);
 
-            Node* old_next = node->next_leaf.load(std::memory_order_relaxed);
-            right->next_leaf.store(old_next, std::memory_order_release);
-            node->next_leaf.store(right, std::memory_order_release);
+            Node* oldNext = node->nextLeaf.load(std::memory_order_relaxed);
+            right->nextLeaf.store(oldNext, std::memory_order_release);
+            node->nextLeaf.store(right, std::memory_order_release);
 
-            end_write(node);
+            endWrite(node);
 
             SplitResult split;
             split.separator = right->keys[0].load(std::memory_order_relaxed);
@@ -297,80 +295,80 @@ namespace akkaradb::engine {
             return split;
         }
 
-        const uint16_t child_index = find_child_index(node, key);
-        Node* child = node->children[child_index].load(std::memory_order_relaxed);
+        const uint16_t childIndex = findChildIndex(node, key);
+        Node* child = node->children[childIndex].load(std::memory_order_relaxed);
         if (child == nullptr) { return std::nullopt; }
 
-        std::optional<SplitResult> child_split = insert_recursive(child, record);
-        if (!child_split.has_value()) { return std::nullopt; }
+        std::optional<SplitResult> childSplit = insertRecursive(child, record);
+        if (!childSplit.has_value()) { return std::nullopt; }
 
-        const uint16_t key_count = node->key_count.load(std::memory_order_relaxed);
-        const uint16_t insert_pos = child_index;
+        const uint16_t keyCount = node->keyCount.load(std::memory_order_relaxed);
+        const uint16_t insertPos = childIndex;
 
-        if (key_count < MAX_KEYS) {
-            begin_write(node);
-            for (uint16_t i = key_count; i > insert_pos; --i) {
+        if (keyCount < MAX_KEYS) {
+            beginWrite(node);
+            for (uint16_t i = keyCount; i > insertPos; --i) {
                 node->keys[i].store(node->keys[i - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
             }
-            for (uint16_t i = static_cast<uint16_t>(key_count + 1); i > static_cast<uint16_t>(insert_pos + 1); --i) {
+            for (uint16_t i = static_cast<uint16_t>(keyCount + 1); i > static_cast<uint16_t>(insertPos + 1); --i) {
                 node->children[i].store(node->children[i - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
             }
-            node->keys[insert_pos].store(child_split->separator, std::memory_order_release);
-            node->children[insert_pos + 1].store(child_split->right, std::memory_order_release);
-            node->key_count.store(static_cast<uint16_t>(key_count + 1), std::memory_order_release);
-            end_write(node);
+            node->keys[insertPos].store(childSplit->separator, std::memory_order_release);
+            node->children[insertPos + 1].store(childSplit->right, std::memory_order_release);
+            node->keyCount.store(static_cast<uint16_t>(keyCount + 1), std::memory_order_release);
+            endWrite(node);
             return std::nullopt;
         }
 
-        std::array<const core::OwnedRecord*, MAX_KEYS + 1> all_keys{};
-        std::array<Node*, MAX_KEYS + 2> all_children{};
+        std::array<const core::OwnedRecord*, MAX_KEYS + 1> allKeys{};
+        std::array<Node*, MAX_KEYS + 2> allChildren{};
 
-        for (uint16_t i = 0; i < key_count; ++i) { all_keys[i] = node->keys[i].load(std::memory_order_relaxed); }
-        for (uint16_t i = 0; i < static_cast<uint16_t>(key_count + 1); ++i) {
-            all_children[i] = node->children[i].load(std::memory_order_relaxed);
+        for (uint16_t i = 0; i < keyCount; ++i) { allKeys[i] = node->keys[i].load(std::memory_order_relaxed); }
+        for (uint16_t i = 0; i < static_cast<uint16_t>(keyCount + 1); ++i) {
+            allChildren[i] = node->children[i].load(std::memory_order_relaxed);
         }
 
-        for (uint16_t i = key_count; i > insert_pos; --i) { all_keys[i] = all_keys[i - 1]; }
-        all_keys[insert_pos] = child_split->separator;
+        for (uint16_t i = keyCount; i > insertPos; --i) { allKeys[i] = allKeys[i - 1]; }
+        allKeys[insertPos] = childSplit->separator;
 
-        for (uint16_t i = static_cast<uint16_t>(key_count + 1); i > static_cast<uint16_t>(insert_pos + 1); --i) {
-            all_children[i] = all_children[i - 1];
+        for (uint16_t i = static_cast<uint16_t>(keyCount + 1); i > static_cast<uint16_t>(insertPos + 1); --i) {
+            allChildren[i] = allChildren[i - 1];
         }
-        all_children[insert_pos + 1] = child_split->right;
+        allChildren[insertPos + 1] = childSplit->right;
 
-        const uint16_t total_keys = static_cast<uint16_t>(MAX_KEYS + 1);
-        const uint16_t mid = static_cast<uint16_t>(total_keys / 2);
+        const uint16_t totalKeys = static_cast<uint16_t>(MAX_KEYS + 1);
+        const uint16_t mid = static_cast<uint16_t>(totalKeys / 2);
 
-        Node* right = make_node(false);
+        Node* right = makeNode(false);
 
-        begin_write(node);
+        beginWrite(node);
 
         for (uint16_t i = 0; i < mid; ++i) {
-            node->keys[i].store(all_keys[i], std::memory_order_relaxed);
-            node->children[i].store(all_children[i], std::memory_order_relaxed);
+            node->keys[i].store(allKeys[i], std::memory_order_relaxed);
+            node->children[i].store(allChildren[i], std::memory_order_relaxed);
         }
-        node->children[mid].store(all_children[mid], std::memory_order_relaxed);
+        node->children[mid].store(allChildren[mid], std::memory_order_relaxed);
         for (uint16_t i = mid; i < MAX_KEYS; ++i) { node->keys[i].store(nullptr, std::memory_order_relaxed); }
         for (uint16_t i = static_cast<uint16_t>(mid + 1); i < MAX_KEYS + 1; ++i) {
             node->children[i].store(nullptr, std::memory_order_relaxed);
         }
-        node->key_count.store(mid, std::memory_order_release);
+        node->keyCount.store(mid, std::memory_order_release);
 
-        const uint16_t right_key_count = static_cast<uint16_t>(total_keys - mid - 1);
-        for (uint16_t i = 0; i < right_key_count; ++i) {
-            right->keys[i].store(all_keys[mid + 1 + i], std::memory_order_relaxed);
-            right->children[i].store(all_children[mid + 1 + i], std::memory_order_relaxed);
+        const uint16_t rightKeyCount = static_cast<uint16_t>(totalKeys - mid - 1);
+        for (uint16_t i = 0; i < rightKeyCount; ++i) {
+            right->keys[i].store(allKeys[mid + 1 + i], std::memory_order_relaxed);
+            right->children[i].store(allChildren[mid + 1 + i], std::memory_order_relaxed);
         }
-        right->children[right_key_count].store(all_children[total_keys], std::memory_order_relaxed);
-        for (uint16_t i = right_key_count; i < MAX_KEYS; ++i) { right->keys[i].store(nullptr, std::memory_order_relaxed); }
-        for (uint16_t i = static_cast<uint16_t>(right_key_count + 1); i < MAX_KEYS + 1; ++i) {
+        right->children[rightKeyCount].store(allChildren[totalKeys], std::memory_order_relaxed);
+        for (uint16_t i = rightKeyCount; i < MAX_KEYS; ++i) { right->keys[i].store(nullptr, std::memory_order_relaxed); }
+        for (uint16_t i = static_cast<uint16_t>(rightKeyCount + 1); i < MAX_KEYS + 1; ++i) {
             right->children[i].store(nullptr, std::memory_order_relaxed);
         }
-        right->key_count.store(right_key_count, std::memory_order_release);
+        right->keyCount.store(rightKeyCount, std::memory_order_release);
 
-        const core::OwnedRecord* promoted = all_keys[mid];
+        const core::OwnedRecord* promoted = allKeys[mid];
 
-        end_write(node);
+        endWrite(node);
 
         SplitResult split;
         split.separator = promoted;
@@ -378,19 +376,19 @@ namespace akkaradb::engine {
         return split;
     }
 
-    BPTreeMemTable::Node* BPTreeMemTable::descend_to_candidate_leaf(std::span<const uint8_t> key) const noexcept {
+    BPTreeMemTable::Node* BPTreeMemTable::descendToCandidateLeaf(std::span<const uint8_t> key) const noexcept {
         Node* current = root_.load(std::memory_order_acquire);
-        while (current != nullptr && !current->is_leaf) {
-            Node* next_child = nullptr;
+        while (current != nullptr && !current->isLeaf) {
+            Node* nextChild = nullptr;
             for (;;) {
                 const uint64_t begin = current->version.load(std::memory_order_acquire);
                 if ((begin & 1ULL) != 0ULL) { continue; }
-                const uint16_t child_index = find_child_index(current, key);
-                next_child = current->children[child_index].load(std::memory_order_acquire);
+                const uint16_t childIndex = findChildIndex(current, key);
+                nextChild = current->children[childIndex].load(std::memory_order_acquire);
                 const uint64_t end = current->version.load(std::memory_order_acquire);
                 if (begin == end && (end & 1ULL) == 0ULL) { break; }
             }
-            current = next_child;
+            current = nextChild;
         }
         return current;
     }
@@ -400,244 +398,244 @@ namespace akkaradb::engine {
         ByteView value,
         uint64_t seq,
         uint8_t flags,
-        uint64_t precomputed_fp64,
-        uint64_t precomputed_mk
+        uint64_t precomputedFp64,
+        uint64_t precomputedMk
     ) {
-        if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::InvalidArgument, "memtable is frozen"); }
+        if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::INVALID_ARGUMENT, "memtable is frozen"); }
         if (key.size() > std::numeric_limits<uint16_t>::max() || value.size() > std::numeric_limits<uint16_t>::max()) {
-            return Status::Error(Status::Code::InvalidArgument, "key/value too large for MemHdr16");
+            return Status::Error(Status::Code::INVALID_ARGUMENT, "key/value too large for MemHdr16");
         }
 
-        const auto key_u8 = as_u8(key);
-        const auto value_u8 = as_u8(value);
-        const core::OwnedRecord* record = make_record(key_u8, value_u8, seq, flags, precomputed_fp64, precomputed_mk);
+        const auto keyU8 = asU8(key);
+        const auto valueU8 = asU8(value);
+        const core::OwnedRecord* record = makeRecord(keyU8, valueU8, seq, flags, precomputedFp64, precomputedMk);
 
-        Node* current_root = root_.load(std::memory_order_acquire);
-        std::optional<SplitResult> split = insert_recursive(current_root, record);
+        Node* currentRoot = root_.load(std::memory_order_acquire);
+        std::optional<SplitResult> split = insertRecursive(currentRoot, record);
         if (!split.has_value()) { return Status::OK(); }
 
-        Node* new_root = make_node(false);
-        new_root->keys[0].store(split->separator, std::memory_order_relaxed);
-        new_root->children[0].store(current_root, std::memory_order_relaxed);
-        new_root->children[1].store(split->right, std::memory_order_relaxed);
-        new_root->key_count.store(1, std::memory_order_relaxed);
+        Node* newRoot = makeNode(false);
+        newRoot->keys[0].store(split->separator, std::memory_order_relaxed);
+        newRoot->children[0].store(currentRoot, std::memory_order_relaxed);
+        newRoot->children[1].store(split->right, std::memory_order_relaxed);
+        newRoot->keyCount.store(1, std::memory_order_relaxed);
 
-        root_.store(new_root, std::memory_order_release);
+        root_.store(newRoot, std::memory_order_release);
         return Status::OK();
     }
 
-    bool BPTreeMemTable::get(ByteView key, uint64_t snapshot_seq, RecordView* out) const {
+    bool BPTreeMemTable::get(ByteView key, uint64_t snapshotSeq, RecordView* out) const {
         if (out == nullptr) { return false; }
 
-        const std::span<const uint8_t> target = as_u8(key);
-        Node* leaf = descend_to_candidate_leaf(target);
+        const std::span<const uint8_t> target = asU8(key);
+        Node* leaf = descendToCandidateLeaf(target);
 
         while (leaf != nullptr) {
             uint16_t pos = 0;
-            uint16_t key_count = 0;
+            uint16_t keyCount = 0;
             int cmp = 1;
             VersionChain* chain = nullptr;
 
             for (;;) {
                 const uint64_t begin = leaf->version.load(std::memory_order_acquire);
                 if ((begin & 1ULL) != 0ULL) { continue; }
-                key_count = leaf->key_count.load(std::memory_order_acquire);
-                pos = find_leaf_position(leaf, target, key_count);
+                keyCount = leaf->keyCount.load(std::memory_order_acquire);
+                pos = findLeafPosition(leaf, target, keyCount);
                 cmp = 1;
                 chain = nullptr;
-                if (pos < key_count) {
-                    const core::OwnedRecord* candidate_key = leaf->keys[pos].load(std::memory_order_relaxed);
-                    cmp = compare_record_key(candidate_key, target);
+                if (pos < keyCount) {
+                    const core::OwnedRecord* candidateKey = leaf->keys[pos].load(std::memory_order_relaxed);
+                    cmp = compareRecordKey(candidateKey, target);
                     if (cmp == 0) { chain = leaf->chains[pos].load(std::memory_order_relaxed); }
                 }
                 const uint64_t end = leaf->version.load(std::memory_order_acquire);
                 if (begin == end && (end & 1ULL) == 0ULL) { break; }
             }
 
-            if (pos < key_count) {
-                if (cmp == 0) { return visible_record(chain, snapshot_seq, out); }
+            if (pos < keyCount) {
+                if (cmp == 0) { return visibleRecord(chain, snapshotSeq, out); }
                 if (cmp > 0) { return false; }
             }
 
-            leaf = leaf->next_leaf.load(std::memory_order_acquire);
+            leaf = leaf->nextLeaf.load(std::memory_order_acquire);
         }
 
         return false;
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterate_snapshot(uint64_t snapshot_seq) const {
-        std::vector<RecordView> visible_records;
-        visible_records.reserve(entryCount());
-        bool ordered_unique = true;
-        bool has_prev = false;
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateSnapshot(uint64_t snapshotSeq) const {
+        std::vector<RecordView> visibleRecords;
+        visibleRecords.reserve(entryCount());
+        bool orderedUnique = true;
+        bool hasPrev = false;
         RecordView prev;
 
         Node* node = root_.load(std::memory_order_acquire);
-        while (node != nullptr && !node->is_leaf) { node = node->children[0].load(std::memory_order_acquire); }
+        while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
 
         while (node != nullptr) {
             std::array<VersionChain*, MAX_KEYS> chains{};
-            uint16_t key_count = 0;
+            uint16_t keyCount = 0;
             for (;;) {
                 const uint64_t begin = node->version.load(std::memory_order_acquire);
                 if ((begin & 1ULL) != 0ULL) { continue; }
-                key_count = node->key_count.load(std::memory_order_acquire);
-                for (uint16_t i = 0; i < key_count; ++i) { chains[i] = node->chains[i].load(std::memory_order_acquire); }
+                keyCount = node->keyCount.load(std::memory_order_acquire);
+                for (uint16_t i = 0; i < keyCount; ++i) { chains[i] = node->chains[i].load(std::memory_order_acquire); }
                 const uint64_t end = node->version.load(std::memory_order_acquire);
                 if (begin == end && (end & 1ULL) == 0ULL) { break; }
             }
 
-            for (uint16_t i = 0; i < key_count; ++i) {
+            for (uint16_t i = 0; i < keyCount; ++i) {
                 RecordView visible;
-                if (visible_record(chains[i], snapshot_seq, &visible)) {
-                    if (has_prev) { if (prev.compare_key(visible) >= 0) { ordered_unique = false; } }
+                if (visibleRecord(chains[i], snapshotSeq, &visible)) {
+                    if (hasPrev) { if (prev.compareKey(visible) >= 0) { orderedUnique = false; } }
                     prev = visible;
-                    has_prev = true;
-                    visible_records.push_back(visible);
+                    hasPrev = true;
+                    visibleRecords.push_back(visible);
                 }
             }
 
-            node = node->next_leaf.load(std::memory_order_acquire);
+            node = node->nextLeaf.load(std::memory_order_acquire);
         }
 
-        if (ordered_unique) {
-            for (const RecordView& rec : visible_records) { co_yield rec; }
+        if (orderedUnique) {
+            for (const RecordView& rec : visibleRecords) { co_yield rec; }
             co_return;
         }
 
         std::sort(
-            visible_records.begin(),
-            visible_records.end(),
+            visibleRecords.begin(),
+            visibleRecords.end(),
             [](const RecordView& a, const RecordView& b) {
-                const int cmp = a.compare_key(b);
+                const int cmp = a.compareKey(b);
                 if (cmp != 0) { return cmp < 0; }
                 return a.seq() > b.seq();
             }
         );
 
-        for (size_t i = 0; i < visible_records.size(); ++i) {
-            if (i > 0 && visible_records[i - 1].compare_key(visible_records[i]) == 0) { continue; }
-            co_yield visible_records[i];
+        for (size_t i = 0; i < visibleRecords.size(); ++i) {
+            if (i > 0 && visibleRecords[i - 1].compareKey(visibleRecords[i]) == 0) { continue; }
+            co_yield visibleRecords[i];
         }
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterate_snapshot_range(
-        uint64_t snapshot_seq,
-        std::vector<uint8_t> start_key,
-        std::vector<uint8_t> end_key
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateSnapshotRange(
+        uint64_t snapshotSeq,
+        std::vector<uint8_t> startKey,
+        std::vector<uint8_t> endKey
     ) const {
-        const std::span<const uint8_t> start{start_key.data(), start_key.size()};
-        const std::span<const uint8_t> end{end_key.data(), end_key.size()};
-        if (!start.empty() && !end.empty() && compare_key_bytes(start, end) >= 0) { co_return; }
+        const std::span<const uint8_t> start{startKey.data(), startKey.size()};
+        const std::span<const uint8_t> end{endKey.data(), endKey.size()};
+        if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
 
-        std::vector<RecordView> visible_records;
-        visible_records.reserve(128);
-        bool ordered_unique = true;
-        bool has_prev = false;
+        std::vector<RecordView> visibleRecords;
+        visibleRecords.reserve(128);
+        bool orderedUnique = true;
+        bool hasPrev = false;
         RecordView prev;
 
         Node* node = nullptr;
-        uint16_t first_pos = 0;
-        bool first_leaf = true;
+        uint16_t firstPos = 0;
+        bool firstLeaf = true;
 
         if (start.empty()) {
             node = root_.load(std::memory_order_acquire);
-            while (node != nullptr && !node->is_leaf) { node = node->children[0].load(std::memory_order_acquire); }
+            while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
         }
         else {
-            node = descend_to_candidate_leaf(start);
+            node = descendToCandidateLeaf(start);
             while (node != nullptr) {
-                Node* next_leaf = nullptr;
-                uint16_t key_count = 0;
+                Node* nextLeaf = nullptr;
+                uint16_t keyCount = 0;
                 for (;;) {
                     const uint64_t begin = node->version.load(std::memory_order_acquire);
                     if ((begin & 1ULL) != 0ULL) { continue; }
-                    key_count = node->key_count.load(std::memory_order_acquire);
-                    first_pos = find_leaf_position(node, start, key_count);
-                    next_leaf = node->next_leaf.load(std::memory_order_acquire);
-                    const uint64_t end_version = node->version.load(std::memory_order_acquire);
-                    if (begin == end_version && (end_version & 1ULL) == 0ULL) { break; }
+                    keyCount = node->keyCount.load(std::memory_order_acquire);
+                    firstPos = findLeafPosition(node, start, keyCount);
+                    nextLeaf = node->nextLeaf.load(std::memory_order_acquire);
+                    const uint64_t endVersion = node->version.load(std::memory_order_acquire);
+                    if (begin == endVersion && (endVersion & 1ULL) == 0ULL) { break; }
                 }
-                if (first_pos < key_count) { break; }
-                node = next_leaf;
-                first_pos = 0;
+                if (firstPos < keyCount) { break; }
+                node = nextLeaf;
+                firstPos = 0;
             }
         }
 
         while (node != nullptr) {
             std::array<const core::OwnedRecord*, MAX_KEYS> keys{};
             std::array<VersionChain*, MAX_KEYS> chains{};
-            Node* next_leaf = nullptr;
-            uint16_t key_count = 0;
+            Node* nextLeaf = nullptr;
+            uint16_t keyCount = 0;
 
             for (;;) {
                 const uint64_t begin = node->version.load(std::memory_order_acquire);
                 if ((begin & 1ULL) != 0ULL) { continue; }
-                key_count = node->key_count.load(std::memory_order_acquire);
-                for (uint16_t i = 0; i < key_count; ++i) {
+                keyCount = node->keyCount.load(std::memory_order_acquire);
+                for (uint16_t i = 0; i < keyCount; ++i) {
                     keys[i] = node->keys[i].load(std::memory_order_acquire);
                     chains[i] = node->chains[i].load(std::memory_order_acquire);
                 }
-                next_leaf = node->next_leaf.load(std::memory_order_acquire);
-                const uint64_t end_version = node->version.load(std::memory_order_acquire);
-                if (begin == end_version && (end_version & 1ULL) == 0ULL) { break; }
+                nextLeaf = node->nextLeaf.load(std::memory_order_acquire);
+                const uint64_t endVersion = node->version.load(std::memory_order_acquire);
+                if (begin == endVersion && (endVersion & 1ULL) == 0ULL) { break; }
             }
 
-            const uint16_t start_pos = first_leaf ? first_pos : 0;
-            first_leaf = false;
+            const uint16_t startPos = firstLeaf ? firstPos : 0;
+            firstLeaf = false;
 
-            for (uint16_t i = start_pos; i < key_count; ++i) {
-                const core::OwnedRecord* key_record = keys[i];
-                if (key_record == nullptr) { continue; }
-                if (!start.empty() && compare_record_key(key_record, start) < 0) { continue; }
-                if (!end.empty() && compare_record_key(key_record, end) >= 0) {
+            for (uint16_t i = startPos; i < keyCount; ++i) {
+                const core::OwnedRecord* keyRecord = keys[i];
+                if (keyRecord == nullptr) { continue; }
+                if (!start.empty() && compareRecordKey(keyRecord, start) < 0) { continue; }
+                if (!end.empty() && compareRecordKey(keyRecord, end) >= 0) {
                     node = nullptr;
                     break;
                 }
 
                 RecordView visible;
-                if (!visible_record(chains[i], snapshot_seq, &visible)) { continue; }
-                if (has_prev && prev.compare_key(visible) >= 0) { ordered_unique = false; }
+                if (!visibleRecord(chains[i], snapshotSeq, &visible)) { continue; }
+                if (hasPrev && prev.compareKey(visible) >= 0) { orderedUnique = false; }
                 prev = visible;
-                has_prev = true;
-                visible_records.push_back(visible);
+                hasPrev = true;
+                visibleRecords.push_back(visible);
             }
 
-            if (node != nullptr) { node = next_leaf; }
+            if (node != nullptr) { node = nextLeaf; }
         }
 
-        if (ordered_unique) {
-            for (const RecordView& rec : visible_records) { co_yield rec; }
+        if (orderedUnique) {
+            for (const RecordView& rec : visibleRecords) { co_yield rec; }
             co_return;
         }
 
         std::sort(
-            visible_records.begin(),
-            visible_records.end(),
+            visibleRecords.begin(),
+            visibleRecords.end(),
             [](const RecordView& a, const RecordView& b) {
-                const int cmp = a.compare_key(b);
+                const int cmp = a.compareKey(b);
                 if (cmp != 0) { return cmp < 0; }
                 return a.seq() > b.seq();
             }
         );
 
-        for (size_t i = 0; i < visible_records.size(); ++i) {
-            if (i > 0 && visible_records[i - 1].compare_key(visible_records[i]) == 0) { continue; }
-            co_yield visible_records[i];
+        for (size_t i = 0; i < visibleRecords.size(); ++i) {
+            if (i > 0 && visibleRecords[i - 1].compareKey(visibleRecords[i]) == 0) { continue; }
+            co_yield visibleRecords[i];
         }
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView start_key, ByteView end_key, uint64_t snapshot_seq) const {
-        const std::span<const uint8_t> start = as_u8(start_key);
-        const std::span<const uint8_t> end = as_u8(end_key);
-        std::vector<uint8_t> start_owned(start.begin(), start.end());
-        std::vector<uint8_t> end_owned(end.begin(), end.end());
+    ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const {
+        const std::span<const uint8_t> start = asU8(startKey);
+        const std::span<const uint8_t> end = asU8(endKey);
+        std::vector<uint8_t> startOwned(start.begin(), start.end());
+        std::vector<uint8_t> endOwned(end.begin(), end.end());
 
-        std::lock_guard<std::mutex> lock{generator_arena_mutex_};
-        return ArenaGenerator<RecordView>::with_arena(
-            generator_arena_,
-            [this, snapshot_seq, start_owned = std::move(start_owned), end_owned = std::move(end_owned)]() mutable {
-                return iterate_snapshot_range(snapshot_seq, std::move(start_owned), std::move(end_owned));
+        std::lock_guard<std::mutex> lock{generatorArenaMutex_};
+        return ArenaGenerator<RecordView>::withArena(
+            generatorArena_,
+            [this, snapshotSeq, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
+                return iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }
         );
     }
@@ -647,4 +645,4 @@ namespace akkaradb::engine {
     size_t BPTreeMemTable::sizeBytes() const { return bytes_.load(std::memory_order_acquire); }
 
     size_t BPTreeMemTable::entryCount() const { return entries_.load(std::memory_order_acquire); }
-} // namespace akkaradb::engine
+} // namespace akkaradb::engine::memtable

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/smoke/blob_smoke_test.cpp
+// benchmarks/smoke/blobSmokeTest.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/blob/BlobManager.hpp"
@@ -34,22 +34,22 @@
 using namespace akkaradb::engine::blob;
 
 namespace {
-    static std::filesystem::path make_temp_dir(const std::string& suffix) {
-        auto dir = std::filesystem::temp_directory_path() / ("akkaradb_blob_smoke_" + suffix);
+    static std::filesystem::path makeTempDir(const std::string& suffix) {
+        auto dir = std::filesystem::temp_directory_path() / ("akkaradbBlobSmoke_" + suffix);
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir, ec);
-        assert(!ec);
+        AKK_TEST_CHECK(!ec);
         return dir;
     }
 
-    static std::vector<uint8_t> patterned_payload(size_t size) {
+    static std::vector<uint8_t> patternedPayload(size_t size) {
         std::vector<uint8_t> payload(size);
         for (size_t i = 0; i < payload.size(); ++i) { payload[i] = static_cast<uint8_t>((i * 131u) & 0xffu); }
         return payload;
     }
 
-    static std::vector<uint8_t> pseudo_random_payload(size_t size) {
+    static std::vector<uint8_t> pseudoRandomPayload(size_t size) {
         std::vector<uint8_t> payload(size);
         uint64_t state = 0x9e3779b97f4a7c15ULL;
         for (auto& byte : payload) {
@@ -61,16 +61,16 @@ namespace {
         return payload;
     }
 
-    static AkBlobHeaderV5 read_header(const std::filesystem::path& path) {
+    static AkBlobHeaderV5 readHeader(const std::filesystem::path& path) {
         std::ifstream in(path, std::ios::binary);
-        assert(in);
+        AKK_TEST_CHECK(in);
         uint8_t buf[AKBLOB_HEADER_SIZE_V5]{};
         in.read(reinterpret_cast<char*>(buf), sizeof(buf));
-        assert(in.gcount() == static_cast<std::streamsize>(sizeof(buf)));
-        return deserialize_blob_header(buf);
+        AKK_TEST_CHECK(in.gcount() == static_cast<std::streamsize>(sizeof(buf)));
+        return deserializeBlobHeader(buf);
     }
 
-    static bool wait_until_missing(const std::filesystem::path& path) {
+    static bool waitUntilMissing(const std::filesystem::path& path) {
         for (int i = 0; i < 100; ++i) {
             if (!std::filesystem::exists(path)) { return true; }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -78,38 +78,38 @@ namespace {
         return !std::filesystem::exists(path);
     }
 
-    static void test_blob_ref_roundtrip() {
+    static void testBlobRefRoundtrip() {
         uint8_t buf[BLOB_REF_SIZE]{};
         const BlobRef in{0x0102030405060708ULL, 64ULL * 1024ULL, 0xaabbccddu};
-        encode_blob_ref(buf, in);
-        const BlobRef out = decode_blob_ref(buf);
-        assert(out.blob_id == in.blob_id);
-        assert(out.total_size == in.total_size);
-        assert(out.content_crc32c == in.content_crc32c);
+        encodeBlobRef(buf, in);
+        const BlobRef out = decodeBlobRef(buf);
+        AKK_TEST_CHECK(out.blobId == in.blobId);
+        AKK_TEST_CHECK(out.totalSize == in.totalSize);
+        AKK_TEST_CHECK(out.contentCrc32c == in.contentCrc32c);
         static_assert(BLOB_REF_SIZE == 20);
     }
 
-    static void test_roundtrip_and_reopen() {
-        const auto dir = make_temp_dir("roundtrip");
-        const uint64_t blob_id = 0x0000000000000042ULL;
-        const auto payload = patterned_payload(64 * 1024);
+    static void testRoundtripAndReopen() {
+        const auto dir = makeTempDir("roundtrip");
+        const uint64_t blobId = 0x0000000000000042ULL;
+        const auto payload = patternedPayload(64 * 1024);
         std::filesystem::path path;
 
         {
             auto mgr = BlobManager::create(BlobManager::Options{dir});
             mgr->start();
-            mgr->write(blob_id, payload);
-            path = mgr->blob_path(blob_id);
-            assert(path.extension() == ".akblob");
-            assert(std::filesystem::exists(path));
-            assert(mgr->read(blob_id) == payload);
+            mgr->write(blobId, payload);
+            path = mgr->blobPath(blobId);
+            AKK_TEST_CHECK(path.extension() == ".akblob");
+            AKK_TEST_CHECK(std::filesystem::exists(path));
+            AKK_TEST_CHECK(mgr->read(blobId) == payload);
             mgr->close();
         }
 
         {
             auto mgr = BlobManager::create(BlobManager::Options{dir});
             mgr->start();
-            assert(mgr->read(blob_id) == payload);
+            AKK_TEST_CHECK(mgr->read(blobId) == payload);
             mgr->close();
         }
 
@@ -117,64 +117,64 @@ namespace {
         std::filesystem::remove_all(dir, ec);
     }
 
-    static void test_zstd_and_incompressible_paths() {
-        const auto dir = make_temp_dir("zstd");
-        const uint64_t zstd_id = 0x0100000000000001ULL;
-        const uint64_t raw_id = 0x0100000000000002ULL;
+    static void testZstdAndIncompressiblePaths() {
+        const auto dir = makeTempDir("zstd");
+        const uint64_t zstdId = 0x0100000000000001ULL;
+        const uint64_t rawId = 0x0100000000000002ULL;
         std::vector<uint8_t> compressible(64 * 1024, 0x3a);
-        const auto incompressible = pseudo_random_payload(64 * 1024);
+        const auto incompressible = pseudoRandomPayload(64 * 1024);
 
-        auto mgr = BlobManager::create(BlobManager::Options{dir, DEFAULT_THRESHOLD_BYTES, BlobCodec::Zstd});
+        auto mgr = BlobManager::create(BlobManager::Options{dir, DEFAULT_THRESHOLD_BYTES, BlobCodec::ZSTD});
         mgr->start();
-        mgr->write(zstd_id, compressible);
-        mgr->write(raw_id, incompressible);
+        mgr->write(zstdId, compressible);
+        mgr->write(rawId, incompressible);
 
-        const auto zstd_hdr = read_header(mgr->blob_path(zstd_id));
-        assert(verify_blob_header(zstd_hdr));
-        assert(zstd_hdr.codec == static_cast<uint32_t>(BlobCodec::Zstd));
-        assert((zstd_hdr.flags & AKBLOB_FLAG_ZSTD) != 0);
-        assert(zstd_hdr.stored_size < zstd_hdr.total_size);
-        assert(mgr->read(zstd_id) == compressible);
+        const auto zstdHdr = readHeader(mgr->blobPath(zstdId));
+        AKK_TEST_CHECK(verifyBlobHeader(zstdHdr));
+        AKK_TEST_CHECK(zstdHdr.codec == static_cast<uint32_t>(BlobCodec::ZSTD));
+        AKK_TEST_CHECK((zstdHdr.flags & AKBLOB_FLAG_ZSTD) != 0);
+        AKK_TEST_CHECK(zstdHdr.storedSize < zstdHdr.totalSize);
+        AKK_TEST_CHECK(mgr->read(zstdId) == compressible);
 
-        const auto raw_hdr = read_header(mgr->blob_path(raw_id));
-        assert(verify_blob_header(raw_hdr));
-        assert(raw_hdr.codec == static_cast<uint32_t>(BlobCodec::None));
-        assert((raw_hdr.flags & AKBLOB_FLAG_ZSTD) == 0);
-        assert(raw_hdr.stored_size == raw_hdr.total_size);
-        assert(mgr->read(raw_id) == incompressible);
+        const auto rawHdr = readHeader(mgr->blobPath(rawId));
+        AKK_TEST_CHECK(verifyBlobHeader(rawHdr));
+        AKK_TEST_CHECK(rawHdr.codec == static_cast<uint32_t>(BlobCodec::NONE));
+        AKK_TEST_CHECK((rawHdr.flags & AKBLOB_FLAG_ZSTD) == 0);
+        AKK_TEST_CHECK(rawHdr.storedSize == rawHdr.totalSize);
+        AKK_TEST_CHECK(mgr->read(rawId) == incompressible);
 
         mgr->close();
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
 
-    static void test_gc_delete_and_orphans() {
-        const auto dir = make_temp_dir("gc");
-        const auto payload = patterned_payload(32 * 1024);
+    static void testGcDeleteAndOrphans() {
+        const auto dir = makeTempDir("gc");
+        const auto payload = patternedPayload(32 * 1024);
 
         auto mgr = BlobManager::create(BlobManager::Options{dir});
         mgr->start();
 
         mgr->write(0x0200000000000001ULL, payload);
-        const auto deleted_path = mgr->blob_path(0x0200000000000001ULL);
-        mgr->schedule_delete(0x0200000000000001ULL);
-        assert(wait_until_missing(deleted_path));
+        const auto deletedPath = mgr->blobPath(0x0200000000000001ULL);
+        mgr->scheduleDelete(0x0200000000000001ULL);
+        AKK_TEST_CHECK(waitUntilMissing(deletedPath));
 
         mgr->write(0x0200000000000002ULL, payload);
         mgr->write(0x0200000000000003ULL, payload);
-        const auto kept_path = mgr->blob_path(0x0200000000000002ULL);
-        const auto orphan_path = mgr->blob_path(0x0200000000000003ULL);
-        mgr->scan_orphans([](uint64_t id) { return id == 0x0200000000000002ULL; });
-        assert(wait_until_missing(orphan_path));
-        assert(std::filesystem::exists(kept_path));
+        const auto keptPath = mgr->blobPath(0x0200000000000002ULL);
+        const auto orphanPath = mgr->blobPath(0x0200000000000003ULL);
+        mgr->scanOrphans([](uint64_t id) { return id == 0x0200000000000002ULL; });
+        AKK_TEST_CHECK(waitUntilMissing(orphanPath));
+        AKK_TEST_CHECK(std::filesystem::exists(keptPath));
 
         mgr->close();
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
 
-    static void test_startup_cleanup() {
-        const auto dir = make_temp_dir("cleanup");
+    static void testStartupCleanup() {
+        const auto dir = makeTempDir("cleanup");
         const auto shard = dir / "00";
         std::filesystem::create_directories(shard);
         const auto tmp = shard / "0000000000000001.akblob.tmp";
@@ -183,31 +183,31 @@ namespace {
             std::ofstream(tmp, std::ios::binary) << "tmp";
             std::ofstream(del, std::ios::binary) << "del";
         }
-        assert(std::filesystem::exists(tmp));
-        assert(std::filesystem::exists(del));
+        AKK_TEST_CHECK(std::filesystem::exists(tmp));
+        AKK_TEST_CHECK(std::filesystem::exists(del));
 
         auto mgr = BlobManager::create(BlobManager::Options{dir});
         mgr->start();
-        assert(!std::filesystem::exists(tmp));
-        assert(!std::filesystem::exists(del));
+        AKK_TEST_CHECK(!std::filesystem::exists(tmp));
+        AKK_TEST_CHECK(!std::filesystem::exists(del));
         mgr->close();
 
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
 
-    static void test_content_crc_failure() {
-        const auto dir = make_temp_dir("corrupt");
-        const uint64_t blob_id = 0x0300000000000001ULL;
-        const auto payload = patterned_payload(32 * 1024);
+    static void testContentCrcFailure() {
+        const auto dir = makeTempDir("corrupt");
+        const uint64_t blobId = 0x0300000000000001ULL;
+        const auto payload = patternedPayload(32 * 1024);
 
         auto mgr = BlobManager::create(BlobManager::Options{dir});
         mgr->start();
-        mgr->write(blob_id, payload);
-        const auto path = mgr->blob_path(blob_id);
+        mgr->write(blobId, payload);
+        const auto path = mgr->blobPath(blobId);
         {
             std::fstream io(path, std::ios::binary | std::ios::in | std::ios::out);
-            assert(io);
+            AKK_TEST_CHECK(io);
             io.seekg(-1, std::ios::end);
             char c = 0;
             io.read(&c, 1);
@@ -218,12 +218,12 @@ namespace {
 
         bool threw = false;
         try {
-            (void)mgr->read(blob_id);
+            (void)mgr->read(blobId);
         }
         catch (const std::runtime_error&) {
             threw = true;
         }
-        assert(threw);
+        AKK_TEST_CHECK(threw);
 
         mgr->close();
         std::error_code ec;
@@ -232,14 +232,14 @@ namespace {
 } // namespace
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
-    test_blob_ref_roundtrip();
-    test_roundtrip_and_reopen();
-    test_zstd_and_incompressible_paths();
-    test_gc_delete_and_orphans();
-    test_startup_cleanup();
-    test_content_crc_failure();
-    std::printf("akkaradb_blob_smoke_test: ok\n");
+    testBlobRefRoundtrip();
+    testRoundtripAndReopen();
+    testZstdAndIncompressiblePaths();
+    testGcDeleteAndOrphans();
+    testStartupCleanup();
+    testContentCrcFailure();
+    std::printf("akkaradbBlobSmokeTest: ok\n");
     return 0;
 }

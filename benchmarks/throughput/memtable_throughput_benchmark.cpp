@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/throughput/memtable_throughput_benchmark.cpp
+// benchmarks/throughput/memtableThroughputBenchmark.cpp
 #include "TestErrorHandlers.hpp"
 
 /*
@@ -29,13 +29,13 @@
  * Runs one backend with configurable shard/flush settings.
  *
  * Usage:
- *   akkaradb_memtable_throughput_benchmark [ops_per_case]
+ *   akkaradbMemtableThroughputBenchmark [opsPerCase]
  *       [--writers=N] [--shards=N] [--auto-cap=N]
  *       [--threshold-bytes=N|NK|NM|NG|NKiB|NMiB|NGiB]
  *       [--flush-after-scan] [--prehash] [--backend=skiplist|bptree|art]
  *
  * Default:
- *   ops_per_case = 200000
+ *   opsPerCase = 200000
  *   writers      = 16
  *   shards       = 0 (auto)
  */
@@ -63,6 +63,7 @@
 
 using Clock = std::chrono::steady_clock;
 using namespace akkaradb::engine;
+using namespace akkaradb::engine::memtable;
 using namespace akkaradb::core;
 
 namespace {
@@ -71,16 +72,16 @@ namespace {
     constexpr uint64_t kAutoFlushDisabledThreshold = (1ULL << 62);
 
     struct CaseSpec {
-        int key_size;
-        int value_size;
+        int keySize;
+        int valueSize;
     };
 
     struct LatencyPercentiles {
-        double p50_us = 0.0;
-        double p90_us = 0.0;
-        double p99_us = 0.0;
-        double p999_us = 0.0;
-        uint32_t sample_count = 0;
+        double p50Us = 0.0;
+        double p90Us = 0.0;
+        double p99Us = 0.0;
+        double p999Us = 0.0;
+        uint32_t sampleCount = 0;
     };
 
     enum class BackendKind {
@@ -90,67 +91,67 @@ namespace {
     };
 
     struct ThroughputResult {
-        double put_ops_per_sec;
-        double get_ops_per_sec;
-        double scan_ops_per_sec;
-        double put_ms;
-        double get_ms;
-        double scan_ms;
-        double flush_ms;
-        uint64_t approx_bytes;
-        uint64_t flushes_completed;
-        uint64_t flush_records_seen;
-        LatencyPercentiles put_latency;
-        LatencyPercentiles get_latency;
-        LatencyPercentiles scan_latency;
+        double putOpsPerSec;
+        double getOpsPerSec;
+        double scanOpsPerSec;
+        double putMs;
+        double getMs;
+        double scanMs;
+        double flushMs;
+        uint64_t approxBytes;
+        uint64_t flushesCompleted;
+        uint64_t flushRecordsSeen;
+        LatencyPercentiles putLatency;
+        LatencyPercentiles getLatency;
+        LatencyPercentiles scanLatency;
     };
 
     struct BenchConfig {
-        int ops_per_case = 500000;
-        int writer_threads = 16;
-        uint32_t requested_shards = 0;
-        uint32_t auto_shard_count_cap = 128;
-        uint64_t threshold_bytes_per_shard = kAutoFlushDisabledThreshold;
-        bool flush_after_scan = false;
-        bool use_prehash = false;
+        int opsPerCase = 500000;
+        int writerThreads = 16;
+        uint32_t requestedShards = 0;
+        uint32_t autoShardCountCap = 128;
+        uint64_t thresholdBytesPerShard = kAutoFlushDisabledThreshold;
+        bool flushAfterScan = false;
+        bool usePrehash = false;
         BackendKind backend = BackendKind::ART;
     };
 
-    [[nodiscard]] static uint32_t next_pow2_clamped(uint64_t n, uint32_t min_value, uint32_t max_value) {
+    [[nodiscard]] static uint32_t nextPow2Clamped(uint64_t n, uint32_t minValue, uint32_t maxValue) {
         uint32_t p = 1;
-        while (p < n && p < max_value) {
+        while (p < n && p < maxValue) {
             p <<= 1;
         }
-        if (p < min_value) {
-            p = min_value;
+        if (p < minValue) {
+            p = minValue;
         }
-        if (p > max_value) {
-            p = max_value;
+        if (p > maxValue) {
+            p = maxValue;
         }
         return p;
     }
 
-    [[nodiscard]] static uint32_t resolve_shard_count(
+    [[nodiscard]] static uint32_t resolveShardCount(
         size_t requested,
-        size_t expected_concurrent_writers,
-        size_t auto_cap
+        size_t expectedConcurrentWriters,
+        size_t autoCap
     ) {
         if (requested == 1) {
             return 1;
         }
         if (requested > 1) {
-            return next_pow2_clamped(static_cast<uint64_t>(requested), 2, 256);
+            return nextPow2Clamped(static_cast<uint64_t>(requested), 2, 256);
         }
 
-        const uint32_t effective_cap = next_pow2_clamped(static_cast<uint64_t>(auto_cap == 0 ? 128 : auto_cap), 2, 256);
-        const size_t n = expected_concurrent_writers > 0
-            ? expected_concurrent_writers
+        const uint32_t effectiveCap = nextPow2Clamped(static_cast<uint64_t>(autoCap == 0 ? 128 : autoCap), 2, 256);
+        const size_t n = expectedConcurrentWriters > 0
+            ? expectedConcurrentWriters
             : std::max<size_t>(2, std::thread::hardware_concurrency());
         const uint64_t target = n <= 1 ? 1ULL : static_cast<uint64_t>(n) * 4ULL;
-        return next_pow2_clamped(target, 2, effective_cap);
+        return nextPow2Clamped(target, 2, effectiveCap);
     }
 
-    [[nodiscard]] static int resolve_writer_threads(int requested) {
+    [[nodiscard]] static int resolveWriterThreads(int requested) {
         if (requested > 0) {
             return requested;
         }
@@ -158,11 +159,11 @@ namespace {
         return static_cast<int>(hw == 0 ? 1u : hw);
     }
 
-    static std::span<const uint8_t> as_u8(const std::string& s) {
+    static std::span<const uint8_t> asU8(const std::string& s) {
         return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
     }
 
-    [[nodiscard]] static std::string lower_ascii(std::string s) {
+    [[nodiscard]] static std::string lowerAscii(std::string s) {
         for (char& ch : s) {
             if (ch >= 'A' && ch <= 'Z') {
                 ch = static_cast<char>(ch - 'A' + 'a');
@@ -171,7 +172,7 @@ namespace {
         return s;
     }
 
-    [[nodiscard]] static bool parse_u64_with_suffix(const std::string& text, uint64_t* out) {
+    [[nodiscard]] static bool parseU64WithSuffix(const std::string& text, uint64_t* out) {
         if (text.empty() || out == nullptr) {
             return false;
         }
@@ -182,7 +183,7 @@ namespace {
             return false;
         }
 
-        const std::string suffix = lower_ascii(std::string{end});
+        const std::string suffix = lowerAscii(std::string{end});
         uint64_t multiplier = 1;
         if (suffix.empty() || suffix == "b") {
             multiplier = 1;
@@ -205,7 +206,7 @@ namespace {
         return true;
     }
 
-    [[nodiscard]] static std::string format_bytes(uint64_t bytes) {
+    [[nodiscard]] static std::string formatBytes(uint64_t bytes) {
         constexpr double kKiB = 1024.0;
         constexpr double kMiB = 1024.0 * 1024.0;
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
@@ -226,44 +227,44 @@ namespace {
         return std::format("{} B", bytes);
     }
 
-    [[nodiscard]] static double payload_mib_per_sec(size_t bytes_per_op, int ops, double ms) {
+    [[nodiscard]] static double payloadMibPerSec(size_t bytesPerOp, int ops, double ms) {
         if (ms <= 0.0) {
             return 0.0;
         }
-        const double total_mib = static_cast<double>(bytes_per_op) * static_cast<double>(ops) / (1024.0 * 1024.0);
-        return total_mib * 1000.0 / ms;
+        const double totalMib = static_cast<double>(bytesPerOp) * static_cast<double>(ops) / (1024.0 * 1024.0);
+        return totalMib * 1000.0 / ms;
     }
 
-    [[nodiscard]] static double quantile_from_sorted(
-        const std::vector<uint32_t>& sorted_ns,
+    [[nodiscard]] static double quantileFromSorted(
+        const std::vector<uint32_t>& sortedNs,
         double q
     ) {
-        if (sorted_ns.empty()) {
+        if (sortedNs.empty()) {
             return 0.0;
         }
-        const double q_clamped = std::clamp(q, 0.0, 1.0);
+        const double qClamped = std::clamp(q, 0.0, 1.0);
         const size_t idx = static_cast<size_t>(
-            q_clamped * static_cast<double>(sorted_ns.size() - 1)
+            qClamped * static_cast<double>(sortedNs.size() - 1)
         );
-        return static_cast<double>(sorted_ns[idx]) / 1000.0;
+        return static_cast<double>(sortedNs[idx]) / 1000.0;
     }
 
-    [[nodiscard]] static LatencyPercentiles build_percentiles(std::vector<uint32_t>& samples_ns) {
+    [[nodiscard]] static LatencyPercentiles buildPercentiles(std::vector<uint32_t>& samplesNs) {
         LatencyPercentiles out{};
-        if (samples_ns.empty()) {
+        if (samplesNs.empty()) {
             return out;
         }
 
-        std::sort(samples_ns.begin(), samples_ns.end());
-        out.sample_count = static_cast<uint32_t>(samples_ns.size());
-        out.p50_us = quantile_from_sorted(samples_ns, 0.50);
-        out.p90_us = quantile_from_sorted(samples_ns, 0.90);
-        out.p99_us = quantile_from_sorted(samples_ns, 0.99);
-        out.p999_us = quantile_from_sorted(samples_ns, 0.999);
+        std::sort(samplesNs.begin(), samplesNs.end());
+        out.sampleCount = static_cast<uint32_t>(samplesNs.size());
+        out.p50Us = quantileFromSorted(samplesNs, 0.50);
+        out.p90Us = quantileFromSorted(samplesNs, 0.90);
+        out.p99Us = quantileFromSorted(samplesNs, 0.99);
+        out.p999Us = quantileFromSorted(samplesNs, 0.999);
         return out;
     }
 
-    static std::string make_fixed_bytes(int size, uint64_t seed) {
+    static std::string makeFixedBytes(int size, uint64_t seed) {
         std::string out;
         out.resize(static_cast<size_t>(size));
         uint64_t x = seed ^ 0x9e3779b97f4a7c15ULL;
@@ -276,104 +277,104 @@ namespace {
         return out;
     }
 
-    static memtable::MemTable::Options make_options(
+    static memtable::MemTable::Options makeOptions(
         const BenchConfig& config,
-        int effective_writers,
-        std::atomic<uint64_t>* flush_records_seen
+        int effectiveWriters,
+        std::atomic<uint64_t>* flushRecordsSeen
     ) {
         memtable::MemTable::Options opts;
-        opts.shard_count = config.requested_shards;
-        opts.expected_concurrent_writers = static_cast<size_t>(effective_writers);
-        opts.auto_shard_count_cap = config.auto_shard_count_cap;
-        opts.threshold_bytes_per_shard = config.threshold_bytes_per_shard;
-        if (config.flush_after_scan) {
-            opts.on_flush = [flush_records_seen](std::span<const memtable::MemTable::RecordView> records) {
-                if (flush_records_seen) {
-                    flush_records_seen->fetch_add(static_cast<uint64_t>(records.size()), std::memory_order_relaxed);
+        opts.shardCount = config.requestedShards;
+        opts.expectedConcurrentWriters = static_cast<size_t>(effectiveWriters);
+        opts.autoShardCountCap = config.autoShardCountCap;
+        opts.thresholdBytesPerShard = config.thresholdBytesPerShard;
+        if (config.flushAfterScan) {
+            opts.onFlush = [flushRecordsSeen](std::span<const memtable::MemTable::RecordView> records) {
+                if (flushRecordsSeen) {
+                    flushRecordsSeen->fetch_add(static_cast<uint64_t>(records.size()), std::memory_order_relaxed);
                 }
             };
         }
         if (config.backend == BackendKind::BPTree) {
-            opts.backend_factory = []() {
+            opts.backendFactory = []() {
                 return std::make_unique<BPTreeMemTable>();
             };
         } else if (config.backend == BackendKind::ART) {
-            opts.backend_factory = []() {
+            opts.backendFactory = []() {
                 return std::make_unique<ARTMemTable>();
             };
         } else {
-            opts.backend_factory = []() {
+            opts.backendFactory = []() {
                 return std::make_unique<SkipListMemTable>();
             };
         }
         return opts;
     }
 
-    static void run_put_parallel(
+    static void runPutParallel(
         memtable::MemTable& memtable,
         const std::vector<std::string>& keys,
         const std::string& value,
-        const std::vector<uint64_t>* key_fp64,
-        const std::vector<uint64_t>* key_mk,
-        int writer_threads,
-        std::vector<uint32_t>* latency_samples_ns
+        const std::vector<uint64_t>* keyFp64,
+        const std::vector<uint64_t>* keyMk,
+        int writerThreads,
+        std::vector<uint32_t>* latencySamplesNs
     ) {
-        if (latency_samples_ns) {
-            latency_samples_ns->clear();
+        if (latencySamplesNs) {
+            latencySamplesNs->clear();
         }
 
-        if (writer_threads <= 1) {
-            if (latency_samples_ns) {
-                latency_samples_ns->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
+        if (writerThreads <= 1) {
+            if (latencySamplesNs) {
+                latencySamplesNs->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
             }
             for (size_t i = 0; i < keys.size(); ++i) {
-                const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                const uint64_t seq = memtable.next_seq();
+                const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                const uint64_t seq = memtable.nextSeq();
                 memtable.put(
-                    as_u8(keys[i]),
-                    as_u8(value),
+                    asU8(keys[i]),
+                    asU8(value),
                     seq,
                     0,
-                    key_fp64 ? (*key_fp64)[i] : 0ULL,
-                    key_mk ? (*key_mk)[i] : 0ULL
+                    keyFp64 ? (*keyFp64)[i] : 0ULL,
+                    keyMk ? (*keyMk)[i] : 0ULL
                 );
-                if (do_sample && latency_samples_ns) {
+                if (doSample && latencySamplesNs) {
                     const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
-                    latency_samples_ns->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
+                    latencySamplesNs->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                 }
             }
             return;
         }
 
         std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(writer_threads));
-        std::vector<std::vector<uint32_t>> local_samples(static_cast<size_t>(writer_threads));
-        for (auto& v : local_samples) {
-            v.reserve((keys.size() / static_cast<size_t>(writer_threads) + kLatencySampleMask) / (kLatencySampleMask + 1));
+        threads.reserve(static_cast<size_t>(writerThreads));
+        std::vector<std::vector<uint32_t>> localSamples(static_cast<size_t>(writerThreads));
+        for (auto& v : localSamples) {
+            v.reserve((keys.size() / static_cast<size_t>(writerThreads) + kLatencySampleMask) / (kLatencySampleMask + 1));
         }
 
-        for (int tid = 0; tid < writer_threads; ++tid) {
+        for (int tid = 0; tid < writerThreads; ++tid) {
             threads.emplace_back([&, tid]() {
-                auto& samples = local_samples[static_cast<size_t>(tid)];
-                const size_t stride = static_cast<size_t>(writer_threads);
+                auto& samples = localSamples[static_cast<size_t>(tid)];
+                const size_t stride = static_cast<size_t>(writerThreads);
                 const size_t first = static_cast<size_t>(tid);
-                const size_t op_count = first < keys.size() ? ((keys.size() - first + stride - 1) / stride) : 0;
-                const uint64_t seq_base = memtable.reserve_seq(static_cast<uint64_t>(op_count));
-                uint64_t seq_offset = 0;
+                const size_t opCount = first < keys.size() ? ((keys.size() - first + stride - 1) / stride) : 0;
+                const uint64_t seqBase = memtable.reserveSeq(static_cast<uint64_t>(opCount));
+                uint64_t seqOffset = 0;
                 for (size_t i = first; i < keys.size(); i += stride) {
-                    const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                    const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                    const uint64_t seq = seq_base + seq_offset++;
+                    const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                    const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                    const uint64_t seq = seqBase + seqOffset++;
                     memtable.put(
-                        as_u8(keys[i]),
-                        as_u8(value),
+                        asU8(keys[i]),
+                        asU8(value),
                         seq,
                         0,
-                        key_fp64 ? (*key_fp64)[i] : 0ULL,
-                        key_mk ? (*key_mk)[i] : 0ULL
+                        keyFp64 ? (*keyFp64)[i] : 0ULL,
+                        keyMk ? (*keyMk)[i] : 0ULL
                     );
-                    if (do_sample) {
+                    if (doSample) {
                         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
                         samples.push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                     }
@@ -385,69 +386,69 @@ namespace {
             th.join();
         }
 
-        if (latency_samples_ns) {
+        if (latencySamplesNs) {
             size_t total = 0;
-            for (const auto& v : local_samples) {
+            for (const auto& v : localSamples) {
                 total += v.size();
             }
-            latency_samples_ns->reserve(total);
-            for (auto& v : local_samples) {
-                latency_samples_ns->insert(latency_samples_ns->end(), v.begin(), v.end());
+            latencySamplesNs->reserve(total);
+            for (auto& v : localSamples) {
+                latencySamplesNs->insert(latencySamplesNs->end(), v.begin(), v.end());
             }
         }
     }
 
-    static void run_get_parallel(
+    static void runGetParallel(
         memtable::MemTable& memtable,
         const std::vector<std::string>& keys,
-        const std::vector<uint64_t>* key_fp64,
+        const std::vector<uint64_t>* keyFp64,
         uint64_t snapshot,
-        int reader_threads,
-        std::vector<uint32_t>* latency_samples_ns
+        int readerThreads,
+        std::vector<uint32_t>* latencySamplesNs
     ) {
-        if (latency_samples_ns) {
-            latency_samples_ns->clear();
+        if (latencySamplesNs) {
+            latencySamplesNs->clear();
         }
 
-        if (reader_threads <= 1) {
+        if (readerThreads <= 1) {
             RecordView out;
-            if (latency_samples_ns) {
-                latency_samples_ns->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
+            if (latencySamplesNs) {
+                latencySamplesNs->reserve((keys.size() + kLatencySampleMask) / (kLatencySampleMask + 1));
             }
             for (size_t i = 0; i < keys.size(); ++i) {
-                const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                if (!memtable.get(as_u8(keys[i]), snapshot, &out, key_fp64 ? (*key_fp64)[i] : 0ULL)) {
+                const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                if (!memtable.get(asU8(keys[i]), snapshot, &out, keyFp64 ? (*keyFp64)[i] : 0ULL)) {
                     std::fprintf(stderr, "GET miss at i=%zu\n", i);
                     std::exit(3);
                 }
-                if (do_sample && latency_samples_ns) {
+                if (doSample && latencySamplesNs) {
                     const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
-                    latency_samples_ns->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
+                    latencySamplesNs->push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                 }
             }
             return;
         }
 
         std::vector<std::thread> threads;
-        threads.reserve(static_cast<size_t>(reader_threads));
-        std::vector<std::vector<uint32_t>> local_samples(static_cast<size_t>(reader_threads));
-        for (auto& v : local_samples) {
-            v.reserve((keys.size() / static_cast<size_t>(reader_threads) + kLatencySampleMask) / (kLatencySampleMask + 1));
+        threads.reserve(static_cast<size_t>(readerThreads));
+        std::vector<std::vector<uint32_t>> localSamples(static_cast<size_t>(readerThreads));
+        for (auto& v : localSamples) {
+            v.reserve((keys.size() / static_cast<size_t>(readerThreads) + kLatencySampleMask) / (kLatencySampleMask + 1));
         }
 
-        for (int tid = 0; tid < reader_threads; ++tid) {
+        for (int tid = 0; tid < readerThreads; ++tid) {
             threads.emplace_back([&, tid]() {
                 RecordView out;
-                auto& samples = local_samples[static_cast<size_t>(tid)];
-                for (size_t i = static_cast<size_t>(tid); i < keys.size(); i += static_cast<size_t>(reader_threads)) {
-                    const bool do_sample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
-                    const auto t0 = do_sample ? Clock::now() : Clock::time_point{};
-                    if (!memtable.get(as_u8(keys[i]), snapshot, &out, key_fp64 ? (*key_fp64)[i] : 0ULL)) {
+                auto& samples = localSamples[static_cast<size_t>(tid)];
+                for (size_t i = static_cast<size_t>(tid); i < keys.size(); i += static_cast<size_t>(readerThreads)) {
+                    const bool doSample = ((static_cast<uint32_t>(i) & kLatencySampleMask) == 0);
+                    const auto t0 = doSample ? Clock::now() : Clock::time_point{};
+                    if (!memtable.get(asU8(keys[i]), snapshot, &out, keyFp64 ? (*keyFp64)[i] : 0ULL)) {
                         std::fprintf(stderr, "GET miss at i=%zu (tid=%d)\n", i, tid);
                         std::exit(3);
                     }
-                    if (do_sample) {
+                    if (doSample) {
                         const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
                         samples.push_back(static_cast<uint32_t>(std::min<int64_t>(dt, INT32_MAX)));
                     }
@@ -459,50 +460,50 @@ namespace {
             th.join();
         }
 
-        if (latency_samples_ns) {
+        if (latencySamplesNs) {
             size_t total = 0;
-            for (const auto& v : local_samples) {
+            for (const auto& v : localSamples) {
                 total += v.size();
             }
-            latency_samples_ns->reserve(total);
-            for (auto& v : local_samples) {
-                latency_samples_ns->insert(latency_samples_ns->end(), v.begin(), v.end());
+            latencySamplesNs->reserve(total);
+            for (auto& v : localSamples) {
+                latencySamplesNs->insert(latencySamplesNs->end(), v.begin(), v.end());
             }
         }
     }
 
-    static double run_scan_single(
+    static double runScanSingle(
         memtable::MemTable& memtable,
         uint64_t snapshot,
-        size_t expected_records,
-        std::vector<uint32_t>* latency_samples_ns
+        size_t expectedRecords,
+        std::vector<uint32_t>* latencySamplesNs
     ) {
-        if (latency_samples_ns) {
-            latency_samples_ns->clear();
-            latency_samples_ns->reserve((expected_records + kLatencySampleMask) / (kLatencySampleMask + 1));
+        if (latencySamplesNs) {
+            latencySamplesNs->clear();
+            latencySamplesNs->reserve((expectedRecords + kLatencySampleMask) / (kLatencySampleMask + 1));
         }
 
-        memtable::MemTable::KeyRange full_range{};
+        memtable::MemTable::KeyRange fullRange{};
         size_t scanned = 0;
-        const auto scan_t0 = Clock::now();
-        auto it = memtable.iterator(full_range, snapshot);
-        while (it.has_next()) {
-            const bool do_sample = ((static_cast<uint32_t>(scanned) & kLatencySampleMask) == 0);
-            if (do_sample && latency_samples_ns) {
+        const auto scanT0 = Clock::now();
+        auto it = memtable.iterator(fullRange, snapshot);
+        while (it.hasNext()) {
+            const bool doSample = ((static_cast<uint32_t>(scanned) & kLatencySampleMask) == 0);
+            if (doSample && latencySamplesNs) {
                 const auto t0 = Clock::now();
-                size_t window_count = 0;
-                while (window_count < kScanSampleWindow && it.has_next()) {
+                size_t windowCount = 0;
+                while (windowCount < kScanSampleWindow && it.hasNext()) {
                     const auto rec = it.next();
                     if (!rec.has_value()) {
                         std::fprintf(stderr, "SCAN iterator returned nullopt before end (scanned=%zu)\n", scanned);
                         std::exit(4);
                     }
-                    ++window_count;
+                    ++windowCount;
                     ++scanned;
                 }
                 const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
-                const int64_t per_record_ns = window_count > 0 ? (dt / static_cast<int64_t>(window_count)) : 0;
-                latency_samples_ns->push_back(static_cast<uint32_t>(std::min<int64_t>(per_record_ns, INT32_MAX)));
+                const int64_t perRecordNs = windowCount > 0 ? (dt / static_cast<int64_t>(windowCount)) : 0;
+                latencySamplesNs->push_back(static_cast<uint32_t>(std::min<int64_t>(perRecordNs, INT32_MAX)));
                 continue;
             }
 
@@ -513,131 +514,131 @@ namespace {
             }
             ++scanned;
         }
-        const auto scan_ms = std::chrono::duration<double, std::milli>(Clock::now() - scan_t0).count();
+        const auto scanMs = std::chrono::duration<double, std::milli>(Clock::now() - scanT0).count();
 
-        if (scanned != expected_records) {
-            std::fprintf(stderr, "SCAN count mismatch: expected=%zu actual=%zu\n", expected_records, scanned);
+        if (scanned != expectedRecords) {
+            std::fprintf(stderr, "SCAN count mismatch: expected=%zu actual=%zu\n", expectedRecords, scanned);
             std::exit(5);
         }
-        if (scan_ms <= 0.0) {
+        if (scanMs <= 0.0) {
             return 0.0;
         }
-        return static_cast<double>(scanned) * 1000.0 / scan_ms;
+        return static_cast<double>(scanned) * 1000.0 / scanMs;
     }
 
-    static ThroughputResult run_case(
+    static ThroughputResult runCase(
         const CaseSpec spec,
-        int ops_per_case,
-        int writer_threads,
+        int opsPerCase,
+        int writerThreads,
         const BenchConfig& config
     ) {
-        const int warmup_ops = std::min(ops_per_case, 100000);
+        const int warmupOps = std::min(opsPerCase, 100000);
 
         std::vector<std::string> keys;
-        keys.reserve(static_cast<size_t>(ops_per_case));
-        for (int i = 0; i < ops_per_case; ++i) {
-            std::string key = make_fixed_bytes(spec.key_size, static_cast<uint64_t>(i) + 1);
-            if (spec.key_size >= 10) {
+        keys.reserve(static_cast<size_t>(opsPerCase));
+        for (int i = 0; i < opsPerCase; ++i) {
+            std::string key = makeFixedBytes(spec.keySize, static_cast<uint64_t>(i) + 1);
+            if (spec.keySize >= 10) {
                 const auto tail = std::format("{:010d}", i);
-                std::memcpy(key.data() + (spec.key_size - 10), tail.data(), 10);
+                std::memcpy(key.data() + (spec.keySize - 10), tail.data(), 10);
             }
             keys.emplace_back(std::move(key));
         }
 
-        const std::string value = make_fixed_bytes(spec.value_size, 0xA11CEULL);
+        const std::string value = makeFixedBytes(spec.valueSize, 0xA11CEULL);
 
-        std::vector<uint64_t> key_fp64;
-        std::vector<uint64_t> key_mk;
-        const std::vector<uint64_t>* fp_ptr = nullptr;
-        const std::vector<uint64_t>* mk_ptr = nullptr;
+        std::vector<uint64_t> keyFp64;
+        std::vector<uint64_t> keyMk;
+        const std::vector<uint64_t>* fpPtr = nullptr;
+        const std::vector<uint64_t>* mkPtr = nullptr;
 
-        if (config.use_prehash) {
-            key_fp64.resize(static_cast<size_t>(ops_per_case));
-            key_mk.resize(static_cast<size_t>(ops_per_case));
-            for (int i = 0; i < ops_per_case; ++i) {
+        if (config.usePrehash) {
+            keyFp64.resize(static_cast<size_t>(opsPerCase));
+            keyMk.resize(static_cast<size_t>(opsPerCase));
+            for (int i = 0; i < opsPerCase; ++i) {
                 const auto& key = keys[static_cast<size_t>(i)];
                 const uint8_t* ptr = reinterpret_cast<const uint8_t*>(key.data());
                 const size_t len = key.size();
-                key_fp64[static_cast<size_t>(i)] = compute_key_fp64(ptr, len);
-                key_mk[static_cast<size_t>(i)] = build_mini_key(ptr, len);
+                keyFp64[static_cast<size_t>(i)] = computeKeyFp64(ptr, len);
+                keyMk[static_cast<size_t>(i)] = buildMiniKey(ptr, len);
             }
-            fp_ptr = &key_fp64;
-            mk_ptr = &key_mk;
+            fpPtr = &keyFp64;
+            mkPtr = &keyMk;
         }
 
         {
-            std::atomic<uint64_t> warmup_flush_records_seen{0};
-            auto warmup = memtable::MemTable::create(make_options(config, writer_threads, &warmup_flush_records_seen));
-            const std::vector<std::string> warmup_keys(keys.begin(), keys.begin() + warmup_ops);
-            run_put_parallel(*warmup, warmup_keys, value, fp_ptr, mk_ptr, writer_threads, nullptr);
+            std::atomic<uint64_t> warmupFlushRecordsSeen{0};
+            auto warmup = memtable::MemTable::create(makeOptions(config, writerThreads, &warmupFlushRecordsSeen));
+            const std::vector<std::string> warmupKeys(keys.begin(), keys.begin() + warmupOps);
+            runPutParallel(*warmup, warmupKeys, value, fpPtr, mkPtr, writerThreads, nullptr);
 
-            const uint64_t snapshot = warmup->last_seq();
+            const uint64_t snapshot = warmup->lastSeq();
             RecordView out;
-            for (int i = 0; i < warmup_ops; ++i) {
-                if (!warmup->get(as_u8(keys[static_cast<size_t>(i)]), snapshot, &out)) {
+            for (int i = 0; i < warmupOps; ++i) {
+                if (!warmup->get(asU8(keys[static_cast<size_t>(i)]), snapshot, &out)) {
                     std::fprintf(stderr, "WARMUP GET miss at i=%d\n", i);
                     std::exit(1);
                 }
             }
         }
 
-        std::atomic<uint64_t> flush_records_seen{0};
-        auto memtable = memtable::MemTable::create(make_options(config, writer_threads, &flush_records_seen));
-        std::vector<uint32_t> put_latency_ns;
-        std::vector<uint32_t> get_latency_ns;
-        std::vector<uint32_t> scan_latency_ns;
+        std::atomic<uint64_t> flushRecordsSeen{0};
+        auto memtable = memtable::MemTable::create(makeOptions(config, writerThreads, &flushRecordsSeen));
+        std::vector<uint32_t> putLatencyNs;
+        std::vector<uint32_t> getLatencyNs;
+        std::vector<uint32_t> scanLatencyNs;
 
-        const auto put_t0 = Clock::now();
-        run_put_parallel(*memtable, keys, value, fp_ptr, mk_ptr, writer_threads, &put_latency_ns);
-        const auto put_ms = std::chrono::duration<double, std::milli>(Clock::now() - put_t0).count();
+        const auto putT0 = Clock::now();
+        runPutParallel(*memtable, keys, value, fpPtr, mkPtr, writerThreads, &putLatencyNs);
+        const auto putMs = std::chrono::duration<double, std::milli>(Clock::now() - putT0).count();
 
-        const uint64_t snapshot = memtable->last_seq();
-        const auto get_t0 = Clock::now();
-        run_get_parallel(*memtable, keys, fp_ptr, snapshot, writer_threads, &get_latency_ns);
-        const auto get_ms = std::chrono::duration<double, std::milli>(Clock::now() - get_t0).count();
-        const auto scan_t0 = Clock::now();
-        const double scan_ops_per_sec = run_scan_single(*memtable, snapshot, keys.size(), &scan_latency_ns);
-        const auto scan_ms = std::chrono::duration<double, std::milli>(Clock::now() - scan_t0).count();
+        const uint64_t snapshot = memtable->lastSeq();
+        const auto getT0 = Clock::now();
+        runGetParallel(*memtable, keys, fpPtr, snapshot, writerThreads, &getLatencyNs);
+        const auto getMs = std::chrono::duration<double, std::milli>(Clock::now() - getT0).count();
+        const auto scanT0 = Clock::now();
+        const double scanOpsPerSec = runScanSingle(*memtable, snapshot, keys.size(), &scanLatencyNs);
+        const auto scanMs = std::chrono::duration<double, std::milli>(Clock::now() - scanT0).count();
 
-        double flush_ms = 0.0;
-        if (config.flush_after_scan) {
-            const auto flush_t0 = Clock::now();
-            memtable->force_flush();
-            flush_ms = std::chrono::duration<double, std::milli>(Clock::now() - flush_t0).count();
+        double flushMs = 0.0;
+        if (config.flushAfterScan) {
+            const auto flushT0 = Clock::now();
+            memtable->forceFlush();
+            flushMs = std::chrono::duration<double, std::milli>(Clock::now() - flushT0).count();
         }
-        const auto snapshot_after = memtable->snapshot();
+        const auto snapshotAfter = memtable->snapshot();
 
         return {
-            .put_ops_per_sec = static_cast<double>(ops_per_case) * 1000.0 / put_ms,
-            .get_ops_per_sec = static_cast<double>(ops_per_case) * 1000.0 / get_ms,
-            .scan_ops_per_sec = scan_ops_per_sec,
-            .put_ms = put_ms,
-            .get_ms = get_ms,
-            .scan_ms = scan_ms,
-            .flush_ms = flush_ms,
-            .approx_bytes = snapshot_after.approx_bytes,
-            .flushes_completed = snapshot_after.flushes_completed,
-            .flush_records_seen = flush_records_seen.load(std::memory_order_relaxed),
-            .put_latency = build_percentiles(put_latency_ns),
-            .get_latency = build_percentiles(get_latency_ns),
-            .scan_latency = build_percentiles(scan_latency_ns)
+            .putOpsPerSec = static_cast<double>(opsPerCase) * 1000.0 / putMs,
+            .getOpsPerSec = static_cast<double>(opsPerCase) * 1000.0 / getMs,
+            .scanOpsPerSec = scanOpsPerSec,
+            .putMs = putMs,
+            .getMs = getMs,
+            .scanMs = scanMs,
+            .flushMs = flushMs,
+            .approxBytes = snapshotAfter.approxBytes,
+            .flushesCompleted = snapshotAfter.flushesCompleted,
+            .flushRecordsSeen = flushRecordsSeen.load(std::memory_order_relaxed),
+            .putLatency = buildPercentiles(putLatencyNs),
+            .getLatency = buildPercentiles(getLatencyNs),
+            .scanLatency = buildPercentiles(scanLatencyNs)
         };
     }
 } // namespace
 
 int main(int argc, char** argv) {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
     BenchConfig config;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--prehash") {
-            config.use_prehash = true;
+            config.usePrehash = true;
             continue;
         }
         if (arg == "--flush-after-scan" || arg == "--flush-callback") {
-            config.flush_after_scan = true;
+            config.flushAfterScan = true;
             continue;
         }
         if (arg.rfind("--backend=", 0) == 0) {
@@ -658,27 +659,27 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (arg.rfind("--writers=", 0) == 0) {
-            config.writer_threads = std::max(0, std::atoi(arg.substr(10).c_str()));
+            config.writerThreads = std::max(0, std::atoi(arg.substr(10).c_str()));
             continue;
         }
         if (arg.rfind("--shards=", 0) == 0) {
-            config.requested_shards = static_cast<uint32_t>(std::max(0, std::atoi(arg.substr(9).c_str())));
+            config.requestedShards = static_cast<uint32_t>(std::max(0, std::atoi(arg.substr(9).c_str())));
             continue;
         }
         if (arg.rfind("--auto-cap=", 0) == 0) {
-            config.auto_shard_count_cap = static_cast<uint32_t>(std::max(0, std::atoi(arg.substr(11).c_str())));
+            config.autoShardCountCap = static_cast<uint32_t>(std::max(0, std::atoi(arg.substr(11).c_str())));
             continue;
         }
         if (arg.rfind("--threshold-bytes=", 0) == 0) {
             uint64_t parsed = 0;
-            if (!parse_u64_with_suffix(arg.substr(18), &parsed)) {
+            if (!parseU64WithSuffix(arg.substr(18), &parsed)) {
                 std::fprintf(stderr, "Invalid --threshold-bytes value: %s\n", arg.substr(18).c_str());
                 return 2;
             }
-            config.threshold_bytes_per_shard = parsed;
+            config.thresholdBytesPerShard = parsed;
             continue;
         }
-        config.ops_per_case = std::max(1000, std::atoi(arg.c_str()));
+        config.opsPerCase = std::max(1000, std::atoi(arg.c_str()));
     }
 
     const std::array<CaseSpec, 6> cases{{
@@ -690,98 +691,98 @@ int main(int argc, char** argv) {
         {64, 16384}
     }};
 
-    const int effective_writers = resolve_writer_threads(config.writer_threads);
-    if (config.flush_after_scan && config.threshold_bytes_per_shard != kAutoFlushDisabledThreshold) {
+    const int effectiveWriters = resolveWriterThreads(config.writerThreads);
+    if (config.flushAfterScan && config.thresholdBytesPerShard != kAutoFlushDisabledThreshold) {
         std::fprintf(
             stderr,
             "--flush-after-scan expects auto flush to stay disabled; omit --threshold-bytes for this benchmark mode.\n"
         );
         return 2;
     }
-    const uint32_t shard_count = resolve_shard_count(
-        config.requested_shards,
-        static_cast<size_t>(effective_writers),
-        config.auto_shard_count_cap
+    const uint32_t shardCount = resolveShardCount(
+        config.requestedShards,
+        static_cast<size_t>(effectiveWriters),
+        config.autoShardCountCap
     );
 
     std::printf("Sharded MemTable throughput benchmark\n");
-    std::printf("ops_per_case = %d\n", config.ops_per_case);
-    const char* backend_name = "skiplist";
+    std::printf("opsPerCase = %d\n", config.opsPerCase);
+    const char* backendName = "skiplist";
     if (config.backend == BackendKind::BPTree) {
-        backend_name = "bptree";
+        backendName = "bptree";
     } else if (config.backend == BackendKind::ART) {
-        backend_name = "art";
+        backendName = "art";
     }
-    std::printf("backend = %s\n", backend_name);
-    if (config.writer_threads == 0) {
-        std::printf("writer_threads = auto (%d from hw_threads)\n", effective_writers);
+    std::printf("backend = %s\n", backendName);
+    if (config.writerThreads == 0) {
+        std::printf("writerThreads = auto (%d from hwThreads)\n", effectiveWriters);
     } else {
-        std::printf("writer_threads = %d\n", config.writer_threads);
+        std::printf("writerThreads = %d\n", config.writerThreads);
     }
-    if (config.requested_shards == 0) {
-        std::printf("resolved_shards = %u (auto, writers*4 locality heuristic, cap %u)\n", shard_count, config.auto_shard_count_cap);
-    } else if (config.requested_shards == shard_count) {
-        std::printf("resolved_shards = %u (explicit)\n", shard_count);
+    if (config.requestedShards == 0) {
+        std::printf("resolvedShards = %u (auto, writers*4 locality heuristic, cap %u)\n", shardCount, config.autoShardCountCap);
+    } else if (config.requestedShards == shardCount) {
+        std::printf("resolvedShards = %u (explicit)\n", shardCount);
     } else {
-        std::printf("resolved_shards = %u (explicit %u rounded to power-of-two)\n", shard_count, config.requested_shards);
+        std::printf("resolvedShards = %u (explicit %u rounded to power-of-two)\n", shardCount, config.requestedShards);
     }
-    if (config.threshold_bytes_per_shard == kAutoFlushDisabledThreshold) {
-        std::printf("threshold_bytes_per_shard = disabled\n");
-    } else if (config.flush_after_scan) {
-        std::printf("threshold_bytes_per_shard = %s\n", format_bytes(config.threshold_bytes_per_shard).c_str());
+    if (config.thresholdBytesPerShard == kAutoFlushDisabledThreshold) {
+        std::printf("thresholdBytesPerShard = disabled\n");
+    } else if (config.flushAfterScan) {
+        std::printf("thresholdBytesPerShard = %s\n", formatBytes(config.thresholdBytesPerShard).c_str());
     } else {
         std::printf(
-            "threshold_bytes_per_shard = %s (no flush worker)\n",
-            format_bytes(config.threshold_bytes_per_shard).c_str()
+            "thresholdBytesPerShard = %s (no flush worker)\n",
+            formatBytes(config.thresholdBytesPerShard).c_str()
         );
     }
-    std::printf("flush_after_scan = %s\n\n", config.flush_after_scan ? "ON" : "OFF");
-    std::printf("warmup_ops   = %d\n\n", std::min(config.ops_per_case, 50000));
-    std::printf("prehash_mode = %s\n\n", config.use_prehash ? "ON (fp64/mk precomputed)" : "OFF (hash inside put)");
+    std::printf("flushAfterScan = %s\n\n", config.flushAfterScan ? "ON" : "OFF");
+    std::printf("warmupOps   = %d\n\n", std::min(config.opsPerCase, 50000));
+    std::printf("prehashMode = %s\n\n", config.usePrehash ? "ON (fp64/mk precomputed)" : "OFF (hash inside put)");
     std::printf("%-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
-                "key", "value", "shards", "writers", "put(ops/s)", "get(ops/s)", "scan(ops/s)", "mem_bytes", "put_smp", "get_smp", "scan_smp");
+                "key", "value", "shards", "writers", "put(ops/s)", "get(ops/s)", "scan(ops/s)", "memBytes", "putSmp", "getSmp", "scanSmp");
     std::printf("%-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
                 "", "", "", "", "", "", "", "", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)");
     std::printf("------------------------------------------------------------------------------------------------\n");
 
     for (const auto& spec : cases) {
-        const ThroughputResult result = run_case(spec, config.ops_per_case, effective_writers, config);
+        const ThroughputResult result = runCase(spec, config.opsPerCase, effectiveWriters, config);
         std::printf("%-10d %-12d %-8u %-8d %-14.0f %-14.0f %-14.0f %-14llu %-8u %-8u %-8u\n",
-                    spec.key_size,
-                    spec.value_size,
-                    shard_count,
-                    effective_writers,
-                    result.put_ops_per_sec,
-                    result.get_ops_per_sec,
-                    result.scan_ops_per_sec,
-                    static_cast<unsigned long long>(result.approx_bytes),
-                    result.put_latency.sample_count,
-                    result.get_latency.sample_count,
-                    result.scan_latency.sample_count);
+                    spec.keySize,
+                    spec.valueSize,
+                    shardCount,
+                    effectiveWriters,
+                    result.putOpsPerSec,
+                    result.getOpsPerSec,
+                    result.scanOpsPerSec,
+                    static_cast<unsigned long long>(result.approxBytes),
+                    result.putLatency.sampleCount,
+                    result.getLatency.sampleCount,
+                    result.scanLatency.sampleCount);
         std::printf("%-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %4.2f/%4.2f/%4.2f/%4.2f %4.2f/%4.2f/%4.2f/%4.2f %4.2f/%4.2f/%4.2f/%4.2f\n",
                     "", "", "", "", "", "", "", "",
-                    result.put_latency.p50_us,
-                    result.put_latency.p90_us,
-                    result.put_latency.p99_us,
-                    result.put_latency.p999_us,
-                    result.get_latency.p50_us,
-                    result.get_latency.p90_us,
-                    result.get_latency.p99_us,
-                    result.get_latency.p999_us,
-                    result.scan_latency.p50_us,
-                    result.scan_latency.p90_us,
-                    result.scan_latency.p99_us,
-                    result.scan_latency.p999_us);
-        std::printf("  timings(ms): put=%8.2f get=%8.2f scan=%8.2f flush=%8.2f   payload(MiB/s): put=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flush_records=%llu\n",
-                    result.put_ms,
-                    result.get_ms,
-                    result.scan_ms,
-                    result.flush_ms,
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), config.ops_per_case, result.put_ms),
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), config.ops_per_case, result.get_ms),
-                    payload_mib_per_sec(static_cast<size_t>(spec.key_size + spec.value_size), config.ops_per_case, result.scan_ms),
-                    static_cast<unsigned long long>(result.flushes_completed),
-                    static_cast<unsigned long long>(result.flush_records_seen));
+                    result.putLatency.p50Us,
+                    result.putLatency.p90Us,
+                    result.putLatency.p99Us,
+                    result.putLatency.p999Us,
+                    result.getLatency.p50Us,
+                    result.getLatency.p90Us,
+                    result.getLatency.p99Us,
+                    result.getLatency.p999Us,
+                    result.scanLatency.p50Us,
+                    result.scanLatency.p90Us,
+                    result.scanLatency.p99Us,
+                    result.scanLatency.p999Us);
+        std::printf("  timings(ms): put=%8.2f get=%8.2f scan=%8.2f flush=%8.2f   payload(MiB/s): put=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flushRecords=%llu\n",
+                    result.putMs,
+                    result.getMs,
+                    result.scanMs,
+                    result.flushMs,
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.putMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.getMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.scanMs),
+                    static_cast<unsigned long long>(result.flushesCompleted),
+                    static_cast<unsigned long long>(result.flushRecordsSeen));
         std::printf("------------------------------------------------------------------------------------------------\n");
         std::fflush(stdout);
     }

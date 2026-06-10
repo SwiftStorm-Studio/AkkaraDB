@@ -31,7 +31,7 @@ namespace akkaradb::engine::server {
         constexpr size_t kMaxContentLength = 64u * 1024u * 1024u;
         constexpr size_t kRecvBufferBytes = 4096;
 
-        [[nodiscard]] bool iequal_prefix(std::string_view line, std::string_view prefix) noexcept {
+        [[nodiscard]] bool iequalPrefix(std::string_view line, std::string_view prefix) noexcept {
             if (line.size() < prefix.size()) { return false; }
             for (size_t i = 0; i < prefix.size(); ++i) {
                 if (static_cast<char>(std::tolower(static_cast<unsigned char>(line[i]))) != prefix[i]) { return false; }
@@ -55,8 +55,8 @@ namespace akkaradb::engine::server {
             return false;
         }
 
-        [[nodiscard]] std::string_view reason_phrase(int status_code) noexcept {
-            switch (status_code) {
+        [[nodiscard]] std::string_view reasonPhrase(int statusCode) noexcept {
+            switch (statusCode) {
                 case 200: return "OK";
                 case 204: return "No Content";
                 case 400: return "Bad Request";
@@ -76,74 +76,110 @@ namespace akkaradb::engine::server {
 
     void HttpApiServer::start() {
         if (running_.load(std::memory_order_acquire)) { return; }
-        listen_socket_ = detail::listen_on(options_.bind_host, options_.http_port, "HttpApiServer", detail::make_socket_tuning(options_));
+        listenSocket_ = detail::listenOn(options_.bindHost, options_.httpPort, "HttpApiServer", detail::makeSocketTuning(options_));
         try {
             running_.store(true, std::memory_order_release);
-            accept_thread_ = std::thread([this] { accept_loop(); });
+            acceptThread_ = std::thread([this] { acceptLoop(); });
         }
         catch (...) {
             running_.store(false, std::memory_order_release);
-            detail::shutdown_socket(listen_socket_);
-            detail::close_socket(listen_socket_);
-            listen_socket_ = detail::BAD_SOCKET_VALUE;
+            detail::shutdownSocket(listenSocket_);
+            detail::closeSocket(listenSocket_);
+            listenSocket_ = detail::BAD_SOCKET_VALUE;
             throw;
         }
     }
 
     void HttpApiServer::close() {
         if (!running_.exchange(false, std::memory_order_acq_rel)) { return; }
-        detail::shutdown_socket(listen_socket_);
-        detail::close_socket(listen_socket_);
-        listen_socket_ = detail::BAD_SOCKET_VALUE;
-        if (accept_thread_.joinable()) { accept_thread_.join(); }
+        detail::shutdownSocket(listenSocket_);
+        detail::closeSocket(listenSocket_);
+        listenSocket_ = detail::BAD_SOCKET_VALUE;
+        if (acceptThread_.joinable()) { acceptThread_.join(); }
+        {
+            std::lock_guard lock(clientsMu_);
+            for (const detail::SocketHandle client : activeClients_) { detail::shutdownSocket(client); }
+        }
+        for (auto& thread : connectionThreads_) { if (thread.joinable()) { thread.join(); } }
+        connectionThreads_.clear();
     }
 
-    void HttpApiServer::accept_loop() {
+    void HttpApiServer::acceptLoop() {
         while (running_.load(std::memory_order_acquire)) {
-            const detail::socket_t client = ::accept(listen_socket_, nullptr, nullptr);
-            if (!detail::socket_ok(client)) {
+            const detail::SocketHandle client = ::accept(listenSocket_, nullptr, nullptr);
+            if (!detail::socketOk(client)) {
                 if (!running_.load(std::memory_order_acquire)) { break; }
-                if (detail::last_accept_error_is_transient()) { continue; }
+                if (detail::lastAcceptErrorIsTransient()) { continue; }
                 break;
             }
-            detail::apply_socket_tuning(client, detail::make_socket_tuning(options_), true);
+            detail::applySocketTuning(client, detail::makeSocketTuning(options_), true);
 
-            std::thread(
-                [this, client] {
-                    detail::Connection connection{client};
-                    if (options_.transport_mode == cluster::TransportMode::TLS) {
-                        try { connection.enable_tls(options_.tls); }
-                        catch (...) { return; }
+            if (!running_.load(std::memory_order_acquire)) {
+                detail::shutdownSocket(client);
+                detail::closeSocket(client);
+                break;
+            }
+
+            {
+                std::lock_guard lock(clientsMu_);
+                activeClients_.insert(client);
+            }
+
+            try {
+                connectionThreads_.emplace_back(
+                    [this, client] {
+                        detail::Connection connection{client};
+                        if (options_.transportMode == cluster::TransportMode::TLS) {
+                            try { connection.enableTls(options_.tls); }
+                            catch (...) {
+                                std::lock_guard lock(clientsMu_);
+                                activeClients_.erase(client);
+                                return;
+                            }
+                        }
+                        handleConnection(connection);
+                        connection.shutdown();
+                        {
+                            std::lock_guard lock(clientsMu_);
+                            activeClients_.erase(client);
+                        }
                     }
-                    handle_connection(connection);
-                    connection.shutdown();
+                );
+            }
+            catch (...) {
+                {
+                    std::lock_guard lock(clientsMu_);
+                    activeClients_.erase(client);
                 }
-            ).detach();
+                detail::shutdownSocket(client);
+                detail::closeSocket(client);
+                throw;
+            }
         }
     }
 
-    bool HttpApiServer::read_request(detail::Connection& connection, ParsedRequest& request) {
+    bool HttpApiServer::readRequest(detail::Connection& connection, ParsedRequest& request) {
         std::array<uint8_t, kRecvBufferBytes> buffer{};
         size_t pos = 0;
         size_t len = 0;
 
         const auto refill = [&]() -> bool {
-            len = connection.recv_some(buffer.data(), buffer.size());
+            len = connection.recvSome(buffer.data(), buffer.size());
             pos = 0;
             return len > 0;
         };
 
-        const auto read_byte = [&](char& c) -> bool {
+        const auto readByte = [&](char& c) -> bool {
             if (pos >= len && !refill()) { return false; }
             c = static_cast<char>(buffer[pos++]);
             return true;
         };
 
-        const auto read_line = [&](std::string& line) -> bool {
+        const auto readLine = [&](std::string& line) -> bool {
             line.clear();
             char c = 0;
             while (line.size() < kMaxHttpLineBytes) {
-                if (!read_byte(c)) { return false; }
+                if (!readByte(c)) { return false; }
                 if (c == '\n') {
                     if (!line.empty() && line.back() == '\r') { line.pop_back(); }
                     return true;
@@ -154,7 +190,7 @@ namespace akkaradb::engine::server {
         };
 
         std::string line;
-        if (!read_line(line) || line.empty()) { return false; }
+        if (!readLine(line) || line.empty()) { return false; }
 
         const auto sp1 = line.find(' ');
         const auto sp2 = sp1 == std::string::npos ? std::string::npos : line.find(' ', sp1 + 1);
@@ -166,41 +202,41 @@ namespace akkaradb::engine::server {
         request.path = qmark == std::string::npos ? target : target.substr(0, qmark);
         request.query = qmark == std::string::npos ? "" : target.substr(qmark + 1);
         request.body.clear();
-        request.keep_alive = true;
+        request.keepAlive = true;
 
-        size_t content_length = 0;
-        while (read_line(line)) {
+        size_t contentLength = 0;
+        while (readLine(line)) {
             if (line.empty()) { break; }
-            if (iequal_prefix(line, "content-length:")) {
+            if (iequalPrefix(line, "content-length:")) {
                 const auto colon = line.find(':');
                 std::string_view value{line.data() + colon + 1, line.size() - colon - 1};
                 while (!value.empty() && value.front() == ' ') { value.remove_prefix(1); }
-                const auto result = std::from_chars(value.data(), value.data() + value.size(), content_length);
-                if (result.ec != std::errc{} || content_length > kMaxContentLength) { return false; }
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), contentLength);
+                if (result.ec != std::errc{} || contentLength > kMaxContentLength) { return false; }
             }
-            else if (iequal_prefix(line, "connection:")) {
+            else if (iequalPrefix(line, "connection:")) {
                 const auto colon = line.find(':');
                 const std::string_view value{line.data() + colon + 1, line.size() - colon - 1};
-                if (icontains(value, "close")) { request.keep_alive = false; }
+                if (icontains(value, "close")) { request.keepAlive = false; }
             }
         }
 
-        if (content_length == 0) { return true; }
+        if (contentLength == 0) { return true; }
 
-        request.body.resize(content_length);
-        size_t body_pos = 0;
+        request.body.resize(contentLength);
+        size_t bodyPos = 0;
         const size_t buffered = len - pos;
         if (buffered > 0) {
-            const size_t take = std::min(buffered, content_length);
+            const size_t take = std::min(buffered, contentLength);
             std::memcpy(request.body.data(), buffer.data() + pos, take);
             pos += take;
-            body_pos = take;
+            bodyPos = take;
         }
-        if (body_pos < content_length && !connection.recv_all(request.body.data() + body_pos, content_length - body_pos)) { return false; }
+        if (bodyPos < contentLength && !connection.recvAll(request.body.data() + bodyPos, contentLength - bodyPos)) { return false; }
         return true;
     }
 
-    std::string HttpApiServer::query_param(std::string_view query, std::string_view name) {
+    std::string HttpApiServer::queryParam(std::string_view query, std::string_view name) {
         while (!query.empty()) {
             const auto amp = query.find('&');
             const auto part = query.substr(0, amp);
@@ -211,7 +247,7 @@ namespace akkaradb::engine::server {
         return {};
     }
 
-    std::vector<uint8_t> HttpApiServer::url_decode(std::string_view encoded) {
+    std::vector<uint8_t> HttpApiServer::urlDecode(std::string_view encoded) {
         std::vector<uint8_t> out;
         out.reserve(encoded.size());
         for (size_t i = 0; i < encoded.size(); ++i) {
@@ -231,67 +267,67 @@ namespace akkaradb::engine::server {
         return out;
     }
 
-    bool HttpApiServer::send_response(detail::Connection& connection, int status_code, std::span<const uint8_t> body) {
-        const std::string header = "HTTP/1.1 " + std::to_string(status_code) + " " + std::string{reason_phrase(status_code)} + "\r\n"
+    bool HttpApiServer::sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body) {
+        const std::string header = "HTTP/1.1 " + std::to_string(statusCode) + " " + std::string{reasonPhrase(statusCode)} + "\r\n"
             "Content-Type: application/octet-stream\r\n" "Content-Length: " + std::to_string(body.size()) + "\r\n" "\r\n";
-        if (!connection.send_all(reinterpret_cast<const uint8_t*>(header.data()), header.size())) { return false; }
-        return body.empty() || connection.send_all(body.data(), body.size());
+        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(header.data()), header.size())) { return false; }
+        return body.empty() || connection.sendAll(body.data(), body.size());
     }
 
-    bool HttpApiServer::send_empty(detail::Connection& connection, int status_code) { return send_response(connection, status_code, {}); }
+    bool HttpApiServer::sendEmpty(detail::Connection& connection, int statusCode) { return sendResponse(connection, statusCode, {}); }
 
-    bool HttpApiServer::route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& value_buffer) {
-        const std::string raw_key = query_param(request.query, "key");
-        if (raw_key.empty() && request.path != "/v1/ping") {
-            send_empty(connection, 400);
-            return request.keep_alive;
+    bool HttpApiServer::route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer) {
+        const std::string rawKey = queryParam(request.query, "key");
+        if (rawKey.empty() && request.path != "/v1/ping") {
+            sendEmpty(connection, 400);
+            return request.keepAlive;
         }
 
-        const std::vector<uint8_t> key = url_decode(raw_key);
-        const std::span<const uint8_t> key_span{key.data(), key.size()};
+        const std::vector<uint8_t> key = urlDecode(rawKey);
+        const std::span<const uint8_t> keySpan{key.data(), key.size()};
 
         if (request.path == "/v1/put" && request.method == "POST") {
-            engine_.put(key_span, std::span<const uint8_t>{request.body.data(), request.body.size()});
-            send_empty(connection, 204);
+            engine_.put(keySpan, std::span<const uint8_t>{request.body.data(), request.body.size()});
+            sendEmpty(connection, 204);
         }
         else if (request.path == "/v1/get" && request.method == "GET") {
-            value_buffer.clear();
-            if (engine_.get_into(key_span, value_buffer)) {
-                send_response(connection, 200, std::span<const uint8_t>{value_buffer.data(), value_buffer.size()});
+            valueBuffer.clear();
+            if (engine_.getInto(keySpan, valueBuffer)) {
+                sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
             }
-            else { send_empty(connection, 404); }
+            else { sendEmpty(connection, 404); }
         }
         else if (request.path == "/v1/remove" && request.method == "DELETE") {
-            engine_.remove(key_span);
-            send_empty(connection, 204);
+            engine_.remove(keySpan);
+            sendEmpty(connection, 204);
         }
-        else if (request.path == "/v1/get_at" && request.method == "GET") {
-            const std::string seq_text = query_param(request.query, "seq");
+        else if (request.path == "/v1/getAt" && request.method == "GET") {
+            const std::string seqText = queryParam(request.query, "seq");
             uint64_t seq = 0;
-            const auto result = std::from_chars(seq_text.data(), seq_text.data() + seq_text.size(), seq);
-            if (seq_text.empty() || result.ec != std::errc{}) {
-                send_empty(connection, 400);
-                return request.keep_alive;
+            const auto result = std::from_chars(seqText.data(), seqText.data() + seqText.size(), seq);
+            if (seqText.empty() || result.ec != std::errc{}) {
+                sendEmpty(connection, 400);
+                return request.keepAlive;
             }
-            auto value = engine_.get_at(key_span, seq);
-            if (value) { send_response(connection, 200, std::span<const uint8_t>{value->data(), value->size()}); }
-            else { send_empty(connection, 404); }
+            auto value = engine_.getAt(keySpan, seq);
+            if (value) { sendResponse(connection, 200, std::span<const uint8_t>{value->data(), value->size()}); }
+            else { sendEmpty(connection, 404); }
         }
         else if (request.path == "/v1/ping" && request.method == "GET") {
             static constexpr std::string_view pong = "pong";
-            send_response(connection, 200, {reinterpret_cast<const uint8_t*>(pong.data()), pong.size()});
+            sendResponse(connection, 200, {reinterpret_cast<const uint8_t*>(pong.data()), pong.size()});
         }
-        else { send_empty(connection, 404); }
+        else { sendEmpty(connection, 404); }
 
-        return request.keep_alive;
+        return request.keepAlive;
     }
 
-    void HttpApiServer::handle_connection(detail::Connection& connection) {
-        std::vector<uint8_t> value_buffer;
+    void HttpApiServer::handleConnection(detail::Connection& connection) {
+        std::vector<uint8_t> valueBuffer;
         while (running_.load(std::memory_order_relaxed)) {
             ParsedRequest request;
-            if (!read_request(connection, request)) { break; }
-            if (!route(connection, request, value_buffer)) { break; }
+            if (!readRequest(connection, request)) { break; }
+            if (!route(connection, request, valueBuffer)) { break; }
         }
     }
 }

@@ -31,51 +31,51 @@ namespace akkaradb::engine::cluster {
     namespace {
         constexpr size_t HEADER_SIZE = 32;
 
-        uint64_t now_us() noexcept {
+        uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count());
         }
 
-        void write_u16(uint8_t* b, size_t off, uint16_t v) noexcept {
+        void writeU16(uint8_t* b, size_t off, uint16_t v) noexcept {
             b[off] = static_cast<uint8_t>(v);
             b[off + 1] = static_cast<uint8_t>(v >> 8);
         }
 
-        void write_u32(uint8_t* b, size_t off, uint32_t v) noexcept {
+        void writeU32(uint8_t* b, size_t off, uint32_t v) noexcept {
             b[off] = static_cast<uint8_t>(v);
             b[off + 1] = static_cast<uint8_t>(v >> 8);
             b[off + 2] = static_cast<uint8_t>(v >> 16);
             b[off + 3] = static_cast<uint8_t>(v >> 24);
         }
 
-        void write_u64(uint8_t* b, size_t off, uint64_t v) noexcept {
+        void writeU64(uint8_t* b, size_t off, uint64_t v) noexcept {
             for (size_t i = 0; i < 8; ++i) { b[off + i] = static_cast<uint8_t>(v >> (8 * i)); }
         }
 
-        uint16_t read_u16(const uint8_t* b, size_t off) noexcept {
+        uint16_t readU16(const uint8_t* b, size_t off) noexcept {
             return static_cast<uint16_t>(b[off]) | static_cast<uint16_t>(static_cast<uint16_t>(b[off + 1]) << 8);
         }
 
-        uint32_t read_u32(const uint8_t* b, size_t off) noexcept {
+        uint32_t readU32(const uint8_t* b, size_t off) noexcept {
             return static_cast<uint32_t>(b[off]) | (static_cast<uint32_t>(b[off + 1]) << 8) | (static_cast<uint32_t>(b[off + 2]) << 16) | (
                 static_cast<uint32_t>(b[off + 3]) << 24);
         }
 
-        uint64_t read_u64(const uint8_t* b, size_t off) noexcept {
+        uint64_t readU64(const uint8_t* b, size_t off) noexcept {
             uint64_t v = 0;
             for (size_t i = 0; i < 8; ++i) { v |= static_cast<uint64_t>(b[off + i]) << (8 * i); }
             return v;
         }
 
-        uint32_t crc_file_image(std::vector<uint8_t> bytes) {
-            if (bytes.size() >= 28) { write_u32(bytes.data(), 24, 0); }
+        uint32_t crcFileImage(std::vector<uint8_t> bytes) {
+            if (bytes.size() >= 28) { writeU32(bytes.data(), 24, 0); }
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         }
     } // namespace
 
-    ClusterConfig::ClusterConfig(std::vector<NodeInfo> nodes, ReplicationMode mode, AckPolicy ack_policy)
-        : nodes_{std::move(nodes)}, mode_{mode}, ack_policy_{ack_policy} { validate(); }
+    ClusterConfig::ClusterConfig(std::vector<NodeInfo> nodes, ReplicationMode mode, AckPolicy ackPolicy)
+        : nodes_{std::move(nodes)}, mode_{mode}, ackPolicy_{ackPolicy} { validate(); }
 
     ClusterConfig ClusterConfig::load(const std::filesystem::path& path) {
         std::ifstream file(path, std::ios::binary);
@@ -84,36 +84,36 @@ namespace akkaradb::engine::cluster {
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         if (bytes.size() < HEADER_SIZE) { throw std::runtime_error("ClusterConfig: file too short"); }
 
-        const uint32_t magic = read_u32(bytes.data(), 0);
-        const uint16_t version = read_u16(bytes.data(), 4);
+        const uint32_t magic = readU32(bytes.data(), 0);
+        const uint16_t version = readU16(bytes.data(), 4);
         if (magic != MAGIC) { throw std::runtime_error("ClusterConfig: bad magic"); }
         if (version != VERSION) { throw std::runtime_error("ClusterConfig: unsupported version"); }
 
-        const uint32_t stored_crc = read_u32(bytes.data(), 24);
-        if (stored_crc != crc_file_image(bytes)) { throw std::runtime_error("ClusterConfig: CRC mismatch"); }
+        const uint32_t storedCrc = readU32(bytes.data(), 24);
+        if (storedCrc != crcFileImage(bytes)) { throw std::runtime_error("ClusterConfig: CRC mismatch"); }
 
-        const uint16_t flags = read_u16(bytes.data(), 6);
-        const uint16_t node_count = read_u16(bytes.data(), 8);
+        const uint16_t flags = readU16(bytes.data(), 6);
+        const uint16_t nodeCount = readU16(bytes.data(), 8);
         const auto mode = static_cast<ReplicationMode>(bytes[10]);
         AckPolicy ack{};
         ack.mode = static_cast<AckPolicyMode>(bytes[11]);
-        ack.quorum = read_u16(bytes.data(), 12);
+        ack.quorum = readU16(bytes.data(), 12);
 
         size_t cursor = HEADER_SIZE;
         std::vector<NodeInfo> nodes;
-        nodes.reserve(node_count);
-        for (uint16_t i = 0; i < node_count; ++i) {
+        nodes.reserve(nodeCount);
+        for (uint16_t i = 0; i < nodeCount; ++i) {
             if (cursor + 18 > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated node entry"); }
             NodeInfo node{};
-            node.node_id = read_u64(bytes.data(), cursor);
-            node.capabilities = read_u32(bytes.data(), cursor + 8);
-            node.data_port = read_u16(bytes.data(), cursor + 12);
-            node.repl_port = read_u16(bytes.data(), cursor + 14);
-            const uint16_t host_len = read_u16(bytes.data(), cursor + 16);
+            node.nodeId = readU64(bytes.data(), cursor);
+            node.capabilities = readU32(bytes.data(), cursor + 8);
+            node.dataPort = readU16(bytes.data(), cursor + 12);
+            node.replPort = readU16(bytes.data(), cursor + 14);
+            const uint16_t hostLen = readU16(bytes.data(), cursor + 16);
             cursor += 18;
-            if (cursor + host_len > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated host"); }
-            node.host.assign(reinterpret_cast<const char*>(bytes.data() + cursor), host_len);
-            cursor += host_len;
+            if (cursor + hostLen > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated host"); }
+            node.host.assign(reinterpret_cast<const char*>(bytes.data() + cursor), hostLen);
+            cursor += hostLen;
             nodes.push_back(std::move(node));
         }
 
@@ -128,87 +128,88 @@ namespace akkaradb::engine::cluster {
         if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
 
         std::vector<uint8_t> bytes(HEADER_SIZE);
-        write_u32(bytes.data(), 0, MAGIC);
-        write_u16(bytes.data(), 4, VERSION);
-        write_u16(bytes.data(), 6, config.flags_);
-        write_u16(bytes.data(), 8, static_cast<uint16_t>(config.nodes_.size()));
+        writeU32(bytes.data(), 0, MAGIC);
+        writeU16(bytes.data(), 4, VERSION);
+        writeU16(bytes.data(), 6, config.flags_);
+        writeU16(bytes.data(), 8, static_cast<uint16_t>(config.nodes_.size()));
         bytes[10] = static_cast<uint8_t>(config.mode_);
-        bytes[11] = static_cast<uint8_t>(config.ack_policy_.mode);
-        write_u16(bytes.data(), 12, config.ack_policy_.quorum);
-        write_u64(bytes.data(), 16, now_us());
-        write_u32(bytes.data(), 24, 0);
+        bytes[11] = static_cast<uint8_t>(config.ackPolicy_.mode);
+        writeU16(bytes.data(), 12, config.ackPolicy_.quorum);
+        writeU64(bytes.data(), 16, nowUs());
+        writeU32(bytes.data(), 24, 0);
 
         for (const auto& node : config.nodes_) {
-            const auto host_len = static_cast<uint16_t>(node.host.size());
+            const auto hostLen = static_cast<uint16_t>(node.host.size());
             const size_t off = bytes.size();
-            bytes.resize(off + 18 + host_len);
-            write_u64(bytes.data(), off, node.node_id);
-            write_u32(bytes.data(), off + 8, node.capabilities);
-            write_u16(bytes.data(), off + 12, node.data_port);
-            write_u16(bytes.data(), off + 14, node.repl_port);
-            write_u16(bytes.data(), off + 16, host_len);
-            std::memcpy(bytes.data() + off + 18, node.host.data(), host_len);
+            bytes.resize(off + 18 + hostLen);
+            writeU64(bytes.data(), off, node.nodeId);
+            writeU32(bytes.data(), off + 8, node.capabilities);
+            writeU16(bytes.data(), off + 12, node.dataPort);
+            writeU16(bytes.data(), off + 14, node.replPort);
+            writeU16(bytes.data(), off + 16, hostLen);
+            std::memcpy(bytes.data() + off + 18, node.host.data(), hostLen);
         }
 
-        write_u32(bytes.data(), 24, crc_file_image(bytes));
+        writeU32(bytes.data(), 24, crcFileImage(bytes));
 
-        const auto tmp_path = path.parent_path() / (path.filename().string() + ".tmp");
+        const auto tmpPath = path.parent_path() / (path.filename().string() + ".tmp");
         {
-            std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-            if (!out) { throw std::runtime_error("ClusterConfig: cannot create " + tmp_path.string()); }
+            std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!out) { throw std::runtime_error("ClusterConfig: cannot create " + tmpPath.string()); }
             out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
             if (!out) { throw std::runtime_error("ClusterConfig: write failed"); }
         }
-        std::filesystem::rename(tmp_path, path);
+        std::filesystem::rename(tmpPath, path);
     }
 
-    const NodeInfo* ClusterConfig::find_by_id(uint64_t node_id) const noexcept {
-        for (const auto& node : nodes_) { if (node.node_id == node_id) { return &node; } }
+    const NodeInfo* ClusterConfig::findById(uint64_t nodeId) const noexcept {
+        for (const auto& node : nodes_) { if (node.nodeId == nodeId) { return &node; } }
         return nullptr;
     }
 
-    std::vector<NodeInfo> ClusterConfig::data_nodes() const {
+    std::vector<NodeInfo> ClusterConfig::dataNodes() const {
         std::vector<NodeInfo> result;
-        for (const auto& node : nodes_) { if (node.data_bearing()) { result.push_back(node); } }
+        for (const auto& node : nodes_) { if (node.dataBearing()) { result.push_back(node); } }
         return result;
     }
 
-    std::vector<NodeInfo> ClusterConfig::coordinator_nodes() const {
+    std::vector<NodeInfo> ClusterConfig::coordinatorNodes() const {
         std::vector<NodeInfo> result;
-        for (const auto& node : nodes_) { if (node.coordinator_eligible()) { result.push_back(node); } }
+        for (const auto& node : nodes_) { if (node.coordinatorEligible()) { result.push_back(node); } }
         return result;
     }
 
-    bool ClusterConfig::is_standalone() const noexcept { return mode_ == ReplicationMode::Standalone || nodes_.size() <= 1; }
+    bool ClusterConfig::isStandalone() const noexcept { return mode_ == ReplicationMode::STANDALONE || nodes_.size() <= 1; }
 
     void ClusterConfig::validate() const {
         if (nodes_.size() > UINT16_MAX) { throw std::invalid_argument("ClusterConfig: too many nodes"); }
-        if (mode_ != ReplicationMode::Standalone && mode_ != ReplicationMode::Mirror && mode_ != ReplicationMode::Stripe) {
+        if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::STRIPE) {
             throw std::invalid_argument("ClusterConfig: invalid replication mode");
         }
-        if (ack_policy_.mode != AckPolicyMode::Async && ack_policy_.mode != AckPolicyMode::All && ack_policy_.mode !=
-            AckPolicyMode::Quorum) { throw std::invalid_argument("ClusterConfig: invalid ack policy"); }
-        if (ack_policy_.mode == AckPolicyMode::Quorum && ack_policy_.quorum == 0) {
+        if (ackPolicy_.mode != AckPolicyMode::ASYNC && ackPolicy_.mode != AckPolicyMode::ALL && ackPolicy_.mode != AckPolicyMode::QUORUM) {
+            throw std::invalid_argument("ClusterConfig: invalid ack policy");
+        }
+        if (ackPolicy_.mode == AckPolicyMode::QUORUM && ackPolicy_.quorum == 0) {
             throw std::invalid_argument("ClusterConfig: quorum policy requires quorum > 0");
         }
 
         std::unordered_set<uint64_t> ids;
-        bool has_data_node = false;
-        bool has_coordinator = false;
+        bool hasDataNode = false;
+        bool hasCoordinator = false;
         for (const auto& node : nodes_) {
-            if (node.node_id == 0) { throw std::invalid_argument("ClusterConfig: node_id 0 is reserved"); }
-            if (!ids.insert(node.node_id).second) { throw std::invalid_argument("ClusterConfig: duplicate node_id"); }
+            if (node.nodeId == 0) { throw std::invalid_argument("ClusterConfig: nodeId 0 is reserved"); }
+            if (!ids.insert(node.nodeId).second) { throw std::invalid_argument("ClusterConfig: duplicate nodeId"); }
             if (node.host.empty()) { throw std::invalid_argument("ClusterConfig: empty host"); }
-            if ((node.capabilities & ~(CoordinatorEligible | DataBearing)) != 0) {
+            if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING)) != 0) {
                 throw std::invalid_argument("ClusterConfig: unknown node capability");
             }
-            has_data_node = has_data_node || node.data_bearing();
-            has_coordinator = has_coordinator || node.coordinator_eligible();
+            hasDataNode = hasDataNode || node.dataBearing();
+            hasCoordinator = hasCoordinator || node.coordinatorEligible();
         }
-        if (mode_ != ReplicationMode::Standalone && !has_data_node) {
+        if (mode_ != ReplicationMode::STANDALONE && !hasDataNode) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a data-bearing node");
         }
-        if (mode_ != ReplicationMode::Standalone && !has_coordinator) {
+        if (mode_ != ReplicationMode::STANDALONE && !hasCoordinator) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a coordinator-eligible node");
         }
     }

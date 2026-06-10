@@ -63,13 +63,13 @@ namespace akkaradb::core {
              * Do not encode subsystem-specific errors here.
              */
             enum class Code : uint8_t {
-                Ok = 0, NotFound, InvalidArgument, IOError, Corruption, OutOfMemory, InternalError
+                OK = 0, NOT_FOUND, INVALID_ARGUMENT, IO_ERROR, CORRUPTION, OUT_OF_MEMORY, INTERNAL_ERROR
             };
 
             /**
              * @brief Create success status.
              */
-            static Status OK() noexcept { return {Code::Ok, nullptr}; }
+            static Status OK() noexcept { return {Code::OK, nullptr}; }
 
             /**
              * @brief Create error status without message.
@@ -98,7 +98,7 @@ namespace akkaradb::core {
             /**
              * @brief Check if status is OK.
              */
-            [[nodiscard]] bool ok() const noexcept { return code_ == Code::Ok; }
+            [[nodiscard]] bool ok() const noexcept { return code_ == Code::OK; }
 
             /**
              * @brief Get error code.

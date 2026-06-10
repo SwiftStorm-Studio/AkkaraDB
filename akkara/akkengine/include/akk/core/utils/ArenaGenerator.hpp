@@ -34,16 +34,16 @@ namespace akkaradb::core {
      * @brief Arena-backed coroutine generator.
      *
      * Coroutine frames are allocated from the currently active arena
-     * (set via with_arena()).
+     * (set via withArena()).
      */
     template <typename T>
     class ArenaGenerator {
         public:
             struct promise_type;
-            using handle_type = std::coroutine_handle<promise_type>;
+            using HandleType = std::coroutine_handle<promise_type>;
 
             struct promise_type {
-                T current_value_{};
+                T currentValue_{};
                 std::exception_ptr exception_{};
 
                 #ifdef _MSC_VER
@@ -52,28 +52,28 @@ namespace akkaradb::core {
                 #endif
 
                 struct alignas(std::max_align_t) AllocationHeader {
-                    bool from_arena;
+                    bool fromArena;
                 };
 
                 #ifdef _MSC_VER
                 #pragma warning(pop)
                 #endif
 
-                static thread_local BufferArena* tls_arena_;
+                static thread_local BufferArena* tlsArena_;
 
                 [[nodiscard]] void* operator new(size_t size) {
                     const size_t total = size + sizeof(AllocationHeader);
 
-                    if (tls_arena_ != nullptr) {
-                        std::byte* raw = tls_arena_->allocate(total, alignof(std::max_align_t));
+                    if (tlsArena_ != nullptr) {
+                        std::byte* raw = tlsArena_->allocate(total, alignof(std::max_align_t));
                         auto* header = reinterpret_cast<AllocationHeader*>(raw);
-                        header->from_arena = true;
+                        header->fromArena = true;
                         return raw + sizeof(AllocationHeader);
                     }
 
                     void* raw = ::operator new(total);
                     auto* header = static_cast<AllocationHeader*>(raw);
-                    header->from_arena = false;
+                    header->fromArena = false;
                     return reinterpret_cast<std::byte*>(raw) + sizeof(AllocationHeader);
                 }
 
@@ -81,12 +81,12 @@ namespace akkaradb::core {
                     if (ptr == nullptr) { return; }
 
                     auto* header = reinterpret_cast<AllocationHeader*>(reinterpret_cast<std::byte*>(ptr) - sizeof(AllocationHeader));
-                    if (!header->from_arena) { ::operator delete(header); }
+                    if (!header->fromArena) { ::operator delete(header); }
                 }
 
                 static void operator delete(void* ptr) noexcept { operator delete(ptr, 0); }
 
-                [[nodiscard]] ArenaGenerator get_return_object() noexcept { return ArenaGenerator{handle_type::from_promise(*this)}; }
+                [[nodiscard]] ArenaGenerator get_return_object() noexcept { return ArenaGenerator{HandleType::from_promise(*this)}; }
 
                 [[nodiscard]] std::suspend_always initial_suspend() noexcept { return {}; }
                 [[nodiscard]] std::suspend_always final_suspend() noexcept { return {}; }
@@ -94,7 +94,7 @@ namespace akkaradb::core {
                 void unhandled_exception() noexcept { exception_ = std::current_exception(); }
 
                 [[nodiscard]] std::suspend_always yield_value(T value) noexcept(std::is_nothrow_move_assignable_v<T>) {
-                    current_value_ = std::move(value);
+                    currentValue_ = std::move(value);
                     return {};
                 }
             };
@@ -108,7 +108,7 @@ namespace akkaradb::core {
                     using reference = const T&;
 
                     iterator() noexcept = default;
-                    explicit iterator(handle_type handle, bool done) noexcept : handle_{handle}, done_{done} {}
+                    explicit iterator(HandleType handle, bool done) noexcept : handle_{handle}, done_{done} {}
 
                     iterator& operator++() {
                         handle_.resume();
@@ -119,19 +119,19 @@ namespace akkaradb::core {
                         return *this;
                     }
 
-                    reference operator*() const noexcept { return handle_.promise().current_value_; }
-                    pointer operator->() const noexcept { return &handle_.promise().current_value_; }
+                    reference operator*() const noexcept { return handle_.promise().currentValue_; }
+                    pointer operator->() const noexcept { return &handle_.promise().currentValue_; }
 
                     [[nodiscard]] bool operator==(std::default_sentinel_t) const noexcept { return done_; }
 
                 private:
-                    handle_type handle_{};
+                    HandleType handle_{};
                     bool done_{true};
             };
 
             ArenaGenerator() noexcept = default;
 
-            explicit ArenaGenerator(handle_type handle) noexcept : handle_{handle} {}
+            explicit ArenaGenerator(HandleType handle) noexcept : handle_{handle} {}
 
             ArenaGenerator(const ArenaGenerator&) = delete;
             ArenaGenerator& operator=(const ArenaGenerator&) = delete;
@@ -163,10 +163,12 @@ namespace akkaradb::core {
             [[nodiscard]] std::default_sentinel_t end() const noexcept { return {}; }
 
             template <typename Factory>
-            [[nodiscard]] static ArenaGenerator with_arena(BufferArena& arena, Factory&& factory) {
+            [[nodiscard]] static ArenaGenerator withArena(BufferArena& arena, Factory&& factory) {
                 struct ScopedArena {
-                    explicit ScopedArena(BufferArena* arena_ptr) noexcept : prev_{promise_type::tls_arena_} { promise_type::tls_arena_ = arena_ptr; }
-                    ~ScopedArena() { promise_type::tls_arena_ = prev_; }
+                    explicit ScopedArena(BufferArena* arenaPtr) noexcept
+                        : prev_{promise_type::tlsArena_} { promise_type::tlsArena_ = arenaPtr; }
+
+                    ~ScopedArena() { promise_type::tlsArena_ = prev_; }
                     BufferArena* prev_;
                 };
 
@@ -174,49 +176,55 @@ namespace akkaradb::core {
                 return std::forward<Factory>(factory)();
             }
 
-            [[nodiscard]] static ArenaGenerator yield_all(BufferArena& arena, ArenaGenerator first, ArenaGenerator second) {
-                return yieldAll(arena, std::move(first), std::move(second));
-            }
-
             [[nodiscard]] static ArenaGenerator yieldAll(BufferArena& arena, ArenaGenerator first, ArenaGenerator second) {
-                return with_arena(
+                return withArena(
                     arena,
-                    [first = std::move(first), second = std::move(second)]() mutable { return yield_all_impl(std::move(first), std::move(second)); }
+                    [first = std::move(first), second = std::move(second)]() mutable {
+                        return yieldAllImpl(std::move(first), std::move(second));
+                    }
                 );
             }
 
             [[nodiscard]] static ArenaGenerator yieldAll(BufferArena& arena, ArenaGenerator first) {
-                return with_arena(arena, [first = std::move(first)]() mutable { return yield_all_impl(std::move(first), ArenaGenerator{}); });
+                return withArena(arena, [first = std::move(first)]() mutable { return yieldAllImpl(std::move(first), ArenaGenerator{}); });
             }
 
             template <typename... Rest>
             [[nodiscard]] static ArenaGenerator yieldAll(BufferArena& arena, ArenaGenerator first, ArenaGenerator second, Rest... rest) {
-                static_assert((std::is_same_v<ArenaGenerator, std::remove_cvref_t<Rest>> && ...), "yieldAll rest arguments must be ArenaGenerator<T>");
+                static_assert(
+                    (std::is_same_v<ArenaGenerator, std::remove_cvref_t<Rest>> && ...),
+                    "yieldAll rest arguments must be ArenaGenerator<T>"
+                );
 
-                return with_arena(
+                return withArena(
                     arena,
-                    [first = std::move(first), second = std::move(second), tail = std::array<ArenaGenerator, sizeof...(Rest)>{std::move(rest)...}]() mutable {
-                        return yield_all_many_impl(std::move(first), std::move(second), std::move(tail));
+                    [first = std::move(first), second = std::move(second), tail = std::array<ArenaGenerator, sizeof...(Rest)>
+                        {std::move(rest)...}]() mutable {
+                        return yieldAllManyImpl(std::move(first), std::move(second), std::move(tail));
                     }
                 );
             }
 
         private:
-            [[nodiscard]] static ArenaGenerator yield_all_impl(ArenaGenerator first, ArenaGenerator second) {
+            [[nodiscard]] static ArenaGenerator yieldAllImpl(ArenaGenerator first, ArenaGenerator second) {
                 for (auto&& value : first) { co_yield value; }
                 for (auto&& value : second) { co_yield value; }
             }
 
             template <size_t N>
-            [[nodiscard]] static ArenaGenerator yield_all_many_impl(ArenaGenerator first, ArenaGenerator second, std::array<ArenaGenerator, N> tail) {
+            [[nodiscard]] static ArenaGenerator yieldAllManyImpl(
+                ArenaGenerator first,
+                ArenaGenerator second,
+                std::array<ArenaGenerator, N> tail
+            ) {
                 for (auto&& value : first) { co_yield value; }
                 for (auto&& value : second) { co_yield value; }
                 for (auto& gen : tail) { for (auto&& value : gen) { co_yield value; } }
             }
 
-            handle_type handle_{};
+            HandleType handle_{};
     };
 
     template <typename T>
-    thread_local BufferArena* ArenaGenerator<T>::promise_type::tls_arena_ = nullptr;
+    thread_local BufferArena* ArenaGenerator<T>::promise_type::tlsArena_ = nullptr;
 } // namespace akkaradb::core

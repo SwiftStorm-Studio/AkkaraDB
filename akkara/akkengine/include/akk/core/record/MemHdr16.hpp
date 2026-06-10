@@ -33,8 +33,8 @@ namespace akkaradb::core {
      *
      * Binary layout (Little-Endian, 16 bytes total):
      * [0..7]   seq      (u64)  - Global sequence number (monotonic)
-     * [8..9]   k_len    (u16)  - Key length (0..65535)
-     * [10..11] v_len    (u16)  - Value length (0..65535)
+     * [8..9]   kLen    (u16)  - Key length (0..65535)
+     * [10..11] vLen    (u16)  - Value length (0..65535)
      * [12]     flags    (u8)   - Flags (0x01 = TOMBSTONE, etc.)
      * [13]     version  (u8)   - Header format version
      * [14..15] reserved (u16)  - Reserved (must be 0)
@@ -61,8 +61,8 @@ namespace akkaradb::core {
 
         uint64_t seq; ///< Global sequence number
 
-        uint16_t k_len; ///< Key length (0..65535)
-        uint16_t v_len; ///< Value length (0..65535)
+        uint16_t kLen; ///< Key length (0..65535)
+        uint16_t vLen; ///< Value length (0..65535)
 
         uint8_t flags; ///< Flags (see FLAG_* constants)
 
@@ -81,23 +81,23 @@ namespace akkaradb::core {
         /**
          * Checks if this record is a tombstone (deleted).
          */
-        [[nodiscard]] constexpr bool is_tombstone() const noexcept { return (flags & FLAG_TOMBSTONE) != 0; }
+        [[nodiscard]] constexpr bool isTombstone() const noexcept { return (flags & FLAG_TOMBSTONE) != 0; }
 
         /**
          * Returns the total size of the record (header + key + value).
          */
-        [[nodiscard]] constexpr size_t total_size() const noexcept { return sizeof(MemHdr16) + k_len + v_len; }
+        [[nodiscard]] constexpr size_t totalSize() const noexcept { return sizeof(MemHdr16) + kLen + vLen; }
 
         /**
          * Creates a MemHdr16 from key/value metadata.
          *
-         * @param key_len Key length
-         * @param value_len Value length
+         * @param keyLen Key length
+         * @param valueLen Value length
          * @param seq Sequence number
          * @param flags Flags (FLAG_NORMAL or FLAG_TOMBSTONE)
          * @return Initialized header
          */
-        [[nodiscard]] static MemHdr16 create(size_t key_len, size_t value_len, uint64_t seq, uint8_t flags = FLAG_NORMAL) noexcept;
+        [[nodiscard]] static MemHdr16 create(size_t keyLen, size_t valueLen, uint64_t seq, uint8_t flags = FLAG_NORMAL);
     };
 
     static_assert(sizeof(MemHdr16) == 16);

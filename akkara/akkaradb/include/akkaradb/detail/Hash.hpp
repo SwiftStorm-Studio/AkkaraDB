@@ -24,7 +24,7 @@
 #include <string_view>
 
 namespace akkaradb::detail {
-    [[nodiscard]] constexpr uint64_t fnv1a_64(std::string_view s) noexcept {
+    [[nodiscard]] constexpr uint64_t fnv1a64(std::string_view s) noexcept {
         uint64_t h = 14695981039346656037ULL;
         for (const unsigned char c : s) {
             h ^= static_cast<uint64_t>(c);
@@ -33,18 +33,18 @@ namespace akkaradb::detail {
         return h;
     }
 
-    inline void write_le32(uint32_t v, uint8_t* dst) noexcept {
+    inline void writeLe32(uint32_t v, uint8_t* dst) noexcept {
         dst[0] = static_cast<uint8_t>(v);
         dst[1] = static_cast<uint8_t>(v >> 8);
         dst[2] = static_cast<uint8_t>(v >> 16);
         dst[3] = static_cast<uint8_t>(v >> 24);
     }
 
-    inline void write_le64(uint64_t v, uint8_t* dst) noexcept {
+    inline void writeLe64(uint64_t v, uint8_t* dst) noexcept {
         for (size_t i = 0; i < 8; ++i) { dst[i] = static_cast<uint8_t>(v >> (8 * i)); }
     }
 
-    [[nodiscard]] inline bool increment_lexicographic_bytes(uint8_t* data, size_t size) noexcept {
+    [[nodiscard]] inline bool incrementLexicographicBytes(uint8_t* data, size_t size) noexcept {
         for (size_t i = size; i > 0; --i) { if (++data[i - 1] != 0) { return true; } }
         return false;
     }

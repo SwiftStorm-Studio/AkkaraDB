@@ -31,21 +31,21 @@ namespace akkaradb::engine::wal {
         static constexpr uint16_t VERSION = 0x0001;
         static constexpr uint16_t SIZE = 48;
 
-        uint64_t segment_id = 0;
-        uint64_t created_us = 0;
-        uint64_t first_seq = 0;
-        uint64_t last_seq = 0;
+        uint64_t segmentId = 0;
+        uint64_t createdUs = 0;
+        uint64_t firstSeq = 0;
+        uint64_t lastSeq = 0;
         uint32_t magic = MAGIC;
         uint32_t crc32c = 0;
         uint16_t version = VERSION;
-        uint16_t header_size = SIZE;
-        uint16_t shard_id = 0;
+        uint16_t headerSize = SIZE;
+        uint16_t shardId = 0;
         uint16_t flags = 0;
 
-        [[nodiscard]] bool verify_magic() const noexcept { return magic == MAGIC; }
-        [[nodiscard]] bool verify_version() const noexcept { return version == VERSION && header_size == SIZE; }
-        [[nodiscard]] bool verify_checksum() const noexcept;
-        [[nodiscard]] static WalSegmentHeader build(uint16_t shard_id, uint64_t segment_id, uint64_t created_us) noexcept;
+        [[nodiscard]] bool verifyMagic() const noexcept { return magic == MAGIC; }
+        [[nodiscard]] bool verifyVersion() const noexcept { return version == VERSION && headerSize == SIZE; }
+        [[nodiscard]] bool verifyChecksum() const noexcept;
+        [[nodiscard]] static WalSegmentHeader build(uint16_t shardId, uint64_t segmentId, uint64_t createdUs) noexcept;
         void serialize(uint8_t out[SIZE]) const noexcept;
         [[nodiscard]] static WalSegmentHeader deserialize(const uint8_t in[SIZE]) noexcept;
     };
@@ -59,16 +59,22 @@ namespace akkaradb::engine::wal {
         static constexpr uint16_t SIZE = 32;
 
         uint64_t seq = 0;
-        uint64_t key_fp64 = 0;
-        uint32_t entry_len = SIZE;
-        uint32_t value_len = 0;
-        uint16_t key_len = 0;
+        uint64_t keyFp64 = 0;
+        uint32_t entryLen = SIZE;
+        uint32_t valueLen = 0;
+        uint16_t keyLen = 0;
         uint16_t flags = 0;
         uint32_t crc32c = 0;
 
-        [[nodiscard]] bool verify_lengths(size_t max_entry_bytes) const noexcept;
-        [[nodiscard]] bool verify_checksum(std::span<const uint8_t> key, std::span<const uint8_t> value) const noexcept;
-        [[nodiscard]] static WalEntryHeader build(uint64_t seq, uint64_t key_fp64, uint16_t key_len, uint32_t value_len, uint16_t flags) noexcept;
+        [[nodiscard]] bool verifyLengths(size_t maxEntryBytes) const noexcept;
+        [[nodiscard]] bool verifyChecksum(std::span<const uint8_t> key, std::span<const uint8_t> value) const noexcept;
+        [[nodiscard]] static WalEntryHeader build(
+            uint64_t seq,
+            uint64_t keyFp64,
+            uint16_t keyLen,
+            uint32_t valueLen,
+            uint16_t flags
+        ) noexcept;
         void serialize(uint8_t out[SIZE]) const noexcept;
         [[nodiscard]] static WalEntryHeader deserialize(const uint8_t in[SIZE]) noexcept;
     };
@@ -78,13 +84,13 @@ namespace akkaradb::engine::wal {
     static_assert(std::is_standard_layout_v<WalEntryHeader>);
     static_assert(std::is_trivially_copyable_v<WalEntryHeader>);
 
-    [[nodiscard]] std::vector<uint8_t> serialize_entry(
+    [[nodiscard]] std::vector<uint8_t> serializeEntry(
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
         uint64_t seq,
-        uint64_t key_fp64,
+        uint64_t keyFp64,
         uint16_t flags
     );
 
-    [[nodiscard]] uint32_t entry_crc32c(const WalEntryHeader& header, std::span<const uint8_t> key, std::span<const uint8_t> value);
+    [[nodiscard]] uint32_t entryCrc32c(const WalEntryHeader& header, std::span<const uint8_t> key, std::span<const uint8_t> value);
 } // namespace akkaradb::engine::wal

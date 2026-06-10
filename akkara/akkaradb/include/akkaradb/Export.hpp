@@ -28,4 +28,3 @@
 #else
 #  define AKDB_API
 #endif
-

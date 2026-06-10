@@ -26,11 +26,11 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        const NodeInfo* configured_primary(const ClusterConfig& config) noexcept {
+        const NodeInfo* configuredPrimary(const ClusterConfig& config) noexcept {
             const NodeInfo* best = nullptr;
             for (const auto& node : config.nodes()) {
-                if (!node.coordinator_eligible()) { continue; }
-                if (best == nullptr || node.node_id < best->node_id) { best = &node; }
+                if (!node.coordinatorEligible()) { continue; }
+                if (best == nullptr || node.nodeId < best->nodeId) { best = &node; }
             }
             return best;
         }
@@ -38,100 +38,98 @@ namespace akkaradb::engine::cluster {
 
     class ClusterManager::Impl {
         public:
-            Impl(std::filesystem::path db_dir, ClusterConfig config, uint64_t self_node_id)
-                : config_{std::move(config)}, self_node_id_{self_node_id} {
-                (void)db_dir;
+            Impl(std::filesystem::path dbDir, ClusterConfig config, uint64_t selfNodeId)
+                : config_{std::move(config)}, selfNodeId_{selfNodeId} {
+                (void)dbDir;
                 config_.validate();
-                if (!config_.is_standalone() && config_.find_by_id(self_node_id_) == nullptr) {
-                    throw std::runtime_error("ClusterManager: self_node_id not found in cluster config");
+                if (!config_.isStandalone() && config_.findById(selfNodeId_) == nullptr) {
+                    throw std::runtime_error("ClusterManager: selfNodeId not found in cluster config");
                 }
             }
 
             ~Impl() { close(); }
 
-            void set_role_change_callback(RoleChangeCallback callback) {
-                std::lock_guard lock{callback_mutex_};
+            void setRoleChangeCallback(RoleChangeCallback callback) {
+                std::lock_guard lock{callbackMutex_};
                 callback_ = std::move(callback);
             }
 
             void start() {
-                if (config_.is_standalone()) {
-                    set_role(NodeRole::Standalone);
+                if (config_.isStandalone()) {
+                    setRole(NodeRole::STANDALONE);
                     return;
                 }
                 if (running_.exchange(true)) { return; }
-                elect_role();
+                electRole();
             }
 
             void close() { running_.store(false); }
 
             NodeRole role() const noexcept { return role_.load(); }
-            uint64_t self_node_id() const noexcept { return self_node_id_; }
-            bool is_standalone() const noexcept { return config_.is_standalone(); }
+            uint64_t selfNodeId() const noexcept { return selfNodeId_; }
+            bool isStandalone() const noexcept { return config_.isStandalone(); }
 
-            std::string primary_host() const {
-                std::lock_guard lock{primary_mutex_};
-                return primary_host_;
+            std::string primaryHost() const {
+                std::lock_guard lock{primaryMutex_};
+                return primaryHost_;
             }
 
-            uint16_t primary_repl_port() const {
-                std::lock_guard lock{primary_mutex_};
-                return primary_repl_port_;
+            uint16_t primaryReplPort() const {
+                std::lock_guard lock{primaryMutex_};
+                return primaryReplPort_;
             }
 
         private:
-            void set_role(NodeRole role) {
+            void setRole(NodeRole role) {
                 const NodeRole old = role_.exchange(role);
                 if (old == role) { return; }
                 RoleChangeCallback cb;
                 {
-                    std::lock_guard lock{callback_mutex_};
+                    std::lock_guard lock{callbackMutex_};
                     cb = callback_;
                 }
                 if (cb) { cb(role); }
             }
 
-            void elect_role() {
-                const auto* primary = configured_primary(config_);
+            void electRole() {
+                const auto* primary = configuredPrimary(config_);
                 if (primary == nullptr) { throw std::runtime_error("ClusterManager: cluster config has no coordinator-eligible node"); }
 
                 {
-                    std::lock_guard lock{primary_mutex_};
-                    primary_host_ = primary->host;
-                    primary_repl_port_ = primary->repl_port;
+                    std::lock_guard lock{primaryMutex_};
+                    primaryHost_ = primary->host;
+                    primaryReplPort_ = primary->replPort;
                 }
 
-                set_role(primary->node_id == self_node_id_ ? NodeRole::Primary : NodeRole::Replica);
+                setRole(primary->nodeId == selfNodeId_ ? NodeRole::PRIMARY : NodeRole::REPLICA);
             }
 
             ClusterConfig config_;
-            uint64_t self_node_id_;
-            std::atomic<NodeRole> role_{NodeRole::Standalone};
+            uint64_t selfNodeId_;
+            std::atomic<NodeRole> role_{NodeRole::STANDALONE};
             std::atomic<bool> running_{false};
 
-            mutable std::mutex primary_mutex_;
-            std::string primary_host_;
-            uint16_t primary_repl_port_ = 0;
+            mutable std::mutex primaryMutex_;
+            std::string primaryHost_;
+            uint16_t primaryReplPort_ = 0;
 
-            std::mutex callback_mutex_;
+            std::mutex callbackMutex_;
             RoleChangeCallback callback_;
     };
 
-    std::unique_ptr<ClusterManager> ClusterManager::create(std::filesystem::path db_dir, ClusterConfig config, uint64_t self_node_id) {
-        return std::unique_ptr<ClusterManager>(
-            new ClusterManager(std::make_unique<Impl>(std::move(db_dir), std::move(config), self_node_id))
-        );
+    std::unique_ptr<ClusterManager> ClusterManager::create(std::filesystem::path dbDir, ClusterConfig config, uint64_t selfNodeId) {
+        return std::unique_ptr<ClusterManager>(new ClusterManager(std::make_unique<Impl>(std::move(dbDir), std::move(config), selfNodeId)));
     }
 
     ClusterManager::ClusterManager(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
     ClusterManager::~ClusterManager() = default;
 
-    void ClusterManager::set_role_change_callback(RoleChangeCallback callback) { impl_->set_role_change_callback(std::move(callback)); }
+    void ClusterManager::setRoleChangeCallback(RoleChangeCallback callback) { impl_->setRoleChangeCallback(std::move(callback)); }
     void ClusterManager::start() { impl_->start(); }
     void ClusterManager::close() { impl_->close(); }
     NodeRole ClusterManager::role() const noexcept { return impl_->role(); }
-    uint64_t ClusterManager::self_node_id() const noexcept { return impl_->self_node_id(); }
-    std::string ClusterManager::primary_host() const { return impl_->primary_host(); }
-    uint16_t ClusterManager::primary_repl_port() const { return impl_->primary_repl_port(); }
-    bool ClusterManager::is_standalone() const noexcept { return impl_->is_standalone(); }
+    uint64_t ClusterManager::selfNodeId() const noexcept { return impl_->selfNodeId(); }
+    std::string ClusterManager::primaryHost() const { return impl_->primaryHost(); }
+    uint16_t ClusterManager::primaryReplPort() const { return impl_->primaryReplPort(); }
+    bool ClusterManager::isStandalone() const noexcept { return impl_->isStandalone(); }
 } // namespace akkaradb::engine::cluster

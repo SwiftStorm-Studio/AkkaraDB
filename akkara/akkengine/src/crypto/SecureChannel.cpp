@@ -36,261 +36,247 @@ namespace akkaradb::crypto {
         constexpr std::string_view NONCE_CONTEXT = "transport-nonce";
 
         struct DerivedKeys {
-            SecretKey initiator_to_responder{};
-            SecretKey responder_to_initiator{};
-            SecretKey handshake_auth_key{};
+            SecretKey initiatorToResponder{};
+            SecretKey responderToInitiator{};
+            SecretKey handshakeAuthKey{};
         };
 
-        void append(std::vector<std::uint8_t>& out, std::string_view value) {
-            out.insert(out.end(), value.begin(), value.end());
-        }
+        void append(std::vector<std::uint8_t>& out, std::string_view value) { out.insert(out.end(), value.begin(), value.end()); }
 
         void append(std::vector<std::uint8_t>& out, const std::uint8_t* data, std::size_t size) {
             out.insert(out.end(), data, data + size);
         }
 
         template <typename T>
-        void append(std::vector<std::uint8_t>& out, const T& value) {
-            append(out, value.data(), value.size());
+        void append(std::vector<std::uint8_t>& out, const T& value) { append(out, value.data(), value.size()); }
+
+        void appendU64Le(std::vector<std::uint8_t>& out, std::uint64_t value) {
+            for (int i = 0; i < 8; ++i) { out.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu)); }
         }
 
-        void append_u64_le(std::vector<std::uint8_t>& out, std::uint64_t value) {
-            for (int i = 0; i < 8; ++i) {
-                out.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu));
-            }
-        }
-
-        [[nodiscard]] SecretKey x25519_checked(const SecretKey& secret_key, const PublicKey& public_key) {
+        [[nodiscard]] SecretKey x25519Checked(const SecretKey& secretKey, const PublicKey& publicKey) {
             SecretKey shared{};
-            crypto_x25519(shared.data(), secret_key.data(), public_key.data());
+            crypto_x25519(shared.data(), secretKey.data(), publicKey.data());
 
             const std::array<std::uint8_t, 32> zeros{};
             if (crypto_verify32(shared.data(), zeros.data()) == 0) {
-                secure_wipe(shared);
+                secureWipe(shared);
                 throw std::runtime_error("SecureChannel: invalid low-order X25519 shared secret");
             }
             return shared;
         }
 
-        void keyed_hash(
-            std::span<std::uint8_t> out,
-            const std::array<std::uint8_t, 64>& key,
-            const std::vector<std::uint8_t>& message
-        ) {
-            auto mutable_key = key;
+        void keyedHash(std::span<std::uint8_t> out, const std::array<std::uint8_t, 64>& key, const std::vector<std::uint8_t>& message) {
+            auto mutableKey = key;
             crypto_blake2b_keyed(
                 out.data(),
                 out.size(),
-                mutable_key.data(),
-                mutable_key.size(),
+                mutableKey.data(),
+                mutableKey.size(),
                 message.empty() ? nullptr : message.data(),
                 message.size()
             );
-            secure_wipe(mutable_key);
+            secureWipe(mutableKey);
         }
 
-        [[nodiscard]] DerivedKeys derive_keys(
-            const PublicKey& initiator_static,
-            const PublicKey& responder_static,
-            const PublicKey& initiator_ephemeral,
-            const PublicKey& responder_ephemeral,
-            const SecretKey& dh_ee,
-            const SecretKey& dh_es,
-            const SecretKey& dh_se,
-            const SecretKey& dh_ss
+        [[nodiscard]] DerivedKeys deriveKeys(
+            const PublicKey& initiatorStatic,
+            const PublicKey& responderStatic,
+            const PublicKey& initiatorEphemeral,
+            const PublicKey& responderEphemeral,
+            const SecretKey& dhEe,
+            const SecretKey& dhEs,
+            const SecretKey& dhSe,
+            const SecretKey& dhSs
         ) {
-            std::vector<std::uint8_t> extract_input;
-            append(extract_input, PROTOCOL_NAME);
-            append(extract_input, initiator_static);
-            append(extract_input, responder_static);
-            append(extract_input, initiator_ephemeral);
-            append(extract_input, responder_ephemeral);
-            append(extract_input, dh_ee);
-            append(extract_input, dh_es);
-            append(extract_input, dh_se);
-            append(extract_input, dh_ss);
+            std::vector<std::uint8_t> extractInput;
+            append(extractInput, PROTOCOL_NAME);
+            append(extractInput, initiatorStatic);
+            append(extractInput, responderStatic);
+            append(extractInput, initiatorEphemeral);
+            append(extractInput, responderEphemeral);
+            append(extractInput, dhEe);
+            append(extractInput, dhEs);
+            append(extractInput, dhSe);
+            append(extractInput, dhSs);
 
             std::array<std::uint8_t, 64> prk{};
-            crypto_blake2b(prk.data(), prk.size(), extract_input.data(), extract_input.size());
+            crypto_blake2b(prk.data(), prk.size(), extractInput.data(), extractInput.size());
 
             auto expand = [&prk](std::string_view label) {
                 SecretKey out{};
                 std::vector<std::uint8_t> info;
                 append(info, PROTOCOL_NAME);
                 append(info, label);
-                keyed_hash(out, prk, info);
+                keyedHash(out, prk, info);
                 return out;
             };
 
-            DerivedKeys keys{
-                expand("initiator-to-responder"),
-                expand("responder-to-initiator"),
-                expand("handshake-auth"),
-            };
-            secure_wipe(prk);
+            DerivedKeys keys{expand("initiator-to-responder"), expand("responder-to-initiator"), expand("handshake-auth"),};
+            secureWipe(prk);
             return keys;
         }
 
-        [[nodiscard]] std::vector<std::uint8_t> transcript_for_auth(
-            const ClientHello& client_hello,
-            const ServerHello& server_hello_without_tag
+        [[nodiscard]] std::vector<std::uint8_t> transcriptForAuth(
+            const ClientHello& clientHello,
+            const ServerHello& serverHelloWithoutTag
         ) {
             std::vector<std::uint8_t> transcript;
             append(transcript, PROTOCOL_NAME);
-            append(transcript, client_hello.static_public_key);
-            append(transcript, client_hello.ephemeral_public_key);
-            append(transcript, server_hello_without_tag.static_public_key);
-            append(transcript, server_hello_without_tag.ephemeral_public_key);
+            append(transcript, clientHello.staticPublicKey);
+            append(transcript, clientHello.ephemeralPublicKey);
+            append(transcript, serverHelloWithoutTag.staticPublicKey);
+            append(transcript, serverHelloWithoutTag.ephemeralPublicKey);
             append(transcript, SERVER_FINISHED);
             return transcript;
         }
 
-        [[nodiscard]] AeadTag server_authenticator(const SecretKey& handshake_auth_key, const ClientHello& client, const ServerHello& server) {
-            std::array<std::uint8_t, 64> expanded_key{};
-            std::copy(handshake_auth_key.begin(), handshake_auth_key.end(), expanded_key.begin());
-            const auto transcript = transcript_for_auth(client, server);
+        [[nodiscard]] AeadTag serverAuthenticator(const SecretKey& handshakeAuthKey, const ClientHello& client, const ServerHello& server) {
+            std::array<std::uint8_t, 64> expandedKey{};
+            std::copy(handshakeAuthKey.begin(), handshakeAuthKey.end(), expandedKey.begin());
+            const auto transcript = transcriptForAuth(client, server);
 
             AeadTag tag{};
-            keyed_hash(tag, expanded_key, transcript);
-            secure_wipe(expanded_key);
+            keyedHash(tag, expandedKey, transcript);
+            secureWipe(expandedKey);
             return tag;
         }
 
-        [[nodiscard]] std::array<std::uint8_t, 24> derive_nonce(const SecretKey& key, std::uint64_t counter) {
+        [[nodiscard]] std::array<std::uint8_t, 24> deriveNonce(const SecretKey& key, std::uint64_t counter) {
             std::vector<std::uint8_t> info;
             append(info, PROTOCOL_NAME);
             append(info, NONCE_CONTEXT);
-            append_u64_le(info, counter);
+            appendU64Le(info, counter);
 
-            auto mutable_key = key;
+            auto mutableKey = key;
             std::array<std::uint8_t, 24> nonce{};
-            crypto_blake2b_keyed(nonce.data(), nonce.size(), mutable_key.data(), mutable_key.size(), info.data(), info.size());
-            secure_wipe(mutable_key);
+            crypto_blake2b_keyed(nonce.data(), nonce.size(), mutableKey.data(), mutableKey.size(), info.data(), info.size());
+            secureWipe(mutableKey);
             return nonce;
         }
 
-        [[nodiscard]] DerivedKeys derive_for_initiator(
-            const NodeIdentity& local_identity,
-            const SecretKey& local_ephemeral_secret,
-            const ClientHello& client_hello,
-            const ServerHello& server_hello
+        [[nodiscard]] DerivedKeys deriveForInitiator(
+            const NodeIdentity& localIdentity,
+            const SecretKey& localEphemeralSecret,
+            const ClientHello& clientHello,
+            const ServerHello& serverHello
         ) {
-            auto dh_ee = x25519_checked(local_ephemeral_secret, server_hello.ephemeral_public_key);
-            auto dh_es = x25519_checked(local_ephemeral_secret, server_hello.static_public_key);
-            auto dh_se = x25519_checked(local_identity.secret_key, server_hello.ephemeral_public_key);
-            auto dh_ss = x25519_checked(local_identity.secret_key, server_hello.static_public_key);
+            auto dhEe = x25519Checked(localEphemeralSecret, serverHello.ephemeralPublicKey);
+            auto dhEs = x25519Checked(localEphemeralSecret, serverHello.staticPublicKey);
+            auto dhSe = x25519Checked(localIdentity.secretKey, serverHello.ephemeralPublicKey);
+            auto dhSs = x25519Checked(localIdentity.secretKey, serverHello.staticPublicKey);
 
-            auto keys = derive_keys(
-                client_hello.static_public_key,
-                server_hello.static_public_key,
-                client_hello.ephemeral_public_key,
-                server_hello.ephemeral_public_key,
-                dh_ee,
-                dh_es,
-                dh_se,
-                dh_ss
+            auto keys = deriveKeys(
+                clientHello.staticPublicKey,
+                serverHello.staticPublicKey,
+                clientHello.ephemeralPublicKey,
+                serverHello.ephemeralPublicKey,
+                dhEe,
+                dhEs,
+                dhSe,
+                dhSs
             );
 
-            secure_wipe(dh_ee);
-            secure_wipe(dh_es);
-            secure_wipe(dh_se);
-            secure_wipe(dh_ss);
+            secureWipe(dhEe);
+            secureWipe(dhEs);
+            secureWipe(dhSe);
+            secureWipe(dhSs);
             return keys;
         }
 
-        [[nodiscard]] DerivedKeys derive_for_responder(
-            const NodeIdentity& local_identity,
-            const SecretKey& local_ephemeral_secret,
-            const ClientHello& client_hello,
-            const ServerHello& server_hello
+        [[nodiscard]] DerivedKeys deriveForResponder(
+            const NodeIdentity& localIdentity,
+            const SecretKey& localEphemeralSecret,
+            const ClientHello& clientHello,
+            const ServerHello& serverHello
         ) {
-            auto dh_ee = x25519_checked(local_ephemeral_secret, client_hello.ephemeral_public_key);
-            auto dh_es = x25519_checked(local_identity.secret_key, client_hello.ephemeral_public_key);
-            auto dh_se = x25519_checked(local_ephemeral_secret, client_hello.static_public_key);
-            auto dh_ss = x25519_checked(local_identity.secret_key, client_hello.static_public_key);
+            auto dhEe = x25519Checked(localEphemeralSecret, clientHello.ephemeralPublicKey);
+            auto dhEs = x25519Checked(localIdentity.secretKey, clientHello.ephemeralPublicKey);
+            auto dhSe = x25519Checked(localEphemeralSecret, clientHello.staticPublicKey);
+            auto dhSs = x25519Checked(localIdentity.secretKey, clientHello.staticPublicKey);
 
-            auto keys = derive_keys(
-                client_hello.static_public_key,
-                server_hello.static_public_key,
-                client_hello.ephemeral_public_key,
-                server_hello.ephemeral_public_key,
-                dh_ee,
-                dh_es,
-                dh_se,
-                dh_ss
+            auto keys = deriveKeys(
+                clientHello.staticPublicKey,
+                serverHello.staticPublicKey,
+                clientHello.ephemeralPublicKey,
+                serverHello.ephemeralPublicKey,
+                dhEe,
+                dhEs,
+                dhSe,
+                dhSs
             );
 
-            secure_wipe(dh_ee);
-            secure_wipe(dh_es);
-            secure_wipe(dh_se);
-            secure_wipe(dh_ss);
+            secureWipe(dhEe);
+            secureWipe(dhEs);
+            secureWipe(dhSe);
+            secureWipe(dhSs);
             return keys;
         }
     } // namespace
 
     SecureSession::~SecureSession() {
-        secure_wipe(send_key_);
-        secure_wipe(recv_key_);
+        secureWipe(sendKey_);
+        secureWipe(recvKey_);
     }
 
     SecureSession::SecureSession(SecureSession&& other) noexcept
-        : send_key_(other.send_key_),
-          recv_key_(other.recv_key_),
-          send_counter_(other.send_counter_),
-          recv_counter_(other.recv_counter_),
+        : sendKey_(other.sendKey_),
+          recvKey_(other.recvKey_),
+          sendCounter_(other.sendCounter_),
+          recvCounter_(other.recvCounter_),
           valid_(other.valid_) {
-        secure_wipe(other.send_key_);
-        secure_wipe(other.recv_key_);
+        secureWipe(other.sendKey_);
+        secureWipe(other.recvKey_);
         other.valid_ = false;
-        other.send_counter_ = 0;
-        other.recv_counter_ = 0;
+        other.sendCounter_ = 0;
+        other.recvCounter_ = 0;
     }
 
     SecureSession& SecureSession::operator=(SecureSession&& other) noexcept {
         if (this != &other) {
-            secure_wipe(send_key_);
-            secure_wipe(recv_key_);
-            send_key_ = other.send_key_;
-            recv_key_ = other.recv_key_;
-            send_counter_ = other.send_counter_;
-            recv_counter_ = other.recv_counter_;
+            secureWipe(sendKey_);
+            secureWipe(recvKey_);
+            sendKey_ = other.sendKey_;
+            recvKey_ = other.recvKey_;
+            sendCounter_ = other.sendCounter_;
+            recvCounter_ = other.recvCounter_;
             valid_ = other.valid_;
 
-            secure_wipe(other.send_key_);
-            secure_wipe(other.recv_key_);
+            secureWipe(other.sendKey_);
+            secureWipe(other.recvKey_);
             other.valid_ = false;
-            other.send_counter_ = 0;
-            other.recv_counter_ = 0;
+            other.sendCounter_ = 0;
+            other.recvCounter_ = 0;
         }
         return *this;
     }
 
-    SecureSession::SecureSession(SecretKey initiator_to_responder, SecretKey responder_to_initiator, Role role) {
-        if (role == Role::Initiator) {
-            send_key_ = initiator_to_responder;
-            recv_key_ = responder_to_initiator;
+    SecureSession::SecureSession(SecretKey initiatorToResponder, SecretKey responderToInitiator, Role role) {
+        if (role == Role::INITIATOR) {
+            sendKey_ = initiatorToResponder;
+            recvKey_ = responderToInitiator;
         }
         else {
-            send_key_ = responder_to_initiator;
-            recv_key_ = initiator_to_responder;
+            sendKey_ = responderToInitiator;
+            recvKey_ = initiatorToResponder;
         }
         valid_ = true;
-        secure_wipe(initiator_to_responder);
-        secure_wipe(responder_to_initiator);
+        secureWipe(initiatorToResponder);
+        secureWipe(responderToInitiator);
     }
 
     EncryptedFrame SecureSession::seal(BytesView plaintext, BytesView aad) {
         if (!valid_) { throw std::runtime_error("SecureSession::seal on invalid session"); }
 
         EncryptedFrame frame;
-        frame.counter = send_counter_++;
+        frame.counter = sendCounter_++;
         frame.ciphertext.resize(plaintext.size());
 
-        const auto nonce = derive_nonce(send_key_, frame.counter);
+        const auto nonce = deriveNonce(sendKey_, frame.counter);
         crypto_aead_lock(
             frame.ciphertext.empty() ? nullptr : frame.ciphertext.data(),
             frame.tag.data(),
-            send_key_.data(),
+            sendKey_.data(),
             nonce.data(),
             aad.empty() ? nullptr : aad.data(),
             aad.size(),
@@ -301,14 +287,14 @@ namespace akkaradb::crypto {
     }
 
     bool SecureSession::open(const EncryptedFrame& frame, std::vector<std::uint8_t>& plaintext, BytesView aad) {
-        if (!valid_ || frame.counter != recv_counter_) { return false; }
+        if (!valid_ || frame.counter != recvCounter_) { return false; }
 
         std::vector<std::uint8_t> out(frame.ciphertext.size());
-        const auto nonce = derive_nonce(recv_key_, frame.counter);
+        const auto nonce = deriveNonce(recvKey_, frame.counter);
         const int rc = crypto_aead_unlock(
             out.empty() ? nullptr : out.data(),
             frame.tag.data(),
-            recv_key_.data(),
+            recvKey_.data(),
             nonce.data(),
             aad.empty() ? nullptr : aad.data(),
             aad.size(),
@@ -317,68 +303,69 @@ namespace akkaradb::crypto {
         );
         if (rc != 0) { return false; }
 
-        ++recv_counter_;
+        ++recvCounter_;
         plaintext = std::move(out);
         return true;
     }
 
-    NoiseInitiator::NoiseInitiator(const NodeIdentity& local_identity) : local_identity_(local_identity) {
-        secure_random(ephemeral_secret_);
-        hello_.static_public_key = local_identity_.public_key;
-        crypto_x25519_public_key(hello_.ephemeral_public_key.data(), ephemeral_secret_.data());
+    NoiseInitiator::NoiseInitiator(const NodeIdentity& localIdentity)
+        : localIdentity_(localIdentity) {
+        secureRandom(ephemeralSecret_);
+        hello_.staticPublicKey = localIdentity_.publicKey;
+        crypto_x25519_public_key(hello_.ephemeralPublicKey.data(), ephemeralSecret_.data());
     }
 
-    SecureSession NoiseInitiator::finish(const ServerHello& hello, const std::optional<PublicKey>& expected_remote) {
+    SecureSession NoiseInitiator::finish(const ServerHello& hello, const std::optional<PublicKey>& expectedRemote) {
         if (finished_) { throw std::runtime_error("NoiseInitiator::finish called twice"); }
-        if (expected_remote && hello.static_public_key != *expected_remote) {
+        if (expectedRemote && hello.staticPublicKey != *expectedRemote) {
             throw std::runtime_error("NoiseInitiator: unexpected responder public key");
         }
 
-        auto keys = derive_for_initiator(local_identity_, ephemeral_secret_, hello_, hello);
-        const auto expected_tag = server_authenticator(keys.handshake_auth_key, hello_, hello);
-        if (crypto_verify16(expected_tag.data(), hello.authenticator.data()) != 0) {
-            secure_wipe(keys.initiator_to_responder);
-            secure_wipe(keys.responder_to_initiator);
-            secure_wipe(keys.handshake_auth_key);
+        auto keys = deriveForInitiator(localIdentity_, ephemeralSecret_, hello_, hello);
+        const auto expectedTag = serverAuthenticator(keys.handshakeAuthKey, hello_, hello);
+        if (crypto_verify16(expectedTag.data(), hello.authenticator.data()) != 0) {
+            secureWipe(keys.initiatorToResponder);
+            secureWipe(keys.responderToInitiator);
+            secureWipe(keys.handshakeAuthKey);
             throw std::runtime_error("NoiseInitiator: responder authenticator mismatch");
         }
 
         finished_ = true;
-        secure_wipe(ephemeral_secret_);
-        secure_wipe(keys.handshake_auth_key);
-        return SecureSession(std::move(keys.initiator_to_responder), std::move(keys.responder_to_initiator), SecureSession::Role::Initiator);
+        secureWipe(ephemeralSecret_);
+        secureWipe(keys.handshakeAuthKey);
+        return SecureSession(std::move(keys.initiatorToResponder), std::move(keys.responderToInitiator), SecureSession::Role::INITIATOR);
     }
 
-    ResponderHandshake accept_responder(
-        const NodeIdentity& local_identity,
+    ResponderHandshake acceptResponder(
+        const NodeIdentity& localIdentity,
         const ClientHello& hello,
-        const std::optional<PublicKey>& expected_remote
+        const std::optional<PublicKey>& expectedRemote
     ) {
-        if (expected_remote && hello.static_public_key != *expected_remote) {
-            throw std::runtime_error("accept_responder: unexpected initiator public key");
+        if (expectedRemote && hello.staticPublicKey != *expectedRemote) {
+            throw std::runtime_error("acceptResponder: unexpected initiator public key");
         }
 
-        SecretKey ephemeral_secret{};
-        secure_random(ephemeral_secret);
+        SecretKey ephemeralSecret{};
+        secureRandom(ephemeralSecret);
 
         ResponderHandshake result;
-        result.hello.static_public_key = local_identity.public_key;
-        crypto_x25519_public_key(result.hello.ephemeral_public_key.data(), ephemeral_secret.data());
+        result.hello.staticPublicKey = localIdentity.publicKey;
+        crypto_x25519_public_key(result.hello.ephemeralPublicKey.data(), ephemeralSecret.data());
 
-        auto keys = derive_for_responder(local_identity, ephemeral_secret, hello, result.hello);
-        result.hello.authenticator = server_authenticator(keys.handshake_auth_key, hello, result.hello);
+        auto keys = deriveForResponder(localIdentity, ephemeralSecret, hello, result.hello);
+        result.hello.authenticator = serverAuthenticator(keys.handshakeAuthKey, hello, result.hello);
 
-        result.remote_static_public_key = hello.static_public_key;
-        result.remote_fingerprint = fingerprint_public_key(hello.static_public_key);
-        result.remote_node_id = node_id_from_public_key(hello.static_public_key);
+        result.remoteStaticPublicKey = hello.staticPublicKey;
+        result.remoteFingerprint = fingerprintPublicKey(hello.staticPublicKey);
+        result.remoteNodeId = nodeIdFromPublicKey(hello.staticPublicKey);
         result.session = SecureSession(
-            std::move(keys.initiator_to_responder),
-            std::move(keys.responder_to_initiator),
-            SecureSession::Role::Responder
+            std::move(keys.initiatorToResponder),
+            std::move(keys.responderToInitiator),
+            SecureSession::Role::RESPONDER
         );
 
-        secure_wipe(ephemeral_secret);
-        secure_wipe(keys.handshake_auth_key);
+        secureWipe(ephemeralSecret);
+        secureWipe(keys.handshakeAuthKey);
         return result;
     }
 } // namespace akkaradb::crypto

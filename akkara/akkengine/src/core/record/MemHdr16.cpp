@@ -19,18 +19,18 @@
 // akkengine/src/core/record/MemHdr16.cpp
 #include "akk/core/record/MemHdr16.hpp"
 
-#include <cassert>
 #include <limits>
+#include <stdexcept>
 
 namespace akkaradb::core {
-    MemHdr16 MemHdr16::create(size_t key_len, size_t value_len, uint64_t seq, uint8_t flags) noexcept {
-        assert(key_len <= std::numeric_limits<uint16_t>::max() && "MemHdr16::create: key_len exceeds u16 range");
-        assert(value_len <= std::numeric_limits<uint16_t>::max() && "MemHdr16::create: value_len exceeds u16 range");
-        assert((flags & ~(FLAG_TOMBSTONE | FLAG_BLOB)) == 0 && "MemHdr16::create: invalid flags");
+    MemHdr16 MemHdr16::create(size_t keyLen, size_t valueLen, uint64_t seq, uint8_t flags) {
+        if (keyLen > std::numeric_limits<uint16_t>::max()) { throw std::length_error("MemHdr16::create: keyLen exceeds u16 range"); }
+        if (valueLen > std::numeric_limits<uint16_t>::max()) { throw std::length_error("MemHdr16::create: valueLen exceeds u16 range"); }
+        if ((flags & ~(FLAG_TOMBSTONE | FLAG_BLOB)) != 0) { throw std::invalid_argument("MemHdr16::create: invalid flags"); }
         return MemHdr16{
             .seq = seq,
-            .k_len = static_cast<uint16_t>(key_len),
-            .v_len = static_cast<uint16_t>(value_len),
+            .kLen = static_cast<uint16_t>(keyLen),
+            .vLen = static_cast<uint16_t>(valueLen),
             .flags = flags,
             .version = CURRENT_VERSION,
             .reserved = 0

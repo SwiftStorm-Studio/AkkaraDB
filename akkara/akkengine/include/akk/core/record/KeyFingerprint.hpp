@@ -31,17 +31,17 @@ namespace akkaradb::core {
      * seed.  The fingerprint is an optimization hint only; callers must still
      * compare full keys for correctness.
      *
-     * @param key     Pointer to key bytes. May be null only when key_len == 0.
-     * @param key_len Key length in bytes.
+     * @param key     Pointer to key bytes. May be null only when keyLen == 0.
+     * @param keyLen Key length in bytes.
      * @return 64-bit key fingerprint.
      */
-    [[nodiscard]] uint64_t compute_key_fp64(const uint8_t* key, size_t key_len) noexcept;
+    [[nodiscard]] uint64_t computeKeyFp64(const uint8_t* key, size_t keyLen) noexcept;
 
     /**
      * Computes the 64-bit fingerprint used for fast key rejection.
      */
-    [[nodiscard]] inline uint64_t compute_key_fp64(std::span<const uint8_t> key) noexcept {
-        return key.empty() ? 0ULL : compute_key_fp64(key.data(), key.size());
+    [[nodiscard]] inline uint64_t computeKeyFp64(std::span<const uint8_t> key) noexcept {
+        return key.empty() ? 0ULL : computeKeyFp64(key.data(), key.size());
     }
 
     /**
@@ -50,14 +50,16 @@ namespace akkaradb::core {
      * Bytes are packed little-endian.  Missing bytes are zero-filled when the
      * key is shorter than eight bytes.
      *
-     * @param key     Pointer to key bytes. May be null only when key_len == 0.
-     * @param key_len Key length in bytes.
+     * @param key     Pointer to key bytes. May be null only when keyLen == 0.
+     * @param keyLen Key length in bytes.
      * @return 64-bit mini-key prefix hint.
      */
-    [[nodiscard]] uint64_t build_mini_key(const uint8_t* key, size_t key_len) noexcept;
+    [[nodiscard]] uint64_t buildMiniKey(const uint8_t* key, size_t keyLen) noexcept;
 
     /**
      * Builds the mini-key prefix hint from the first up to eight key bytes.
      */
-    [[nodiscard]] inline uint64_t build_mini_key(std::span<const uint8_t> key) noexcept { return key.empty() ? 0ULL : build_mini_key(key.data(), key.size()); }
+    [[nodiscard]] inline uint64_t buildMiniKey(std::span<const uint8_t> key) noexcept {
+        return key.empty() ? 0ULL : buildMiniKey(key.data(), key.size());
+    }
 } // namespace akkaradb::core

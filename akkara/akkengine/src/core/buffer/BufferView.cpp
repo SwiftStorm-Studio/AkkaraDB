@@ -31,20 +31,20 @@ namespace akkaradb::core {
     // ==================== Slice ====================
 
     BufferView BufferView::slice(size_t offset, size_t length) const {
-        check_bounds(offset, length);
+        checkBounds(offset, length);
         const std::byte* start = (size_ == 0) ? data_ : data_ + offset;
         return BufferView{start, length};
     }
 
     BufferView BufferView::slice(size_t offset) const {
-        check_bounds(offset, 0);
+        checkBounds(offset, 0);
         const std::byte* start = (size_ == 0) ? data_ : data_ + offset;
         return BufferView{start, size_ - offset};
     }
 
     // ==================== Ownership ====================
 
-    OwnedBuffer BufferView::to_owned() const {
+    OwnedBuffer BufferView::toOwned() const {
         if (size_ == 0) { return OwnedBuffer::allocate(0); }
 
         auto out = OwnedBuffer::allocate(size_);
@@ -54,27 +54,27 @@ namespace akkaradb::core {
 
     // ==================== Little-Endian Reads ====================
 
-    uint8_t BufferView::read_u8(size_t offset) const {
-        check_bounds(offset, 1);
+    uint8_t BufferView::readU8(size_t offset) const {
+        checkBounds(offset, 1);
         return static_cast<uint8_t>(data_[offset]);
     }
 
-    uint16_t BufferView::read_u16_le(size_t offset) const {
-        check_bounds(offset, 2);
+    uint16_t BufferView::readU16Le(size_t offset) const {
+        checkBounds(offset, 2);
         uint16_t v;
         std::memcpy(&v, data_ + offset, sizeof(v));
         return v;
     }
 
-    uint32_t BufferView::read_u32_le(size_t offset) const {
-        check_bounds(offset, 4);
+    uint32_t BufferView::readU32Le(size_t offset) const {
+        checkBounds(offset, 4);
         uint32_t v;
         std::memcpy(&v, data_ + offset, sizeof(v));
         return v;
     }
 
-    uint64_t BufferView::read_u64_le(size_t offset) const {
-        check_bounds(offset, 8);
+    uint64_t BufferView::readU64Le(size_t offset) const {
+        checkBounds(offset, 8);
         uint64_t v;
         std::memcpy(&v, data_ + offset, sizeof(v));
         return v;
@@ -83,22 +83,22 @@ namespace akkaradb::core {
     // ==================== CRC32C ====================
 
     uint32_t BufferView::crc32c(size_t offset, size_t length) const {
-        check_bounds(offset, length);
+        checkBounds(offset, length);
         const std::byte* start = (length == 0) ? data_ : data_ + offset;
         return cpu::CRC32C(start, length);
     }
 
     // ==================== String ====================
 
-    std::string_view BufferView::as_string_view(size_t offset, size_t length) const {
-        check_bounds(offset, length);
+    std::string_view BufferView::asStringView(size_t offset, size_t length) const {
+        checkBounds(offset, length);
         const std::byte* start = (length == 0) ? data_ : data_ + offset;
         return {reinterpret_cast<const char*>(start), length};
     }
 
     // ==================== Bounds ====================
 
-    void BufferView::check_bounds(size_t offset, size_t length) const {
+    void BufferView::checkBounds(size_t offset, size_t length) const {
         if (offset > size_ || length > size_ - offset) { throw std::out_of_range("BufferView: out of range"); }
     }
 } // namespace akkaradb::core

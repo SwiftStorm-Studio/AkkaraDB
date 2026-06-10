@@ -28,7 +28,7 @@ namespace akkaradb::core {
      * Characteristics:
      * - allocate(size, align) only
      * - no per-allocation free
-     * - reset() rewinds all blocks in O(num_blocks)
+     * - reset() rewinds all blocks in O(numBlocks)
      * - thread-unsafe by design
      *
      * Intended usage:
@@ -40,7 +40,7 @@ namespace akkaradb::core {
             static constexpr size_t DEFAULT_INITIAL_BLOCK_SIZE = 64 * 1024;
             static constexpr size_t DEFAULT_MAX_BLOCK_SIZE = 4 * 1024 * 1024;
 
-            explicit BufferArena(size_t initial_block_size = DEFAULT_INITIAL_BLOCK_SIZE, size_t max_block_size = DEFAULT_MAX_BLOCK_SIZE);
+            explicit BufferArena(size_t initialBlockSize = DEFAULT_INITIAL_BLOCK_SIZE, size_t maxBlockSize = DEFAULT_MAX_BLOCK_SIZE);
 
             ~BufferArena() noexcept;
 
@@ -79,17 +79,16 @@ namespace akkaradb::core {
                 Block* next;
             };
 
-            size_t initial_block_size_;
-            size_t next_block_size_;
-            size_t max_block_size_;
+            size_t initialBlockSize_;
+            size_t nextBlockSize_;
+            size_t maxBlockSize_;
             Block* head_;
             Block* tail_;
             Block* current_;
 
-            [[nodiscard]] static bool is_power_of_two(size_t x) noexcept;
-            [[nodiscard]] static size_t align_up(size_t x, size_t align) noexcept;
-            [[nodiscard]] Block* create_block(size_t capacity, size_t alignment);
-            [[nodiscard]] static std::byte* try_allocate_from_block(Block* block, size_t size, size_t align) noexcept;
+            [[nodiscard]] static bool isPowerOfTwo(size_t x) noexcept;
+            [[nodiscard]] static size_t alignUp(size_t x, size_t align) noexcept;
+            [[nodiscard]] Block* createBlock(size_t capacity, size_t alignment);
+            [[nodiscard]] static std::byte* tryAllocateFromBlock(Block* block, size_t size, size_t align) noexcept;
     };
 } // namespace akkaradb::core
-

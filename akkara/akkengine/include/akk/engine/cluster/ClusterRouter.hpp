@@ -49,7 +49,7 @@ namespace akkaradb::engine::cluster {
              * @throws std::runtime_error if routing requires a data-bearing node
              *         but none is configured.
              */
-            [[nodiscard]] std::vector<NodeInfo> write_targets(std::span<const uint8_t> key) const;
+            [[nodiscard]] std::vector<NodeInfo> writeTargets(std::span<const uint8_t> key) const;
 
             /**
              * Returns nodes that can satisfy a read for key.
@@ -60,13 +60,13 @@ namespace akkaradb::engine::cluster {
              * @throws std::runtime_error if routing requires a data-bearing node
              *         but none is configured.
              */
-            [[nodiscard]] std::vector<NodeInfo> read_candidates(std::span<const uint8_t> key) const;
+            [[nodiscard]] std::vector<NodeInfo> readCandidates(std::span<const uint8_t> key) const;
 
         private:
             /** Returns the rendezvous-hash owner for key in Stripe mode. */
-            [[nodiscard]] NodeInfo stripe_target(std::span<const uint8_t> key) const;
+            [[nodiscard]] NodeInfo stripeTarget(std::span<const uint8_t> key) const;
 
             ClusterConfig config_;
-            std::vector<NodeInfo> data_nodes_;
+            std::vector<NodeInfo> dataNodes_;
     };
 } // namespace akkaradb::engine::cluster

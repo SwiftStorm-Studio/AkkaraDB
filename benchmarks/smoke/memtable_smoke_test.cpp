@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// benchmarks/smoke/memtable_smoke_test.cpp
+// benchmarks/smoke/memtableSmokeTest.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/core/record/RecordView.hpp"
@@ -42,13 +42,14 @@
 
 using namespace akkaradb::core;
 using namespace akkaradb::engine;
+using namespace akkaradb::engine::memtable;
 
 namespace {
-    static std::span<const uint8_t> as_u8(std::string_view sv) {
+    static std::span<const uint8_t> asU8(std::string_view sv) {
         return {reinterpret_cast<const uint8_t*>(sv.data()), sv.size()};
     }
 
-    static ByteView as_bv(std::string_view sv) {
+    static ByteView asBv(std::string_view sv) {
         return {reinterpret_cast<const std::byte*>(sv.data()), sv.size()};
     }
 
@@ -58,87 +59,87 @@ namespace {
 
     using BackendFactory = std::function<std::unique_ptr<IMemTable>()>;
 
-    static void run_contract_tests_for_backend(const BackendFactory& make_backend) {
+    static void runContractTestsForBackend(const BackendFactory& makeBackend) {
         {
-            auto memtable = make_backend();
+            auto memtable = makeBackend();
             RecordView out;
 
-            assert(memtable->put(as_bv("k"), as_bv("v1"), 1, 0).ok());
-            assert(memtable->put(as_bv("k"), as_bv("v2"), 2, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("k"), asBv("v1"), 1, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("k"), asBv("v2"), 2, 0).ok());
 
-            assert(memtable->get(as_bv("k"), 1, &out));
-            assert(to_string(out.value()) == "v1");
+            AKK_TEST_CHECK(memtable->get(asBv("k"), 1, &out));
+            AKK_TEST_CHECK(to_string(out.value()) == "v1");
 
-            assert(memtable->get(as_bv("k"), 2, &out));
-            assert(to_string(out.value()) == "v2");
+            AKK_TEST_CHECK(memtable->get(asBv("k"), 2, &out));
+            AKK_TEST_CHECK(to_string(out.value()) == "v2");
         }
 
         {
-            auto memtable = make_backend();
+            auto memtable = makeBackend();
             RecordView out;
 
-            assert(memtable->put(as_bv("key"), as_bv("v1"), 1, 0).ok());
-            assert(memtable->put(as_bv("key"), as_bv("v2"), 2, 0).ok());
-            assert(memtable->put(as_bv("key"), as_bv("v3"), 3, 0).ok());
-            assert(memtable->put(as_bv("key"), as_bv("v4"), 4, 0).ok());
-            assert(memtable->put(as_bv("key"), as_bv("v5"), 5, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("key"), asBv("v1"), 1, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("key"), asBv("v2"), 2, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("key"), asBv("v3"), 3, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("key"), asBv("v4"), 4, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("key"), asBv("v5"), 5, 0).ok());
 
-            assert(!memtable->get(as_bv("key"), 1, &out));
-            assert(memtable->get(as_bv("key"), 2, &out));
-            assert(to_string(out.value()) == "v2");
-            assert(memtable->get(as_bv("key"), 5, &out));
-            assert(to_string(out.value()) == "v5");
-            assert(memtable->entryCount() == 4);
+            AKK_TEST_CHECK(!memtable->get(asBv("key"), 1, &out));
+            AKK_TEST_CHECK(memtable->get(asBv("key"), 2, &out));
+            AKK_TEST_CHECK(to_string(out.value()) == "v2");
+            AKK_TEST_CHECK(memtable->get(asBv("key"), 5, &out));
+            AKK_TEST_CHECK(to_string(out.value()) == "v5");
+            AKK_TEST_CHECK(memtable->entryCount() == 4);
         }
 
         {
-            auto memtable = make_backend();
+            auto memtable = makeBackend();
             RecordView out;
 
-            assert(memtable->put(as_bv("dead"), as_bv("alive"), 1, 0).ok());
-            assert(memtable->put(as_bv("dead"), ByteView{}, 2, RecordView::FLAG_TOMBSTONE).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("dead"), asBv("alive"), 1, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("dead"), ByteView{}, 2, RecordView::FLAG_TOMBSTONE).ok());
 
-            assert(memtable->get(as_bv("dead"), 2, &out));
-            assert(out.is_tombstone());
+            AKK_TEST_CHECK(memtable->get(asBv("dead"), 2, &out));
+            AKK_TEST_CHECK(out.isTombstone());
         }
 
         {
-            auto memtable = make_backend();
+            auto memtable = makeBackend();
             memtable->freeze();
-            const Status st = memtable->put(as_bv("k"), as_bv("v"), 1, 0);
-            assert(!st.ok());
+            const Status st = memtable->put(asBv("k"), asBv("v"), 1, 0);
+            AKK_TEST_CHECK(!st.ok());
         }
 
         {
-            auto memtable = make_backend();
-            assert(memtable->put(as_bv("b"), as_bv("1"), 1, 0).ok());
-            assert(memtable->put(as_bv("a"), as_bv("2"), 2, 0).ok());
-            assert(memtable->put(as_bv("c"), as_bv("3"), 3, 0).ok());
+            auto memtable = makeBackend();
+            AKK_TEST_CHECK(memtable->put(asBv("b"), asBv("1"), 1, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("a"), asBv("2"), 2, 0).ok());
+            AKK_TEST_CHECK(memtable->put(asBv("c"), asBv("3"), 3, 0).ok());
 
             std::vector<std::string> keys;
             for (const RecordView& rec : memtable->iterator(ByteView{}, ByteView{}, 3)) {
                 keys.emplace_back(reinterpret_cast<const char*>(rec.key().data()), rec.key().size());
             }
 
-            assert(keys.size() == 3);
-            assert(keys[0] == "a");
-            assert(keys[1] == "b");
-            assert(keys[2] == "c");
+            AKK_TEST_CHECK(keys.size() == 3);
+            AKK_TEST_CHECK(keys[0] == "a");
+            AKK_TEST_CHECK(keys[1] == "b");
+            AKK_TEST_CHECK(keys[2] == "c");
         }
     }
 
-    static void run_single_writer_multi_reader_get_stress(const BackendFactory& make_backend) {
-        auto memtable = make_backend();
+    static void runSingleWriterMultiReaderGetStress(const BackendFactory& makeBackend) {
+        auto memtable = makeBackend();
         std::atomic<bool> stop{false};
-        std::atomic<uint64_t> latest_seq{0};
-        std::atomic<uint64_t> read_hits{0};
+        std::atomic<uint64_t> latestSeq{0};
+        std::atomic<uint64_t> readHits{0};
 
         std::thread writer([&]() {
             for (uint64_t seq = 1; seq <= 2000; ++seq) {
                 std::string value = "v" + std::to_string(seq);
-                const Status st = memtable->put(as_bv("shared"), as_bv(value), seq, 0);
-                assert(st.ok());
-                latest_seq.store(seq, std::memory_order_release);
+                const Status st = memtable->put(asBv("shared"), asBv(value), seq, 0);
+                AKK_TEST_CHECK(st.ok());
+                latestSeq.store(seq, std::memory_order_release);
             }
             stop.store(true, std::memory_order_release);
         });
@@ -150,12 +151,12 @@ namespace {
                 RecordView out;
                 size_t spin = 0;
                 while (!stop.load(std::memory_order_acquire)) {
-                    const uint64_t snapshot = latest_seq.load(std::memory_order_acquire);
+                    const uint64_t snapshot = latestSeq.load(std::memory_order_acquire);
                     if (snapshot == 0) {
                         continue;
                     }
-                    if (memtable->get(as_bv("shared"), snapshot, &out)) {
-                        read_hits.fetch_add(1, std::memory_order_relaxed);
+                    if (memtable->get(asBv("shared"), snapshot, &out)) {
+                        readHits.fetch_add(1, std::memory_order_relaxed);
                     }
                     if ((++spin & 0x3FF) == 0) {
                         std::this_thread::yield();
@@ -169,33 +170,33 @@ namespace {
             th.join();
         }
 
-        assert(read_hits.load(std::memory_order_relaxed) > 0);
+        AKK_TEST_CHECK(readHits.load(std::memory_order_relaxed) > 0);
     }
 
-    static void run_writer_iterator_stress(const BackendFactory& make_backend) {
-        auto memtable = make_backend();
+    static void runWriterIteratorStress(const BackendFactory& makeBackend) {
+        auto memtable = makeBackend();
         std::atomic<bool> stop{false};
-        std::atomic<uint64_t> latest_seq{0};
-        std::atomic<uint64_t> iter_steps{0};
+        std::atomic<uint64_t> latestSeq{0};
+        std::atomic<uint64_t> iterSteps{0};
 
         std::thread writer([&]() {
             for (uint64_t seq = 1; seq <= 2000; ++seq) {
                 const std::string key = "k" + std::to_string(seq % 128);
                 const std::string value = "v" + std::to_string(seq);
-                const Status st = memtable->put(as_bv(key), as_bv(value), seq, 0);
-                assert(st.ok());
-                latest_seq.store(seq, std::memory_order_release);
+                const Status st = memtable->put(asBv(key), asBv(value), seq, 0);
+                AKK_TEST_CHECK(st.ok());
+                latestSeq.store(seq, std::memory_order_release);
             }
             stop.store(true, std::memory_order_release);
         });
 
-        std::thread iter_reader([&]() {
+        std::thread iterReader([&]() {
             while (!stop.load(std::memory_order_acquire)) {
-                const uint64_t snapshot = latest_seq.load(std::memory_order_acquire);
+                const uint64_t snapshot = latestSeq.load(std::memory_order_acquire);
                 if (snapshot == 0) {
                     continue;
                 }
-                std::string prev_key;
+                std::string prevKey;
                 bool first = true;
                 for (const RecordView& rec : memtable->iterator(ByteView{}, ByteView{}, snapshot)) {
                     const std::string key{
@@ -203,82 +204,82 @@ namespace {
                         rec.key().size()
                     };
                     if (!first) {
-                        assert(prev_key <= key);
+                        AKK_TEST_CHECK(prevKey <= key);
                     }
-                    assert(rec.seq() <= snapshot);
-                    prev_key = key;
+                    AKK_TEST_CHECK(rec.seq() <= snapshot);
+                    prevKey = key;
                     first = false;
-                    iter_steps.fetch_add(1, std::memory_order_relaxed);
+                    iterSteps.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         });
 
         writer.join();
-        iter_reader.join();
-        assert(iter_steps.load(std::memory_order_relaxed) > 0);
+        iterReader.join();
+        AKK_TEST_CHECK(iterSteps.load(std::memory_order_relaxed) > 0);
     }
 
-    static std::vector<std::string> collect_range_keys(
+    static std::vector<std::string> collectRangeKeys(
         IMemTable& memtable,
         std::string_view start,
         std::string_view end,
-        uint64_t snapshot_seq
+        uint64_t snapshotSeq
     ) {
         std::vector<std::string> keys;
-        for (const RecordView& rec : memtable.iterator(as_bv(start), as_bv(end), snapshot_seq)) {
+        for (const RecordView& rec : memtable.iterator(asBv(start), asBv(end), snapshotSeq)) {
             keys.emplace_back(reinterpret_cast<const char*>(rec.key().data()), rec.key().size());
         }
         return keys;
     }
 
-    static void run_range_boundary_tests_for_backend(const BackendFactory& make_backend) {
-        auto memtable = make_backend();
-        assert(memtable->put(as_bv("a"), as_bv("v1"), 1, 0).ok());
-        assert(memtable->put(as_bv("ab"), as_bv("v2"), 2, 0).ok());
-        assert(memtable->put(as_bv("ac"), as_bv("v3"), 3, 0).ok());
-        assert(memtable->put(as_bv("b"), as_bv("v4"), 4, 0).ok());
+    static void runRangeBoundaryTestsForBackend(const BackendFactory& makeBackend) {
+        auto memtable = makeBackend();
+        AKK_TEST_CHECK(memtable->put(asBv("a"), asBv("v1"), 1, 0).ok());
+        AKK_TEST_CHECK(memtable->put(asBv("ab"), asBv("v2"), 2, 0).ok());
+        AKK_TEST_CHECK(memtable->put(asBv("ac"), asBv("v3"), 3, 0).ok());
+        AKK_TEST_CHECK(memtable->put(asBv("b"), asBv("v4"), 4, 0).ok());
 
         {
-            const auto keys = collect_range_keys(*memtable, "", "", 4);
-            assert((keys == std::vector<std::string>{"a", "ab", "ac", "b"}));
+            const auto keys = collectRangeKeys(*memtable, "", "", 4);
+            AKK_TEST_CHECK((keys == std::vector<std::string>{"a", "ab", "ac", "b"}));
         }
         {
-            const auto keys = collect_range_keys(*memtable, "ab", "", 4);
-            assert((keys == std::vector<std::string>{"ab", "ac", "b"}));
+            const auto keys = collectRangeKeys(*memtable, "ab", "", 4);
+            AKK_TEST_CHECK((keys == std::vector<std::string>{"ab", "ac", "b"}));
         }
         {
-            const auto keys = collect_range_keys(*memtable, "", "ac", 4);
-            assert((keys == std::vector<std::string>{"a", "ab"}));
+            const auto keys = collectRangeKeys(*memtable, "", "ac", 4);
+            AKK_TEST_CHECK((keys == std::vector<std::string>{"a", "ab"}));
         }
         {
-            const auto keys = collect_range_keys(*memtable, "ab", "ab", 4);
-            assert(keys.empty());
+            const auto keys = collectRangeKeys(*memtable, "ab", "ab", 4);
+            AKK_TEST_CHECK(keys.empty());
         }
         {
-            const auto keys = collect_range_keys(*memtable, "ac", "ab", 4);
-            assert(keys.empty());
+            const auto keys = collectRangeKeys(*memtable, "ac", "ab", 4);
+            AKK_TEST_CHECK(keys.empty());
         }
         {
-            const auto keys = collect_range_keys(*memtable, "ab", "ac", 4);
-            assert((keys == std::vector<std::string>{"ab"}));
+            const auto keys = collectRangeKeys(*memtable, "ab", "ac", 4);
+            AKK_TEST_CHECK((keys == std::vector<std::string>{"ab"}));
         }
     }
 
-    void test_generator_yield_all() {
+    void testGeneratorYieldAll() {
         BufferArena arena{16 * 1024, 128 * 1024};
 
-        auto gen1 = ArenaGenerator<int>::with_arena(arena, []() -> ArenaGenerator<int> {
+        auto gen1 = ArenaGenerator<int>::withArena(arena, []() -> ArenaGenerator<int> {
             co_yield 1;
             co_yield 2;
         });
-        auto gen2 = ArenaGenerator<int>::with_arena(arena, []() -> ArenaGenerator<int> {
+        auto gen2 = ArenaGenerator<int>::withArena(arena, []() -> ArenaGenerator<int> {
             co_yield 3;
             co_yield 4;
         });
-        auto gen3 = ArenaGenerator<int>::with_arena(arena, []() -> ArenaGenerator<int> {
+        auto gen3 = ArenaGenerator<int>::withArena(arena, []() -> ArenaGenerator<int> {
             co_yield 5;
         });
-        auto gen4 = ArenaGenerator<int>::with_arena(arena, []() -> ArenaGenerator<int> {
+        auto gen4 = ArenaGenerator<int>::withArena(arena, []() -> ArenaGenerator<int> {
             co_yield 6;
             co_yield 7;
         });
@@ -295,83 +296,83 @@ namespace {
             values.push_back(value);
         }
 
-        assert(values.size() == 7);
-        assert(values[0] == 1);
-        assert(values[1] == 2);
-        assert(values[2] == 3);
-        assert(values[3] == 4);
-        assert(values[4] == 5);
-        assert(values[5] == 6);
-        assert(values[6] == 7);
+        AKK_TEST_CHECK(values.size() == 7);
+        AKK_TEST_CHECK(values[0] == 1);
+        AKK_TEST_CHECK(values[1] == 2);
+        AKK_TEST_CHECK(values[2] == 3);
+        AKK_TEST_CHECK(values[3] == 4);
+        AKK_TEST_CHECK(values[4] == 5);
+        AKK_TEST_CHECK(values[5] == 6);
+        AKK_TEST_CHECK(values[6] == 7);
     }
 
-    void test_backend_contracts_skiplist() {
-        run_contract_tests_for_backend([]() { return std::make_unique<SkipListMemTable>(); });
+    void testBackendContractsSkiplist() {
+        runContractTestsForBackend([]() { return std::make_unique<SkipListMemTable>(); });
     }
 
-    void test_backend_contracts_bptree() {
-        run_contract_tests_for_backend([]() { return std::make_unique<BPTreeMemTable>(); });
+    void testBackendContractsBptree() {
+        runContractTestsForBackend([]() { return std::make_unique<BPTreeMemTable>(); });
     }
 
-    void test_backend_contracts_art() {
-        run_contract_tests_for_backend([]() { return std::make_unique<ARTMemTable>(); });
+    void testBackendContractsArt() {
+        runContractTestsForBackend([]() { return std::make_unique<ARTMemTable>(); });
     }
 
-    void test_backend_single_writer_multi_reader_stress() {
-        run_single_writer_multi_reader_get_stress([]() { return std::make_unique<SkipListMemTable>(); });
-        run_single_writer_multi_reader_get_stress([]() { return std::make_unique<BPTreeMemTable>(); });
-        run_single_writer_multi_reader_get_stress([]() { return std::make_unique<ARTMemTable>(); });
+    void testBackendSingleWriterMultiReaderStress() {
+        runSingleWriterMultiReaderGetStress([]() { return std::make_unique<SkipListMemTable>(); });
+        runSingleWriterMultiReaderGetStress([]() { return std::make_unique<BPTreeMemTable>(); });
+        runSingleWriterMultiReaderGetStress([]() { return std::make_unique<ARTMemTable>(); });
     }
 
-    void test_backend_writer_iterator_stress() {
-        run_writer_iterator_stress([]() { return std::make_unique<BPTreeMemTable>(); });
-        run_writer_iterator_stress([]() { return std::make_unique<ARTMemTable>(); });
+    void testBackendWriterIteratorStress() {
+        runWriterIteratorStress([]() { return std::make_unique<BPTreeMemTable>(); });
+        runWriterIteratorStress([]() { return std::make_unique<ARTMemTable>(); });
     }
 
-    void test_backend_range_boundaries() {
-        run_range_boundary_tests_for_backend([]() { return std::make_unique<BPTreeMemTable>(); });
-        run_range_boundary_tests_for_backend([]() { return std::make_unique<ARTMemTable>(); });
+    void testBackendRangeBoundaries() {
+        runRangeBoundaryTestsForBackend([]() { return std::make_unique<BPTreeMemTable>(); });
+        runRangeBoundaryTestsForBackend([]() { return std::make_unique<ARTMemTable>(); });
     }
 
-    void test_sharded_memtable_get_into_and_contains() {
+    void testShardedMemtableGetIntoAndContains() {
         memtable::MemTable::Options opts;
-        opts.shard_count = 4;
+        opts.shardCount = 4;
         auto table = memtable::MemTable::create(opts);
 
-        const uint64_t s1 = table->next_seq();
-        table->put(as_u8("alpha"), as_u8("v1"), s1);
-        const uint64_t s2 = table->reserve_seq(2);
-        table->remove(as_u8("alpha"), s2);
+        const uint64_t s1 = table->nextSeq();
+        table->put(asU8("alpha"), asU8("v1"), s1);
+        const uint64_t s2 = table->reserveSeq(2);
+        table->remove(asU8("alpha"), s2);
         const uint64_t s3 = s2 + 1;
-        table->put(as_u8("beta"), as_u8("v2"), s3);
-        assert(table->next_seq() == s3 + 1);
+        table->put(asU8("beta"), asU8("v2"), s3);
+        AKK_TEST_CHECK(table->nextSeq() == s3 + 1);
 
         std::vector<uint8_t> out;
-        auto r1 = table->get_into(as_u8("beta"), s3, out);
-        assert(r1.has_value() && *r1);
-        assert(to_string(out) == "v2");
+        auto r1 = table->getInto(asU8("beta"), s3, out);
+        AKK_TEST_CHECK(r1.has_value() && *r1);
+        AKK_TEST_CHECK(to_string(out) == "v2");
 
-        auto r2 = table->get_into(as_u8("alpha"), s3, out);
-        assert(r2.has_value() && !*r2);
+        auto r2 = table->getInto(asU8("alpha"), s3, out);
+        AKK_TEST_CHECK(r2.has_value() && !*r2);
 
-        auto r3 = table->contains(as_u8("gamma"), s3);
-        assert(!r3.has_value());
+        auto r3 = table->contains(asU8("gamma"), s3);
+        AKK_TEST_CHECK(!r3.has_value());
     }
 
-    void test_sharded_memtable_force_flush_and_callback() {
+    void testShardedMemtableForceFlushAndCallback() {
         std::mutex mu;
         std::condition_variable cv;
-        std::vector<std::string> flushed_keys;
+        std::vector<std::string> flushedKeys;
         bool flushed = false;
 
         memtable::MemTable::Options opts;
-        opts.shard_count = 2;
-        opts.threshold_bytes_per_shard = 1;
-        opts.backend_factory = []() { return std::make_unique<BPTreeMemTable>(); };
-        opts.on_flush = [&](std::span<const RecordView> batch) {
+        opts.shardCount = 2;
+        opts.thresholdBytesPerShard = 1;
+        opts.backendFactory = []() { return std::make_unique<BPTreeMemTable>(); };
+        opts.onFlush = [&](std::span<const RecordView> batch) {
             std::lock_guard<std::mutex> lock{mu};
             for (const RecordView& rec : batch) {
-                flushed_keys.emplace_back(
+                flushedKeys.emplace_back(
                     reinterpret_cast<const char*>(rec.key().data()),
                     rec.key().size()
                 );
@@ -381,72 +382,72 @@ namespace {
         };
 
         auto table = memtable::MemTable::create(opts);
-        table->put(as_u8("k1"), as_u8("v1"), table->next_seq());
-        table->flush_hint();
-        table->force_flush();
+        table->put(asU8("k1"), asU8("v1"), table->nextSeq());
+        table->flushHint();
+        table->forceFlush();
 
         {
             std::unique_lock<std::mutex> lock{mu};
             cv.wait_for(lock, std::chrono::seconds(1), [&]() { return flushed; });
         }
-        assert(flushed);
-        assert(!flushed_keys.empty());
+        AKK_TEST_CHECK(flushed);
+        AKK_TEST_CHECK(!flushedKeys.empty());
     }
 
-    void test_sharded_memtable_range_merge() {
+    void testShardedMemtableRangeMerge() {
         memtable::MemTable::Options opts;
-        opts.shard_count = 1;
-        opts.backend_factory = []() { return std::make_unique<BPTreeMemTable>(); };
+        opts.shardCount = 1;
+        opts.backendFactory = []() { return std::make_unique<BPTreeMemTable>(); };
         auto table = memtable::MemTable::create(opts);
 
-        table->put(as_u8("b"), as_u8("v1"), table->next_seq());
-        table->put(as_u8("a"), as_u8("v2"), table->next_seq());
-        table->put(as_u8("c"), as_u8("v3"), table->next_seq());
-        table->put(as_u8("b"), as_u8("v4"), table->next_seq());
+        table->put(asU8("b"), asU8("v1"), table->nextSeq());
+        table->put(asU8("a"), asU8("v2"), table->nextSeq());
+        table->put(asU8("c"), asU8("v3"), table->nextSeq());
+        table->put(asU8("b"), asU8("v4"), table->nextSeq());
 
         memtable::MemTable::KeyRange range;
         range.start = std::vector<uint8_t>{'a'};
         range.end = std::vector<uint8_t>{'z'};
 
-        auto it = table->iterator(range, table->last_seq());
+        auto it = table->iterator(range, table->lastSeq());
         std::vector<std::string> pairs;
-        while (it.has_next()) {
+        while (it.hasNext()) {
             const auto rec = it.next();
-            assert(rec.has_value());
+            AKK_TEST_CHECK(rec.has_value());
             pairs.emplace_back(
                 std::string(reinterpret_cast<const char*>(rec->key().data()), rec->key().size()) + ":" +
                 std::string(reinterpret_cast<const char*>(rec->value().data()), rec->value().size())
             );
         }
 
-        assert(pairs.size() == 3);
-        assert(pairs[0] == "a:v2");
-        assert(pairs[1] == "b:v4");
-        assert(pairs[2] == "c:v3");
+        AKK_TEST_CHECK(pairs.size() == 3);
+        AKK_TEST_CHECK(pairs[0] == "a:v2");
+        AKK_TEST_CHECK(pairs[1] == "b:v4");
+        AKK_TEST_CHECK(pairs[2] == "c:v3");
     }
 
-    void test_sharded_memtable_bptree_flush_reader_iterator_safety() {
+    void testShardedMemtableBptreeFlushReaderIteratorSafety() {
         memtable::MemTable::Options opts;
-        opts.shard_count = 4;
-        opts.threshold_bytes_per_shard = 1024;
-        opts.backend_factory = []() { return std::make_unique<BPTreeMemTable>(); };
-        opts.on_flush = [](std::span<const RecordView>) {};
+        opts.shardCount = 4;
+        opts.thresholdBytesPerShard = 1024;
+        opts.backendFactory = []() { return std::make_unique<BPTreeMemTable>(); };
+        opts.onFlush = [](std::span<const RecordView>) {};
         auto table = memtable::MemTable::create(opts);
 
         std::atomic<bool> stop{false};
-        std::atomic<uint64_t> latest_seq{0};
+        std::atomic<uint64_t> latestSeq{0};
         std::atomic<uint64_t> reads{0};
         std::atomic<uint64_t> iters{0};
 
         std::thread writer([&]() {
             for (uint64_t i = 1; i <= 2500; ++i) {
-                const uint64_t seq = table->next_seq();
+                const uint64_t seq = table->nextSeq();
                 const std::string key = "key" + std::to_string(i % 256);
                 const std::string value = "value" + std::to_string(i);
-                table->put(as_u8(key), as_u8(value), seq);
-                latest_seq.store(seq, std::memory_order_release);
+                table->put(asU8(key), asU8(value), seq);
+                latestSeq.store(seq, std::memory_order_release);
                 if ((i % 128) == 0) {
-                    table->flush_hint();
+                    table->flushHint();
                 }
             }
             stop.store(true, std::memory_order_release);
@@ -456,46 +457,46 @@ namespace {
             RecordView out;
             memtable::MemTable::KeyRange range;
             while (!stop.load(std::memory_order_acquire)) {
-                const uint64_t snapshot = latest_seq.load(std::memory_order_acquire);
+                const uint64_t snapshot = latestSeq.load(std::memory_order_acquire);
                 if (snapshot == 0) {
                     continue;
                 }
-                if (table->get(as_u8("key1"), snapshot, &out)) {
+                if (table->get(asU8("key1"), snapshot, &out)) {
                     reads.fetch_add(1, std::memory_order_relaxed);
                 }
                 auto it = table->iterator(range, snapshot);
-                while (it.has_next()) {
+                while (it.hasNext()) {
                     const auto rec = it.next();
-                    assert(rec.has_value());
-                    assert(rec->seq() <= snapshot);
+                    AKK_TEST_CHECK(rec.has_value());
+                    AKK_TEST_CHECK(rec->seq() <= snapshot);
                     iters.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         });
 
         writer.join();
-        table->force_flush();
+        table->forceFlush();
         reader.join();
 
-        assert(reads.load(std::memory_order_relaxed) > 0);
-        assert(iters.load(std::memory_order_relaxed) > 0);
+        AKK_TEST_CHECK(reads.load(std::memory_order_relaxed) > 0);
+        AKK_TEST_CHECK(iters.load(std::memory_order_relaxed) > 0);
     }
 
-    void test_sharded_memtable_concurrency_smoke() {
+    void testShardedMemtableConcurrencySmoke() {
         memtable::MemTable::Options opts;
-        opts.shard_count = 4;
+        opts.shardCount = 4;
         auto table = memtable::MemTable::create(opts);
 
         std::atomic<bool> stop{false};
-        std::atomic<uint64_t> latest_seq{0};
+        std::atomic<uint64_t> latestSeq{0};
         std::atomic<uint64_t> reads{0};
 
         std::thread writer([&]() {
             for (uint64_t i = 0; i < 2000; ++i) {
-                const uint64_t seq = table->next_seq();
+                const uint64_t seq = table->nextSeq();
                 const std::string value = "v" + std::to_string(seq);
-                table->put(as_u8("shared"), as_u8(value), seq);
-                latest_seq.store(seq, std::memory_order_release);
+                table->put(asU8("shared"), asU8(value), seq);
+                latestSeq.store(seq, std::memory_order_release);
             }
             stop.store(true, std::memory_order_release);
         });
@@ -503,11 +504,11 @@ namespace {
         std::thread reader([&]() {
             RecordView out;
             while (!stop.load(std::memory_order_acquire)) {
-                const uint64_t snap = latest_seq.load(std::memory_order_acquire);
+                const uint64_t snap = latestSeq.load(std::memory_order_acquire);
                 if (snap == 0) {
                     continue;
                 }
-                if (table->get(as_u8("shared"), snap, &out)) {
+                if (table->get(asU8("shared"), snap, &out)) {
                     reads.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -515,75 +516,75 @@ namespace {
 
         writer.join();
         reader.join();
-        assert(reads.load(std::memory_order_relaxed) > 0);
+        AKK_TEST_CHECK(reads.load(std::memory_order_relaxed) > 0);
     }
 
-    void test_sharded_memtable_auto_shard_derivation() {
+    void testShardedMemtableAutoShardDerivation() {
         memtable::MemTable::Options opts;
-        opts.shard_count = 0;
-        opts.expected_concurrent_writers = 4;
+        opts.shardCount = 0;
+        opts.expectedConcurrentWriters = 4;
 
         auto table = memtable::MemTable::create(opts);
         const auto snap = table->snapshot();
-        // writers * 2 = 8, already power-of-two
-        assert(snap.shard_count == 8);
+        // writers * 4 = 16, already power-of-two
+        AKK_TEST_CHECK(snap.shardCount == 16);
     }
 } // namespace
 
 int main() {
-    akkara::test::install_msvc_test_error_handlers();
+    akkaradb::test::installMsvcTestErrorHandlers();
 
     std::puts("[1/13] backend contracts (skiplist)");
     std::fflush(stdout);
-    test_backend_contracts_skiplist();
+    testBackendContractsSkiplist();
 
     std::puts("[2/13] backend contracts (bptree)");
     std::fflush(stdout);
-    test_backend_contracts_bptree();
+    testBackendContractsBptree();
 
     std::puts("[3/13] backend contracts (art)");
     std::fflush(stdout);
-    test_backend_contracts_art();
+    testBackendContractsArt();
 
-    std::puts("[4/13] ArenaGenerator::yield_all");
+    std::puts("[4/13] ArenaGenerator::yieldAll");
     std::fflush(stdout);
-    test_generator_yield_all();
+    testGeneratorYieldAll();
 
     std::puts("[5/13] backend single-writer/multi-reader get stress");
     std::fflush(stdout);
-    test_backend_single_writer_multi_reader_stress();
+    testBackendSingleWriterMultiReaderStress();
 
     std::puts("[6/13] backend writer+iterator stress");
     std::fflush(stdout);
-    test_backend_writer_iterator_stress();
+    testBackendWriterIteratorStress();
 
     std::puts("[7/13] backend range boundary iterator");
     std::fflush(stdout);
-    test_backend_range_boundaries();
+    testBackendRangeBoundaries();
 
-    std::puts("[8/13] sharded memtable get_into/contains");
+    std::puts("[8/13] sharded memtable getInto/contains");
     std::fflush(stdout);
-    test_sharded_memtable_get_into_and_contains();
+    testShardedMemtableGetIntoAndContains();
 
-    std::puts("[9/13] sharded memtable force_flush (bptree)");
+    std::puts("[9/13] sharded memtable forceFlush (bptree)");
     std::fflush(stdout);
-    test_sharded_memtable_force_flush_and_callback();
+    testShardedMemtableForceFlushAndCallback();
 
     std::puts("[10/13] sharded memtable range merge (bptree)");
     std::fflush(stdout);
-    test_sharded_memtable_range_merge();
+    testShardedMemtableRangeMerge();
 
     std::puts("[11/13] sharded memtable bptree flush/read/iterator safety");
     std::fflush(stdout);
-    test_sharded_memtable_bptree_flush_reader_iterator_safety();
+    testShardedMemtableBptreeFlushReaderIteratorSafety();
 
     std::puts("[12/13] sharded memtable concurrency");
     std::fflush(stdout);
-    test_sharded_memtable_concurrency_smoke();
+    testShardedMemtableConcurrencySmoke();
 
     std::puts("[13/13] sharded memtable auto shard derivation");
     std::fflush(stdout);
-    test_sharded_memtable_auto_shard_derivation();
+    testShardedMemtableAutoShardDerivation();
 
     std::puts("memtable smoke test passed");
     return 0;

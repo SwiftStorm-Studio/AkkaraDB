@@ -36,16 +36,16 @@ namespace akkaradb::engine::sst {
         std::vector<uint8_t> value;
         uint64_t seq = 0;
         uint8_t flags = 0;
-        uint64_t key_fp64 = 0;
-        uint64_t mini_key = 0;
+        uint64_t keyFp64 = 0;
+        uint64_t miniKey = 0;
 
-        [[nodiscard]] bool is_tombstone() const noexcept { return (flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0; }
+        [[nodiscard]] bool isTombstone() const noexcept { return (flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0; }
     };
 
     class SSTReader {
         public:
             struct Options {
-                uint64_t block_cache_bytes = 64ULL * 1024ULL * 1024ULL;
+                uint64_t blockCacheBytes = 64ULL * 1024ULL * 1024ULL;
             };
 
             [[nodiscard]] static std::unique_ptr<SSTReader> open(const std::filesystem::path& path);
@@ -59,13 +59,16 @@ namespace akkaradb::engine::sst {
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const;
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> get_into(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
-            [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(std::span<const uint8_t> start_key = {}, std::span<const uint8_t> end_key = {}) const;
+            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
+            [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(
+                std::span<const uint8_t> startKey = {},
+                std::span<const uint8_t> endKey = {}
+            ) const;
 
-            [[nodiscard]] bool key_in_range(std::span<const uint8_t> key) const noexcept;
+            [[nodiscard]] bool keyInRange(std::span<const uint8_t> key) const noexcept;
             [[nodiscard]] const SSTFileHeaderV2& header() const noexcept;
-            [[nodiscard]] std::span<const uint8_t> first_key() const noexcept;
-            [[nodiscard]] std::span<const uint8_t> last_key() const noexcept;
+            [[nodiscard]] std::span<const uint8_t> firstKey() const noexcept;
+            [[nodiscard]] std::span<const uint8_t> lastKey() const noexcept;
             [[nodiscard]] const std::filesystem::path& path() const noexcept;
 
         private:

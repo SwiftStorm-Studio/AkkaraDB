@@ -49,12 +49,12 @@ namespace akkaradb::engine::cluster {
              * callback invocation.
              */
             using ApplyCallback = std::function<void(
-uint64_t seq,
- ReplOpType op,
- std::span<const uint8_t> key,
- std::span<const uint8_t> value,
- uint8_t record_flags,
- uint64_t source_node_id
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId
             )>;
 
             /**
@@ -62,24 +62,24 @@ uint64_t seq,
              *
              * The content span is valid only for the duration of the callback.
              */
-            using BlobCallback = std::function<void(uint64_t seq, uint64_t blob_id, std::span<const uint8_t> content)>;
+            using BlobCallback = std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)>;
 
             /**
              * Creates a replica client.
              *
-             * @param primary_host       Hostname or address of the primary.
-             * @param primary_repl_port  Primary replication listener port.
-             * @param self_node_id       Local replica node id.
-             * @param get_last_seq       Returns the highest local applied seq
+             * @param primaryHost       Hostname or address of the primary.
+             * @param primaryReplPort  Primary replication listener port.
+             * @param selfNodeId       Local replica node id.
+             * @param getLastSeq       Returns the highest local applied seq
              *                           for ClientHello.
-             * @param runtime_options    Transport/TLS options.
+             * @param runtimeOptions    Transport/TLS options.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
-                std::string primary_host,
-                uint16_t primary_repl_port,
-                uint64_t self_node_id,
-                std::function<uint64_t()> get_last_seq,
-                ClusterRuntimeOptions runtime_options = {}
+                std::string primaryHost,
+                uint16_t primaryReplPort,
+                uint64_t selfNodeId,
+                std::function<uint64_t()> getLastSeq,
+                ClusterRuntimeOptions runtimeOptions = {}
             );
 
             ~ReplicationClient();
@@ -88,10 +88,10 @@ uint64_t seq,
             ReplicationClient& operator=(const ReplicationClient&) = delete;
 
             /** Sets the callback used for replicated key/value entries. */
-            void set_apply_callback(ApplyCallback callback);
+            void setApplyCallback(ApplyCallback callback);
 
             /** Sets the callback used for replicated blob payloads. */
-            void set_blob_callback(BlobCallback callback);
+            void setBlobCallback(BlobCallback callback);
 
             /** Starts the reconnecting receive worker. */
             void start();

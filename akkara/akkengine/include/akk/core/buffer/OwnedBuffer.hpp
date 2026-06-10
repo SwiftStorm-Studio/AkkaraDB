@@ -47,12 +47,12 @@ namespace akkaradb::core {
      * Example:
      * @code
      * auto buf = OwnedBuffer::allocate(1024); // heap allocation
-     * auto view = buf.as_view();              // non-owning view
+     * auto view = buf.asView();              // non-owning view
      * @endcode
      *
      * Custom allocator example (pool):
      * @code
-     * auto buf = OwnedBuffer(ptr, size, pool_deleter, pool_ptr);
+     * auto buf = OwnedBuffer(ptr, size, poolDeleter, poolPtr);
      * @endcode
      *
      * Thread-safety:
@@ -87,7 +87,8 @@ namespace akkaradb::core {
              *
              * @warning data must be valid for the given size.
              */
-            OwnedBuffer(std::byte* data, size_t size, Deleter deleter, void* ctx) noexcept : data_{data}, size_{size}, deleter_{deleter}, ctx_{ctx} {}
+            OwnedBuffer(std::byte* data, size_t size, Deleter deleter, void* ctx) noexcept
+                : data_{data}, size_{size}, deleter_{deleter}, ctx_{ctx} {}
 
             // ==================== Move semantics ====================
 
@@ -174,7 +175,7 @@ namespace akkaradb::core {
             /**
              * @brief Creates a non-owning view of the buffer.
              */
-            [[nodiscard]] BufferView as_view() const noexcept;
+            [[nodiscard]] BufferView asView() const noexcept;
 
             // ==================== Ownership control ====================
 

@@ -53,29 +53,29 @@ namespace akkaradb::engine::wal {
     namespace {
         static constexpr uint64_t SEGMENT_BYTES = 64ULL * 1024ULL * 1024ULL;
 
-        [[nodiscard]] uint64_t now_us() noexcept {
+        [[nodiscard]] uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count());
         }
 
-        [[nodiscard]] uint16_t resolve_auto_shard_count() noexcept {
+        [[nodiscard]] uint16_t resolveAutoShardCount() noexcept {
             const unsigned hw = std::thread::hardware_concurrency();
             return static_cast<uint16_t>(std::clamp<unsigned>(hw == 0 ? 1u : hw, 1u, 16u));
         }
 
-        [[nodiscard]] uint32_t crc32c_bytes(const uint8_t* data, size_t size) noexcept {
+        [[nodiscard]] uint32_t crc32cBytes(const uint8_t* data, size_t size) noexcept {
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(data), size);
         }
 
-        void refresh_segment_crc(WalSegmentHeader& header) noexcept {
+        void refreshSegmentCrc(WalSegmentHeader& header) noexcept {
             header.crc32c = 0;
             uint8_t buf[WalSegmentHeader::SIZE]{};
             header.serialize(buf);
-            header.crc32c = crc32c_bytes(buf, sizeof(buf));
+            header.crc32c = crc32cBytes(buf, sizeof(buf));
         }
 
-        void do_fdatasync(FILE* f) {
+        void doFdatasync(FILE* f) {
             if (f == nullptr) { return; }
             #ifdef _WIN32
             if (_commit(_fileno(f)) != 0) { throw std::runtime_error("WAL fdatasync failed"); }
@@ -84,7 +84,7 @@ namespace akkaradb::engine::wal {
             #endif
         }
 
-        [[nodiscard]] FILE* open_rw(const fs::path& path, bool exists) {
+        [[nodiscard]] FILE* openRw(const fs::path& path, bool exists) {
             #ifdef _WIN32
             FILE* f = _wfopen(path.wstring().c_str(), exists ? L"r+b" : L"w+b");
             #else
@@ -94,98 +94,98 @@ namespace akkaradb::engine::wal {
             return f;
         }
 
-        void close_file(FILE*& f) noexcept {
+        void closeFile(FILE*& f) noexcept {
             if (f != nullptr) {
                 std::fclose(f);
                 f = nullptr;
             }
         }
 
-        void write_all(FILE* f, const uint8_t* data, size_t size) {
+        void writeAll(FILE* f, const uint8_t* data, size_t size) {
             if (size == 0) { return; }
             if (std::fwrite(data, 1, size, f) != size) { throw std::runtime_error("WAL write failed"); }
         }
 
-        [[nodiscard]] bool read_exact(std::ifstream& file, uint8_t* out, size_t len) {
+        [[nodiscard]] bool readExact(std::ifstream& file, uint8_t* out, size_t len) {
             if (len == 0) { return true; }
             file.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(len));
             return file.good() || file.gcount() == static_cast<std::streamsize>(len);
         }
 
-        [[nodiscard]] std::string segment_name(uint16_t shard_id, uint64_t segment_id) {
+        [[nodiscard]] std::string segmentName(uint16_t shardId, uint64_t segmentId) {
             std::ostringstream os;
-            os << std::setfill('0') << std::setw(4) << shard_id << "_" << std::hex << std::nouppercase << std::setw(16) << segment_id <<
+            os << std::setfill('0') << std::setw(4) << shardId << "_" << std::hex << std::nouppercase << std::setw(16) << segmentId <<
                 ".akwal";
             return os.str();
         }
 
-        [[nodiscard]] fs::path segment_path(const fs::path& wal_dir, uint16_t shard_id, uint64_t segment_id) {
-            return wal_dir / segment_name(shard_id, segment_id);
+        [[nodiscard]] fs::path segmentPath(const fs::path& walDir, uint16_t shardId, uint64_t segmentId) {
+            return walDir / segmentName(shardId, segmentId);
         }
 
         struct SegmentScanResult {
-            bool valid_header = false;
-            uint64_t first_seq = 0;
-            uint64_t last_seq = 0;
+            bool validHeader = false;
+            uint64_t firstSeq = 0;
+            uint64_t lastSeq = 0;
         };
 
-        [[nodiscard]] SegmentScanResult scan_segment_sequences(const fs::path& path) {
+        [[nodiscard]] SegmentScanResult scanSegmentSequences(const fs::path& path) {
             SegmentScanResult result{};
             std::ifstream file(path, std::ios::binary);
             if (!file) { return result; }
 
-            uint8_t shdr_buf[WalSegmentHeader::SIZE]{};
-            if (!read_exact(file, shdr_buf, WalSegmentHeader::SIZE)) { return result; }
-            const WalSegmentHeader shdr = WalSegmentHeader::deserialize(shdr_buf);
-            if (!shdr.verify_magic() || !shdr.verify_version() || !shdr.verify_checksum()) { return result; }
-            result.valid_header = true;
+            uint8_t shdrBuf[WalSegmentHeader::SIZE]{};
+            if (!readExact(file, shdrBuf, WalSegmentHeader::SIZE)) { return result; }
+            const WalSegmentHeader shdr = WalSegmentHeader::deserialize(shdrBuf);
+            if (!shdr.verifyMagic() || !shdr.verifyVersion() || !shdr.verifyChecksum()) { return result; }
+            result.validHeader = true;
 
             while (true) {
-                uint8_t ehdr_buf[WalEntryHeader::SIZE]{};
-                file.read(reinterpret_cast<char*>(ehdr_buf), WalEntryHeader::SIZE);
+                uint8_t ehdrBuf[WalEntryHeader::SIZE]{};
+                file.read(reinterpret_cast<char*>(ehdrBuf), WalEntryHeader::SIZE);
                 const std::streamsize got = file.gcount();
                 if (got == 0) { break; }
                 if (got != static_cast<std::streamsize>(WalEntryHeader::SIZE)) { break; }
 
-                const WalEntryHeader ehdr = WalEntryHeader::deserialize(ehdr_buf);
-                if (!ehdr.verify_lengths(SEGMENT_BYTES)) { break; }
+                const WalEntryHeader ehdr = WalEntryHeader::deserialize(ehdrBuf);
+                if (!ehdr.verifyLengths(SEGMENT_BYTES)) { break; }
 
-                std::vector<uint8_t> key(ehdr.key_len);
-                std::vector<uint8_t> value(ehdr.value_len);
-                if (!read_exact(file, key.data(), key.size()) || !read_exact(file, value.data(), value.size())) { break; }
-                if (!ehdr.verify_checksum(
+                std::vector<uint8_t> key(ehdr.keyLen);
+                std::vector<uint8_t> value(ehdr.valueLen);
+                if (!readExact(file, key.data(), key.size()) || !readExact(file, value.data(), value.size())) { break; }
+                if (!ehdr.verifyChecksum(
                     std::span<const uint8_t>{key.data(), key.size()},
                     std::span<const uint8_t>{value.data(), value.size()}
                 )) { break; }
 
-                if (result.first_seq == 0 || ehdr.seq < result.first_seq) { result.first_seq = ehdr.seq; }
-                if (ehdr.seq > result.last_seq) { result.last_seq = ehdr.seq; }
+                if (result.firstSeq == 0 || ehdr.seq < result.firstSeq) { result.firstSeq = ehdr.seq; }
+                if (ehdr.seq > result.lastSeq) { result.lastSeq = ehdr.seq; }
             }
             return result;
         }
 
-        [[nodiscard]] uint64_t find_last_segment_id(const fs::path& wal_dir, uint16_t shard_id) {
-            uint64_t max_segment = 0;
+        [[nodiscard]] uint64_t findLastSegmentId(const fs::path& walDir, uint16_t shardId) {
+            uint64_t maxSegment = 0;
             bool found = false;
-            if (!fs::exists(wal_dir)) { return 0; }
+            if (!fs::exists(walDir)) { return 0; }
 
-            for (const auto& entry : fs::directory_iterator(wal_dir)) {
+            for (const auto& entry : fs::directory_iterator(walDir)) {
                 if (!entry.is_regular_file() || entry.path().extension() != ".akwal") { continue; }
                 std::ifstream file(entry.path(), std::ios::binary);
                 if (!file) { continue; }
-                uint8_t hdr_buf[WalSegmentHeader::SIZE]{};
-                if (!read_exact(file, hdr_buf, WalSegmentHeader::SIZE)) { continue; }
-                const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdr_buf);
-                if (!hdr.verify_magic() || !hdr.verify_version() || !hdr.verify_checksum() || hdr.shard_id != shard_id) { continue; }
-                max_segment = found ? std::max(max_segment, hdr.segment_id) : hdr.segment_id;
+                uint8_t hdrBuf[WalSegmentHeader::SIZE]{};
+                if (!readExact(file, hdrBuf, WalSegmentHeader::SIZE)) { continue; }
+                const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdrBuf);
+                if (!hdr.verifyMagic() || !hdr.verifyVersion() || !hdr.verifyChecksum() || hdr.shardId != shardId) { continue; }
+                maxSegment = found ? std::max(maxSegment, hdr.segmentId) : hdr.segmentId;
                 found = true;
             }
-            return found ? max_segment : 0;
+            return found ? maxSegment : 0;
         }
 
-        [[nodiscard]] uint16_t shard_for(uint64_t fp64, uint16_t shard_count) noexcept {
-            if (shard_count <= 1) { return 0; }
-            return static_cast<uint16_t>(fp64 % static_cast<uint64_t>(shard_count));
+        [[nodiscard]] uint16_t shardFor(uint64_t fp64, uint16_t shardCount) noexcept {
+            if (shardCount <= 1) { return 0; }
+            return static_cast<uint16_t>(fp64 % static_cast<uint64_t>(shardCount));
         }
     } // namespace
 
@@ -198,13 +198,13 @@ namespace akkaradb::engine::wal {
 
             class ShardWriter {
                 public:
-                    ShardWriter(WalOptions options, uint16_t shard_id)
-                        : options_{std::move(options)}, shard_id_{shard_id}, running_{options_.sync_mode == WalSyncMode::Async} {
-                        fs::create_directories(options_.wal_dir);
-                        segment_id_ = find_last_segment_id(options_.wal_dir, shard_id_);
-                        open_segment(segment_id_);
+                    ShardWriter(WalOptions options, uint16_t shardId)
+                        : options_{std::move(options)}, shardId_{shardId}, running_{options_.syncMode == WalSyncMode::ASYNC} {
+                        fs::create_directories(options_.walDir);
+                        segmentId_ = findLastSegmentId(options_.walDir, shardId_);
+                        openSegment(segmentId_);
 
-                        if (options_.sync_mode == WalSyncMode::Async) { thread_ = std::thread([this] { run_flusher(); }); }
+                        if (options_.syncMode == WalSyncMode::ASYNC) { thread_ = std::thread([this] { runFlusher(); }); }
                     }
 
                     ~ShardWriter() noexcept {
@@ -216,68 +216,68 @@ namespace akkaradb::engine::wal {
                     ShardWriter& operator=(const ShardWriter&) = delete;
 
                     void append(PendingEntry entry) {
-                        check_async_error();
-                        if (options_.sync_mode == WalSyncMode::Async) {
-                            const uint64_t entry_bytes = static_cast<uint64_t>(entry.bytes.size());
+                        checkAsyncError();
+                        if (options_.syncMode == WalSyncMode::ASYNC) {
+                            const uint64_t entryBytes = static_cast<uint64_t>(entry.bytes.size());
                             {
-                                std::unique_lock lock{queue_mutex_};
-                                queue_space_cv_.wait(
+                                std::unique_lock lock{queueMutex_};
+                                queueSpaceCv_.wait(
                                     lock,
                                     [&] {
-                                        const uint64_t pending_bytes = queue_bytes_ + in_flight_bytes_;
-                                        return async_error_ || pending_bytes + entry_bytes <= options_.async_max_pending_bytes || (queue_.
-                                            empty() && in_flight_bytes_ == 0);
+                                        const uint64_t pendingBytes = queueBytes_ + inFlightBytes_;
+                                        return asyncError_ || pendingBytes + entryBytes <= options_.asyncMaxPendingBytes || (queue_.empty()
+                                            && inFlightBytes_ == 0);
                                     }
                                 );
-                                if (async_error_) { std::rethrow_exception(async_error_); }
+                                if (asyncError_) { std::rethrow_exception(asyncError_); }
                                 queue_.push_back(std::move(entry));
-                                queue_bytes_ += entry_bytes;
+                                queueBytes_ += entryBytes;
                             }
-                            queue_cv_.notify_one();
+                            queueCv_.notify_one();
                             return;
                         }
 
-                        std::lock_guard file_lock{file_mutex_};
-                        write_one_locked(entry);
+                        std::lock_guard fileLock{fileMutex_};
+                        writeOneLocked(entry);
                         std::fflush(file_);
-                        batches_flushed_.fetch_add(1, std::memory_order_relaxed);
-                        if (options_.sync_mode == WalSyncMode::Sync) {
-                            do_fdatasync(file_);
-                            syncs_executed_.fetch_add(1, std::memory_order_relaxed);
+                        batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
+                        if (options_.syncMode == WalSyncMode::SYNC) {
+                            doFdatasync(file_);
+                            syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
 
-                    void force_sync() {
-                        check_async_error();
-                        if (options_.sync_mode == WalSyncMode::Async) { drain_async(); }
+                    void forceSync() {
+                        checkAsyncError();
+                        if (options_.syncMode == WalSyncMode::ASYNC) { drainAsync(); }
 
-                        std::lock_guard file_lock{file_mutex_};
-                        update_header_locked();
+                        std::lock_guard fileLock{fileMutex_};
+                        updateHeaderLocked();
                         std::fflush(file_);
-                        do_fdatasync(file_);
-                        syncs_executed_.fetch_add(1, std::memory_order_relaxed);
+                        doFdatasync(file_);
+                        syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                     }
 
-                    void prune_until(uint64_t checkpoint_seq) {
-                        force_sync();
+                    void pruneUntil(uint64_t checkpointSeq) {
+                        forceSync();
                         std::vector<fs::path> removable;
 
                         {
-                            std::lock_guard file_lock{file_mutex_};
-                            for (const auto& entry : fs::directory_iterator(options_.wal_dir)) {
+                            std::lock_guard fileLock{fileMutex_};
+                            for (const auto& entry : fs::directory_iterator(options_.walDir)) {
                                 if (!entry.is_regular_file() || entry.path().extension() != ".akwal" || entry.path() == path_) { continue; }
 
                                 std::ifstream file(entry.path(), std::ios::binary);
                                 if (!file) { continue; }
-                                uint8_t hdr_buf[WalSegmentHeader::SIZE]{};
-                                if (!read_exact(file, hdr_buf, WalSegmentHeader::SIZE)) { continue; }
-                                const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdr_buf);
-                                if (!hdr.verify_magic() || !hdr.verify_version() || !hdr.verify_checksum() || hdr.shard_id != shard_id_) {
+                                uint8_t hdrBuf[WalSegmentHeader::SIZE]{};
+                                if (!readExact(file, hdrBuf, WalSegmentHeader::SIZE)) { continue; }
+                                const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdrBuf);
+                                if (!hdr.verifyMagic() || !hdr.verifyVersion() || !hdr.verifyChecksum() || hdr.shardId != shardId_) {
                                     continue;
                                 }
 
-                                const SegmentScanResult scan = scan_segment_sequences(entry.path());
-                                if (scan.valid_header && scan.last_seq != 0 && scan.last_seq <= checkpoint_seq) {
+                                const SegmentScanResult scan = scanSegmentSequences(entry.path());
+                                if (scan.validHeader && scan.lastSeq != 0 && scan.lastSeq <= checkpointSeq) {
                                     removable.push_back(entry.path());
                                 }
                             }
@@ -288,25 +288,25 @@ namespace akkaradb::engine::wal {
 
                     void close() {
                         if (closed_) { return; }
-                        if (options_.sync_mode == WalSyncMode::Async) {
+                        if (options_.syncMode == WalSyncMode::ASYNC) {
                             {
-                                std::lock_guard lock{queue_mutex_};
+                                std::lock_guard lock{queueMutex_};
                                 running_ = false;
                             }
-                            queue_cv_.notify_one();
+                            queueCv_.notify_one();
                             if (thread_.joinable()) { thread_.join(); }
-                            check_async_error();
+                            checkAsyncError();
                         }
 
-                        std::lock_guard file_lock{file_mutex_};
+                        std::lock_guard fileLock{fileMutex_};
                         if (file_ != nullptr) {
-                            update_header_locked();
+                            updateHeaderLocked();
                             std::fflush(file_);
-                            if (options_.sync_mode != WalSyncMode::Off) {
-                                do_fdatasync(file_);
-                                syncs_executed_.fetch_add(1, std::memory_order_relaxed);
+                            if (options_.syncMode != WalSyncMode::OFF) {
+                                doFdatasync(file_);
+                                syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                             }
-                            close_file(file_);
+                            closeFile(file_);
                         }
                         closed_ = true;
                     }
@@ -314,209 +314,206 @@ namespace akkaradb::engine::wal {
                     [[nodiscard]] WalWriterSnapshot snapshot() const noexcept {
                         return {
                             1,
-                            entries_written_.load(std::memory_order_relaxed),
-                            bytes_written_.load(std::memory_order_relaxed),
-                            batches_flushed_.load(std::memory_order_relaxed),
-                            syncs_executed_.load(std::memory_order_relaxed),
-                            segment_rotations_.load(std::memory_order_relaxed)
+                            entriesWritten_.load(std::memory_order_relaxed),
+                            bytesWritten_.load(std::memory_order_relaxed),
+                            batchesFlushed_.load(std::memory_order_relaxed),
+                            syncsExecuted_.load(std::memory_order_relaxed),
+                            segmentRotations_.load(std::memory_order_relaxed)
                         };
                     }
 
                 private:
-                    void open_segment(uint64_t segment_id) {
-                        path_ = segment_path(options_.wal_dir, shard_id_, segment_id);
+                    void openSegment(uint64_t segmentId) {
+                        path_ = segmentPath(options_.walDir, shardId_, segmentId);
                         const bool exists = fs::exists(path_) && fs::file_size(path_) >= WalSegmentHeader::SIZE;
-                        file_ = open_rw(path_, exists);
+                        file_ = openRw(path_, exists);
 
                         if (exists) {
-                            uint8_t hdr_buf[WalSegmentHeader::SIZE]{};
-                            if (std::fseek(file_, 0, SEEK_SET) != 0 || std::fread(hdr_buf, 1, WalSegmentHeader::SIZE, file_) !=
+                            uint8_t hdrBuf[WalSegmentHeader::SIZE]{};
+                            if (std::fseek(file_, 0, SEEK_SET) != 0 || std::fread(hdrBuf, 1, WalSegmentHeader::SIZE, file_) !=
                                 WalSegmentHeader::SIZE) {
                                 throw std::runtime_error("WAL failed to read segment header: " + path_.string());
                             }
-                            header_ = WalSegmentHeader::deserialize(hdr_buf);
-                            if (!header_.verify_magic() || !header_.verify_version() || !header_.verify_checksum() || header_.shard_id !=
-                                shard_id_) {
-                                close_file(file_);
-                                ++segment_id_;
-                                open_segment(segment_id_);
+                            header_ = WalSegmentHeader::deserialize(hdrBuf);
+                            if (!header_.verifyMagic() || !header_.verifyVersion() || !header_.verifyChecksum() || header_.shardId !=
+                                shardId_) {
+                                closeFile(file_);
+                                ++segmentId_;
+                                openSegment(segmentId_);
                                 return;
                             }
 
-                            const SegmentScanResult scan = scan_segment_sequences(path_);
-                            if (scan.valid_header) {
-                                header_.first_seq = scan.first_seq;
-                                header_.last_seq = scan.last_seq;
+                            const SegmentScanResult scan = scanSegmentSequences(path_);
+                            if (scan.validHeader) {
+                                header_.firstSeq = scan.firstSeq;
+                                header_.lastSeq = scan.lastSeq;
                             }
-                            current_size_ = fs::file_size(path_);
-                            if (current_size_ >= SEGMENT_BYTES) {
-                                rotate_locked();
+                            currentSize_ = fs::file_size(path_);
+                            if (currentSize_ >= SEGMENT_BYTES) {
+                                rotateLocked();
                                 return;
                             }
                             std::fseek(file_, 0, SEEK_END);
                             return;
                         }
 
-                        header_ = WalSegmentHeader::build(shard_id_, segment_id_, now_us());
-                        current_size_ = 0;
-                        update_header_locked();
-                        current_size_ = WalSegmentHeader::SIZE;
+                        header_ = WalSegmentHeader::build(shardId_, segmentId_, nowUs());
+                        currentSize_ = 0;
+                        updateHeaderLocked();
+                        currentSize_ = WalSegmentHeader::SIZE;
                         std::fflush(file_);
                     }
 
-                    void rotate_locked() {
-                        update_header_locked();
+                    void rotateLocked() {
+                        updateHeaderLocked();
                         std::fflush(file_);
-                        if (options_.sync_mode != WalSyncMode::Off) {
-                            do_fdatasync(file_);
-                            syncs_executed_.fetch_add(1, std::memory_order_relaxed);
+                        if (options_.syncMode != WalSyncMode::OFF) {
+                            doFdatasync(file_);
+                            syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                         }
-                        close_file(file_);
-                        ++segment_id_;
-                        segment_rotations_.fetch_add(1, std::memory_order_relaxed);
-                        open_segment(segment_id_);
+                        closeFile(file_);
+                        ++segmentId_;
+                        segmentRotations_.fetch_add(1, std::memory_order_relaxed);
+                        openSegment(segmentId_);
                     }
 
-                    void update_header_locked() {
+                    void updateHeaderLocked() {
                         if (file_ == nullptr) { return; }
-                        refresh_segment_crc(header_);
+                        refreshSegmentCrc(header_);
                         uint8_t buf[WalSegmentHeader::SIZE]{};
                         header_.serialize(buf);
                         if (std::fseek(file_, 0, SEEK_SET) != 0) { throw std::runtime_error("WAL seek header failed"); }
-                        write_all(file_, buf, sizeof(buf));
+                        writeAll(file_, buf, sizeof(buf));
                         if (std::fseek(file_, 0, SEEK_END) != 0) { throw std::runtime_error("WAL seek end failed"); }
                     }
 
-                    void write_one_locked(const PendingEntry& entry) {
+                    void writeOneLocked(const PendingEntry& entry) {
                         if (entry.bytes.size() + WalSegmentHeader::SIZE > SEGMENT_BYTES) {
                             throw std::invalid_argument("WAL entry exceeds segment capacity");
                         }
-                        if (current_size_ + entry.bytes.size() > SEGMENT_BYTES && current_size_ > WalSegmentHeader::SIZE) {
-                            rotate_locked();
-                        }
+                        if (currentSize_ + entry.bytes.size() > SEGMENT_BYTES && currentSize_ > WalSegmentHeader::SIZE) { rotateLocked(); }
 
-                        if (header_.first_seq == 0 || entry.seq < header_.first_seq) { header_.first_seq = entry.seq; }
-                        if (entry.seq > header_.last_seq) { header_.last_seq = entry.seq; }
-                        write_all(file_, entry.bytes.data(), entry.bytes.size());
-                        current_size_ += entry.bytes.size();
-                        entries_written_.fetch_add(1, std::memory_order_relaxed);
-                        bytes_written_.fetch_add(static_cast<uint64_t>(entry.bytes.size()), std::memory_order_relaxed);
+                        if (header_.firstSeq == 0 || entry.seq < header_.firstSeq) { header_.firstSeq = entry.seq; }
+                        if (entry.seq > header_.lastSeq) { header_.lastSeq = entry.seq; }
+                        writeAll(file_, entry.bytes.data(), entry.bytes.size());
+                        currentSize_ += entry.bytes.size();
+                        entriesWritten_.fetch_add(1, std::memory_order_relaxed);
+                        bytesWritten_.fetch_add(static_cast<uint64_t>(entry.bytes.size()), std::memory_order_relaxed);
                     }
 
-                    void run_flusher() {
+                    void runFlusher() {
                         std::vector<PendingEntry> batch;
-                        batch.reserve(options_.group_n == 0 ? 128 : options_.group_n);
+                        batch.reserve(options_.groupN == 0 ? 128 : options_.groupN);
 
                         try {
                             while (true) {
                                 {
-                                    std::unique_lock lock{queue_mutex_};
-                                    queue_cv_.wait(lock, [this] { return !queue_.empty() || !running_; });
+                                    std::unique_lock lock{queueMutex_};
+                                    queueCv_.wait(lock, [this] { return !queue_.empty() || !running_; });
                                     if (!running_ && queue_.empty()) { break; }
-                                    if (running_ && queue_.size() < options_.group_n && queue_bytes_ < options_.group_bytes) {
-                                        queue_cv_.wait_for(
+                                    if (running_ && queue_.size() < options_.groupN && queueBytes_ < options_.groupBytes) {
+                                        queueCv_.wait_for(
                                             lock,
-                                            std::chrono::microseconds(options_.group_micros),
+                                            std::chrono::microseconds(options_.groupMicros),
                                             [this] {
-                                                return queue_.size() >= options_.group_n || queue_bytes_ >= options_.group_bytes || !
-                                                    running_;
+                                                return queue_.size() >= options_.groupN || queueBytes_ >= options_.groupBytes || !running_;
                                             }
                                         );
                                     }
-                                    in_flight_ = true;
-                                    in_flight_bytes_ = queue_bytes_;
+                                    inFlight_ = true;
+                                    inFlightBytes_ = queueBytes_;
                                     std::swap(batch, queue_);
-                                    queue_bytes_ = 0;
+                                    queueBytes_ = 0;
                                 }
-                                queue_space_cv_.notify_all();
+                                queueSpaceCv_.notify_all();
 
                                 if (!batch.empty()) {
                                     {
-                                        std::lock_guard file_lock{file_mutex_};
-                                        for (const PendingEntry& entry : batch) { write_one_locked(entry); }
+                                        std::lock_guard fileLock{fileMutex_};
+                                        for (const PendingEntry& entry : batch) { writeOneLocked(entry); }
                                         std::fflush(file_);
-                                        do_fdatasync(file_);
-                                        batches_flushed_.fetch_add(1, std::memory_order_relaxed);
-                                        syncs_executed_.fetch_add(1, std::memory_order_relaxed);
+                                        doFdatasync(file_);
+                                        batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
+                                        syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                                     }
                                     batch.clear();
                                 }
 
                                 {
-                                    std::lock_guard lock{queue_mutex_};
-                                    in_flight_ = false;
-                                    in_flight_bytes_ = 0;
+                                    std::lock_guard lock{queueMutex_};
+                                    inFlight_ = false;
+                                    inFlightBytes_ = 0;
                                 }
-                                queue_cv_.notify_all();
-                                queue_space_cv_.notify_all();
+                                queueCv_.notify_all();
+                                queueSpaceCv_.notify_all();
                             }
                         }
                         catch (...) {
                             {
-                                std::lock_guard lock{queue_mutex_};
-                                async_error_ = std::current_exception();
-                                in_flight_ = false;
-                                in_flight_bytes_ = 0;
+                                std::lock_guard lock{queueMutex_};
+                                asyncError_ = std::current_exception();
+                                inFlight_ = false;
+                                inFlightBytes_ = 0;
                             }
-                            queue_cv_.notify_all();
-                            queue_space_cv_.notify_all();
+                            queueCv_.notify_all();
+                            queueSpaceCv_.notify_all();
                         }
                     }
 
-                    void drain_async() {
+                    void drainAsync() {
                         {
-                            std::unique_lock lock{queue_mutex_};
-                            queue_cv_.wait(lock, [this] { return queue_.empty() && !in_flight_; });
+                            std::unique_lock lock{queueMutex_};
+                            queueCv_.wait(lock, [this] { return queue_.empty() && !inFlight_; });
                         }
-                        check_async_error();
+                        checkAsyncError();
                     }
 
-                    void check_async_error() {
-                        std::lock_guard lock{queue_mutex_};
-                        if (async_error_) { std::rethrow_exception(async_error_); }
+                    void checkAsyncError() {
+                        std::lock_guard lock{queueMutex_};
+                        if (asyncError_) { std::rethrow_exception(asyncError_); }
                     }
 
                     WalOptions options_;
-                    uint16_t shard_id_ = 0;
-                    uint64_t segment_id_ = 0;
+                    uint16_t shardId_ = 0;
+                    uint64_t segmentId_ = 0;
                     fs::path path_;
                     FILE* file_ = nullptr;
                     WalSegmentHeader header_{};
-                    uint64_t current_size_ = 0;
+                    uint64_t currentSize_ = 0;
                     bool closed_ = false;
 
-                    mutable std::mutex file_mutex_;
-                    std::mutex queue_mutex_;
-                    std::condition_variable queue_cv_;
-                    std::condition_variable queue_space_cv_;
+                    mutable std::mutex fileMutex_;
+                    std::mutex queueMutex_;
+                    std::condition_variable queueCv_;
+                    std::condition_variable queueSpaceCv_;
                     std::vector<PendingEntry> queue_;
-                    uint64_t queue_bytes_ = 0;
+                    uint64_t queueBytes_ = 0;
                     bool running_ = false;
-                    bool in_flight_ = false;
-                    uint64_t in_flight_bytes_ = 0;
-                    std::exception_ptr async_error_;
+                    bool inFlight_ = false;
+                    uint64_t inFlightBytes_ = 0;
+                    std::exception_ptr asyncError_;
                     std::thread thread_;
 
-                    std::atomic<uint64_t> entries_written_{0};
-                    std::atomic<uint64_t> bytes_written_{0};
-                    std::atomic<uint64_t> batches_flushed_{0};
-                    std::atomic<uint64_t> syncs_executed_{0};
-                    std::atomic<uint64_t> segment_rotations_{0};
+                    std::atomic<uint64_t> entriesWritten_{0};
+                    std::atomic<uint64_t> bytesWritten_{0};
+                    std::atomic<uint64_t> batchesFlushed_{0};
+                    std::atomic<uint64_t> syncsExecuted_{0};
+                    std::atomic<uint64_t> segmentRotations_{0};
             };
 
             explicit Impl(WalOptions options)
                 : options_{std::move(options)} {
-                if (options_.wal_dir.empty()) { throw std::invalid_argument("WAL directory is required"); }
-                if (options_.shard_count == 0) { options_.shard_count = resolve_auto_shard_count(); }
-                if (options_.shard_count > 16) { throw std::invalid_argument("WAL shard_count must be in range 1..16, or 0 for auto"); }
-                if (options_.group_n == 0) { options_.group_n = 128; }
-                if (options_.group_micros == 0) { options_.group_micros = 100; }
-                if (options_.group_bytes == 0) { options_.group_bytes = 4ULL * 1024ULL * 1024ULL; }
-                if (options_.async_max_pending_bytes == 0) { options_.async_max_pending_bytes = 64ULL * 1024ULL * 1024ULL; }
-                if (options_.async_max_pending_bytes < options_.group_bytes) { options_.async_max_pending_bytes = options_.group_bytes; }
+                if (options_.walDir.empty()) { throw std::invalid_argument("WAL directory is required"); }
+                if (options_.shardCount == 0) { options_.shardCount = resolveAutoShardCount(); }
+                if (options_.shardCount > 16) { throw std::invalid_argument("WAL shardCount must be in range 1..16, or 0 for auto"); }
+                if (options_.groupN == 0) { options_.groupN = 128; }
+                if (options_.groupMicros == 0) { options_.groupMicros = 100; }
+                if (options_.groupBytes == 0) { options_.groupBytes = 4ULL * 1024ULL * 1024ULL; }
+                if (options_.asyncMaxPendingBytes == 0) { options_.asyncMaxPendingBytes = 64ULL * 1024ULL * 1024ULL; }
+                if (options_.asyncMaxPendingBytes < options_.groupBytes) { options_.asyncMaxPendingBytes = options_.groupBytes; }
 
-                shards_.reserve(options_.shard_count);
-                for (uint16_t i = 0; i < options_.shard_count; ++i) { shards_.push_back(std::make_unique<ShardWriter>(options_, i)); }
+                shards_.reserve(options_.shardCount);
+                for (uint16_t i = 0; i < options_.shardCount; ++i) { shards_.push_back(std::make_unique<ShardWriter>(options_, i)); }
             }
 
             ~Impl() { close(); }
@@ -526,30 +523,30 @@ namespace akkaradb::engine::wal {
                 std::span<const uint8_t> value,
                 uint64_t seq,
                 uint8_t flags,
-                uint64_t precomputed_fp64
+                uint64_t precomputedFp64
             ) {
-                const uint64_t fp64 = precomputed_fp64 != 0
-                                          ? precomputed_fp64
-                                          : (key.empty() ? 0 : core::compute_key_fp64(key.data(), key.size()));
-                const uint16_t shard_id = shard_for(fp64, options_.shard_count);
-                PendingEntry entry{seq, serialize_entry(key, value, seq, fp64, flags)};
-                shards_[shard_id]->append(std::move(entry));
+                const uint64_t fp64 = precomputedFp64 != 0
+                                          ? precomputedFp64
+                                          : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
+                const uint16_t shardId = shardFor(fp64, options_.shardCount);
+                PendingEntry entry{seq, serializeEntry(key, value, seq, fp64, flags)};
+                shards_[shardId]->append(std::move(entry));
             }
 
-            void force_sync() { for (const auto& shard : shards_) { shard->force_sync(); } }
+            void forceSync() { for (const auto& shard : shards_) { shard->forceSync(); } }
 
-            void prune_until(uint64_t checkpoint_seq) { for (const auto& shard : shards_) { shard->prune_until(checkpoint_seq); } }
+            void pruneUntil(uint64_t checkpointSeq) { for (const auto& shard : shards_) { shard->pruneUntil(checkpointSeq); } }
 
             [[nodiscard]] WalWriterSnapshot snapshot() const noexcept {
                 WalWriterSnapshot out;
-                out.shard_count = static_cast<uint32_t>(shards_.size());
+                out.shardCount = static_cast<uint32_t>(shards_.size());
                 for (const auto& shard : shards_) {
                     const auto snap = shard->snapshot();
-                    out.entries_written += snap.entries_written;
-                    out.bytes_written += snap.bytes_written;
-                    out.batches_flushed += snap.batches_flushed;
-                    out.syncs_executed += snap.syncs_executed;
-                    out.segment_rotations += snap.segment_rotations;
+                    out.entriesWritten += snap.entriesWritten;
+                    out.bytesWritten += snap.bytesWritten;
+                    out.batchesFlushed += snap.batchesFlushed;
+                    out.syncsExecuted += snap.syncsExecuted;
+                    out.segmentRotations += snap.segmentRotations;
                 }
                 return out;
             }
@@ -581,12 +578,12 @@ namespace akkaradb::engine::wal {
         std::span<const uint8_t> value,
         uint64_t seq,
         uint8_t flags,
-        uint64_t precomputed_fp64
-    ) { impl_->append(key, value, seq, flags, precomputed_fp64); }
+        uint64_t precomputedFp64
+    ) { impl_->append(key, value, seq, flags, precomputedFp64); }
 
-    void WalWriter::force_sync() { impl_->force_sync(); }
+    void WalWriter::forceSync() { impl_->forceSync(); }
 
-    void WalWriter::prune_until(uint64_t checkpoint_seq) { impl_->prune_until(checkpoint_seq); }
+    void WalWriter::pruneUntil(uint64_t checkpointSeq) { impl_->pruneUntil(checkpointSeq); }
 
     WalWriterSnapshot WalWriter::snapshot() const noexcept { return impl_ ? impl_->snapshot() : WalWriterSnapshot{}; }
 
