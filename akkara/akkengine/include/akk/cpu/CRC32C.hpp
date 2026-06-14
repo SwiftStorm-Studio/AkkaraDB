@@ -19,6 +19,8 @@
 // akkengine/include/akk/cpu/CRC32C.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -38,5 +40,5 @@ namespace akkaradb::cpu {
      * @param length Number of bytes to process.
      * @return CRC32C checksum for the input.
      */
-    [[nodiscard]] uint32_t CRC32C(const std::byte* data, size_t length) noexcept;
+    [[nodiscard]] AKDB_API uint32_t CRC32C(const std::byte* data, size_t length) noexcept;
 } // namespace akkaradb::cpu

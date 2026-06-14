@@ -25,9 +25,12 @@
 
 #include <algorithm>
 #include <array>
-#include <cstring>
+#include <limits>
+#include <span>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace akkaradb::crypto {
     namespace {
@@ -39,6 +42,46 @@ namespace akkaradb::crypto {
             SecretKey initiatorToResponder{};
             SecretKey responderToInitiator{};
             SecretKey handshakeAuthKey{};
+
+            DerivedKeys() = default;
+
+            DerivedKeys(SecretKey initiator, SecretKey responder, SecretKey handshake)
+                : initiatorToResponder(initiator),
+                  responderToInitiator(responder),
+                  handshakeAuthKey(handshake) {
+                secureWipe(initiator);
+                secureWipe(responder);
+                secureWipe(handshake);
+            }
+
+            ~DerivedKeys() { wipe(); }
+
+            DerivedKeys(const DerivedKeys&) = delete;
+            DerivedKeys& operator=(const DerivedKeys&) = delete;
+
+            DerivedKeys(DerivedKeys&& other) noexcept
+                : initiatorToResponder(other.initiatorToResponder),
+                  responderToInitiator(other.responderToInitiator),
+                  handshakeAuthKey(other.handshakeAuthKey) {
+                other.wipe();
+            }
+
+            DerivedKeys& operator=(DerivedKeys&& other) noexcept {
+                if (this != &other) {
+                    wipe();
+                    initiatorToResponder = other.initiatorToResponder;
+                    responderToInitiator = other.responderToInitiator;
+                    handshakeAuthKey = other.handshakeAuthKey;
+                    other.wipe();
+                }
+                return *this;
+            }
+
+            void wipe() noexcept {
+                secureWipe(initiatorToResponder);
+                secureWipe(responderToInitiator);
+                secureWipe(handshakeAuthKey);
+            }
         };
 
         void append(std::vector<std::uint8_t>& out, std::string_view value) { out.insert(out.end(), value.begin(), value.end()); }
@@ -49,6 +92,10 @@ namespace akkaradb::crypto {
 
         template <typename T>
         void append(std::vector<std::uint8_t>& out, const T& value) { append(out, value.data(), value.size()); }
+
+        void wipeVector(std::vector<std::uint8_t>& secret) noexcept {
+            if (!secret.empty()) { secureWipe(std::span<std::uint8_t>(secret.data(), secret.size())); }
+        }
 
         void appendU64Le(std::vector<std::uint8_t>& out, std::uint64_t value) {
             for (int i = 0; i < 8; ++i) { out.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xffu)); }
@@ -102,6 +149,7 @@ namespace akkaradb::crypto {
 
             std::array<std::uint8_t, 64> prk{};
             crypto_blake2b(prk.data(), prk.size(), extractInput.data(), extractInput.size());
+            wipeVector(extractInput);
 
             auto expand = [&prk](std::string_view label) {
                 SecretKey out{};
@@ -132,9 +180,9 @@ namespace akkaradb::crypto {
         }
 
         [[nodiscard]] AeadTag serverAuthenticator(const SecretKey& handshakeAuthKey, const ClientHello& client, const ServerHello& server) {
+            const auto transcript = transcriptForAuth(client, server);
             std::array<std::uint8_t, 64> expandedKey{};
             std::copy(handshakeAuthKey.begin(), handshakeAuthKey.end(), expandedKey.begin());
-            const auto transcript = transcriptForAuth(client, server);
 
             AeadTag tag{};
             keyedHash(tag, expandedKey, transcript);
@@ -161,27 +209,40 @@ namespace akkaradb::crypto {
             const ClientHello& clientHello,
             const ServerHello& serverHello
         ) {
-            auto dhEe = x25519Checked(localEphemeralSecret, serverHello.ephemeralPublicKey);
-            auto dhEs = x25519Checked(localEphemeralSecret, serverHello.staticPublicKey);
-            auto dhSe = x25519Checked(localIdentity.secretKey, serverHello.ephemeralPublicKey);
-            auto dhSs = x25519Checked(localIdentity.secretKey, serverHello.staticPublicKey);
+            SecretKey dhEe{};
+            SecretKey dhEs{};
+            SecretKey dhSe{};
+            SecretKey dhSs{};
+            try {
+                dhEe = x25519Checked(localEphemeralSecret, serverHello.ephemeralPublicKey);
+                dhEs = x25519Checked(localEphemeralSecret, serverHello.staticPublicKey);
+                dhSe = x25519Checked(localIdentity.secretKey, serverHello.ephemeralPublicKey);
+                dhSs = x25519Checked(localIdentity.secretKey, serverHello.staticPublicKey);
 
-            auto keys = deriveKeys(
-                clientHello.staticPublicKey,
-                serverHello.staticPublicKey,
-                clientHello.ephemeralPublicKey,
-                serverHello.ephemeralPublicKey,
-                dhEe,
-                dhEs,
-                dhSe,
-                dhSs
-            );
+                auto keys = deriveKeys(
+                    clientHello.staticPublicKey,
+                    serverHello.staticPublicKey,
+                    clientHello.ephemeralPublicKey,
+                    serverHello.ephemeralPublicKey,
+                    dhEe,
+                    dhEs,
+                    dhSe,
+                    dhSs
+                );
 
-            secureWipe(dhEe);
-            secureWipe(dhEs);
-            secureWipe(dhSe);
-            secureWipe(dhSs);
-            return keys;
+                secureWipe(dhEe);
+                secureWipe(dhEs);
+                secureWipe(dhSe);
+                secureWipe(dhSs);
+                return keys;
+            }
+            catch (...) {
+                secureWipe(dhEe);
+                secureWipe(dhEs);
+                secureWipe(dhSe);
+                secureWipe(dhSs);
+                throw;
+            }
         }
 
         [[nodiscard]] DerivedKeys deriveForResponder(
@@ -190,27 +251,40 @@ namespace akkaradb::crypto {
             const ClientHello& clientHello,
             const ServerHello& serverHello
         ) {
-            auto dhEe = x25519Checked(localEphemeralSecret, clientHello.ephemeralPublicKey);
-            auto dhEs = x25519Checked(localIdentity.secretKey, clientHello.ephemeralPublicKey);
-            auto dhSe = x25519Checked(localEphemeralSecret, clientHello.staticPublicKey);
-            auto dhSs = x25519Checked(localIdentity.secretKey, clientHello.staticPublicKey);
+            SecretKey dhEe{};
+            SecretKey dhEs{};
+            SecretKey dhSe{};
+            SecretKey dhSs{};
+            try {
+                dhEe = x25519Checked(localEphemeralSecret, clientHello.ephemeralPublicKey);
+                dhEs = x25519Checked(localIdentity.secretKey, clientHello.ephemeralPublicKey);
+                dhSe = x25519Checked(localEphemeralSecret, clientHello.staticPublicKey);
+                dhSs = x25519Checked(localIdentity.secretKey, clientHello.staticPublicKey);
 
-            auto keys = deriveKeys(
-                clientHello.staticPublicKey,
-                serverHello.staticPublicKey,
-                clientHello.ephemeralPublicKey,
-                serverHello.ephemeralPublicKey,
-                dhEe,
-                dhEs,
-                dhSe,
-                dhSs
-            );
+                auto keys = deriveKeys(
+                    clientHello.staticPublicKey,
+                    serverHello.staticPublicKey,
+                    clientHello.ephemeralPublicKey,
+                    serverHello.ephemeralPublicKey,
+                    dhEe,
+                    dhEs,
+                    dhSe,
+                    dhSs
+                );
 
-            secureWipe(dhEe);
-            secureWipe(dhEs);
-            secureWipe(dhSe);
-            secureWipe(dhSs);
-            return keys;
+                secureWipe(dhEe);
+                secureWipe(dhEs);
+                secureWipe(dhSe);
+                secureWipe(dhSs);
+                return keys;
+            }
+            catch (...) {
+                secureWipe(dhEe);
+                secureWipe(dhEs);
+                secureWipe(dhSe);
+                secureWipe(dhSs);
+                throw;
+            }
         }
     } // namespace
 
@@ -267,6 +341,10 @@ namespace akkaradb::crypto {
 
     EncryptedFrame SecureSession::seal(BytesView plaintext, BytesView aad) {
         if (!valid_) { throw std::runtime_error("SecureSession::seal on invalid session"); }
+        if (sendCounter_ == std::numeric_limits<std::uint64_t>::max()) {
+            valid_ = false;
+            throw std::runtime_error("SecureSession::seal counter exhausted");
+        }
 
         EncryptedFrame frame;
         frame.counter = sendCounter_++;
@@ -288,6 +366,10 @@ namespace akkaradb::crypto {
 
     bool SecureSession::open(const EncryptedFrame& frame, std::vector<std::uint8_t>& plaintext, BytesView aad) {
         if (!valid_ || frame.counter != recvCounter_) { return false; }
+        if (recvCounter_ == std::numeric_limits<std::uint64_t>::max()) {
+            valid_ = false;
+            return false;
+        }
 
         std::vector<std::uint8_t> out(frame.ciphertext.size());
         const auto nonce = deriveNonce(recvKey_, frame.counter);
@@ -315,6 +397,10 @@ namespace akkaradb::crypto {
         crypto_x25519_public_key(hello_.ephemeralPublicKey.data(), ephemeralSecret_.data());
     }
 
+    NoiseInitiator::~NoiseInitiator() {
+        secureWipe(ephemeralSecret_);
+    }
+
     SecureSession NoiseInitiator::finish(const ServerHello& hello, const std::optional<PublicKey>& expectedRemote) {
         if (finished_) { throw std::runtime_error("NoiseInitiator::finish called twice"); }
         if (expectedRemote && hello.staticPublicKey != *expectedRemote) {
@@ -324,9 +410,7 @@ namespace akkaradb::crypto {
         auto keys = deriveForInitiator(localIdentity_, ephemeralSecret_, hello_, hello);
         const auto expectedTag = serverAuthenticator(keys.handshakeAuthKey, hello_, hello);
         if (crypto_verify16(expectedTag.data(), hello.authenticator.data()) != 0) {
-            secureWipe(keys.initiatorToResponder);
-            secureWipe(keys.responderToInitiator);
-            secureWipe(keys.handshakeAuthKey);
+            keys.wipe();
             throw std::runtime_error("NoiseInitiator: responder authenticator mismatch");
         }
 
@@ -348,24 +432,30 @@ namespace akkaradb::crypto {
         SecretKey ephemeralSecret{};
         secureRandom(ephemeralSecret);
 
-        ResponderHandshake result;
-        result.hello.staticPublicKey = localIdentity.publicKey;
-        crypto_x25519_public_key(result.hello.ephemeralPublicKey.data(), ephemeralSecret.data());
+        try {
+            ResponderHandshake result;
+            result.hello.staticPublicKey = localIdentity.publicKey;
+            crypto_x25519_public_key(result.hello.ephemeralPublicKey.data(), ephemeralSecret.data());
 
-        auto keys = deriveForResponder(localIdentity, ephemeralSecret, hello, result.hello);
-        result.hello.authenticator = serverAuthenticator(keys.handshakeAuthKey, hello, result.hello);
+            auto keys = deriveForResponder(localIdentity, ephemeralSecret, hello, result.hello);
+            result.hello.authenticator = serverAuthenticator(keys.handshakeAuthKey, hello, result.hello);
 
-        result.remoteStaticPublicKey = hello.staticPublicKey;
-        result.remoteFingerprint = fingerprintPublicKey(hello.staticPublicKey);
-        result.remoteNodeId = nodeIdFromPublicKey(hello.staticPublicKey);
-        result.session = SecureSession(
-            std::move(keys.initiatorToResponder),
-            std::move(keys.responderToInitiator),
-            SecureSession::Role::RESPONDER
-        );
+            result.remoteStaticPublicKey = hello.staticPublicKey;
+            result.remoteFingerprint = fingerprintPublicKey(hello.staticPublicKey);
+            result.remoteNodeId = nodeIdFromPublicKey(hello.staticPublicKey);
+            result.session = SecureSession(
+                std::move(keys.initiatorToResponder),
+                std::move(keys.responderToInitiator),
+                SecureSession::Role::RESPONDER
+            );
 
-        secureWipe(ephemeralSecret);
-        secureWipe(keys.handshakeAuthKey);
-        return result;
+            secureWipe(ephemeralSecret);
+            keys.wipe();
+            return result;
+        }
+        catch (...) {
+            secureWipe(ephemeralSecret);
+            throw;
+        }
     }
 } // namespace akkaradb::crypto

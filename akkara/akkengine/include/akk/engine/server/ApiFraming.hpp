@@ -23,9 +23,26 @@
 #include <span>
 #include <vector>
 
+#include "akk/engine/server/AkkApiServerExport.hpp"
+
 namespace akkaradb::engine::server {
     enum class ApiOp : uint8_t {
-        GET = 0x01, PUT = 0x02, REMOVE = 0x03, GET_AT = 0x04, BATCH_PUT = 0x05, BATCH_GET = 0x06,
+        GET = 0x01,
+        PUT = 0x02,
+        REMOVE = 0x03,
+        GET_AT = 0x04,
+        BATCH_PUT = 0x05,
+        BATCH_GET = 0x06,
+        PING = 0x07,
+        EXISTS = 0x08,
+        COUNT = 0x09,
+        SCAN = 0x0A,
+        HISTORY = 0x0B,
+        ROLLBACK_TO = 0x0C,
+        ROLLBACK_KEY = 0x0D,
+        FORCE_SYNC = 0x0E,
+        FORCE_FLUSH = 0x0F,
+        STATS = 0x10,
     };
 
     enum class ApiStatus : uint8_t {
@@ -67,12 +84,12 @@ namespace akkaradb::engine::server {
         std::span<const uint8_t> value;
     };
 
-    [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> data) noexcept;
-    [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> first, std::span<const uint8_t> second);
+    [[nodiscard]] AKKARADB_API_SERVER_API uint32_t crc32c(std::span<const uint8_t> data) noexcept;
+    [[nodiscard]] AKKARADB_API_SERVER_API uint32_t crc32c(std::span<const uint8_t> first, std::span<const uint8_t> second);
 
-    [[nodiscard]] bool decodeBatchPut(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<ApiBatchPutItem>& out);
-    [[nodiscard]] bool decodeBatchGet(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<std::span<const uint8_t>>& out);
-    void encodeResponse(ApiStatus status, uint32_t requestId, std::span<const uint8_t> value, std::vector<uint8_t>& out);
-    void encodeBatchGetResponse(uint32_t requestId, std::span<const ApiBatchGetResult> results, std::vector<uint8_t>& out);
-    void encodeError(uint32_t requestId, std::vector<uint8_t>& out);
+    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchPut(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<ApiBatchPutItem>& out);
+    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchGet(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<std::span<const uint8_t>>& out);
+    AKKARADB_API_SERVER_API void encodeResponse(ApiStatus status, uint32_t requestId, std::span<const uint8_t> value, std::vector<uint8_t>& out);
+    AKKARADB_API_SERVER_API void encodeBatchGetResponse(uint32_t requestId, std::span<const ApiBatchGetResult> results, std::vector<uint8_t>& out);
+    AKKARADB_API_SERVER_API void encodeError(uint32_t requestId, std::vector<uint8_t>& out);
 }

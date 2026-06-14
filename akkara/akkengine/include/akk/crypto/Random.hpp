@@ -19,6 +19,8 @@
 // akkengine/include/akk/crypto/Random.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -32,10 +34,10 @@ namespace akkaradb::crypto {
      *
      * @throws std::runtime_error when the OS random source is unavailable.
      */
-    void secureRandom(std::span<std::uint8_t> out);
+    AKDB_API void secureRandom(std::span<std::uint8_t> out);
 
     /**
      * @brief Best-effort constant-time wipe for temporary secret material.
      */
-    void secureWipe(std::span<std::uint8_t> secret) noexcept;
+    AKDB_API void secureWipe(std::span<std::uint8_t> secret) noexcept;
 } // namespace akkaradb::crypto

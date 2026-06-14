@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/blob/BlobManager.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include "akk/engine/blob/BlobFraming.hpp"
 
 #include <filesystem>
@@ -28,7 +30,7 @@
 #include <vector>
 
 namespace akkaradb::engine::blob {
-    class BlobManager {
+    class AKDB_API BlobManager {
         public:
             struct Options {
                 std::filesystem::path blobDir;
@@ -69,7 +71,7 @@ namespace akkaradb::engine::blob {
             [[nodiscard]] Snapshot snapshot() const noexcept;
 
         private:
-            BlobManager() = default;
+            BlobManager();
 
             class Impl;
             std::unique_ptr<Impl> impl_;

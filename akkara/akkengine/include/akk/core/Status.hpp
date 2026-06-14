@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/Status.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -54,7 +56,7 @@ namespace akkaradb::core {
      * Status itself is immutable and thread-safe.
      * Arena is assumed to be externally synchronized or thread-confined.
      */
-    class Status {
+    class AKDB_API Status {
         public:
             /**
              * @brief Canonical error codes used across AkkaraDB.

@@ -686,7 +686,7 @@ namespace akkaradb {
                     return *this;
                 }
 
-                void bind(core::BufferArena* arena) noexcept {
+                void bind(BufferArena* arena) noexcept {
                     arena_ = arena;
                     release();
                 }
@@ -749,7 +749,7 @@ namespace akkaradb {
             private:
                 void ensureArena() const { if (arena_ == nullptr) { throw std::logic_error("PackedTable: arena buffer is not bound"); } }
 
-                core::BufferArena* arena_ = nullptr;
+                BufferArena* arena_ = nullptr;
                 uint8_t* data_ = nullptr;
                 size_t size_ = 0;
                 size_t capacity_ = 0;

@@ -19,10 +19,39 @@
 // akkengine/src/engine/server/AkkApiServer.cpp
 #include "akk/engine/server/AkkApiServer.hpp"
 
-#include "akk/engine/server/HttpApiServer.hpp"
-#include "akk/engine/server/TcpApiServer.hpp"
+#include <filesystem>
+#include <stdexcept>
+#include <utility>
 
 namespace akkaradb::engine::server {
+    namespace {
+        [[nodiscard]] const char* backendName(AkkEngineOptions::ApiBackend backend) noexcept {
+            switch (backend) {
+                case AkkEngineOptions::ApiBackend::HTTP: return "HTTP";
+                case AkkEngineOptions::ApiBackend::TCP: return "TCP";
+                case AkkEngineOptions::ApiBackend::GRPC: return "GRPC";
+            }
+            return "unknown";
+        }
+
+        [[nodiscard]] const std::filesystem::path& backendPath(
+            const AkkEngineOptions::ApiOptions& options,
+            AkkEngineOptions::ApiBackend backend
+        ) noexcept {
+            switch (backend) {
+                case AkkEngineOptions::ApiBackend::HTTP:
+                    return options.httpBackendPath.empty() ? options.transportBackendPath : options.httpBackendPath;
+                case AkkEngineOptions::ApiBackend::TCP:
+                    return options.tcpBackendPath.empty() ? options.transportBackendPath : options.tcpBackendPath;
+                case AkkEngineOptions::ApiBackend::GRPC:
+                    return options.grpcBackendPath.empty() ? options.transportBackendPath : options.grpcBackendPath;
+            }
+            return options.transportBackendPath;
+        }
+    }
+
+    AkkApiServer::AkkApiServer() = default;
+
     std::unique_ptr<AkkApiServer> AkkApiServer::create(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options) {
         auto server = std::unique_ptr<AkkApiServer>{new AkkApiServer()};
         auto backends = options.backends;
@@ -32,12 +61,10 @@ namespace akkaradb::engine::server {
         }
 
         for (const auto backend : backends) {
-            switch (backend) {
-                case AkkEngineOptions::ApiBackend::HTTP: server->http_ = HttpApiServer::create(engine, options);
-                    break;
-                case AkkEngineOptions::ApiBackend::TCP: server->tcp_ = TcpApiServer::create(engine, options);
-                    break;
+            if (!akkApiTransportFactoryAvailable(backend) && !loadAkkApiTransportBackend(backend, backendPath(options, backend))) {
+                throw std::runtime_error(std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available");
             }
+            server->transports_.push_back(createAkkApiTransport(backend, engine, options));
         }
         return server;
     }
@@ -46,8 +73,7 @@ namespace akkaradb::engine::server {
 
     void AkkApiServer::start() {
         try {
-            if (http_) { http_->start(); }
-            if (tcp_) { tcp_->start(); }
+            for (auto& transport : transports_) { transport->start(); }
         }
         catch (...) {
             close();
@@ -56,21 +82,100 @@ namespace akkaradb::engine::server {
     }
 
     void AkkApiServer::close() {
-        if (http_) {
-            http_->close();
-            http_.reset();
-        }
-        if (tcp_) {
-            tcp_->close();
-            tcp_.reset();
-        }
+        for (auto& transport : transports_) { if (transport) { transport->close(); } }
+        transports_.clear();
     }
 
     EngineStats::ApiStats AkkApiServer::stats() const noexcept {
         EngineStats::ApiStats out;
-        out.enabled = true;
-        if (tcp_) { out = tcp_->stats(); }
-        out.enabled = true;
+        for (const auto& transport : transports_) {
+            if (!transport) { continue; }
+            const auto next = transport->stats();
+            out.enabled = out.enabled || next.enabled;
+
+            if (next.httpEnabled) {
+                out.httpEnabled = true;
+                out.httpTlsEnabled = next.httpTlsEnabled;
+                out.httpPort = next.httpPort;
+                out.httpMaxBatchItems = next.httpMaxBatchItems;
+                out.httpMaxScanItems = next.httpMaxScanItems;
+                out.httpMaxHistoryEntries = next.httpMaxHistoryEntries;
+                out.httpMaxContentLength = next.httpMaxContentLength;
+                out.httpConnectionsAcceptedTotal = next.httpConnectionsAcceptedTotal;
+                out.httpConnectionsClosedTotal = next.httpConnectionsClosedTotal;
+                out.httpConnectionsActive = next.httpConnectionsActive;
+                out.httpRequestsTotal = next.httpRequestsTotal;
+                out.httpResponsesTotal = next.httpResponsesTotal;
+                out.httpBytesReceivedTotal = next.httpBytesReceivedTotal;
+                out.httpBytesSentTotal = next.httpBytesSentTotal;
+                out.httpProtocolErrorsTotal = next.httpProtocolErrorsTotal;
+                out.httpErrorsTotal = next.httpErrorsTotal;
+                out.httpBatchPutItemsTotal = next.httpBatchPutItemsTotal;
+                out.httpBatchGetItemsTotal = next.httpBatchGetItemsTotal;
+            }
+
+            if (next.tcpEnabled) {
+                out.tcpEnabled = true;
+                out.tcpTlsEnabled = next.tcpTlsEnabled;
+                out.tcpWorkerThreads = next.tcpWorkerThreads;
+                out.tcpAcceptQueueLimit = next.tcpAcceptQueueLimit;
+                out.tcpAcceptQueueTimeoutMs = next.tcpAcceptQueueTimeoutMs;
+                out.tcpListenBacklog = next.tcpListenBacklog;
+                out.tcpReadTimeoutMs = next.tcpReadTimeoutMs;
+                out.tcpWriteTimeoutMs = next.tcpWriteTimeoutMs;
+                out.tcpConnectionsAcceptedTotal = next.tcpConnectionsAcceptedTotal;
+                out.tcpConnectionsClosedTotal = next.tcpConnectionsClosedTotal;
+                out.tcpConnectionsActive = next.tcpConnectionsActive;
+                out.tcpAcceptQueueDepth = next.tcpAcceptQueueDepth;
+                out.tcpAcceptQueuePeakDepth = next.tcpAcceptQueuePeakDepth;
+                out.tcpAcceptQueueRejectedTotal = next.tcpAcceptQueueRejectedTotal;
+                out.tcpAcceptQueueExpiredTotal = next.tcpAcceptQueueExpiredTotal;
+                out.tcpRequestsTotal = next.tcpRequestsTotal;
+                out.tcpResponsesTotal = next.tcpResponsesTotal;
+                out.tcpBytesReceivedTotal = next.tcpBytesReceivedTotal;
+                out.tcpBytesSentTotal = next.tcpBytesSentTotal;
+                out.tcpProtocolErrorsTotal = next.tcpProtocolErrorsTotal;
+                out.tcpCrcErrorsTotal = next.tcpCrcErrorsTotal;
+                out.tcpPipelineBatchesTotal = next.tcpPipelineBatchesTotal;
+                out.tcpBackpressureFlushesTotal = next.tcpBackpressureFlushesTotal;
+                out.tcpBackpressureDisconnectsTotal = next.tcpBackpressureDisconnectsTotal;
+                out.tcpBatchPutItemsTotal = next.tcpBatchPutItemsTotal;
+                out.tcpBatchGetItemsTotal = next.tcpBatchGetItemsTotal;
+                out.tcpIoBackend = next.tcpIoBackend;
+            }
+
+            if (next.grpcEnabled) {
+                out.grpcEnabled = true;
+                out.grpcTlsEnabled = next.grpcTlsEnabled;
+                out.grpcPort = next.grpcPort;
+                out.grpcWorkerThreads = next.grpcWorkerThreads;
+                out.grpcCompletionQueues = next.grpcCompletionQueues;
+                out.grpcMinPollers = next.grpcMinPollers;
+                out.grpcMaxPollers = next.grpcMaxPollers;
+                out.grpcMaxConcurrentStreams = next.grpcMaxConcurrentStreams;
+                out.grpcResourceQuotaBytes = next.grpcResourceQuotaBytes;
+                out.grpcMaxBatchItems = next.grpcMaxBatchItems;
+                out.grpcMaxScanItems = next.grpcMaxScanItems;
+                out.grpcMaxHistoryEntries = next.grpcMaxHistoryEntries;
+                out.grpcRequestsTotal = next.grpcRequestsTotal;
+                out.grpcResponsesTotal = next.grpcResponsesTotal;
+                out.grpcActiveRequests = next.grpcActiveRequests;
+                out.grpcErrorsTotal = next.grpcErrorsTotal;
+                out.grpcBatchPutItemsTotal = next.grpcBatchPutItemsTotal;
+                out.grpcBatchGetItemsTotal = next.grpcBatchGetItemsTotal;
+            }
+        }
+        out.enabled = out.enabled || !transports_.empty();
         return out;
     }
+}
+
+extern "C" AKKARADB_API_SERVER_API bool akkaradb_api_server_register() noexcept {
+    return akkaradb::engine::server::registerAkkApiServerFactory(
+        [](akkaradb::engine::AkkEngine& engine, const akkaradb::engine::AkkEngineOptions::ApiOptions& options) {
+            return std::unique_ptr<akkaradb::engine::server::IAkkApiServer>{
+                akkaradb::engine::server::AkkApiServer::create(engine, options).release()
+            };
+        }
+    );
 }

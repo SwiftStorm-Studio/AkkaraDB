@@ -28,7 +28,6 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
-#include <stdexcept>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/random.h>
@@ -36,8 +35,8 @@
 #endif
 
 #include <algorithm>
-#include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace akkaradb::crypto {
     namespace {

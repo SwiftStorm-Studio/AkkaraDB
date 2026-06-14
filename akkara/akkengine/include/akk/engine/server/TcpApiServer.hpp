@@ -20,6 +20,8 @@
 #pragma once
 
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/server/AkkApiServerExport.hpp"
+#include "akk/engine/server/AkkApiTransportProvider.hpp"
 #include "akk/engine/server/ApiTransport.hpp"
 
 #include <atomic>
@@ -34,18 +36,18 @@
 #include <vector>
 
 namespace akkaradb::engine::server {
-    class TcpApiServer {
+    class AKKARADB_API_SERVER_API TcpApiServer final : public IAkkApiTransport {
         public:
             [[nodiscard]] static std::unique_ptr<TcpApiServer> create(AkkEngine& engine, AkkEngineOptions::ApiOptions options);
 
-            ~TcpApiServer();
+            ~TcpApiServer() override;
 
             TcpApiServer(const TcpApiServer&) = delete;
             TcpApiServer& operator=(const TcpApiServer&) = delete;
 
-            void start();
-            void close();
-            [[nodiscard]] EngineStats::ApiStats stats() const noexcept;
+            void start() override;
+            void close() override;
+            [[nodiscard]] EngineStats::ApiStats stats() const noexcept override;
 
         private:
             TcpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options);

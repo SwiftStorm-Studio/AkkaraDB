@@ -189,6 +189,8 @@ namespace akkaradb::engine::wal {
         }
     } // namespace
 
+    WalWriter::WalWriter() = default;
+
     class WalWriter::Impl {
         public:
             struct PendingEntry {

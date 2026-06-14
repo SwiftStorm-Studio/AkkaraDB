@@ -19,35 +19,20 @@
 // akkengine/include/akk/engine/cluster/ClusterRuntime.hpp
 #pragma once
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterManager.hpp"
+#include "akk/engine/cluster/ClusterRuntimeProvider.hpp"
 #include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include "akk/engine/cluster/ReplicationServer.hpp"
 
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <memory>
 #include <span>
 
 namespace akkaradb::engine::cluster {
-    /**
-     * ClusterEngineCallbacks - Hooks from cluster runtime back into the engine.
-     *
-     * The runtime uses these callbacks to query sequence state, apply incoming
-     * replica records, apply replicated blob payloads, and report role changes.
-     * Empty callbacks are allowed for optional paths, but replication work will
-     * be skipped when the corresponding callback is absent.
-     */
-    struct ClusterEngineCallbacks {
-        std::function<uint64_t()> getCurrentSeq; ///< Primary hello: current sequence advertised to replicas.
-        std::function<uint64_t()> getLastSeq; ///< Replica hello: last applied sequence sent to primary.
-        ReplicationClient::ApplyCallback apply; ///< Applies replicated put/remove entries on replicas.
-        ReplicationClient::BlobCallback applyBlob; ///< Applies replicated blob payloads on replicas.
-        ClusterManager::RoleChangeCallback roleChange; ///< Notifies the engine after local role changes.
-    };
-
     /**
      * ClusterRuntime - Orchestrates manager, router, replication client/server.
      *
@@ -60,7 +45,7 @@ namespace akkaradb::engine::cluster {
      * Thread-safety: start(), close(), shipEntry(), and shipBlob() serialize
      * access to the active replication endpoint.
      */
-    class ClusterRuntime {
+    class AKKARADB_CLUSTER_RUNTIME_API ClusterRuntime final : public IClusterRuntime {
         public:
             /**
              * Creates a cluster runtime.
@@ -69,7 +54,7 @@ namespace akkaradb::engine::cluster {
              * @param config          Cluster membership and replication policy.
              * @param selfNodeId    Stable id of the local node.
              * @param callbacks       Engine callbacks used by replication.
-             * @param runtimeOptions Transport/TLS options for replication links.
+             * @param runtimeOptions Transport options for replication links.
              * @throws std::invalid_argument if Stripe mode is requested before
              *         distributed write routing and ownership migration exist.
              * @throws std::invalid_argument if Plain transport is requested for
@@ -83,16 +68,16 @@ namespace akkaradb::engine::cluster {
                 ClusterRuntimeOptions runtimeOptions = {}
             );
 
-            ~ClusterRuntime();
+            ~ClusterRuntime() override;
 
             ClusterRuntime(const ClusterRuntime&) = delete;
             ClusterRuntime& operator=(const ClusterRuntime&) = delete;
 
             /** Starts role election and the role-appropriate replication endpoint. */
-            void start();
+            void start() override;
 
             /** Stops the active replication endpoint and cluster manager. */
-            void close();
+            void close() override;
 
             /** Returns the current local cluster role. */
             [[nodiscard]] NodeRole role() const noexcept;
@@ -112,14 +97,14 @@ namespace akkaradb::engine::cluster {
                 std::span<const uint8_t> value,
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
-            );
+            ) override;
 
             /**
              * Ships a blob payload to connected replicas when primary.
              *
              * Blob frames are not sequence-ack gated by ReplicationServer.
              */
-            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
+            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) override;
 
         private:
             class Impl;

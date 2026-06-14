@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/manifest/Manifest.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -45,7 +47,7 @@ namespace akkaradb::engine::manifest {
      *     flusher thread and fsynced periodically.  Lower latency but
      *     relaxed durability guarantee.
      */
-    class Manifest {
+    class AKDB_API Manifest {
         public:
             // ================================================================
             // Event types (used for replay / state queries)

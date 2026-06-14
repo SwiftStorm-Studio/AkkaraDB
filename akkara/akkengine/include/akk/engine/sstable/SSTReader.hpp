@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/sstable/SSTReader.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -31,7 +33,7 @@
 #include "akk/engine/sstable/SSTFormat.hpp"
 
 namespace akkaradb::engine::sst {
-    struct SSTRecord {
+    struct AKDB_API SSTRecord {
         std::vector<uint8_t> key;
         std::vector<uint8_t> value;
         uint64_t seq = 0;
@@ -42,7 +44,7 @@ namespace akkaradb::engine::sst {
         [[nodiscard]] bool isTombstone() const noexcept { return (flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0; }
     };
 
-    class SSTReader {
+    class AKDB_API SSTReader {
         public:
             struct Options {
                 uint64_t blockCacheBytes = 64ULL * 1024ULL * 1024ULL;

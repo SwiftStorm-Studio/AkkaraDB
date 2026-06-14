@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/memtable/IMemTable.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -53,7 +55,7 @@ namespace akkaradb::engine::memtable {
      * - multi-version records are backend-managed
      * - tombstones are represented via record flags
      */
-    class IMemTable {
+    class AKDB_API IMemTable {
         public:
             virtual ~IMemTable() = default;
 

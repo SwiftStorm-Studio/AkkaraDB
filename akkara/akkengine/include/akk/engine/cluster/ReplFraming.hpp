@@ -23,6 +23,7 @@
 #include <span>
 #include <vector>
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 namespace akkaradb::engine::cluster {
@@ -69,7 +70,7 @@ namespace akkaradb::engine::cluster {
      * The header is followed by payloadLen bytes.  CRC covers only the
      * payload, not the header.
      */
-    struct ReplFrameHeader {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplFrameHeader {
         static constexpr uint32_t MAGIC = 0x35524B41; // "AKR5"
         static constexpr size_t SIZE = 14;
 
@@ -82,28 +83,28 @@ namespace akkaradb::engine::cluster {
     /**
      * DecodedFrame - Validated frame returned by decodeFrame().
      */
-    struct DecodedFrame {
+    struct AKKARADB_CLUSTER_RUNTIME_API DecodedFrame {
         ReplMsgType type{};
         uint8_t flags = 0;
         std::vector<uint8_t> payload;
     };
 
     /** Replica-to-primary handshake payload. */
-    struct ClientHello {
+    struct AKKARADB_CLUSTER_RUNTIME_API ClientHello {
         uint64_t nodeId = 0; ///< Replica node id.
         uint64_t lastSeq = 0; ///< Last sequence already applied by the replica.
         NodeRole role = NodeRole::REPLICA; ///< Expected to be NodeRole::REPLICA.
     };
 
     /** Primary-to-replica handshake response payload. */
-    struct ServerHello {
+    struct AKKARADB_CLUSTER_RUNTIME_API ServerHello {
         uint64_t nodeId = 0; ///< Primary node id.
         uint64_t currentSeq = 0; ///< Primary's current sequence at handshake time.
         NodeRole role = NodeRole::PRIMARY; ///< Expected to be NodeRole::PRIMARY.
     };
 
     /** Replicated key/value mutation payload. */
-    struct ReplEntry {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplEntry {
         uint64_t seq = 0; ///< Monotonic sequence assigned by the source engine.
         uint64_t sourceNodeId = 0; ///< Node that originally produced the entry.
         ReplOpType op = ReplOpType::PUT; ///< Mutation type.
@@ -113,26 +114,26 @@ namespace akkaradb::engine::cluster {
     };
 
     /** Replicated blob payload. */
-    struct ReplBlob {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplBlob {
         uint64_t seq = 0; ///< Sequence associated with the blob reference.
         uint64_t blobId = 0; ///< Stable blob identifier.
         std::vector<uint8_t> content; ///< Raw blob content.
     };
 
     /** Replica acknowledgement payload. */
-    struct ReplAck {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplAck {
         uint64_t seq = 0; ///< Highest entry sequence acknowledged by the replica.
     };
 
     /** Reserved point-in-time read request payload. */
-    struct ReadRequest {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReadRequest {
         uint64_t requestId = 0;
         uint64_t snapshotSeq = 0;
         std::vector<uint8_t> key;
     };
 
     /** Reserved point-in-time read response payload. */
-    struct ReadResponse {
+    struct AKKARADB_CLUSTER_RUNTIME_API ReadResponse {
         uint64_t requestId = 0;
         ReadStatus status = ReadStatus::ERROR_STATUS;
         uint8_t recordFlags = 0;
@@ -143,54 +144,54 @@ namespace akkaradb::engine::cluster {
     /**
      * Encodes a complete frame with header, payload, and payload CRC32C.
      */
-    [[nodiscard]] std::vector<uint8_t> encodeFrame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags = 0);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeFrame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags = 0);
 
     /**
      * Decodes and validates a complete frame.
      *
      * @return false on short input, bad magic, length mismatch, or CRC mismatch.
      */
-    [[nodiscard]] bool decodeFrame(std::span<const uint8_t> wire, DecodedFrame& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeFrame(std::span<const uint8_t> wire, DecodedFrame& out);
 
     /** Encodes a ClientHello frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeClientHello(const ClientHello& hello);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeClientHello(const ClientHello& hello);
 
     /** Encodes a ServerHello frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeServerHello(const ServerHello& hello);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeServerHello(const ServerHello& hello);
 
     /** Encodes a ReplEntry frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeEntry(const ReplEntry& entry);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeEntry(const ReplEntry& entry);
 
     /** Encodes a ReplBlob frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeBlob(const ReplBlob& blob);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeBlob(const ReplBlob& blob);
 
     /** Encodes a ReplAck frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeAck(const ReplAck& ack);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeAck(const ReplAck& ack);
 
     /** Encodes a ReadRequest frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeReadRequest(const ReadRequest& request);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeReadRequest(const ReadRequest& request);
 
     /** Encodes a ReadResponse frame. */
-    [[nodiscard]] std::vector<uint8_t> encodeReadResponse(const ReadResponse& response);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeReadResponse(const ReadResponse& response);
 
     /** Decodes a ClientHello payload. */
-    [[nodiscard]] bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out);
 
     /** Decodes a ServerHello payload. */
-    [[nodiscard]] bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out);
 
     /** Decodes a ReplEntry payload. */
-    [[nodiscard]] bool decodeEntry(std::span<const uint8_t> payload, ReplEntry& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeEntry(std::span<const uint8_t> payload, ReplEntry& out);
 
     /** Decodes a ReplBlob payload. */
-    [[nodiscard]] bool decodeBlob(std::span<const uint8_t> payload, ReplBlob& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeBlob(std::span<const uint8_t> payload, ReplBlob& out);
 
     /** Decodes a ReplAck payload. */
-    [[nodiscard]] bool decodeAck(std::span<const uint8_t> payload, ReplAck& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeAck(std::span<const uint8_t> payload, ReplAck& out);
 
     /** Decodes a ReadRequest payload. */
-    [[nodiscard]] bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out);
 
     /** Decodes a ReadResponse payload. */
-    [[nodiscard]] bool decodeReadResponse(std::span<const uint8_t> payload, ReadResponse& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeReadResponse(std::span<const uint8_t> payload, ReadResponse& out);
 } // namespace akkaradb::engine::cluster

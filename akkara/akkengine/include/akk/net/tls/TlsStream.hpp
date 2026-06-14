@@ -19,11 +19,13 @@
 // akkengine/include/akk/net/tls/TlsStream.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 
 namespace akkaradb::net {
-    struct TlsConfig {
+    struct AKDB_API TlsConfig {
         const char* certPath = nullptr;
         const char* keyPath = nullptr;
         const char* caPath = nullptr;
@@ -39,7 +41,7 @@ namespace akkaradb::net {
      * Provides blocking TLS communication over a connected socket.
      * TLS implementation details are hidden in the source file.
      */
-    class TlsStream {
+    class AKDB_API TlsStream {
         public:
             TlsStream() = default;
             ~TlsStream();

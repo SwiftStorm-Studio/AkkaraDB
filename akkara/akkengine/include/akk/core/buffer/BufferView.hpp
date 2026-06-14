@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/buffer/BufferView.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -45,7 +47,7 @@ namespace akkaradb::core {
      *
      * If you need to retain the data, call toOwned().
      */
-    class BufferView {
+    class AKDB_API BufferView {
         public:
             // ==================== Constructors ====================
 

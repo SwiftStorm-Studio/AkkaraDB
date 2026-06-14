@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/memtable/MemTable.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -32,7 +34,7 @@
 #include "akk/engine/memtable/IMemTable.hpp"
 
 namespace akkaradb::engine::memtable {
-    class MemTable {
+    class AKDB_API MemTable {
         public:
             using RecordView = core::RecordView;
             using FlushCallback = std::function<void(std::span<const RecordView>)>;
@@ -61,7 +63,7 @@ namespace akkaradb::engine::memtable {
                 uint64_t flushesCompleted = 0;
             };
 
-            class RangeIterator {
+            class AKDB_API RangeIterator {
                 public:
                     ~RangeIterator();
                     RangeIterator(RangeIterator&&) noexcept;

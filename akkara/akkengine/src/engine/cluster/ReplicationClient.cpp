@@ -18,13 +18,15 @@
 
 // akkengine/src/engine/cluster/ReplicationClient.cpp
 #include "akk/engine/cluster/ReplicationClient.hpp"
-#include "akk/net/tls/TlsStream.hpp"
+#include "akk/crypto/SecureChannel.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,18 +105,6 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool sendAll(net::TlsStream& stream, const uint8_t* data, size_t size) {
-            size_t sent = 0;
-            while (sent < size) { sent += stream.send(data + sent, size - sent); }
-            return true;
-        }
-
-        bool recvAll(net::TlsStream& stream, uint8_t* data, size_t size) {
-            size_t received = 0;
-            while (received < size) { received += stream.recv(data + received, size - received); }
-            return true;
-        }
-
         bool recvFrame(SocketHandle s, DecodedFrame& out) {
             uint8_t header[ReplFrameHeader::SIZE];
             if (!recvAll(s, header, sizeof(header))) { return false; }
@@ -128,39 +118,110 @@ namespace akkaradb::engine::cluster {
             return decodeFrame(wire, out);
         }
 
-        bool recvFrame(net::TlsStream& stream, DecodedFrame& out) {
-            uint8_t header[ReplFrameHeader::SIZE];
-            try {
-                if (!recvAll(stream, header, sizeof(header))) { return false; }
+        constexpr uint32_t SECURE_HELLO_MAGIC = 0x48434B41; // "AKCH"
+        constexpr uint32_t SECURE_FRAME_MAGIC = 0x46434B41; // "AKCF"
+        constexpr uint8_t SECURE_VERSION = 1;
+        constexpr uint8_t SECURE_CLIENT_HELLO = 1;
+        constexpr uint8_t SECURE_SERVER_HELLO = 2;
+        constexpr size_t SECURE_HELLO_HEADER_SIZE = 6;
+        constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
+        constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
+        constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = 128u * 1024u * 1024u;
 
-                const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<
-                    uint32_t>(header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
-
-                std::vector<uint8_t> wire(sizeof(header) + payloadLen);
-                std::memcpy(wire.data(), header, sizeof(header));
-                if (payloadLen > 0 && !recvAll(stream, wire.data() + sizeof(header), payloadLen)) { return false; }
-                return decodeFrame(wire, out);
-            }
-            catch (...) { return false; }
+        void writeU32Le(uint8_t* out, uint32_t value) noexcept {
+            for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
         }
 
-        struct TlsConfigStorage {
-            std::string certPath;
-            std::string keyPath;
-            std::string caPath;
-            net::TlsConfig config{};
-        };
+        void writeU64Le(uint8_t* out, uint64_t value) noexcept {
+            for (size_t i = 0; i < 8; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
+        }
 
-        TlsConfigStorage makeTlsConfig(const ClusterRuntimeOptions& options) {
-            TlsConfigStorage storage;
-            storage.certPath = options.tls.certPath.string();
-            storage.keyPath = options.tls.keyPath.string();
-            storage.caPath = options.tls.caPath.string();
-            storage.config.certPath = storage.certPath.empty() ? nullptr : storage.certPath.c_str();
-            storage.config.keyPath = storage.keyPath.empty() ? nullptr : storage.keyPath.c_str();
-            storage.config.caPath = storage.caPath.empty() ? nullptr : storage.caPath.c_str();
-            storage.config.verifyPeer = options.tls.verifyPeer;
-            return storage;
+        uint32_t readU32Le(const uint8_t* in) noexcept {
+            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (
+                static_cast<uint32_t>(in[3]) << 24);
+        }
+
+        uint64_t readU64Le(const uint8_t* in) noexcept {
+            uint64_t out = 0;
+            for (size_t i = 0; i < 8; ++i) { out |= static_cast<uint64_t>(in[i]) << (i * 8); }
+            return out;
+        }
+
+        crypto::NodeIdentity loadSecureIdentity(const ClusterRuntimeOptions& options) {
+            if (options.secure.identitySeedPath.empty()) { return crypto::generateNodeIdentity(); }
+            return crypto::IdentityStore{options.secure.identitySeedPath}.loadOrCreate();
+        }
+
+        std::optional<crypto::PublicKey> pinnedPeerKey(const ClusterRuntimeOptions& options, uint64_t nodeId) {
+            if (nodeId == 0) { return std::nullopt; }
+            for (const auto& pin : options.secure.pinnedPeers) {
+                if (pin.nodeId == nodeId) { return pin.publicKey; }
+            }
+            return std::nullopt;
+        }
+
+        bool writeSecureClientHello(SocketHandle socket, const crypto::ClientHello& hello) {
+            std::array<uint8_t, SECURE_CLIENT_HELLO_SIZE> wire{};
+            writeU32Le(wire.data(), SECURE_HELLO_MAGIC);
+            wire[4] = SECURE_VERSION;
+            wire[5] = SECURE_CLIENT_HELLO;
+            std::memcpy(wire.data() + SECURE_HELLO_HEADER_SIZE, hello.staticPublicKey.data(), hello.staticPublicKey.size());
+            std::memcpy(wire.data() + SECURE_HELLO_HEADER_SIZE + hello.staticPublicKey.size(), hello.ephemeralPublicKey.data(), hello.ephemeralPublicKey.size());
+            return sendAll(socket, wire.data(), wire.size());
+        }
+
+        bool readSecureServerHello(SocketHandle socket, crypto::ServerHello& hello) {
+            std::array<uint8_t, SECURE_SERVER_HELLO_SIZE> wire{};
+            if (!recvAll(socket, wire.data(), wire.size())) { return false; }
+            if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_SERVER_HELLO) { return false; }
+            std::memcpy(hello.staticPublicKey.data(), wire.data() + SECURE_HELLO_HEADER_SIZE, hello.staticPublicKey.size());
+            std::memcpy(
+                hello.ephemeralPublicKey.data(),
+                wire.data() + SECURE_HELLO_HEADER_SIZE + hello.staticPublicKey.size(),
+                hello.ephemeralPublicKey.size()
+            );
+            std::memcpy(
+                hello.authenticator.data(),
+                wire.data() + SECURE_HELLO_HEADER_SIZE + hello.staticPublicKey.size() + hello.ephemeralPublicKey.size(),
+                hello.authenticator.size()
+            );
+            return true;
+        }
+
+        bool sendSecureFrame(SocketHandle socket, crypto::SecureSession& session, const uint8_t* data, size_t size) {
+            if (size > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
+            const auto encrypted = session.seal(std::span<const uint8_t>{data, size});
+            if (encrypted.ciphertext.size() > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
+
+            std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
+            writeU32Le(header.data(), SECURE_FRAME_MAGIC);
+            header[4] = SECURE_VERSION;
+            header[5] = 0;
+            writeU64Le(header.data() + 6, encrypted.counter);
+            writeU32Le(header.data() + 14, static_cast<uint32_t>(encrypted.ciphertext.size()));
+            std::memcpy(header.data() + 18, encrypted.tag.data(), encrypted.tag.size());
+
+            return sendAll(socket, header.data(), header.size()) &&
+                   (encrypted.ciphertext.empty() || sendAll(socket, encrypted.ciphertext.data(), encrypted.ciphertext.size()));
+        }
+
+        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out) {
+            std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
+            if (!recvAll(socket, header.data(), header.size())) { return false; }
+            if (readU32Le(header.data()) != SECURE_FRAME_MAGIC || header[4] != SECURE_VERSION) { return false; }
+
+            crypto::EncryptedFrame encrypted;
+            encrypted.counter = readU64Le(header.data() + 6);
+            const uint32_t ciphertextSize = readU32Le(header.data() + 14);
+            if (ciphertextSize > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
+            std::memcpy(encrypted.tag.data(), header.data() + 18, encrypted.tag.size());
+            encrypted.ciphertext.resize(ciphertextSize);
+            if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize)) { return false; }
+
+            std::vector<uint8_t> plaintext;
+            if (!session.open(encrypted, plaintext)) { return false; }
+            return decodeFrame(plaintext, out);
         }
 
         SocketHandle connectTo(const std::string& host, uint16_t port) {
@@ -201,7 +262,8 @@ namespace akkaradb::engine::cluster {
                   primaryReplPort_{primaryReplPort},
                   selfNodeId_{selfNodeId},
                   getLastSeq_{std::move(getLastSeq)},
-                  runtimeOptions_{std::move(runtimeOptions)} {}
+                  runtimeOptions_{std::move(runtimeOptions)},
+                  localIdentity_{runtimeOptions_.transportMode == TransportMode::SECURE ? loadSecureIdentity(runtimeOptions_) : crypto::NodeIdentity{}} {}
 
             ~Impl() { close(); }
 
@@ -224,19 +286,11 @@ namespace akkaradb::engine::cluster {
                 running_ = false;
                 {
                     std::lock_guard lock{socketMutex_};
-                    if (tls_) { tls_->shutdown(); }
                     shutdownSocket(socket_);
                     closeSocket(socket_);
                     socket_ = INVALID_SOCKET_HANDLE;
                 }
                 if (worker_.joinable()) { worker_.join(); }
-                {
-                    std::lock_guard lock{socketMutex_};
-                    if (tls_) {
-                        tls_->close();
-                        tls_.reset();
-                    }
-                }
                 connected_ = false;
             }
 
@@ -246,47 +300,43 @@ namespace akkaradb::engine::cluster {
             void run() {
                 while (running_) {
                     SocketHandle socket = INVALID_SOCKET_HANDLE;
-                    net::TlsStream* tls = nullptr;
+                    std::unique_ptr<crypto::SecureSession> secure;
+                    crypto::PublicKey secureRemotePublicKey{};
 
-                    if (runtimeOptions_.transportMode == TransportMode::TLS) {
+                    socket = connectTo(primaryHost_, primaryReplPort_);
+                    if (socket == INVALID_SOCKET_HANDLE) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        continue;
+                    }
+
+                    {
+                        std::lock_guard lock{socketMutex_};
+                        socket_ = socket;
+                    }
+
+                    if (runtimeOptions_.transportMode == TransportMode::SECURE) {
                         try {
-                            auto storage = makeTlsConfig(runtimeOptions_);
-                            auto stream = std::make_unique<net::TlsStream>();
-                            stream->connect(primaryHost_.c_str(), primaryReplPort_, storage.config);
-                            tls = stream.get();
-                            std::lock_guard lock{socketMutex_};
-                            tls_ = std::move(stream);
+                            auto opened = openSecureSession(socket);
+                            secureRemotePublicKey = opened.remotePublicKey;
+                            secure = std::make_unique<crypto::SecureSession>(std::move(opened.session));
                         }
                         catch (...) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                            continue;
-                        }
-                    }
-                    else {
-                        socket = connectTo(primaryHost_, primaryReplPort_);
-                        if (socket == INVALID_SOCKET_HANDLE) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                            continue;
-                        }
-
-                        {
+                            closeSocket(socket);
                             std::lock_guard lock{socketMutex_};
-                            socket_ = socket;
+                            if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            continue;
                         }
                     }
 
-                    if (handshake(socket, tls)) {
+                    if (handshake(socket, secure.get(), secureRemotePublicKey)) {
                         connected_ = true;
-                        receiveLoop(socket, tls);
+                        receiveLoop(socket, secure.get());
                     }
 
                     connected_ = false;
                     {
                         std::lock_guard lock{socketMutex_};
-                        if (tls_ && tls_.get() == tls) {
-                            tls_->close();
-                            tls_.reset();
-                        }
                         if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
                     }
                     closeSocket(socket);
@@ -295,30 +345,58 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
-            bool handshake(SocketHandle socket, net::TlsStream* tls) {
-                const ClientHello hello{.nodeId = selfNodeId_, .lastSeq = getLastSeq_ ? getLastSeq_() : 0, .role = NodeRole::REPLICA,};
-                const auto wire = encodeClientHello(hello);
-                if (!sendTo(socket, tls, wire.data(), wire.size())) { return false; }
+            struct OpenSecureSession {
+                crypto::SecureSession session;
+                crypto::PublicKey remotePublicKey{};
+            };
 
-                DecodedFrame frame;
-                if (!recvFrameFrom(socket, tls, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
-                ServerHello serverHello;
-                return decodeServerHello(frame.payload, serverHello);
+            OpenSecureSession openSecureSession(SocketHandle socket) {
+                crypto::NoiseInitiator initiator{localIdentity_};
+                if (!writeSecureClientHello(socket, initiator.hello())) { throw std::runtime_error("ReplicationClient: secure hello send failed"); }
+
+                crypto::ServerHello serverHello{};
+                if (!readSecureServerHello(socket, serverHello)) { throw std::runtime_error("ReplicationClient: secure hello receive failed"); }
+
+                const auto expected = pinnedPeerKey(runtimeOptions_, runtimeOptions_.secure.expectedPrimaryNodeId);
+                auto session = initiator.finish(serverHello, expected);
+                return OpenSecureSession{std::move(session), serverHello.staticPublicKey};
             }
 
-            static bool sendTo(SocketHandle socket, net::TlsStream* tls, const uint8_t* data, size_t size) {
-                try { return tls != nullptr ? sendAll(*tls, data, size) : sendAll(socket, data, size); }
+            bool handshake(SocketHandle socket, crypto::SecureSession* secure, const crypto::PublicKey& secureRemotePublicKey) {
+                const ClientHello hello{.nodeId = selfNodeId_, .lastSeq = getLastSeq_ ? getLastSeq_() : 0, .role = NodeRole::REPLICA,};
+                const auto wire = encodeClientHello(hello);
+                if (!sendTo(socket, secure, wire.data(), wire.size())) { return false; }
+
+                DecodedFrame frame;
+                if (!recvFrameFrom(socket, secure, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
+                ServerHello serverHello;
+                if (!decodeServerHello(frame.payload, serverHello) || serverHello.role != NodeRole::PRIMARY) { return false; }
+                if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.expectedPrimaryNodeId) { return false; }
+                if (secure != nullptr) {
+                    if (const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId); expected && secureRemotePublicKey != *expected) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
+            static bool sendTo(SocketHandle socket, crypto::SecureSession* secure, const uint8_t* data, size_t size) {
+                try {
+                    if (secure != nullptr) { return sendSecureFrame(socket, *secure, data, size); }
+                    return sendAll(socket, data, size);
+                }
                 catch (...) { return false; }
             }
 
-            static bool recvFrameFrom(SocketHandle socket, net::TlsStream* tls, DecodedFrame& frame) {
-                return tls != nullptr ? recvFrame(*tls, frame) : recvFrame(socket, frame);
+            static bool recvFrameFrom(SocketHandle socket, crypto::SecureSession* secure, DecodedFrame& frame) {
+                if (secure != nullptr) { return recvSecureFrame(socket, *secure, frame); }
+                return recvFrame(socket, frame);
             }
 
-            void receiveLoop(SocketHandle socket, net::TlsStream* tls) {
+            void receiveLoop(SocketHandle socket, crypto::SecureSession* secure) {
                 while (running_) {
                     DecodedFrame frame;
-                    if (!recvFrameFrom(socket, tls, frame)) { return; }
+                    if (!recvFrameFrom(socket, secure, frame)) { return; }
 
                     if (frame.type == ReplMsgType::ENTRY) {
                         ReplEntry entry;
@@ -330,7 +408,7 @@ namespace akkaradb::engine::cluster {
                         }
                         if (callback) { callback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId); }
                         const auto ack = encodeAck(ReplAck{.seq = entry.seq});
-                        if (!sendTo(socket, tls, ack.data(), ack.size())) { return; }
+                        if (!sendTo(socket, secure, ack.data(), ack.size())) { return; }
                     }
                     else if (frame.type == ReplMsgType::BLOB_PUT) {
                         ReplBlob blob;
@@ -351,6 +429,7 @@ namespace akkaradb::engine::cluster {
             uint64_t selfNodeId_;
             std::function<uint64_t()> getLastSeq_;
             ClusterRuntimeOptions runtimeOptions_;
+            crypto::NodeIdentity localIdentity_;
 
             std::atomic<bool> running_{false};
             std::atomic<bool> connected_{false};
@@ -358,7 +437,6 @@ namespace akkaradb::engine::cluster {
 
             mutable std::mutex socketMutex_;
             SocketHandle socket_ = INVALID_SOCKET_HANDLE;
-            std::unique_ptr<net::TlsStream> tls_;
 
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;

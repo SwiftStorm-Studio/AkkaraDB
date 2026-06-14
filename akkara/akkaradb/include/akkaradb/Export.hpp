@@ -19,6 +19,10 @@
 // akkaradb/include/akkaradb/Export.hpp
 #pragma once
 
+#if defined(_MSC_VER)
+#  pragma warning(disable: 4251)
+#endif
+
 #if defined(_WIN32) && !defined(AKKARADB_STATIC)
 #  if defined(AKKARADB_BUILD_SHARED)
 #    define AKDB_API __declspec(dllexport)

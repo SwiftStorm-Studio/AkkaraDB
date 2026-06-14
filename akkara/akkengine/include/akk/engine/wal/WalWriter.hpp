@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/wal/WalWriter.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -30,7 +32,7 @@ namespace akkaradb::engine::wal {
         SYNC = 0, ASYNC = 1, OFF = 2,
     };
 
-    struct WalOptions {
+    struct AKDB_API WalOptions {
         std::filesystem::path walDir;
         WalSyncMode syncMode = WalSyncMode::SYNC;
         // 0 means auto: one shard per hardware thread, capped at 16.
@@ -41,7 +43,7 @@ namespace akkaradb::engine::wal {
         uint64_t asyncMaxPendingBytes = 64ULL * 1024ULL * 1024ULL;
     };
 
-    struct WalWriterSnapshot {
+    struct AKDB_API WalWriterSnapshot {
         uint32_t shardCount = 0;
         uint64_t entriesWritten = 0;
         uint64_t bytesWritten = 0;
@@ -50,7 +52,7 @@ namespace akkaradb::engine::wal {
         uint64_t segmentRotations = 0;
     };
 
-    class WalWriter {
+    class AKDB_API WalWriter {
         public:
             [[nodiscard]] static std::unique_ptr<WalWriter> create(WalOptions options);
             ~WalWriter();
@@ -74,7 +76,7 @@ namespace akkaradb::engine::wal {
             void close();
 
         private:
-            WalWriter() = default;
+            WalWriter();
 
             class Impl;
             std::unique_ptr<Impl> impl_;

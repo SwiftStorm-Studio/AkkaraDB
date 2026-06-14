@@ -19,6 +19,7 @@
 // akkengine/include/akk/engine/cluster/ClusterRouter.hpp
 #pragma once
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 #include <cstdint>
@@ -34,7 +35,7 @@ namespace akkaradb::engine::cluster {
      * data-bearing nodes; Stripe mode returns the deterministic rendezvous-hash
      * owner for the key.
      */
-    class ClusterRouter {
+    class AKKARADB_CLUSTER_RUNTIME_API ClusterRouter {
         public:
             /**
              * Builds a router from a validated cluster config.

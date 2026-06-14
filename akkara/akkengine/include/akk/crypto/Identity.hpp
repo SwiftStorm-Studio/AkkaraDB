@@ -19,6 +19,8 @@
 // akkengine/include/akk/crypto/Identity.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -30,7 +32,7 @@ namespace akkaradb::crypto {
     using Fingerprint = std::array<std::uint8_t, 32>;
     using NodeId = std::array<std::uint8_t, 16>;
 
-    struct NodeIdentity {
+    struct AKDB_API NodeIdentity {
         SecretKey secretKey{};
         PublicKey publicKey{};
         Fingerprint fingerprint{};
@@ -40,7 +42,7 @@ namespace akkaradb::crypto {
     /**
      * @brief Generate a fresh raw-public-key identity for one AkkaraDB node.
      */
-    [[nodiscard]] NodeIdentity generateNodeIdentity();
+    [[nodiscard]] AKDB_API NodeIdentity generateNodeIdentity();
 
     /**
      * @brief Deterministically derive a node identity from a secret random seed.
@@ -48,13 +50,13 @@ namespace akkaradb::crypto {
      * The seed must be secret and high entropy.  This is useful for persistent
      * load/create flows, not for deriving keys from public instance IDs.
      */
-    [[nodiscard]] NodeIdentity nodeIdentityFromSeed(const SecretKey& seed);
+    [[nodiscard]] AKDB_API NodeIdentity nodeIdentityFromSeed(const SecretKey& seed);
 
-    [[nodiscard]] Fingerprint fingerprintPublicKey(const PublicKey& publicKey);
-    [[nodiscard]] NodeId nodeIdFromPublicKey(const PublicKey& publicKey);
-    [[nodiscard]] std::string publicKeyToHex(const PublicKey& bytes);
-    [[nodiscard]] std::string fingerprintToHex(const Fingerprint& bytes);
-    [[nodiscard]] std::string nodeIdToHex(const NodeId& bytes);
+    [[nodiscard]] AKDB_API Fingerprint fingerprintPublicKey(const PublicKey& publicKey);
+    [[nodiscard]] AKDB_API NodeId nodeIdFromPublicKey(const PublicKey& publicKey);
+    [[nodiscard]] AKDB_API std::string publicKeyToHex(const PublicKey& bytes);
+    [[nodiscard]] AKDB_API std::string fingerprintToHex(const Fingerprint& bytes);
+    [[nodiscard]] AKDB_API std::string nodeIdToHex(const NodeId& bytes);
 
     /**
      * @brief Load or create the local node identity seed file.
@@ -62,13 +64,19 @@ namespace akkaradb::crypto {
      * The file stores only the secret seed.  The X25519 key pair and public
      * fingerprint are derived from it at load time.
      */
-    class IdentityStore {
+    class AKDB_API IdentityStore {
         public:
             explicit IdentityStore(std::filesystem::path path);
 
             [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
             [[nodiscard]] NodeIdentity loadOrCreate() const;
             void saveSeed(const SecretKey& seed) const;
+            /**
+             * @brief Load the raw secret seed from disk.
+             *
+             * The returned seed is secret material. Callers that use this
+             * low-level API must wipe it after deriving the identity.
+             */
             [[nodiscard]] SecretKey loadSeed() const;
 
         private:

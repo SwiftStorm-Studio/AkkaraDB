@@ -87,7 +87,7 @@ namespace akkaradb::engine::cluster {
             for (const auto& node : config.nodes()) {
                 if (!isLanOrLoopbackHost(node.host)) {
                     throw std::invalid_argument(
-                        "ClusterRuntime: Plain replication transport is only allowed for LAN or loopback node hosts; use TLS for WAN"
+                        "ClusterRuntime: Plain replication transport is only allowed for LAN or loopback node hosts; use Secure for WAN"
                     );
                 }
             }
@@ -100,6 +100,7 @@ namespace akkaradb::engine::cluster {
                 );
             }
         }
+
     } // namespace
 
     class ClusterRuntime::Impl {
@@ -113,10 +114,13 @@ namespace akkaradb::engine::cluster {
             )
                 : config_{std::move(config)},
                   router_{config_},
-                  manager_{ClusterManager::create(std::move(dbDir), config_, selfNodeId)},
+                  manager_{ClusterManager::create(dbDir, config_, selfNodeId)},
                   selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
                   runtimeOptions_{std::move(runtimeOptions)} {
+                if (runtimeOptions_.transportMode == TransportMode::SECURE && runtimeOptions_.secure.identitySeedPath.empty() && !dbDir.empty()) {
+                    runtimeOptions_.secure.identitySeedPath = dbDir / "cluster.identity";
+                }
                 validateRuntimeMode(config_);
                 validateTransportScope(config_, runtimeOptions_);
                 manager_->setRoleChangeCallback(
@@ -186,12 +190,14 @@ namespace akkaradb::engine::cluster {
                     server_->start();
                 }
                 else if (role == NodeRole::REPLICA) {
+                    auto clientOptions = runtimeOptions_;
+                    clientOptions.secure.expectedPrimaryNodeId = manager_->primaryNodeId();
                     client_ = ReplicationClient::create(
                         manager_->primaryHost(),
                         manager_->primaryReplPort(),
                         selfNodeId_,
                         callbacks_.getLastSeq,
-                        runtimeOptions_
+                        std::move(clientOptions)
                     );
                     client_->setApplyCallback(callbacks_.apply);
                     client_->setBlobCallback(callbacks_.applyBlob);
@@ -262,3 +268,23 @@ namespace akkaradb::engine::cluster {
         impl_->shipBlob(seq, blobId, content);
     }
 } // namespace akkaradb::engine::cluster
+
+extern "C" AKKARADB_CLUSTER_RUNTIME_API bool akkaradb_cluster_register() noexcept {
+    return akkaradb::engine::cluster::registerClusterRuntimeFactory(
+        [](
+            std::filesystem::path dbDir,
+            akkaradb::engine::cluster::ClusterConfig config,
+            uint64_t selfNodeId,
+            akkaradb::engine::cluster::ClusterEngineCallbacks callbacks,
+            akkaradb::engine::cluster::ClusterRuntimeOptions runtimeOptions
+        ) -> std::unique_ptr<akkaradb::engine::cluster::IClusterRuntime> {
+            return akkaradb::engine::cluster::ClusterRuntime::create(
+                std::move(dbDir),
+                std::move(config),
+                selfNodeId,
+                std::move(callbacks),
+                std::move(runtimeOptions)
+            );
+        }
+    );
+}

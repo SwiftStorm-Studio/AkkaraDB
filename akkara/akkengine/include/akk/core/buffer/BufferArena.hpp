@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/buffer/BufferArena.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 
 namespace akkaradb::core {
@@ -35,7 +37,7 @@ namespace akkaradb::core {
      * - temporary buffers during request-local / stage-local processing
      * - memory is invalidated on reset()/destruction
      */
-    class BufferArena {
+    class AKDB_API BufferArena {
         public:
             static constexpr size_t DEFAULT_INITIAL_BLOCK_SIZE = 64 * 1024;
             static constexpr size_t DEFAULT_MAX_BLOCK_SIZE = 4 * 1024 * 1024;

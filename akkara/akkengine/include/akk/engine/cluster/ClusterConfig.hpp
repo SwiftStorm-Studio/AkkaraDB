@@ -19,11 +19,15 @@
 // akkengine/include/akk/engine/cluster/ClusterConfig.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "akk/crypto/Identity.hpp"
 
 namespace akkaradb::engine::cluster {
     /**
@@ -53,7 +57,8 @@ namespace akkaradb::engine::cluster {
      * TransportMode - Network transport used by replication links.
      */
     enum class TransportMode : uint8_t {
-        TLS = 0, PLAIN = 1,
+        PLAIN = 0,
+        SECURE = 1,
     };
 
     /**
@@ -76,7 +81,7 @@ namespace akkaradb::engine::cluster {
     /**
      * AckPolicy - Acknowledgement rule applied by ReplicationServer.
      */
-    struct AckPolicy {
+    struct AKDB_API AckPolicy {
         AckPolicyMode mode = AckPolicyMode::ASYNC;
         uint16_t quorum = 0; ///< Required replica count when mode == AckPolicyMode::QUORUM.
     };
@@ -84,7 +89,7 @@ namespace akkaradb::engine::cluster {
     /**
      * NodeInfo - Persistent identity and connection endpoints for one node.
      */
-    struct NodeInfo {
+    struct AKDB_API NodeInfo {
         uint64_t nodeId = 0; ///< Stable node id.  Zero is reserved.
         std::string host; ///< Hostname or address used by peer nodes.
         uint16_t dataPort = 0; ///< Public data API port.
@@ -98,23 +103,27 @@ namespace akkaradb::engine::cluster {
         [[nodiscard]] bool dataBearing() const noexcept { return (capabilities & DATA_BEARING) != 0; }
     };
 
+    struct AKDB_API ClusterPeerPublicKeyPin {
+        uint64_t nodeId = 0; ///< Cluster node id this key is expected to identify.
+        crypto::PublicKey publicKey{}; ///< Raw X25519 static public key.
+    };
+
     /**
-     * ClusterTlsOptions - TLS certificate configuration for replication links.
+     * ClusterSecureOptions - Raw-public-key secure replication options.
      */
-    struct ClusterTlsOptions {
-        std::filesystem::path certPath; ///< Local certificate path.
-        std::filesystem::path keyPath; ///< Local private-key path.
-        std::filesystem::path caPath; ///< CA bundle used for peer verification.
-        bool verifyPeer = true; ///< Whether TLS peers must validate against caPath.
+    struct AKDB_API ClusterSecureOptions {
+        std::filesystem::path identitySeedPath; ///< Persistent local identity seed; generated if missing.
+        std::vector<ClusterPeerPublicKeyPin> pinnedPeers; ///< Optional peer public-key pins by cluster node id.
+        uint64_t expectedPrimaryNodeId = 0; ///< Client-side expected primary id, or 0 if unknown.
     };
 
     /**
      * ClusterRuntimeOptions - Runtime-only network options.
      */
-    struct ClusterRuntimeOptions {
-        TransportMode transportMode = TransportMode::TLS;
+    struct AKDB_API ClusterRuntimeOptions {
+        TransportMode transportMode = TransportMode::SECURE;
         std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
-        ClusterTlsOptions tls;
+        ClusterSecureOptions secure;
     };
 
     /**
@@ -122,10 +131,10 @@ namespace akkaradb::engine::cluster {
      *
      * The config is stored as a compact CRC-protected binary file.  It records
      * node identities, data/replication ports, node capabilities, replication
-     * mode, and acknowledgement policy.  Runtime-only options such as TLS paths
-     * live in ClusterRuntimeOptions and are intentionally not serialized here.
+     * mode, and acknowledgement policy. Runtime-only transport options live in
+     * ClusterRuntimeOptions and are intentionally not serialized here.
      */
-    class ClusterConfig {
+    class AKDB_API ClusterConfig {
         public:
             static constexpr uint32_t MAGIC = 0x35434B41; // "AKC5"
             static constexpr uint16_t VERSION = 1;

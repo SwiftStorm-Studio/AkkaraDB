@@ -19,6 +19,7 @@
 // akkengine/include/akk/engine/cluster/ReplicationServer.hpp
 #pragma once
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 
@@ -39,7 +40,7 @@ namespace akkaradb::engine::cluster {
      * Thread-safety: start(), close(), shipEntry(), shipBlob(), and
      * replicaCount() may be called concurrently.  close() is idempotent.
      */
-    class ReplicationServer {
+    class AKKARADB_CLUSTER_RUNTIME_API ReplicationServer {
         public:
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.
@@ -56,7 +57,7 @@ namespace akkaradb::engine::cluster {
              * @param selfNodeId    Primary node id advertised in ServerHello.
              * @param getCurrentSeq Returns current primary seq for ServerHello.
              * @param ackPolicy      Entry acknowledgement policy.
-             * @param runtimeOptions Transport/TLS options.
+             * @param runtimeOptions Transport options.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationServer> create(
                 uint16_t replPort,

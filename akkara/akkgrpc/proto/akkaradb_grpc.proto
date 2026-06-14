@@ -1,0 +1,289 @@
+syntax = "proto3";
+
+package akkaradb.grpcapi.v1;
+
+option cc_enable_arenas = true;
+
+service AkkaraDB {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Put(PutRequest) returns (Empty);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Remove(RemoveRequest) returns (Empty);
+  rpc Exists(ExistsRequest) returns (ExistsResponse);
+  rpc Count(CountRequest) returns (CountResponse);
+  rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc GetAt(GetAtRequest) returns (GetResponse);
+  rpc History(HistoryRequest) returns (HistoryResponse);
+  rpc RollbackTo(RollbackToRequest) returns (Empty);
+  rpc RollbackKey(RollbackKeyRequest) returns (Empty);
+  rpc BatchPut(BatchPutRequest) returns (Empty);
+  rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
+  rpc ForceSync(Empty) returns (Empty);
+  rpc ForceFlush(Empty) returns (Empty);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message Empty {}
+
+message PingRequest {}
+
+message PingResponse {
+  string message = 1;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message RemoveRequest {
+  bytes key = 1;
+}
+
+message ExistsRequest {
+  bytes key = 1;
+}
+
+message ExistsResponse {
+  bool found = 1;
+}
+
+message CountRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+}
+
+message CountResponse {
+  uint64 count = 1;
+}
+
+message KeyValue {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message ScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint32 limit = 3;
+}
+
+message ScanResponse {
+  repeated KeyValue items = 1;
+  bool truncated = 2;
+}
+
+message GetAtRequest {
+  bytes key = 1;
+  uint64 seq = 2;
+}
+
+message GetResponse {
+  bytes value = 1;
+}
+
+message HistoryRequest {
+  bytes key = 1;
+}
+
+message VersionEntry {
+  uint64 seq = 1;
+  uint64 source_node_id = 2;
+  uint64 timestamp_ns = 3;
+  uint32 flags = 4;
+  bytes value = 5;
+}
+
+message HistoryResponse {
+  repeated VersionEntry entries = 1;
+  bool truncated = 2;
+}
+
+message RollbackToRequest {
+  uint64 target_seq = 1;
+}
+
+message RollbackKeyRequest {
+  bytes key = 1;
+  uint64 target_seq = 2;
+}
+
+message BatchPutItem {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message BatchPutRequest {
+  repeated BatchPutItem items = 1;
+}
+
+message BatchGetRequest {
+  repeated bytes keys = 1;
+}
+
+enum ItemStatus {
+  ITEM_STATUS_OK = 0;
+  ITEM_STATUS_NOT_FOUND = 1;
+  ITEM_STATUS_ERROR = 2;
+}
+
+message BatchGetItem {
+  ItemStatus status = 1;
+  bytes value = 2;
+}
+
+message BatchGetResponse {
+  repeated BatchGetItem items = 1;
+}
+
+message StatsRequest {}
+
+message LevelStats {
+  int32 level = 1;
+  uint64 file_count = 2;
+  uint64 bytes = 3;
+  uint64 budget_bytes = 4;
+}
+
+message APIStats {
+  bool enabled = 1;
+  bool tcp_enabled = 2;
+  bool tcp_tls_enabled = 3;
+  uint32 tcp_io_backend = 4;
+  uint32 tcp_worker_threads = 5;
+  uint32 tcp_accept_queue_limit = 6;
+  uint32 tcp_accept_queue_timeout_ms = 7;
+  uint32 tcp_listen_backlog = 8;
+  uint32 tcp_read_timeout_ms = 9;
+  uint32 tcp_write_timeout_ms = 10;
+  uint64 tcp_connections_accepted_total = 11;
+  uint64 tcp_connections_closed_total = 12;
+  uint64 tcp_connections_active = 13;
+  uint64 tcp_accept_queue_depth = 14;
+  uint64 tcp_accept_queue_peak_depth = 15;
+  uint64 tcp_accept_queue_rejected_total = 16;
+  uint64 tcp_accept_queue_expired_total = 17;
+  uint64 tcp_requests_total = 18;
+  uint64 tcp_responses_total = 19;
+  uint64 tcp_bytes_received_total = 20;
+  uint64 tcp_bytes_sent_total = 21;
+  uint64 tcp_protocol_errors_total = 22;
+  uint64 tcp_crc_errors_total = 23;
+  uint64 tcp_pipeline_batches_total = 24;
+  uint64 tcp_backpressure_flushes_total = 25;
+  uint64 tcp_backpressure_disconnects_total = 26;
+  uint64 tcp_batch_put_items_total = 27;
+  uint64 tcp_batch_get_items_total = 28;
+  bool grpc_enabled = 29;
+  bool grpc_tls_enabled = 30;
+  uint32 grpc_port = 31;
+  uint64 grpc_requests_total = 32;
+  uint64 grpc_errors_total = 33;
+  uint64 grpc_batch_put_items_total = 34;
+  uint64 grpc_batch_get_items_total = 35;
+  uint32 grpc_worker_threads = 36;
+  uint32 grpc_completion_queues = 37;
+  uint32 grpc_min_pollers = 38;
+  uint32 grpc_max_pollers = 39;
+  uint32 grpc_max_concurrent_streams = 40;
+  uint64 grpc_resource_quota_bytes = 41;
+  uint32 grpc_max_batch_items = 42;
+  uint32 grpc_max_scan_items = 43;
+  uint32 grpc_max_history_entries = 44;
+  uint64 grpc_responses_total = 45;
+  uint64 grpc_active_requests = 46;
+  bool http_enabled = 47;
+  bool http_tls_enabled = 48;
+  uint32 http_port = 49;
+  uint32 http_max_batch_items = 50;
+  uint32 http_max_scan_items = 51;
+  uint32 http_max_history_entries = 52;
+  uint64 http_max_content_length = 53;
+  uint64 http_connections_accepted_total = 54;
+  uint64 http_connections_closed_total = 55;
+  uint64 http_connections_active = 56;
+  uint64 http_requests_total = 57;
+  uint64 http_responses_total = 58;
+  uint64 http_bytes_received_total = 59;
+  uint64 http_bytes_sent_total = 60;
+  uint64 http_protocol_errors_total = 61;
+  uint64 http_errors_total = 62;
+  uint64 http_batch_put_items_total = 63;
+  uint64 http_batch_get_items_total = 64;
+}
+
+message MemTableStats {
+  uint32 shard_count = 1;
+  uint64 threshold_bytes_per_shard = 2;
+  uint64 approx_bytes = 3;
+  uint64 puts_applied = 4;
+  uint64 removes_applied = 5;
+  uint64 flushes_completed = 6;
+  uint64 bytes_flushed = 7;
+}
+
+message WALStats {
+  bool enabled = 1;
+  uint32 shard_count = 2;
+  uint64 entries_written = 3;
+  uint64 bytes_written = 4;
+  uint64 batches_flushed = 5;
+  uint64 syncs_executed = 6;
+  uint64 segment_rotations = 7;
+}
+
+message BlobStats {
+  bool enabled = 1;
+  uint64 threshold_bytes = 2;
+  uint64 blobs_written = 3;
+  uint64 bytes_uncompressed = 4;
+  uint64 bytes_on_disk = 5;
+  uint64 blobs_deleted = 6;
+  uint64 gc_cycles = 7;
+}
+
+message SSTStats {
+  bool enabled = 1;
+  repeated LevelStats levels = 2;
+  uint64 file_count = 3;
+  uint64 bytes = 4;
+  uint64 l0_file_count = 5;
+  bool compaction_pending = 6;
+  uint64 compactions_completed = 7;
+  uint64 files_compacted = 8;
+  uint64 bytes_compacted_in = 9;
+  uint64 bytes_compacted_out = 10;
+  uint64 l0_stalls = 11;
+}
+
+message VLogStats {
+  bool enabled = 1;
+}
+
+message EngineStats {
+  uint64 current_seq = 1;
+  uint64 node_id = 2;
+  uint64 puts_total = 3;
+  uint64 removes_total = 4;
+  uint64 gets_total = 5;
+  uint64 gets_memtable_hit = 6;
+  uint64 gets_sst_hit = 7;
+  uint64 gets_miss = 8;
+  uint64 exists_total = 9;
+  uint64 scans_total = 10;
+  uint64 blob_puts_total = 11;
+  APIStats api = 12;
+  MemTableStats memtable = 13;
+  WALStats wal = 14;
+  BlobStats blob = 15;
+  SSTStats sst = 16;
+  VLogStats vlog = 17;
+}
+
+message StatsResponse {
+  EngineStats engine = 1;
+}

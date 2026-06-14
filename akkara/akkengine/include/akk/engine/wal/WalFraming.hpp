@@ -25,8 +25,10 @@
 #include <type_traits>
 #include <vector>
 
+#include "akkaradb/Export.hpp"
+
 namespace akkaradb::engine::wal {
-    struct WalSegmentHeader {
+    struct AKDB_API WalSegmentHeader {
         static constexpr uint32_t MAGIC = 0x414B5741; // "AKWA"
         static constexpr uint16_t VERSION = 0x0001;
         static constexpr uint16_t SIZE = 48;
@@ -55,7 +57,7 @@ namespace akkaradb::engine::wal {
     static_assert(std::is_standard_layout_v<WalSegmentHeader>);
     static_assert(std::is_trivially_copyable_v<WalSegmentHeader>);
 
-    struct WalEntryHeader {
+    struct AKDB_API WalEntryHeader {
         static constexpr uint16_t SIZE = 32;
 
         uint64_t seq = 0;
@@ -84,7 +86,7 @@ namespace akkaradb::engine::wal {
     static_assert(std::is_standard_layout_v<WalEntryHeader>);
     static_assert(std::is_trivially_copyable_v<WalEntryHeader>);
 
-    [[nodiscard]] std::vector<uint8_t> serializeEntry(
+    [[nodiscard]] AKDB_API std::vector<uint8_t> serializeEntry(
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
         uint64_t seq,
@@ -92,5 +94,5 @@ namespace akkaradb::engine::wal {
         uint16_t flags
     );
 
-    [[nodiscard]] uint32_t entryCrc32c(const WalEntryHeader& header, std::span<const uint8_t> key, std::span<const uint8_t> value);
+    [[nodiscard]] AKDB_API uint32_t entryCrc32c(const WalEntryHeader& header, std::span<const uint8_t> key, std::span<const uint8_t> value);
 } // namespace akkaradb::engine::wal

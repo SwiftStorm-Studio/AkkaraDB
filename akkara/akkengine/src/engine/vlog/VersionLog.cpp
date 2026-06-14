@@ -92,6 +92,8 @@ namespace akkaradb::engine::vlog {
         }
     } // namespace
 
+    VersionLog::VersionLog() = default;
+
     class VersionLog::Impl {
         public:
             VersionLogOptions opts_;

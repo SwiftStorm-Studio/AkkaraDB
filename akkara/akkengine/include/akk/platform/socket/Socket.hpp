@@ -19,6 +19,8 @@
 // akkengine/include/akk/platform/socket/Socket.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <system_error>
@@ -30,7 +32,7 @@ namespace akkaradb::platform {
      * The socket is configured for non-blocking I/O after connection establishment.
      * sendSome() and recvSome() never block; they report would-block via std::error_code.
      */
-    class Socket {
+    class AKDB_API Socket {
         public:
             /**
              * @brief Construct an invalid socket.

@@ -8,6 +8,7 @@ project(AkkaraDB
 
 # ==================== Build Options ====================
 option(BUILD_SHARED_LIBS "Build shared libraries (.so/.dll)" ON)
+set(AKKARADB_BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS}")
 option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
 option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" OFF)
 set(AKKARADB_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION_REVISION" CACHE FILEPATH "AkkaraDB release revision counter file")
@@ -32,6 +33,11 @@ set(AKKARADB_SRC_DIR ${AKKARADB_DIR}/src)
 set(AKKENGINE_INCLUDE_DIR ${AKKENGINE_DIR}/include)
 set(AKKENGINE_SRC_DIR ${AKKENGINE_DIR}/src)
 
+set(AKKGRPC_DIR ${AKKARA_ROOT}/akkgrpc)
+set(AKKGRPC_INCLUDE_DIR ${AKKGRPC_DIR}/include)
+set(AKKGRPC_SRC_DIR ${AKKGRPC_DIR}/src)
+set(AKKGRPC_PROTO_DIR ${AKKGRPC_DIR}/proto)
+
 set(AKKARADB_RUNTIME_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
 set(AKKARADB_TEST_OUTPUT_DIR "${CMAKE_BINARY_DIR}/test")
 file(MAKE_DIRECTORY "${AKKARADB_RUNTIME_OUTPUT_DIR}")
@@ -50,14 +56,34 @@ endif ()
 
 set(AKKARADB_DIST_PLATFORM "${AKKARADB_DIST_OS}-${AKKARADB_DIST_ARCH}")
 set(AKKARADB_NATIVE_OUTPUT_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_OUTPUT_NAME "akkaradb-api-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_HTTP_OUTPUT_NAME "akkaradb-api-http-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_TCP_OUTPUT_NAME "akkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_GRPC_OUTPUT_NAME "akkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_CLUSTER_OUTPUT_NAME "akkaradb-cluster-${AKKARADB_RELEASE_VERSION}")
 set(AKKARADB_JNI_OUTPUT_NAME "akkaradb-jni-${AKKARADB_RELEASE_VERSION}")
 string(REGEX MATCH "^[0-9]+" AKKARADB_NATIVE_GENERATION "${AKKARADB_COMPAT_LINE}")
 if (WIN32)
     set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "akkaradb-api-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "akkaradb-api-http-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "akkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "akkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "akkaradb-cluster-${AKKARADB_RELEASE_VERSION}.dll")
 elseif (APPLE)
     set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "libakkaradb-api-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "libakkaradb-api-http-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "libakkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "libakkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "libakkaradb-cluster-${AKKARADB_RELEASE_VERSION}.dylib")
 else ()
     set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "libakkaradb-api-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "libakkaradb-api-http-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "libakkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "libakkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "libakkaradb-cluster-${AKKARADB_RELEASE_VERSION}.so")
 endif ()
 set(AKKARADB_NATIVE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native/${AKKARADB_RELEASE_VERSION}")
 set(AKKARADB_JNI_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/jni/${AKKARADB_RELEASE_VERSION}")
@@ -105,7 +131,7 @@ set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
 set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
 
 # ── Boost.PFR (header-only) ───────────────────────────────────────────────────
@@ -144,7 +170,7 @@ set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(mbedtls)
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
 
 # ==================== Main Library ====================
 add_library(akkaradb)
@@ -185,9 +211,43 @@ file(GLOB_RECURSE AKKENGINE_SOURCES CONFIGURE_DEPENDS
         "${AKKENGINE_SRC_DIR}/*.cpp"
 )
 
+file(GLOB_RECURSE AKKENGINE_API_SERVER_SOURCES CONFIGURE_DEPENDS
+        "${AKKENGINE_SRC_DIR}/engine/server/*.cpp"
+)
+
+set(AKKENGINE_API_CORE_SOURCES
+        "${AKKENGINE_SRC_DIR}/engine/server/AkkApiServer.cpp"
+)
+
+set(AKKENGINE_API_PROVIDER_SOURCE
+        "${AKKENGINE_SRC_DIR}/engine/server/AkkApiTransportProvider.cpp"
+)
+
+set(AKKENGINE_API_HTTP_SOURCES
+        "${AKKENGINE_SRC_DIR}/engine/server/HttpApiServer.cpp"
+)
+
+set(AKKENGINE_API_TCP_SOURCES
+        "${AKKENGINE_SRC_DIR}/engine/server/TcpApiServer.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/server/ApiFraming.cpp"
+)
+
+set(AKKENGINE_CLUSTER_RUNTIME_SOURCES
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRuntime.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterManager.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRouter.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ReplicationClient.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ReplicationServer.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ReplFraming.cpp"
+)
+
+list(REMOVE_ITEM AKKENGINE_SOURCES ${AKKENGINE_API_SERVER_SOURCES})
+list(REMOVE_ITEM AKKENGINE_SOURCES ${AKKENGINE_CLUSTER_RUNTIME_SOURCES})
+
 target_sources(akkaradb PRIVATE
         ${AKKARADB_SOURCES}
         ${AKKENGINE_SOURCES}
+        ${AKKENGINE_API_PROVIDER_SOURCE}
 )
 
 add_custom_target(akkaradb_increment_revision
@@ -222,10 +282,21 @@ endif ()
 target_link_libraries(akkaradb PRIVATE libzstd_static akkaradb_monocypher mbedtls mbedcrypto mbedx509)
 
 # TLS always enabled
-target_compile_definitions(akkaradb PRIVATE AKKARADB_TLS_ENABLED)
+target_compile_definitions(akkaradb PRIVATE
+        AKKARADB_TLS_ENABLED
+        AKKARADB_API_SERVER_LIBRARY_FILENAME="${AKKARADB_API_DIST_LIBRARY_NAME}"
+        AKKARADB_API_HTTP_LIBRARY_FILENAME="${AKKARADB_API_HTTP_DIST_LIBRARY_NAME}"
+        AKKARADB_API_TCP_LIBRARY_FILENAME="${AKKARADB_API_TCP_DIST_LIBRARY_NAME}"
+        AKKARADB_API_GRPC_LIBRARY_FILENAME="${AKKARADB_API_GRPC_DIST_LIBRARY_NAME}"
+        AKKARADB_CLUSTER_LIBRARY_FILENAME="${AKKARADB_CLUSTER_DIST_LIBRARY_NAME}"
+)
 
 if(WIN32)
     target_link_libraries(akkaradb PRIVATE ws2_32 bcrypt)
+endif()
+
+if(CMAKE_DL_LIBS)
+    target_link_libraries(akkaradb PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # ==================== Include Directories ====================
@@ -237,10 +308,333 @@ target_include_directories(akkaradb
         $<INSTALL_INTERFACE:include>
 )
 
+# ==================== API Server Backend Library ====================
+add_library(akkaradb_api SHARED)
+
+target_sources(akkaradb_api PRIVATE ${AKKENGINE_API_CORE_SOURCES})
+
+target_include_directories(akkaradb_api
+        PRIVATE
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+        ${boost_pfr_SOURCE_DIR}/include
+)
+
+target_link_libraries(akkaradb_api PRIVATE akkaradb)
+
+target_compile_definitions(akkaradb_api PRIVATE
+        AKKARADB_API_SERVER_BUILD_SHARED
+        AKKARADB_TLS_ENABLED
+)
+
+if (MSVC)
+    target_compile_options(akkaradb_api PRIVATE /WX)
+else ()
+    target_compile_options(akkaradb_api PRIVATE -Werror)
+endif ()
+
+if(WIN32)
+    target_link_libraries(akkaradb_api PRIVATE ws2_32 bcrypt)
+endif()
+
+add_library(akkaradb_api_http SHARED)
+target_sources(akkaradb_api_http PRIVATE ${AKKENGINE_API_HTTP_SOURCES})
+target_include_directories(akkaradb_api_http PRIVATE
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+        ${boost_pfr_SOURCE_DIR}/include
+)
+target_link_libraries(akkaradb_api_http PRIVATE akkaradb)
+target_compile_definitions(akkaradb_api_http PRIVATE
+        AKKARADB_API_SERVER_BUILD_SHARED
+        AKKARADB_TLS_ENABLED
+)
+if (MSVC)
+    target_compile_options(akkaradb_api_http PRIVATE /WX)
+else ()
+    target_compile_options(akkaradb_api_http PRIVATE -Werror)
+endif ()
+if(WIN32)
+    target_link_libraries(akkaradb_api_http PRIVATE ws2_32 bcrypt)
+endif()
+
+add_library(akkaradb_api_tcp SHARED)
+target_sources(akkaradb_api_tcp PRIVATE ${AKKENGINE_API_TCP_SOURCES})
+target_include_directories(akkaradb_api_tcp PRIVATE
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+        ${boost_pfr_SOURCE_DIR}/include
+)
+target_link_libraries(akkaradb_api_tcp PRIVATE akkaradb)
+target_compile_definitions(akkaradb_api_tcp PRIVATE
+        AKKARADB_API_SERVER_BUILD_SHARED
+        AKKARADB_TLS_ENABLED
+)
+if (MSVC)
+    target_compile_options(akkaradb_api_tcp PRIVATE /WX)
+else ()
+    target_compile_options(akkaradb_api_tcp PRIVATE -Werror)
+endif ()
+if(WIN32)
+    target_link_libraries(akkaradb_api_tcp PRIVATE ws2_32 bcrypt)
+endif()
+
+add_library(akkaradb_api_grpc SHARED)
+target_include_directories(akkaradb_api_grpc PRIVATE
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+        ${AKKGRPC_INCLUDE_DIR}
+        ${boost_pfr_SOURCE_DIR}/include
+)
+target_link_libraries(akkaradb_api_grpc PRIVATE akkaradb)
+target_compile_definitions(akkaradb_api_grpc PRIVATE
+        AKKARADB_API_SERVER_BUILD_SHARED
+        AKKARADB_TLS_ENABLED
+)
+if (MSVC)
+    target_compile_options(akkaradb_api_grpc PRIVATE /WX)
+else ()
+    target_compile_options(akkaradb_api_grpc PRIVATE -Werror)
+endif ()
+if(WIN32)
+    target_link_libraries(akkaradb_api_grpc PRIVATE ws2_32 bcrypt)
+endif()
+
+add_library(akkaradb_cluster SHARED)
+target_sources(akkaradb_cluster PRIVATE ${AKKENGINE_CLUSTER_RUNTIME_SOURCES})
+target_include_directories(akkaradb_cluster PRIVATE
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+        ${boost_pfr_SOURCE_DIR}/include
+)
+target_link_libraries(akkaradb_cluster PRIVATE akkaradb)
+target_compile_definitions(akkaradb_cluster PRIVATE
+        AKKARADB_CLUSTER_RUNTIME_BUILD_SHARED
+        AKKARADB_TLS_ENABLED
+)
+if (MSVC)
+    target_compile_options(akkaradb_cluster PRIVATE /WX)
+else ()
+    target_compile_options(akkaradb_cluster PRIVATE -Werror)
+endif ()
+if(WIN32)
+    target_link_libraries(akkaradb_cluster PRIVATE ws2_32 bcrypt)
+endif()
+
+add_dependencies(akkaradb_api
+        akkaradb_api_http
+        akkaradb_api_tcp
+        akkaradb_api_grpc
+        akkaradb_cluster
+)
+
+# ==================== Optional gRPC Backend ====================
+find_package(Protobuf CONFIG QUIET)
+find_package(gRPC CONFIG QUIET)
+
+set(AKKARADB_FETCHED_GRPC OFF)
+if (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
+    message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; fetching gRPC")
+    set(AKKARADB_FETCHED_GRPC ON)
+    set(gRPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_CODEGEN ON CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_CSHARP_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_NODE_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_OBJECTIVE_C_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_PHP_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_PYTHON_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPC_RUBY_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_GRPCPP_OTEL_PLUGIN OFF CACHE BOOL "" FORCE)
+    set(gRPC_INSTALL OFF CACHE BOOL "" FORCE)
+    set(gRPC_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(gRPC_ABSL_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_CARES_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_PROTOBUF_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_RE2_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_SSL_PROVIDER "module" CACHE STRING "" FORCE)
+    set(gRPC_ZLIB_PROVIDER "module" CACHE STRING "" FORCE)
+    set(OPENSSL_NO_ASM ON CACHE BOOL "" FORCE)
+    set(protobuf_INSTALL OFF CACHE BOOL "" FORCE)
+    set(utf8_range_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+            grpc
+            GIT_REPOSITORY https://github.com/grpc/grpc.git
+            GIT_TAG v1.60.2
+            GIT_SHALLOW TRUE
+            GIT_SUBMODULES
+                third_party/abseil-cpp
+                third_party/boringssl-with-bazel
+                third_party/cares/cares
+                third_party/protobuf
+                third_party/re2
+                third_party/zlib
+            GIT_SUBMODULES_RECURSE FALSE
+    )
+    FetchContent_MakeAvailable(grpc)
+    set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+endif ()
+
+set(AKKARADB_GRPCPP_TARGET "")
+if (AKKARADB_FETCHED_GRPC AND TARGET grpc++)
+    set(AKKARADB_GRPCPP_TARGET grpc++)
+elseif (TARGET gRPC::grpc++)
+    set(AKKARADB_GRPCPP_TARGET gRPC::grpc++)
+elseif (TARGET grpc++)
+    set(AKKARADB_GRPCPP_TARGET grpc++)
+endif ()
+
+set(AKKARADB_PROTOBUF_TARGET "")
+if (AKKARADB_FETCHED_GRPC AND TARGET libprotobuf)
+    set(AKKARADB_PROTOBUF_TARGET libprotobuf)
+elseif (TARGET protobuf::libprotobuf)
+    set(AKKARADB_PROTOBUF_TARGET protobuf::libprotobuf)
+elseif (TARGET libprotobuf)
+    set(AKKARADB_PROTOBUF_TARGET libprotobuf)
+endif ()
+
+set(AKKARADB_PROTOC_TARGET "")
+if (AKKARADB_FETCHED_GRPC AND TARGET protoc)
+    set(AKKARADB_PROTOC_TARGET protoc)
+elseif (TARGET protobuf::protoc)
+    set(AKKARADB_PROTOC_TARGET protobuf::protoc)
+elseif (TARGET protoc)
+    set(AKKARADB_PROTOC_TARGET protoc)
+endif ()
+
+set(AKKARADB_GRPC_CPP_PLUGIN_TARGET "")
+if (AKKARADB_FETCHED_GRPC AND TARGET grpc_cpp_plugin)
+    set(AKKARADB_GRPC_CPP_PLUGIN_TARGET grpc_cpp_plugin)
+elseif (TARGET gRPC::grpc_cpp_plugin)
+    set(AKKARADB_GRPC_CPP_PLUGIN_TARGET gRPC::grpc_cpp_plugin)
+elseif (TARGET grpc_cpp_plugin)
+    set(AKKARADB_GRPC_CPP_PLUGIN_TARGET grpc_cpp_plugin)
+endif ()
+
+if (AKKARADB_GRPCPP_TARGET AND AKKARADB_PROTOBUF_TARGET AND AKKARADB_PROTOC_TARGET AND AKKARADB_GRPC_CPP_PLUGIN_TARGET)
+    set(AKKARADB_GRPC_PROTO "${AKKGRPC_PROTO_DIR}/akkaradb_grpc.proto")
+    set(AKKARADB_GRPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/akkgrpc")
+    file(MAKE_DIRECTORY "${AKKARADB_GRPC_GENERATED_DIR}")
+
+    set(AKKARADB_GRPC_GENERATED_SOURCES
+            "${AKKARADB_GRPC_GENERATED_DIR}/akkaradb_grpc.pb.cc"
+            "${AKKARADB_GRPC_GENERATED_DIR}/akkaradb_grpc.grpc.pb.cc"
+    )
+
+    set(AKKARADB_GRPC_GENERATED_HEADERS
+            "${AKKARADB_GRPC_GENERATED_DIR}/akkaradb_grpc.pb.h"
+            "${AKKARADB_GRPC_GENERATED_DIR}/akkaradb_grpc.grpc.pb.h"
+    )
+
+    add_custom_command(
+            OUTPUT ${AKKARADB_GRPC_GENERATED_SOURCES} ${AKKARADB_GRPC_GENERATED_HEADERS}
+            COMMAND $<TARGET_FILE:${AKKARADB_PROTOC_TARGET}>
+            ARGS
+            --cpp_out "${AKKARADB_GRPC_GENERATED_DIR}"
+            --grpc_out "${AKKARADB_GRPC_GENERATED_DIR}"
+            --plugin=protoc-gen-grpc=$<TARGET_FILE:${AKKARADB_GRPC_CPP_PLUGIN_TARGET}>
+            -I "${AKKGRPC_PROTO_DIR}"
+            "${AKKARADB_GRPC_PROTO}"
+            DEPENDS "${AKKARADB_GRPC_PROTO}" ${AKKARADB_PROTOC_TARGET} ${AKKARADB_GRPC_CPP_PLUGIN_TARGET}
+            VERBATIM
+    )
+
+    add_custom_target(akkaradb_grpc_codegen
+            DEPENDS ${AKKARADB_GRPC_GENERATED_SOURCES} ${AKKARADB_GRPC_GENERATED_HEADERS}
+    )
+
+    target_sources(akkaradb_api_grpc PRIVATE
+            "${AKKGRPC_SRC_DIR}/AkkaraGRPCServer.cpp"
+            ${AKKARADB_GRPC_GENERATED_SOURCES}
+            ${AKKARADB_GRPC_GENERATED_HEADERS}
+    )
+    add_dependencies(akkaradb_api_grpc akkaradb_grpc_codegen)
+    if (MSVC)
+        set_source_files_properties(
+                "${AKKGRPC_SRC_DIR}/AkkaraGRPCServer.cpp"
+                ${AKKARADB_GRPC_GENERATED_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "/WX-"
+        )
+    endif ()
+    target_include_directories(akkaradb_api_grpc PRIVATE ${AKKARADB_GRPC_GENERATED_DIR})
+    target_link_libraries(akkaradb_api_grpc PRIVATE ${AKKARADB_GRPCPP_TARGET} ${AKKARADB_PROTOBUF_TARGET})
+    target_compile_definitions(akkaradb_api_grpc PRIVATE
+            AKKARADB_GRPC_ENABLED
+            _SILENCE_ALL_CXX23_DEPRECATION_WARNINGS
+            _SILENCE_CXX23_ALIGNED_STORAGE_DEPRECATION_WARNING
+    )
+    message(STATUS "AkkaraDB: gRPC backend enabled")
+else ()
+    target_sources(akkaradb_api_grpc PRIVATE "${AKKGRPC_SRC_DIR}/AkkaraGRPCServerStub.cpp")
+    message(STATUS "AkkaraDB: gRPC backend stub enabled; install Protobuf and gRPC CMake packages for real gRPC")
+endif ()
+
 set_target_properties(akkaradb PROPERTIES
         LINKER_LANGUAGE CXX
         OUTPUT_NAME "${AKKARADB_NATIVE_OUTPUT_NAME}"
 )
+
+set_target_properties(akkaradb_api PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_API_OUTPUT_NAME}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+set_target_properties(akkaradb_api_http PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_API_HTTP_OUTPUT_NAME}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+set_target_properties(akkaradb_api_tcp PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_API_TCP_OUTPUT_NAME}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+set_target_properties(akkaradb_api_grpc PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_API_GRPC_OUTPUT_NAME}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+set_target_properties(akkaradb_cluster PROPERTIES
+        LINKER_LANGUAGE CXX
+        OUTPUT_NAME "${AKKARADB_CLUSTER_OUTPUT_NAME}"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+if (WIN32)
+    set_target_properties(akkaradb_api PROPERTIES
+            WINDOWS_EXPORT_ALL_SYMBOLS OFF
+            ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    foreach (AKKARADB_OPTIONAL_BACKEND_TARGET IN ITEMS akkaradb_api_http akkaradb_api_tcp akkaradb_api_grpc akkaradb_cluster)
+        set_target_properties(${AKKARADB_OPTIONAL_BACKEND_TARGET} PROPERTIES
+                WINDOWS_EXPORT_ALL_SYMBOLS OFF
+                ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+    endforeach ()
+endif ()
 
 # ==================== Shared / Static Configuration ====================
 if (BUILD_SHARED_LIBS)
@@ -253,7 +647,7 @@ if (BUILD_SHARED_LIBS)
     )
     if (WIN32)
         set_target_properties(akkaradb PROPERTIES
-                WINDOWS_EXPORT_ALL_SYMBOLS ON
+                WINDOWS_EXPORT_ALL_SYMBOLS OFF
                 ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
                 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         )
@@ -272,6 +666,18 @@ install(TARGETS akkaradb
         RUNTIME DESTINATION bin COMPONENT SDK
         FILE_SET HEADERS DESTINATION include COMPONENT SDK
         FILE_SET akkengine_headers DESTINATION include COMPONENT SDK
+)
+
+install(TARGETS
+        akkaradb_api
+        akkaradb_api_http
+        akkaradb_api_tcp
+        akkaradb_api_grpc
+        akkaradb_cluster
+        EXPORT AkkaraDBTargets
+        LIBRARY DESTINATION lib COMPONENT SDK
+        ARCHIVE DESTINATION lib COMPONENT SDK
+        RUNTIME DESTINATION bin COMPONENT SDK
 )
 
 install(EXPORT AkkaraDBTargets
@@ -355,7 +761,7 @@ if(MSVC)
     target_compile_options(akkaradb_api_server_smoke_test PRIVATE /WX-)
 endif()
 
-target_link_libraries(akkaradb_api_server_smoke_test PRIVATE akkaradb)
+target_link_libraries(akkaradb_api_server_smoke_test PRIVATE akkaradb akkaradb_api akkaradb_api_tcp)
 
 target_include_directories(akkaradb_api_server_smoke_test
         PRIVATE
@@ -377,7 +783,7 @@ if(MSVC)
     target_compile_options(akkaradb_api_server_test PRIVATE /WX-)
 endif()
 
-target_link_libraries(akkaradb_api_server_test PRIVATE akkaradb)
+target_link_libraries(akkaradb_api_server_test PRIVATE akkaradb akkaradb_api akkaradb_api_tcp)
 
 target_include_directories(akkaradb_api_server_test
         PRIVATE
@@ -400,6 +806,7 @@ if(MSVC)
 endif()
 
 target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE akkaradb)
+target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE akkaradb_api akkaradb_api_tcp)
 if(WIN32)
     target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE ws2_32)
 endif()
@@ -670,7 +1077,7 @@ if(MSVC)
     target_compile_options(akkaradb_cluster_smoke_test PRIVATE /WX-)
 endif()
 
-target_link_libraries(akkaradb_cluster_smoke_test PRIVATE akkaradb)
+target_link_libraries(akkaradb_cluster_smoke_test PRIVATE akkaradb akkaradb_cluster)
 
 target_include_directories(akkaradb_cluster_smoke_test
         PRIVATE
@@ -780,25 +1187,45 @@ if (WIN32 AND BUILD_SHARED_LIBS)
     )
 endif()
 
-add_custom_command(TARGET akkaradb POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:akkaradb>
-        "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
-        COMMENT "Copying akkaradb native library to dist/native/${AKKARADB_RELEASE_VERSION}"
-)
+if (BUILD_SHARED_LIBS)
+    add_custom_command(TARGET akkaradb POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb>
+            "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
+            COMMENT "Copying akkaradb native library to dist/native/${AKKARADB_RELEASE_VERSION}"
+    )
 
-add_custom_command(TARGET akkaradb POST_BUILD
-        COMMAND ${CMAKE_COMMAND}
-        -DBUILD_DIR="${CMAKE_BINARY_DIR}"
-        -DINSTALL_CONFIG=$<CONFIG>
-        -DRELEASE_DIST_DIR="${AKKARADB_RELEASE_DIST_DIR}"
-        -DEXTRACT_DIR="${AKKARADB_SDK_EXTRACT_DIR}"
-        -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
-        -DZIP_PATH="${AKKARADB_SDK_ZIP}"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
-        COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
-)
+    add_custom_command(TARGET akkaradb_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb_api>
+            "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_API_DIST_LIBRARY_NAME}"
+            COMMENT "Copying akkaradb API backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+    )
+
+    foreach (AKKARADB_OPTIONAL_BACKEND_TARGET IN ITEMS akkaradb_api_http akkaradb_api_tcp akkaradb_api_grpc akkaradb_cluster)
+        add_custom_command(TARGET ${AKKARADB_OPTIONAL_BACKEND_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:${AKKARADB_OPTIONAL_BACKEND_TARGET}>
+                "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:${AKKARADB_OPTIONAL_BACKEND_TARGET}>"
+                COMMENT "Copying optional AkkaraDB backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+        )
+    endforeach ()
+
+    add_custom_command(TARGET akkaradb_api POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR="${CMAKE_BINARY_DIR}"
+            -DINSTALL_CONFIG=$<CONFIG>
+            -DRELEASE_DIST_DIR="${AKKARADB_RELEASE_DIST_DIR}"
+            -DEXTRACT_DIR="${AKKARADB_SDK_EXTRACT_DIR}"
+            -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
+            -DZIP_PATH="${AKKARADB_SDK_ZIP}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
+            COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
+    )
+endif ()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_api_server_smoke_test
@@ -832,6 +1259,20 @@ if (AKKARADB_BUILD_TESTS)
                     $<TARGET_FILE_DIR:${AKKARADB_TEST_TARGET}>
                     COMMENT "Copying akkaradb.dll to ${AKKARADB_TEST_TARGET} output directory"
             )
+            add_custom_command(TARGET ${AKKARADB_TEST_TARGET} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:akkaradb_api>
+                    $<TARGET_FILE_DIR:${AKKARADB_TEST_TARGET}>
+                    COMMENT "Copying akkaradb API backend DLL to ${AKKARADB_TEST_TARGET} output directory"
+            )
+            foreach (AKKARADB_OPTIONAL_BACKEND_TARGET IN ITEMS akkaradb_api_http akkaradb_api_tcp akkaradb_api_grpc akkaradb_cluster)
+                add_custom_command(TARGET ${AKKARADB_TEST_TARGET} POST_BUILD
+                        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        $<TARGET_FILE:${AKKARADB_OPTIONAL_BACKEND_TARGET}>
+                        $<TARGET_FILE_DIR:${AKKARADB_TEST_TARGET}>
+                        COMMENT "Copying optional AkkaraDB backend DLL to ${AKKARADB_TEST_TARGET} output directory"
+                )
+            endforeach ()
         endif ()
     endforeach ()
 endif ()
@@ -894,7 +1335,7 @@ if(AKKARADB_BUILD_JNI)
             COMMENT "Copying akkaradb JNI library to dist/jni/${AKKARADB_RELEASE_VERSION}"
     )
 
-    message(STATUS "JNI bridge enabled  Etarget: akkaradb_jni")
+    message(STATUS "JNI bridge enabled target: akkaradb_jni")
 endif()
 
 message(STATUS "AkkaraDB CMake configuration completed. TLS is enabled; SIMD paths are selected at runtime.")

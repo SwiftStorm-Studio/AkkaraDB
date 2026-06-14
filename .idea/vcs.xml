@@ -11,7 +11,6 @@
     <mapping directory="$PROJECT_DIR$/builds/_stale/cmake-build-release/_deps/mbedtls-src/framework" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/_stale/cmake-build-release/_deps/zstd-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/debug/_deps/mbedtls-src" vcs="Git" />
-    <mapping directory="$PROJECT_DIR$/builds/debug/_deps/mbedtls-src/framework" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/debug/_deps/zstd-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/release/_deps/mbedtls-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/release/_deps/mbedtls-src/framework" vcs="Git" />
@@ -32,5 +31,9 @@
     <mapping directory="$PROJECT_DIR$/builds/verify-sdk-script/_deps/mbedtls-src" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/verify-sdk-script/_deps/mbedtls-src/framework" vcs="Git" />
     <mapping directory="$PROJECT_DIR$/builds/verify-sdk-script/_deps/zstd-src" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/framework" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/protobuf" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/re2" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/zlib" vcs="Git" />
   </component>
 </project>

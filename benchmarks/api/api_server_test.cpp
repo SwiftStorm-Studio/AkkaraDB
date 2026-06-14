@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
     options.api.tcpMaxPendingResponseBytes = tcpMaxPendingResponseBytes;
     options.api.tcpReadTimeoutMs = tcpReadTimeoutMs;
     options.api.tcpWriteTimeoutMs = tcpWriteTimeoutMs;
-    options.api.transportMode = tls ? cluster::TransportMode::TLS : cluster::TransportMode::PLAIN;
+    options.api.transportMode = tls ? AkkEngineOptions::ApiTransportMode::TLS : AkkEngineOptions::ApiTransportMode::PLAIN;
     options.api.backends.clear();
 
     const bool useHttp = wantBoth || wantHttp || !wantTcp;

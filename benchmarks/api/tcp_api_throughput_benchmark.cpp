@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
     options.api.bindHost = "127.0.0.1";
     options.api.tcpPort = port;
     options.api.backends = {AkkEngineOptions::ApiBackend::TCP};
-    options.api.transportMode = cluster::TransportMode::PLAIN;
+    options.api.transportMode = AkkEngineOptions::ApiTransportMode::PLAIN;
     options.api.tcpWorkerThreads = static_cast<uint32_t>(clients);
     options.runtime.writerThreads = static_cast<uint32_t>(clients);
 

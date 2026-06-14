@@ -74,6 +74,8 @@ namespace akkaradb::engine::cluster {
                 return primaryHost_;
             }
 
+            uint64_t primaryNodeId() const noexcept { return primaryNodeId_.load(); }
+
             uint16_t primaryReplPort() const {
                 std::lock_guard lock{primaryMutex_};
                 return primaryReplPort_;
@@ -97,6 +99,7 @@ namespace akkaradb::engine::cluster {
 
                 {
                     std::lock_guard lock{primaryMutex_};
+                    primaryNodeId_.store(primary->nodeId);
                     primaryHost_ = primary->host;
                     primaryReplPort_ = primary->replPort;
                 }
@@ -110,6 +113,7 @@ namespace akkaradb::engine::cluster {
             std::atomic<bool> running_{false};
 
             mutable std::mutex primaryMutex_;
+            std::atomic<uint64_t> primaryNodeId_{0};
             std::string primaryHost_;
             uint16_t primaryReplPort_ = 0;
 
@@ -130,6 +134,7 @@ namespace akkaradb::engine::cluster {
     NodeRole ClusterManager::role() const noexcept { return impl_->role(); }
     uint64_t ClusterManager::selfNodeId() const noexcept { return impl_->selfNodeId(); }
     std::string ClusterManager::primaryHost() const { return impl_->primaryHost(); }
+    uint64_t ClusterManager::primaryNodeId() const noexcept { return impl_->primaryNodeId(); }
     uint16_t ClusterManager::primaryReplPort() const { return impl_->primaryReplPort(); }
     bool ClusterManager::isStandalone() const noexcept { return impl_->isStandalone(); }
 } // namespace akkaradb::engine::cluster

@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/erasure/ErasureCodec.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -29,14 +31,14 @@ namespace akkaradb::engine::erasure {
         XOR = 1, DUAL_XOR = 2,
     };
 
-    struct ErasureLayout {
+    struct AKDB_API ErasureLayout {
         uint16_t dataShards = 0;
         uint16_t parityShards = 1;
 
         [[nodiscard]] uint16_t totalShards() const noexcept;
     };
 
-    struct ErasureShard {
+    struct AKDB_API ErasureShard {
         uint16_t index = 0;
         uint64_t originalSize = 0;
         ErasureCodecKind codec = ErasureCodecKind::XOR;
@@ -46,7 +48,7 @@ namespace akkaradb::engine::erasure {
         [[nodiscard]] bool verifyCrc() const noexcept;
     };
 
-    class XorErasureCodec {
+    class AKDB_API XorErasureCodec {
         public:
             /**
              * Encodes value into k data shards and one XOR parity shard.

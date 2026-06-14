@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/memtable/ARTMemTable.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -33,7 +35,7 @@
 #include "akk/engine/memtable/IMemTable.hpp"
 
 namespace akkaradb::engine::memtable {
-    class ARTMemTable final : public IMemTable {
+    class AKDB_API ARTMemTable final : public IMemTable {
         public:
             static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;
 

@@ -19,6 +19,7 @@
 // akkengine/include/akk/engine/cluster/ClusterManager.hpp
 #pragma once
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 #include <filesystem>
@@ -43,7 +44,7 @@ namespace akkaradb::engine::cluster {
      * Thread-safety: public methods are safe to call from different threads
      * unless otherwise noted.  start() and close() are idempotent.
      */
-    class ClusterManager {
+    class AKKARADB_CLUSTER_RUNTIME_API ClusterManager {
         public:
             /**
              * Called whenever the local node's role changes.
@@ -96,6 +97,9 @@ namespace akkaradb::engine::cluster {
 
             /** Returns the currently known primary host, or empty if unknown. */
             [[nodiscard]] std::string primaryHost() const;
+
+            /** Returns the currently known primary node id, or 0 if unknown. */
+            [[nodiscard]] uint64_t primaryNodeId() const noexcept;
 
             /** Returns the currently known primary replication port, or 0 if unknown. */
             [[nodiscard]] uint16_t primaryReplPort() const;

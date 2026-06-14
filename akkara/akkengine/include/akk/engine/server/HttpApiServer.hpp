@@ -20,6 +20,8 @@
 #pragma once
 
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/server/AkkApiServerExport.hpp"
+#include "akk/engine/server/AkkApiTransportProvider.hpp"
 #include "akk/engine/server/ApiTransport.hpp"
 
 #include <atomic>
@@ -33,17 +35,18 @@
 #include <vector>
 
 namespace akkaradb::engine::server {
-    class HttpApiServer {
+    class AKKARADB_API_SERVER_API HttpApiServer final : public IAkkApiTransport {
         public:
             [[nodiscard]] static std::unique_ptr<HttpApiServer> create(AkkEngine& engine, AkkEngineOptions::ApiOptions options);
 
-            ~HttpApiServer();
+            ~HttpApiServer() override;
 
             HttpApiServer(const HttpApiServer&) = delete;
             HttpApiServer& operator=(const HttpApiServer&) = delete;
 
-            void start();
-            void close();
+            void start() override;
+            void close() override;
+            [[nodiscard]] EngineStats::ApiStats stats() const noexcept override;
 
         private:
             struct ParsedRequest {
@@ -58,21 +61,36 @@ namespace akkaradb::engine::server {
 
             void acceptLoop();
             void handleConnection(detail::Connection& connection);
-            bool readRequest(detail::Connection& connection, ParsedRequest& request);
+            bool readRequest(detail::Connection& connection, ParsedRequest& request, bool& protocolError);
             bool route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer);
             bool sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body);
+            bool sendText(detail::Connection& connection, int statusCode, std::string_view body);
             bool sendEmpty(detail::Connection& connection, int statusCode);
 
             [[nodiscard]] static std::string queryParam(std::string_view query, std::string_view name);
             [[nodiscard]] static std::vector<uint8_t> urlDecode(std::string_view encoded);
+            [[nodiscard]] uint32_t maxBatchItems() const noexcept;
+            [[nodiscard]] uint32_t maxScanItems() const noexcept;
+            [[nodiscard]] uint32_t maxHistoryEntries() const noexcept;
+            [[nodiscard]] uint64_t maxContentLength() const noexcept;
 
             AkkEngine& engine_;
             AkkEngineOptions::ApiOptions options_;
             std::atomic<bool> running_{false};
             detail::SocketHandle listenSocket_{detail::BAD_SOCKET_VALUE};
             std::thread acceptThread_;
-            std::mutex clientsMu_;
+            mutable std::mutex clientsMu_;
             std::unordered_set<detail::SocketHandle> activeClients_;
             std::vector<std::thread> connectionThreads_;
+            std::atomic<uint64_t> connectionsAcceptedTotal_{0};
+            std::atomic<uint64_t> connectionsClosedTotal_{0};
+            std::atomic<uint64_t> requestsTotal_{0};
+            std::atomic<uint64_t> responsesTotal_{0};
+            std::atomic<uint64_t> bytesReceivedTotal_{0};
+            std::atomic<uint64_t> bytesSentTotal_{0};
+            std::atomic<uint64_t> protocolErrorsTotal_{0};
+            std::atomic<uint64_t> errorsTotal_{0};
+            std::atomic<uint64_t> batchPutItemsTotal_{0};
+            std::atomic<uint64_t> batchGetItemsTotal_{0};
     };
 }

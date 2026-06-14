@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/record/RecordView.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -60,7 +62,7 @@ namespace akkaradb::core {
      * Thread-safety:
      *   - Safe if underlying memory is immutable
      */
-    class RecordView {
+    class AKDB_API RecordView {
         public:
             [[nodiscard]] static constexpr uint64_t bswap64(uint64_t v) noexcept {
                 v = ((v & 0x00FF00FF00FF00FFULL) << 8) | ((v >> 8) & 0x00FF00FF00FF00FFULL);

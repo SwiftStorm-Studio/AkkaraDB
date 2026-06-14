@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/buffer/OwnedBuffer.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -59,7 +61,7 @@ namespace akkaradb::core {
      * - Not thread-safe for concurrent mutation
      * - Safe to move across threads
      */
-    class OwnedBuffer {
+    class AKDB_API OwnedBuffer {
         public:
             /**
              * @brief Deleter function signature.

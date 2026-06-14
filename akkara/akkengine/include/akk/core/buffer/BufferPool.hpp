@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/buffer/BufferPool.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -42,7 +44,7 @@ namespace akkaradb::core {
      * - Safe for concurrent acquire/release
      * - Pool should outlive worker threads when TLS cache is enabled
      */
-    class BufferPool {
+    class AKDB_API BufferPool {
         public:
             static constexpr size_t DEFAULT_MIN_CLASS_SIZE = 64;
             static constexpr size_t DEFAULT_MAX_CLASS_SIZE = 64 * 1024;

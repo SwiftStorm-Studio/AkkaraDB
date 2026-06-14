@@ -49,6 +49,24 @@ namespace akkaradb::engine {
 
         struct ApiStats {
             bool enabled = false;
+            bool httpEnabled = false;
+            bool httpTlsEnabled = false;
+            uint16_t httpPort = 0;
+            uint32_t httpMaxBatchItems = 0;
+            uint32_t httpMaxScanItems = 0;
+            uint32_t httpMaxHistoryEntries = 0;
+            uint64_t httpMaxContentLength = 0;
+            uint64_t httpConnectionsAcceptedTotal = 0;
+            uint64_t httpConnectionsClosedTotal = 0;
+            uint64_t httpConnectionsActive = 0;
+            uint64_t httpRequestsTotal = 0;
+            uint64_t httpResponsesTotal = 0;
+            uint64_t httpBytesReceivedTotal = 0;
+            uint64_t httpBytesSentTotal = 0;
+            uint64_t httpProtocolErrorsTotal = 0;
+            uint64_t httpErrorsTotal = 0;
+            uint64_t httpBatchPutItemsTotal = 0;
+            uint64_t httpBatchGetItemsTotal = 0;
             bool tcpEnabled = false;
             bool tcpTlsEnabled = false;
             uint8_t tcpIoBackend = 0;
@@ -76,6 +94,24 @@ namespace akkaradb::engine {
             uint64_t tcpBackpressureDisconnectsTotal = 0;
             uint64_t tcpBatchPutItemsTotal = 0;
             uint64_t tcpBatchGetItemsTotal = 0;
+            bool grpcEnabled = false;
+            bool grpcTlsEnabled = false;
+            uint16_t grpcPort = 0;
+            uint32_t grpcWorkerThreads = 0;
+            uint32_t grpcCompletionQueues = 0;
+            uint32_t grpcMinPollers = 0;
+            uint32_t grpcMaxPollers = 0;
+            uint32_t grpcMaxConcurrentStreams = 0;
+            uint64_t grpcResourceQuotaBytes = 0;
+            uint32_t grpcMaxBatchItems = 0;
+            uint32_t grpcMaxScanItems = 0;
+            uint32_t grpcMaxHistoryEntries = 0;
+            uint64_t grpcRequestsTotal = 0;
+            uint64_t grpcResponsesTotal = 0;
+            uint64_t grpcActiveRequests = 0;
+            uint64_t grpcErrorsTotal = 0;
+            uint64_t grpcBatchPutItemsTotal = 0;
+            uint64_t grpcBatchGetItemsTotal = 0;
         } api;
 
         struct MemTableStats {

@@ -20,30 +20,30 @@
 #pragma once
 
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/server/AkkApiServerExport.hpp"
+#include "akk/engine/server/AkkApiServerProvider.hpp"
+#include "akk/engine/server/AkkApiTransportProvider.hpp"
 
 #include <memory>
+#include <vector>
 
 namespace akkaradb::engine::server {
-    class HttpApiServer;
-    class TcpApiServer;
-
-    class AkkApiServer {
+    class AKKARADB_API_SERVER_API AkkApiServer final : public IAkkApiServer {
         public:
             [[nodiscard]] static std::unique_ptr<AkkApiServer> create(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options);
 
-            ~AkkApiServer();
+            ~AkkApiServer() override;
 
             AkkApiServer(const AkkApiServer&) = delete;
             AkkApiServer& operator=(const AkkApiServer&) = delete;
 
-            void start();
-            void close();
-            [[nodiscard]] EngineStats::ApiStats stats() const noexcept;
+            void start() override;
+            void close() override;
+            [[nodiscard]] EngineStats::ApiStats stats() const noexcept override;
 
         private:
-            AkkApiServer() = default;
+            AkkApiServer();
 
-            std::unique_ptr<HttpApiServer> http_;
-            std::unique_ptr<TcpApiServer> tcp_;
+            std::vector<std::unique_ptr<IAkkApiTransport>> transports_;
     };
 }

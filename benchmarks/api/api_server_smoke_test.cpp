@@ -27,6 +27,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -229,6 +230,21 @@ namespace {
         return response;
     }
 
+    [[nodiscard]] std::vector<uint8_t> httpBody(const std::string& response) {
+        const auto headerEnd = response.find("\r\n\r\n");
+        AKK_TEST_CHECK(headerEnd != std::string::npos);
+        return {
+            reinterpret_cast<const uint8_t*>(response.data() + headerEnd + 4),
+            reinterpret_cast<const uint8_t*>(response.data() + response.size())
+        };
+    }
+
+    [[nodiscard]] std::string httpRequestWithBody(uint16_t port, std::string_view header, std::span<const uint8_t> body) {
+        std::string request{header};
+        request.append(reinterpret_cast<const char*>(body.data()), body.size());
+        return httpRequest(port, request);
+    }
+
     void testTcp(uint16_t port, const std::vector<VersionEntry>& history) {
         akkaradb::net::TlsStream stream;
         stream.connect("127.0.0.1", port, {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
@@ -287,18 +303,93 @@ namespace {
         AKK_TEST_CHECK(decodedBatch[2].status == ApiStatus::OK && text(decodedBatch[2].value) == "y");
         AKK_TEST_CHECK(decodedBatch[3].status == ApiStatus::OK && text(decodedBatch[3].value) == "z");
 
+        auto ping = makeRequest(17, ApiOp::PING, {});
+        tlsSendAll(stream, ping.data(), ping.size());
+        auto pingResponse = readResponse(stream);
+        AKK_TEST_CHECK(pingResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(text(pingResponse.value) == "pong");
+
+        auto exists = makeRequest(18, ApiOp::EXISTS, bytes("b1"));
+        tlsSendAll(stream, exists.data(), exists.size());
+        auto existsResponse = readResponse(stream);
+        AKK_TEST_CHECK(existsResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(existsResponse.value.size() == 1 && existsResponse.value[0] == 1);
+
+        auto count = makeRequest(19, ApiOp::COUNT, bytes("b"), bytes("c"));
+        tlsSendAll(stream, count.data(), count.size());
+        auto countResponse = readResponse(stream);
+        AKK_TEST_CHECK(countResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(countResponse.value.size() == sizeof(uint64_t));
+        uint64_t counted = 0;
+        std::memcpy(&counted, countResponse.value.data(), sizeof(counted));
+        AKK_TEST_CHECK(counted >= 3);
+
+        std::vector<uint8_t> scanPayload;
+        appendPlain(scanPayload, static_cast<uint32_t>(2));
+        appendBytes(scanPayload, bytes("c"));
+        auto scan = makeRequest(20, ApiOp::SCAN, bytes("b"), std::span<const uint8_t>{scanPayload.data(), scanPayload.size()});
+        tlsSendAll(stream, scan.data(), scan.size());
+        auto scanResponse = readResponse(stream);
+        AKK_TEST_CHECK(scanResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(scanResponse.value.size() >= sizeof(uint32_t) + sizeof(uint8_t));
+        uint32_t scanned = 0;
+        std::memcpy(&scanned, scanResponse.value.data(), sizeof(scanned));
+        AKK_TEST_CHECK(scanned == 2);
+        AKK_TEST_CHECK(scanResponse.value[sizeof(uint32_t)] == 1);
+
+        auto historyRequest = makeRequest(21, ApiOp::HISTORY, bytes("history"));
+        tlsSendAll(stream, historyRequest.data(), historyRequest.size());
+        auto historyResponse = readResponse(stream);
+        AKK_TEST_CHECK(historyResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(historyResponse.value.size() >= sizeof(uint32_t));
+        uint32_t tcpHistoryCount = 0;
+        std::memcpy(&tcpHistoryCount, historyResponse.value.data(), sizeof(tcpHistoryCount));
+        AKK_TEST_CHECK(tcpHistoryCount >= 2);
+
+        auto forceSync = makeRequest(22, ApiOp::FORCE_SYNC, {});
+        tlsSendAll(stream, forceSync.data(), forceSync.size());
+        AKK_TEST_CHECK(readResponse(stream).status == ApiStatus::OK);
+
+        auto stats = makeRequest(23, ApiOp::STATS, {});
+        tlsSendAll(stream, stats.data(), stats.size());
+        auto statsResponse = readResponse(stream);
+        AKK_TEST_CHECK(statsResponse.status == ApiStatus::OK);
+        AKK_TEST_CHECK(!statsResponse.value.empty());
+
         std::vector<uint8_t> pipeline;
-        for (uint32_t requestId = 9; requestId < 17; ++requestId) {
+        for (uint32_t requestId = 25; requestId < 33; ++requestId) {
             auto request = makeRequest(requestId, ApiOp::GET, bytes("b1"));
             pipeline.insert(pipeline.end(), request.begin(), request.end());
         }
         tlsSendAll(stream, pipeline.data(), pipeline.size());
-        for (uint32_t requestId = 9; requestId < 17; ++requestId) {
+        for (uint32_t requestId = 25; requestId < 33; ++requestId) {
             auto response = readResponse(stream);
             AKK_TEST_CHECK(response.status == ApiStatus::OK);
             AKK_TEST_CHECK(response.requestId == requestId);
             AKK_TEST_CHECK(text(response.value) == "x");
         }
+    }
+
+    void testTcpProtocolError(uint16_t port) {
+        akkaradb::net::TlsStream stream;
+        stream.connect("127.0.0.1", port, {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
+
+        auto invalidOpcode = makeRequest(100, static_cast<ApiOp>(0x7f), bytes("bad-op"));
+        tlsSendAll(stream, invalidOpcode.data(), invalidOpcode.size());
+
+        auto response = readResponse(stream);
+        AKK_TEST_CHECK(response.status == ApiStatus::ERROR_STATUS);
+        AKK_TEST_CHECK(response.requestId == 100);
+        AKK_TEST_CHECK(response.value.empty());
+
+        bool closed = false;
+        try {
+            auto get = makeRequest(101, ApiOp::GET, bytes("b1"));
+            tlsSendAll(stream, get.data(), get.size());
+            (void)readResponse(stream);
+        }
+        catch (...) { closed = true; }
+        AKK_TEST_CHECK(closed);
     }
 
     void testHttp(uint16_t port) {
@@ -332,10 +423,125 @@ namespace {
         );
         AKK_TEST_CHECK(ping.find("200 OK") != std::string::npos);
         AKK_TEST_CHECK(ping.ends_with("pong"));
+
+        const auto exists = httpRequest(
+            port,
+            "GET /v1/exists?key=http HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(exists.find("200 OK") != std::string::npos);
+        const auto existsBody = httpBody(exists);
+        AKK_TEST_CHECK(existsBody.size() == 1 && existsBody[0] == 1);
+
+        const auto count = httpRequest(
+            port,
+            "GET /v1/count?start=h&end=i HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(count.find("200 OK") != std::string::npos);
+        const auto countBody = httpBody(count);
+        AKK_TEST_CHECK(countBody.size() == sizeof(uint64_t));
+        uint64_t httpCount = 0;
+        std::memcpy(&httpCount, countBody.data(), sizeof(httpCount));
+        AKK_TEST_CHECK(httpCount >= 1);
+
+        const auto scan = httpRequest(
+            port,
+            "GET /v1/scan?start=h&end=i&limit=1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(scan.find("200 OK") != std::string::npos);
+        const auto scanBody = httpBody(scan);
+        AKK_TEST_CHECK(scanBody.size() >= sizeof(uint32_t) + sizeof(uint8_t));
+        uint32_t httpScanned = 0;
+        std::memcpy(&httpScanned, scanBody.data(), sizeof(httpScanned));
+        AKK_TEST_CHECK(httpScanned == 1);
+
+        const auto history = httpRequest(
+            port,
+            "GET /v1/history?key=history HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(history.find("200 OK") != std::string::npos);
+        const auto historyBody = httpBody(history);
+        AKK_TEST_CHECK(historyBody.size() >= sizeof(uint32_t) + sizeof(uint8_t));
+        uint32_t httpHistoryCount = 0;
+        std::memcpy(&httpHistoryCount, historyBody.data(), sizeof(httpHistoryCount));
+        AKK_TEST_CHECK(httpHistoryCount >= 2);
+
+        const std::pair<std::string_view, std::string_view> httpBatchPutItems[] = {
+            {"hb1", "one"},
+            {"hb2", "two"},
+        };
+        std::vector<uint8_t> batchPutBody;
+        appendPlain(batchPutBody, static_cast<uint32_t>(std::size(httpBatchPutItems)));
+        for (const auto& [key, value] : httpBatchPutItems) {
+            appendPlain(batchPutBody, static_cast<uint32_t>(key.size()));
+            appendPlain(batchPutBody, static_cast<uint32_t>(value.size()));
+            appendBytes(batchPutBody, bytes(key));
+            appendBytes(batchPutBody, bytes(value));
+        }
+        const std::string batchPutHeader =
+            "POST /v1/batchPut HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "Content-Length: " + std::to_string(batchPutBody.size()) + "\r\n"
+            "\r\n";
+        const auto batchPut = httpRequestWithBody(port, batchPutHeader, batchPutBody);
+        AKK_TEST_CHECK(batchPut.find("204 No Content") != std::string::npos);
+
+        const std::string_view httpBatchGetKeys[] = {"hb1", "missing", "hb2"};
+        std::vector<uint8_t> batchGetBody;
+        appendPlain(batchGetBody, static_cast<uint32_t>(std::size(httpBatchGetKeys)));
+        for (const auto key : httpBatchGetKeys) {
+            appendPlain(batchGetBody, static_cast<uint32_t>(key.size()));
+            appendBytes(batchGetBody, bytes(key));
+        }
+        const std::string batchGetHeader =
+            "POST /v1/batchGet HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "Content-Length: " + std::to_string(batchGetBody.size()) + "\r\n"
+            "\r\n";
+        const auto batchGet = httpRequestWithBody(port, batchGetHeader, batchGetBody);
+        AKK_TEST_CHECK(batchGet.find("200 OK") != std::string::npos);
+        const auto decodedBatch = decodeBatchGetResponse(httpBody(batchGet));
+        AKK_TEST_CHECK(decodedBatch.size() == 3);
+        AKK_TEST_CHECK(decodedBatch[0].status == ApiStatus::OK && text(decodedBatch[0].value) == "one");
+        AKK_TEST_CHECK(decodedBatch[1].status == ApiStatus::NOT_FOUND);
+        AKK_TEST_CHECK(decodedBatch[2].status == ApiStatus::OK && text(decodedBatch[2].value) == "two");
+
+        const auto forceFlush = httpRequest(
+            port,
+            "POST /v1/forceFlush HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(forceFlush.find("204 No Content") != std::string::npos);
+
+        const auto stats = httpRequest(
+            port,
+            "GET /v1/stats HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(stats.find("200 OK") != std::string::npos);
+        AKK_TEST_CHECK(!httpBody(stats).empty());
     }
 }
 
-int main() {
+int main() try {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     const uint16_t httpPort = basePort();
@@ -361,8 +567,21 @@ int main() {
     AKK_TEST_CHECK(history.size() == 2);
 
     testTcp(tcpPort, history);
+    testTcpProtocolError(tcpPort);
     testHttp(httpPort);
+
+    const auto stats = engine->stats();
+    AKK_TEST_CHECK(stats.api.tcpEnabled);
+    AKK_TEST_CHECK(stats.api.tcpRequestsTotal >= 24);
+    AKK_TEST_CHECK(stats.api.tcpResponsesTotal >= 24);
+    AKK_TEST_CHECK(stats.api.tcpProtocolErrorsTotal >= 1);
 
     engine->close();
     return 0;
+}
+catch (const std::exception& e) {
+    akkaradb::test::failFastExit("API SERVER SMOKE EXCEPTION", e.what());
+}
+catch (...) {
+    akkaradb::test::failFastExit("API SERVER SMOKE EXCEPTION", "unknown exception");
 }

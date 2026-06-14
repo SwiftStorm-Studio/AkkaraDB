@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/sstable/SSTManager.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -34,7 +36,7 @@
 #include "akk/engine/sstable/SSTWriter.hpp"
 
 namespace akkaradb::engine::sst {
-    class SSTManager {
+    class AKDB_API SSTManager {
         private:
             class Impl;
 
@@ -67,7 +69,7 @@ namespace akkaradb::engine::sst {
                 uint64_t bytesCompactedOut = 0;
             };
 
-            class Iterator {
+            class AKDB_API Iterator {
                 public:
                     Iterator();
                     ~Iterator();

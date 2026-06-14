@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/memtable/BPTreeMemTable.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -34,7 +36,7 @@
 #include "akk/engine/memtable/IMemTable.hpp"
 
 namespace akkaradb::engine::memtable {
-    class BPTreeMemTable final : public IMemTable {
+    class AKDB_API BPTreeMemTable final : public IMemTable {
         public:
             static constexpr uint16_t MAX_KEYS = 63;
             static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;

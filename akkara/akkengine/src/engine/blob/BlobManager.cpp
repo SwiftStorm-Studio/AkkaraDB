@@ -189,6 +189,8 @@ namespace akkaradb::engine::blob {
         }
     } // namespace
 
+    BlobManager::BlobManager() = default;
+
     class BlobManager::Impl {
         public:
             explicit Impl(Options optionsValue) : options(std::move(optionsValue)) {}

@@ -25,12 +25,12 @@
 
 #include <algorithm>
 #include <array>
-#include <cstddef>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 #ifndef _WIN32
 #include <sys/stat.h>
@@ -100,14 +100,31 @@ namespace akkaradb::crypto {
     IdentityStore::IdentityStore(std::filesystem::path path) : path_(std::move(path)) {}
 
     NodeIdentity IdentityStore::loadOrCreate() const {
-        if (std::filesystem::exists(path_)) { return nodeIdentityFromSeed(loadSeed()); }
+        if (std::filesystem::exists(path_)) {
+            auto seed = loadSeed();
+            try {
+                auto identity = nodeIdentityFromSeed(seed);
+                secureWipe(seed);
+                return identity;
+            }
+            catch (...) {
+                secureWipe(seed);
+                throw;
+            }
+        }
 
         SecretKey seed{};
         secureRandom(seed);
-        saveSeed(seed);
-        auto identity = nodeIdentityFromSeed(seed);
-        secureWipe(seed);
-        return identity;
+        try {
+            saveSeed(seed);
+            auto identity = nodeIdentityFromSeed(seed);
+            secureWipe(seed);
+            return identity;
+        }
+        catch (...) {
+            secureWipe(seed);
+            throw;
+        }
     }
 
     void IdentityStore::saveSeed(const SecretKey& seed) const {
@@ -138,11 +155,20 @@ namespace akkaradb::crypto {
         SecretKey seed{};
         in.read(reinterpret_cast<char*>(magic.data()), static_cast<std::streamsize>(magic.size()));
         in.read(reinterpret_cast<char*>(seed.data()), static_cast<std::streamsize>(seed.size()));
-        if (!in) { throw std::runtime_error("IdentityStore: truncated seed file"); }
-        if (magic != IDENTITY_FILE_MAGIC) { throw std::runtime_error("IdentityStore: invalid seed file magic"); }
+        if (!in) {
+            secureWipe(seed);
+            throw std::runtime_error("IdentityStore: truncated seed file");
+        }
+        if (magic != IDENTITY_FILE_MAGIC) {
+            secureWipe(seed);
+            throw std::runtime_error("IdentityStore: invalid seed file magic");
+        }
 
         char extra = 0;
-        if (in.read(&extra, 1)) { throw std::runtime_error("IdentityStore: seed file has trailing bytes"); }
+        if (in.read(&extra, 1)) {
+            secureWipe(seed);
+            throw std::runtime_error("IdentityStore: seed file has trailing bytes");
+        }
         return seed;
     }
 } // namespace akkaradb::crypto

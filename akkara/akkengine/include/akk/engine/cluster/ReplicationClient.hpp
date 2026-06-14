@@ -19,6 +19,7 @@
 // akkengine/include/akk/engine/cluster/ReplicationClient.hpp
 #pragma once
 
+#include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 
@@ -40,7 +41,7 @@ namespace akkaradb::engine::cluster {
      * synchronized internally.  Callbacks are invoked from the client's worker
      * thread.
      */
-    class ReplicationClient {
+    class AKKARADB_CLUSTER_RUNTIME_API ReplicationClient {
         public:
             /**
              * Applies a replicated put/remove entry to the local engine.
@@ -72,7 +73,7 @@ namespace akkaradb::engine::cluster {
              * @param selfNodeId       Local replica node id.
              * @param getLastSeq       Returns the highest local applied seq
              *                           for ClientHello.
-             * @param runtimeOptions    Transport/TLS options.
+             * @param runtimeOptions    Transport options.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
                 std::string primaryHost,

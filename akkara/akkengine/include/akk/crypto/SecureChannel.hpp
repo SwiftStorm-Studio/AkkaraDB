@@ -19,6 +19,8 @@
 // akkengine/include/akk/crypto/SecureChannel.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include "akk/crypto/Identity.hpp"
 
 #include <array>
@@ -31,24 +33,24 @@ namespace akkaradb::crypto {
     using BytesView = std::span<const std::uint8_t>;
     using AeadTag = std::array<std::uint8_t, 16>;
 
-    struct ClientHello {
+    struct AKDB_API ClientHello {
         PublicKey staticPublicKey{};
         PublicKey ephemeralPublicKey{};
     };
 
-    struct ServerHello {
+    struct AKDB_API ServerHello {
         PublicKey staticPublicKey{};
         PublicKey ephemeralPublicKey{};
         AeadTag authenticator{};
     };
 
-    struct EncryptedFrame {
+    struct AKDB_API EncryptedFrame {
         std::uint64_t counter = 0;
         AeadTag tag{};
         std::vector<std::uint8_t> ciphertext;
     };
 
-    class SecureSession {
+    class AKDB_API SecureSession {
         public:
             SecureSession() = default;
             ~SecureSession();
@@ -67,7 +69,7 @@ namespace akkaradb::crypto {
         private:
             friend class NoiseInitiator;
             friend struct ResponderHandshake;
-            friend ResponderHandshake acceptResponder(
+            friend AKDB_API ResponderHandshake acceptResponder(
                 const NodeIdentity& localIdentity,
                 const ClientHello& hello,
                 const std::optional<PublicKey>& expectedRemote
@@ -86,7 +88,7 @@ namespace akkaradb::crypto {
             bool valid_ = false;
     };
 
-    struct ResponderHandshake {
+    struct AKDB_API ResponderHandshake {
         ServerHello hello{};
         SecureSession session;
         PublicKey remoteStaticPublicKey{};
@@ -100,15 +102,29 @@ namespace akkaradb::crypto {
      * This is intentionally socket independent.  Transport code serializes the
      * hello structs, exchanges them, then uses SecureSession for AEAD frames.
      */
-    class NoiseInitiator {
+    class AKDB_API NoiseInitiator {
         public:
             explicit NoiseInitiator(const NodeIdentity& localIdentity);
+            ~NoiseInitiator();
+
+            NoiseInitiator(const NoiseInitiator&) = delete;
+            NoiseInitiator& operator=(const NoiseInitiator&) = delete;
+            NoiseInitiator(NoiseInitiator&&) = delete;
+            NoiseInitiator& operator=(NoiseInitiator&&) = delete;
 
             [[nodiscard]] const ClientHello& hello() const noexcept { return hello_; }
+            /**
+             * @brief Finish the initiator handshake after receiving the responder hello.
+             *
+             * When @p expectedRemote is present, the responder static public key
+             * must match it. Passing std::nullopt disables static-key pinning and
+             * is intended only for enrollment/TOFU flows where the caller records
+             * or authenticates the responder identity through another channel.
+             */
             [[nodiscard]] SecureSession finish(const ServerHello& hello, const std::optional<PublicKey>& expectedRemote = std::nullopt);
 
         private:
-            NodeIdentity localIdentity_{};
+            const NodeIdentity& localIdentity_;
             SecretKey ephemeralSecret_{};
             ClientHello hello_{};
             bool finished_ = false;
@@ -118,10 +134,11 @@ namespace akkaradb::crypto {
      * @brief Accept an initiator hello and return the responder hello + session.
      *
      * If @p expectedRemote is present, the initiator static public key must
-     * match it.  Without it this is suitable for enrollment, where the caller
-     * must authenticate the join request through another mechanism.
+     * match it. Passing std::nullopt disables static-key pinning and is suitable
+     * only for enrollment/TOFU flows where the caller records or authenticates
+     * the join request through another mechanism before trusting the peer.
      */
-    [[nodiscard]] ResponderHandshake acceptResponder(
+    [[nodiscard]] AKDB_API ResponderHandshake acceptResponder(
         const NodeIdentity& localIdentity,
         const ClientHello& hello,
         const std::optional<PublicKey>& expectedRemote = std::nullopt

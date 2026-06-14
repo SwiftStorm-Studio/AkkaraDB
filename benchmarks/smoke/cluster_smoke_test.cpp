@@ -26,6 +26,7 @@
 #include "akk/engine/cluster/ReplFraming.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include "akk/engine/cluster/ReplicationServer.hpp"
+#include "akk/crypto/Identity.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -291,7 +292,7 @@ namespace {
 
     void testTransportDefault() {
         ClusterRuntimeOptions options{};
-        AKK_TEST_CHECK(options.transportMode == TransportMode::TLS);
+        AKK_TEST_CHECK(options.transportMode == TransportMode::SECURE);
         AKK_TEST_CHECK(options.replBindHost == "0.0.0.0");
 
         constexpr uint16_t port = 19972;
@@ -305,8 +306,8 @@ namespace {
             AKK_TEST_CHECK(op == ReplOpType::PUT);
             AKK_TEST_CHECK(source == 1);
             AKK_TEST_CHECK(flags == 4);
-            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "tls-k");
-            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "tls-v");
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "secure-k");
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "secure-v");
             ++applied;
         });
 
@@ -318,9 +319,62 @@ namespace {
         }
         AKK_TEST_CHECK(server->replicaCount() == 1);
 
-        const std::string key = "tls-k";
-        const std::string value = "tls-v";
+        const std::string key = "secure-k";
+        const std::string value = "secure-v";
         server->shipEntry(2, ReplOpType::PUT, bytesOf(key), bytesOf(value), 4, 1);
+
+        for (int i = 0; i < 50 && applied.load() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        AKK_TEST_CHECK(applied.load() == 1);
+
+        client->close();
+        server->close();
+    }
+
+    void testPinnedSecureReplication() {
+        const auto dir = makeTempDir("securePinned");
+        constexpr uint16_t port = 19973;
+        const auto serverSeed = dir / "server.identity";
+        const auto clientSeed = dir / "client.identity";
+        const auto serverIdentity = akkaradb::crypto::IdentityStore{serverSeed}.loadOrCreate();
+        const auto clientIdentity = akkaradb::crypto::IdentityStore{clientSeed}.loadOrCreate();
+
+        ClusterRuntimeOptions serverOptions{};
+        serverOptions.secure.identitySeedPath = serverSeed;
+        serverOptions.secure.pinnedPeers.push_back(ClusterPeerPublicKeyPin{.nodeId = 2, .publicKey = clientIdentity.publicKey});
+
+        ClusterRuntimeOptions clientOptions{};
+        clientOptions.secure.identitySeedPath = clientSeed;
+        clientOptions.secure.expectedPrimaryNodeId = 1;
+        clientOptions.secure.pinnedPeers.push_back(ClusterPeerPublicKeyPin{.nodeId = 1, .publicKey = serverIdentity.publicKey});
+
+        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
+        auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, serverOptions);
+        std::atomic<int> applied{0};
+
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, clientOptions);
+        client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
+            AKK_TEST_CHECK(seq == 3);
+            AKK_TEST_CHECK(op == ReplOpType::PUT);
+            AKK_TEST_CHECK(source == 1);
+            AKK_TEST_CHECK(flags == 5);
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(key.data()), key.size()) == "pin-k");
+            AKK_TEST_CHECK(std::string(reinterpret_cast<const char*>(value.data()), value.size()) == "pin-v");
+            ++applied;
+        });
+
+        server->start();
+        client->start();
+
+        for (int i = 0; i < 50 && server->replicaCount() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        AKK_TEST_CHECK(server->replicaCount() == 1);
+
+        const std::string key = "pin-k";
+        const std::string value = "pin-v";
+        server->shipEntry(3, ReplOpType::PUT, bytesOf(key), bytesOf(value), 5, 1);
 
         for (int i = 0; i < 50 && applied.load() == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -394,6 +448,7 @@ int main() {
     testManagerElection();
     testPlainReplication();
     testTransportDefault();
+    testPinnedSecureReplication();
     testPlainTransportRejectsWanHosts();
     testRuntimeRejectsStripeUntilRoutingExists();
     std::printf("cluster smoke test passed\n");

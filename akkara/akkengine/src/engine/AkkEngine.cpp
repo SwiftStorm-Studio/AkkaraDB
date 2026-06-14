@@ -22,9 +22,9 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/blob/BlobFraming.hpp"
-#include "akk/engine/cluster/ClusterRuntime.hpp"
+#include "akk/engine/cluster/ClusterRuntimeProvider.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
-#include "akk/engine/server/AkkApiServer.hpp"
+#include "akk/engine/server/AkkApiServerProvider.hpp"
 #include "akk/engine/wal/WalRecovery.hpp"
 
 #include <algorithm>
@@ -85,9 +85,9 @@ namespace akkaradb::engine {
         }
 
         [[nodiscard]] int compareKey(std::span<const uint8_t> a, std::span<const uint8_t> b) {
-            const int cmp = std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end())
+            const int cmp = std::ranges::lexicographical_compare(a, b)
                                 ? -1
-                                : std::lexicographical_compare(b.begin(), b.end(), a.begin(), a.end())
+                                : std::ranges::lexicographical_compare(b, a)
                                 ? 1
                                 : 0;
             return cmp;
@@ -168,8 +168,8 @@ namespace akkaradb::engine {
             std::unique_ptr<wal::WalWriter> walWriter;
             std::unique_ptr<blob::BlobManager> blobManager;
             std::unique_ptr<vlog::VersionLog> versionLog;
-            std::unique_ptr<cluster::ClusterRuntime> clusterRuntime;
-            std::unique_ptr<server::AkkApiServer> apiServer;
+            std::unique_ptr<cluster::IClusterRuntime> clusterRuntime;
+            std::unique_ptr<server::IAkkApiServer> apiServer;
 
             mutable std::mutex writeMu;
             std::atomic<uint64_t> putsTotal{0};
@@ -194,17 +194,17 @@ namespace akkaradb::engine {
                 blobManager->write(seq, value);
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
                 blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
-                flags |= core::MemHdr16::FLAG_BLOB;
+                flags |= MemHdr16::FLAG_BLOB;
                 if (clusterRuntime) { clusterRuntime->shipBlob(seq, seq, value); }
                 return ref;
             }
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> resolveValue(uint8_t flags, std::span<const uint8_t> value) const {
-                if ((flags & core::MemHdr16::FLAG_BLOB) == 0) { return std::vector<uint8_t>{value.begin(), value.end()}; }
+                if ((flags & MemHdr16::FLAG_BLOB) == 0) { return std::vector<uint8_t>{value.begin(), value.end()}; }
                 if (!blobManager || value.size() < blob::BLOB_REF_SIZE) { return std::nullopt; }
-                const blob::BlobRef ref = blob::decodeBlobRef(value.data());
-                auto out = blobManager->read(ref.blobId, ref.contentCrc32c);
-                if (out.empty() && ref.totalSize != 0) { return std::nullopt; }
+                const auto [blobId, totalSize, contentCrc32c] = blob::decodeBlobRef(value.data());
+                auto out = blobManager->read(blobId, contentCrc32c);
+                if (out.empty() && totalSize != 0) { return std::nullopt; }
                 return out;
             }
 
@@ -222,7 +222,7 @@ namespace akkaradb::engine {
                 if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64); }
                 if (versionLog) { versionLog->append(key, seq, sourceNodeId, nowNs(), flags, storedValue); }
 
-                if ((flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
+                if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
             }
 
@@ -236,7 +236,7 @@ namespace akkaradb::engine {
             ) {
                 std::lock_guard lock(writeMu);
                 uint8_t flags = recordFlags;
-                if (op == cluster::ReplOpType::REMOVE) { flags |= core::MemHdr16::FLAG_TOMBSTONE; }
+                if (op == cluster::ReplOpType::REMOVE) { flags |= MemHdr16::FLAG_TOMBSTONE; }
                 appendAll(seq, key, value, flags, sourceNodeId);
                 memtable->advanceSeq(seq);
             }
@@ -344,7 +344,12 @@ namespace akkaradb::engine {
                 if (impl.blobManager) { impl.blobManager->write(blobId, content); }
             };
 
-            impl.clusterRuntime = cluster::ClusterRuntime::create(
+            if (!cluster::clusterRuntimeFactoryAvailable() && !cluster::loadClusterRuntimeBackend(impl.opts.cluster.runtimeBackendPath)) {
+                throw std::runtime_error(
+                    "AkkEngine: cluster component is enabled, but the cluster runtime backend library is not available"
+                );
+            }
+            impl.clusterRuntime = cluster::createClusterRuntime(
                 impl.opts.paths.dataDir,
                 std::move(cfg),
                 impl.nodeId,
@@ -355,7 +360,10 @@ namespace akkaradb::engine {
         }
 
         if (impl.opts.components.apiEnabled) {
-            impl.apiServer = server::AkkApiServer::create(*engine, impl.opts.api);
+            if (!server::akkApiServerFactoryAvailable() && !server::loadAkkApiServerBackend(impl.opts.api.serverBackendPath)) {
+                throw std::runtime_error("AkkEngine: API server component is enabled, but the API server backend library is not available");
+            }
+            impl.apiServer = server::createAkkApiServer(*engine, impl.opts.api);
             impl.apiServer->start();
         }
 
@@ -366,14 +374,14 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
 
         uint64_t seq = 0;
-        uint8_t flags = core::MemHdr16::FLAG_NORMAL;
+        uint8_t flags = MemHdr16::FLAG_NORMAL;
         std::vector<uint8_t> stored;
         {
             std::lock_guard lock(impl_->writeMu);
             seq = impl_->memtable->reserveSeq(1);
             stored = impl_->maybeExternalize(seq, value, flags);
             impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-            if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+            if ((flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
             impl_->appendAll(seq, key, stored, flags, impl_->nodeId);
         }
         if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::PUT, key, stored, flags, impl_->nodeId); }
@@ -383,14 +391,14 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
 
         uint64_t seq = 0;
-        uint8_t flags = core::MemHdr16::FLAG_NORMAL;
+        uint8_t flags = MemHdr16::FLAG_NORMAL;
         std::vector<uint8_t> stored;
         {
             std::lock_guard lock(impl_->writeMu);
             seq = impl_->memtable->reserveSeq(1);
             stored = impl_->maybeExternalize(seq, value, flags);
             impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-            if ((flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+            if ((flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
             impl_->appendAll(seq, key, stored, flags, impl_->nodeId, fp64, miniKey);
         }
         if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::PUT, key, stored, flags, impl_->nodeId); }
@@ -414,13 +422,13 @@ namespace akkaradb::engine {
             std::lock_guard lock(impl_->writeMu);
             const uint64_t baseSeq = impl_->memtable->reserveSeq(entries.size());
             for (size_t i = 0; i < entries.size(); ++i) {
-                const BatchPutEntry& entry = entries[i];
+                const auto& [key, value] = entries[i];
                 PendingShip item;
                 item.seq = baseSeq + i;
-                item.key = entry.key;
-                item.stored = impl_->maybeExternalize(item.seq, entry.value, item.flags);
+                item.key = key;
+                item.stored = impl_->maybeExternalize(item.seq, value, item.flags);
                 impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-                if ((item.flags & core::MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                if ((item.flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                 impl_->appendAll(item.seq, item.key, item.stored, item.flags, impl_->nodeId);
                 pending.push_back(std::move(item));
             }
@@ -437,7 +445,7 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
 
         uint64_t seq = 0;
-        constexpr uint8_t flags = core::MemHdr16::FLAG_TOMBSTONE;
+        constexpr uint8_t flags = MemHdr16::FLAG_TOMBSTONE;
         {
             std::lock_guard lock(impl_->writeMu);
             seq = impl_->memtable->reserveSeq(1);
@@ -451,7 +459,7 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
 
         uint64_t seq = 0;
-        constexpr uint8_t flags = core::MemHdr16::FLAG_TOMBSTONE;
+        constexpr uint8_t flags = MemHdr16::FLAG_TOMBSTONE;
         {
             std::lock_guard lock(impl_->writeMu);
             seq = impl_->memtable->reserveSeq(1);
@@ -466,7 +474,7 @@ namespace akkaradb::engine {
         impl_->getsTotal.fetch_add(1, std::memory_order_relaxed);
         const uint64_t seq = impl_->snapshotSeq();
 
-        core::RecordView view;
+        RecordView view;
         if (impl_->memtable->get(key, seq, &view)) {
             if (view.isTombstone()) {
                 impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
@@ -569,7 +577,7 @@ namespace akkaradb::engine {
 
         impl_->getsTotal.fetch_add(1, std::memory_order_relaxed);
         const uint64_t seq = impl_->snapshotSeq();
-        core::RecordView view;
+        RecordView view;
         if (impl_->memtable->get(key, seq, &view)) {
             if (view.isTombstone()) {
                 impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);

@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/sstable/SSTWriter.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -28,7 +30,7 @@
 #include "akk/engine/sstable/SSTFormat.hpp"
 
 namespace akkaradb::engine::sst {
-    class SSTWriter {
+    class AKDB_API SSTWriter {
         public:
             enum class Codec : uint8_t {
                 NONE = 0, ZSTD = 1,

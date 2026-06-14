@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <span>
 
+#include "akkaradb/Export.hpp"
+
 namespace akkaradb::engine::blob {
     enum class BlobCodec : uint32_t {
         NONE = 0, ZSTD = 1,
@@ -36,14 +38,14 @@ namespace akkaradb::engine::blob {
     inline constexpr uint16_t AKBLOB_HEADER_SIZE_V5 = 48;
     inline constexpr uint32_t AKBLOB_FLAG_ZSTD = 0x00000001u;
 
-    struct BlobRef {
+    struct AKDB_API BlobRef {
         uint64_t blobId = 0;
         uint64_t totalSize = 0;
         uint32_t contentCrc32c = 0;
     };
 
     #pragma pack(push, 1)
-    struct AkBlobHeaderV5 {
+    struct AKDB_API AkBlobHeaderV5 {
         uint32_t magic = AKBLOB_MAGIC_V5;
         uint16_t version = AKBLOB_VERSION_V5;
         uint16_t headerSize = AKBLOB_HEADER_SIZE_V5;
@@ -59,10 +61,10 @@ namespace akkaradb::engine::blob {
 
     static_assert(sizeof(AkBlobHeaderV5) == AKBLOB_HEADER_SIZE_V5);
 
-    void encodeBlobRef(uint8_t* out, BlobRef ref) noexcept;
-    [[nodiscard]] BlobRef decodeBlobRef(const uint8_t* data) noexcept;
+    AKDB_API void encodeBlobRef(uint8_t* out, BlobRef ref) noexcept;
+    [[nodiscard]] AKDB_API BlobRef decodeBlobRef(const uint8_t* data) noexcept;
 
-    [[nodiscard]] AkBlobHeaderV5 buildBlobHeader(
+    [[nodiscard]] AKDB_API AkBlobHeaderV5 buildBlobHeader(
         uint64_t blobId,
         uint64_t totalSize,
         uint64_t storedSize,
@@ -70,9 +72,9 @@ namespace akkaradb::engine::blob {
         uint32_t contentCrc32c
     ) noexcept;
 
-    void serializeBlobHeader(const AkBlobHeaderV5& header, uint8_t out[AKBLOB_HEADER_SIZE_V5]) noexcept;
-    [[nodiscard]] AkBlobHeaderV5 deserializeBlobHeader(const uint8_t in[AKBLOB_HEADER_SIZE_V5]) noexcept;
-    [[nodiscard]] bool verifyBlobHeader(const AkBlobHeaderV5& header) noexcept;
+    AKDB_API void serializeBlobHeader(const AkBlobHeaderV5& header, uint8_t out[AKBLOB_HEADER_SIZE_V5]) noexcept;
+    [[nodiscard]] AKDB_API AkBlobHeaderV5 deserializeBlobHeader(const uint8_t in[AKBLOB_HEADER_SIZE_V5]) noexcept;
+    [[nodiscard]] AKDB_API bool verifyBlobHeader(const AkBlobHeaderV5& header) noexcept;
 
-    [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> bytes) noexcept;
+    [[nodiscard]] AKDB_API uint32_t crc32c(std::span<const uint8_t> bytes) noexcept;
 } // namespace akkaradb::engine::blob

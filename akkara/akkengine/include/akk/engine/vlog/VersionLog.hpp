@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/vlog/VersionLog.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -34,12 +36,12 @@ namespace akkaradb::engine::vlog {
         SYNC = 0, ASYNC = 1,
     };
 
-    struct VersionLogOptions {
+    struct AKDB_API VersionLogOptions {
         std::filesystem::path logPath;
         VLogSyncMode syncMode = VLogSyncMode::ASYNC;
     };
 
-    struct VersionEntry {
+    struct AKDB_API VersionEntry {
         uint64_t seq = 0;
         uint64_t sourceNodeId = 0;
         uint64_t timestampNs = 0;
@@ -47,7 +49,7 @@ namespace akkaradb::engine::vlog {
         std::vector<uint8_t> value;
     };
 
-    class VersionLog {
+    class AKDB_API VersionLog {
         public:
             [[nodiscard]] static std::unique_ptr<VersionLog> create(VersionLogOptions opts);
 
@@ -77,7 +79,7 @@ namespace akkaradb::engine::vlog {
             void close();
 
         private:
-            VersionLog() = default;
+            VersionLog();
 
             class Impl;
             std::unique_ptr<Impl> impl_;

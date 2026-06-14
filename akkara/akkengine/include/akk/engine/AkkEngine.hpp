@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/AkkEngine.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include "akkaradb/Stats.hpp"
 #include "akk/engine/blob/BlobManager.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
@@ -44,7 +46,7 @@ namespace akkaradb::engine {
         NONE = 0, ZSTD = 1,
     };
 
-    struct AkkEngineOptions {
+    struct AKDB_API AkkEngineOptions {
         struct Paths {
             std::filesystem::path dataDir;
             std::filesystem::path walDir;
@@ -72,15 +74,20 @@ namespace akkaradb::engine {
 
         struct ClusterOptions {
             std::optional<cluster::ClusterConfig> config;
+            std::filesystem::path runtimeBackendPath;
             cluster::ClusterRuntimeOptions runtime;
         } cluster;
 
         enum class ApiBackend : uint8_t {
-            HTTP = 0, TCP = 1,
+            HTTP = 0, TCP = 1, GRPC = 2,
         };
 
         enum class ApiIoBackend : uint8_t {
             AUTO = 0, THREAD_POOL = 1,
+        };
+
+        enum class ApiTransportMode : uint8_t {
+            TLS = 0, PLAIN = 1,
         };
 
         struct ApiTlsOptions {
@@ -94,9 +101,28 @@ namespace akkaradb::engine {
 
         struct ApiOptions {
             std::vector<ApiBackend> backends;
+            std::filesystem::path serverBackendPath;
+            std::filesystem::path transportBackendPath;
+            std::filesystem::path httpBackendPath;
+            std::filesystem::path tcpBackendPath;
+            std::filesystem::path grpcBackendPath;
             std::string bindHost;
             uint16_t httpPort = 7070;
+            uint32_t httpMaxBatchItems = 4096;
+            uint32_t httpMaxScanItems = 4096;
+            uint32_t httpMaxHistoryEntries = 4096;
+            uint64_t httpMaxContentLength = 64ULL * 1024ULL * 1024ULL;
             uint16_t tcpPort = 7071;
+            uint16_t grpcPort = 7072;
+            uint32_t grpcWorkerThreads = 0;
+            uint32_t grpcCompletionQueues = 0;
+            uint32_t grpcMinPollers = 0;
+            uint32_t grpcMaxPollers = 0;
+            uint32_t grpcMaxConcurrentStreams = 0;
+            uint64_t grpcResourceQuotaBytes = 0;
+            uint32_t grpcMaxBatchItems = 4096;
+            uint32_t grpcMaxScanItems = 4096;
+            uint32_t grpcMaxHistoryEntries = 4096;
             ApiIoBackend tcpIoBackend = ApiIoBackend::AUTO;
             uint32_t tcpWorkerThreads = 0;
             uint32_t tcpAcceptQueueLimit = 4096;
@@ -111,7 +137,7 @@ namespace akkaradb::engine {
             uint32_t tcpWriteTimeoutMs = 30000;
             bool tcpNoDelay = true;
             bool tcpKeepAlive = true;
-            cluster::TransportMode transportMode = cluster::TransportMode::TLS;
+            ApiTransportMode transportMode = ApiTransportMode::TLS;
             ApiTlsOptions tls;
         } api;
 
@@ -132,7 +158,7 @@ namespace akkaradb::engine {
         vlog::VersionLogOptions vlog;
     };
 
-    class AkkEngine {
+    class AKDB_API AkkEngine {
         public:
             struct ScanRecordView {
                 std::span<const uint8_t> key;

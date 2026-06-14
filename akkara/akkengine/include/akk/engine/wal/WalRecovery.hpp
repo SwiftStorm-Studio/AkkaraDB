@@ -19,6 +19,8 @@
 // akkengine/include/akk/engine/wal/WalRecovery.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -31,13 +33,13 @@ namespace akkaradb::engine::memtable {
 }
 
 namespace akkaradb::engine::wal {
-    struct WalRecoveryOptions {
+    struct AKDB_API WalRecoveryOptions {
         std::filesystem::path walDir;
         uint64_t checkpointSeq = 0;
         size_t maxEntryBytes = 64ULL * 1024ULL * 1024ULL;
     };
 
-    struct WalRecoveredEntry {
+    struct AKDB_API WalRecoveredEntry {
         std::vector<uint8_t> key;
         std::vector<uint8_t> value;
         uint64_t seq = 0;
@@ -47,7 +49,7 @@ namespace akkaradb::engine::wal {
         uint64_t segmentId = 0;
     };
 
-    struct WalRecoveryResult {
+    struct AKDB_API WalRecoveryResult {
         uint64_t segmentsSeen = 0;
         uint64_t segmentsReplayed = 0;
         uint64_t corruptSegments = 0;
@@ -56,7 +58,7 @@ namespace akkaradb::engine::wal {
         uint64_t maxSeq = 0;
     };
 
-    class WalRecovery {
+    class AKDB_API WalRecovery {
         public:
             using Callback = std::function<void(const WalRecoveredEntry&)>;
 
