@@ -1,39 +1,35 @@
-# AkkaraDB Native API 使い方
+# AkkaraDB Native API 使用方法
 
-このドキュメントは native C++ 側の低レベル API と高レベル API の使い分けをまとめたものです。
-
-低レベル API は `akkaradb::engine::AkkEngine` を直接使う byte-oriented な API です。キーと値を `std::span<const uint8_t>` として扱い、WAL、SST、Blob、VersionLog、scan、flush、sync などを細かく制御したい場合に向いています。
-
-高レベル API は `akkaradb::AkkaraDB` と `akkaradb::PackedTable` を使う typed table API です。C++ の struct を BinPack で保存し、primary key、secondary index、scan、query helper をテーブル単位で扱いたい場合に向いています。
+この文書は native C++ 側の主要 API の使い方を、現行コードに合わせてまとめたものです。低レベル API は `akkaradb::engine::AkkEngine` を直接使う byte-oriented な API で、キーと値を `std::span<const uint8_t>` として扱います。高レベル API は `akkaradb::AkkaraDB` と `akkaradb::PackedTable` を使う typed table API で、C++ aggregate を BinPack で保存し、primary key、secondary index、query、join、`Ref<T>` を扱えます。
 
 ## ビルドと include
 
 インストール済みの AkkaraDB を使う場合は CMake target を link します。
 
 ```cmake
-find_package(AkkaraDB REQUIRED)
+find_package(AkkaraDB CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE AkkaraDB::akkaradb)
 target_compile_features(my_app PRIVATE cxx_std_23)
 ```
 
-高レベル API だけを使う場合は、通常は次の include で足ります。
+高レベル API は通常この include だけで使えます。
 
 ```cpp
 #include <akkaradb/AkkaraDB.hpp>
 ```
 
-低レベル API を直接使う場合は engine header を include します。
+低レベル engine を直接使う場合は次の header を include します。
 
 ```cpp
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 ```
 
 ## 低レベル API
 
-`AkkEngine` は raw key/value API です。キーや値の schema を engine は解釈しないため、呼び出し側が byte layout、prefix 設計、serialize / deserialize を管理します。
+`AkkEngine` は raw key/value API です。schema や typed entity は解釈せず、呼び出し側が key layout と serialize / deserialize を管理します。
 
 ```cpp
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 
 #include <cstdint>
 #include <span>
@@ -51,59 +47,49 @@ std::span<const uint8_t> bytes(std::string_view value) {
     };
 }
 
-std::string text(std::span<const uint8_t> value) {
-    return {
-        reinterpret_cast<const char*>(value.data()),
-        value.size()
-    };
-}
-
 int main() {
     engine::AkkEngineOptions opts;
-    opts.paths.data_dir = "data";
-    opts.components.version_log_enabled = true;
-    opts.wal.sync_mode = engine::wal::WalSyncMode::Async;
-    opts.blob.threshold_bytes = 32 * 1024;
-    opts.runtime.sst_promote_reads = true;
+    opts.paths.dataDir = "data";
+    opts.components.versionLogEnabled = true;
+    opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+    opts.blob.thresholdBytes = 32 * 1024;
+    opts.runtime.sstPromoteReads = true;
 
     auto db = engine::AkkEngine::open(std::move(opts));
 
     db->put(bytes("user:1"), bytes("Alice"));
     db->put(bytes("user:2"), bytes("Bob"));
 
-    if (auto value = db->get(bytes("user:1"))) {
-        auto name = std::string{
-            reinterpret_cast<const char*>(value->data()),
-            value->size()
-        };
-        (void)name;
-    }
+    auto value = db->get(bytes("user:1"));
 
     std::vector<uint8_t> out;
-    if (db->get_into(bytes("user:2"), out)) {
-        auto name = std::string{
-            reinterpret_cast<const char*>(out.data()),
-            out.size()
-        };
-        (void)name;
-    }
+    bool found = db->getInto(bytes("user:2"), out);
 
-    const bool exists = db->exists(bytes("user:1"));
-    const size_t count = db->count(bytes("user:"), bytes("user;"));
-    (void)exists;
-    (void)count;
+    bool exists = db->exists(bytes("user:1"));
+    size_t count = db->count(bytes("user:"), bytes("user;"));
 
     db->remove(bytes("user:1"));
-    db->force_sync();
+    db->forceSync();
     db->close();
+
+    (void)value;
+    (void)found;
+    (void)exists;
+    (void)count;
 }
 ```
 
-`get()` は `std::optional<std::vector<uint8_t>>` を返します。hot path で一時 allocation を抑えたい場合は、呼び出し側の `std::vector<uint8_t>` に書き込む `get_into()` を使います。さらに arena 管理の読み取りが必要な場合は `get_into_arena()` も使えます。
+`get()` は `std::optional<std::vector<uint8_t>>` を返します。hot path で allocation を抑えたい場合は呼び出し側の `std::vector<uint8_t>` を再利用する `getInto()`、arena lifetime の view として読みたい場合は `getIntoArena()` を使います。
 
-### scan
+```cpp
+akkaradb::core::BufferArena arena;
+std::span<const uint8_t> view;
+if (db->getIntoArena(bytes("user:2"), arena, view)) {
+    std::vector<uint8_t> owned{view.begin(), view.end()};
+}
+```
 
-`scan()` は caller-owned な `BufferArena` を受け取り、`ArenaGenerator<ScanRecordView>` を返します。返される key/value view は arena に依存するため、scan 中は arena を生かしておきます。
+range scan は caller-owned の `BufferArena` を受け取り、`ArenaGenerator<ScanRecordView>` を返します。返される key/value view は arena の lifetime 中だけ有効です。
 
 ```cpp
 akkaradb::core::BufferArena arena;
@@ -112,34 +98,12 @@ auto rows = db->scan(arena, bytes("user:"), bytes("user;"));
 for (auto it = rows.begin(); !(it == rows.end()); ++it) {
     std::span<const uint8_t> key = it->key;
     std::span<const uint8_t> value = it->value;
+    (void)key;
+    (void)value;
 }
 ```
 
-scan から返る `key` と `value` は non-owning view です。arena の `reset()`、`clear()`、destruction の後には参照できません。scan 結果を arena の lifetime より長く保持したい場合は、返却直後に own 化します。
-
-AkkaraDB の native buffer として保持する場合は、`BufferView::to_owned()` で `OwnedBuffer` に deep copy する方法を強く推奨します。`OwnedBuffer` は move-only の所有型で、view の lifetime を arena から切り離せるため、API 境界を越えて値を保持する用途に向いています。
-
-```cpp
-#include "core/buffer/BufferView.hpp"
-#include "core/buffer/OwnedBuffer.hpp"
-
-auto value_bytes = std::as_bytes(row.value);
-akkaradb::core::BufferView value_view{value_bytes};
-akkaradb::core::OwnedBuffer owned_value = value_view.to_owned();
-```
-
-アプリケーション側で `std::vector<uint8_t>` を標準の所有型として使っている場合は、vector への copy でも問題ありません。
-
-```cpp
-std::vector<uint8_t> owned_key{row.key.begin(), row.key.end()};
-std::vector<uint8_t> owned_value{row.value.begin(), row.value.end()};
-```
-
-`start_key` と `end_key` は半開区間として扱う設計です。prefix scan をしたい場合は、次の prefix に相当する end key を呼び出し側で渡します。上の例では `"user:"` から `"user;"` までを scan しています。
-
-### version history
-
-`components.version_log_enabled` を有効にすると、per-key history、point-in-time read、rollback が使えます。
+VersionLog を有効にすると、履歴、point-in-time read、rollback が使えます。
 
 ```cpp
 db->put(bytes("profile:1"), bytes("v1"));
@@ -147,42 +111,23 @@ db->put(bytes("profile:1"), bytes("v2"));
 
 auto history = db->history(bytes("profile:1"));
 if (!history.empty()) {
-    auto old_value = db->get_at(bytes("profile:1"), history.front().seq);
-    db->rollback_key(bytes("profile:1"), history.front().seq);
+    auto oldValue = db->getAt(bytes("profile:1"), history.front().seq);
+    db->rollbackKey(bytes("profile:1"), history.front().seq);
+    (void)oldValue;
 }
 ```
 
-`rollback_to()` は engine 全体を指定 sequence に戻す操作です。対象範囲が広いため、運用コードでは実行タイミングと durability 設定を明確にしてから使います。
-
-### low-level API の主な操作
-
-| 操作 | API | 用途 |
-|---|---|---|
-| write | `put(key, value)` | key/value を保存する |
-| write with hint | `put_hinted(key, value, fp64, mini_key)` | 呼び出し側が fingerprint を持っている hot path 用 |
-| delete | `remove(key)` | key を削除する |
-| read | `get(key)` | optional vector として読む |
-| read into buffer | `get_into(key, out)` | 呼び出し側の vector を再利用して読む |
-| arena read | `get_into_arena(key, arena, out)` | arena lifetime に紐づく view として読む |
-| exists | `exists(key)` | key の存在確認 |
-| count | `count(start, end)` | 範囲内の件数を数える |
-| scan | `scan(arena, start, end)` | 範囲内の key/value を順に読む |
-| stats | `stats()` | engine、WAL、MemTable、SST、Blob の統計を見る |
-| flush | `force_flush()` | MemTable を SST 側へ flush する |
-| sync | `force_sync()` | 永続化の同期を明示する |
-| close | `close()` | engine を閉じる |
+主な低レベル API は `put`、`putHinted`、`putBatch`、`remove`、`removeHinted`、`get`、`getBatch`、`exists`、`getInto`、`getIntoArena`、`count`、`scan`、`getAt`、`history`、`rollbackTo`、`rollbackKey`、`stats`、`forceSync`、`forceFlush`、`close` です。
 
 ## 高レベル API
 
-`AkkaraDB` は `AkkEngine` の上に typed table を作る薄い facade です。`PackedTable<&T::id>` は entity を BinPack で serialize し、table name ごとに primary key namespace を分けます。
+`AkkaraDB` は `AkkEngine` の上に typed table を作る facade です。`PackedTable<&T::id>` は entity を BinPack で serialize し、table name ごとに primary key namespace を分けます。
 
 ```cpp
 #include <akkaradb/AkkaraDB.hpp>
 
 #include <cstdint>
 #include <string>
-#include <utility>
-#include <vector>
 
 struct User {
     uint64_t id;
@@ -201,10 +146,9 @@ int main() {
     users.put({2, "bob@example.test", "Bob", 25});
 
     auto alice = users.get(1);
-    (void)alice;
 
     User bob{};
-    if (users.get_into(2, bob)) {
+    if (users.getInto(2, bob)) {
         bob.age = 26;
     }
 
@@ -213,61 +157,68 @@ int main() {
         user.age = 26;
     });
 
-    const bool exists = users.exists(1);
-    const size_t rows = users.count();
-    (void)exists;
-    (void)rows;
+    bool exists = users.exists(1);
+    size_t rows = users.count();
 
     users.remove(1);
     db->close();
+
+    (void)alice;
+    (void)exists;
+    (void)rows;
 }
 ```
 
-primary key は `table<&User::id>("users")` のように member pointer で指定します。`PackedTable` は保存時に entity から primary key を取り出すため、`put()` に渡す entity の primary key field は有効な値を持っている必要があります。
+`AKKARADB_QUERYABLE(Type, A, B, C, D)` は query proxy を作る macro です。現行 macro は 4 field 分を受け取ります。`AKKARADB_ENTITY(Type, PrimaryKey, B, C, D)` は `AKKARADB_QUERYABLE` に加えて `Ref<T>` 用の `RefTraits<T>` も定義します。
 
-### secondary index
+## secondary index
 
-`index<&T::field>()` は index handle を返します。`indexed<&T::field>()` は table に index を登録したうえで同じ table を返すため、chain したい場合に使えます。
+`index<&T::field>()` は index handle を返し、`indexed<&T::field>()` は table に index を登録して同じ table を返します。index は non-unique なので、同じ field value を持つ entity が複数あれば `find()` は複数行を返します。
 
 ```cpp
 auto users = db->table<&User::id>("users");
-auto by_email = users.index<&User::email>();
-auto by_age = users.index<&User::age>();
+auto byEmail = users.index<&User::email>();
+users.indexed<&User::age>();
 
 users.put({1, "alice@example.test", "Alice", 30});
 users.put({2, "bob@example.test", "Bob", 30});
 
-auto found = users.find_by<&User::email>(std::string{"alice@example.test"});
+auto first = users.findBy<&User::email>(std::string{"alice@example.test"});
 
-auto age30 = by_age.find(30U);
-while (age30.has_next()) {
+auto age30 = users.index<&User::age>().find(30U);
+while (age30.hasNext()) {
     auto entry = age30.next();
     uint64_t id = entry.id;
     User user = entry.value;
     (void)id;
     (void)user;
 }
+
+(void)byEmail;
+(void)first;
 ```
 
-index は non-unique です。同じ field value を持つ entity が複数ある場合、`find()` は複数行を返します。`find_by()` は登録済み index を使って最初の一致を返します。
+indexed field の保存形式は query range に使えるよう調整されています。整数と浮動小数は bytewise order が値の順序に合う sortable encoding を使い、それ以外は BinPack encoding を使います。
 
-### scan と query helper
+## scan と query helper
 
 table scan は table namespace の中だけを対象にします。
 
 ```cpp
-auto all = users.scan_all();
-while (all.has_next()) {
+auto all = users.scanAll();
+while (all.hasNext()) {
     auto entry = all.next();
+    (void)entry;
 }
 
 auto range = users.scan(10ULL, 100ULL);
-while (range.has_next()) {
+while (range.hasNext()) {
     auto entry = range.next();
+    (void)entry;
 }
 ```
 
-query helper は predicate を受け取り、`first()`、`any()`、`count()`、`limit()`、`to_vector()` で結果を扱えます。
+query helper は predicate を受け取り、`first()`、`any()`、`count()`、`limit()`、`toVector()` で結果を扱えます。
 
 ```cpp
 auto adults = users
@@ -275,58 +226,141 @@ auto adults = users
         return user.age >= 18;
     })
     .limit(100)
-    .to_vector();
+    .toVector();
 
 auto bob = users
-    .query([](auto user) {
+    .query()
+    .where([](auto user) {
         return user.email == "bob@example.test";
     })
     .first();
 
-const bool has_senior = users
+bool hasSenior = users
     .query([](auto user) {
         return user.age > 65;
     })
     .any();
 ```
 
-`AKKARADB_QUERYABLE(User, id, email, name, age)` を定義しておくと、query predicate の中で field expression を使えます。`==`、`!=`、`>`、`>=`、`<`、`<=`、`&&`、`||`、`in()`、`not_in()`、`starts_with()`、`contains()`、`like()` が用意されています。
+predicate では `==`、`!=`、`>`、`>=`、`<`、`<=`、`&&`、`||`、`!`、`in()`、`notIn()`、`startsWith()`、`contains()`、`like()`、`isNull()`、`isNotNull()` が使えます。
 
 ```cpp
 auto selected = users
     .query([](auto user) {
-        return user.email.starts_with("alice@") || user.age.in({30U, 31U});
+        return user.email.startsWith("alice@") || user.age.in({30U, 31U});
     })
-    .to_vector();
+    .toVector();
 ```
 
-登録済み index があり、predicate が index に変換できる形の場合は index scan が使われます。それ以外の場合は table scan に fallback し、predicate を C++ 側で評価します。
+`std::optional<T>` は null 判定に使えます。ネストした aggregate field は `.field<&Nested::member>()`、map は `.mapGet(key)` または `.get(key)` で参照します。
+
+```cpp
+struct Profile {
+    uint64_t id;
+    std::string email;
+    std::string name;
+    std::optional<uint32_t> age;
+};
+
+AKKARADB_QUERYABLE(Profile, id, email, name, age)
+
+auto missingAge = profiles.query([](auto profile) {
+    return profile.age.isNull();
+}).toVector();
+```
+
+登録済み index があり、predicate が index source に変換できる形なら、query planner は index scan を使ってから C++ 側で残りの predicate を評価します。対応しない形は table scan に fallback します。
+
+## Ref、Schema、foreign key、join
+
+`Ref<T>` は参照先の primary key だけを保存し、binding が attached されていれば dereference 時に lazily resolve します。
+
+```cpp
+struct Author {
+    uint64_t id;
+    std::string name;
+    uint32_t age;
+    std::string email;
+};
+
+AKKARADB_ENTITY(Author, id, name, age, email);
+
+struct Post {
+    uint64_t id;
+    akkaradb::Ref<Author> author;
+    std::string body;
+    uint32_t likes;
+    std::string title;
+};
+
+AKKARADB_ENTITY(Post, id, author, body, likes);
+
+auto schema = db->schema()
+    .table<&Author::id>("authors")
+    .table<&Post::id>("posts")
+    .foreignKey<&Post::author>()
+    .open();
+
+auto& authors = schema.table<Author>();
+auto& posts = schema.table<Post>();
+
+authors.put({1, "Alice", 30, "alice@example.test"});
+posts.put({100, akkaradb::ref<Author>(1), "hello", 5, "first"});
+
+auto post = posts.get(100);
+std::string authorName = post->author->name;
+
+auto joined = posts
+    .join<&Post::author>(authors)
+    .where([](const Post& post, const Author& author) {
+        return post.likes > 0 && author.name == "Alice";
+    })
+    .toVector();
+```
+
+`foreignKey<&Post::author>()` は保存前に参照先の存在を検証します。schema helper の `foreignKey` は現在 `OnDelete::Cascade` を使うため、参照先を削除すると参照元も cascade delete されます。schema を使わずに table 同士を手動で結びたい場合は `bindRef<&Post::author>(authors)`、cascade だけを手動登録したい場合は `cascadeDeleteFrom<&Post::author>(posts)` を使えます。
+
+`join` は `Ref<T>` だけでなく、比較可能な field 同士にも使えます。
+
+```cpp
+struct PlainPost {
+    uint64_t id;
+    uint64_t authorId;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_QUERYABLE(PlainPost, id, authorId, body, likes)
+
+auto plainPosts = db->table<&PlainPost::id>("plain_posts");
+auto joinedById = plainPosts.join<&PlainPost::authorId, &Author::id>(authors).toVector();
+```
 
 ## StartupMode と Options
 
-高レベル API では `StartupMode` でよく使う durability profile を選べます。
+高レベル API では `StartupMode` で durability profile を選びます。
 
 | Mode | WAL | close 時の flush/sync | version history | 主な用途 |
 |---|---|---|---|---|
-| `ULTRA_FAST` | Off | なし | Off | test、一時データ、in-memory cache |
+| `ULTRA_FAST` | Off | なし | Off | test、一時データ、cache |
 | `FAST` | Async | あり | Off | throughput 重視の ingestion |
 | `NORMAL` | Async | あり | Off | 通常用途 |
-| `DURABLE` | Sync | あり | On | 監査ログ、強い durability が必要な用途 |
+| `DURABLE` | Sync | あり | On | 強い durability や履歴が必要な用途 |
 
 細かい設定を変える場合は `AkkaraDB::Options` を使います。
 
 ```cpp
 akkaradb::AkkaraDB::Options opts;
-opts.data_dir = "data";
+opts.dataDir = "data";
 opts.mode = akkaradb::StartupMode::FAST;
-opts.overrides.memtable_threshold_per_shard = 128ULL << 20;
-opts.overrides.version_log_enabled = true;
-opts.overrides.sst_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_threshold_bytes = 32ULL * 1024ULL;
-opts.overrides.sst_promote_reads = true;
-opts.overrides.sst_bloom_bits_per_key = 10;
-opts.overrides.max_l0_sst_files = 8;
+opts.overrides.memtableThresholdPerShard = 128ULL << 20;
+opts.overrides.versionLogEnabled = true;
+opts.overrides.sstCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobThresholdBytes = 32ULL * 1024ULL;
+opts.overrides.sstPromoteReads = true;
+opts.overrides.sstBloomBitsPerKey = 10;
+opts.overrides.maxL0SstFiles = 8;
 
 auto db = akkaradb::AkkaraDB::open(std::move(opts));
 ```
@@ -335,16 +369,10 @@ auto db = akkaradb::AkkaraDB::open(std::move(opts));
 
 ```cpp
 akkaradb::engine::AkkEngineOptions opts;
-opts.components.wal_enabled = false;
-opts.components.blob_enabled = false;
-opts.components.manifest_enabled = false;
-opts.components.sst_enabled = false;
+opts.components.walEnabled = false;
+opts.components.blobEnabled = false;
+opts.components.manifestEnabled = false;
+opts.components.sstEnabled = false;
 
 auto db = akkaradb::engine::AkkEngine::open(std::move(opts));
 ```
-
-## 使い分け
-
-アプリケーションコードで型付き entity を扱うなら、まず高レベル API を使うのが自然です。table namespace、primary key encoding、BinPack serialization、secondary index の更新を API 側に寄せられるため、呼び出し側のコードが読みやすくなります。
-
-storage engine の挙動を直接検証したい場合、独自の binary key layout を使いたい場合、既存の protocol / JNI / server layer から byte列をそのまま流し込みたい場合は、低レベル API が向いています。低レベル API では schema と key design の責任が呼び出し側に残るため、prefix 設計と serialize format を先に固定しておくと運用しやすくなります。

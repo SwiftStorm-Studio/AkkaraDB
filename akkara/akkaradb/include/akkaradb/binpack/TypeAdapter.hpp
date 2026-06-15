@@ -19,6 +19,7 @@
 // akkaradb/include/akkaradb/binpack/TypeAdapter.hpp
 #pragma once
 
+#include "../Ref.hpp"
 #include "detail/WireHelpers.hpp"
 
 #include <array>
@@ -114,6 +115,29 @@ namespace akkaradb::binpack {
                 return total;
             }
             else { static_assert(detail::alwaysFalse<T>, "BinPack: no TypeAdapter for this type"); }
+        }
+    };
+
+    template <typename T>
+    struct TypeAdapter<akkaradb::Ref<T>> {
+        using Key = typename akkaradb::Ref<T>::Key;
+
+        template <typename Out>
+        static void write(const akkaradb::Ref<T>& v, Out& out) {
+            TypeAdapter<Key>::write(v.id(), out);
+        }
+
+        static akkaradb::Ref<T> read(std::span<const uint8_t>& in) {
+            return akkaradb::Ref<T>{TypeAdapter<Key>::read(in)};
+        }
+
+        static bool readInto(std::span<const uint8_t>& in, akkaradb::Ref<T>& out) {
+            out = read(in);
+            return true;
+        }
+
+        static size_t estimateSize(const akkaradb::Ref<T>& v) {
+            return TypeAdapter<Key>::estimateSize(v.id());
         }
     };
 

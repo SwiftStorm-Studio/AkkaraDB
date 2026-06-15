@@ -26,9 +26,39 @@
 #include <format>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <chrono>
+
+struct RefAuthor {
+    uint64_t id;
+    std::string name;
+    uint32_t age;
+    std::string email;
+};
+
+AKKARADB_ENTITY(RefAuthor, id, name, age, email);
+
+struct RefPost {
+    uint64_t id;
+    akkaradb::Ref<RefAuthor> author;
+    std::string body;
+    uint32_t likes;
+    std::string title;
+};
+
+AKKARADB_ENTITY(RefPost, id, author, body, likes);
+
+struct PlainPost {
+    uint64_t id;
+    uint64_t authorId;
+    uint32_t authorAge;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_QUERYABLE(PlainPost, id, authorId, authorAge, body);
 
 namespace {
     namespace fs = std::filesystem;
@@ -443,6 +473,80 @@ namespace {
         }).toVector();
         AKK_TEST_CHECK(highScores.size() == 2);
     }
+
+    void testRefLazyResolveAndCascadePut() {
+        using namespace akkaradb;
+        TempDir dir{"refLazyResolve"};
+        auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
+        auto schema = db->schema()
+            .table<&RefAuthor::id>("authors")
+            .table<&RefPost::id>("posts")
+            .foreignKey<&RefPost::author>()
+            .open();
+        auto& authors = schema.table<RefAuthor>();
+        auto& posts = schema.table<RefPost>();
+
+        authors.put({1, "Alice", 30, "alice@example.test"});
+        posts.put({100, ref<RefAuthor>(1), "hello", 5, "first"});
+
+        auto post = posts.get(100);
+        AKK_TEST_CHECK(post.has_value());
+        AKK_TEST_CHECK(post->author.id() == 1);
+        AKK_TEST_CHECK(post->author->name == "Alice");
+
+        auto joined = posts.join<&RefPost::author>(authors).toVector();
+        AKK_TEST_CHECK(joined.size() == 1);
+        AKK_TEST_CHECK(joined[0].left.value.id == 100);
+        AKK_TEST_CHECK(joined[0].right.name == "Alice");
+
+        auto joinedAlice = posts
+            .join<&RefPost::author>(authors)
+            .where([](const RefPost& joinedPost, const RefAuthor& author) {
+                return joinedPost.likes == 5 && author.name == "Alice";
+            })
+            .first();
+        AKK_TEST_CHECK(joinedAlice.has_value());
+        AKK_TEST_CHECK(joinedAlice->left.id == 100);
+
+        auto plainPosts = db->table<&PlainPost::id>("plain_posts");
+        plainPosts.put({200, 1, 30, "plain pk join", 7});
+        plainPosts.put({201, 404, 30, "plain field join", 2});
+
+        auto plainPkJoined = plainPosts.join<&PlainPost::authorId, &RefAuthor::id>(authors).toVector();
+        AKK_TEST_CHECK(plainPkJoined.size() == 1);
+        AKK_TEST_CHECK(plainPkJoined[0].left.value.id == 200);
+        AKK_TEST_CHECK(plainPkJoined[0].right.name == "Alice");
+
+        auto plainFieldJoined = plainPosts.join<&PlainPost::authorAge, &RefAuthor::age>(authors).toVector();
+        AKK_TEST_CHECK(plainFieldJoined.size() == 2);
+        AKK_TEST_CHECK(plainFieldJoined[0].right.name == "Alice");
+
+        post->author->name = "Alice Updated";
+        posts.put(*post);
+
+        auto updatedAuthor = authors.get(1);
+        AKK_TEST_CHECK(updatedAuthor.has_value());
+        AKK_TEST_CHECK(updatedAuthor->name == "Alice Updated");
+
+        posts.put({101, RefAuthor{2, "Bob", 40, "bob@example.test"}, "from value", 3, "second"});
+        auto bob = authors.get(2);
+        AKK_TEST_CHECK(bob.has_value());
+        AKK_TEST_CHECK(bob->name == "Bob");
+
+        authors.remove(2);
+        AKK_TEST_CHECK(!authors.exists(2));
+        AKK_TEST_CHECK(!posts.exists(101));
+
+        bool missingAuthorRejected = false;
+        try {
+            posts.put({102, ref<RefAuthor>(404), "missing", 1, "broken"});
+        }
+        catch (const std::runtime_error&) {
+            missingAuthorRejected = true;
+        }
+        AKK_TEST_CHECK(missingAuthorRejected);
+        AKK_TEST_CHECK(!posts.exists(102));
+    }
 } // namespace
 
 int main() {
@@ -457,5 +561,6 @@ int main() {
     testOptionalNullQueryHelpers();
     testNestedFieldQueryHelpers();
     testMapGetQueryHelpers();
+    testRefLazyResolveAndCascadePut();
     return 0;
 }

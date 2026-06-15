@@ -19,6 +19,8 @@
 // akkengine/include/akk/core/record/KeyFingerprint.hpp
 #pragma once
 
+#include "akkaradb/Export.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -35,7 +37,7 @@ namespace akkaradb::core {
      * @param keyLen Key length in bytes.
      * @return 64-bit key fingerprint.
      */
-    [[nodiscard]] uint64_t computeKeyFp64(const uint8_t* key, size_t keyLen) noexcept;
+    [[nodiscard]] AKDB_API uint64_t computeKeyFp64(const uint8_t* key, size_t keyLen) noexcept;
 
     /**
      * Computes the 64-bit fingerprint used for fast key rejection.
@@ -54,7 +56,7 @@ namespace akkaradb::core {
      * @param keyLen Key length in bytes.
      * @return 64-bit mini-key prefix hint.
      */
-    [[nodiscard]] uint64_t buildMiniKey(const uint8_t* key, size_t keyLen) noexcept;
+    [[nodiscard]] AKDB_API uint64_t buildMiniKey(const uint8_t* key, size_t keyLen) noexcept;
 
     /**
      * Builds the mini-key prefix hint from the first up to eight key bytes.

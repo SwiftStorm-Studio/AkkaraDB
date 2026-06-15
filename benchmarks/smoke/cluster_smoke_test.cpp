@@ -416,8 +416,8 @@ namespace {
         AKK_TEST_CHECK(rejected);
     }
 
-    void testRuntimeRejectsStripeUntilRoutingExists() {
-        const auto dir = makeTempDir("stripeRuntimeReject");
+    void testRuntimeAcceptsStripeRouting() {
+        const auto dir = makeTempDir("stripeRuntimeAccept");
         const ClusterConfig cfg{
             {
                 node(1, 19793, 19813, static_cast<uint32_t>(NodeCapability::COORDINATOR_ELIGIBLE) | static_cast<uint32_t>(NodeCapability::DATA_BEARING)),
@@ -427,15 +427,13 @@ namespace {
             AckPolicy{},
         };
 
-        bool rejected = false;
-        try {
-            ClusterEngineCallbacks callbacks;
-            (void)ClusterRuntime::create(dir, cfg, 1, std::move(callbacks), ClusterRuntimeOptions{});
-        }
-        catch (const std::invalid_argument&) {
-            rejected = true;
-        }
-        AKK_TEST_CHECK(rejected);
+        ClusterEngineCallbacks callbacks;
+        auto runtime = ClusterRuntime::create(dir, cfg, 1, std::move(callbacks), ClusterRuntimeOptions{});
+        const std::string key = "stripe-key";
+        const auto targets = runtime->router().writeTargets(bytesOf(key));
+        AKK_TEST_CHECK(targets.size() == 1);
+        AKK_TEST_CHECK(runtime->router().readCandidates(bytesOf(key))[0].nodeId == targets[0].nodeId);
+        runtime->close();
     }
 } // namespace
 
@@ -450,7 +448,7 @@ int main() {
     testTransportDefault();
     testPinnedSecureReplication();
     testPlainTransportRejectsWanHosts();
-    testRuntimeRejectsStripeUntilRoutingExists();
+    testRuntimeAcceptsStripeRouting();
     std::printf("cluster smoke test passed\n");
     return 0;
 }

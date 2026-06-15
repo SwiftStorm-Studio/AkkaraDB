@@ -104,4 +104,6 @@ namespace akkaradb {
 
     engine::AkkEngine& AkkaraDB::engine() noexcept { return *engine_; }
     const engine::AkkEngine& AkkaraDB::engine() const noexcept { return *engine_; }
+
+    AkkaraDB::Schema AkkaraDB::schema() { return Schema{*this}; }
 } // namespace akkaradb

@@ -137,7 +137,7 @@ get(key)
          +-- tombstone -> not found
          +-- normal    -> value
          +-- blob      -> BlobManager::read(blob_id, crc)
-         +-- optional sst_promote_reads -> put SST record back into MemTable
+         +-- optional sstPromoteReads -> put SST record back into MemTable
 ```
 
 ### Range Scan Path
@@ -239,14 +239,19 @@ For integral primary keys of size <= 8, `encoded_pk` is a fixed-width little-end
 ```
 
 `index_prefix` is `FNV-1a-64(table_name + ":idx:" + field_name)` written little-endian.
+`field_len` is the byte length of `encoded_field` written little-endian.
 
 Index entries are non-unique. The encoded primary key suffix makes duplicate field values distinct and allows exact-match index scans to recover the entity by
 primary key.
 
 ### 3.6 Key Ordering
 
-Raw engine keys are ordered lexicographically by bytes. PackedTable stores numeric fields little-endian to match the rest of the native binary formats. Numeric
-ordering should therefore be enforced by typed scan/query logic rather than by assuming bytewise key order matches numeric order.
+Raw engine keys are ordered lexicographically by bytes. PackedTable primary keys use the same compact primary-key encoding described above; integral primary
+keys are little-endian and are mainly a namespace/key identity format, not a general numeric sort encoding.
+
+Secondary index field bytes are encoded separately from BinPack when ordering matters. Integral fields use a sortable big-endian unsigned representation, signed
+integrals flip the sign bit before big-endian encoding, and `float`/`double` values use the standard sortable IEEE-754 bit transform before big-endian encoding.
+Other field types use `BinPack::encodeInto`. This lets indexed equality and numeric range query plans use bytewise index ranges.
 
 ---
 
@@ -281,7 +286,7 @@ MemTable and WAL shard counts are derived from writer count using a birthday-par
 | `shard_count`                 | 0       | Auto when zero                       |
 | `expected_concurrent_writers` | 0       | Used by MemTable auto-sharding       |
 | `auto_shard_count_cap`        | 128     | MemTable shard cap                   |
-| `threshold_bytes_per_shard`   | 64 MiB  | Flush hint threshold                 |
+| `thresholdBytesPerShard`      | 64 MiB  | Flush hint threshold                 |
 | `backend_factory`             | null    | Uses the implementation default      |
 | `on_flush`                    | null    | Called with sorted `RecordView` span |
 
@@ -308,7 +313,7 @@ older SST values.
 
 ### 5.4 Flush Lifecycle
 
-When a shard crosses `threshold_bytes_per_shard`, it can be sealed and flushed. The engine installs an `on_flush` callback that writes records to
+When a shard crosses `thresholdBytesPerShard`, it can be sealed and flushed. The engine installs an `on_flush` callback that writes records to
 `SSTManager::flush`, checkpoints the manifest, and prunes WAL segments up to the resulting checkpoint sequence when configured.
 
 ---
@@ -382,7 +387,7 @@ Recovery validates segment headers and entry CRCs before applying entries to a f
 
 ### 7.1 Purpose
 
-The BlobManager externalizes values whose size is greater than or equal to `threshold_bytes`, default 16 KiB. Externalization keeps MemTable and WAL entries
+The BlobManager externalizes values whose size is greater than or equal to `thresholdBytes`, default 16 KiB. Externalization keeps MemTable and WAL entries
 small while preserving transparent reads at the engine API.
 
 ### 7.2 Options
@@ -390,7 +395,7 @@ small while preserving transparent reads at the engine API.
 | Field             | Default            | Description               |
 |-------------------|--------------------|---------------------------|
 | `blobDir`        | `{dataDir}/blobs` | Blob directory            |
-| `threshold_bytes` | 16 KiB             | Externalization threshold |
+| `thresholdBytes`  | 16 KiB             | Externalization threshold |
 | `codec`           | `None`             | `None` or `Zstd`          |
 
 ### 7.3 Blob Header v5
@@ -551,7 +556,7 @@ The VersionLog records per-key history when enabled. It powers:
 - `AkkEngine::getAt(key, seq)`
 - `AkkEngine::history(key)`
 - `AkkEngine::rollbackTo(seq)`
-- `AkkEngine::rollback_key(key, seq)`
+- `AkkEngine::rollbackKey(key, seq)`
 
 ### 10.2 Options
 
@@ -578,21 +583,24 @@ Rollback-generated records use `ROLLBACK_NODE = UINT64_MAX` and `VLOG_FLAG_ROLLB
 
 ### 11.1 Configuration
 
-API servers are enabled through `AkkEngineOptions::components.api_enabled`. The server set is controlled by `AkkEngineOptions::api.backends`.
+API servers are enabled through `AkkEngineOptions::components.apiEnabled`. The server set is controlled by `AkkEngineOptions::api.backends`.
+When `backends` is empty, the native server starts HTTP and TCP backends. GRPC is an available backend enum and can be enabled when the gRPC transport factory
+has been registered by the gRPC module.
 
 | Field                  | Default     | Description                                              |
 |------------------------|-------------|----------------------------------------------------------|
-| `backends`             | empty       | Values: `Http`, `Tcp`                                    |
-| `bind_host`            | empty       | Required when API is enabled                             |
-| `http_port`            | 7070        | HTTP port                                                |
-| `tcp_port`             | 7071        | Binary TCP port                                          |
-| `tcp_worker_threads`   | 0           | TCP worker threads. `0` uses hardware concurrency.       |
-| `tcp_accept_queue_limit` | 4096      | Max accepted TCP sockets waiting for a worker.           |
-| `tcp_accept_queue_timeout_ms` | 60000 | Max time a socket may wait in the worker queue. `0` disables it. |
-| `tcp_listen_backlog`   | 1024        | Kernel listen backlog passed to `listen`.                |
-| `tcp_read_timeout_ms`  | 60000       | TCP idle/partial-frame read timeout. `0` disables it.    |
-| `tcp_write_timeout_ms` | 30000       | TCP response write timeout. `0` disables it.             |
-| `transport_mode`       | `TLS`       | `TLS` or `Plain`                                         |
+| `backends`             | empty       | Values: `HTTP`, `TCP`, `GRPC`; empty means HTTP + TCP    |
+| `bindHost`             | empty       | Required when API is enabled                             |
+| `httpPort`             | 7070        | HTTP port                                                |
+| `tcpPort`              | 7071        | Binary TCP port                                          |
+| `grpcPort`             | 7072        | gRPC port when GRPC backend is enabled                   |
+| `tcpWorkerThreads`     | 0           | TCP worker threads. `0` uses hardware concurrency.       |
+| `tcpAcceptQueueLimit` | 4096      | Max accepted TCP sockets waiting for a worker.           |
+| `tcpAcceptQueueTimeoutMs` | 60000 | Max time a socket may wait in the worker queue. `0` disables it. |
+| `tcpListenBacklog`    | 1024        | Kernel listen backlog passed to `listen`.                |
+| `tcpReadTimeoutMs`    | 60000       | TCP idle/partial-frame read timeout. `0` disables it.    |
+| `tcpWriteTimeoutMs`   | 30000       | TCP response write timeout. `0` disables it.             |
+| `transportMode`        | `TLS`       | `TLS` or `PLAIN`                                         |
 | `tls`                  | empty paths | TLS/PSK options                                          |
 
 ### 11.2 Binary Protocol v2
@@ -625,6 +633,18 @@ Opcodes:
 | `0x02` | `Put`    |
 | `0x03` | `Remove` |
 | `0x04` | `GetAt`  |
+| `0x05` | `BatchPut` |
+| `0x06` | `BatchGet` |
+| `0x07` | `Ping` |
+| `0x08` | `Exists` |
+| `0x09` | `Count` |
+| `0x0A` | `Scan` |
+| `0x0B` | `History` |
+| `0x0C` | `RollbackTo` |
+| `0x0D` | `RollbackKey` |
+| `0x0E` | `ForceSync` |
+| `0x0F` | `ForceFlush` |
+| `0x10` | `Stats` |
 
 Statuses:
 
@@ -639,13 +659,30 @@ Statuses:
 The HTTP server exposes REST-style endpoints for basic key/value operations. Keys are passed as percent-encoded query parameters and values are request/response
 bodies.
 
-| Method   | Path         | Query        | Description                                                 |
-|----------|--------------|--------------|-------------------------------------------------------------|
-| `GET`    | `/v1/ping`   | none         | Health check                                                |
-| `POST`   | `/v1/put`    | `key`        | Store request body as value                                 |
-| `GET`    | `/v1/get`    | `key`        | Return current value                                        |
-| `DELETE` | `/v1/remove` | `key`        | Write tombstone                                             |
-| `GET`    | `/v1/getAt` | `key`, `seq` | Return value visible at sequence when VersionLog is enabled |
+| Method   | Path           | Query              | Description                                                 |
+|----------|----------------|--------------------|-------------------------------------------------------------|
+| `GET`    | `/v1/ping`     | none               | Health check                                                |
+| `POST`   | `/v1/put`      | `key`              | Store request body as value                                 |
+| `GET`    | `/v1/get`      | `key`              | Return current value                                        |
+| `DELETE` | `/v1/remove`   | `key`              | Write tombstone                                             |
+| `GET`    | `/v1/exists`   | `key`              | Return point existence                                      |
+| `GET`    | `/v1/count`    | `start`, `end`     | Count records in a half-open range                          |
+| `GET`    | `/v1/scan`     | `start`, `end`, `limit` | Return range records, bounded by server limit          |
+| `GET`    | `/v1/getAt`    | `key`, `seq`       | Return value visible at sequence when VersionLog is enabled |
+| `GET`    | `/v1/history`  | `key`, `limit`     | Return version entries                                      |
+| `POST`   | `/v1/rollbackTo` | `seq`            | Roll the engine back to a sequence                          |
+| `POST`   | `/v1/rollbackKey` | `key`, `seq`    | Roll one key back to a sequence                             |
+| `POST`   | `/v1/batchPut` | body               | Store multiple key/value pairs                              |
+| `POST`   | `/v1/batchGet` | body               | Read multiple keys                                          |
+| `POST`   | `/v1/forceSync` | none              | Force WAL sync                                              |
+| `POST`   | `/v1/forceFlush` | none             | Force MemTable flush                                        |
+| `GET`    | `/v1/stats`    | none               | Return engine/server stats                                  |
+
+### 11.4 gRPC API
+
+The gRPC module defines `akkaradb.grpcapi.v1.AkkaraDB` with unary RPCs for `Ping`, `Put`, `Get`, `Remove`, `Exists`, `Count`, `Scan`, `GetAt`, `History`,
+`RollbackTo`, `RollbackKey`, `BatchPut`, `BatchGet`, `ForceSync`, `ForceFlush`, and `Stats`. It can run with insecure credentials or TLS credentials depending
+on the configured certificate/key/CA paths.
 
 ---
 
@@ -659,7 +696,9 @@ bodies.
 | `Mirror`     | Writes are mirrored to all data-bearing nodes    |
 | `Stripe`     | Keys are assigned to data nodes by router policy |
 
-`Stripe` routing primitives exist, but `ClusterRuntime` currently rejects Stripe configs because distributed write forwarding and ownership migration are not implemented yet.
+`Stripe` uses the cluster router's deterministic rendezvous-hash placement to assign each key to one data-bearing node. `ClusterRuntime` accepts Stripe configs
+and exposes the same owner selection through `ClusterRuntime::router()`. Operational ownership migration remains an explicit administrative concern when changing
+the node set or moving data between placement policies.
 
 ### 12.2 Node Roles
 
@@ -690,8 +729,8 @@ Cluster config is stored as `{dataDir}/cluster.akcc` by default and uses magic `
 - acknowledgement policy
 
 Runtime-only TLS/transport paths and the local replication bind host are not serialized in the config file. They live in `ClusterRuntimeOptions`.
-The advertised `NodeInfo.host` is the address peers dial; `ClusterRuntimeOptions::repl_bind_host` is the local address the primary listener binds to, defaulting to `0.0.0.0`.
-Replication links run over TCP. `TransportMode::TLS` wraps the TCP stream with mbedTLS; `TransportMode::Plain` is accepted only when every advertised node host is loopback or LAN/private address space.
+The advertised `NodeInfo.host` is the address peers dial; `ClusterRuntimeOptions::replBindHost` is the local address the primary listener binds to, defaulting to `0.0.0.0`.
+Replication links run over TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel; `TransportMode::PLAIN` is accepted only when every advertised node host is loopback or LAN/private address space.
 
 Primary selection is deterministic: the coordinator-eligible node with the lowest node id becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not a quorum consensus protocol and does not provide automatic split-brain-safe failover.
 Changing the configured primary for non-mirrored ownership requires an explicit migration plan: the new primary must not retain unrelated user data, and owned data must be moved back to the node selected by the placement policy before traffic is accepted.
@@ -725,7 +764,7 @@ verify_peer   Whether peer verification is required
 `TlsStream` wraps one TCP connection and provides blocking `connect`, `accept`, `send`, `recv`, `shutdown`, and `close` operations. It owns the accepted or
 connected socket after setup begins.
 
-TLS can be used by API servers and replication links depending on their `transport_mode` and runtime options.
+TLS can be used by API servers and replication links depending on their `transportMode` and runtime options.
 
 ---
 
@@ -742,20 +781,20 @@ High-level `AkkaraDB::open` converts `StartupMode` into `AkkEngineOptions`.
 | `NORMAL`     | enabled async | enabled  | enabled  | enabled  | disabled   | force flush/sync    | default 64 MiB/shard |
 | `DURABLE`    | enabled sync  | enabled  | enabled  | enabled  | enabled    | force flush/sync    | default 64 MiB/shard |
 
-`FAST` also enables `runtime.sst_promote_reads`.
+`FAST` also enables `runtime.sstPromoteReads`.
 
 ### 14.2 AkkaraDB::Options Overrides
 
 | Override                       | Maps to                              |
 |--------------------------------|--------------------------------------|
-| `memtable_threshold_per_shard` | `memtable.threshold_bytes_per_shard` |
-| `version_log_enabled`          | `components.version_log_enabled`     |
-| `sstCodec`                    | `sst.codec`                          |
-| `blob_codec`                   | `blob.codec`                         |
-| `blob_threshold_bytes`         | `blob.threshold_bytes`               |
-| `sst_promote_reads`            | `runtime.sst_promote_reads`          |
-| `sst_bloom_bits_per_key`       | `sst.bloom_bits_per_key`             |
-| `max_l0_sst_files`             | `sst.max_l0_files`                   |
+| `memtableThresholdPerShard`    | `memtable.thresholdBytesPerShard`    |
+| `versionLogEnabled`            | `components.versionLogEnabled`       |
+| `sstCodec`                     | `sst.codec`                          |
+| `blobCodec`                    | `blob.codec`                         |
+| `blobThresholdBytes`           | `blob.thresholdBytes`                |
+| `sstPromoteReads`              | `runtime.sstPromoteReads`            |
+| `sstBloomBitsPerKey`           | `sst.bloomBitsPerKey`                |
+| `maxL0SstFiles`                | `sst.maxL0Files`                     |
 
 ### 14.3 Path Defaults
 
@@ -775,23 +814,23 @@ If `paths.dataDir` is set, missing component paths are derived as:
 
 | Field                  | Default | Description                                |
 |------------------------|---------|--------------------------------------------|
-| `writer_threads`       | 0       | Derives MemTable/WAL shard counts when > 0 |
-| `recover_wal`          | true    | Replay WAL at startup                      |
-| `recover_sst`          | true    | Recover SST state at startup               |
-| `prune_wal_on_flush`   | true    | Prune WAL after SST checkpoint             |
-| `forceFlush_on_close` | true    | Force MemTable flush during close          |
-| `forceSync_on_close`  | true    | Force WAL sync during close                |
-| `sst_promote_reads`    | false   | Promote SST read hits into MemTable        |
+| `writerThreads`        | 0       | Derives MemTable/WAL shard counts when > 0 |
+| `recoverWal`           | true    | Replay WAL at startup                      |
+| `recoverSst`           | true    | Recover SST state at startup               |
+| `pruneWalOnFlush`      | true    | Prune WAL after SST checkpoint             |
+| `forceFlushOnClose`    | true    | Force MemTable flush during close          |
+| `forceSyncOnClose`     | true    | Force WAL sync during close                |
+| `sstPromoteReads`      | false   | Promote SST read hits into MemTable        |
 
 ### 14.5 Cluster Runtime Options
 
 | Field            | Default   | Description                                      |
 |------------------|-----------|--------------------------------------------------|
-| `transport_mode` | `TLS`     | Replication transport: `TLS` or `Plain`          |
-| `repl_bind_host` | `0.0.0.0` | Local address used by the primary repl listener  |
+| `transportMode`  | `SECURE`  | Replication transport: `SECURE` or `PLAIN`       |
+| `replBindHost`   | `0.0.0.0` | Local address used by the primary repl listener  |
 | `tls`            | empty     | Runtime-only certificate/key/CA verification set |
 
-`Plain` replication is rejected for non-private advertised node hosts. Hostnames other than `localhost` are treated as non-private because the runtime does not resolve DNS during configuration validation.
+`PLAIN` replication is rejected for non-private advertised node hosts. Hostnames other than `localhost` are treated as non-private because the runtime does not resolve DNS during configuration validation.
 
 ---
 
@@ -807,7 +846,7 @@ auto db = akkaradb::AkkaraDB::open("/var/lib/akkaradb", akkaradb::StartupMode::N
 akkaradb::AkkaraDB::Options opts;
 opts.dataDir = "/var/lib/akkaradb";
 opts.mode = akkaradb::StartupMode::FAST;
-opts.overrides.blob_threshold_bytes = 32 * 1024;
+opts.overrides.blobThresholdBytes = 32 * 1024;
 opts.overrides.sstCodec = akkaradb::Codec::ZSTD;
 auto tuned = akkaradb::AkkaraDB::open(std::move(opts));
 
@@ -835,7 +874,7 @@ for (auto it = rows.begin(); it != rows.end(); ++it) {
 
 auto hist = engine.history(key);
 auto old = engine.getAt(key, 42);
-engine.rollback_key(key, 42);
+engine.rollbackKey(key, 42);
 engine.forceFlush();
 engine.forceSync();
 ```
@@ -872,22 +911,98 @@ while (emailHits.hasNext()) {
 auto adults = users
     .query([](auto u) { return u.age >= 18; })
     .limit(100)
-    .to_vector();
+    .toVector();
 
 auto first = users.query()
     .where([](auto u) { return u.email == "a@example.test"; })
     .first();
+
+auto exact = users.findBy<&User::email>(std::string{"a@example.test"});
+auto range = users.scan(1ULL, 100ULL);
 ```
+
+`PackedTable` supports `put`, `get`, `getInto`, `remove`, `exists`, `upsert`, `count`, `scanAll`, `scan(startPk)`, `scan(startPk, endPk)`, `index`,
+`indexed`, `findBy`, and `query` helpers. Query predicates support comparison, `&&`, `||`, `!`, `in`, `notIn`, `startsWith`, `contains`, `like`, `isNull`,
+`isNotNull`, nested struct access through `.field<&Nested::member>()`, and map access through `.mapGet(key)` / `.get(key)`.
+
+When a registered secondary index can provide a narrower source range, the query planner scans that index and applies the predicate as a residual filter. Equality,
+`in`, optional null checks, and arithmetic range predicates can use indexes. String prefix/contains/like predicates may use the field index as the source and
+still apply the full predicate in C++.
 
 `PackedTable` is move-only and not documented as thread-safe. Use separate handles or external synchronization when sharing across threads.
 
-### 15.4 BinPack
+### 15.4 Ref, Schema, and Joins
+
+`Ref<T>` stores only the target primary key in BinPack, and can lazily resolve the target entity when a table binding is attached. `AKKARADB_ENTITY` combines
+`AKKARADB_QUERYABLE` with `AKKARADB_REF_ENTITY`, which defines `RefTraits<T>` for the primary key.
+
+```cpp
+struct Author {
+    uint64_t id;
+    std::string name;
+    uint32_t age;
+    std::string email;
+};
+
+AKKARADB_ENTITY(Author, id, name, age, email);
+
+struct Post {
+    uint64_t id;
+    akkaradb::Ref<Author> author;
+    std::string body;
+    uint32_t likes;
+    std::string title;
+};
+
+AKKARADB_ENTITY(Post, id, author, body, likes);
+
+auto schema = db->schema()
+    .table<&Author::id>("authors")
+    .table<&Post::id>("posts")
+    .foreignKey<&Post::author>()
+    .open();
+
+auto& authors = schema.table<Author>();
+auto& posts = schema.table<Post>();
+
+authors.put({1, "Alice", 30, "alice@example.test"});
+posts.put({100, akkaradb::ref<Author>(1), "hello", 5, "first"});
+
+auto post = posts.get(100);
+auto authorName = post->author->name; // lazy resolve through the attached binding
+
+auto joined = posts.join<&Post::author>(authors).toVector();
+```
+
+`foreignKey<&Owner::refField>()` validates that the referenced entity exists before storing the owner row. The schema helper currently supports cascade delete
+through `OnDelete::Cascade`, which is the only `OnDelete` mode.
+
+Manual table binding is also available through `bindRef<&Owner::refField>(targetTable)`, and manual cascade registration is available through
+`cascadeDeleteFrom<&Owner::refField>(sourceTable)`. Joins can use either a `Ref<T>` field or arbitrary comparable fields:
+
+```cpp
+auto byRef = posts.join<&Post::author>(authors);
+
+struct PlainPost {
+    uint64_t id;
+    uint64_t authorId;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_QUERYABLE(PlainPost, id, authorId, body, likes)
+
+auto plainPosts = db->table<&PlainPost::id>("plain_posts");
+auto byField = plainPosts.join<&PlainPost::authorId, &Author::id>(authors);
+```
+
+### 15.5 BinPack
 
 ```cpp
 auto bytes = akkaradb::binpack::BinPack::encode(value);
 auto value2 = akkaradb::binpack::BinPack::decode<T>(bytes);
-akkaradb::binpack::BinPack::encode_into(value, out);
-size_t n = akkaradb::binpack::BinPack::estimate_size(value);
+akkaradb::binpack::BinPack::encodeInto(value, out);
+size_t n = akkaradb::binpack::BinPack::estimateSize(value);
 ```
 
 Built-in adapters include:
@@ -904,7 +1019,10 @@ Built-in adapters include:
 
 Integers are encoded little-endian by BinPack.
 
-### 15.5 JNI Bridge
+`Ref<T>` is encoded as its key only. Aggregate structs are encoded field-by-field through Boost.PFR, except trivially copyable aggregates which currently use a
+memcpy fast path.
+
+### 15.6 JNI Bridge
 
 When `AKKARADB_BUILD_JNI=ON`, the native build produces `akkaradb_jni`. The JNI bridge exposes the raw engine operations, scan cursors, query scan transport,
 and option-based open used by the JVM module. The public JVM engine API uses `ByteBufferL`; the current JNI native methods receive `jbyteArray` snapshots made
@@ -927,7 +1045,7 @@ The JNI engine entry points are:
 | cursor `next`      | `NativeScanCursor.nativeNext` | Returns JVM `RowView(ByteBufferL key, ByteBufferL value)` |
 | cursor `close`     | `NativeScanCursor.nativeClose` | Destroys the native cursor                            |
 
-#### 15.5.1 JVM Query Scan Payloads
+#### 15.6.1 JVM Query Scan Payloads
 
 `nativeOpenQueryScan(handle, startKey, endKey, queryBytes, schemaBytes)` opens a normal native scan over `[startKey, endKey)` and evaluates the decoded query
 against each row value before yielding it. The row value is decoded with the supplied schema. The query payload is produced by the JVM `AstSerializer`; the schema
@@ -935,7 +1053,7 @@ payload is produced by `SchemaSerializer`.
 
 All query and schema payload integer fields are little-endian. Payload strings are UTF-8.
 
-#### 15.5.2 Query Payload
+#### 15.6.2 Query Payload
 
 The query payload contains captures followed by one recursive expression tree:
 
@@ -999,7 +1117,7 @@ Expr:
 The current native evaluator implements comparison, equality, boolean, null-check, capture, literal, and column expressions used by the JVM scan path. Unsupported
 operators must be treated as query-evaluation errors rather than silently matching rows.
 
-#### 15.5.3 Schema Payload
+#### 15.6.3 Schema Payload
 
 The schema payload describes the BinPack layout of the row value. The root is always a struct schema and does not include a leading `Struct` kind byte:
 
@@ -1208,6 +1326,7 @@ When building from the source tree, the primary target is `akkaradb`.
 |------------------------------------|---------------------------------------------------------|
 | `akkaradb/AkkaraDB.hpp`            | High-level open API, `StartupMode`, `AkkaraDB::Options` |
 | `akkaradb/PackedTable.hpp`         | Typed table, secondary indexes, query helpers           |
+| `akkaradb/Ref.hpp`                 | `Ref<T>`, `RefTraits`, schema reference bindings        |
 | `akkaradb/Stats.hpp`               | Engine statistics snapshot                              |
 | `akkaradb/binpack/BinPack.hpp`     | Encode/decode facade                                    |
 | `akkaradb/binpack/TypeAdapter.hpp` | Serialization adapters                                  |

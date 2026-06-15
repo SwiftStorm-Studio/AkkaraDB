@@ -28,7 +28,7 @@
 
 namespace akkaradb::engine::erasure {
     enum class ErasureCodecKind : uint8_t {
-        XOR = 1, DUAL_XOR = 2,
+        XOR = 1, DUAL_XOR = 2, RS = 3, ERS = 4
     };
 
     struct AKDB_API ErasureLayout {

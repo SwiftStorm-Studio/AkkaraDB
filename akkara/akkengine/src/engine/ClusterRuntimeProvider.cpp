@@ -20,12 +20,12 @@ namespace akkaradb::engine::cluster {
         [[nodiscard]] std::filesystem::path currentModuleDirectory() {
             #ifdef _WIN32
             HMODULE module = nullptr;
-            const auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            constexpr auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
             if (!::GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(&currentModuleDirectory), &module)) { return {}; }
 
             std::wstring buffer(MAX_PATH, L'\0');
             for (;;) {
-                const DWORD len = ::GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
+                const DWORD len = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
                 if (len == 0) { return {}; }
                 if (len < buffer.size() - 1) {
                     buffer.resize(len);

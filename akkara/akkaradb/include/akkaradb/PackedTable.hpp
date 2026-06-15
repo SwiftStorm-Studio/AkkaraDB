@@ -27,6 +27,7 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +41,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <typeindex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -668,6 +670,10 @@ namespace akkaradb {
             return Proxy{}; \
         }
 
+    #define AKKARADB_ENTITY(Type, PrimaryKey, B, C, D) \
+        AKKARADB_REF_ENTITY(Type, PrimaryKey); \
+        AKKARADB_QUERYABLE(Type, PrimaryKey, B, C, D)
+
     template <auto PrimaryKeyPtr>
     class PackedTable {
         class ArenaByteBuffer {
@@ -772,6 +778,51 @@ namespace akkaradb {
             template <auto FieldPtr>
             class Index;
 
+            template <auto FieldPtr, auto TargetPrimaryKeyPtr>
+            PackedTable& bindRef(PackedTable<TargetPrimaryKeyPtr>& target) {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "ref field must belong to the table entity");
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                static_assert(isRef<Field>, "bindRef field must be akkaradb::Ref<T>");
+                using Target = typename RefTarget<Field>::Type;
+                using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
+                static_assert(std::is_same_v<typename TargetTable::Entity, Target>, "ref target table entity does not match Ref<T>");
+                static_assert(std::is_same_v<typename Field::Key, typename TargetTable::PK>, "ref key type does not match target table primary key");
+
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                for (auto& refField : refFields_) {
+                    if (refField.fieldName == fieldName) {
+                        auto binding = std::make_unique<TableRefBinding<TargetPrimaryKeyPtr>>(&target);
+                        refField.binding = binding.get();
+                        refBindings_.push_back(std::move(binding));
+                        return *this;
+                    }
+                }
+
+                auto binding = std::make_unique<TableRefBinding<TargetPrimaryKeyPtr>>(&target);
+                auto* rawBinding = binding.get();
+                refBindings_.push_back(std::move(binding));
+                refFields_.push_back(
+                    RefFieldDef{
+                        std::string(fieldName),
+                        rawBinding,
+                        [](const Entity& entity, void* raw) {
+                            auto* binding = static_cast<TableRefBinding<TargetPrimaryKeyPtr>*>(raw);
+                            (entity.*FieldPtr).attach(binding);
+                        },
+                        [](const Entity& entity, void* raw) {
+                            auto* binding = static_cast<TableRefBinding<TargetPrimaryKeyPtr>*>(raw);
+                            const auto& ref = entity.*FieldPtr;
+                            ref.attach(binding);
+                            if (ref.dirty()) {
+                                binding->put(ref.value());
+                                ref.markClean();
+                            }
+                        }
+                    }
+                );
+                return *this;
+            }
+
             template <auto FieldPtr>
             [[nodiscard]] Index<FieldPtr> index() {
                 static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "index field must belong to the table entity");
@@ -799,8 +850,78 @@ namespace akkaradb {
                 return *this;
             }
 
+            PackedTable& bindRefsFrom(const RefBindingLookup& lookup) {
+                refBindingLookup_ = &lookup;
+                return *this;
+            }
+
+            template <auto FieldPtr>
+            PackedTable& foreignKey() {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "foreign key field must belong to the table entity");
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                static_assert(isRef<Field>, "foreignKey field must be akkaradb::Ref<T>");
+
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                for (const auto& fk : foreignKeys_) { if (fk.fieldName == fieldName) { return *this; } }
+
+                foreignKeys_.push_back(
+                    ForeignKeyDef{
+                        std::string(fieldName),
+                        [](const Entity& entity, const PackedTable& table) {
+                            using Target = typename RefTarget<Field>::Type;
+                            const auto* binding = table.template findRefBinding<Target>();
+                            if (binding == nullptr) { throw std::runtime_error("AkkaraDB foreign key: Ref target table is not registered"); }
+
+                            const auto& ref = entity.*FieldPtr;
+                            if (!binding->exists(ref.id())) {
+                                throw std::runtime_error("AkkaraDB foreign key: referenced entity was not found");
+                            }
+                        }
+                    }
+                );
+                return *this;
+            }
+
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr>
+            PackedTable& cascadeDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "cascade ref field must belong to the source entity");
+                static_assert(isRef<Field>, "cascade ref field must be akkaradb::Ref<T>");
+                using Target = typename RefTarget<Field>::Type;
+                static_assert(std::is_same_v<Target, Entity>, "cascade target table entity does not match Ref<T>");
+                static_assert(std::is_same_v<typename Field::Key, PK>, "cascade ref key type does not match target primary key");
+
+                const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                for (const auto& cascade : cascadeDeletes_) {
+                    if (cascade.source == &source && cascade.fieldName == fieldName) { return *this; }
+                }
+
+                cascadeDeletes_.push_back(
+                    CascadeDeleteDef{
+                        &source,
+                        std::string(fieldName),
+                        [](const PK& targetPk, void* rawSource) {
+                            auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            std::vector<typename SourceTable::PK> removeKeys;
+                            auto rows = sourceTable->scanAll();
+                            while (rows.hasNext()) {
+                                auto entry = rows.next();
+                                if ((entry.value.*RefFieldPtr).id() == targetPk) { removeKeys.push_back(entry.id); }
+                            }
+                            for (const auto& key : removeKeys) { sourceTable->remove(key); }
+                        }
+                    }
+                );
+                return *this;
+            }
+
             void put(const Entity& entity) {
                 resetTempBuffers();
+                attachRefBindings(entity);
+                flushDirtyRefs(entity);
+                validateForeignKeys(entity);
                 const PK& pk = entity.*PrimaryKeyPtr;
                 makePkKey(pk, pkKeyBuffer_);
 
@@ -831,11 +952,14 @@ namespace akkaradb {
                 makePkKey(pk, pkKeyBuffer_);
                 std::span<const uint8_t> bytes;
                 if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, bytes)) { return false; }
-                return binpack::BinPack::decodeInto<Entity>(bytes, out);
+                const bool decoded = binpack::BinPack::decodeInto<Entity>(bytes, out);
+                if (decoded) { attachRefBindings(out); }
+                return decoded;
             }
 
             void remove(const PK& pk) {
                 resetTempBuffers();
+                runCascadeDeletes(pk);
                 makePkKey(pk, pkKeyBuffer_);
 
                 if (!indexes_.empty()) {
@@ -941,7 +1065,9 @@ namespace akkaradb {
                             ) != 0) { return; }
 
                             std::span<const uint8_t> pkBytes{key.data() + table_->pkPrefix_.size(), key.size() - table_->pkPrefix_.size()};
-                            pending_ = Entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
+                            Entry entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
+                            table_->attachRefBindings(entry.value);
+                            pending_ = std::move(entry);
                             ++it_;
                             return;
                         }
@@ -1054,6 +1180,7 @@ namespace akkaradb {
                                         key.size() - table_->pkPrefix_.size()
                                     };
                                     entry = Entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
+                                    table_->attachRefBindings(entry.value);
                                 }
                                 else {
                                     const auto key = raw.key;
@@ -1223,6 +1350,196 @@ namespace akkaradb {
             template <typename Pred>
             [[nodiscard]] auto query(Pred&& predicate) const { return query().where(std::forward<Pred>(predicate)); }
 
+            template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
+            class JoinView {
+                public:
+                    using LeftEntry = Entry;
+                    using RightTable = PackedTable<TargetPrimaryKeyPtr>;
+                    using RightEntry = typename RightTable::Entry;
+                    using RightEntity = typename RightTable::Entity;
+                    using RightPK = typename RightTable::PK;
+
+                    struct JoinRow {
+                        LeftEntry left;
+                        RightEntity right;
+                    };
+
+                    class Iterator {
+                        public:
+                            struct Sentinel {};
+
+                            using value_type = JoinRow;
+                            using difference_type = std::ptrdiff_t;
+                            using iterator_category = std::input_iterator_tag;
+
+                            [[nodiscard]] const JoinRow& operator*() const noexcept { return *current_; }
+                            [[nodiscard]] const JoinRow* operator->() const noexcept { return &*current_; }
+
+                            Iterator& operator++() {
+                                advance();
+                                return *this;
+                            }
+
+                            [[nodiscard]] bool operator!=(const Sentinel&) const noexcept { return current_.has_value(); }
+                            [[nodiscard]] bool operator==(const Sentinel&) const noexcept { return !current_.has_value(); }
+
+                        private:
+                            friend class JoinView;
+
+                            explicit Iterator(const JoinView* view)
+                                : view_{view}, scan_{view_->left_->scanAll()} { advance(); }
+
+                            void advance() {
+                                current_.reset();
+                                if constexpr (usesRightPrimaryKey()) {
+                                    while (scan_.hasNext()) {
+                                        auto left = scan_.next();
+                                        auto right = view_->right_->get(view_->joinKey(left.value.*LeftFieldPtr));
+                                        if (!right) { continue; }
+                                        if (!view_->predicate_(left.value, *right)) { continue; }
+                                        current_ = JoinRow{std::move(left), std::move(*right)};
+                                        return;
+                                    }
+                                }
+                                else {
+                                    while (true) {
+                                        if (!left_) {
+                                            if (!scan_.hasNext()) { return; }
+                                            left_ = scan_.next();
+                                            rightScan_.emplace(view_->right_->scanAll());
+                                        }
+
+                                        while (rightScan_->hasNext()) {
+                                            auto right = rightScan_->next();
+                                            if (!view_->joinFieldsEqual(left_->value, right.value)) { continue; }
+                                            if (!view_->predicate_(left_->value, right.value)) { continue; }
+                                            current_ = JoinRow{*left_, std::move(right.value)};
+                                            return;
+                                        }
+
+                                        left_.reset();
+                                        rightScan_.reset();
+                                    }
+                                }
+                            }
+
+                            const JoinView* view_;
+                            ScanRange scan_;
+                            std::optional<LeftEntry> left_;
+                            std::optional<typename RightTable::ScanRange> rightScan_;
+                            std::optional<JoinRow> current_;
+                    };
+
+                    [[nodiscard]] Iterator begin() const { return Iterator{this}; }
+                    [[nodiscard]] typename Iterator::Sentinel end() const noexcept { return {}; }
+
+                    template <typename Pred>
+                    [[nodiscard]] JoinView where(Pred&& predicate) const {
+                        auto previous = predicate_;
+                        auto next = std::function<bool(const Entity&, const RightEntity&)>{
+                            [previous = std::move(previous), predicate = std::forward<Pred>(predicate)](
+                                const Entity& left,
+                                const RightEntity& right
+                            ) mutable {
+                                return previous(left, right) && predicate(left, right);
+                            }
+                        };
+                        return JoinView{left_, right_, std::move(next)};
+                    }
+
+                    [[nodiscard]] std::optional<JoinRow> first() const {
+                        auto it = begin();
+                        if (it != end()) { return *it; }
+                        return std::nullopt;
+                    }
+
+                    [[nodiscard]] bool any() const { return first().has_value(); }
+
+                    [[nodiscard]] size_t count() const {
+                        size_t n = 0;
+                        auto it = begin();
+                        while (it != end()) {
+                            ++n;
+                            ++it;
+                        }
+                        return n;
+                    }
+
+                    [[nodiscard]] std::vector<JoinRow> toVector() const {
+                        std::vector<JoinRow> out;
+                        for (const auto& row : *this) { out.push_back(row); }
+                        return out;
+                    }
+
+                private:
+                    friend class PackedTable;
+
+                    JoinView(
+                        const PackedTable* left,
+                        const RightTable* right,
+                        std::function<bool(const Entity&, const RightEntity&)> predicate = [](const Entity&, const RightEntity&) { return true; }
+                    )
+                        : left_{left}, right_{right}, predicate_{std::move(predicate)} {}
+
+                    template <typename X>
+                    static decltype(auto) joinKey(const X& value) {
+                        using Field = std::remove_cvref_t<X>;
+                        if constexpr (isRef<Field>) {
+                            return value.id();
+                        }
+                        else {
+                            return (value);
+                        }
+                    }
+
+                    static consteval bool usesRightPrimaryKey() {
+                        if constexpr (std::is_same_v<decltype(RightFieldPtr), decltype(TargetPrimaryKeyPtr)>) {
+                            return RightFieldPtr == TargetPrimaryKeyPtr;
+                        }
+                        else {
+                            return false;
+                        }
+                    }
+
+                    [[nodiscard]] bool joinFieldsEqual(const Entity& left, const RightEntity& right) const {
+                        return joinKey(left.*LeftFieldPtr) == joinKey(right.*RightFieldPtr);
+                    }
+
+                    const PackedTable* left_;
+                    const RightTable* right_;
+                    std::function<bool(const Entity&, const RightEntity&)> predicate_;
+            };
+
+            template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
+            [[nodiscard]] JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr> join(const PackedTable<TargetPrimaryKeyPtr>& target) const {
+                static_assert(std::is_same_v<binpack::detail::classOf<LeftFieldPtr>, Entity>, "join left field must belong to the left table entity");
+                using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
+                using RightEntity = typename TargetTable::Entity;
+                static_assert(std::is_same_v<binpack::detail::classOf<RightFieldPtr>, RightEntity>, "join right field must belong to the right table entity");
+                using LeftField = binpack::detail::memberOf<LeftFieldPtr>;
+                using RightField = binpack::detail::memberOf<RightFieldPtr>;
+                static_assert(
+                    requires(const LeftField& left, const RightField& right) {
+                        { JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr>::joinKey(left)
+                            == JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr>::joinKey(right) } -> std::convertible_to<bool>;
+                    },
+                    "join fields must be comparable"
+                );
+                return JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr>{this, &target};
+            }
+
+            template <auto RefFieldPtr, auto TargetPrimaryKeyPtr>
+                requires(isRef<binpack::detail::memberOf<RefFieldPtr>>)
+            [[nodiscard]] auto join(const PackedTable<TargetPrimaryKeyPtr>& target) const {
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, Entity>, "join ref field must belong to the table entity");
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using Target = typename RefTarget<Field>::Type;
+                using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
+                static_assert(std::is_same_v<typename TargetTable::Entity, Target>, "join target table entity does not match Ref<T>");
+                static_assert(std::is_same_v<typename Field::Key, typename TargetTable::PK>, "join key type does not match target table primary key");
+                return join<RefFieldPtr, TargetPrimaryKeyPtr, TargetPrimaryKeyPtr>(target);
+            }
+
             [[nodiscard]] std::string_view tableName() const noexcept { return tableName_; }
             [[nodiscard]] engine::AkkEngine& engine() noexcept { return *engine_; }
             [[nodiscard]] const engine::AkkEngine& engine() const noexcept { return *engine_; }
@@ -1321,10 +1638,49 @@ namespace akkaradb {
                 void (*encodeField)(const Entity&, ArenaByteBuffer&);
             };
 
+            struct RefFieldDef {
+                std::string fieldName;
+                void* binding;
+                void (*attach)(const Entity&, void*);
+                void (*flush)(const Entity&, void*);
+            };
+
+            struct ForeignKeyDef {
+                std::string fieldName;
+                void (*validate)(const Entity&, const PackedTable&);
+            };
+
+            struct CascadeDeleteDef {
+                void* source;
+                std::string fieldName;
+                void (*cascade)(const PK&, void*);
+            };
+
+            template <auto TargetPrimaryKeyPtr>
+            class TableRefBinding final : public RefBinding<binpack::detail::classOf<TargetPrimaryKeyPtr>> {
+                public:
+                    using TargetEntity = binpack::detail::classOf<TargetPrimaryKeyPtr>;
+                    using Key = binpack::detail::memberOf<TargetPrimaryKeyPtr>;
+
+                    explicit TableRefBinding(PackedTable<TargetPrimaryKeyPtr>* table) : table_{table} {}
+
+                    [[nodiscard]] bool exists(const Key& key) const override { return table_->exists(key); }
+                    [[nodiscard]] std::optional<TargetEntity> get(const Key& key) const override { return table_->get(key); }
+                    void put(const TargetEntity& value) override { table_->put(value); }
+
+                private:
+                    PackedTable<TargetPrimaryKeyPtr>* table_;
+            };
+
             engine::AkkEngine* engine_ = nullptr;
             std::string tableName_;
             std::array<uint8_t, 8> pkPrefix_{};
             std::vector<IndexDef> indexes_;
+            std::vector<RefFieldDef> refFields_;
+            std::vector<ForeignKeyDef> foreignKeys_;
+            std::vector<CascadeDeleteDef> cascadeDeletes_;
+            std::vector<std::unique_ptr<RefBindingBase>> refBindings_;
+            const RefBindingLookup* refBindingLookup_ = nullptr;
 
             mutable std::unique_ptr<core::BufferArena> tempArena_ = std::make_unique<core::BufferArena>();
             mutable ArenaByteBuffer pkKeyBuffer_{tempArena_.get()};
@@ -1355,6 +1711,67 @@ namespace akkaradb {
                 plan.ranges.clear();
                 makePrefixStartEnd(pkPrefix_, scanStartBuffer_, scanEndBuffer_);
                 addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, 0);
+            }
+
+            void attachRefBindings(const Entity& entity) const {
+                if (refFields_.empty() && refBindingLookup_ == nullptr) { return; }
+                for (const auto& refField : refFields_) { refField.attach(entity, refField.binding); }
+                if (refBindingLookup_ != nullptr) { attachAutoRefs(entity); }
+            }
+
+            void flushDirtyRefs(const Entity& entity) const {
+                if (refFields_.empty() && refBindingLookup_ == nullptr) { return; }
+                for (const auto& refField : refFields_) { refField.flush(entity, refField.binding); }
+                if (refBindingLookup_ != nullptr) { flushAutoRefs(entity); }
+            }
+
+            void validateForeignKeys(const Entity& entity) const {
+                for (const auto& fk : foreignKeys_) { fk.validate(entity, *this); }
+            }
+
+            void runCascadeDeletes(const PK& pk) {
+                for (const auto& cascade : cascadeDeletes_) { cascade.cascade(pk, cascade.source); }
+            }
+
+            template <typename Target>
+            [[nodiscard]] const RefBinding<Target>* findRefBinding() const {
+                if (refBindingLookup_ == nullptr) { return nullptr; }
+                auto* raw = refBindingLookup_->findRefBinding(std::type_index(typeid(Target)));
+                if (raw == nullptr) { return nullptr; }
+                return static_cast<RefBinding<Target>*>(raw);
+            }
+
+            template <typename X>
+            void attachAutoRefs(const X& value) const {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (isRef<Field>) {
+                    using Target = typename RefTarget<Field>::Type;
+                    auto* raw = refBindingLookup_->findRefBinding(std::type_index(typeid(Target)));
+                    if (raw == nullptr) { throw std::runtime_error("AkkaraDB schema: Ref target table is not registered"); }
+                    value.attach(static_cast<RefBinding<Target>*>(raw));
+                }
+                else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
+                    boost::pfr::for_each_field(value, [this](const auto& field) { attachAutoRefs(field); });
+                }
+            }
+
+            template <typename X>
+            void flushAutoRefs(const X& value) const {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (isRef<Field>) {
+                    using Target = typename RefTarget<Field>::Type;
+                    auto* raw = refBindingLookup_->findRefBinding(std::type_index(typeid(Target)));
+                    if (raw == nullptr) { throw std::runtime_error("AkkaraDB schema: Ref target table is not registered"); }
+                    auto* binding = static_cast<RefBinding<Target>*>(raw);
+                    value.attach(binding);
+                    if (value.dirty()) {
+                        binding->put(value.value());
+                        value.markClean();
+                    }
+                }
+                else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
+                    boost::pfr::for_each_field(value, [this](const auto& field) { flushAutoRefs(field); });
+                }
             }
 
             void addQueryRange(
@@ -1706,6 +2123,7 @@ namespace akkaradb {
                 if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, valueSpan)) { return false; }
                 std::span pkSpan{pkBytes.data(), pkBytes.size()};
                 out = Entry{binpack::BinPack::decode<PK>(pkSpan), binpack::BinPack::decode<Entity>(valueSpan)};
+                attachRefBindings(out.value);
                 return true;
             }
 

@@ -93,14 +93,6 @@ namespace akkaradb::engine::cluster {
             }
         }
 
-        void validateRuntimeMode(const ClusterConfig& config) {
-            if (config.mode() == ReplicationMode::STRIPE) {
-                throw std::invalid_argument(
-                    "ClusterRuntime: Stripe mode requires distributed write routing and ownership migration, which are not implemented yet"
-                );
-            }
-        }
-
     } // namespace
 
     class ClusterRuntime::Impl {
@@ -121,7 +113,6 @@ namespace akkaradb::engine::cluster {
                 if (runtimeOptions_.transportMode == TransportMode::SECURE && runtimeOptions_.secure.identitySeedPath.empty() && !dbDir.empty()) {
                     runtimeOptions_.secure.identitySeedPath = dbDir / "cluster.identity";
                 }
-                validateRuntimeMode(config_);
                 validateTransportScope(config_, runtimeOptions_);
                 manager_->setRoleChangeCallback(
                     [this](NodeRole role) {
