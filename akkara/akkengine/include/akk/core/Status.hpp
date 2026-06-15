@@ -31,7 +31,10 @@ namespace akkaradb::core {
     /**
      * @brief Lightweight status object used across AkkaraDB core and storage layers.
      *
-     * Status represents the outcome of operations in a zero-exception design.
+     * Status represents the outcome of subsystem operations that intentionally
+     * avoid exceptions on hot internal paths. It is not the global public API
+     * error contract; public storage APIs still throw standard exceptions for
+     * invalid configuration, closed-engine access, I/O failure, and corruption.
      * It is designed for high-frequency DB paths such as:
      * - MemTable writes
      * - WAL appends

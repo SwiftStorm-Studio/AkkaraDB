@@ -72,11 +72,11 @@ std::span<const uint8_t> bytes(std::string_view s) {
 }
 
 AkkEngineOptions opts;
-opts.paths.data_dir = "data";
-opts.components.version_log_enabled = true;
-opts.wal.sync_mode = wal::WalSyncMode::Async;
-opts.blob.threshold_bytes = 16 * 1024;
-opts.runtime.sst_promote_reads = true;
+opts.paths.dataDir = "data";
+opts.components.versionLogEnabled = true;
+opts.wal.syncMode = wal::WalSyncMode::ASYNC;
+opts.blob.thresholdBytes = 16 * 1024;
+opts.runtime.sstPromoteReads = true;
 
 auto engine = AkkEngine::open(std::move(opts));
 
@@ -88,12 +88,12 @@ if (value) {
 }
 
 std::vector<uint8_t> out;
-if (engine->get_into(bytes("user:1"), out)) {
+if (engine->getInto(bytes("user:1"), out)) {
     // optional allocation を避ける hot read path
 }
 
 engine->remove(bytes("user:1"));
-engine->force_sync();
+engine->forceSync();
 engine->close();
 ```
 
@@ -109,14 +109,14 @@ for (auto it = rows.begin(); !(it == rows.end()); ++it) {
 }
 ```
 
-`version_log_enabled` が有効な場合は version history も使えます。
+`versionLogEnabled` が有効な場合は version history も使えます。
 
 ```cpp
-auto at = engine->get_at(bytes("user:1"), target_seq);
+auto at = engine->getAt(bytes("user:1"), target_seq);
 auto history = engine->history(bytes("user:1"));
 
-engine->rollback_key(bytes("user:1"), target_seq);
-engine->rollback_to(target_seq);
+engine->rollbackKey(bytes("user:1"), target_seq);
+engine->rollbackTo(target_seq);
 ```
 
 ---
@@ -152,12 +152,12 @@ users.put({2, "bob@example.test", "Bob", 30});
 auto alice = users.get(1ULL);
 
 User out{};
-if (users.get_into(2ULL, out)) {
+if (users.getInto(2ULL, out)) {
     // out contains Bob
 }
 
 auto age30 = by_age.find(30U);
-while (age30.has_next()) {
+while (age30.hasNext()) {
     auto entry = age30.next();
     auto id = entry.id;
     auto user = entry.value;
@@ -166,9 +166,9 @@ while (age30.has_next()) {
 auto adults = users
     .query([](const User& user) { return user.age >= 18; })
     .limit(100)
-    .to_vector();
+    .toVector();
 
-auto first_bob = users.find_by<&User::email>(std::string{"bob@example.test"});
+auto first_bob = users.findBy<&User::email>(std::string{"bob@example.test"});
 
 users.upsert(2ULL, [](User& user) {
     user.name = "Bobby";
@@ -282,14 +282,14 @@ C++ と JVM の両方で細かい override ができます。
 
 | Override                     | C++                            | JVM                         |
 |------------------------------|--------------------------------|-----------------------------|
-| MemTable threshold per shard | `memtable_threshold_per_shard` | `memtableThresholdPerShard` |
-| Version log                  | `version_log_enabled`          | `versionLogEnabled`         |
-| SST codec                    | `sst_codec`                    | `sstCodec`                  |
-| Blob codec                   | `blob_codec`                   | `blobCodec`                 |
-| Blob threshold               | `blob_threshold_bytes`         | `blobThresholdBytes`        |
-| Promote SST reads            | `sst_promote_reads`            | `sstPromoteReads`           |
-| Bloom bits per key           | `sst_bloom_bits_per_key`       | `sstBloomBitsPerKey`        |
-| Max L0 SST files             | `max_l0_sst_files`             | `maxL0SstFiles`             |
+| MemTable threshold per shard | `memtableThresholdPerShard` | `memtableThresholdPerShard` |
+| Version log                  | `versionLogEnabled`          | `versionLogEnabled`         |
+| SST codec                    | `sstCodec`                    | `sstCodec`                  |
+| Blob codec                   | `blobCodec`                   | `blobCodec`                 |
+| Blob threshold               | `blobThresholdBytes`         | `blobThresholdBytes`        |
+| Promote SST reads            | `sstPromoteReads`            | `sstPromoteReads`           |
+| Bloom bits per key           | `sstBloomBitsPerKey`       | `sstBloomBitsPerKey`        |
+| Max L0 SST files             | `maxL0SstFiles`             | `maxL0SstFiles`             |
 
 ---
 
@@ -321,7 +321,7 @@ read path:
 MemTable -> SSTManager -> BlobManager when the value is externalized
 ```
 
-SST read は Bloom filter と sparse block index を使います。`sst_promote_reads` が有効な場合、SST hit を MemTable に戻すことができます。
+SST read は Bloom filter と sparse block index を使います。`sstPromoteReads` が有効な場合、SST hit を MemTable に戻すことができます。
 
 ---
 
@@ -329,17 +329,17 @@ SST read は Bloom filter と sparse block index を使います。`sst_promote_
 
 ```cpp
 akkaradb::AkkaraDB::Options opts;
-opts.data_dir = "data";
+opts.dataDir = "data";
 opts.mode = akkaradb::StartupMode::FAST;
 
-opts.overrides.memtable_threshold_per_shard = 128ULL << 20;
-opts.overrides.version_log_enabled = true;
-opts.overrides.sst_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_threshold_bytes = 32ULL * 1024ULL;
-opts.overrides.sst_promote_reads = true;
-opts.overrides.sst_bloom_bits_per_key = 10;
-opts.overrides.max_l0_sst_files = 8;
+opts.overrides.memtableThresholdPerShard = 128ULL << 20;
+opts.overrides.versionLogEnabled = true;
+opts.overrides.sstCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobThresholdBytes = 32ULL * 1024ULL;
+opts.overrides.sstPromoteReads = true;
+opts.overrides.sstBloomBitsPerKey = 10;
+opts.overrides.maxL0SstFiles = 8;
 
 auto db = akkaradb::AkkaraDB::open(std::move(opts));
 ```
@@ -350,12 +350,12 @@ native configuration の詳細は [SPEC.md section 14](../../SPEC.md#14-configur
 
 ## API Servers
 
-`components.api_enabled` を有効にすると、internal engine は HTTP と TCP API backend を起動できます。
+`components.apiEnabled` を有効にすると、internal engine は HTTP と TCP API backend を起動できます。
 
 ```cpp
 AkkEngineOptions opts;
-opts.paths.data_dir = "data";
-opts.components.api_enabled = true;
+opts.paths.dataDir = "data";
+opts.components.apiEnabled = true;
 opts.api.bind_host = "127.0.0.1";
 opts.api.backends = {
     AkkEngineOptions::ApiBackend::Http,
@@ -373,7 +373,7 @@ HTTP endpoints:
 | `POST`   | `/v1/put?key=<percent-encoded>`                 |
 | `GET`    | `/v1/get?key=<percent-encoded>`                 |
 | `DELETE` | `/v1/remove?key=<percent-encoded>`              |
-| `GET`    | `/v1/get_at?key=<percent-encoded>&seq=<number>` |
+| `GET`    | `/v1/getAt?key=<percent-encoded>&seq=<number>` |
 
 binary TCP protocol は `AK5Q` request frame と `AK5S` response frame を使います。frame layout は [SPEC.md section 11.2](../../SPEC.md#112-binary-protocol-v2)
 にあります。
@@ -383,7 +383,7 @@ binary TCP protocol は `AK5Q` request frame と `AK5S` response frame を使い
 ## File Layout
 
 ```text
-{data_dir}/
+{dataDir}/
 |-- wal/             Write-ahead log segments
 |-- sstable/         SST levels
 |   |-- L0/
@@ -439,6 +439,18 @@ dependency は CMake の `FetchContent` で取得されます。
 
 現在の native specification は [SPEC.md](../../SPEC.md) です。record layout、WAL/SST/blob/manifest format、API framing、configuration、concurrency、recovery behavior
 をまとめています。
+
+---
+
+## Architecture
+
+native engine ? subsystem?data flow?recovery?concurrency model ? [readme/ja/ARCHITECTURE_ja.md](ARCHITECTURE_ja.md) ?????????
+
+---
+
+## Native API Usage
+
+???? `AkkEngine` API ????? typed table API ????? [readme/ja/API_USAGE_ja.md](API_USAGE_ja.md) ?????????
 
 ---
 

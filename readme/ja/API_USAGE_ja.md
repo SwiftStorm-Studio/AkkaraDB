@@ -89,6 +89,8 @@ if (db->getIntoArena(bytes("user:2"), arena, view)) {
 }
 ```
 
+### Scan
+
 range scan は caller-owned の `BufferArena` を受け取り、`ArenaGenerator<ScanRecordView>` を返します。返される key/value view は arena の lifetime 中だけ有効です。
 
 ```cpp
@@ -103,6 +105,8 @@ for (auto it = rows.begin(); !(it == rows.end()); ++it) {
 }
 ```
 
+### Version History
+
 VersionLog を有効にすると、履歴、point-in-time read、rollback が使えます。
 
 ```cpp
@@ -116,6 +120,8 @@ if (!history.empty()) {
     (void)oldValue;
 }
 ```
+
+### Main Low-Level Operations
 
 主な低レベル API は `put`、`putHinted`、`putBatch`、`remove`、`removeHinted`、`get`、`getBatch`、`exists`、`getInto`、`getIntoArena`、`count`、`scan`、`getAt`、`history`、`rollbackTo`、`rollbackKey`、`stats`、`forceSync`、`forceFlush`、`close` です。
 
@@ -171,7 +177,7 @@ int main() {
 
 `AKKARADB_QUERYABLE(Type, A, B, C, D)` は query proxy を作る macro です。現行 macro は 4 field 分を受け取ります。`AKKARADB_ENTITY(Type, PrimaryKey, B, C, D)` は `AKKARADB_QUERYABLE` に加えて `Ref<T>` 用の `RefTraits<T>` も定義します。
 
-## secondary index
+### Secondary Indexes
 
 `index<&T::field>()` は index handle を返し、`indexed<&T::field>()` は table に index を登録して同じ table を返します。index は non-unique なので、同じ field value を持つ entity が複数あれば `find()` は複数行を返します。
 
@@ -200,7 +206,7 @@ while (age30.hasNext()) {
 
 indexed field の保存形式は query range に使えるよう調整されています。整数と浮動小数は bytewise order が値の順序に合う sortable encoding を使い、それ以外は BinPack encoding を使います。
 
-## scan と query helper
+### Scans And Query Helpers
 
 table scan は table namespace の中だけを対象にします。
 
@@ -271,7 +277,7 @@ auto missingAge = profiles.query([](auto profile) {
 
 登録済み index があり、predicate が index source に変換できる形なら、query planner は index scan を使ってから C++ 側で残りの predicate を評価します。対応しない形は table scan に fallback します。
 
-## Ref、Schema、foreign key、join
+### Ref, Schema, Foreign Keys, And Joins
 
 `Ref<T>` は参照先の primary key だけを保存し、binding が attached されていれば dereference 時に lazily resolve します。
 
@@ -336,6 +342,13 @@ auto plainPosts = db->table<&PlainPost::id>("plain_posts");
 auto joinedById = plainPosts.join<&PlainPost::authorId, &Author::id>(authors).toVector();
 ```
 
+### Error Handling
+
+Native API は zero-exception API ではありません。通常の「存在しない」は戻り値で表し、呼び出しの誤りやストレージ処理の失敗は標準例外で表します。
+
+`get()`、`getAt()`、typed `PackedTable::get()` は値が存在しない場合に `std::nullopt` を返します。`getInto()`、`getIntoArena()`、typed `getInto()` は同じ状況で `false` を返します。scan、query、join、history の結果が空の場合は、空の range/vector として扱われます。
+
+一方で、close 済み engine への操作、不正な設定、未利用 backend、危険な cluster transport 設定、I/O 失敗、永続化データの破損、CRC 不一致、detached `Ref<T>` の dereference、存在しない foreign-key target、未登録 index に対する `findBy()` は `std::runtime_error` または `std::invalid_argument` を投げます。typed scan/query/index range は `hasNext()` を確認してから `next()` を呼ぶ前提で、終端後の `next()` は `std::out_of_range` を投げます。
 ## StartupMode と Options
 
 高レベル API では `StartupMode` で durability profile を選びます。
@@ -376,3 +389,10 @@ opts.components.sstEnabled = false;
 
 auto db = akkaradb::engine::AkkEngine::open(std::move(opts));
 ```
+
+
+## Choosing The Right API
+
+application code ? typed entity ???????????? API ??????table namespace?primary-key encoding?BinPack serialization?secondary-index maintenance ? database API ???????????????? code ???????????
+
+storage engine ?????????????? binary key layout ???????????? protocol / JNI / server layer ? byte buffer ?????????????? API ?????????? API ?? schema ? key design ? caller responsibility ?????????? prefix layout ? serialization format ???????????????

@@ -18,7 +18,7 @@ Multi-machine benchmark results are recorded in [`benchmarks/MULTI_MACHINE_BENCH
 | `akkaradb_sstable_throughput_benchmark`  | Measures SST writer throughput, point-read throughput, full-scan throughput, sampled latency, and generated file bytes.        |
 | `akkaradb_sstable_bloom_negative_lookup_benchmark` | Measures in-range negative SST lookups that exercise the Bloom filter rejection path.                              |
 | `akkaradb_benchmark`                    | Compares raw `AkkEngine` access with SPECv5 `PackedTable` typed CRUD and secondary-index lookup overhead.          |
-| `akkaradb_typed_api_smoke_test`         | Checks typed CRUD, `get_into`, BinPack round-trip, table-scoped scan/count, and non-unique index cleanup.          |
+| `akkaradb_typed_api_smoke_test`         | Checks typed CRUD, `getInto`, BinPack round-trip, table-scoped scan/count, and non-unique index cleanup.          |
 | `akkaradb_manifest_smoke_test`           | Checks Manifest SST lifecycle records, compaction commit, and CRC replay behavior.                                             |
 | `akkaradb_versionlog_smoke_test`         | Checks VersionLog append, history, get-at, and rollback behavior.                                                              |
 

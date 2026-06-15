@@ -11,7 +11,7 @@ The high-level API is `akkaradb::AkkaraDB` with `akkaradb::PackedTable`. It stor
 When AkkaraDB is installed as a CMake package, link the exported target:
 
 ```cmake
-find_package(AkkaraDB REQUIRED)
+find_package(AkkaraDB CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE AkkaraDB::akkaradb)
 target_compile_features(my_app PRIVATE cxx_std_23)
 ```
@@ -25,7 +25,7 @@ For the high-level API, this include is usually enough:
 For direct low-level engine access, include the engine header:
 
 ```cpp
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 ```
 
 ## Low-Level API
@@ -33,7 +33,7 @@ For direct low-level engine access, include the engine header:
 `AkkEngine` is a raw key/value API. The engine does not interpret your schema, so the caller owns key design, value encoding, and decode logic.
 
 ```cpp
-#include "engine/AkkEngine.hpp"
+#include "akk/engine/AkkEngine.hpp"
 
 #include <cstdint>
 #include <span>
@@ -60,11 +60,11 @@ std::string text(std::span<const uint8_t> value) {
 
 int main() {
     engine::AkkEngineOptions opts;
-    opts.paths.data_dir = "data";
-    opts.components.version_log_enabled = true;
-    opts.wal.sync_mode = engine::wal::WalSyncMode::Async;
-    opts.blob.threshold_bytes = 32 * 1024;
-    opts.runtime.sst_promote_reads = true;
+    opts.paths.dataDir = "data";
+    opts.components.versionLogEnabled = true;
+    opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+    opts.blob.thresholdBytes = 32 * 1024;
+    opts.runtime.sstPromoteReads = true;
 
     auto db = engine::AkkEngine::open(std::move(opts));
 
@@ -80,7 +80,7 @@ int main() {
     }
 
     std::vector<uint8_t> out;
-    if (db->get_into(bytes("user:2"), out)) {
+    if (db->getInto(bytes("user:2"), out)) {
         auto name = std::string{
             reinterpret_cast<const char*>(out.data()),
             out.size()
@@ -94,12 +94,12 @@ int main() {
     (void)count;
 
     db->remove(bytes("user:1"));
-    db->force_sync();
+    db->forceSync();
     db->close();
 }
 ```
 
-`get()` returns `std::optional<std::vector<uint8_t>>`. For hot read paths where you want to reuse caller-owned storage, use `get_into()`. For arena-backed reads, use `get_into_arena()`.
+`get()` returns `std::optional<std::vector<uint8_t>>`. For hot read paths where you want to reuse caller-owned storage, use `getInto()`. For arena-backed reads, use `getIntoArena()`.
 
 ### Scan
 
@@ -139,7 +139,7 @@ The `start_key` and `end_key` arguments are intended to describe a half-open ran
 
 ### Version History
 
-Enable `components.version_log_enabled` to use per-key history, point-in-time reads, and rollback.
+Enable `components.versionLogEnabled` to use per-key history, point-in-time reads, and rollback.
 
 ```cpp
 db->put(bytes("profile:1"), bytes("v1"));
@@ -147,29 +147,29 @@ db->put(bytes("profile:1"), bytes("v2"));
 
 auto history = db->history(bytes("profile:1"));
 if (!history.empty()) {
-    auto old_value = db->get_at(bytes("profile:1"), history.front().seq);
-    db->rollback_key(bytes("profile:1"), history.front().seq);
+    auto old_value = db->getAt(bytes("profile:1"), history.front().seq);
+    db->rollbackKey(bytes("profile:1"), history.front().seq);
 }
 ```
 
-`rollback_to()` rolls the whole engine back to the requested sequence. Because that has a wider blast radius than `rollback_key()`, production code should call it only with explicit durability and operational expectations.
+`rollbackTo()` rolls the whole engine back to the requested sequence. Because that has a wider blast radius than `rollbackKey()`, production code should call it only with explicit durability and operational expectations.
 
 ### Main Low-Level Operations
 
 | Operation | API | Purpose |
 |---|---|---|
 | write | `put(key, value)` | Store a key/value pair |
-| write with hint | `put_hinted(key, value, fp64, mini_key)` | Hot path when the caller already has key fingerprints |
+| write with hint | `putHinted(key, value, fp64, miniKey)` | Hot path when the caller already has key fingerprints |
 | delete | `remove(key)` | Delete a key |
 | read | `get(key)` | Read as an optional vector |
-| read into buffer | `get_into(key, out)` | Read into caller-owned vector storage |
-| arena read | `get_into_arena(key, arena, out)` | Read as a view tied to arena lifetime |
+| read into buffer | `getInto(key, out)` | Read into caller-owned vector storage |
+| arena read | `getIntoArena(key, arena, out)` | Read as a view tied to arena lifetime |
 | exists | `exists(key)` | Check whether a key exists |
 | count | `count(start, end)` | Count keys in a range |
 | scan | `scan(arena, start, end)` | Iterate key/value pairs in a range |
 | stats | `stats()` | Inspect engine, WAL, MemTable, SST, and Blob stats |
-| flush | `force_flush()` | Flush MemTable data toward SST storage |
-| sync | `force_sync()` | Explicitly synchronize durable state |
+| flush | `forceFlush()` | Flush MemTable data toward SST storage |
+| sync | `forceSync()` | Explicitly synchronize durable state |
 | close | `close()` | Close the engine |
 
 ## High-Level API
@@ -204,7 +204,7 @@ int main() {
     (void)alice;
 
     User bob{};
-    if (users.get_into(2, bob)) {
+    if (users.getInto(2, bob)) {
         bob.age = 26;
     }
 
@@ -237,10 +237,10 @@ auto by_age = users.index<&User::age>();
 users.put({1, "alice@example.test", "Alice", 30});
 users.put({2, "bob@example.test", "Bob", 30});
 
-auto found = users.find_by<&User::email>(std::string{"alice@example.test"});
+auto found = users.findBy<&User::email>(std::string{"alice@example.test"});
 
 auto age30 = by_age.find(30U);
-while (age30.has_next()) {
+while (age30.hasNext()) {
     auto entry = age30.next();
     uint64_t id = entry.id;
     User user = entry.value;
@@ -249,25 +249,25 @@ while (age30.has_next()) {
 }
 ```
 
-Indexes are non-unique. If multiple entities have the same indexed field value, `find()` returns multiple rows. `find_by()` uses a registered index and returns the first match.
+Indexes are non-unique. If multiple entities have the same indexed field value, `find()` returns multiple rows. `findBy()` uses a registered index and returns the first match.
 
 ### Scans And Query Helpers
 
 Table scans are scoped to the table namespace.
 
 ```cpp
-auto all = users.scan_all();
-while (all.has_next()) {
+auto all = users.scanAll();
+while (all.hasNext()) {
     auto entry = all.next();
 }
 
 auto range = users.scan(10ULL, 100ULL);
-while (range.has_next()) {
+while (range.hasNext()) {
     auto entry = range.next();
 }
 ```
 
-Query helpers accept a predicate and expose `first()`, `any()`, `count()`, `limit()`, and `to_vector()`.
+Query helpers accept a predicate and expose `first()`, `any()`, `count()`, `limit()`, and `toVector()`.
 
 ```cpp
 auto adults = users
@@ -275,7 +275,7 @@ auto adults = users
         return user.age >= 18;
     })
     .limit(100)
-    .to_vector();
+    .toVector();
 
 auto bob = users
     .query([](auto user) {
@@ -290,17 +290,90 @@ const bool has_senior = users
     .any();
 ```
 
-Define `AKKARADB_QUERYABLE(User, id, email, name, age)` to use field expressions in query predicates. The expression layer supports `==`, `!=`, `>`, `>=`, `<`, `<=`, `&&`, `||`, `in()`, `not_in()`, `starts_with()`, `contains()`, and `like()`.
+Define `AKKARADB_QUERYABLE(User, id, email, name, age)` to use field expressions in query predicates. The expression layer supports `==`, `!=`, `>`, `>=`, `<`, `<=`, `&&`, `||`, `!`, `in()`, `notIn()`, `startsWith()`, `contains()`, `like()`, `isNull()`, and `isNotNull()`.
 
 ```cpp
 auto selected = users
     .query([](auto user) {
-        return user.email.starts_with("alice@") || user.age.in({30U, 31U});
+        return user.email.startsWith("alice@") || user.age.in({30U, 31U});
     })
-    .to_vector();
+    .toVector();
 ```
 
 When a registered index exists and the predicate can be planned as an index lookup, the query uses an index scan. Otherwise it falls back to a table scan and evaluates the predicate in C++.
+
+### Ref, Schema, Foreign Keys, And Joins
+
+`Ref<T>` stores only the target primary key in the serialized entity. When the reference is attached to a table binding, dereferencing it lazily resolves the target entity through the database.
+
+```cpp
+struct Author {
+    uint64_t id;
+    std::string name;
+    uint32_t age;
+    std::string email;
+};
+
+AKKARADB_ENTITY(Author, id, name, age, email);
+
+struct Post {
+    uint64_t id;
+    akkaradb::Ref<Author> author;
+    std::string body;
+    uint32_t likes;
+    std::string title;
+};
+
+AKKARADB_ENTITY(Post, id, author, body, likes);
+
+auto schema = db->schema()
+    .table<&Author::id>("authors")
+    .table<&Post::id>("posts")
+    .foreignKey<&Post::author>()
+    .open();
+
+auto& authors = schema.table<Author>();
+auto& posts = schema.table<Post>();
+
+authors.put({1, "Alice", 30, "alice@example.test"});
+posts.put({100, akkaradb::ref<Author>(1), "hello", 5, "first"});
+
+auto post = posts.get(100);
+std::string author_name = post->author->name;
+
+auto joined = posts
+    .join<&Post::author>(authors)
+    .where([](const Post& post, const Author& author) {
+        return post.likes > 0 && author.name == "Alice";
+    })
+    .toVector();
+```
+
+`foreignKey<&Post::author>()` validates that the referenced entity exists before storing a row. The schema helper currently uses `OnDelete::Cascade`, so deleting the referenced row also deletes rows that reference it. Without `Schema`, a table can be wired manually with `bindRef<&Post::author>(authors)` and `cascadeDeleteFrom<&Post::author>(posts)`.
+
+Joins are not limited to `Ref<T>` fields. They can also join compatible plain fields:
+
+```cpp
+struct PlainPost {
+    uint64_t id;
+    uint64_t authorId;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_QUERYABLE(PlainPost, id, authorId, body, likes)
+
+auto plain_posts = db->table<&PlainPost::id>("plain_posts");
+auto joined_by_id = plain_posts.join<&PlainPost::authorId, &Author::id>(authors).toVector();
+```
+
+### Error Handling
+
+The public Native API is not zero-exception. It uses return values for expected absence and exceptions for invalid use or failed storage operations.
+
+`get()`, `getAt()`, and typed `PackedTable::get()` return `std::nullopt` when the requested value is absent. `getInto()`, `getIntoArena()`, and typed `getInto()` return `false` for the same case. Empty scans, queries, joins, and history calls produce empty iterators or vectors.
+
+Closed-engine access, invalid configuration, unavailable API backends, unsafe cluster transport settings, I/O failures, corrupt persisted data, CRC mismatches, detached `Ref<T>` dereference, missing foreign-key targets, and unregistered `findBy()` indexes throw standard exceptions, usually `std::runtime_error` or `std::invalid_argument`. Typed scan/query/index ranges require `hasNext()` before `next()`; calling `next()` after the range is exhausted throws `std::out_of_range`.
 
 ## StartupMode And Options
 
@@ -317,16 +390,16 @@ Use `AkkaraDB::Options` for finer control.
 
 ```cpp
 akkaradb::AkkaraDB::Options opts;
-opts.data_dir = "data";
+opts.dataDir = "data";
 opts.mode = akkaradb::StartupMode::FAST;
-opts.overrides.memtable_threshold_per_shard = 128ULL << 20;
-opts.overrides.version_log_enabled = true;
-opts.overrides.sst_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_codec = akkaradb::Codec::Zstd;
-opts.overrides.blob_threshold_bytes = 32ULL * 1024ULL;
-opts.overrides.sst_promote_reads = true;
-opts.overrides.sst_bloom_bits_per_key = 10;
-opts.overrides.max_l0_sst_files = 8;
+opts.overrides.memtableThresholdPerShard = 128ULL << 20;
+opts.overrides.versionLogEnabled = true;
+opts.overrides.sstCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobCodec = akkaradb::Codec::ZSTD;
+opts.overrides.blobThresholdBytes = 32ULL * 1024ULL;
+opts.overrides.sstPromoteReads = true;
+opts.overrides.sstBloomBitsPerKey = 10;
+opts.overrides.maxL0SstFiles = 8;
 
 auto db = akkaradb::AkkaraDB::open(std::move(opts));
 ```
@@ -335,10 +408,10 @@ The low-level API uses `AkkEngineOptions` directly. Components can be disabled i
 
 ```cpp
 akkaradb::engine::AkkEngineOptions opts;
-opts.components.wal_enabled = false;
-opts.components.blob_enabled = false;
-opts.components.manifest_enabled = false;
-opts.components.sst_enabled = false;
+opts.components.walEnabled = false;
+opts.components.blobEnabled = false;
+opts.components.manifestEnabled = false;
+opts.components.sstEnabled = false;
 
 auto db = akkaradb::engine::AkkEngine::open(std::move(opts));
 ```

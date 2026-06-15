@@ -325,12 +325,12 @@ When a shard crosses `thresholdBytesPerShard`, it can be sealed and flushed. The
 | Field                     | Default                                                  | Description                                                                             |
 |---------------------------|----------------------------------------------------------|-----------------------------------------------------------------------------------------|
 | `walDir`                 | `{dataDir}/wal`                                         | Segment directory                                                                       |
-| `sync_mode`               | `Sync` at engine level, changed by `StartupMode` presets | `Sync`, `Async`, or `Off`                                                               |
-| `shard_count`             | 0                                                        | Auto, one shard per hardware thread capped by implementation; engine writer auto cap 64 |
-| `group_n`                 | 128                                                      | Async batch entry trigger                                                               |
-| `group_micros`            | 100                                                      | Async batch time trigger                                                                |
-| `group_bytes`             | 4 MiB                                                    | Async batch byte trigger                                                                |
-| `async_max_pending_bytes` | 64 MiB                                                   | Backpressure threshold                                                                  |
+| `syncMode`                | `SYNC` at engine level, changed by `StartupMode` presets | `SYNC`, `ASYNC`, or `OFF`                                                               |
+| `shardCount`              | 0                                                        | Auto, one shard per hardware thread capped by implementation; engine writer auto cap 64 |
+| `groupN`                  | 128                                                      | Async batch entry trigger                                                               |
+| `groupMicros`             | 100                                                      | Async batch time trigger                                                                |
+| `groupBytes`              | 4 MiB                                                    | Async batch byte trigger                                                                |
+| `asyncMaxPendingBytes`    | 64 MiB                                                   | Backpressure threshold                                                                  |
 
 ### 6.2 Segment Header
 
@@ -563,7 +563,7 @@ The VersionLog records per-key history when enabled. It powers:
 | Field       | Default                     | Description       |
 |-------------|-----------------------------|-------------------|
 | `logPath`  | `{dataDir}/history.akvlog` | Version log file  |
-| `sync_mode` | `Async`                     | `Sync` or `Async` |
+| `syncMode` | `ASYNC`                     | `SYNC` or `ASYNC` |
 
 ### 10.3 VersionEntry
 
@@ -1234,6 +1234,23 @@ Depending on enabled components and sync modes, background work may include:
 
 Unrecoverable I/O, corrupt-file, invalid-configuration, and closed-engine cases throw standard exceptions, typically `std::runtime_error` or
 `std::invalid_argument`. Expected absence is represented with `std::optional` or `bool`.
+
+This is the Native API contract:
+
+| Case | API behavior |
+|------|--------------|
+| Missing key or missing historical value | `get`, `getAt`, and typed `PackedTable::get` return `std::nullopt`; `getInto`, `getIntoArena`, and typed `getInto` return `false`. |
+| Empty result set | `scan`, `scanAll`, index ranges, `history`, `query().toVector()`, and joins return an empty iterator/vector. |
+| Closed or moved-from engine handle | Public `AkkEngine` operations throw `std::runtime_error`. |
+| Invalid configuration, unsupported backend, invalid cluster topology, unsafe plain transport, malformed primary key | Throws `std::invalid_argument` or `std::runtime_error` at the failing boundary. |
+| Storage I/O failure, corrupt SST/blob/manifest/version-log data, CRC mismatch | Throws `std::runtime_error` instead of returning a negative result. |
+| Version-log mutation while the version log is disabled | `rollbackTo` and `rollbackKey` throw `std::runtime_error`; `getAt` returns `std::nullopt` when no version-log reader is available. |
+| Typed table `findBy` on an unregistered secondary index | Throws `std::runtime_error`. Register the index with `index<&T::field>()` or `indexed<&T::field>()` before using `findBy`. |
+| Calling `next()` after `hasNext()` is false | Typed scan, query, and index ranges throw `std::out_of_range`. |
+| Detached `Ref<T>` dereference or missing referenced entity | Throws `std::runtime_error`. Foreign-key writes also throw when the registered referenced entity is absent. |
+| Truncated BinPack/wire payload | Low-level read helpers throw `std::runtime_error`; boolean decode wrappers only return `false` for decode paths that catch and classify malformed input. |
+
+`core::Status` is an internal lightweight status value for subsystems that keep a non-throwing hot path. It does not make the public Native API zero-exception.
 
 ### 18.2 Startup Recovery
 

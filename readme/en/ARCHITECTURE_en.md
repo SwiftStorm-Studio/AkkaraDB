@@ -84,10 +84,10 @@ At a high level, the architecture looks like this:
 
 ## Storage Layout
 
-When `paths.data_dir` is set, missing component paths are derived from that directory.
+When `paths.dataDir` is set, missing component paths are derived from that directory.
 
 ```text
-{data_dir}/
+{dataDir}/
 |-- wal/             WAL segment files
 |-- sstable/         SST levels
 |   |-- L0/
@@ -126,13 +126,15 @@ The native repository exposes two main API levels.
 
 The JVM layer reaches the same native engine through JNI when `AKKARADB_BUILD_JNI=ON`. The JNI bridge exposes raw operations, scan cursors, query scan payload evaluation, option-based open, and rollback entry points used by the Kotlin module.
 
+Public API errors follow the same boundary as `SPEC.md`: expected absence is represented with `std::optional`, `bool`, or an empty range, while invalid use and failed storage operations throw. Missing keys are not exceptional, but closed-engine calls, invalid options, missing typed foreign-key targets, unregistered `findBy()` indexes, corrupt persisted data, and I/O failures surface as standard exceptions. API servers catch those exceptions at the protocol boundary and return an error response or status instead of exposing C++ exceptions to clients.
+
 ### AkkEngine
 
 `AkkEngine` is the coordinator. It owns or connects the storage components and gives the rest of the system a single thread-safe mutation and read surface.
 
 Main responsibilities:
 
-- derive component paths from `data_dir`
+- derive component paths from `dataDir`
 - create or open WAL, SST, Blob, Manifest, VersionLog, API, and cluster components according to options
 - serialize top-level write sequence assignment
 - externalize large values before writing records
@@ -188,7 +190,7 @@ Lookup returns records visible at the requested snapshot. Tombstones are returne
 Flush lifecycle:
 
 ```text
-shard crosses threshold_bytes_per_shard
+shard crosses thresholdBytesPerShard
   |
   +-- shard can be sealed
   +-- engine on_flush callback receives sorted RecordView span
@@ -199,7 +201,7 @@ shard crosses threshold_bytes_per_shard
 
 ### Write-Ahead Log
 
-The WAL stores append-only mutation records for crash recovery. Native v5 uses a segmented WAL under `{data_dir}/wal`, and each segment starts with a CRC-protected `WalSegmentHeader`.
+The WAL stores append-only mutation records for crash recovery. Native v5 uses a segmented WAL under `{dataDir}/wal`, and each segment starts with a CRC-protected `WalSegmentHeader`.
 
 Entries are serialized as:
 
@@ -221,14 +223,14 @@ During startup recovery, segment headers and entry CRCs are validated before ent
 
 ### Blob Manager
 
-The Blob Manager externalizes values whose size is greater than or equal to `blob.threshold_bytes`, default 16 KiB. This keeps MemTable records, WAL entries, and SST blocks smaller while preserving the normal `get` API shape.
+The Blob Manager externalizes values whose size is greater than or equal to `blob.thresholdBytes`, default 16 KiB. This keeps MemTable records, WAL entries, and SST blocks smaller while preserving the normal `get` API shape.
 
 Write path:
 
 ```text
 value size >= threshold
   |
-  +-- BlobManager writes the payload to {data_dir}/blobs
+  +-- BlobManager writes the payload to {dataDir}/blobs
   +-- optional Zstd compression is applied
   +-- Blob header and content CRC are stored
   +-- record value becomes BlobRef(blob_id, total_size, content_crc32c)
@@ -302,10 +304,10 @@ Manifest replay rebuilds in-memory SST lifecycle state. Malformed or CRC-invalid
 
 The Version Log records per-key history when enabled. It powers:
 
-- `get_at(key, seq)`
+- `getAt(key, seq)`
 - `history(key)`
-- `rollback_to(seq)`
-- `rollback_key(key, seq)`
+- `rollbackTo(seq)`
+- `rollbackKey(key, seq)`
 
 Each version entry stores sequence, source node id, timestamp, flags, and value bytes. Rollback-generated records use a reserved rollback node id and rollback flag so they can be distinguished from normal writes.
 
@@ -313,7 +315,7 @@ Version history is disabled by default in `FAST` and `NORMAL`, and enabled by th
 
 ### API Servers
 
-The engine can start embedded API backends when `components.api_enabled` is set.
+The engine can start embedded API backends when `components.apiEnabled` is set.
 
 Supported backends:
 
@@ -321,10 +323,11 @@ Supported backends:
 |---|---:|---|
 | HTTP | 7070 | REST-style key/value operations |
 | TCP | 7071 | Binary AK5 request/response protocol |
+| GRPC | 7072 | Protobuf/gRPC service when the gRPC module is registered |
 
-The binary protocol uses `AK5Q` request frames and `AK5S` response frames. Current opcodes include `Get`, `Put`, `Remove`, and `GetAt`.
+The binary protocol uses `AK5Q` request frames and `AK5S` response frames. Current opcodes include `Get`, `Put`, `Remove`, `GetAt`, `BatchPut`, `BatchGet`, `Ping`, `Exists`, `Count`, `Scan`, `History`, `RollbackTo`, `RollbackKey`, `ForceSync`, `ForceFlush`, and `Stats`.
 
-The HTTP API exposes basic endpoints such as `/v1/ping`, `/v1/put`, `/v1/get`, `/v1/remove`, and `/v1/get_at`.
+The HTTP API exposes `/v1/ping`, `/v1/put`, `/v1/get`, `/v1/remove`, `/v1/exists`, `/v1/count`, `/v1/scan`, `/v1/getAt`, `/v1/history`, `/v1/rollbackTo`, `/v1/rollbackKey`, `/v1/batchPut`, `/v1/batchGet`, `/v1/forceSync`, `/v1/forceFlush`, and `/v1/stats`.
 
 ### Cluster Runtime and TLS
 
@@ -336,13 +339,13 @@ The cluster layer supports three deployment modes:
 | `Mirror` | Writes are mirrored to all data-bearing nodes |
 | `Stripe` | Keys are assigned to data nodes by router policy |
 
-Stripe routing primitives exist, but the runtime currently rejects Stripe configs because distributed write forwarding and ownership migration are not implemented yet.
+Stripe runtime creation is accepted. The router uses deterministic rendezvous hashing to choose one data-bearing owner for each key, and the selected owner is available through `ClusterRuntime::router()`. Ownership migration after node-set or placement-policy changes is still treated as an explicit operational procedure.
 
 Node roles are `Standalone`, `Primary`, and `Replica`. The primary accepts writes and ships records or blobs to replicas. Replicas apply replicated records and blobs through callbacks supplied by the engine.
 
 Acknowledgement policies are `Async`, `All`, and `Quorum`.
 
-`NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::TLS` wraps the TCP stream with mbedTLS, and `TransportMode::Plain` is allowed only when every node host is loopback or LAN/private address space. Hostnames other than `localhost` are treated as non-private during config validation. Primary selection is deterministic: the coordinator-eligible node with the lowest `node_id` becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not quorum consensus and does not provide split-brain-safe automatic failover.
+`NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel, and `TransportMode::PLAIN` is allowed only when every node host is loopback or LAN/private address space. Hostnames other than `localhost` are treated as non-private during config validation. Primary selection is deterministic: the coordinator-eligible node with the lowest `node_id` becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not quorum consensus and does not provide split-brain-safe automatic failover.
 
 TLS support is compiled into the current native target through mbedTLS. API servers and replication links can use TLS or plain transport depending on their runtime options.
 
@@ -390,7 +393,7 @@ get(key)
         +-- tombstone -> not found
         +-- normal    -> return value
         +-- blob      -> BlobManager::read(...)
-        +-- optional sst_promote_reads -> insert SST hit into MemTable
+        +-- optional sstPromoteReads -> insert SST hit into MemTable
 ```
 
 The MemTable is always the first authority for the current snapshot. SST is the fallback for data that has already been flushed. Blob dereference happens after the winning record has been selected.
@@ -451,7 +454,7 @@ Query and schema payload integers are little-endian. Unsupported operators must 
 `AkkEngine::open` performs startup in a fixed order:
 
 ```text
-1. Derive missing component paths from data_dir
+1. Derive missing component paths from dataDir
 2. Create required directories
 3. Load or generate persistent node id
 4. Open Manifest and prepare replay-capable state

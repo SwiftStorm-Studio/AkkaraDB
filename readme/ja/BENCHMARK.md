@@ -11,7 +11,7 @@
 | `akkaradb_wal_smoke_test`                | WAL append / recovery / tombstone / async force sync / corruption handling / rotation を確認する。   |
 | `akkaradb_wal_throughput_benchmark`      | Sharded WAL の append / close drain / recovery throughput を測る。詳細は `readme/ja/WAL_SETUP.md` を参照。 |
 | `akkaradb_manifest_smoke_test`           | Manifest の SST lifecycle record、compaction commit、CRC replay などを確認する。                          |
-| `akkaradb_versionlog_smoke_test`         | VersionLog の append / history / get_at / rollback 系の基本動作を確認する。                                 |
+| `akkaradb_versionlog_smoke_test`         | VersionLog の append / history / getAt / rollback 系の基本動作を確認する。                                 |
 
 ## ビルド例
 
