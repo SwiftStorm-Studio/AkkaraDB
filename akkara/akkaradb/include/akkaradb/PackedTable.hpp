@@ -27,6 +27,7 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 
 #include <array>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -1065,7 +1066,7 @@ namespace akkaradb {
                             ) != 0) { return; }
 
                             std::span<const uint8_t> pkBytes{key.data() + table_->pkPrefix_.size(), key.size() - table_->pkPrefix_.size()};
-                            Entry entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
+                            Entry entry{table_->decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                             table_->attachRefBindings(entry.value);
                             pending_ = std::move(entry);
                             ++it_;
@@ -1179,7 +1180,7 @@ namespace akkaradb {
                                         key.data() + table_->pkPrefix_.size(),
                                         key.size() - table_->pkPrefix_.size()
                                     };
-                                    entry = Entry{binpack::BinPack::decode<PK>(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
+                                    entry = Entry{table_->decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                                     table_->attachRefBindings(entry.value);
                                 }
                                 else {
@@ -2100,15 +2101,14 @@ namespace akkaradb {
 
             void makePkKey(const PK& pk, ArenaByteBuffer& out) const {
                 out.clear();
-                if constexpr (std::is_integral_v<PK> && sizeof(PK) <= 8) {
-                    out.resize(8 + sizeof(PK));
-                    std::memcpy(out.data(), pkPrefix_.data(), pkPrefix_.size());
-                    uint64_t v = static_cast<uint64_t>(std::make_unsigned_t<PK>(pk));
-                    for (size_t i = 0; i < sizeof(PK); ++i) { out[8 + i] = static_cast<uint8_t>(v >> (i * 8)); }
-                }
+                out.insert(out.end(), pkPrefix_.begin(), pkPrefix_.end());
+                encodePrimaryKeyBytes(pk, out);
+            }
+
+            template <typename Key>
+            static void encodePrimaryKeyBytes(const Key& pk, ArenaByteBuffer& out) {
+                if constexpr (std::is_integral_v<Key> && !std::is_same_v<Key, bool> && sizeof(Key) <= 8) { encodeSortableIntegral(pk, out); }
                 else {
-                    out.reserve(8 + binpack::BinPack::estimateSize(pk));
-                    out.insert(out.end(), pkPrefix_.begin(), pkPrefix_.end());
                     binpack::BinPack::encodeInto(pk, out);
                 }
             }
@@ -2121,10 +2121,35 @@ namespace akkaradb {
 
                 std::span<const uint8_t> valueSpan;
                 if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, valueSpan)) { return false; }
-                std::span pkSpan{pkBytes.data(), pkBytes.size()};
-                out = Entry{binpack::BinPack::decode<PK>(pkSpan), binpack::BinPack::decode<Entity>(valueSpan)};
+                out = Entry{decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(valueSpan)};
                 attachRefBindings(out.value);
                 return true;
+            }
+
+            [[nodiscard]] static PK decodePrimaryKeyBytes(std::span<const uint8_t> pkBytes) {
+                if constexpr (std::is_integral_v<PK> && !std::is_same_v<PK, bool> && sizeof(PK) <= 8) {
+                    return decodeSortableIntegral<PK>(pkBytes);
+                }
+                else { return binpack::BinPack::decode<PK>(pkBytes); }
+            }
+
+            template <typename Integral>
+            static void encodeSortableIntegral(Integral value, ArenaByteBuffer& out) {
+                using Unsigned = std::make_unsigned_t<Integral>;
+                Unsigned sortable = static_cast<Unsigned>(value);
+                if constexpr (std::is_signed_v<Integral>) { sortable ^= (Unsigned{1} << (sizeof(Integral) * 8 - 1)); }
+                writeIndexBigEndian(sortable, out);
+            }
+
+            template <typename Integral>
+            [[nodiscard]] static Integral decodeSortableIntegral(std::span<const uint8_t> bytes) {
+                if (bytes.size() != sizeof(Integral)) { throw std::invalid_argument("PackedTable: malformed primary key"); }
+
+                using Unsigned = std::make_unsigned_t<Integral>;
+                Unsigned sortable = 0;
+                for (uint8_t b : bytes) { sortable = static_cast<Unsigned>((sortable << 8) | static_cast<Unsigned>(b)); }
+                if constexpr (std::is_signed_v<Integral>) { sortable ^= (Unsigned{1} << (sizeof(Integral) * 8 - 1)); }
+                return std::bit_cast<Integral>(sortable);
             }
 
             void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value) {

@@ -163,7 +163,7 @@ SST 上の record は `SSTHdr32` に key bytes と value bytes が続く形式�
 
 value が Blob Manager に外部化される場合、record value は 20-byte の `BlobRef` になり、blob flag が立ちます。read path は `BlobRef` を間接参照として扱い、blob header と content CRC を検証してから original value bytes を返します。
 
-`PackedTable` の primary row key は `[table_prefix:8][encoded_pk]` です。integral primary key は fixed little-endian、non-integral primary key は BinPack で encode されます。secondary index key は `[index_prefix:8][field_len:u32le][encoded_field][encoded_pk]` です。indexed field は query range に使えるよう、整数と浮動小数では sortable big-endian encoding、それ以外では BinPack encoding を使います。
+`PackedTable` の primary row key は `[table_prefix:8][encoded_pk]` です。integral primary key は numeric range scan に使える fixed sortable big-endian、signed integral primary key は sign bit を flip してから big-endian、non-integral primary key は BinPack で encode されます。secondary index key は `[index_prefix:8][field_len:u32le][encoded_field][encoded_pk]` です。indexed field は query range に使えるよう、整数と浮動小数では sortable big-endian encoding、それ以外では BinPack encoding を使います。
 
 ### Memory Management
 

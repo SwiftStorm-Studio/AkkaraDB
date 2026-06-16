@@ -178,8 +178,9 @@ users.remove(1ULL);
 db->close();
 ```
 
-Typed table keys are table-scoped. The primary key layout is an 8-byte FNV-1a table prefix followed by the encoded primary key. Secondary indexes use
-`table_name + ":idx:" + field_name` as their namespace.
+Typed table keys are table-scoped. The primary key layout is an 8-byte FNV-1a table prefix followed by the encoded primary key. Integral primary keys use a
+sortable fixed-width big-endian encoding so typed range scans preserve numeric order. Secondary indexes use `table_name + ":idx:" + field_name` as their
+namespace.
 
 ---
 

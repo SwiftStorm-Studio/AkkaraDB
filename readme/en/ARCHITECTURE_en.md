@@ -146,7 +146,7 @@ Main responsibilities:
 
 ### Record and Key Model
 
-The raw engine orders keys by bytewise lexicographic comparison. Higher layers must encode keys in a way that preserves the ordering they need. `PackedTable` uses little-endian encodings for integral primary keys to stay consistent with the native binary formats; numeric range semantics are enforced by typed scan/query logic rather than by assuming byte order matches numeric order.
+The raw engine orders keys by bytewise lexicographic comparison. Higher layers must encode keys in a way that preserves the ordering they need. `PackedTable` uses sortable fixed-width big-endian encodings for integral primary keys, so typed primary-key scans preserve numeric range order. Secondary indexes use the same sortable encoding strategy for arithmetic indexed fields.
 
 In memory, records are represented by `OwnedRecord`. It is designed as a compact 64-byte metadata object:
 

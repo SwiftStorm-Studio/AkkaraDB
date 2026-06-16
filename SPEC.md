@@ -229,8 +229,8 @@ Offset  Size  Field             Description
 
 `table_prefix` is `FNV-1a-64(table_name)` written little-endian.
 
-For integral primary keys of size <= 8, `encoded_pk` is a fixed-width little-endian integer using exactly `sizeof(PK)` bytes. For non-integral primary keys,
-`encoded_pk` is `BinPack::encode(pk)`.
+For integral primary keys of size <= 8, `encoded_pk` is a fixed-width sortable big-endian integer using exactly `sizeof(PK)` bytes. Signed integral primary
+keys flip the sign bit before big-endian encoding. For non-integral primary keys, `encoded_pk` is `BinPack::encode(pk)`.
 
 #### Secondary Index Entry
 
@@ -246,8 +246,8 @@ primary key.
 
 ### 3.6 Key Ordering
 
-Raw engine keys are ordered lexicographically by bytes. PackedTable primary keys use the same compact primary-key encoding described above; integral primary
-keys are little-endian and are mainly a namespace/key identity format, not a general numeric sort encoding.
+Raw engine keys are ordered lexicographically by bytes. PackedTable integral primary keys use the same sortable fixed-width big-endian encoding described
+above, so typed primary-key scans over integral keys preserve numeric range order.
 
 Secondary index field bytes are encoded separately from BinPack when ordering matters. Integral fields use a sortable big-endian unsigned representation, signed
 integrals flip the sign bit before big-endian encoding, and `float`/`double` values use the standard sortable IEEE-754 bit transform before big-endian encoding.
@@ -625,6 +625,9 @@ u32     request_id
 u32     val_len
 ```
 
+TCP request frames are `[ApiRequestHeader][key bytes][value bytes][crc32c:u32le]`, where the request CRC32C covers `key bytes + value bytes`. TCP response frames
+are `[ApiResponseHeader][value bytes][crc32c:u32le]`, where the response CRC32C covers `value bytes`.
+
 Opcodes:
 
 | Value  | Name     |
@@ -677,6 +680,11 @@ bodies.
 | `POST`   | `/v1/forceSync` | none              | Force WAL sync                                              |
 | `POST`   | `/v1/forceFlush` | none             | Force MemTable flush                                        |
 | `GET`    | `/v1/stats`    | none               | Return engine/server stats                                  |
+
+HTTP batch request bodies are little-endian binary payloads. `batchPut` uses
+`count:u32le` followed by `count` entries of `key_len:u32le`, `value_len:u32le`, `key bytes`, and `value bytes`. `batchGet` uses `count:u32le` followed by
+`count` entries of `key_len:u32le` and `key bytes`. The `batchGet` response uses `count:u32le` followed by `status:u8`, `value_len:u32le`, and `value bytes` per
+entry. The TCP `BatchPut` and `BatchGet` opcodes use the same entry shapes, except per-entry key lengths are `u16le` to match the TCP request header key limit.
 
 ### 11.4 gRPC API
 
@@ -1025,8 +1033,8 @@ memcpy fast path.
 ### 15.6 JNI Bridge
 
 When `AKKARADB_BUILD_JNI=ON`, the native build produces `akkaradb_jni`. The JNI bridge exposes the raw engine operations, scan cursors, query scan transport,
-and option-based open used by the JVM module. The public JVM engine API uses `ByteBufferL`; the current JNI native methods receive `jbyteArray` snapshots made
-from those buffers and call native `AkkaraDB::open(options)`.
+and option-based open used by the JVM module. The public JVM engine API uses `ByteBufferL`; the current JNI native methods receive direct `java.nio.ByteBuffer`
+objects made from those buffers and call native `AkkaraDB::open(options)`.
 
 The JNI engine entry points are:
 
@@ -1083,6 +1091,8 @@ Literal:
 | `0x07`      | Double   | IEEE-754 bits as `u64le`         |
 | `0x08`      | String   | `len:i32le`, then UTF-8 bytes    |
 | `0x09`      | Null     | none                             |
+| `0x0A`      | List     | `count:u32le`, then `count` nested `Literal` values |
+| `0x0B`      | Map      | `count:u32le`, then `count` nested `Literal` key/value pairs |
 
 Expression format:
 
@@ -1113,9 +1123,12 @@ Expr:
 | `0x0C`  | `IS_NULL`     |
 | `0x0D`  | `IS_NOT_NULL` |
 | `0x0E`  | `MAP_GET`     |
+| `0x0F`  | `STARTS_WITH` |
+| `0x10`  | `CONTAINS`    |
+| `0x11`  | `LIKE`        |
 
-The current native evaluator implements comparison, equality, boolean, null-check, capture, literal, and column expressions used by the JVM scan path. Unsupported
-operators must be treated as query-evaluation errors rather than silently matching rows.
+The current native evaluator implements comparison, equality, boolean, membership, map lookup, string predicate, null-check, capture, literal, and column
+expressions used by the JVM scan path. Unsupported operators must be treated as query-evaluation errors rather than silently matching rows.
 
 #### 15.6.3 Schema Payload
 
@@ -1175,7 +1188,9 @@ Primitive values and strings can be read for predicates. Struct, list, and map v
 
 ### 16.2 Endianness
 
-Internal disk structures in WAL, SST, Blob, Manifest, BinPack, PackedTable keys, and JNI query/schema payloads use little-endian field serialization.
+Internal disk structures in WAL, SST, Blob, Manifest, BinPack, PackedTable key prefixes/length fields, and JNI query/schema payloads use little-endian field
+serialization. PackedTable integral primary keys and arithmetic secondary-index field bytes use sortable big-endian encoding so bytewise scans preserve numeric
+order.
 
 ### 16.3 Checksum Policy
 

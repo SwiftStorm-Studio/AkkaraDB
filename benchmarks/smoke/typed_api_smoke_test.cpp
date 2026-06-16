@@ -81,6 +81,15 @@ namespace {
         uint32_t age;
     };
 
+    struct SignedKeyUser {
+        int64_t id;
+        std::string name;
+        int64_t score;
+        uint32_t age;
+    };
+
+    AKKARADB_QUERYABLE(SignedKeyUser, id, name, score, age)
+
     struct Profile {
         uint64_t id;
         std::string email;
@@ -251,6 +260,36 @@ namespace {
             ++indexed;
         }
         AKK_TEST_CHECK(indexed == 2);
+    }
+
+    void testPrimaryKeyRangeScanUsesNumericOrder() {
+        using namespace akkaradb;
+        TempDir dir{"primaryKeyRangeOrder"};
+        auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
+        auto users = db->table<&TrivialUser::id>("rangeUsers");
+        auto signedUsers = db->table<&SignedKeyUser::id>("signedRangeUsers");
+
+        users.put({1, 10, 20});
+        users.put({99, 20, 21});
+        users.put({100, 30, 22});
+        users.put({256, 40, 23});
+        users.put({257, 50, 24});
+
+        std::vector<uint64_t> unsignedIds;
+        auto unsignedRange = users.scan(1ULL, 100ULL);
+        while (unsignedRange.hasNext()) { unsignedIds.push_back(unsignedRange.next().id); }
+        AKK_TEST_CHECK((unsignedIds == std::vector<uint64_t>{1, 99}));
+
+        signedUsers.put({-3, "minus-three", 0, 20});
+        signedUsers.put({-1, "minus-one", 0, 21});
+        signedUsers.put({0, "zero", 0, 22});
+        signedUsers.put({1, "one", 0, 23});
+        signedUsers.put({3, "three", 0, 24});
+
+        std::vector<int64_t> signedIds;
+        auto signedRange = signedUsers.scan(-2, 2);
+        while (signedRange.hasNext()) { signedIds.push_back(signedRange.next().id); }
+        AKK_TEST_CHECK((signedIds == std::vector<int64_t>{-1, 0, 1}));
     }
 
     void testSpecv4QueryAndHelpers() {
@@ -556,6 +595,7 @@ int main() {
     testBinpackRoundtrip();
     testNonUniqueIndexAndCleanup();
     testCountAndScanAreTableScoped();
+    testPrimaryKeyRangeScanUsesNumericOrder();
     testSpecv4QueryAndHelpers();
     testNonUnsignedRangeQueryUsesIndexSource();
     testOptionalNullQueryHelpers();
