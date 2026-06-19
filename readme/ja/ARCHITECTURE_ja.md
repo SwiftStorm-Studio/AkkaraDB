@@ -133,7 +133,8 @@ native repository は主に 2 つの API layer を公開します。
 
 `AkkaraDB` と `PackedTable<&T::id>` は high-level typed API です。C++ aggregate entity を BinPack で raw key/value row に変換します。table key は 8-byte FNV-1a table prefix で namespace 化され、secondary index は `table_name + ":idx:" + field_name` から導出した別 prefix を使います。
 
-high-level API は primary-key encoding、table scope、secondary-index maintenance、query planning、`Ref<T>` の lazy resolve、foreign-key validation、cascade delete、join を API 側で扱います。
+high-level API は primary-key encoding、table scope、stable `RowId` mapping、secondary-index maintenance、query planning、`Ref<T>` の lazy resolve、foreign-key validation、`OnDelete` / `OnUpdate` action、`Immutable<T>` / `Const<T>` による immutable field sealing、local `onUpdate<&Field>(...)` hook、join を API 側で扱います。
+low-level public header には storage engine の open/close path と独立した erasure coding utility として、`XorErasureCodec`、`DualXorErasureCodec`、`RsErasureCodec`、`ErsCodec` も含まれます。
 
 JVM layer は `AKKARADB_BUILD_JNI=ON` のとき、JNI bridge 経由で同じ native engine にアクセスします。JNI bridge は raw operation、scan cursor、query scan payload evaluation、option-based open、rollback entry point を Kotlin module に提供します。
 
@@ -400,7 +401,7 @@ PackedTable<User, id>.put(user)
 
 secondary index entry は non-unique です。encoded primary key suffix によって同じ indexed field value を持つ row を区別し、index scan から primary row を回収できます。
 
-`Ref<T>` field がある場合、table は attached binding を使って dirty reference を先に保存し、foreign key が登録されていれば参照先の存在を検証します。
+`Ref<T>` field がある場合、table は attached binding を使って dirty reference を先に保存し、foreign key が登録されていれば参照先の存在を検証します。typed table は primary row と secondary index だけでなく、`pk -> RowId`、`RowId -> pk`、next row id の metadata key も管理するので、`updatePrimaryKey(...)` で primary key を書き換えても stable identity は維持されます。参照先 key 更新時は schema に応じて `OnUpdate::Cascade` / `Restrict` / `SetNull` が走り、local `onUpdate<&Field>(...)` hook は watched field 変更時に persistence 前に実行されます。
 
 ### JNI Query Scan Path
 

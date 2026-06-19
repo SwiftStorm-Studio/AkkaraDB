@@ -4,7 +4,7 @@ This guide covers the native C++ low-level and high-level APIs.
 
 The low-level API is `akkaradb::engine::AkkEngine`. It is byte-oriented: keys and values are passed as `std::span<const uint8_t>`, and the caller controls byte layout, serialization, scans, durability, and history behavior.
 
-The high-level API is `akkaradb::AkkaraDB` with `akkaradb::PackedTable`. It stores C++ structs through BinPack, scopes keys by table, and provides primary-key operations, secondary indexes, scans, and query helpers.
+The high-level API is `akkaradb::AkkaraDB` with `akkaradb::PackedTable`. It stores C++ structs through BinPack, scopes keys by table, and provides primary-key operations, stable row ids, secondary indexes, scans, joins, foreign keys, and query helpers.
 
 ## Build And Include
 
@@ -172,6 +172,27 @@ if (!history.empty()) {
 | sync | `forceSync()` | Explicitly synchronize durable state |
 | close | `close()` | Close the engine |
 
+### Erasure Codecs
+
+The low-level headers also expose erasure-coding helpers under `akk/engine/erasure/`.
+
+```cpp
+#include "akk/engine/erasure/ErasureCodec.hpp"
+#include "akk/engine/erasure/ErasureCodecExt.hpp"
+
+using namespace akkaradb::engine::erasure;
+
+const ErasureLayout layout{.dataShards = 6, .parityShards = 3};
+auto shards = RsErasureCodec::encode(bytes("payload"), layout);
+auto decoded = RsErasureCodec::decode(shards, layout);
+auto repaired = RsErasureCodec::repairOne(2, std::span<const ErasureShard>{shards}.subspan(1), layout);
+
+auto ers_shards = ErsCodec::encode(bytes("payload"), layout);
+auto recovered = ErsCodec::recover(ers_shards, layout, {1});
+```
+
+`XorErasureCodec` recovers one missing shard, `DualXorErasureCodec` recovers up to two missing data shards with two parity shards, and `RsErasureCodec` recovers from any `k` valid shards in a systematic Reed-Solomon layout. `ErsCodec` uses the same RS shard layout but exposes a separate recovery interface that can identify corrupted shards in addition to known erasures.
+
 ## High-Level API
 
 `AkkaraDB` is a small facade over `AkkEngine`. `PackedTable<&T::id>` serializes entities with BinPack and scopes primary keys by table name.
@@ -224,6 +245,8 @@ int main() {
 ```
 
 The primary key is selected with a member pointer, such as `table<&User::id>("users")`. `PackedTable` reads the primary key from the entity when storing data, so the entity passed to `put()` must contain a valid primary-key field.
+
+Each stored row also receives a stable `akkaradb::RowId` that is independent from the encoded primary key. `rowIdOf(pk)`, `primaryKeyOf(rowId)`, and `getByRowId(rowId)` expose that mapping.
 
 ### Secondary Indexes
 
@@ -350,6 +373,9 @@ auto joined = posts
 ```
 
 `foreignKey<&Post::author>()` validates that the referenced entity exists before storing a row. The schema helper currently uses `OnDelete::Cascade`, so deleting the referenced row also deletes rows that reference it. Without `Schema`, a table can be wired manually with `bindRef<&Post::author>(authors)` and `cascadeDeleteFrom<&Post::author>(posts)`.
+`foreignKey<&Post::author>()` validates that the referenced entity exists before storing a row. Schema foreign keys support one `OnDelete` action and one `OnUpdate` action, each chosen from `Cascade`, `Restrict`, or `SetNull`. `SetNull` requires the owner-side field to be `std::optional<...>`. `Ref<T>` foreign keys currently target the referenced entity primary key; arbitrary non-primary target fields are supported only for plain comparable owner fields.
+
+When a referenced target primary key changes through `updatePrimaryKey(oldPk, entity)`, `OnUpdate::Cascade` rewrites owner-side foreign-key values, `OnUpdate::Restrict` rejects the change while references exist, and `OnUpdate::SetNull` clears optional owner-side references. `Ref<T>` remembers the stable row id of the target, so the reference can continue to identify the same logical entity across primary-key rewrites.
 
 Joins are not limited to `Ref<T>` fields. They can also join compatible plain fields:
 
@@ -367,13 +393,50 @@ auto plain_posts = db->table<&PlainPost::id>("plain_posts");
 auto joined_by_id = plain_posts.join<&PlainPost::authorId, &Author::id>(authors).toVector();
 ```
 
+Stable row-id helpers are available on `PackedTable`:
+
+```cpp
+if (auto row_id = authors.rowIdOf(1ULL)) {
+    auto same_author = authors.getByRowId(*row_id);
+    auto current_pk = authors.primaryKeyOf(*row_id);
+    (void)same_author;
+    (void)current_pk;
+}
+```
+
+Persisted entities can mark immutable fields with `akkaradb::Immutable<T>` or the shorter alias `akkaradb::Const<T>`:
+
+```cpp
+struct ExternalAuthor {
+    uint64_t id;
+    akkaradb::Const<std::string> externalId;
+    std::string name;
+};
+```
+
+Immutable fields can be assigned before the row is persisted, but after `put()` or `get()` they are sealed and later value changes throw `std::runtime_error`. Primary-key fields themselves cannot use `Immutable<T>`.
+
+`PackedTable::onUpdate<&Field>(handler)` registers local update hooks that run when an existing row is replaced and the watched field value changed:
+
+```cpp
+posts.onUpdate<&Post::title>([](const std::string& old_value, std::string& new_value) {
+    if (new_value.empty()) { new_value = old_value; }
+});
+
+posts.onUpdate<&Post::body>([](const Post& old_entity, Post& new_entity) {
+    if (old_entity.body != new_entity.body) { new_entity.likes = 0; }
+});
+```
+
+Supported handler shapes are `(oldField, Field& newField)`, `(oldField, Field& newField, oldEntity, Entity& newEntity)`, `(oldEntity, Entity& newEntity)`, and read-only `newField` / `newEntity` variants.
+
 ### Error Handling
 
 The public Native API is not zero-exception. It uses return values for expected absence and exceptions for invalid use or failed storage operations.
 
 `get()`, `getAt()`, and typed `PackedTable::get()` return `std::nullopt` when the requested value is absent. `getInto()`, `getIntoArena()`, and typed `getInto()` return `false` for the same case. Empty scans, queries, joins, and history calls produce empty iterators or vectors.
 
-Closed-engine access, invalid configuration, unavailable API backends, unsafe cluster transport settings, I/O failures, corrupt persisted data, CRC mismatches, detached `Ref<T>` dereference, missing foreign-key targets, and unregistered `findBy()` indexes throw standard exceptions, usually `std::runtime_error` or `std::invalid_argument`. Typed scan/query/index ranges require `hasNext()` before `next()`; calling `next()` after the range is exhausted throws `std::out_of_range`.
+Closed-engine access, invalid configuration, unavailable API backends, unsafe cluster transport settings, I/O failures, corrupt persisted data, CRC mismatches, detached `Ref<T>` dereference, missing foreign-key targets, immutable-field rewrites after persistence, and unregistered `findBy()` indexes throw standard exceptions, usually `std::runtime_error` or `std::invalid_argument`. Typed scan/query/index ranges require `hasNext()` before `next()`; calling `next()` after the range is exhausted throws `std::out_of_range`.
 
 ## StartupMode And Options
 

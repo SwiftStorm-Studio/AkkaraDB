@@ -675,6 +675,33 @@ namespace akkaradb {
         AKKARADB_REF_ENTITY(Type, PrimaryKey); \
         AKKARADB_QUERYABLE(Type, PrimaryKey, B, C, D)
 
+    template <typename T>
+    struct ForeignKeyValueTraits {
+        using Type = std::remove_cvref_t<T>;
+        static constexpr bool nullable = false;
+    };
+
+    template <typename T>
+    struct ForeignKeyValueTraits<Immutable<T>> {
+        using Type = typename ForeignKeyValueTraits<T>::Type;
+        static constexpr bool nullable = false;
+    };
+
+    template <typename T>
+    struct ForeignKeyValueTraits<Ref<T>> {
+        using Type = RowId;
+        static constexpr bool nullable = false;
+    };
+
+    template <typename T>
+    struct ForeignKeyValueTraits<std::optional<T>> {
+        using Type = typename ForeignKeyValueTraits<T>::Type;
+        static constexpr bool nullable = true;
+    };
+
+    template <typename T>
+    using ForeignKeyComparableType = typename ForeignKeyValueTraits<std::remove_cvref_t<T>>::Type;
+
     template <auto PrimaryKeyPtr>
     class PackedTable {
         class ArenaByteBuffer {
@@ -765,6 +792,9 @@ namespace akkaradb {
         public:
             using Entity = binpack::detail::classOf<PrimaryKeyPtr>;
             using PK = binpack::detail::memberOf<PrimaryKeyPtr>;
+            using StableRowId = RowId;
+
+            static_assert(!isImmutableField<PK>, "AkkaraDB Immutable: primary key fields cannot use akkaradb::Immutable<T>");
 
             struct Entry {
                 PK id;
@@ -815,7 +845,9 @@ namespace akkaradb {
                             const auto& ref = entity.*FieldPtr;
                             ref.attach(binding);
                             if (ref.dirty()) {
+                                const auto key = RefTraits<Target>::keyOf(ref.value());
                                 binding->put(ref.value());
+                                if (const auto rowId = binding->rowIdOf(key)) { ref.rememberRowId(*rowId); }
                                 ref.markClean();
                             }
                         }
@@ -851,8 +883,82 @@ namespace akkaradb {
                 return *this;
             }
 
+            template <auto FieldPtr, typename Handler>
+            PackedTable& onUpdate(Handler&& handler) {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "update field must belong to the table entity");
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                static_assert(
+                    requires(const Field& lhs, const Field& rhs) {
+                        { lhs == rhs } -> std::convertible_to<bool>;
+                    },
+                    "update field handlers require equality comparable fields"
+                );
+
+                updateFieldHooks_.push_back(
+                    UpdateFieldHookDef{
+                        std::string(binpack::detail::memberName<FieldPtr>()),
+                        [](const Entity& oldEntity, const Entity& newEntity) {
+                            return static_cast<bool>((oldEntity.*FieldPtr) == (newEntity.*FieldPtr));
+                        },
+                        [callback = std::forward<Handler>(handler)](const Entity& oldEntity, Entity& newEntity) mutable {
+                            invokeFieldUpdateHandler<FieldPtr>(callback, oldEntity, newEntity);
+                        }
+                    }
+                );
+                return *this;
+            }
+
             PackedTable& bindRefsFrom(const RefBindingLookup& lookup) {
                 refBindingLookup_ = &lookup;
+                return *this;
+            }
+
+            template <auto FieldPtr, auto TargetPrimaryKeyPtr, auto TargetFieldPtr = TargetPrimaryKeyPtr>
+            PackedTable& foreignKey(PackedTable<TargetPrimaryKeyPtr>& target) {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "foreign key field must belong to the table entity");
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
+                using TargetEntity = typename TargetTable::Entity;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = ForeignKeyComparableType<TargetField>;
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, TargetEntity>, "foreign key target field must belong to the target table entity");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "foreign key fields must be comparable"
+                );
+                static_assert(!isRef<TargetField>, "foreign key target field cannot be akkaradb::Ref<T>");
+
+                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+                for (const auto& fk : foreignKeys_) { if (fk.fieldName == fieldName) { return *this; } }
+
+                if constexpr (!sameMemberPointer<TargetFieldPtr, TargetPrimaryKeyPtr>()) { (void)target.template index<TargetFieldPtr>(); }
+
+                foreignKeys_.push_back(
+                    ForeignKeyDef{
+                        std::string(fieldName),
+                        &target,
+                        [](const Entity& entity, void* rawTarget) {
+                            auto* targetTable = static_cast<TargetTable*>(rawTarget);
+                            const auto& field = entity.*FieldPtr;
+                            if (!foreignKeyHasValue(field)) { return; }
+                            const auto& value = foreignKeyComparable(entity.*FieldPtr);
+                            bool exists = false;
+                            if constexpr (sameMemberPointer<TargetFieldPtr, TargetPrimaryKeyPtr>()) {
+                                if constexpr (isRef<Field>) { exists = targetTable->primaryKeyOf(value).has_value(); }
+                                else { exists = targetTable->exists(value); }
+                            }
+                            else {
+                                exists = targetTable->template hasAnyByIndexedFieldValue<TargetFieldPtr>(value);
+                            }
+                            if (!exists) {
+                                throw std::runtime_error("AkkaraDB foreign key: referenced entity was not found");
+                            }
+                        }
+                    }
+                );
                 return *this;
             }
 
@@ -868,14 +974,21 @@ namespace akkaradb {
                 foreignKeys_.push_back(
                     ForeignKeyDef{
                         std::string(fieldName),
-                        [](const Entity& entity, const PackedTable& table) {
+                        nullptr,
+                        [](const Entity& entity, void* rawTable) {
+                            auto* table = static_cast<const PackedTable*>(rawTable);
                             using Target = typename RefTarget<Field>::Type;
-                            const auto* binding = table.template findRefBinding<Target>();
+                            const auto* binding = table->template findRefBinding<Target>();
                             if (binding == nullptr) { throw std::runtime_error("AkkaraDB foreign key: Ref target table is not registered"); }
 
                             const auto& ref = entity.*FieldPtr;
-                            if (!binding->exists(ref.id())) {
-                                throw std::runtime_error("AkkaraDB foreign key: referenced entity was not found");
+                            const bool exists = ref.hasRowId() ? binding->existsByRowId(ref.rowId()) : binding->exists(ref.id());
+                            if (!exists) {
+                                throw std::runtime_error(
+                                    ref.hasRowId()
+                                        ? "AkkaraDB foreign key: referenced entity was not found (row id)"
+                                        : "AkkaraDB foreign key: referenced entity was not found (key)"
+                                );
                             }
                         }
                     }
@@ -883,33 +996,53 @@ namespace akkaradb {
                 return *this;
             }
 
-            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr>
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
             PackedTable& cascadeDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
                 using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
                 using SourceEntity = typename SourceTable::Entity;
                 using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
                 static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "cascade ref field must belong to the source entity");
-                static_assert(isRef<Field>, "cascade ref field must be akkaradb::Ref<T>");
-                using Target = typename RefTarget<Field>::Type;
-                static_assert(std::is_same_v<Target, Entity>, "cascade target table entity does not match Ref<T>");
-                static_assert(std::is_same_v<typename Field::Key, PK>, "cascade ref key type does not match target primary key");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "cascade target field must belong to the target entity");
+                static_assert(!isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(), "Ref cascade delete currently requires target primary key");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "cascade fields must be comparable"
+                );
+                static_assert(!isRef<TargetField>, "cascade target field cannot be akkaradb::Ref<T>");
 
                 const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
                 for (const auto& cascade : cascadeDeletes_) {
-                    if (cascade.source == &source && cascade.fieldName == fieldName) { return *this; }
+                    if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()) {
+                        return *this;
+                    }
                 }
 
+                (void)source.template index<RefFieldPtr>();
                 cascadeDeletes_.push_back(
                     CascadeDeleteDef{
                         &source,
+                        this,
                         std::string(fieldName),
-                        [](const PK& targetPk, void* rawSource) {
+                        std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                        [](const Entity& targetEntity, void* rawSource, void* rawTarget) {
                             auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            auto* targetTable = static_cast<PackedTable*>(rawTarget);
                             std::vector<typename SourceTable::PK> removeKeys;
-                            auto rows = sourceTable->scanAll();
-                            while (rows.hasNext()) {
-                                auto entry = rows.next();
-                                if ((entry.value.*RefFieldPtr).id() == targetPk) { removeKeys.push_back(entry.id); }
+                            const auto targetValue = [&]() -> ComparableTargetField {
+                                if constexpr (isRef<Field>) { return *targetTable->rowIdOf(targetEntity.*TargetFieldPtr); }
+                                else { return foreignKeyComparable(targetEntity.*TargetFieldPtr); }
+                            }();
+                            auto scan = sourceTable->scanAll();
+                            while (scan.hasNext()) {
+                                auto entry = scan.next();
+                                const auto& fieldValue = entry.value.*RefFieldPtr;
+                                if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                if (foreignKeyComparable(fieldValue) == targetValue) { removeKeys.push_back(entry.id); }
                             }
                             for (const auto& key : removeKeys) { sourceTable->remove(key); }
                         }
@@ -918,28 +1051,373 @@ namespace akkaradb {
                 return *this;
             }
 
-            void put(const Entity& entity) {
-                resetTempBuffers();
-                attachRefBindings(entity);
-                flushDirtyRefs(entity);
-                validateForeignKeys(entity);
-                const PK& pk = entity.*PrimaryKeyPtr;
-                makePkKey(pk, pkKeyBuffer_);
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
+            PackedTable& restrictDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "restrict ref field must belong to the source entity");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "restrict target field must belong to the target entity");
+                static_assert(!isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(), "Ref restrict delete currently requires target primary key");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "restrict fields must be comparable"
+                );
+                static_assert(!isRef<TargetField>, "restrict target field cannot be akkaradb::Ref<T>");
 
-                if (!indexes_.empty()) {
-                    std::span<const uint8_t> oldBytes;
-                    if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
-                        const Entity oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
-                        removeIndexEntries(oldEntity, pkKeyBuffer_);
+                const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                for (const auto& restrictDelete : restrictDeletes_) {
+                    if (
+                        restrictDelete.source == &source
+                        && restrictDelete.fieldName == fieldName
+                        && restrictDelete.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()
+                    ) {
+                        return *this;
                     }
                 }
 
+                (void)source.template index<RefFieldPtr>();
+                restrictDeletes_.push_back(
+                    RestrictDeleteDef{
+                        &source,
+                        this,
+                        std::string(fieldName),
+                        std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                        [](const Entity& targetEntity, void* rawSource, void* rawTarget) {
+                            auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            auto* targetTable = static_cast<PackedTable*>(rawTarget);
+                            const auto targetValue = [&]() -> ComparableTargetField {
+                                if constexpr (isRef<Field>) { return *targetTable->rowIdOf(targetEntity.*TargetFieldPtr); }
+                                else { return foreignKeyComparable(targetEntity.*TargetFieldPtr); }
+                            }();
+                            bool hasReferences = false;
+                            auto scan = sourceTable->scanAll();
+                            while (scan.hasNext()) {
+                                auto entry = scan.next();
+                                const auto& fieldValue = entry.value.*RefFieldPtr;
+                                if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                if (foreignKeyComparable(fieldValue) == targetValue) {
+                                    hasReferences = true;
+                                    break;
+                                }
+                            }
+                            if (hasReferences) {
+                                throw std::runtime_error("AkkaraDB foreign key: delete restricted by referencing entities");
+                            }
+                        }
+                    }
+                );
+                return *this;
+            }
+
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
+            PackedTable& setNullDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "set null ref field must belong to the source entity");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "set null target field must belong to the target entity");
+                static_assert(!isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(), "Ref set null delete currently requires target primary key");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "set null fields must be comparable"
+                );
+
+                if constexpr (!query::isOptional<Field>) {
+                    throw std::invalid_argument("AkkaraDB foreign key: OnDelete::SetNull requires std::optional foreign key fields");
+                }
+                else {
+                    const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                    for (const auto& setNullDelete : setNullDeletes_) {
+                        if (
+                            setNullDelete.source == &source
+                            && setNullDelete.fieldName == fieldName
+                            && setNullDelete.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()
+                        ) {
+                            return *this;
+                        }
+                    }
+
+                    (void)source.template index<RefFieldPtr>();
+                    setNullDeletes_.push_back(
+                        SetNullDeleteDef{
+                            &source,
+                            this,
+                            std::string(fieldName),
+                        std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                        [](const Entity& targetEntity, void* rawSource, void* rawTarget) {
+                            auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            auto* targetTable = static_cast<PackedTable*>(rawTarget);
+                            std::vector<typename SourceTable::PK> updateKeys;
+                            const auto targetValue = [&]() -> ComparableTargetField {
+                                if constexpr (isRef<Field>) { return *targetTable->rowIdOf(targetEntity.*TargetFieldPtr); }
+                                else { return foreignKeyComparable(targetEntity.*TargetFieldPtr); }
+                            }();
+                            auto scan = sourceTable->scanAll();
+                            while (scan.hasNext()) {
+                                auto entry = scan.next();
+                                const auto& fieldValue = entry.value.*RefFieldPtr;
+                                if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                if (foreignKeyComparable(fieldValue) == targetValue) { updateKeys.push_back(entry.id); }
+                            }
+                            for (const auto& key : updateKeys) {
+                                auto entity = sourceTable->get(key);
+                                if (!entity) { continue; }
+                                if (!foreignKeyHasValue((*entity).*RefFieldPtr)) { continue; }
+                                setForeignKeyNull((*entity).*RefFieldPtr);
+                                sourceTable->put(*entity);
+                            }
+                        }
+                        }
+                    );
+                    return *this;
+                }
+            }
+
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
+            PackedTable& cascadeUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "cascade update field must belong to the source entity");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "cascade update target field must belong to the target entity");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "cascade update fields must be comparable"
+                );
+
+                const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                for (const auto& cascade : cascadeUpdates_) {
+                    if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()) {
+                        return *this;
+                    }
+                }
+                if constexpr (isRef<Field>) {
+                    return *this;
+                }
+
+                updateActionsNeedTargetWrite_ = true;
+                cascadeUpdates_.push_back(
+                    UpdateCascadeDef{
+                        &source,
+                        this,
+                        std::string(fieldName),
+                        std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                        [](const Entity& oldTargetEntity, const Entity& newTargetEntity, void* rawSource, void* rawTarget) {
+                            auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            (void)rawTarget;
+                            const auto oldTargetValue = [&]() -> ComparableTargetField {
+                                return foreignKeyComparable(oldTargetEntity.*TargetFieldPtr);
+                            }();
+                            const auto newTargetValue = [&]() -> ComparableTargetField {
+                                return foreignKeyComparable(newTargetEntity.*TargetFieldPtr);
+                            }();
+                            if (oldTargetValue == newTargetValue) { return; }
+
+                            std::vector<typename SourceTable::PK> updateKeys;
+                            auto scan = sourceTable->scanAll();
+                            while (scan.hasNext()) {
+                                auto entry = scan.next();
+                                const auto& fieldValue = entry.value.*RefFieldPtr;
+                                if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                if (foreignKeyComparable(fieldValue) == oldTargetValue) { updateKeys.push_back(entry.id); }
+                            }
+                            for (const auto& key : updateKeys) {
+                                auto entity = sourceTable->get(key);
+                                if (!entity) { continue; }
+                                (*entity).*RefFieldPtr = newTargetEntity.*TargetFieldPtr;
+                                sourceTable->put(*entity);
+                            }
+                        }
+                    }
+                );
+                return *this;
+            }
+
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
+            PackedTable& restrictUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "restrict update field must belong to the source entity");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "restrict update target field must belong to the target entity");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "restrict update fields must be comparable"
+                );
+
+                const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                for (const auto& restrictUpdate : restrictUpdates_) {
+                    if (
+                        restrictUpdate.source == &source
+                        && restrictUpdate.fieldName == fieldName
+                        && restrictUpdate.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()
+                    ) {
+                        return *this;
+                    }
+                }
+                if constexpr (isRef<Field>) {
+                    return *this;
+                }
+
+                restrictUpdates_.push_back(
+                    UpdateRestrictDef{
+                        &source,
+                        this,
+                        std::string(fieldName),
+                        std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                        [](const Entity& oldTargetEntity, const Entity& newTargetEntity, void* rawSource, void* rawTarget) {
+                            auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                            (void)rawTarget;
+
+                            const auto oldTargetValue = foreignKeyComparable(oldTargetEntity.*TargetFieldPtr);
+                            const auto newTargetValue = foreignKeyComparable(newTargetEntity.*TargetFieldPtr);
+                            if (oldTargetValue == newTargetValue) { return; }
+
+                            auto scan = sourceTable->scanAll();
+                            while (scan.hasNext()) {
+                                auto entry = scan.next();
+                                const auto& fieldValue = entry.value.*RefFieldPtr;
+                                if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                if (foreignKeyComparable(fieldValue) == oldTargetValue) {
+                                    throw std::runtime_error("AkkaraDB foreign key: update restricted by referencing entities");
+                                }
+                            }
+                        }
+                    }
+                );
+                return *this;
+            }
+
+            template <auto RefFieldPtr, auto SourcePrimaryKeyPtr, auto TargetFieldPtr = PrimaryKeyPtr>
+            PackedTable& setNullUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
+                using SourceTable = PackedTable<SourcePrimaryKeyPtr>;
+                using SourceEntity = typename SourceTable::Entity;
+                using Field = binpack::detail::memberOf<RefFieldPtr>;
+                using TargetField = binpack::detail::memberOf<TargetFieldPtr>;
+                using ComparableField = ForeignKeyComparableType<Field>;
+                using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
+                static_assert(std::is_same_v<binpack::detail::classOf<RefFieldPtr>, SourceEntity>, "set null update field must belong to the source entity");
+                static_assert(std::is_same_v<binpack::detail::classOf<TargetFieldPtr>, Entity>, "set null update target field must belong to the target entity");
+                static_assert(
+                    requires(const ComparableField& field, const ComparableTargetField& targetField) {
+                        { field == targetField } -> std::convertible_to<bool>;
+                    },
+                    "set null update fields must be comparable"
+                );
+
+                if constexpr (!query::isOptional<Field>) {
+                    throw std::invalid_argument("AkkaraDB foreign key: OnUpdate::SetNull requires std::optional foreign key fields");
+                }
+                else {
+                    const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
+                    for (const auto& setNullUpdate : setNullUpdates_) {
+                        if (
+                            setNullUpdate.source == &source
+                            && setNullUpdate.fieldName == fieldName
+                            && setNullUpdate.targetFieldName == binpack::detail::memberName<TargetFieldPtr>()
+                        ) {
+                            return *this;
+                        }
+                    }
+                    if constexpr (isRef<Field>) {
+                        return *this;
+                    }
+
+                    updateActionsNeedTargetWrite_ = true;
+                    setNullUpdates_.push_back(
+                        UpdateSetNullDef{
+                            &source,
+                            this,
+                            std::string(fieldName),
+                            std::string(binpack::detail::memberName<TargetFieldPtr>()),
+                            [](const Entity& oldTargetEntity, const Entity& newTargetEntity, void* rawSource, void* rawTarget) {
+                                auto* sourceTable = static_cast<SourceTable*>(rawSource);
+                                (void)rawTarget;
+                                const auto oldTargetValue = foreignKeyComparable(oldTargetEntity.*TargetFieldPtr);
+                                const auto newTargetValue = foreignKeyComparable(newTargetEntity.*TargetFieldPtr);
+                                if (oldTargetValue == newTargetValue) { return; }
+
+                                std::vector<typename SourceTable::PK> updateKeys;
+                                auto scan = sourceTable->scanAll();
+                                while (scan.hasNext()) {
+                                    auto entry = scan.next();
+                                    const auto& fieldValue = entry.value.*RefFieldPtr;
+                                    if (!foreignKeyHasValue(fieldValue)) { continue; }
+                                    if (foreignKeyComparable(fieldValue) == oldTargetValue) { updateKeys.push_back(entry.id); }
+                                }
+                                for (const auto& key : updateKeys) {
+                                    auto entity = sourceTable->get(key);
+                                    if (!entity) { continue; }
+                                    if (!foreignKeyHasValue((*entity).*RefFieldPtr)) { continue; }
+                                    setForeignKeyNull((*entity).*RefFieldPtr);
+                                    sourceTable->put(*entity);
+                                }
+                            }
+                        }
+                    );
+                    return *this;
+                }
+            }
+
+            void put(const Entity& entity) {
+                resetTempBuffers();
+                Entity workingEntity = entity;
+                const PK& pk = workingEntity.*PrimaryKeyPtr;
+                const auto existingRowId = rowIdOf(pk);
+                makePkKey(pk, pkKeyBuffer_);
+                std::optional<Entity> oldEntity;
+
+                if (!indexes_.empty() || !updateFieldHooks_.empty()) {
+                    std::span<const uint8_t> oldBytes;
+                    if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
+                        oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
+                        attachRefBindings(*oldEntity);
+                        sealImmutableFields(*oldEntity);
+                        if (!updateFieldHooks_.empty()) { runUpdateFieldHooks(*oldEntity, workingEntity); }
+                        ensureImmutableFieldsUnchanged(*oldEntity, workingEntity);
+                        if (!indexes_.empty()) { removeIndexEntries(*oldEntity, pkKeyBuffer_); }
+                    }
+                }
+                else if (existingRowId.has_value()) {
+                    oldEntity = get(pk);
+                    if (oldEntity) {
+                        if (!updateFieldHooks_.empty()) { runUpdateFieldHooks(*oldEntity, workingEntity); }
+                        ensureImmutableFieldsUnchanged(*oldEntity, workingEntity);
+                    }
+                }
+
+                attachRefBindings(workingEntity);
+                flushDirtyRefs(workingEntity);
+                validateForeignKeys(workingEntity);
                 valueBuffer_.clear();
-                valueBuffer_.reserve(binpack::BinPack::estimateSize(entity));
-                binpack::BinPack::encodeInto(entity, valueBuffer_);
+                valueBuffer_.reserve(binpack::BinPack::estimateSize(workingEntity));
+                binpack::BinPack::encodeInto(workingEntity, valueBuffer_);
 
                 putHinted(pkKeyBuffer_, valueBuffer_);
-                if (!indexes_.empty()) { writeIndexEntries(entity, pkKeyBuffer_); }
+                writeRowIdMapping(pk, existingRowId.value_or(allocateRowId()));
+                if (!indexes_.empty()) { writeIndexEntries(workingEntity, pkKeyBuffer_); }
+                sealImmutableFields(workingEntity);
             }
 
             [[nodiscard]] std::optional<Entity> get(const PK& pk) const {
@@ -954,24 +1432,61 @@ namespace akkaradb {
                 std::span<const uint8_t> bytes;
                 if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, bytes)) { return false; }
                 const bool decoded = binpack::BinPack::decodeInto<Entity>(bytes, out);
-                if (decoded) { attachRefBindings(out); }
+                if (decoded) {
+                    attachRefBindings(out);
+                    sealImmutableFields(out);
+                }
                 return decoded;
+            }
+
+            [[nodiscard]] std::optional<StableRowId> rowIdOf(const PK& pk) const {
+                resetTempBuffers();
+                makePkToRowIdKey(pk, pkKeyBuffer_);
+                std::span<const uint8_t> bytes;
+                if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, bytes)) { return std::nullopt; }
+                return decodeRowId(bytes);
+            }
+
+            [[nodiscard]] std::optional<PK> primaryKeyOf(StableRowId rowId) const {
+                resetTempBuffers();
+                makeRowIdToPkKey(rowId, pkKeyBuffer_);
+                std::span<const uint8_t> bytes;
+                if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, bytes)) { return std::nullopt; }
+                return decodePrimaryKeyBytes(bytes);
+            }
+
+            [[nodiscard]] std::optional<Entity> getByRowId(StableRowId rowId) const {
+                Entity out{};
+                if (!getIntoByRowId(rowId, out)) { return std::nullopt; }
+                return out;
+            }
+
+            [[nodiscard]] bool getIntoByRowId(StableRowId rowId, Entity& out) const {
+                const auto pk = primaryKeyOf(rowId);
+                if (!pk) { return false; }
+                return getInto(*pk, out);
             }
 
             void remove(const PK& pk) {
                 resetTempBuffers();
-                runCascadeDeletes(pk);
+                const auto stableRowId = rowIdOf(pk);
                 makePkKey(pk, pkKeyBuffer_);
+                std::vector<uint8_t> pkKeyCopy{pkKeyBuffer_.begin(), pkKeyBuffer_.end()};
 
-                if (!indexes_.empty()) {
+                std::optional<Entity> oldEntity;
+                if (!indexes_.empty() || !cascadeDeletes_.empty() || !restrictDeletes_.empty() || !setNullDeletes_.empty()) {
                     std::span<const uint8_t> oldBytes;
-                    if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
-                        const Entity oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
-                        removeIndexEntries(oldEntity, pkKeyBuffer_);
+                    if (engine_->getIntoArena(pkKeyCopy, *tempArena_, oldBytes)) {
+                        oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
                     }
                 }
 
-                removeHinted(pkKeyBuffer_);
+                if (oldEntity) { runRestrictDeletes(*oldEntity); }
+                if (oldEntity) { runSetNullDeletes(*oldEntity); }
+                if (oldEntity) { runCascadeDeletes(*oldEntity); }
+                if (oldEntity && !indexes_.empty()) { removeIndexEntries(*oldEntity, pkKeyCopy); }
+                removeHinted(pkKeyCopy);
+                if (stableRowId) { removeRowIdMapping(pk, *stableRowId); }
             }
 
             [[nodiscard]] bool exists(const PK& pk) const {
@@ -985,6 +1500,53 @@ namespace akkaradb {
                 entity.*PrimaryKeyPtr = pk;
                 update(entity);
                 put(entity);
+            }
+
+            void updatePrimaryKey(const PK& oldPk, const Entity& entity) {
+                const PK& newPk = entity.*PrimaryKeyPtr;
+                if (oldPk == newPk) {
+                    put(entity);
+                    return;
+                }
+
+                resetTempBuffers();
+                const auto stableRowId = rowIdOf(oldPk);
+                if (!stableRowId) { throw std::runtime_error("PackedTable::updatePrimaryKey: source entity was not found"); }
+
+                auto oldEntity = get(oldPk);
+                if (!oldEntity) { throw std::runtime_error("PackedTable::updatePrimaryKey: source entity was not found"); }
+                if (exists(newPk)) { throw std::runtime_error("PackedTable::updatePrimaryKey: destination primary key already exists"); }
+                Entity workingEntity = entity;
+                runUpdateFieldHooks(*oldEntity, workingEntity);
+                ensureImmutableFieldsUnchanged(*oldEntity, workingEntity);
+                runRestrictUpdates(*oldEntity, workingEntity);
+
+                attachRefBindings(workingEntity);
+                flushDirtyRefs(workingEntity);
+                validateForeignKeys(workingEntity);
+
+                makePkKey(oldPk, pkKeyBuffer_);
+                std::vector<uint8_t> oldPkKeyCopy{pkKeyBuffer_.begin(), pkKeyBuffer_.end()};
+                valueBuffer_.clear();
+                valueBuffer_.reserve(binpack::BinPack::estimateSize(workingEntity));
+                binpack::BinPack::encodeInto(workingEntity, valueBuffer_);
+
+                scanStartBuffer_.clear();
+                makePkKey(newPk, scanStartBuffer_);
+                putHinted(scanStartBuffer_, valueBuffer_);
+                if (!indexes_.empty()) { writeIndexEntries(workingEntity, scanStartBuffer_); }
+                rewriteRowIdMapping(oldPk, newPk, *stableRowId);
+                if (updateActionsNeedTargetWrite_) {
+                    runSetNullUpdates(*oldEntity, workingEntity);
+                    runCascadeUpdates(*oldEntity, workingEntity);
+                }
+                else {
+                    runCascadeUpdates(*oldEntity, workingEntity);
+                    runSetNullUpdates(*oldEntity, workingEntity);
+                }
+                if (!indexes_.empty()) { removeIndexEntries(*oldEntity, oldPkKeyCopy); }
+                removeHinted(oldPkKeyCopy);
+                sealImmutableFields(workingEntity);
             }
 
             template <auto FieldPtr>
@@ -1068,6 +1630,7 @@ namespace akkaradb {
                             std::span<const uint8_t> pkBytes{key.data() + table_->pkPrefix_.size(), key.size() - table_->pkPrefix_.size()};
                             Entry entry{table_->decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                             table_->attachRefBindings(entry.value);
+                            table_->sealImmutableFields(entry.value);
                             pending_ = std::move(entry);
                             ++it_;
                             return;
@@ -1182,6 +1745,7 @@ namespace akkaradb {
                                     };
                                     entry = Entry{table_->decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                                     table_->attachRefBindings(entry.value);
+                                    table_->sealImmutableFields(entry.value);
                                 }
                                 else {
                                     const auto key = raw.key;
@@ -1395,7 +1959,13 @@ namespace akkaradb {
                                 if constexpr (usesRightPrimaryKey()) {
                                     while (scan_.hasNext()) {
                                         auto left = scan_.next();
-                                        auto right = view_->right_->get(view_->joinKey(left.value.*LeftFieldPtr));
+                                        std::optional<RightEntity> right;
+                                        if constexpr (isRef<binpack::detail::memberOf<LeftFieldPtr>>) {
+                                            right = view_->right_->getByRowId((left.value.*LeftFieldPtr).rowId());
+                                        }
+                                        else {
+                                            right = view_->right_->get(view_->joinKey(left.value.*LeftFieldPtr));
+                                        }
                                         if (!right) { continue; }
                                         if (!view_->predicate_(left.value, *right)) { continue; }
                                         current_ = JoinRow{std::move(left), std::move(*right)};
@@ -1611,15 +2181,15 @@ namespace akkaradb {
                     };
 
                     [[nodiscard]] FindRange find(const Field& value) const {
-                        table_->resetTempBuffers();
-                        table_->fieldBuffer_.clear();
-                        table_->encodeIndexFieldValue(value, table_->fieldBuffer_);
-                        table_->makeIndexSearchPrefix(prefix_, table_->fieldBuffer_, table_->scanStartBuffer_);
-                        table_->scanEndBuffer_ = table_->scanStartBuffer_;
-                        if (!detail::incrementLexicographicBytes(table_->scanEndBuffer_.data(), table_->scanEndBuffer_.size())) {
-                            table_->scanEndBuffer_.clear();
+                        std::vector<uint8_t> fieldBytes;
+                        table_->encodeIndexFieldValue(value, fieldBytes);
+                        std::vector<uint8_t> startKey;
+                        table_->makeIndexSearchPrefix(prefix_, fieldBytes, startKey);
+                        std::vector<uint8_t> endKey = startKey;
+                        if (!detail::incrementLexicographicBytes(endKey.data(), endKey.size())) {
+                            endKey.clear();
                         }
-                        return FindRange{table_, table_->scanStartBuffer_.size(), table_->scanStartBuffer_, table_->scanEndBuffer_};
+                        return FindRange{table_, startKey.size(), startKey, endKey};
                     }
 
                 private:
@@ -1632,6 +2202,8 @@ namespace akkaradb {
 
         private:
             friend class AkkaraDB;
+            template <auto>
+            friend class PackedTable;
 
             struct IndexDef {
                 std::array<uint8_t, 8> prefix;
@@ -1648,13 +2220,62 @@ namespace akkaradb {
 
             struct ForeignKeyDef {
                 std::string fieldName;
-                void (*validate)(const Entity&, const PackedTable&);
+                void* target;
+                void (*validate)(const Entity&, void*);
             };
 
             struct CascadeDeleteDef {
                 void* source;
+                void* target;
                 std::string fieldName;
-                void (*cascade)(const PK&, void*);
+                std::string targetFieldName;
+                void (*cascade)(const Entity&, void*, void*);
+            };
+
+            struct RestrictDeleteDef {
+                void* source;
+                void* target;
+                std::string fieldName;
+                std::string targetFieldName;
+                void (*restrictDelete)(const Entity&, void*, void*);
+            };
+
+            struct SetNullDeleteDef {
+                void* source;
+                void* target;
+                std::string fieldName;
+                std::string targetFieldName;
+                void (*setNullDelete)(const Entity&, void*, void*);
+            };
+
+            struct UpdateCascadeDef {
+                void* source;
+                void* target;
+                std::string fieldName;
+                std::string targetFieldName;
+                void (*cascadeUpdate)(const Entity&, const Entity&, void*, void*);
+            };
+
+            struct UpdateRestrictDef {
+                void* source;
+                void* target;
+                std::string fieldName;
+                std::string targetFieldName;
+                void (*restrictUpdate)(const Entity&, const Entity&, void*, void*);
+            };
+
+            struct UpdateSetNullDef {
+                void* source;
+                void* target;
+                std::string fieldName;
+                std::string targetFieldName;
+                void (*setNullUpdate)(const Entity&, const Entity&, void*, void*);
+            };
+
+            struct UpdateFieldHookDef {
+                std::string fieldName;
+                bool (*unchanged)(const Entity&, const Entity&);
+                std::function<void(const Entity&, Entity&)> callback;
             };
 
             template <auto TargetPrimaryKeyPtr>
@@ -1667,6 +2288,10 @@ namespace akkaradb {
 
                     [[nodiscard]] bool exists(const Key& key) const override { return table_->exists(key); }
                     [[nodiscard]] std::optional<TargetEntity> get(const Key& key) const override { return table_->get(key); }
+                    [[nodiscard]] bool existsByRowId(RowId rowId) const override { return table_->primaryKeyOf(rowId).has_value(); }
+                    [[nodiscard]] std::optional<RowId> rowIdOf(const Key& key) const override { return table_->rowIdOf(key); }
+                    [[nodiscard]] std::optional<Key> keyOfRowId(RowId rowId) const override { return table_->primaryKeyOf(rowId); }
+                    [[nodiscard]] std::optional<TargetEntity> getByRowId(RowId rowId) const override { return table_->getByRowId(rowId); }
                     void put(const TargetEntity& value) override { table_->put(value); }
 
                 private:
@@ -1676,12 +2301,22 @@ namespace akkaradb {
             engine::AkkEngine* engine_ = nullptr;
             std::string tableName_;
             std::array<uint8_t, 8> pkPrefix_{};
+            std::array<uint8_t, 8> pkToRowIdPrefix_{};
+            std::array<uint8_t, 8> rowIdToPkPrefix_{};
+            std::array<uint8_t, 8> nextRowIdKey_{};
             std::vector<IndexDef> indexes_;
             std::vector<RefFieldDef> refFields_;
             std::vector<ForeignKeyDef> foreignKeys_;
             std::vector<CascadeDeleteDef> cascadeDeletes_;
+            std::vector<RestrictDeleteDef> restrictDeletes_;
+            std::vector<SetNullDeleteDef> setNullDeletes_;
+            std::vector<UpdateCascadeDef> cascadeUpdates_;
+            std::vector<UpdateRestrictDef> restrictUpdates_;
+            std::vector<UpdateSetNullDef> setNullUpdates_;
+            std::vector<UpdateFieldHookDef> updateFieldHooks_;
             std::vector<std::unique_ptr<RefBindingBase>> refBindings_;
             const RefBindingLookup* refBindingLookup_ = nullptr;
+            bool updateActionsNeedTargetWrite_ = false;
 
             mutable std::unique_ptr<core::BufferArena> tempArena_ = std::make_unique<core::BufferArena>();
             mutable ArenaByteBuffer pkKeyBuffer_{tempArena_.get()};
@@ -1701,6 +2336,97 @@ namespace akkaradb {
                 fieldBuffer_.bind(tempArena_.get());
                 scanStartBuffer_.bind(tempArena_.get());
                 scanEndBuffer_.bind(tempArena_.get());
+            }
+
+            template <typename X>
+            static decltype(auto) foreignKeyComparable(const X& value) {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (query::isOptional<Field>) {
+                    return foreignKeyComparable(*value);
+                }
+                else if constexpr (isImmutableField<Field>) {
+                    return foreignKeyComparable(value.get());
+                }
+                else if constexpr (isRef<Field>) {
+                    return value.rowId();
+                }
+                else {
+                    return (value);
+                }
+            }
+
+            template <typename X>
+            [[nodiscard]] static bool foreignKeyHasValue(const X& value) {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (query::isOptional<Field>) {
+                    return value.has_value();
+                }
+                else {
+                    return true;
+                }
+            }
+
+            template <typename X>
+            static void setForeignKeyNull(X& value) {
+                using Field = std::remove_cvref_t<X>;
+                static_assert(query::isOptional<Field>, "setForeignKeyNull requires std::optional foreign key fields");
+                value = std::nullopt;
+            }
+
+            template <typename X>
+            static void sealImmutableFields(const X& value) {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (isImmutableField<Field>) {
+                    value.seal();
+                }
+                else if constexpr (query::isOptional<Field>) {
+                    if (value) { sealImmutableFields(*value); }
+                }
+                else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
+                    boost::pfr::for_each_field(value, [](const auto& field) { sealImmutableFields(field); });
+                }
+            }
+
+            template <typename X>
+            static void ensureImmutableFieldsUnchanged(const X& oldValue, const X& newValue) {
+                using Field = std::remove_cvref_t<X>;
+                if constexpr (isImmutableField<Field>) {
+                    if (!(oldValue.get() == newValue.get())) {
+                        throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified");
+                    }
+                }
+                else if constexpr (query::isOptional<Field>) {
+                    using Inner = std::remove_cvref_t<decltype(*std::declval<const Field&>())>;
+                    if constexpr (isImmutableField<Inner>) {
+                        if (oldValue.has_value() != newValue.has_value()) {
+                            throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified");
+                        }
+                    }
+                    if (!oldValue.has_value() || !newValue.has_value()) { return; }
+                    ensureImmutableFieldsUnchanged(*oldValue, *newValue);
+                }
+                else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
+                    ensureImmutableAggregateFieldsUnchanged(
+                        oldValue,
+                        newValue,
+                        std::make_index_sequence<boost::pfr::tuple_size_v<Field>>{}
+                    );
+                }
+            }
+
+            template <typename X, size_t... I>
+            static void ensureImmutableAggregateFieldsUnchanged(const X& oldValue, const X& newValue, std::index_sequence<I...>) {
+                (ensureImmutableFieldsUnchanged(boost::pfr::get<I>(oldValue), boost::pfr::get<I>(newValue)), ...);
+            }
+
+            template <auto LeftPtr, auto RightPtr>
+            static consteval bool sameMemberPointer() {
+                if constexpr (std::is_same_v<decltype(LeftPtr), decltype(RightPtr)>) {
+                    return LeftPtr == RightPtr;
+                }
+                else {
+                    return false;
+                }
             }
 
             template <typename Expr>
@@ -1727,11 +2453,48 @@ namespace akkaradb {
             }
 
             void validateForeignKeys(const Entity& entity) const {
-                for (const auto& fk : foreignKeys_) { fk.validate(entity, *this); }
+                for (const auto& fk : foreignKeys_) { fk.validate(entity, fk.target == nullptr ? const_cast<PackedTable*>(this) : fk.target); }
             }
 
-            void runCascadeDeletes(const PK& pk) {
-                for (const auto& cascade : cascadeDeletes_) { cascade.cascade(pk, cascade.source); }
+            void runCascadeDeletes(const Entity& entity) {
+                for (const auto& cascade : cascadeDeletes_) { cascade.cascade(entity, cascade.source, cascade.target); }
+            }
+
+            void runRestrictDeletes(const Entity& entity) {
+                for (const auto& restrictDelete : restrictDeletes_) {
+                    restrictDelete.restrictDelete(entity, restrictDelete.source, restrictDelete.target);
+                }
+            }
+
+            void runSetNullDeletes(const Entity& entity) {
+                for (const auto& setNullDelete : setNullDeletes_) {
+                    setNullDelete.setNullDelete(entity, setNullDelete.source, setNullDelete.target);
+                }
+            }
+
+            void runCascadeUpdates(const Entity& oldEntity, const Entity& newEntity) {
+                for (const auto& cascadeUpdate : cascadeUpdates_) {
+                    cascadeUpdate.cascadeUpdate(oldEntity, newEntity, cascadeUpdate.source, cascadeUpdate.target);
+                }
+            }
+
+            void runRestrictUpdates(const Entity& oldEntity, const Entity& newEntity) {
+                for (const auto& restrictUpdate : restrictUpdates_) {
+                    restrictUpdate.restrictUpdate(oldEntity, newEntity, restrictUpdate.source, restrictUpdate.target);
+                }
+            }
+
+            void runSetNullUpdates(const Entity& oldEntity, const Entity& newEntity) {
+                for (const auto& setNullUpdate : setNullUpdates_) {
+                    setNullUpdate.setNullUpdate(oldEntity, newEntity, setNullUpdate.source, setNullUpdate.target);
+                }
+            }
+
+            void runUpdateFieldHooks(const Entity& oldEntity, Entity& newEntity) {
+                for (const auto& hook : updateFieldHooks_) {
+                    if (hook.unchanged(oldEntity, newEntity)) { continue; }
+                    hook.callback(oldEntity, newEntity);
+                }
             }
 
             template <typename Target>
@@ -1740,6 +2503,105 @@ namespace akkaradb {
                 auto* raw = refBindingLookup_->findRefBinding(std::type_index(typeid(Target)));
                 if (raw == nullptr) { return nullptr; }
                 return static_cast<RefBinding<Target>*>(raw);
+            }
+
+            template <auto FieldPtr, typename Handler>
+            static void invokeFieldUpdateHandler(Handler& handler, const Entity& oldEntity, Entity& newEntity) {
+                using Field = binpack::detail::memberOf<FieldPtr>;
+                if constexpr (std::invocable<Handler&, const Field&, Field&, const Entity&, Entity&>) {
+                    handler(oldEntity.*FieldPtr, newEntity.*FieldPtr, oldEntity, newEntity);
+                }
+                else if constexpr (std::invocable<Handler&, const Field&, Field&>) {
+                    handler(oldEntity.*FieldPtr, newEntity.*FieldPtr);
+                }
+                else if constexpr (std::invocable<Handler&, const Entity&, Entity&>) {
+                    handler(oldEntity, newEntity);
+                }
+                else if constexpr (std::invocable<Handler&, const decltype(oldEntity.*FieldPtr)&, const decltype(newEntity.*FieldPtr)&, const Entity&, const Entity&>) {
+                    handler(oldEntity.*FieldPtr, newEntity.*FieldPtr, oldEntity, newEntity);
+                }
+                else if constexpr (std::invocable<Handler&, const decltype(oldEntity.*FieldPtr)&, const decltype(newEntity.*FieldPtr)&>) {
+                    handler(oldEntity.*FieldPtr, newEntity.*FieldPtr);
+                }
+                else if constexpr (std::invocable<Handler&, const Entity&, const Entity&>) {
+                    handler(oldEntity, newEntity);
+                }
+                else {
+                    static_assert(
+                        !sizeof(Handler),
+                        "onUpdate handler must accept one of: "
+                        "(oldField, Field& newField), "
+                        "(oldField, Field& newField, oldEntity, Entity& newEntity), "
+                        "(oldEntity, Entity& newEntity), "
+                        "(oldField, newField), "
+                        "(oldField, newField, oldEntity, newEntity), "
+                        "or (oldEntity, newEntity)"
+                    );
+                }
+            }
+
+            template <typename IndexedField, typename Value, typename Out>
+            static void encodeIndexedSearchFieldValue(const Value& value, Out& out) {
+                using Indexed = std::remove_cvref_t<IndexedField>;
+                using ValueField = std::remove_cvref_t<Value>;
+                if constexpr (query::isOptional<Indexed>) {
+                    using Inner = typename ForeignKeyValueTraits<Indexed>::Type;
+                    if constexpr (query::isOptional<ValueField>) {
+                        encodeIndexFieldValue(value, out);
+                    }
+                    else if constexpr (isRef<typename std::remove_cvref_t<decltype(*std::declval<Indexed&>())>>) {
+                        encodeIndexFieldValue(Indexed{typename std::remove_cvref_t<decltype(*std::declval<Indexed&>())>{value}}, out);
+                    }
+                    else {
+                        encodeIndexFieldValue(Indexed{value}, out);
+                    }
+                }
+                else if constexpr (isRef<Indexed>) {
+                    if constexpr (std::is_same_v<ValueField, RowId>) { encodeIndexFieldValue(value, out); }
+                    else if constexpr (!isRef<ValueField>) { encodeIndexFieldValue(Indexed{value}, out); }
+                    else { encodeIndexFieldValue(value, out); }
+                }
+                else {
+                    encodeIndexFieldValue(value, out);
+                }
+            }
+
+            template <auto FieldPtr, typename Value>
+            [[nodiscard]] bool hasAnyByIndexedFieldValue(const Value& value) const {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "indexed field lookup must belong to the table entity");
+                using IndexedField = binpack::detail::memberOf<FieldPtr>;
+                std::vector<uint8_t> fieldBytes;
+                encodeIndexedSearchFieldValue<IndexedField>(value, fieldBytes);
+                std::vector<uint8_t> startKey;
+                makeIndexSearchPrefix(makeIndexPrefix(tableName_, binpack::detail::memberName<FieldPtr>()), fieldBytes, startKey);
+                std::vector<uint8_t> endKey = startKey;
+                if (!detail::incrementLexicographicBytes(endKey.data(), endKey.size())) { endKey.clear(); }
+
+                core::BufferArena scanArena;
+                auto rows = engine_->scan(scanArena, startKey, endKey);
+                return !(rows.begin() == rows.end());
+            }
+
+            template <auto FieldPtr, typename Value>
+            void collectPrimaryKeysByIndexedFieldValue(const Value& value, std::vector<PK>& out) const {
+                static_assert(std::is_same_v<binpack::detail::classOf<FieldPtr>, Entity>, "indexed field lookup must belong to the table entity");
+                using IndexedField = binpack::detail::memberOf<FieldPtr>;
+                std::vector<uint8_t> fieldBytes;
+                encodeIndexedSearchFieldValue<IndexedField>(value, fieldBytes);
+                std::vector<uint8_t> startKey;
+                makeIndexSearchPrefix(makeIndexPrefix(tableName_, binpack::detail::memberName<FieldPtr>()), fieldBytes, startKey);
+                std::vector<uint8_t> endKey = startKey;
+                if (!detail::incrementLexicographicBytes(endKey.data(), endKey.size())) { endKey.clear(); }
+
+                core::BufferArena scanArena;
+                auto rows = engine_->scan(scanArena, startKey, endKey);
+                for (auto it = rows.begin(); !(it == rows.end()); ++it) {
+                    const auto& raw = *it;
+                    const auto key = raw.key;
+                    if (key.size() <= startKey.size()) { continue; }
+                    std::span<const uint8_t> pkBytes{key.data() + startKey.size(), key.size() - startKey.size()};
+                    out.push_back(decodePrimaryKeyBytes(pkBytes));
+                }
             }
 
             template <typename X>
@@ -1766,7 +2628,11 @@ namespace akkaradb {
                     auto* binding = static_cast<RefBinding<Target>*>(raw);
                     value.attach(binding);
                     if (value.dirty()) {
+                        const auto key = RefTraits<Target>::keyOf(value.value());
                         binding->put(value.value());
+                        const auto rowId = binding->rowIdOf(key);
+                        if (!rowId.has_value()) { throw std::runtime_error("AkkaraDB Ref: dirty ref flush missing row id after put"); }
+                        value.rememberRowId(*rowId);
                         value.markClean();
                     }
                 }
@@ -1899,22 +2765,29 @@ namespace akkaradb {
                     | static_cast<uint32_t>(src[3]);
             }
 
-            template <typename Field>
-            static void encodeIndexFieldValue(const Field& value, ArenaByteBuffer& out) {
-                if constexpr (std::is_integral_v<Field> && !std::is_same_v<Field, bool>) {
-                    using Unsigned = std::make_unsigned_t<Field>;
+            template <typename Field, typename Out>
+            static void encodeIndexFieldValue(const Field& value, Out& out) {
+                using EncodedField = std::remove_cvref_t<Field>;
+                if constexpr (isImmutableField<EncodedField>) {
+                    encodeIndexFieldValue(value.get(), out);
+                }
+                else if constexpr (isRef<EncodedField>) {
+                    encodeSortableIntegral(value.rowId(), out);
+                }
+                else if constexpr (std::is_integral_v<EncodedField> && !std::is_same_v<EncodedField, bool>) {
+                    using Unsigned = std::make_unsigned_t<EncodedField>;
                     Unsigned sortable = static_cast<Unsigned>(value);
-                    if constexpr (std::is_signed_v<Field>) { sortable ^= (Unsigned{1} << (sizeof(Field) * 8 - 1)); }
+                    if constexpr (std::is_signed_v<EncodedField>) { sortable ^= (Unsigned{1} << (sizeof(EncodedField) * 8 - 1)); }
                     writeIndexBigEndian(sortable, out);
                 }
-                else if constexpr (std::is_same_v<Field, float>) {
+                else if constexpr (std::is_same_v<EncodedField, float>) {
                     uint32_t bits;
                     std::memcpy(&bits, &value, sizeof(bits));
                     const uint32_t sign = uint32_t{1} << 31;
                     bits = (bits & sign) != 0 ? ~bits : bits ^ sign;
                     writeIndexBigEndian(bits, out);
                 }
-                else if constexpr (std::is_same_v<Field, double>) {
+                else if constexpr (std::is_same_v<EncodedField, double>) {
                     uint64_t bits;
                     std::memcpy(&bits, &value, sizeof(bits));
                     const uint64_t sign = uint64_t{1} << 63;
@@ -1924,8 +2797,8 @@ namespace akkaradb {
                 else { binpack::BinPack::encodeInto(value, out); }
             }
 
-            template <typename UInt>
-            static void writeIndexBigEndian(UInt value, ArenaByteBuffer& out) {
+            template <typename UInt, typename Out>
+            static void writeIndexBigEndian(UInt value, Out& out) {
                 static_assert(std::is_unsigned_v<UInt>);
                 for (size_t i = sizeof(UInt); i > 0; --i) { out.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8))); }
             }
@@ -2123,6 +2996,7 @@ namespace akkaradb {
                 if (!engine_->getIntoArena(pkKeyBuffer_, *tempArena_, valueSpan)) { return false; }
                 out = Entry{decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(valueSpan)};
                 attachRefBindings(out.value);
+                sealImmutableFields(out.value);
                 return true;
             }
 
@@ -2133,8 +3007,8 @@ namespace akkaradb {
                 else { return binpack::BinPack::decode<PK>(pkBytes); }
             }
 
-            template <typename Integral>
-            static void encodeSortableIntegral(Integral value, ArenaByteBuffer& out) {
+            template <typename Integral, typename Out>
+            static void encodeSortableIntegral(Integral value, Out& out) {
                 using Unsigned = std::make_unsigned_t<Integral>;
                 Unsigned sortable = static_cast<Unsigned>(value);
                 if constexpr (std::is_signed_v<Integral>) { sortable ^= (Unsigned{1} << (sizeof(Integral) * 8 - 1)); }
@@ -2158,6 +3032,15 @@ namespace akkaradb {
 
             void removeHinted(std::span<const uint8_t> key) { engine_->removeHinted(key, computeKeyFp64(key), buildMiniKey(key)); }
 
+            static void encodeRowIdValue(RowId rowId, ArenaByteBuffer& out) {
+                out.clear();
+                binpack::BinPack::encodeInto(rowId, out);
+            }
+
+            [[nodiscard]] static RowId decodeRowId(std::span<const uint8_t> bytes) {
+                return binpack::BinPack::decode<RowId>(bytes);
+            }
+
             static void makePrefixStartEnd(const std::array<uint8_t, 8>& prefix, ArenaByteBuffer& start, ArenaByteBuffer& end) {
                 start.assign(prefix.begin(), prefix.end());
                 end.assign(prefix.begin(), prefix.end());
@@ -2167,6 +3050,17 @@ namespace akkaradb {
             static std::array<uint8_t, 8> makeTablePrefix(std::string_view name) {
                 std::array<uint8_t, 8> out{};
                 detail::writeLe64(detail::fnv1a64(name), out.data());
+                return out;
+            }
+
+            static std::array<uint8_t, 8> makeMetaPrefix(std::string_view tableName, std::string_view suffix) {
+                std::string input;
+                input.reserve(tableName.size() + 6 + suffix.size());
+                input.append(tableName);
+                input.append(":sys:");
+                input.append(suffix);
+                std::array<uint8_t, 8> out{};
+                detail::writeLe64(detail::fnv1a64(input), out.data());
                 return out;
             }
 
@@ -2181,10 +3075,60 @@ namespace akkaradb {
                 return out;
             }
 
+            void makePkToRowIdKey(const PK& pk, ArenaByteBuffer& out) const {
+                out.clear();
+                out.insert(out.end(), pkToRowIdPrefix_.begin(), pkToRowIdPrefix_.end());
+                encodePrimaryKeyBytes(pk, out);
+            }
+
+            void makeRowIdToPkKey(RowId rowId, ArenaByteBuffer& out) const {
+                out.clear();
+                out.insert(out.end(), rowIdToPkPrefix_.begin(), rowIdToPkPrefix_.end());
+                encodeSortableIntegral(rowId, out);
+            }
+
+            [[nodiscard]] RowId allocateRowId() {
+                indexKeyBuffer_.clear();
+                indexKeyBuffer_.insert(indexKeyBuffer_.end(), nextRowIdKey_.begin(), nextRowIdKey_.end());
+
+                std::span<const uint8_t> valueSpan;
+                RowId next = 1;
+                if (engine_->getIntoArena(indexKeyBuffer_, *tempArena_, valueSpan)) { next = decodeRowId(valueSpan); }
+
+                encodeRowIdValue(next + 1, valueBuffer_);
+                putHinted(indexKeyBuffer_, valueBuffer_);
+                return next;
+            }
+
+            void writeRowIdMapping(const PK& pk, RowId rowId) {
+                makePkToRowIdKey(pk, pkKeyBuffer_);
+                encodeRowIdValue(rowId, valueBuffer_);
+                putHinted(pkKeyBuffer_, valueBuffer_);
+
+                makeRowIdToPkKey(rowId, pkKeyBuffer_);
+                valueBuffer_.clear();
+                encodePrimaryKeyBytes(pk, valueBuffer_);
+                putHinted(pkKeyBuffer_, valueBuffer_);
+            }
+
+            void rewriteRowIdMapping(const PK& oldPk, const PK& newPk, RowId rowId) {
+                makePkToRowIdKey(oldPk, pkKeyBuffer_);
+                removeHinted(pkKeyBuffer_);
+                writeRowIdMapping(newPk, rowId);
+            }
+
+            void removeRowIdMapping(const PK& pk, RowId rowId) {
+                makePkToRowIdKey(pk, pkKeyBuffer_);
+                removeHinted(pkKeyBuffer_);
+                makeRowIdToPkKey(rowId, pkKeyBuffer_);
+                removeHinted(pkKeyBuffer_);
+            }
+
+            template <typename Out>
             void makeIndexSearchPrefix(
                 const std::array<uint8_t, 8>& prefix,
                 std::span<const uint8_t> fieldBytes,
-                ArenaByteBuffer& out
+                Out& out
             ) const {
                 out.clear();
                 out.resize(12 + fieldBytes.size());

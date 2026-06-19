@@ -244,6 +244,20 @@ keys flip the sign bit before big-endian encoding. For non-integral primary keys
 Index entries are non-unique. The encoded primary key suffix makes duplicate field values distinct and allows exact-match index scans to recover the entity by
 primary key.
 
+#### RowId Metadata Entries
+
+Each `PackedTable` also maintains a stable per-row identifier independent from the primary-key bytes:
+
+```
+[pk2row_prefix:8][encoded_pk]   -> BinPack::encode(RowId)
+[row2pk_prefix:8][encoded_rowid] -> encoded_pk
+[nextrow_prefix:8]              -> BinPack::encode(next_row_id)
+```
+
+`RowId` is currently `uint64_t`. It is allocated on first insert, remains stable across `updatePrimaryKey(...)`, and is removed when the row is deleted.
+`Ref<T>` can resolve either by primary key or by remembered `RowId`, which lets references stay attached even when the target table cascades a primary-key
+update.
+
 ### 3.6 Key Ordering
 
 Raw engine keys are ordered lexicographically by bytes. PackedTable integral primary keys use the same sortable fixed-width big-endian encoding described
@@ -982,8 +996,14 @@ auto authorName = post->author->name; // lazy resolve through the attached bindi
 auto joined = posts.join<&Post::author>(authors).toVector();
 ```
 
-`foreignKey<&Owner::refField>()` validates that the referenced entity exists before storing the owner row. The schema helper currently supports cascade delete
-through `OnDelete::Cascade`, which is the only `OnDelete` mode.
+`foreignKey<&Owner::refField>()` validates that the referenced entity exists before storing the owner row. Both `Ref<T>` foreign keys and plain comparable
+fields can be registered through `Schema::foreignKey(...)`, and both `OnDelete` and `OnUpdate` support exactly one of `Cascade`, `Restrict`, or `SetNull`.
+`SetNull` requires the owner field to be `std::optional<...>`. `Ref<T>` foreign keys currently target the referenced entity primary key; arbitrary non-primary
+target fields are supported only for plain comparable owner fields.
+
+Primary-key updates are explicit through `updatePrimaryKey(oldPk, entity)`. When a referenced target primary key changes, `OnUpdate::Cascade` rewrites the
+owner-side foreign-key value, `OnUpdate::Restrict` rejects the change while references exist, and `OnUpdate::SetNull` clears optional owner-side references.
+For `Ref<T>`, the internal remembered `RowId` is preserved so the reference continues to point at the same logical entity after the target primary-key rewrite.
 
 Manual table binding is also available through `bindRef<&Owner::refField>(targetTable)`, and manual cascade registration is available through
 `cascadeDeleteFrom<&Owner::refField>(sourceTable)`. Joins can use either a `Ref<T>` field or arbitrary comparable fields:
@@ -1003,6 +1023,46 @@ AKKARADB_QUERYABLE(PlainPost, id, authorId, body, likes)
 auto plainPosts = db->table<&PlainPost::id>("plain_posts");
 auto byField = plainPosts.join<&PlainPost::authorId, &Author::id>(authors);
 ```
+
+`PackedTable` also exposes stable row-identity helpers:
+
+```cpp
+auto rowId = authors.rowIdOf(1ULL);
+auto sameAuthor = rowId ? authors.getByRowId(*rowId) : std::nullopt;
+auto pk = rowId ? authors.primaryKeyOf(*rowId) : std::nullopt;
+```
+
+`rowIdOf(pk)` returns the stable row id for the current row version, `primaryKeyOf(rowId)` resolves the current primary key, and `getByRowId(rowId)` loads by
+stable identity. These mappings are implementation metadata and not part of the user entity payload.
+
+Persisted entities can mark fields as immutable with `akkaradb::Immutable<T>` or the shorter alias `akkaradb::Const<T>`:
+
+```cpp
+struct Author {
+    uint64_t id;
+    akkaradb::Const<std::string> externalId;
+    std::string name;
+};
+```
+
+Immutable fields are writable before the row is persisted, are sealed after `put(...)` / `get(...)`, and any later attempt to change their value causes
+`std::runtime_error`. Primary-key fields themselves cannot use `Immutable<T>`.
+
+`PackedTable::onUpdate<&Field>(handler)` registers local update hooks that run when a stored row is overwritten or when `updatePrimaryKey(...)` replaces it and
+the watched field changed. Handlers may observe both old and new values and may mutate the new entity. Accepted callable shapes are:
+
+```cpp
+table.onUpdate<&Post::title>([](const std::string& oldValue, std::string& newValue) {
+    if (newValue.empty()) { newValue = oldValue; }
+});
+
+table.onUpdate<&Post::body>([](const Post& oldEntity, Post& newEntity) {
+    if (oldEntity.body != newEntity.body) { newEntity.likes = 0; }
+});
+```
+
+Supported signatures are `(oldField, Field& newField)`, `(oldField, Field& newField, oldEntity, Entity& newEntity)`, `(oldEntity, Entity& newEntity)`, and
+their read-only `newField` / `newEntity` variants.
 
 ### 15.5 BinPack
 
@@ -1030,7 +1090,41 @@ Integers are encoded little-endian by BinPack.
 `Ref<T>` is encoded as its key only. Aggregate structs are encoded field-by-field through Boost.PFR, except trivially copyable aggregates which currently use a
 memcpy fast path.
 
-### 15.6 JNI Bridge
+### 15.6 Erasure Codecs
+
+The low-level engine also exposes erasure-coding helpers under `akk/engine/erasure/`.
+
+`ErasureCodec.hpp` defines:
+
+- `XorErasureCodec`: `k + 1` layout with single-shard recovery.
+- `DualXorErasureCodec`: `k + 2` layout with two dedicated parity shards and recovery of up to two missing data shards.
+- `RsErasureCodec`: systematic Reed-Solomon over GF(256) for erasure recovery from any `k` valid shards.
+
+All three share:
+
+```cpp
+std::vector<ErasureShard> encode(std::span<const uint8_t> value, ErasureLayout layout);
+std::vector<uint8_t> decode(std::span<const ErasureShard> shards, ErasureLayout layout);
+ErasureShard repairOne(uint16_t missingIndex, std::span<const ErasureShard> shards, ErasureLayout layout);
+```
+
+`ErasureShard` stores `index`, `originalSize`, `codec`, payload bytes, and a CRC32C over the shard payload. `repairOne(...)` is defined for the erasure case
+where the missing shard index is already known.
+
+`ErasureCodecExt.hpp` adds `ErsCodec`, which is intentionally separate from the erasure-only interface. `ErsCodec` uses the same systematic RS shard layout as
+`RsErasureCodec::encode(...)`, but its recovery API can identify corrupted shards in addition to known erasures:
+
+```cpp
+auto shards = ErsCodec::encode(bytes, {.dataShards = 6, .parityShards = 3});
+auto recovered = ErsCodec::recover(shards, {.dataShards = 6, .parityShards = 3});
+auto recovered2 = ErsCodec::recover(shards, {.dataShards = 6, .parityShards = 3}, {1, 4});
+```
+
+`ErsRecoveryResult` returns the recovered value, any repaired shard payloads, explicit missing indices, and detected corrupt-shard indices. The current native
+implementation performs bounded search for up to two unknown corrupted shards in addition to known erasures. `knownBadIndices` lets the caller pre-declare
+missing or suspicious shard indices that should be treated as erasures before unknown-error search starts.
+
+### 15.7 JNI Bridge
 
 When `AKKARADB_BUILD_JNI=ON`, the native build produces `akkaradb_jni`. The JNI bridge exposes the raw engine operations, scan cursors, query scan transport,
 and option-based open used by the JVM module. The public JVM engine API uses `ByteBufferL`; the current JNI native methods receive direct `java.nio.ByteBuffer`
@@ -1053,7 +1147,7 @@ The JNI engine entry points are:
 | cursor `next`      | `NativeScanCursor.nativeNext` | Returns JVM `RowView(ByteBufferL key, ByteBufferL value)` |
 | cursor `close`     | `NativeScanCursor.nativeClose` | Destroys the native cursor                            |
 
-#### 15.6.1 JVM Query Scan Payloads
+#### 15.7.1 JVM Query Scan Payloads
 
 `nativeOpenQueryScan(handle, startKey, endKey, queryBytes, schemaBytes)` opens a normal native scan over `[startKey, endKey)` and evaluates the decoded query
 against each row value before yielding it. The row value is decoded with the supplied schema. The query payload is produced by the JVM `AstSerializer`; the schema
@@ -1061,7 +1155,7 @@ payload is produced by `SchemaSerializer`.
 
 All query and schema payload integer fields are little-endian. Payload strings are UTF-8.
 
-#### 15.6.2 Query Payload
+#### 15.7.2 Query Payload
 
 The query payload contains captures followed by one recursive expression tree:
 
@@ -1130,7 +1224,7 @@ Expr:
 The current native evaluator implements comparison, equality, boolean, membership, map lookup, string predicate, null-check, capture, literal, and column
 expressions used by the JVM scan path. Unsupported operators must be treated as query-evaluation errors rather than silently matching rows.
 
-#### 15.6.3 Schema Payload
+#### 15.7.3 Schema Payload
 
 The schema payload describes the BinPack layout of the row value. The root is always a struct schema and does not include a leading `Struct` kind byte:
 
@@ -1358,9 +1452,10 @@ When building from the source tree, the primary target is `akkaradb`.
 |------------------------------------|---------------------------------------------------------|
 | `akkaradb/AkkaraDB.hpp`            | High-level open API, `StartupMode`, `AkkaraDB::Options` |
 | `akkaradb/PackedTable.hpp`         | Typed table, secondary indexes, query helpers           |
-| `akkaradb/Ref.hpp`                 | `Ref<T>`, `RefTraits`, schema reference bindings        |
+| `akkaradb/Ref.hpp`                 | `Ref<T>`, `RefTraits`, `RowId`, `Immutable<T>`, `Const` |
 | `akkaradb/Stats.hpp`               | Engine statistics snapshot                              |
 | `akkaradb/binpack/BinPack.hpp`     | Encode/decode facade                                    |
 | `akkaradb/binpack/TypeAdapter.hpp` | Serialization adapters                                  |
 
-Headers under `akkara/akkengine/include/akk` provide the public low-level AkkEngine API. The higher-level typed database API remains under `akkara/akkaradb/include/akkaradb`.
+Headers under `akkara/akkengine/include/akk` provide the public low-level AkkEngine API, including `akk/engine/erasure/ErasureCodec.hpp` and
+`akk/engine/erasure/ErasureCodecExt.hpp`. The higher-level typed database API remains under `akkara/akkaradb/include/akkaradb`.

@@ -122,7 +122,11 @@ The native repository exposes two main API levels.
 
 `engine::AkkEngine` is the byte-oriented core API. It accepts raw byte spans for keys and values and exposes point reads, writes, removes, scans, history operations, rollback, flush, sync, and close.
 
-`AkkaraDB` and `PackedTable<&T::id>` are the high-level typed API. They map C++ aggregate entities to raw key/value rows using BinPack serialization. Table keys are scoped by an 8-byte FNV-1a table prefix, and secondary indexes use a separate prefix derived from `table_name + ":idx:" + field_name`.
+`AkkaraDB` and `PackedTable<&T::id>` are the high-level typed API. They map C++ aggregate entities to raw key/value rows using BinPack serialization. Table keys are scoped by an 8-byte FNV-1a table prefix, secondary indexes use a separate prefix derived from `table_name + ":idx:" + field_name`, and each stored row also receives a stable `RowId` mapping that survives primary-key rewrites.
+
+The high-level API also owns `Ref<T>` lazy resolution, foreign-key validation, `OnDelete` / `OnUpdate` actions, immutable-field sealing through `Immutable<T>` / `Const<T>`, stable row-id lookups, and local `onUpdate<&Field>(...)` hooks.
+
+The low-level public headers additionally expose erasure-coding utilities (`XorErasureCodec`, `DualXorErasureCodec`, `RsErasureCodec`, and `ErsCodec`) independently from the storage-engine open/close path.
 
 The JVM layer reaches the same native engine through JNI when `AKKARADB_BUILD_JNI=ON`. The JNI bridge exposes raw operations, scan cursors, query scan payload evaluation, option-based open, and rollback entry points used by the Kotlin module.
 
@@ -422,6 +426,9 @@ PackedTable<User, id>.put(user)
   +-- encode primary row key:
   |     [table_prefix:8][encoded_pk]
   |
+  +-- allocate or reuse stable RowId
+  +-- maintain [pk -> rowid] and [rowid -> pk] metadata
+  |
   +-- BinPack::encode(user)
   +-- engine.put(primary_key, encoded_user)
   |
@@ -430,6 +437,8 @@ PackedTable<User, id>.put(user)
 ```
 
 Secondary index entries are non-unique. The encoded primary key suffix keeps duplicate field values distinct and lets index scans recover the primary row.
+
+When the entity contains `Ref<T>` fields, dirty references are written first through the attached table binding. Foreign-key validation then checks that the referenced target exists. If the target later changes primary key through `updatePrimaryKey(...)`, registered `OnUpdate` actions propagate, reject, or null the owner-side foreign key depending on schema configuration. Local `onUpdate<&Field>(...)` hooks run before persistence when a watched field value changed and may mutate the replacement entity.
 
 ### JNI Query Scan Path
 

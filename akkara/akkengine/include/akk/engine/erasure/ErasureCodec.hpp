@@ -79,4 +79,64 @@ namespace akkaradb::engine::erasure {
 
             [[nodiscard]] static size_t shardPayloadSize(uint64_t originalSize, uint16_t dataShards);
     };
+
+    class AKDB_API DualXorErasureCodec {
+        public:
+            /**
+             * Encodes value into k data shards and two parity shards.
+             *
+             * The first parity shard is plain XOR parity. The second parity
+             * shard uses a distinct coefficient per data shard so that decode
+             * can reconstruct up to two missing data shards.
+             */
+            [[nodiscard]] static std::vector<ErasureShard> encode(std::span<const uint8_t> value, ErasureLayout layout);
+
+            /**
+             * Decodes the original value from the available shards.
+             *
+             * DualXOR can recover up to two missing data shards as long as
+             * both parity shards are available for the two-missing case.
+             *
+             * @throws std::invalid_argument on invalid layout or shard set.
+             * @throws std::runtime_error on CRC mismatch or insufficient shards.
+             */
+            [[nodiscard]] static std::vector<uint8_t> decode(std::span<const ErasureShard> shards, ErasureLayout layout);
+
+            /**
+             * Repairs one missing shard when the supplied shard set leaves only
+             * that shard absent.
+             *
+             * @throws std::invalid_argument when missingIndex is out of range
+             *         or the input set is malformed.
+             * @throws std::runtime_error on CRC mismatch or insufficient shards.
+             */
+            [[nodiscard]] static ErasureShard repairOne(uint16_t missingIndex, std::span<const ErasureShard> shards, ErasureLayout layout);
+
+            [[nodiscard]] static size_t shardPayloadSize(uint64_t originalSize, uint16_t dataShards);
+    };
+
+    class AKDB_API RsErasureCodec {
+        public:
+            /**
+             * Encodes value into k systematic data shards plus m Reed-Solomon
+             * parity shards over GF(256).
+             */
+            [[nodiscard]] static std::vector<ErasureShard> encode(std::span<const uint8_t> value, ErasureLayout layout);
+
+            /**
+             * Decodes the original value from any k valid shards.
+             *
+             * @throws std::invalid_argument on invalid layout or shard set.
+             * @throws std::runtime_error on CRC mismatch or insufficient shards.
+             */
+            [[nodiscard]] static std::vector<uint8_t> decode(std::span<const ErasureShard> shards, ErasureLayout layout);
+
+            /**
+             * Repairs one missing shard when the remaining shard set still has
+             * enough information to reconstruct the original data.
+             */
+            [[nodiscard]] static ErasureShard repairOne(uint16_t missingIndex, std::span<const ErasureShard> shards, ErasureLayout layout);
+
+            [[nodiscard]] static size_t shardPayloadSize(uint64_t originalSize, uint16_t dataShards);
+    };
 } // namespace akkaradb::engine::erasure

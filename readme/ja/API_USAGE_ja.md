@@ -342,13 +342,74 @@ auto plainPosts = db->table<&PlainPost::id>("plain_posts");
 auto joinedById = plainPosts.join<&PlainPost::authorId, &Author::id>(authors).toVector();
 ```
 
+`foreignKey<&Post::author>()` は参照先 entity の存在を保存前に検証します。schema の foreign key は `OnDelete` と `OnUpdate` をそれぞれ 1 つずつ指定でき、値は `Cascade` / `Restrict` / `SetNull` です。`SetNull` は owner 側 field が `std::optional<...>` のときだけ使えます。`Ref<T>` の foreign key は現状では参照先 primary key を target にする場合に限られ、任意 field を target にできるのは plain comparable field 側です。
+
+参照先 primary key を変更するときは `updatePrimaryKey(oldPk, entity)` を使います。`OnUpdate::Cascade` は owner 側 foreign key 値を書き換え、`OnUpdate::Restrict` は参照が残っている間その変更を拒否し、`OnUpdate::SetNull` は optional な owner 側参照を `nullopt` にします。`Ref<T>` は内部で stable な `RowId` も覚えるので、cascade 後も同じ logical entity を追跡できます。
+
+stable row identity 用に `PackedTable` には次の helper があります。
+
+```cpp
+if (auto rowId = authors.rowIdOf(1ULL)) {
+    auto sameAuthor = authors.getByRowId(*rowId);
+    auto currentPk = authors.primaryKeyOf(*rowId);
+    (void)sameAuthor;
+    (void)currentPk;
+}
+```
+
+永続化後に書き換えさせたくない field は `akkaradb::Immutable<T>` または短い alias の `akkaradb::Const<T>` で表せます。
+
+```cpp
+struct ExternalAuthor {
+    uint64_t id;
+    akkaradb::Const<std::string> externalId;
+    std::string name;
+};
+```
+
+これらの field は保存前は代入できますが、`put()` / `get()` 後は sealed 状態になり、値変更は `std::runtime_error` になります。primary key field 自体に `Immutable<T>` は使えません。
+
+`PackedTable::onUpdate<&Field>(handler)` は既存 row を上書きするとき、監視 field が変わっていた場合に local hook を実行します。hook は new entity をその場で変更できます。
+
+```cpp
+posts.onUpdate<&Post::title>([](const std::string& oldValue, std::string& newValue) {
+    if (newValue.empty()) { newValue = oldValue; }
+});
+
+posts.onUpdate<&Post::body>([](const Post& oldEntity, Post& newEntity) {
+    if (oldEntity.body != newEntity.body) { newEntity.likes = 0; }
+});
+```
+
+受け付ける signature は `(oldField, Field& newField)`、`(oldField, Field& newField, oldEntity, Entity& newEntity)`、`(oldEntity, Entity& newEntity)` と、その read-only 版です。
+
+### Erasure Codecs
+
+low-level header には erasure coding utility もあります。
+
+```cpp
+#include "akk/engine/erasure/ErasureCodec.hpp"
+#include "akk/engine/erasure/ErasureCodecExt.hpp"
+
+using namespace akkaradb::engine::erasure;
+
+const ErasureLayout layout{.dataShards = 6, .parityShards = 3};
+auto shards = RsErasureCodec::encode(bytes("payload"), layout);
+auto decoded = RsErasureCodec::decode(shards, layout);
+
+auto ersShards = ErsCodec::encode(bytes("payload"), layout);
+auto recovered = ErsCodec::recover(ersShards, layout, {1});
+```
+
+`XorErasureCodec` は 1 shard 欠損復元、`DualXorErasureCodec` は 2 parity で最大 2 data shard 欠損復元、`RsErasureCodec` は systematic RS による erasure recovery です。`ErsCodec` は同じ RS shard layout を使いますが、known erasure だけでなく壊れた shard の検出も行う別 interface です。
+
 ### Error Handling
 
 Native API は zero-exception API ではありません。通常の「存在しない」は戻り値で表し、呼び出しの誤りやストレージ処理の失敗は標準例外で表します。
 
 `get()`、`getAt()`、typed `PackedTable::get()` は値が存在しない場合に `std::nullopt` を返します。`getInto()`、`getIntoArena()`、typed `getInto()` は同じ状況で `false` を返します。scan、query、join、history の結果が空の場合は、空の range/vector として扱われます。
 
-一方で、close 済み engine への操作、不正な設定、未利用 backend、危険な cluster transport 設定、I/O 失敗、永続化データの破損、CRC 不一致、detached `Ref<T>` の dereference、存在しない foreign-key target、未登録 index に対する `findBy()` は `std::runtime_error` または `std::invalid_argument` を投げます。typed scan/query/index range は `hasNext()` を確認してから `next()` を呼ぶ前提で、終端後の `next()` は `std::out_of_range` を投げます。
+一方で、close 済み engine への操作、不正な設定、未利用 backend、危険な cluster transport 設定、I/O 失敗、永続化データの破損、CRC 不一致、detached `Ref<T>` の dereference、存在しない foreign-key target、persisted 後の immutable field 書き換え、未登録 index に対する `findBy()` は `std::runtime_error` または `std::invalid_argument` を投げます。typed scan/query/index range は `hasNext()` を確認してから `next()` を呼ぶ前提で、終端後の `next()` は `std::out_of_range` を投げます。
 ## StartupMode と Options
 
 高レベル API では `StartupMode` で durability profile を選びます。

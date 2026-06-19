@@ -120,15 +120,13 @@ namespace akkaradb::binpack {
 
     template <typename T>
     struct TypeAdapter<akkaradb::Ref<T>> {
-        using Key = typename akkaradb::Ref<T>::Key;
-
         template <typename Out>
         static void write(const akkaradb::Ref<T>& v, Out& out) {
-            TypeAdapter<Key>::write(v.id(), out);
+            detail::writeU64(v.rowId(), out);
         }
 
         static akkaradb::Ref<T> read(std::span<const uint8_t>& in) {
-            return akkaradb::Ref<T>{TypeAdapter<Key>::read(in)};
+            return akkaradb::Ref<T>::fromRowId(detail::readU64(in));
         }
 
         static bool readInto(std::span<const uint8_t>& in, akkaradb::Ref<T>& out) {
@@ -136,9 +134,26 @@ namespace akkaradb::binpack {
             return true;
         }
 
-        static size_t estimateSize(const akkaradb::Ref<T>& v) {
-            return TypeAdapter<Key>::estimateSize(v.id());
+        static size_t estimateSize(const akkaradb::Ref<T>&) { return sizeof(akkaradb::RowId); }
+    };
+
+    template <typename T>
+    struct TypeAdapter<akkaradb::Immutable<T>> {
+        template <typename Out>
+        static void write(const akkaradb::Immutable<T>& v, Out& out) {
+            TypeAdapter<T>::write(v.get(), out);
         }
+
+        static akkaradb::Immutable<T> read(std::span<const uint8_t>& in) {
+            return akkaradb::Immutable<T>::persisted(TypeAdapter<T>::read(in));
+        }
+
+        static bool readInto(std::span<const uint8_t>& in, akkaradb::Immutable<T>& out) {
+            out.replacePersisted(TypeAdapter<T>::read(in));
+            return true;
+        }
+
+        static size_t estimateSize(const akkaradb::Immutable<T>& v) { return TypeAdapter<T>::estimateSize(v.get()); }
     };
 
     template <>

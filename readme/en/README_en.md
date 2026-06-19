@@ -17,9 +17,11 @@
 | Reads        | MemTable-first lookup, SST fallback, optional SST read promotion                        |
 | History      | Optional per-key version log, point-in-time read, global and per-key rollback           |
 | API servers  | HTTP REST and binary TCP backends, default ports 7070 and 7071                          |
-| Typed tables | `PackedTable<&T::id>` with BinPack serialization, scans, helpers, and secondary indexes |
+| Typed tables | `PackedTable<&T::id>` with BinPack serialization, stable `RowId`s, scans, helpers, joins, and secondary indexes |
+| Typed updates | Immutable persisted fields through `Immutable<T>` / `Const<T>`, local `onUpdate<&Field>(...)` hooks, and foreign-key `OnDelete` / `OnUpdate` actions |
 | JVM bridge   | Kotlin/JVM wrapper over JNI using `ByteBufferL` at the public low-level API             |
 | Clustering   | Standalone, mirror, and stripe replication configuration primitives                     |
+| Erasure      | `XOR`, `DualXOR`, `RS`, and `ERS` low-level erasure/error-correcting codecs            |
 | Portability  | Windows/MSVC and Linux/GCC/Clang                                                        |
 
 ---
@@ -119,6 +121,20 @@ engine->rollbackKey(bytes("user:1"), target_seq);
 engine->rollbackTo(target_seq);
 ```
 
+The low-level headers also include erasure-coding helpers:
+
+```cpp
+#include "akk/engine/erasure/ErasureCodec.hpp"
+#include "akk/engine/erasure/ErasureCodecExt.hpp"
+
+using namespace akkaradb::engine::erasure;
+
+const ErasureLayout layout{.dataShards = 6, .parityShards = 3};
+auto shards = RsErasureCodec::encode(bytes("payload"), layout);
+auto decoded = RsErasureCodec::decode(shards, layout);
+auto recovered = ErsCodec::recover(ErsCodec::encode(bytes("payload"), layout), layout, {1});
+```
+
 ---
 
 ## C++ High-Level API
@@ -181,6 +197,32 @@ db->close();
 Typed table keys are table-scoped. The primary key layout is an 8-byte FNV-1a table prefix followed by the encoded primary key. Integral primary keys use a
 sortable fixed-width big-endian encoding so typed range scans preserve numeric order. Secondary indexes use `table_name + ":idx:" + field_name` as their
 namespace.
+
+Stable row identity is available through `rowIdOf(pk)`, `primaryKeyOf(rowId)`, and `getByRowId(rowId)`. Persisted fields can be made immutable with `akkaradb::Immutable<T>` or `akkaradb::Const<T>`, and local `onUpdate<&Field>(...)` hooks can rewrite replacement entities before they are stored.
+
+Schema-managed foreign keys support `OnDelete` and `OnUpdate` actions (`Cascade`, `Restrict`, `SetNull`). `Ref<T>` keeps following the same logical target across primary-key rewrites by remembering the target row id internally.
+
+```cpp
+struct User {
+    uint64_t id;
+    akkaradb::Const<std::string> externalId;
+    std::string email;
+    std::string name;
+};
+
+AKKARADB_QUERYABLE(User, id, externalId, email, name)
+
+users.onUpdate<&User::email>([](const std::string& old_value, std::string& new_value) {
+    if (new_value.empty()) { new_value = old_value; }
+});
+
+if (auto row_id = users.rowIdOf(1ULL)) {
+    auto same_user = users.getByRowId(*row_id);
+    (void)same_user;
+}
+```
+
+For the full typed-table surface, see [API_USAGE_en.md](API_USAGE_en.md).
 
 ---
 

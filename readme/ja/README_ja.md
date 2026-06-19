@@ -119,6 +119,20 @@ engine->rollbackKey(bytes("user:1"), target_seq);
 engine->rollbackTo(target_seq);
 ```
 
+low-level header には erasure coding utility もあります。
+
+```cpp
+#include "akk/engine/erasure/ErasureCodec.hpp"
+#include "akk/engine/erasure/ErasureCodecExt.hpp"
+
+using namespace akkaradb::engine::erasure;
+
+const ErasureLayout layout{.dataShards = 6, .parityShards = 3};
+auto shards = RsErasureCodec::encode(bytes("payload"), layout);
+auto decoded = RsErasureCodec::decode(shards, layout);
+auto recovered = ErsCodec::recover(ErsCodec::encode(bytes("payload"), layout), layout, {1});
+```
+
 ---
 
 ## C++ High-Level API
@@ -177,6 +191,8 @@ users.upsert(2ULL, [](User& user) {
 users.remove(1ULL);
 db->close();
 ```
+
+typed table では `rowIdOf(pk)` / `primaryKeyOf(rowId)` / `getByRowId(rowId)` で stable identity を扱えます。persisted 後に変更させたくない field は `akkaradb::Immutable<T>` または `akkaradb::Const<T>` を使えます。local `onUpdate<&Field>(...)` hook は watched field 変更時に replacement entity を保存前に書き換えられます。schema-managed foreign key は `OnDelete` と `OnUpdate` の `Cascade` / `Restrict` / `SetNull` を使えます。
 
 typed table の key は table ごとに namespace 化されます。primary key layout は 8-byte FNV-1a table prefix と encoded primary key です。secondary index は
 `table_name + ":idx:" + field_name` を namespace として使います。

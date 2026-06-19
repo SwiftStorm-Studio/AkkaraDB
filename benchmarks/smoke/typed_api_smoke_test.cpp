@@ -58,7 +58,34 @@ struct PlainPost {
     uint32_t likes;
 };
 
-AKKARADB_QUERYABLE(PlainPost, id, authorId, authorAge, body);
+AKKARADB_ENTITY(PlainPost, id, authorId, authorAge, body);
+
+struct RestrictedPost {
+    uint64_t id;
+    uint64_t authorId;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_ENTITY(RestrictedPost, id, authorId, body, likes);
+
+struct NullablePost {
+    uint64_t id;
+    std::optional<uint64_t> authorId;
+    std::string body;
+    uint32_t likes;
+};
+
+AKKARADB_ENTITY(NullablePost, id, authorId, body, likes);
+
+struct ImmutableUser {
+    uint64_t id;
+    akkaradb::Immutable<std::string> handle;
+    uint32_t age;
+    std::string bio;
+};
+
+AKKARADB_ENTITY(ImmutableUser, id, handle, age, bio);
 
 namespace {
     namespace fs = std::filesystem;
@@ -520,13 +547,24 @@ namespace {
         auto schema = db->schema()
             .table<&RefAuthor::id>("authors")
             .table<&RefPost::id>("posts")
-            .foreignKey<&RefPost::author>()
+            .table<&PlainPost::id>("plain_posts")
+            .table<&RestrictedPost::id>("restricted_posts")
+            .table<&NullablePost::id>("nullable_posts")
+            .foreignKey<&RefPost::author>({OnDelete::Cascade}, {OnUpdate::Cascade})
+            .foreignKey<&PlainPost::authorId, &RefAuthor::id>({}, {OnUpdate::Cascade})
+            .foreignKey<&RestrictedPost::authorId, &RefAuthor::id>({OnDelete::Restrict}, {OnUpdate::Restrict})
+            .foreignKey<&NullablePost::authorId, &RefAuthor::id>({OnDelete::SetNull}, {OnUpdate::SetNull})
             .open();
         auto& authors = schema.table<RefAuthor>();
         auto& posts = schema.table<RefPost>();
+        auto& plainPosts = schema.table<PlainPost>();
+        auto& restrictedPosts = schema.table<RestrictedPost>();
+        auto& nullablePosts = schema.table<NullablePost>();
 
         authors.put({1, "Alice", 30, "alice@example.test"});
         posts.put({100, ref<RefAuthor>(1), "hello", 5, "first"});
+        nullablePosts.put({400, 1, "set null child", 9});
+        nullablePosts.put({401, std::nullopt, "already null", 1});
 
         auto post = posts.get(100);
         AKK_TEST_CHECK(post.has_value());
@@ -547,12 +585,11 @@ namespace {
         AKK_TEST_CHECK(joinedAlice.has_value());
         AKK_TEST_CHECK(joinedAlice->left.id == 100);
 
-        auto plainPosts = db->table<&PlainPost::id>("plain_posts");
         plainPosts.put({200, 1, 30, "plain pk join", 7});
-        plainPosts.put({201, 404, 30, "plain field join", 2});
+        plainPosts.put({201, 1, 30, "plain field join", 2});
 
         auto plainPkJoined = plainPosts.join<&PlainPost::authorId, &RefAuthor::id>(authors).toVector();
-        AKK_TEST_CHECK(plainPkJoined.size() == 1);
+        AKK_TEST_CHECK(plainPkJoined.size() == 2);
         AKK_TEST_CHECK(plainPkJoined[0].left.value.id == 200);
         AKK_TEST_CHECK(plainPkJoined[0].right.name == "Alice");
 
@@ -567,14 +604,96 @@ namespace {
         AKK_TEST_CHECK(updatedAuthor.has_value());
         AKK_TEST_CHECK(updatedAuthor->name == "Alice Updated");
 
-        posts.put({101, RefAuthor{2, "Bob", 40, "bob@example.test"}, "from value", 3, "second"});
-        auto bob = authors.get(2);
+        RefPost postFromValue{101, RefAuthor{20, "Bob", 40, "bob@example.test"}, "from value", 3, "second"};
+        AKK_TEST_CHECK(postFromValue.author.dirty());
+        AKK_TEST_CHECK(postFromValue.author.loaded());
+        posts.put(postFromValue);
+        auto bob = authors.get(20);
+        AKK_TEST_CHECK(authors.exists(20));
         AKK_TEST_CHECK(bob.has_value());
         AKK_TEST_CHECK(bob->name == "Bob");
+        restrictedPosts.put({300, 20, "restrict child", 1});
 
-        authors.remove(2);
-        AKK_TEST_CHECK(!authors.exists(2));
+        authors.put({3, "Carol", 28, "carol@example.test"});
+        posts.put({103, ref<RefAuthor>(3), "stable ref", 4, "third"});
+        authors.updatePrimaryKey(3, RefAuthor{30, "Carol", 29, "carol@renamed.test"});
+        AKK_TEST_CHECK(!authors.exists(3));
+        AKK_TEST_CHECK(authors.exists(30));
+        auto movedRefPost = posts.get(103);
+        AKK_TEST_CHECK(movedRefPost.has_value());
+        AKK_TEST_CHECK(movedRefPost->author.id() == 30);
+        AKK_TEST_CHECK(movedRefPost->author->email == "carol@renamed.test");
+
+        auto movedJoin = posts.join<&RefPost::author>(authors).where([](const RefPost& post, const RefAuthor& author) {
+            return post.id == 103 && author.id == 30;
+        }).first();
+        AKK_TEST_CHECK(movedJoin.has_value());
+        AKK_TEST_CHECK(movedJoin->right.name == "Carol");
+
+        bool missingPlainAuthorRejected = false;
+        try {
+            plainPosts.put({202, 999, 18, "missing plain fk", 0});
+        }
+        catch (const std::runtime_error&) {
+            missingPlainAuthorRejected = true;
+        }
+        AKK_TEST_CHECK(missingPlainAuthorRejected);
+        AKK_TEST_CHECK(!plainPosts.exists(202));
+
+        authors.updatePrimaryKey(1, RefAuthor{10, "Alice Updated", 31, "alice@updated.test"});
+        AKK_TEST_CHECK(!authors.exists(1));
+        AKK_TEST_CHECK(authors.exists(10));
+        auto cascadedRefPost = posts.get(100);
+        AKK_TEST_CHECK(cascadedRefPost.has_value());
+        AKK_TEST_CHECK(cascadedRefPost->author.id() == 10);
+        auto cascadedPlainPost = plainPosts.get(200);
+        AKK_TEST_CHECK(cascadedPlainPost.has_value());
+        AKK_TEST_CHECK(cascadedPlainPost->authorId == 10);
+        auto nulledOnUpdatePost = nullablePosts.get(400);
+        AKK_TEST_CHECK(nulledOnUpdatePost.has_value());
+        AKK_TEST_CHECK(!nulledOnUpdatePost->authorId.has_value());
+
+        authors.remove(10);
+        AKK_TEST_CHECK(!authors.exists(10));
+        AKK_TEST_CHECK(!posts.exists(100));
+        AKK_TEST_CHECK(plainPosts.exists(200));
+        auto alreadyNullPost = nullablePosts.get(401);
+        AKK_TEST_CHECK(alreadyNullPost.has_value());
+        AKK_TEST_CHECK(!alreadyNullPost->authorId.has_value());
+
+        bool restrictUpdateRejected = false;
+        try {
+            authors.updatePrimaryKey(20, RefAuthor{21, "Bob", 41, "bob-renamed@example.test"});
+        }
+        catch (const std::runtime_error&) {
+            restrictUpdateRejected = true;
+        }
+        AKK_TEST_CHECK(restrictUpdateRejected);
+        AKK_TEST_CHECK(authors.exists(20));
+        AKK_TEST_CHECK(!authors.exists(21));
+        auto unchangedRestricted = restrictedPosts.get(300);
+        AKK_TEST_CHECK(unchangedRestricted.has_value());
+        AKK_TEST_CHECK(unchangedRestricted->authorId == 20);
+
+        bool restrictRejected = false;
+        try {
+            authors.remove(20);
+        }
+        catch (const std::runtime_error&) {
+            restrictRejected = true;
+        }
+        AKK_TEST_CHECK(restrictRejected);
+        AKK_TEST_CHECK(authors.exists(20));
+        AKK_TEST_CHECK(posts.exists(101));
+        AKK_TEST_CHECK(restrictedPosts.exists(300));
+
+        restrictedPosts.remove(300);
+        authors.remove(20);
+        AKK_TEST_CHECK(!authors.exists(20));
         AKK_TEST_CHECK(!posts.exists(101));
+        authors.remove(30);
+        AKK_TEST_CHECK(!authors.exists(30));
+        AKK_TEST_CHECK(!posts.exists(103));
 
         bool missingAuthorRejected = false;
         try {
@@ -586,21 +705,119 @@ namespace {
         AKK_TEST_CHECK(missingAuthorRejected);
         AKK_TEST_CHECK(!posts.exists(102));
     }
+
+    void testImmutableFields() {
+        using namespace akkaradb;
+        TempDir dir{"immutableFields"};
+        auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
+        auto users = db->table<&ImmutableUser::id>("immutable_users");
+        users.indexed<&ImmutableUser::handle>();
+
+        ImmutableUser created{1, "alice", 30, "first"};
+        users.put(created);
+
+        auto loaded = users.get(1);
+        AKK_TEST_CHECK(loaded.has_value());
+        AKK_TEST_CHECK(loaded->handle.get() == "alice");
+
+        bool directMutationRejected = false;
+        try {
+            loaded->handle = "alice-renamed";
+        }
+        catch (const std::runtime_error&) {
+            directMutationRejected = true;
+        }
+        AKK_TEST_CHECK(directMutationRejected);
+
+        loaded->bio = "updated";
+        users.put(*loaded);
+        auto afterMutableUpdate = users.get(1);
+        AKK_TEST_CHECK(afterMutableUpdate.has_value());
+        AKK_TEST_CHECK(afterMutableUpdate->bio == "updated");
+        AKK_TEST_CHECK(afterMutableUpdate->handle.get() == "alice");
+
+        bool persistedMutationRejected = false;
+        try {
+            users.put({1, "alice-renamed", 31, "second"});
+        }
+        catch (const std::runtime_error&) {
+            persistedMutationRejected = true;
+        }
+        AKK_TEST_CHECK(persistedMutationRejected);
+
+        bool upsertMutationRejected = false;
+        try {
+            users.upsert(1, [](ImmutableUser& user) {
+                user.handle = "alice-upsert";
+            });
+        }
+        catch (const std::runtime_error&) {
+            upsertMutationRejected = true;
+        }
+        AKK_TEST_CHECK(upsertMutationRejected);
+
+        auto indexed = users.findBy<&ImmutableUser::handle>(akkaradb::Immutable<std::string>{"alice"});
+        AKK_TEST_CHECK(indexed.has_value());
+        AKK_TEST_CHECK(indexed->id == 1);
+    }
+
+    void testFieldUpdateHooks() {
+        using namespace akkaradb;
+        TempDir dir{"fieldUpdateHooks"};
+        auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
+        auto profiles = db->table<&Profile::id>("update_hook_profiles");
+
+        std::vector<std::string> events;
+        profiles.onUpdate<&Profile::age>([&](const auto& oldAge, const auto& newAge, const Profile& oldProfile, const Profile& newProfile) {
+            events.push_back(std::format("{}:{}->{}:{}", oldProfile.id, oldAge, newAge, newProfile.name));
+        });
+        profiles.onUpdate<&Profile::age>([](const Profile& oldProfile, Profile& newProfile) {
+            newProfile.email = std::format("age-{}@example.test", newProfile.age);
+            newProfile.name = std::format("{} v{}", oldProfile.name, newProfile.age);
+        });
+
+        profiles.put({1, "a@example.test", "Alice", 30});
+        AKK_TEST_CHECK(events.empty());
+
+        profiles.put({1, "a@example.test", "Alice", 31});
+        AKK_TEST_CHECK(events.size() == 1);
+        AKK_TEST_CHECK(events[0] == "1:30->31:Alice");
+        auto ageUpdated = profiles.get(1);
+        AKK_TEST_CHECK(ageUpdated.has_value());
+        AKK_TEST_CHECK(ageUpdated->email == "age-31@example.test");
+        AKK_TEST_CHECK(ageUpdated->name == "Alice v31");
+
+        profiles.put({1, "renamed@example.test", "Alice Updated", 31});
+        AKK_TEST_CHECK(events.size() == 1);
+        auto nonAgeUpdated = profiles.get(1);
+        AKK_TEST_CHECK(nonAgeUpdated.has_value());
+        AKK_TEST_CHECK(nonAgeUpdated->email == "renamed@example.test");
+        AKK_TEST_CHECK(nonAgeUpdated->name == "Alice Updated");
+    }
 } // namespace
 
 int main() {
     akkaradb::test::installMsvcTestErrorHandlers();
-
-    testTrivialCrud();
-    testBinpackRoundtrip();
-    testNonUniqueIndexAndCleanup();
-    testCountAndScanAreTableScoped();
-    testPrimaryKeyRangeScanUsesNumericOrder();
-    testSpecv4QueryAndHelpers();
-    testNonUnsignedRangeQueryUsesIndexSource();
-    testOptionalNullQueryHelpers();
-    testNestedFieldQueryHelpers();
-    testMapGetQueryHelpers();
-    testRefLazyResolveAndCascadePut();
-    return 0;
+    try {
+        testTrivialCrud();
+        testBinpackRoundtrip();
+        testNonUniqueIndexAndCleanup();
+        testCountAndScanAreTableScoped();
+        testPrimaryKeyRangeScanUsesNumericOrder();
+        testSpecv4QueryAndHelpers();
+        testNonUnsignedRangeQueryUsesIndexSource();
+        testOptionalNullQueryHelpers();
+        testNestedFieldQueryHelpers();
+        testMapGetQueryHelpers();
+        testRefLazyResolveAndCascadePut();
+        testImmutableFields();
+        testFieldUpdateHooks();
+        return 0;
+    }
+    catch (const std::exception& ex) {
+        akkaradb::test::failFastExit("STD EXCEPTION", ex.what());
+    }
+    catch (...) {
+        akkaradb::test::failFastExit("UNKNOWN EXCEPTION");
+    }
 }
