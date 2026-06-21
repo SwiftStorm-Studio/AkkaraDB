@@ -33,12 +33,18 @@ namespace akkaradb::engine::vlog {
     inline constexpr uint8_t VLOG_FLAG_ROLLBACK = 0x04;
 
     enum class VLogSyncMode : uint8_t {
-        SYNC = 0, ASYNC = 1,
+        SYNC = 0,
+        ASYNC = 1,
+        BATCHED_SYNC = 2,
     };
 
     struct AKDB_API VersionLogOptions {
         std::filesystem::path logPath;
         VLogSyncMode syncMode = VLogSyncMode::ASYNC;
+        uint32_t groupN = 128;
+        uint32_t groupMicros = 500;
+        uint64_t groupBytes = 1ULL * 1024ULL * 1024ULL;
+        uint64_t asyncMaxPendingBytes = 64ULL * 1024ULL * 1024ULL;
     };
 
     struct AKDB_API VersionEntry {
@@ -76,6 +82,7 @@ namespace akkaradb::engine::vlog {
                 uint64_t targetSeq
             ) const;
 
+            void forceSync();
             void close();
 
         private:

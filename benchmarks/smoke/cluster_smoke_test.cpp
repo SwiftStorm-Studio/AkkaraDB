@@ -218,8 +218,14 @@ namespace {
             AckPolicy{},
         };
 
-        auto primary = ClusterManager::create(dir1, cfg, 1);
-        auto replica = ClusterManager::create(dir2, cfg, 2);
+        ClusterRuntimeOptions primaryOptions{};
+        primaryOptions.startupRole = NodeStartupRole::PRIMARY;
+        ClusterRuntimeOptions replicaOptions{};
+        replicaOptions.startupRole = NodeStartupRole::REPLICA;
+        replicaOptions.primaryNodeId = 1;
+
+        auto primary = ClusterManager::create(dir1, cfg, 1, primaryOptions);
+        auto replica = ClusterManager::create(dir2, cfg, 2, replicaOptions);
         std::atomic<int> primaryChanges{0};
         primary->setRoleChangeCallback([&](NodeRole role) {
             if (role == NodeRole::PRIMARY) {
@@ -237,6 +243,8 @@ namespace {
 
         replica->close();
         primary->close();
+        AKK_TEST_CHECK(std::filesystem::exists(dir1 / "cluster.akmf"));
+        AKK_TEST_CHECK(std::filesystem::exists(dir2 / "cluster.akmf"));
     }
 
     void testPlainReplication() {

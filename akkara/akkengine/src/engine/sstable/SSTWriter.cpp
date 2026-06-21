@@ -43,6 +43,13 @@ namespace akkaradb::engine::sst {
             out.insert(out.end(), p, p + sizeof(T));
         }
 
+        [[nodiscard]] size_t sharedPrefixLen(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept {
+            const size_t n = std::min(a.size(), b.size());
+            size_t i = 0;
+            while (i < n && a[i] == b[i]) { ++i; }
+            return i;
+        }
+
         void writeExact(std::ofstream& out, const void* data, size_t size) {
             out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
             if (!out) { throw std::runtime_error("SSTWriter: write failed"); }
@@ -139,7 +146,8 @@ namespace akkaradb::engine::sst {
         }
 
         [[nodiscard]] std::vector<uint8_t> compressOrRaw(const std::vector<uint8_t>& raw, SSTWriter::Codec codec, uint32_t& flags) {
-            flags = SST_BLOCK_FLAG_RAW;
+            const uint32_t extraFlags = flags & ~SST_BLOCK_FLAG_RAW;
+            flags = extraFlags | SST_BLOCK_FLAG_RAW;
             if (codec != SSTWriter::Codec::ZSTD || raw.empty()) { return raw; }
 
             const size_t bound = ZSTD_compressBound(raw.size());
@@ -147,8 +155,51 @@ namespace akkaradb::engine::sst {
             const size_t n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), 1);
             if (ZSTD_isError(n) || n >= raw.size()) { return raw; }
             compressed.resize(n);
-            flags = SST_BLOCK_FLAG_COMPRESSED;
+            flags = extraFlags | SST_BLOCK_FLAG_COMPRESSED;
             return compressed;
+        }
+
+        struct BlockPayload {
+            std::vector<uint8_t> data;
+            std::vector<uint32_t> offsets;
+            uint32_t flags = SST_BLOCK_FLAG_RAW;
+        };
+
+        [[nodiscard]] BlockPayload encodePrefixCompressedBlock(const PendingBlock& block) {
+            BlockPayload out;
+            out.flags = SST_BLOCK_FLAG_PREFIX_COMPRESSED;
+            out.data.reserve(block.raw.size());
+            out.offsets.reserve(block.offsets.size());
+
+            std::vector<uint8_t> prevKey;
+            for (size_t i = 0; i < block.offsets.size(); ++i) {
+                const uint32_t off = block.offsets[i];
+                if (off + sizeof(core::SSTHdr32) > block.raw.size()) { throw std::runtime_error("SSTWriter: corrupt source block header"); }
+                const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.raw.data() + off);
+                const uint8_t* keyPtr = block.raw.data() + off + sizeof(core::SSTHdr32);
+                const uint8_t* valPtr = keyPtr + hdr->kLen;
+                if (valPtr + hdr->vLen > block.raw.data() + block.raw.size()) { throw std::runtime_error("SSTWriter: corrupt source block payload"); }
+
+                std::span<const uint8_t> key{keyPtr, hdr->kLen};
+                const uint16_t shared = static_cast<uint16_t>(std::min<size_t>(sharedPrefixLen(prevKey, key), UINT16_MAX));
+                const size_t suffixLen = key.size() - shared;
+
+                out.offsets.push_back(static_cast<uint32_t>(out.data.size()));
+
+                core::SSTHdr32 encHdr = *hdr;
+                encHdr.reserved0 = 0;
+                encHdr.reserved1 = shared;
+                appendPod(out.data, encHdr);
+                out.data.insert(out.data.end(), key.begin() + shared, key.end());
+                out.data.insert(out.data.end(), valPtr, valPtr + hdr->vLen);
+                const uint64_t padded = alignUpU64(static_cast<uint64_t>(out.data.size()), 8);
+                out.data.resize(static_cast<size_t>(padded), 0);
+
+                (void)suffixLen;
+                prevKey.assign(key.begin(), key.end());
+            }
+
+            return out;
         }
     } // namespace
 
@@ -199,11 +250,16 @@ namespace akkaradb::engine::sst {
         auto flushBlock = [&]() {
             if (block.empty()) { return; }
 
-            uint32_t blockFlags = 0;
-            std::vector<uint8_t> payload = compressOrRaw(block.raw, options.codec, blockFlags);
+            const BlockPayload encoded = encodePrefixCompressedBlock(block);
+            const bool usePrefixCompressed = !encoded.data.empty() && encoded.data.size() < block.raw.size();
+            const std::vector<uint8_t>& rawPayload = usePrefixCompressed ? encoded.data : block.raw;
+            const std::vector<uint32_t>& rawOffsets = usePrefixCompressed ? encoded.offsets : block.offsets;
+
+            uint32_t blockFlags = usePrefixCompressed ? SST_BLOCK_FLAG_PREFIX_COMPRESSED : 0;
+            std::vector<uint8_t> payload = compressOrRaw(rawPayload, options.codec, blockFlags);
             std::vector<uint8_t> offsetsBytes;
-            offsetsBytes.reserve(block.offsets.size() * sizeof(uint32_t));
-            for (const uint32_t off : block.offsets) { appendPod(offsetsBytes, off); }
+            offsetsBytes.reserve(rawOffsets.size() * sizeof(uint32_t));
+            for (const uint32_t off : rawOffsets) { appendPod(offsetsBytes, off); }
 
             const uint64_t blockOffset = static_cast<uint64_t>(out.tellp());
             SSTBlockHeaderV2 bh{};
@@ -211,7 +267,7 @@ namespace akkaradb::engine::sst {
             bh.flags = blockFlags;
             bh.recordCount = static_cast<uint32_t>(block.offsets.size());
             bh.compressedSize = static_cast<uint32_t>(payload.size());
-            bh.uncompressedSize = static_cast<uint32_t>(block.raw.size());
+            bh.uncompressedSize = static_cast<uint32_t>(rawPayload.size());
             bh.offsetsSize = static_cast<uint32_t>(offsetsBytes.size());
             bh.firstSeq = block.firstSeq;
             bh.lastSeq = block.lastSeq;

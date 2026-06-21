@@ -7,10 +7,16 @@ project(AkkaraDB
 )
 
 # ==================== Build Options ====================
-option(BUILD_SHARED_LIBS "Build shared libraries (.so/.dll)" ON)
-set(AKKARADB_BUILD_SHARED_LIBS "${BUILD_SHARED_LIBS}")
+option(AKKARADB_BUILD_SHARED_LIBS "Build AkkaraDB shared libraries (.so/.dll)" ON)
+set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "Build shared libraries (.so/.dll)" FORCE)
+if (BUILD_SHARED_LIBS)
+    set(AKKARADB_LIBRARY_KIND SHARED)
+else ()
+    set(AKKARADB_LIBRARY_KIND STATIC)
+endif ()
 option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
 option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" OFF)
+option(AKKARADB_FETCH_GRPC "Fetch gRPC with FetchContent when system packages are unavailable" OFF)
 set(AKKARADB_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION_REVISION" CACHE FILEPATH "AkkaraDB release revision counter file")
 set(AKKARADB_DETAIL_VERSION_BASE "126.1.1" CACHE STRING "AkkaraDB detailed release version prefix")
 set(AKKARADB_PRERELEASE "rc.1" CACHE STRING "AkkaraDB prerelease label used in dist artifact names")
@@ -119,7 +125,7 @@ include(FetchContent)
 FetchContent_Declare(
         zstd
         GIT_REPOSITORY https://github.com/facebook/zstd.git
-        GIT_TAG v1.5.6
+        GIT_TAG v1.5.7
         SOURCE_SUBDIR build/cmake
 )
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
@@ -129,23 +135,24 @@ set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 
 set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(AKKARADB_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(zstd)
-set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ${AKKARADB_SAVED_BUILD_SHARED_LIBS})
 set(CMAKE_WARN_DEPRECATED ON CACHE BOOL "" FORCE)
 
 # ── Boost.PFR (header-only) ───────────────────────────────────────────────────
 FetchContent_Declare(
         boost_pfr
         GIT_REPOSITORY https://github.com/boostorg/pfr.git
-        GIT_TAG boost-1.84.0
+        GIT_TAG boost-1.91.0
 )
 FetchContent_MakeAvailable(boost_pfr)
 
 FetchContent_Declare(
         monocypher
         GIT_REPOSITORY https://github.com/LoupVaillant/Monocypher.git
-        GIT_TAG 4.0.2
+        GIT_TAG 4.0.3
 )
 FetchContent_MakeAvailable(monocypher)
 
@@ -155,7 +162,8 @@ if (NOT TARGET akkaradb_monocypher)
             ${monocypher_SOURCE_DIR}/src/monocypher.c
     )
     target_include_directories(akkaradb_monocypher PUBLIC
-            ${monocypher_SOURCE_DIR}/src
+            $<BUILD_INTERFACE:${monocypher_SOURCE_DIR}/src>
+            $<INSTALL_INTERFACE:include/akkaradb/third_party/monocypher>
     )
 endif ()
 
@@ -163,17 +171,18 @@ endif ()
 FetchContent_Declare(
         mbedtls
         GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
-        GIT_TAG v3.6.2
+        GIT_TAG v4.1.0
 )
 set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(AKKARADB_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
 FetchContent_MakeAvailable(mbedtls)
-set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ${AKKARADB_SAVED_BUILD_SHARED_LIBS})
 
 # ==================== Main Library ====================
-add_library(akkaradb)
+add_library(akkaradb ${AKKARADB_LIBRARY_KIND})
 
 if (MSVC)
     target_compile_options(akkaradb PRIVATE /WX)
@@ -433,7 +442,7 @@ find_package(Protobuf CONFIG QUIET)
 find_package(gRPC CONFIG QUIET)
 
 set(AKKARADB_FETCHED_GRPC OFF)
-if (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
+if ((NOT Protobuf_FOUND OR NOT gRPC_FOUND) AND AKKARADB_FETCH_GRPC)
     message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; fetching gRPC")
     set(AKKARADB_FETCHED_GRPC ON)
     set(gRPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -458,11 +467,12 @@ if (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
     set(utf8_range_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    set(AKKARADB_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
     FetchContent_Declare(
             grpc
             GIT_REPOSITORY https://github.com/grpc/grpc.git
-            GIT_TAG v1.60.2
+            GIT_TAG v1.81.1
             GIT_SHALLOW TRUE
             GIT_SUBMODULES
                 third_party/abseil-cpp
@@ -474,7 +484,9 @@ if (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
             GIT_SUBMODULES_RECURSE FALSE
     )
     FetchContent_MakeAvailable(grpc)
-    set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+    set(BUILD_SHARED_LIBS ${AKKARADB_SAVED_BUILD_SHARED_LIBS})
+elseif (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
+    message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; using gRPC stub backend")
 endif ()
 
 set(AKKARADB_GRPCPP_TARGET "")
@@ -679,6 +691,44 @@ install(TARGETS
         ARCHIVE DESTINATION lib COMPONENT SDK
         RUNTIME DESTINATION bin COMPONENT SDK
 )
+
+if (NOT BUILD_SHARED_LIBS)
+    install(TARGETS
+            libzstd_static
+            akkaradb_monocypher
+            everest
+            p256m
+            mbedtls
+            mbedcrypto
+            mbedx509
+            EXPORT AkkaraDBTargets
+            LIBRARY DESTINATION lib COMPONENT SDK
+            ARCHIVE DESTINATION lib COMPONENT SDK
+            RUNTIME DESTINATION bin COMPONENT SDK
+    )
+
+    install(DIRECTORY
+            "${mbedtls_SOURCE_DIR}/include/"
+            DESTINATION include
+            COMPONENT SDK
+    )
+
+    install(DIRECTORY
+            "${zstd_SOURCE_DIR}/lib/"
+            DESTINATION include/zstd
+            COMPONENT SDK
+            FILES_MATCHING
+            PATTERN "*.h"
+    )
+
+    install(DIRECTORY
+            "${monocypher_SOURCE_DIR}/src/"
+            DESTINATION include/akkaradb/third_party/monocypher
+            COMPONENT SDK
+            FILES_MATCHING
+            PATTERN "*.h"
+    )
+endif ()
 
 install(EXPORT AkkaraDBTargets
         FILE AkkaraDBTargets.cmake

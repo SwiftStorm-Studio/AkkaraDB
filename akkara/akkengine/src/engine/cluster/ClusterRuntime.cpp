@@ -106,7 +106,7 @@ namespace akkaradb::engine::cluster {
             )
                 : config_{std::move(config)},
                   router_{config_},
-                  manager_{ClusterManager::create(dbDir, config_, selfNodeId)},
+                  manager_{ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions)},
                   selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
                   runtimeOptions_{std::move(runtimeOptions)} {

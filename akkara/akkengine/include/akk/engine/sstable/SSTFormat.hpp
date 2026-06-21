@@ -35,6 +35,7 @@ namespace akkaradb::engine::sst {
 
     inline constexpr uint32_t SST_BLOCK_FLAG_COMPRESSED = 0x00000001u;
     inline constexpr uint32_t SST_BLOCK_FLAG_RAW = 0x00000002u;
+    inline constexpr uint32_t SST_BLOCK_FLAG_PREFIX_COMPRESSED = 0x00000004u;
 
     inline constexpr uint8_t SST_RECORD_FLAG_TOMBSTONE = 0x01u;
     inline constexpr uint8_t SST_RECORD_FLAG_BLOB = 0x02u;

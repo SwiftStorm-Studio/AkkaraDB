@@ -463,6 +463,21 @@ namespace akkaradb::engine::memtable {
         return false;
     }
 
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateFrozenSnapshot(uint64_t snapshotSeq) const {
+        Node* node = root_.load(std::memory_order_acquire);
+        while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
+
+        while (node != nullptr) {
+            const uint16_t keyCount = node->keyCount.load(std::memory_order_acquire);
+            for (uint16_t i = 0; i < keyCount; ++i) {
+                VersionChain* chain = node->chains[i].load(std::memory_order_acquire);
+                RecordView visible;
+                if (visibleRecord(chain, snapshotSeq, &visible)) { co_yield visible; }
+            }
+            node = node->nextLeaf.load(std::memory_order_acquire);
+        }
+    }
+
     ArenaGenerator<RecordView> BPTreeMemTable::iterateSnapshot(uint64_t snapshotSeq) const {
         std::vector<RecordView> visibleRecords;
         visibleRecords.reserve(entryCount());
@@ -519,6 +534,56 @@ namespace akkaradb::engine::memtable {
         }
     }
 
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateFrozenSnapshotRange(
+        uint64_t snapshotSeq,
+        std::vector<uint8_t> startKey,
+        std::vector<uint8_t> endKey
+    ) const {
+        const std::span<const uint8_t> start{startKey.data(), startKey.size()};
+        const std::span<const uint8_t> end{endKey.data(), endKey.size()};
+        if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
+
+        Node* node = root_.load(std::memory_order_acquire);
+        uint16_t firstPos = 0;
+        bool firstLeaf = true;
+
+        if (start.empty()) {
+            while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
+        }
+        else {
+            while (node != nullptr && !node->isLeaf) {
+                const uint16_t childIndex = findChildIndex(node, start);
+                node = node->children[childIndex].load(std::memory_order_acquire);
+            }
+
+            while (node != nullptr) {
+                const uint16_t keyCount = node->keyCount.load(std::memory_order_acquire);
+                firstPos = findLeafPosition(node, start, keyCount);
+                if (firstPos < keyCount) { break; }
+                node = node->nextLeaf.load(std::memory_order_acquire);
+                firstPos = 0;
+            }
+        }
+
+        while (node != nullptr) {
+            const uint16_t keyCount = node->keyCount.load(std::memory_order_acquire);
+            const uint16_t startPos = firstLeaf ? firstPos : 0;
+            firstLeaf = false;
+
+            for (uint16_t i = startPos; i < keyCount; ++i) {
+                const core::OwnedRecord* keyRecord = node->keys[i].load(std::memory_order_acquire);
+                if (keyRecord == nullptr) { continue; }
+                if (!end.empty() && compareRecordKey(keyRecord, end) >= 0) { co_return; }
+
+                VersionChain* chain = node->chains[i].load(std::memory_order_acquire);
+                RecordView visible;
+                if (visibleRecord(chain, snapshotSeq, &visible)) { co_yield visible; }
+            }
+
+            node = node->nextLeaf.load(std::memory_order_acquire);
+        }
+    }
+
     ArenaGenerator<RecordView> BPTreeMemTable::iterateSnapshotRange(
         uint64_t snapshotSeq,
         std::vector<uint8_t> startKey,
@@ -529,7 +594,8 @@ namespace akkaradb::engine::memtable {
         if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
 
         std::vector<RecordView> visibleRecords;
-        visibleRecords.reserve(128);
+        const size_t reserveHint = std::min<size_t>(entryCount(), 1024);
+        visibleRecords.reserve(reserveHint);
         bool orderedUnique = true;
         bool hasPrev = false;
         RecordView prev;
@@ -628,14 +694,22 @@ namespace akkaradb::engine::memtable {
     ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const {
         const std::span<const uint8_t> start = asU8(startKey);
         const std::span<const uint8_t> end = asU8(endKey);
-        std::vector<uint8_t> startOwned(start.begin(), start.end());
-        std::vector<uint8_t> endOwned(end.begin(), end.end());
+        const bool frozen = frozen_.load(std::memory_order_acquire);
 
         std::lock_guard<std::mutex> lock{generatorArenaMutex_};
+        if (start.empty() && end.empty()) {
+            return ArenaGenerator<RecordView>::withArena(generatorArena_, [this, snapshotSeq, frozen]() {
+                return frozen ? iterateFrozenSnapshot(snapshotSeq) : iterateSnapshot(snapshotSeq);
+            });
+        }
+
+        std::vector<uint8_t> startOwned(start.begin(), start.end());
+        std::vector<uint8_t> endOwned(end.begin(), end.end());
         return ArenaGenerator<RecordView>::withArena(
             generatorArena_,
-            [this, snapshotSeq, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
-                return iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
+            [this, snapshotSeq, frozen, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
+                return frozen ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                              : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }
         );
     }

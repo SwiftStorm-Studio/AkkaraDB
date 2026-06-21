@@ -28,6 +28,7 @@
 #include "akk/engine/manifest/Manifest.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <iostream>
@@ -117,6 +118,58 @@ namespace {
         }
         AKK_TEST_CHECK(scanned == 10);
         reader.reset();
+        fs::remove_all(dir);
+    }
+
+    void testPrefixCompressedBlockRoundtrip() {
+        auto dir = tempDir("sstPrefix");
+        const auto path = dir / "prefix.aksst";
+
+        Records recs;
+        recs.keys.reserve(128);
+        recs.vals.reserve(128);
+        recs.views.reserve(128);
+        for (int i = 0; i < 128; ++i) {
+            recs.keys.push_back(bytes(std::format("tenant:0001:user:{:05}:profile:email", i)));
+            recs.vals.push_back(bytes(std::format("value_{:05}", i)));
+        }
+        for (int i = 0; i < 128; ++i) {
+            const auto& k = recs.keys[static_cast<size_t>(i)];
+            const auto& v = recs.vals[static_cast<size_t>(i)];
+            const uint64_t fp = core::computeKeyFp64(k.data(), k.size());
+            const uint64_t mk = core::buildMiniKey(k.data(), k.size());
+            recs.views.emplace_back(k.data(), static_cast<uint16_t>(k.size()), v.data(), static_cast<uint16_t>(v.size()), 100 + i, core::SSTHdr32::FLAG_NORMAL, fp, mk);
+        }
+
+        sst::SSTWriter::Options opts;
+        opts.blockSize = 4096;
+        opts.codec = sst::SSTWriter::Codec::ZSTD;
+        (void)sst::SSTWriter::write(path, recs.views, opts);
+
+        std::ifstream in(path, std::ios::binary);
+        AKK_TEST_CHECK(in.good());
+        sst::SSTFileHeaderV2 header{};
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        AKK_TEST_CHECK(in.good());
+        in.seekg(static_cast<std::streamoff>(header.dataOffset));
+        sst::SSTBlockHeaderV2 blockHeader{};
+        in.read(reinterpret_cast<char*>(&blockHeader), sizeof(blockHeader));
+        AKK_TEST_CHECK(in.good());
+        AKK_TEST_CHECK((blockHeader.flags & sst::SST_BLOCK_FLAG_PREFIX_COMPRESSED) != 0);
+
+        auto reader = sst::SSTReader::open(path);
+        AKK_TEST_CHECK(reader);
+        auto found = reader->get(bytes("tenant:0001:user:00042:profile:email"));
+        AKK_TEST_CHECK(found);
+        AKK_TEST_CHECK(str(found->value) == "value_00042");
+
+        size_t count = 0;
+        for (auto&& rec : reader->scan(bytes("tenant:0001:user:00040"), bytes("tenant:0001:user:00045:profile:email"))) {
+            (void)rec;
+            ++count;
+        }
+        AKK_TEST_CHECK(count == 5);
+
         fs::remove_all(dir);
     }
 
@@ -268,6 +321,7 @@ int main() {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     testWriterReaderRoundtrip();
+    testPrefixCompressedBlockRoundtrip();
     testMemtableFlushManagerRecover();
     testCompactionOverwriteAndTombstone();
     testManagerScanIterMergesLazily();

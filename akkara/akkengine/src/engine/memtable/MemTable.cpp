@@ -60,12 +60,6 @@ namespace akkaradb::engine::memtable {
             return core::buildMiniKey(key.data(), key.size());
         }
 
-        [[nodiscard]] uint64_t loadU64Le(const uint8_t* p) noexcept {
-            uint64_t v = 0;
-            std::memcpy(&v, p, sizeof(v));
-            return v;
-        }
-
         [[nodiscard]] uint64_t avalanche64(uint64_t x) noexcept {
             x ^= x >> 33;
             x *= 0xff51afd7ed558ccdULL;
@@ -75,26 +69,8 @@ namespace akkaradb::engine::memtable {
             return x;
         }
 
-        [[nodiscard]] uint64_t computeShardHash(std::span<const uint8_t> key) noexcept {
-            const auto* p = key.data();
-            size_t n = key.size();
-            uint64_t h = 0x9e3779b97f4a7c15ULL ^ (static_cast<uint64_t>(n) * 0xbf58476d1ce4e5b9ULL);
-
-            while (n >= 8) {
-                uint64_t lane = loadU64Le(p);
-                lane *= 0x9ddfea08eb382d69ULL;
-                lane ^= lane >> 32;
-                h ^= lane;
-                h = (h << 27) | (h >> 37);
-                h = h * 5 + 0x52dce729;
-                p += 8;
-                n -= 8;
-            }
-
-            uint64_t tail = 0;
-            for (size_t i = 0; i < n; ++i) { tail |= static_cast<uint64_t>(p[i]) << (i * 8); }
-            h ^= tail * 0x9ddfea08eb382d69ULL;
-            return avalanche64(h);
+        [[nodiscard]] uint64_t shardRouteHash(uint64_t fp64, size_t keySize) noexcept {
+            return avalanche64(fp64 ^ (static_cast<uint64_t>(keySize) * 0xbf58476d1ce4e5b9ULL));
         }
 
         [[nodiscard]] uint32_t nextPow2Clamped(uint64_t n, uint32_t minValue, uint32_t maxValue) noexcept {
@@ -120,6 +96,12 @@ namespace akkaradb::engine::memtable {
             return nextPow2Clamped(target, 2, effectiveCap);
         }
 
+        [[nodiscard]] uint32_t resolveFlushWorkerCount(uint32_t shardCount) noexcept {
+            const uint32_t hardware = std::max(1u, std::thread::hardware_concurrency());
+            const uint32_t target = std::max(1u, hardware / 2u);
+            return std::min(std::max(1u, shardCount), target);
+        }
+
         [[nodiscard]] uint32_t shardForHash(uint64_t hash, uint32_t shardCount) noexcept {
             if (shardCount <= 1) { return 0; }
             return static_cast<uint32_t>(hash & static_cast<uint64_t>(shardCount - 1));
@@ -138,20 +120,114 @@ namespace akkaradb::engine::memtable {
 
     class MemTable::RangeIterator::Impl {
         public:
-            explicit Impl(std::vector<RecordView> records, std::vector<std::shared_ptr<const IMemTable>> sources)
-                : records_{std::move(records)}, sources_{std::move(sources)} {}
+            explicit Impl(
+                std::vector<std::shared_ptr<const IMemTable>> sources,
+                std::vector<uint8_t> start,
+                std::vector<uint8_t> end,
+                uint64_t snapshotSeq
+            )
+                : sources_{std::move(sources)},
+                  start_{std::move(start)},
+                  end_{std::move(end)},
+                  heap_{CursorCompare{&cursors_}} {
+                const core::ByteView startView{
+                    reinterpret_cast<const std::byte*>(start_.data()),
+                    start_.size()
+                };
+                const core::ByteView endView{
+                    reinterpret_cast<const std::byte*>(end_.data()),
+                    end_.size()
+                };
 
-            [[nodiscard]] bool hasNext() const noexcept { return index_ < records_.size(); }
+                cursors_.reserve(sources_.size());
+                for (const auto& table : sources_) {
+                    cursors_.emplace_back();
+                    SourceCursor& cursor = cursors_.back();
+                    cursor.generator = table->iterator(startView, endView, snapshotSeq);
+                    cursor.it = cursor.generator.begin();
+                    if (!advance(cursor, false)) {
+                        cursors_.pop_back();
+                        continue;
+                    }
+                    heap_.push(cursors_.size() - 1);
+                }
+
+                sameKeyIndices_.reserve(cursors_.size());
+            }
+
+            [[nodiscard]] bool hasNext() const noexcept {
+                return const_cast<Impl*>(this)->fillPending();
+            }
 
             [[nodiscard]] std::optional<RecordView> next() noexcept {
-                if (!hasNext()) { return std::nullopt; }
-                return records_[index_++];
+                if (!fillPending()) { return std::nullopt; }
+                const RecordView out = *pending_;
+                pending_.reset();
+                return out;
             }
 
         private:
-            std::vector<RecordView> records_;
+            struct SourceCursor {
+                core::ArenaGenerator<RecordView> generator;
+                core::ArenaGenerator<RecordView>::iterator it{};
+                RecordView current{};
+            };
+
+            struct CursorCompare {
+                const std::vector<SourceCursor>* cursors{nullptr};
+
+                [[nodiscard]] bool operator()(size_t lhs, size_t rhs) const noexcept {
+                    const RecordView& a = (*cursors)[lhs].current;
+                    const RecordView& b = (*cursors)[rhs].current;
+                    const int keyCmp = a.compareKey(b);
+                    if (keyCmp != 0) { return keyCmp > 0; }
+                    return a.seq() < b.seq();
+                }
+            };
+
+            [[nodiscard]] bool advance(SourceCursor& cursor, bool consumeCurrent) {
+                if (consumeCurrent) { ++cursor.it; }
+                if (cursor.it == cursor.generator.end()) { return false; }
+                cursor.current = *cursor.it;
+                return true;
+            }
+
+            [[nodiscard]] bool fillPending() {
+                if (pending_.has_value()) { return true; }
+                if (heap_.empty()) { return false; }
+
+                sameKeyIndices_.clear();
+
+                const size_t firstIdx = heap_.top();
+                heap_.pop();
+
+                RecordView best = cursors_[firstIdx].current;
+                sameKeyIndices_.push_back(firstIdx);
+
+                while (!heap_.empty()) {
+                    const size_t idx = heap_.top();
+                    if (cursors_[idx].current.compareKey(best) != 0) { break; }
+                    heap_.pop();
+                    const RecordView candidate = cursors_[idx].current;
+                    if (candidate.seq() > best.seq()) { best = candidate; }
+                    sameKeyIndices_.push_back(idx);
+                }
+
+                for (const size_t idx : sameKeyIndices_) {
+                    if (advance(cursors_[idx], true)) { heap_.push(idx); }
+                }
+
+                pending_ = best;
+                return true;
+            }
+
             std::vector<std::shared_ptr<const IMemTable>> sources_;
-            size_t index_{0};
+            std::vector<uint8_t> start_;
+            std::vector<uint8_t> end_;
+            std::vector<SourceCursor> cursors_;
+            std::priority_queue<size_t, std::vector<size_t>, CursorCompare> heap_;
+            std::vector<size_t> sameKeyIndices_;
+            std::optional<RecordView> pending_;
     };
 
     class MemTable::Impl {
@@ -182,29 +258,37 @@ namespace akkaradb::engine::memtable {
                 uint64_t nextImmutableId{1};
             };
 
-            class Flusher {
+            class FlushPool {
                 public:
                     struct Item {
+                        uint32_t shardIndex;
                         uint64_t id;
                         std::shared_ptr<IMemTable> table;
                     };
 
-                    using FlushDone = std::function<void(uint64_t)>;
+                    using FlushDone = std::function<void(uint32_t, uint64_t)>;
 
-                    Flusher(FlushCallback callback, FlushDone done)
-                        : callback_{std::move(callback)}, onDone_{std::move(done)}, running_{true}, thread_{[this]() { run(); }} {}
+                    FlushPool(uint32_t workerCount, FlushCallback callback, FlushDone done)
+                        : callback_{std::move(callback)}, onDone_{std::move(done)}, running_{true} {
+                        workers_.reserve(workerCount);
+                        for (uint32_t i = 0; i < workerCount; ++i) {
+                            workers_.emplace_back([this]() { run(); });
+                        }
+                    }
 
-                    ~Flusher() {
+                    ~FlushPool() {
                         {
                             std::lock_guard<std::mutex> lock{mutex_};
                             running_ = false;
                         }
                         cv_.notify_all();
-                        if (thread_.joinable()) { thread_.join(); }
+                        for (auto& worker : workers_) {
+                            if (worker.joinable()) { worker.join(); }
+                        }
                     }
 
-                    Flusher(const Flusher&) = delete;
-                    Flusher& operator=(const Flusher&) = delete;
+                    FlushPool(const FlushPool&) = delete;
+                    FlushPool& operator=(const FlushPool&) = delete;
 
                     void enqueue(Item item) {
                         {
@@ -240,7 +324,7 @@ namespace akkaradb::engine::memtable {
                                      std::numeric_limits<uint64_t>::max()
                                  )) { records.push_back(rec); }
                             if (callback_) { callback_(std::span<const RecordView>{records}); }
-                            if (onDone_) { onDone_(item.id); }
+                            if (onDone_) { onDone_(item.shardIndex, item.id); }
 
                             {
                                 std::lock_guard<std::mutex> lock{mutex_};
@@ -257,7 +341,7 @@ namespace akkaradb::engine::memtable {
                     std::queue<Item> queue_;
                     bool running_;
                     size_t inFlight_{0};
-                    std::thread thread_;
+                    std::vector<std::thread> workers_;
             };
 
             explicit Impl(Options options)
@@ -292,7 +376,7 @@ namespace akkaradb::engine::memtable {
             ) {
                 const uint64_t fp64 = computeFp64(key, precomputedFp64);
                 const uint64_t mini = computeMini(key, precomputedMk);
-                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
+                const uint32_t shardIndex = shardForHash(shardRouteHash(fp64, key.size()), shardCount_);
 
                 auto& shard = *shards_[shardIndex];
                 bool shouldFlush = false;
@@ -319,7 +403,7 @@ namespace akkaradb::engine::memtable {
             void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputedFp64, uint64_t precomputedMk) {
                 const uint64_t fp64 = computeFp64(key, precomputedFp64);
                 const uint64_t mini = computeMini(key, precomputedMk);
-                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
+                const uint32_t shardIndex = shardForHash(shardRouteHash(fp64, key.size()), shardCount_);
 
                 put(key, {}, seq, RecordView::FLAG_TOMBSTONE, fp64, mini);
                 shards_[shardIndex]->putsApplied.fetch_sub(1, std::memory_order_relaxed);
@@ -330,8 +414,8 @@ namespace akkaradb::engine::memtable {
                 if (out == nullptr) { return false; }
 
                 const core::ByteView keyView = toByteView(key);
-                (void)precomputedFp64;
-                const uint32_t shardIndex = shardForHash(computeShardHash(key), shardCount_);
+                const uint64_t fp64 = computeFp64(key, precomputedFp64);
+                const uint32_t shardIndex = shardForHash(shardRouteHash(fp64, key.size()), shardCount_);
                 const auto& shard = *shards_[shardIndex];
 
                 if (rawActiveGetEnabled_.load(std::memory_order_acquire) && shard.immutableCount.load(std::memory_order_acquire) == 0) {
@@ -376,76 +460,9 @@ namespace akkaradb::engine::memtable {
                     for (const auto& immutable : published->immutables) { if (immutable) { sources.push_back(immutable); } }
                 }
 
-                const core::ByteView startView = toByteView(std::span<const uint8_t>{range.start.data(), range.start.size()});
-                const core::ByteView endView = toByteView(std::span<const uint8_t>{range.end.data(), range.end.size()});
-
-                std::vector<RecordView> deduped;
-
-                struct SourceCursor {
-                    core::ArenaGenerator<RecordView> generator;
-                    core::ArenaGenerator<RecordView>::iterator it{};
-                    RecordView current{};
+                return RangeIterator{
+                    std::make_unique<RangeIterator::Impl>(std::move(sources), range.start, range.end, snapshotSeq)
                 };
-
-                auto advanceFiltered = [&](SourceCursor& cursor, bool consumeCurrent) -> bool {
-                    if (consumeCurrent) { ++cursor.it; }
-                    if (cursor.it == cursor.generator.end()) { return false; }
-                    cursor.current = *cursor.it;
-                    return true;
-                };
-
-                std::vector<SourceCursor> cursors;
-                cursors.reserve(sources.size());
-
-                for (const auto& table : sources) {
-                    SourceCursor cursor;
-                    cursor.generator = table->iterator(startView, endView, snapshotSeq);
-                    cursor.it = cursor.generator.begin();
-                    if (cursor.it == cursor.generator.end()) { continue; }
-                    if (!advanceFiltered(cursor, false)) { continue; }
-                    cursors.push_back(std::move(cursor));
-                }
-
-                if (!cursors.empty()) {
-                    auto minKeyCmp = [&](size_t lhs, size_t rhs) {
-                        const RecordView& a = cursors[lhs].current;
-                        const RecordView& b = cursors[rhs].current;
-                        const int keyCmp = a.compareKey(b);
-                        if (keyCmp != 0) { return keyCmp > 0; }
-                        return a.seq() < b.seq();
-                    };
-
-                    std::priority_queue<size_t, std::vector<size_t>, decltype(minKeyCmp)> heap(minKeyCmp);
-                    for (size_t i = 0; i < cursors.size(); ++i) { heap.push(i); }
-
-                    std::vector<size_t> sameKeyIndices;
-                    sameKeyIndices.reserve(cursors.size());
-
-                    while (!heap.empty()) {
-                        sameKeyIndices.clear();
-
-                        const size_t firstIdx = heap.top();
-                        heap.pop();
-
-                        RecordView best = cursors[firstIdx].current;
-                        sameKeyIndices.push_back(firstIdx);
-
-                        while (!heap.empty()) {
-                            const size_t idx = heap.top();
-                            if (cursors[idx].current.compareKey(best) != 0) { break; }
-                            heap.pop();
-                            const RecordView candidate = cursors[idx].current;
-                            if (candidate.seq() > best.seq()) { best = candidate; }
-                            sameKeyIndices.push_back(idx);
-                        }
-
-                        deduped.push_back(best);
-
-                        for (const size_t idx : sameKeyIndices) { if (advanceFiltered(cursors[idx], true)) { heap.push(idx); } }
-                    }
-                }
-
-                return RangeIterator{std::make_unique<RangeIterator::Impl>(std::move(deduped), std::move(sources))};
             }
 
             [[nodiscard]] uint64_t nextSeq() noexcept { return seqGen_.fetch_add(1, std::memory_order_relaxed); }
@@ -479,24 +496,25 @@ namespace akkaradb::engine::memtable {
 
             void forceFlush() {
                 for (uint32_t i = 0; i < shardCount_; ++i) { triggerFlush(i); }
-                for (auto& worker : flushers_) { if (worker) { worker->drain(); } }
+                if (flushPool_) { flushPool_->drain(); }
             }
 
             void setFlushCallback(const FlushCallback& cb) {
                 rawActiveGetEnabled_.store(false, std::memory_order_release);
-                for (auto& worker : flushers_) { if (worker) { worker->drain(); } }
+                if (flushPool_) { flushPool_->drain(); }
 
-                flushers_.clear();
-                flushers_.resize(shardCount_);
+                flushPool_.reset();
 
                 if (!cb) {
                     rawActiveGetEnabled_.store(true, std::memory_order_release);
                     return;
                 }
 
-                for (uint32_t i = 0; i < shardCount_; ++i) {
-                    flushers_[i] = std::make_unique<Flusher>(cb, [this, i](uint64_t immutableId) { onFlushed(i, immutableId); });
-                }
+                flushPool_ = std::make_unique<FlushPool>(
+                    resolveFlushWorkerCount(shardCount_),
+                    cb,
+                    [this](uint32_t shardIndex, uint64_t immutableId) { onFlushed(shardIndex, immutableId); }
+                );
             }
 
             [[nodiscard]] size_t approxSize() const noexcept {
@@ -536,7 +554,7 @@ namespace akkaradb::engine::memtable {
             }
 
             void triggerFlush(uint32_t shardIndex) {
-                if (shardIndex >= flushers_.size() || !flushers_[shardIndex]) { return; }
+                if (!flushPool_) { return; }
 
                 auto& shard = *shards_[shardIndex];
                 std::shared_ptr<IMemTable> sealed;
@@ -568,7 +586,7 @@ namespace akkaradb::engine::memtable {
                     publishTablesLocked(shard);
                 }
 
-                flushers_[shardIndex]->enqueue(Flusher::Item{immutableId, std::move(sealed)});
+                flushPool_->enqueue(FlushPool::Item{shardIndex, immutableId, std::move(sealed)});
             }
 
             void onFlushed(uint32_t shardIndex, uint64_t immutableId) {
@@ -591,7 +609,7 @@ namespace akkaradb::engine::memtable {
             uint32_t shardCount_;
             size_t thresholdBytesPerShard_;
             std::vector<std::unique_ptr<Shard>> shards_;
-            std::vector<std::unique_ptr<Flusher>> flushers_;
+            std::unique_ptr<FlushPool> flushPool_;
 
             std::atomic<uint64_t> seqGen_;
             std::atomic<uint64_t> flushesCompleted_{0};

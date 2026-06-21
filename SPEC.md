@@ -464,6 +464,9 @@ Blob reads validate the header and content CRC before returning bytes.
 [SSTFooterV2:48]
 ```
 
+Each data block stores records in key order. Within a block, keys may be prefix-delta encoded against the previous key before optional block compression. The reader
+expands them back to full keys when loading the block into memory.
+
 ### 8.3 SSTFileHeaderV2
 
 `SSTFileHeaderV2` is 256 bytes. Important fields:
@@ -513,8 +516,8 @@ L0 may contain overlapping files; newer files are checked first by manager polic
 
 ### 9.1 Purpose
 
-The Manifest is an append-only, CRC-protected log of storage lifecycle events. It tracks live SST files, compaction transitions, checkpoints, and cluster
-metadata events.
+The Manifest is an append-only, CRC-protected log of storage lifecycle events. The main engine manifest (`manifest.akmf`) tracks live SST files, compaction
+transitions, and checkpoints. A separate node-local cluster manifest (`cluster.akmf`) records cluster runtime events.
 
 ### 9.2 File Format
 
@@ -559,6 +562,15 @@ The record CRC covers payload bytes only.
 
 `CompactionCommit` is the preferred compaction record because replay either applies all output/input file changes or none.
 
+The cluster manifest currently records:
+
+- `NodeJoin` when a node starts and advertises its replication endpoint
+- `NodeLeave` when a node shuts down cleanly
+- `PrimaryLease` when a node starts as `PRIMARY`
+
+Replay of `manifest.akmf` rebuilds SST lifecycle state. The cluster manifest is a durable local event log for cluster runtime breadcrumbs; it is not a distributed
+leader-election source of truth.
+
 ---
 
 ## 10. Version Log
@@ -577,7 +589,11 @@ The VersionLog records per-key history when enabled. It powers:
 | Field       | Default                     | Description       |
 |-------------|-----------------------------|-------------------|
 | `logPath`  | `{dataDir}/history.akvlog` | Version log file  |
-| `syncMode` | `ASYNC`                     | `SYNC` or `ASYNC` |
+| `syncMode` | `ASYNC`                     | `SYNC`, `BATCHED_SYNC`, or `ASYNC` |
+
+`SYNC` writes the entry, flushes the stdio buffer, and issues a durability sync before returning. `BATCHED_SYNC` updates the in-memory history immediately, writes
+through a background flusher, and issues durability sync per batch. `ASYNC` also uses the background flusher but does not guarantee per-batch durability at method
+return.
 
 ### 10.3 VersionEntry
 
@@ -590,6 +606,9 @@ value          bytes
 ```
 
 Rollback-generated records use `ROLLBACK_NODE = UINT64_MAX` and `VLOG_FLAG_ROLLBACK = 0x04`.
+
+Version-log recovery is fail-fast: corrupt headers, malformed entries, truncated payloads, and CRC mismatches raise `std::runtime_error` during open instead of
+being silently ignored.
 
 ---
 
@@ -730,6 +749,10 @@ the node set or moving data between placement policies.
 | `Primary`    | Accepts and ships writes             |
 | `Replica`    | Applies replicated records and blobs |
 
+`ReplicationMode` and `NodeRole` are separate concerns. `Standalone`, `Mirror`, and `Stripe` describe deployment topology; `Primary` and `Replica` describe
+runtime responsibility inside non-standalone topologies. `Standalone` mode does not require an explicit startup role. `Mirror` and `Stripe` require
+`ClusterRuntimeOptions::startupRole` to be set to `PRIMARY` or `REPLICA`; `AUTO` is rejected at runtime.
+
 ### 12.3 Ack Policy
 
 | Mode     | Description                      |
@@ -754,13 +777,43 @@ Runtime-only TLS/transport paths and the local replication bind host are not ser
 The advertised `NodeInfo.host` is the address peers dial; `ClusterRuntimeOptions::replBindHost` is the local address the primary listener binds to, defaulting to `0.0.0.0`.
 Replication links run over TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel; `TransportMode::PLAIN` is accepted only when every advertised node host is loopback or LAN/private address space.
 
-Primary selection is deterministic: the coordinator-eligible node with the lowest node id becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not a quorum consensus protocol and does not provide automatic split-brain-safe failover.
-Changing the configured primary for non-mirrored ownership requires an explicit migration plan: the new primary must not retain unrelated user data, and owned data must be moved back to the node selected by the placement policy before traffic is accepted.
+### 12.5 Startup Role Resolution
 
-### 12.5 Runtime Integration
+There is no automatic primary election in the current runtime. For `Mirror` and `Stripe`, the process must start explicitly as either `PRIMARY` or `REPLICA`.
+
+`PRIMARY` startup requirements:
+
+- `selfNodeId` must exist in the cluster config
+- the local node must be `coordinatorEligible()`
+- the local node's configured `replPort` is used for the replication listener
+
+`REPLICA` startup requirements:
+
+- `primaryNodeId` must be provided either directly in `ClusterRuntimeOptions` or through `secure.expectedPrimaryNodeId`
+- the primary target cannot be the local node
+- a reachable primary host and replication port must be known
+- if `primaryNodeId` exists in the cluster config, missing `primaryHost` and `primaryReplPort` are filled from that config entry
+- if the configured primary node is found in the config, it must be `coordinatorEligible()`
+
+Runtime startup fails fast with `std::runtime_error` when these requirements are not met. This is intentional: split-brain-safe failover, quorum leader election,
+and automatic primary re-selection are out of scope for the current cluster layer.
+
+Changing the primary for non-mirrored ownership still requires an explicit migration plan. The new primary must not retain unrelated user data, and owned data must
+be moved back to the node selected by the placement policy before traffic is accepted.
+
+### 12.6 Runtime Integration
 
 `ClusterRuntime` receives engine callbacks for current sequence, last applied sequence, record application, blob application, and role changes. The engine calls
 `ship_entry` and `ship_blob` after local writes when cluster runtime is active.
+
+When running as `PRIMARY`, `ClusterRuntime` opens a `ReplicationServer` on the local node's configured replication port and binds it to
+`ClusterRuntimeOptions::replBindHost`. When running as `REPLICA`, it opens a `ReplicationClient` and dials `primaryHost:primaryReplPort`.
+
+`ClusterManager` also maintains `{dataDir}/cluster.akmf`. On successful startup it records `NodeJoin`; on clean shutdown it records `NodeLeave`; and when the
+node starts as `PRIMARY` it records a `PrimaryLease` event containing the local node id and lease-until timestamp.
+
+Replication ingress is primary-centric: replicas are replication consumers, not direct write ingress endpoints. In `Stripe` mode, key ownership is still decided by
+the deterministic router, but ownership migration and operational traffic placement remain explicit administrative concerns.
 
 ---
 
@@ -786,7 +839,8 @@ verify_peer   Whether peer verification is required
 `TlsStream` wraps one TCP connection and provides blocking `connect`, `accept`, `send`, `recv`, `shutdown`, and `close` operations. It owns the accepted or
 connected socket after setup begins.
 
-TLS can be used by API servers and replication links depending on their `transportMode` and runtime options.
+TLS is used by API servers when enabled. Cluster replication does not use `TlsStream`; it uses the native secure channel when
+`ClusterRuntimeOptions::transportMode == TransportMode::SECURE`, or plain TCP when `transportMode == TransportMode::PLAIN`.
 
 ---
 
@@ -846,13 +900,21 @@ If `paths.dataDir` is set, missing component paths are derived as:
 
 ### 14.5 Cluster Runtime Options
 
-| Field            | Default   | Description                                      |
-|------------------|-----------|--------------------------------------------------|
-| `transportMode`  | `SECURE`  | Replication transport: `SECURE` or `PLAIN`       |
-| `replBindHost`   | `0.0.0.0` | Local address used by the primary repl listener  |
-| `tls`            | empty     | Runtime-only certificate/key/CA verification set |
+| Field                      | Default   | Description                                                             |
+|----------------------------|-----------|-------------------------------------------------------------------------|
+| `transportMode`            | `SECURE`  | Replication transport: native secure channel or plain TCP               |
+| `replBindHost`             | `0.0.0.0` | Local address used by the primary replication listener                  |
+| `startupRole`              | `AUTO`    | Explicit runtime role; `AUTO` is rejected for `Mirror` and `Stripe`     |
+| `primaryHost`              | empty     | Replica-side override for the primary host                              |
+| `primaryReplPort`          | `0`       | Replica-side override for the primary replication port                  |
+| `primaryNodeId`            | `0`       | Replica-side override for the primary node id                           |
+| `secure.identitySeedPath`  | empty     | Persistent local identity seed path for the native secure channel       |
+| `secure.pinnedPeers`       | empty     | Optional raw-public-key pins keyed by cluster node id                   |
+| `secure.expectedPrimaryNodeId` | `0`   | Replica-side expected primary id when `primaryNodeId` is not supplied   |
 
-`PLAIN` replication is rejected for non-private advertised node hosts. Hostnames other than `localhost` are treated as non-private because the runtime does not resolve DNS during configuration validation.
+`PLAIN` replication is rejected for non-private advertised node hosts. Hostnames other than `localhost` are treated as non-private because the runtime does not
+resolve DNS during configuration validation. When `transportMode == SECURE` and `secure.identitySeedPath` is empty, the runtime defaults it to
+`{dataDir}/cluster.identity` if a database directory is available.
 
 ---
 
@@ -1330,7 +1392,7 @@ Depending on enabled components and sync modes, background work may include:
 - MemTable shard flushing
 - SST compaction workers
 - Manifest fast-mode flusher
-- VersionLog async flusher
+- VersionLog async/batched flusher
 - Blob cleanup
 - API server accept/connection handling
 - Cluster manager and replication endpoints

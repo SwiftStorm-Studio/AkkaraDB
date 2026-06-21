@@ -31,15 +31,11 @@ namespace akkaradb::engine::cluster {
     /**
      * ClusterManager - Selects the local cluster role.
      *
-     * ClusterManager owns the lightweight primary-election loop. In cluster
-     * mode, every node selects the same primary from the durable config: the
-     * coordinator-eligible node with the lowest nodeId. Other nodes become
-     * Replica and connect to that configured primary endpoint through the
-     * replication client.
+     * ClusterManager owns local cluster role selection.
      *
-     * This is intentionally deterministic and LAN/WAN-safe, but it is not a
-     * consensus protocol. Automatic failover across network partitions requires
-     * a quorum-based coordinator above this layer.
+     * Standalone mode comes from ClusterConfig::mode(). For MIRROR/STRIPE
+     * modes the runtime startup role is explicit: each node starts either as
+     * PRIMARY or as a REPLICA attached to a configured primary endpoint.
      *
      * Thread-safety: public methods are safe to call from different threads
      * unless otherwise noted.  start() and close() are idempotent.
@@ -67,7 +63,8 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] static std::unique_ptr<ClusterManager> create(
                 std::filesystem::path dbDir,
                 ClusterConfig config,
-                uint64_t selfNodeId
+                uint64_t selfNodeId,
+                ClusterRuntimeOptions runtimeOptions = {}
             );
 
             ~ClusterManager();
@@ -79,10 +76,10 @@ namespace akkaradb::engine::cluster {
             void setRoleChangeCallback(RoleChangeCallback callback);
 
             /**
-             * Starts role election.
+             * Starts role selection.
              *
              * Standalone configs immediately move to NodeRole::STANDALONE.
-             * Cluster configs select the primary deterministically from config.
+             * MIRROR/STRIPE configs require an explicit startup role.
              */
             void start();
 

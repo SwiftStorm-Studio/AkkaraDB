@@ -52,6 +52,12 @@ namespace akkaradb::engine::sst {
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         }
 
+        template <typename T>
+        void appendPod(std::vector<uint8_t>& out, const T& value) {
+            const auto* p = reinterpret_cast<const uint8_t*>(&value);
+            out.insert(out.end(), p, p + sizeof(T));
+        }
+
         [[nodiscard]] int compareBytes(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept {
             const size_t n = std::min(a.size(), b.size());
             if (n > 0) {
@@ -83,6 +89,53 @@ namespace akkaradb::engine::sst {
         [[nodiscard]] std::span<const uint8_t> arenaKey(const std::vector<uint8_t>& arena, uint32_t off, uint32_t len) noexcept {
             if (off > arena.size() || len > arena.size() - off) { return {}; }
             return {arena.data() + off, len};
+        }
+
+        struct DecodedBlockData {
+            std::vector<uint8_t> data;
+            std::vector<uint32_t> offsets;
+        };
+
+        [[nodiscard]] std::optional<DecodedBlockData> decodePrefixCompressedBlock(
+            std::span<const uint8_t> encoded,
+            std::span<const uint32_t> encodedOffsets
+        ) {
+            DecodedBlockData out;
+            out.offsets.reserve(encodedOffsets.size());
+
+            std::vector<uint8_t> prevKey;
+            for (size_t i = 0; i < encodedOffsets.size(); ++i) {
+                const uint32_t off = encodedOffsets[i];
+                if (off + sizeof(core::SSTHdr32) > encoded.size()) { return std::nullopt; }
+
+                const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(encoded.data() + off);
+                const uint16_t shared = hdr->reserved1;
+                if (shared > hdr->kLen || shared > prevKey.size()) { return std::nullopt; }
+
+                const uint8_t* suffixPtr = encoded.data() + off + sizeof(core::SSTHdr32);
+                const size_t suffixLen = static_cast<size_t>(hdr->kLen) - shared;
+                const uint8_t* valPtr = suffixPtr + suffixLen;
+                if (valPtr + hdr->vLen > encoded.data() + encoded.size()) { return std::nullopt; }
+
+                std::vector<uint8_t> fullKey;
+                fullKey.reserve(hdr->kLen);
+                fullKey.insert(fullKey.end(), prevKey.begin(), prevKey.begin() + shared);
+                fullKey.insert(fullKey.end(), suffixPtr, suffixPtr + suffixLen);
+
+                out.offsets.push_back(static_cast<uint32_t>(out.data.size()));
+                core::SSTHdr32 decodedHdr = *hdr;
+                decodedHdr.reserved0 = 0;
+                decodedHdr.reserved1 = 0;
+                appendPod(out.data, decodedHdr);
+                out.data.insert(out.data.end(), fullKey.begin(), fullKey.end());
+                out.data.insert(out.data.end(), valPtr, valPtr + hdr->vLen);
+                const uint64_t padded = alignUpU64(static_cast<uint64_t>(out.data.size()), 8);
+                out.data.resize(static_cast<size_t>(padded), 0);
+
+                prevKey = std::move(fullKey);
+            }
+
+            return out;
         }
     } // namespace
 
@@ -309,7 +362,13 @@ namespace akkaradb::engine::sst {
                     if (offsetsBytes.size() % sizeof(uint32_t) != 0) { return nullptr; }
                     block->offsets.resize(offsetsBytes.size() / sizeof(uint32_t));
                     if (!block->offsets.empty()) { std::memcpy(block->offsets.data(), offsetsBytes.data(), offsetsBytes.size()); }
-                    block->bytes = block->data.size() + offsetsBytes.size();
+                    if ((bh.flags & SST_BLOCK_FLAG_PREFIX_COMPRESSED) != 0) {
+                        const auto decoded = decodePrefixCompressedBlock(block->data, block->offsets);
+                        if (!decoded.has_value()) { return nullptr; }
+                        block->data = std::move(decoded->data);
+                        block->offsets = std::move(decoded->offsets);
+                    }
+                    block->bytes = block->data.size() + block->offsets.size() * sizeof(uint32_t);
                     putCache(idx, block);
                     return block;
                 }

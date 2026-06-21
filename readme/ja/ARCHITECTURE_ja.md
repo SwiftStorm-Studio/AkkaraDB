@@ -107,6 +107,7 @@ native engine は最小限の LSM 実装だけではなく、次の subsystem �
 |-- manifest.akmf    SST lifecycle and checkpoint metadata
 |-- history.akvlog   version history when enabled
 |-- cluster.akcc     cluster topology when enabled
+|-- cluster.akmf     node-local cluster runtime event log when enabled
 `-- node.id          persistent node identity
 ```
 
@@ -120,6 +121,9 @@ native engine は最小限の LSM 実装だけではなく、次の subsystem �
 | Blob files | 大きな value を MemTable / WAL / SST payload の外側に保存する |
 | Version Log | point-in-time read と rollback のための履歴を保存する |
 | Cluster config | durable な cluster topology を保存する。runtime TLS path は含めない |
+
+`manifest.akmf` 縺ｯ SST lifecycle / checkpoint 用の main engine manifest 縺ｧ縺吶・`cluster.akmf` 縺ｯ node-local な cluster runtime event log 縺ｧ、
+`cluster.akcc` 縺ｮ topology/config 永続化と責務を分離しています。
 
 ---
 
@@ -247,11 +251,17 @@ SST v2 file layout は次の通りです。
 [SSTFooterV2:48]
 ```
 
+block 内の record は key order を保ちます。key は optional な block compression の前に、直前 key に対する prefix-delta 形式で保存されることがあり、
+reader が block load 時に full key へ展開します。
+
 lookup は file min/max key check、Bloom filter negative check、block index binary search、in-block binary search の順で絞り込みます。data block は raw concatenated SST record または Zstd-compressed bytes を持ちます。
 
 flush は sorted MemTable record から新しい SST を作ります。compaction は overlapping または budget 超過の SST set を lower level へ rewrite し、その transition を Manifest に記録します。`CompactionCommit` は input/output file の変更を replay 時に atomically 適用できるため、preferred な manifest event です。
 
 ### Manifest
+
+実装上は 2 種類の manifest を使います。`manifest.akmf` は SST lifecycle / checkpoint 用、`cluster.akmf` は `NodeJoin` / `NodeLeave` /
+`PrimaryLease` のような local cluster runtime event 用です。
 
 Manifest は append-only で CRC-protected な storage lifecycle log です。live SST file、compaction transition、checkpoint、cluster metadata event を追跡します。
 
@@ -269,8 +279,10 @@ Manifest は append-only で CRC-protected な storage lifecycle log です。li
 | `CompactionCommit` | compaction の input/output transition |
 | `Truncate` | informational truncation marker |
 | `NodeJoin`, `NodeLeave`, `PrimaryLease` | cluster metadata |
+`NodeJoin` / `NodeLeave` / `PrimaryLease` は `cluster.akmf` に書かれる node-local event です。
 
-Manifest replay は in-memory の SST lifecycle state を再構築します。malformed record や CRC-invalid record は適用しません。
+Manifest replay は in-memory の SST lifecycle state を再構築します。`cluster.akmf` は現状、startup/shutdown と primary lease の durable local event log
+として使われます。malformed record や CRC-invalid record は適用しません。
 
 ### Version Log
 
@@ -282,6 +294,11 @@ Version Log は有効な場合に per-key history を記録します。次の機
 - `rollbackKey(key, seq)`
 
 各 version entry は sequence、source node id、timestamp、flags、value bytes を保存します。rollback によって生成される record は reserved rollback node id と rollback flag を使い、通常 write と区別できます。
+
+`SYNC` mode は entry を write して durability sync まで完了してから返ります。`BATCHED_SYNC` mode は in-memory history を即時更新し、
+background flusher が batch 単位で serialize と durability sync を行います。`ASYNC` mode も background flusher を使いますが、method return 時点
+で batch durability は保証しません。corrupt header、malformed entry、truncation、CRC mismatch は silently skip せず、open 時に exception として
+扱います。
 
 Version history は `FAST` / `NORMAL` では default disabled、`DURABLE` では default enabled です。`AkkaraDB::Options::Overrides::versionLogEnabled` で変更できます。
 
@@ -313,11 +330,32 @@ Stripe runtime creation は受理されます。router は deterministic rendezv
 
 node role は `Standalone`、`Primary`、`Replica` です。Primary は write を受け取り、record と blob を replica に ship します。Replica は engine から渡された callback を使って replicated record / blob を適用します。acknowledgement policy は `Async`、`All`、`Quorum` です。
 
+`ReplicationMode` と runtime role は別物です。`Standalone`、`Mirror`、`Stripe` は deployment topology を表し、`Primary` と `Replica` は
+non-standalone topology の中で process がどの役割で起動するかを表します。`Standalone` mode では明示的な startup role は不要です。
+`Mirror` と `Stripe` では `ClusterRuntimeOptions::startupRole` を `PRIMARY` か `REPLICA` に設定する必要があり、`AUTO` は runtime error にします。
+
 replication link は TCP です。`TransportMode::SECURE` は native secure channel で TCP stream を保護し、`TransportMode::PLAIN` は node host が loopback または LAN/private address の場合だけ許可されます。`localhost` 以外の hostname は config validation では non-private と扱われます。
 
-Primary selection は coordinator-eligible な最小 `node_id` による deterministic selection です。これは shared filesystem state なしで LAN/WAN node 間に同じ primary view を作りますが、quorum consensus ではなく split-brain-safe な automatic failover はこの layer の対象外です。
+current runtime には automatic な primary election はありません。`Mirror` と `Stripe` では、process は明示的に `PRIMARY` または `REPLICA`
+として起動する必要があります。
 
-TLS support は mbedTLS によって current native target に組み込まれます。API server と replication link は runtime option に応じて TLS / secure transport または plain transport を使います。
+- `PRIMARY` 起動では local `selfNodeId` が cluster config に存在し、その node が coordinator-eligible である必要があります
+- `REPLICA` 起動では primary node id と、到達可能な primary host / replication port が必要です
+- `primaryHost` と `primaryReplPort` は `primaryNodeId` に対応する config entry から補完できます
+- `REPLICA` が自分自身を primary として指定することはできません
+
+条件を満たさない場合は startup を fail-fast させます。split-brain-safe な failover、quorum による leader election、automatic な primary 再選出は
+この layer の scope 外です。
+
+`PRIMARY` として動く場合、runtime は local node の configured replication port で `ReplicationServer` を立てます。`REPLICA` として動く場合は
+`ReplicationClient` を作って configured primary に接続します。replication ingress は primary-centric で、replica は replication consumer であり
+direct な external write ingress endpoint ではありません。
+
+`ClusterManager` は `{dataDir}/cluster.akmf` も書きます。successful startup 後に `NodeJoin`、clean shutdown 時に `NodeLeave`、`PRIMARY` として起動した
+ときに `PrimaryLease` を記録します。
+
+TLS support は mbedTLS によって API 向け endpoint に組み込まれます。replication link は TLS ではなく、native secure channel
+(`TransportMode::SECURE`) か plain TCP (`TransportMode::PLAIN`) を使います。
 
 ---
 
@@ -489,7 +527,7 @@ public storage component は public method boundary で thread-safe に扱える
 
 top-level write は `AkkEngine::Impl::write_mu` によって serialize されます。sequence assignment と write に伴う side effect を一貫した順序で扱うためです。
 
-background work には WAL async flusher、MemTable shard flushing、SST compaction worker、Manifest fast-mode flusher、VersionLog async flusher、Blob cleanup、API server accept / connection handling、Cluster manager / replication endpoint が含まれます。
+background work には WAL async flusher、MemTable shard flushing、SST compaction worker、Manifest fast-mode flusher、VersionLog async/batched flusher、Blob cleanup、API server accept / connection handling、Cluster manager / replication endpoint が含まれます。
 
 ---
 

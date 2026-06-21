@@ -81,7 +81,7 @@ namespace {
         }
     }
 
-    static void testRecoveryAndCorruptionTolerance() {
+    static void testRecoveryAndCorruptionDetection() {
         const auto dir = makeTempDir("recovery");
         const auto path = dir / "history.akvlog";
 
@@ -109,9 +109,15 @@ namespace {
         }
 
         {
-            auto log = VersionLog::create(VersionLogOptions{.logPath = path, .syncMode = VLogSyncMode::ASYNC});
-            const auto vb = log->getAt(asU8("b"), 999);
-            (void)vb;
+            bool threw = false;
+            try {
+                auto log = VersionLog::create(VersionLogOptions{.logPath = path, .syncMode = VLogSyncMode::ASYNC});
+                (void)log;
+            }
+            catch (const std::runtime_error&) {
+                threw = true;
+            }
+            AKK_TEST_CHECK(threw);
         }
     }
 
@@ -130,14 +136,42 @@ namespace {
         AKK_TEST_CHECK(targets[0].second.has_value());
         AKK_TEST_CHECK(targets[0].second->seq == 10);
     }
+
+    static void testBatchedSyncRecovery() {
+        const auto dir = makeTempDir("batchedSync");
+        const auto path = dir / "history.akvlog";
+
+        {
+            auto log = VersionLog::create(
+                VersionLogOptions{
+                    .logPath = path,
+                    .syncMode = VLogSyncMode::BATCHED_SYNC,
+                    .groupN = 4,
+                    .groupMicros = 0,
+                    .groupBytes = 256,
+                }
+            );
+            log->append(asU8("k"), 1, 11, 100, 0x00, asU8("v1"));
+            log->append(asU8("k"), 2, 11, 200, 0x00, asU8("v2"));
+            log->close();
+        }
+
+        {
+            auto log = VersionLog::create(VersionLogOptions{.logPath = path, .syncMode = VLogSyncMode::ASYNC});
+            const auto v = log->getAt(asU8("k"), 2);
+            AKK_TEST_CHECK(v.has_value());
+            AKK_TEST_CHECK(to_string(v->value) == "v2");
+        }
+    }
 } // namespace
 
 int main() {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     testAppendAndQueries();
-    testRecoveryAndCorruptionTolerance();
+    testRecoveryAndCorruptionDetection();
     testCollectRollbackTargets();
+    testBatchedSyncRecovery();
     std::printf("versionlog smoke test passed\n");
     return 0;
 }

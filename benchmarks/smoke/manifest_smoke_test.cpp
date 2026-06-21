@@ -135,6 +135,29 @@ namespace {
             AKK_TEST_CHECK(mf->liveSst().empty());
         }
     }
+
+    static void testClusterEventsInProcessState() {
+        const auto dir = makeTempDir("cluster");
+        const auto path = dir / "manifest.akmf";
+
+        auto mf = Manifest::create(path, false);
+        mf->nodeJoin(7, 20481, "127.0.0.1");
+        mf->primaryLease(7, 123456789);
+        mf->nodeLeave(7);
+
+        const auto joins = mf->nodeJoins();
+        const auto leaves = mf->nodeLeaves();
+        const auto lease = mf->lastPrimaryLease();
+        AKK_TEST_CHECK(joins.size() == 1);
+        AKK_TEST_CHECK(joins.front().nodeId == 7);
+        AKK_TEST_CHECK(joins.front().replPort == 20481);
+        AKK_TEST_CHECK(joins.front().host == "127.0.0.1");
+        AKK_TEST_CHECK(leaves.size() == 1);
+        AKK_TEST_CHECK(leaves.front().nodeId == 7);
+        AKK_TEST_CHECK(lease.has_value());
+        AKK_TEST_CHECK(lease->nodeId == 7);
+        AKK_TEST_CHECK(lease->leaseUntilUs == 123456789);
+    }
 } // namespace
 
 int main() {
@@ -143,6 +166,7 @@ int main() {
     testBasicStateAndReplay();
     testCompactionCommit();
     testCrcStopOnCorruption();
+    testClusterEventsInProcessState();
     std::printf("manifest smoke test passed\n");
     return 0;
 }

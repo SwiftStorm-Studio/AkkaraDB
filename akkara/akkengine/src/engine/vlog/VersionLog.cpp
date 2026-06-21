@@ -23,6 +23,10 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <chrono>
 #include <limits>
 #include <cstdio>
 #include <cstring>
@@ -30,6 +34,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -98,6 +103,8 @@ namespace akkaradb::engine::vlog {
         public:
             VersionLogOptions opts_;
             mutable std::mutex mu_;
+            std::condition_variable flushCv_;
+            std::condition_variable queueSpaceCv_;
 
             struct StringViewHash {
                 using is_transparent = void;
@@ -107,10 +114,13 @@ namespace akkaradb::engine::vlog {
 
             std::unordered_map<std::string, std::vector<VersionEntry>, StringViewHash, std::equal_to<>> index_;
             FILE* file_ = nullptr;
-            std::vector<uint8_t> writeBuf_;
+            std::deque<std::vector<uint8_t>> pendingWrites_;
+            std::thread flushThread_;
+            std::exception_ptr asyncError_;
+            bool closing_ = false;
+            uint64_t pendingBytes_ = 0;
 
-            void serializeAndWrite(
-                FILE* f,
+            [[nodiscard]] std::vector<uint8_t> serializeEntry(
                 const uint8_t* keyData,
                 size_t keyLen,
                 uint64_t seq,
@@ -126,8 +136,8 @@ namespace akkaradb::engine::vlog {
                 if (valueLen > std::numeric_limits<uint32_t>::max()) { throw std::invalid_argument("VersionLog: value too large"); }
 
                 const uint32_t entryLen = static_cast<uint32_t>(total);
-                writeBuf_.resize(entryLen);
-                uint8_t* p = writeBuf_.data();
+                std::vector<uint8_t> out(entryLen);
+                uint8_t* p = out.data();
 
                 auto& hdr = *reinterpret_cast<AkvlogV5EntryHeader*>(p);
                 hdr.entryLen = entryLen;
@@ -150,10 +160,87 @@ namespace akkaradb::engine::vlog {
                 }
 
                 std::memset(p, 0, CRC_SIZE);
-                const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(writeBuf_.data()), entryLen - CRC_SIZE);
+                const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(out.data()), entryLen - CRC_SIZE);
                 std::memcpy(p, &crc, CRC_SIZE);
+                return out;
+            }
 
-                if (fwrite(writeBuf_.data(), 1, entryLen, f) != entryLen) { throw std::runtime_error("VersionLog: fwrite failed"); }
+            static void writeSerialized(FILE* f, std::span<const uint8_t> bytes) {
+                if (fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size()) { throw std::runtime_error("VersionLog: fwrite failed"); }
+            }
+
+            void checkAsyncErrorLocked() const {
+                if (asyncError_) { std::rethrow_exception(asyncError_); }
+            }
+
+            void flushLoop() {
+                std::deque<std::vector<uint8_t>> batch;
+                while (true) {
+                    {
+                        std::unique_lock lock{mu_};
+                        flushCv_.wait(lock, [this] { return closing_ || !pendingWrites_.empty(); });
+                        if (pendingWrites_.empty()) {
+                            if (closing_) { break; }
+                            continue;
+                        }
+
+                        if (!closing_) {
+                            const auto maxWait = std::chrono::microseconds(opts_.groupMicros);
+                            const auto deadline = std::chrono::steady_clock::now() + maxWait;
+                            while (pendingWrites_.size() < opts_.groupN && pendingBytes_ < opts_.groupBytes && !closing_) {
+                                if (opts_.groupMicros == 0) { break; }
+                                if (flushCv_.wait_until(
+                                    lock,
+                                    deadline,
+                                    [this] {
+                                        return closing_ || pendingWrites_.size() >= opts_.groupN || pendingBytes_ >= opts_.groupBytes;
+                                    }
+                                )) {
+                                    break;
+                                }
+                                break;
+                            }
+                        }
+
+                        batch.swap(pendingWrites_);
+                        pendingBytes_ = 0;
+                        queueSpaceCv_.notify_all();
+                    }
+
+                    try {
+                        for (const auto& entry : batch) { writeSerialized(file_, entry); }
+                        fflush(file_);
+                        if (opts_.syncMode == VLogSyncMode::BATCHED_SYNC) { doFdatasync(file_); }
+                    }
+                    catch (...) {
+                        std::lock_guard lock{mu_};
+                        if (!asyncError_) { asyncError_ = std::current_exception(); }
+                        closing_ = true;
+                        pendingWrites_.clear();
+                        pendingBytes_ = 0;
+                        queueSpaceCv_.notify_all();
+                        flushCv_.notify_all();
+                        break;
+                    }
+
+                    batch.clear();
+                }
+            }
+
+            void startAsyncWorkerIfNeeded() {
+                if (opts_.syncMode == VLogSyncMode::SYNC || flushThread_.joinable()) { return; }
+                closing_ = false;
+                flushThread_ = std::thread([this] { flushLoop(); });
+            }
+
+            void stopAsyncWorker() {
+                if (!flushThread_.joinable()) { return; }
+                {
+                    std::lock_guard lock{mu_};
+                    closing_ = true;
+                    flushCv_.notify_all();
+                }
+                flushThread_.join();
             }
 
             void writeEntry(
@@ -164,9 +251,16 @@ namespace akkaradb::engine::vlog {
                 uint8_t flags,
                 std::span<const uint8_t> value
             ) {
-                serializeAndWrite(file_, key.data(), key.size(), seq, sourceNodeId, timestampNs, flags, value.data(), value.size());
-                fflush(file_);
-                if (opts_.syncMode == VLogSyncMode::SYNC) { doFdatasync(file_); }
+                auto bytes = serializeEntry(key.data(), key.size(), seq, sourceNodeId, timestampNs, flags, value.data(), value.size());
+                if (opts_.syncMode == VLogSyncMode::SYNC) {
+                    writeSerialized(file_, bytes);
+                    fflush(file_);
+                    doFdatasync(file_);
+                    return;
+                }
+
+                pendingWrites_.push_back(std::move(bytes));
+                flushCv_.notify_one();
             }
 
             void writeFileHeader(FILE* wf) {
@@ -200,7 +294,13 @@ namespace akkaradb::engine::vlog {
                     rf = fopen(path.string().c_str(), "rb");
                     #endif
                     if (rf != nullptr) {
-                        recover(rf);
+                        try {
+                            recover(rf);
+                        }
+                        catch (...) {
+                            fclose(rf);
+                            throw;
+                        }
                         fclose(rf);
                     }
                 }
@@ -213,6 +313,7 @@ namespace akkaradb::engine::vlog {
                 if (!file_) { throw std::runtime_error("VersionLog: cannot open file: " + path.string()); }
 
                 if (!existed || fs::file_size(path) == 0) { writeFileHeader(file_); }
+                startAsyncWorkerIfNeeded();
             }
 
             void insertSorted(const std::string& key, VersionEntry ve) {
@@ -239,31 +340,35 @@ namespace akkaradb::engine::vlog {
                 fileHdr.crc32c = 0;
                 const uint32_t computedHeaderCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(&fileHdr), sizeof(fileHdr));
                 if (fileHdr.magic != AKVLOG_V5_MAGIC || fileHdr.version != AKVLOG_V5_VERSION || storedHeaderCrc != computedHeaderCrc) {
-                    return;
+                    throw std::runtime_error("VersionLog: corrupt file header");
                 }
 
                 std::vector<uint8_t> buf;
                 while (true) {
                     uint32_t entryLen = 0;
                     if (fread(&entryLen, sizeof(entryLen), 1, rf) != 1) { break; }
-                    if (entryLen < MIN_ENTRY_SIZE || entryLen > MAX_ENTRY_SIZE) { break; }
+                    if (entryLen < MIN_ENTRY_SIZE || entryLen > MAX_ENTRY_SIZE) {
+                        throw std::runtime_error("VersionLog: corrupt entry length");
+                    }
 
                     buf.resize(entryLen);
                     std::memcpy(buf.data(), &entryLen, sizeof(entryLen));
 
                     const size_t rest = entryLen - sizeof(entryLen);
-                    if (fread(buf.data() + sizeof(entryLen), 1, rest, rf) != rest) { break; }
+                    if (fread(buf.data() + sizeof(entryLen), 1, rest, rf) != rest) {
+                        throw std::runtime_error("VersionLog: truncated entry");
+                    }
 
                     uint32_t storedEntryCrc = 0;
                     std::memcpy(&storedEntryCrc, buf.data() + entryLen - CRC_SIZE, CRC_SIZE);
                     std::memset(buf.data() + entryLen - CRC_SIZE, 0, CRC_SIZE);
                     const uint32_t computedEntryCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(buf.data()), entryLen - CRC_SIZE);
-                    if (storedEntryCrc != computedEntryCrc) { continue; }
+                    if (storedEntryCrc != computedEntryCrc) { throw std::runtime_error("VersionLog: entry CRC mismatch"); }
 
-                    if (buf.size() < ENTRY_HDR_SIZE) { continue; }
+                    if (buf.size() < ENTRY_HDR_SIZE) { throw std::runtime_error("VersionLog: corrupt entry header"); }
                     const auto& ehdr = *reinterpret_cast<const AkvlogV5EntryHeader*>(buf.data());
                     const size_t expectedSize = ENTRY_HDR_SIZE + ehdr.keyLen + ehdr.valueLen + CRC_SIZE;
-                    if (expectedSize != entryLen) { continue; }
+                    if (expectedSize != entryLen) { throw std::runtime_error("VersionLog: corrupt entry payload"); }
 
                     const uint8_t* p = buf.data() + ENTRY_HDR_SIZE;
                     std::string key(reinterpret_cast<const char*>(p), ehdr.keyLen);
@@ -284,12 +389,16 @@ namespace akkaradb::engine::vlog {
         auto log = std::unique_ptr<VersionLog>(new VersionLog{});
         log->impl_ = std::make_unique<Impl>();
         log->impl_->opts_ = std::move(opts);
-        log->impl_->writeBuf_.reserve(4096);
         log->impl_->openOrCreate();
         return log;
     }
 
-    VersionLog::~VersionLog() { close(); }
+    VersionLog::~VersionLog() {
+        try {
+            close();
+        }
+        catch (...) {}
+    }
 
     void VersionLog::append(
         std::span<const uint8_t> key,
@@ -301,10 +410,27 @@ namespace akkaradb::engine::vlog {
     ) {
         if (!impl_) { return; }
 
-        std::lock_guard lock{impl_->mu_};
+        std::unique_lock lock{impl_->mu_};
+        impl_->checkAsyncErrorLocked();
         if (!impl_->file_) { return; }
 
-        impl_->writeEntry(key, seq, sourceNodeId, timestampNs, flags, value);
+        if (impl_->opts_.syncMode != VLogSyncMode::SYNC) {
+            auto bytes = impl_->serializeEntry(key.data(), key.size(), seq, sourceNodeId, timestampNs, flags, value.data(), value.size());
+            const uint64_t entryBytes = static_cast<uint64_t>(bytes.size());
+            impl_->queueSpaceCv_.wait(
+                lock,
+                [&] {
+                    return impl_->asyncError_ || impl_->closing_ || impl_->pendingBytes_ + entryBytes <= impl_->opts_.asyncMaxPendingBytes ||
+                           impl_->pendingWrites_.empty();
+                }
+            );
+            impl_->checkAsyncErrorLocked();
+            if (impl_->closing_) { throw std::runtime_error("VersionLog: append rejected while flusher is stopping"); }
+            impl_->pendingWrites_.push_back(std::move(bytes));
+            impl_->pendingBytes_ += entryBytes;
+            impl_->flushCv_.notify_one();
+        }
+        else { impl_->writeEntry(key, seq, sourceNodeId, timestampNs, flags, value); }
 
         const std::string keyStr(reinterpret_cast<const char*>(key.data()), key.size());
         VersionEntry ve;
@@ -320,6 +446,7 @@ namespace akkaradb::engine::vlog {
         if (!impl_) { return std::nullopt; }
 
         std::lock_guard lock{impl_->mu_};
+        impl_->checkAsyncErrorLocked();
         const std::string_view keySv(reinterpret_cast<const char*>(key.data()), key.size());
         const auto it = impl_->index_.find(keySv);
         if (it == impl_->index_.end()) { return std::nullopt; }
@@ -339,6 +466,7 @@ namespace akkaradb::engine::vlog {
         if (!impl_) { return {}; }
 
         std::lock_guard lock{impl_->mu_};
+        impl_->checkAsyncErrorLocked();
         const std::string_view keySv(reinterpret_cast<const char*>(key.data()), key.size());
         const auto it = impl_->index_.find(keySv);
         if (it == impl_->index_.end()) { return {}; }
@@ -349,6 +477,7 @@ namespace akkaradb::engine::vlog {
         if (!impl_) { return {}; }
 
         std::lock_guard lock{impl_->mu_};
+        impl_->checkAsyncErrorLocked();
         std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> result;
         for (const auto& [key, versions] : impl_->index_) {
             if (versions.empty() || versions.back().seq <= targetSeq) { continue; }
@@ -370,12 +499,48 @@ namespace akkaradb::engine::vlog {
         return result;
     }
 
+    void VersionLog::forceSync() {
+        if (!impl_) { return; }
+
+        if (impl_->opts_.syncMode == VLogSyncMode::SYNC) {
+            std::lock_guard lock{impl_->mu_};
+            impl_->checkAsyncErrorLocked();
+            if (!impl_->file_) { return; }
+            fflush(impl_->file_);
+            doFdatasync(impl_->file_);
+            return;
+        }
+
+        impl_->stopAsyncWorker();
+
+        {
+            std::lock_guard lock{impl_->mu_};
+            impl_->checkAsyncErrorLocked();
+            if (!impl_->file_) { return; }
+            fflush(impl_->file_);
+            doFdatasync(impl_->file_);
+            impl_->closing_ = false;
+        }
+
+        impl_->startAsyncWorkerIfNeeded();
+    }
+
     void VersionLog::close() {
         if (!impl_) { return; }
-        std::lock_guard lock{impl_->mu_};
-        if (!impl_->file_) { return; }
-        fflush(impl_->file_);
-        fclose(impl_->file_);
-        impl_->file_ = nullptr;
+        impl_->stopAsyncWorker();
+
+        std::exception_ptr asyncError;
+        {
+            std::lock_guard lock{impl_->mu_};
+            asyncError = impl_->asyncError_;
+            if (!impl_->file_) {
+                if (asyncError) { std::rethrow_exception(asyncError); }
+                return;
+            }
+            fflush(impl_->file_);
+            fclose(impl_->file_);
+            impl_->file_ = nullptr;
+        }
+        if (asyncError) { std::rethrow_exception(asyncError); }
     }
 } // namespace akkaradb::engine::vlog

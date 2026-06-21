@@ -135,6 +135,12 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] std::optional<SplitResult> insertRecursive(Node* node, const core::OwnedRecord* record);
             [[nodiscard]] Node* descendToCandidateLeaf(std::span<const uint8_t> key) const noexcept;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshot(uint64_t snapshotSeq) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshotRange(
+                uint64_t snapshotSeq,
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey
+            ) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshot(uint64_t snapshotSeq) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshotRange(
                 uint64_t snapshotSeq,

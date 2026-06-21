@@ -69,6 +69,24 @@ namespace akkaradb::engine::manifest {
                 uint64_t tsUs;
             };
 
+            struct NodeJoinEvent {
+                uint64_t nodeId;
+                uint16_t replPort;
+                std::string host;
+                uint64_t tsUs;
+            };
+
+            struct NodeLeaveEvent {
+                uint64_t nodeId;
+                uint64_t tsUs;
+            };
+
+            struct PrimaryLeaseEvent {
+                uint64_t nodeId;
+                uint64_t leaseUntilUs;
+                uint64_t tsUs;
+            };
+
             // ================================================================
             // Factory / lifecycle
             // ================================================================
@@ -166,6 +184,15 @@ namespace akkaradb::engine::manifest {
              */
             void truncate(const std::optional<std::string>& reason = std::nullopt);
 
+            /** Records that a cluster node has joined and is advertising a replication endpoint. */
+            void nodeJoin(uint64_t nodeId, uint16_t replPort, const std::string& host);
+
+            /** Records that a cluster node has left. */
+            void nodeLeave(uint64_t nodeId);
+
+            /** Records the last advertised primary lease window. */
+            void primaryLease(uint64_t nodeId, uint64_t leaseUntilUs);
+
             // ================================================================
             // Replay
             // ================================================================
@@ -193,6 +220,15 @@ namespace akkaradb::engine::manifest {
 
             /** Returns all SSTSeal events in replay order. */
             [[nodiscard]] std::vector<SSTSealEvent> sstSeals() const;
+
+            /** Returns all node-join events in replay order. */
+            [[nodiscard]] std::vector<NodeJoinEvent> nodeJoins() const;
+
+            /** Returns all node-leave events in replay order. */
+            [[nodiscard]] std::vector<NodeLeaveEvent> nodeLeaves() const;
+
+            /** Returns the most recently replayed primary-lease event, if any. */
+            [[nodiscard]] std::optional<PrimaryLeaseEvent> lastPrimaryLease() const noexcept;
 
             // ================================================================
             // Shutdown

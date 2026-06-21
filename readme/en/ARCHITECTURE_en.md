@@ -98,6 +98,7 @@ When `paths.dataDir` is set, missing component paths are derived from that direc
 |-- manifest.akmf    SST lifecycle and checkpoint metadata
 |-- history.akvlog   Version history when enabled
 |-- cluster.akcc     Cluster topology when enabled
+|-- cluster.akmf     Node-local cluster runtime event log when enabled
 `-- node.id          Persistent node identity
 ```
 
@@ -107,7 +108,7 @@ The exact binary formats are defined in `SPEC.md`. The important architectural p
 |---|---|
 | WAL | Replays acknowledged or pending writes after a crash |
 | SST | Stores immutable sorted key/value records |
-| Manifest | Tracks which SST files and compaction transitions are live |
+| Manifest | Tracks SST lifecycle/checkpoints and local cluster runtime events |
 | Blob files | Store large values outside MemTable, WAL, and SST payloads |
 | Version Log | Stores historical values used by point-in-time reads and rollback |
 | Cluster config | Stores durable cluster topology, not runtime TLS paths |
@@ -267,6 +268,9 @@ SST v2 file layout:
 [SSTFooterV2:48]
 ```
 
+Records inside a block stay in key order. Keys may be prefix-delta encoded against the previous key before optional block compression, and are expanded back to full
+keys when the reader loads the block.
+
 Lookup uses several filters before doing full record comparison:
 
 ```text
@@ -283,7 +287,8 @@ Flush creates new SSTs from sorted MemTable records. Compaction rewrites overlap
 
 ### Manifest
 
-The Manifest is an append-only, CRC-protected storage lifecycle log. It tracks live SST files, compaction transitions, checkpoints, and cluster metadata events.
+The Manifest is an append-only, CRC-protected storage lifecycle log. The main engine manifest (`manifest.akmf`) tracks live SST files, compaction transitions,
+and checkpoints. A separate node-local cluster manifest (`cluster.akmf`) records cluster runtime events.
 
 The file starts with `ManifestFileHeader`, then appends records:
 
@@ -300,9 +305,10 @@ Important record types include:
 | `CompactionStart` | Informational start marker |
 | `CompactionCommit` | Atomic compaction input/output transition |
 | `Truncate` | Informational truncation marker |
-| `NodeJoin`, `NodeLeave`, `PrimaryLease` | Cluster metadata |
+| `NodeJoin`, `NodeLeave`, `PrimaryLease` | Cluster runtime events written to `cluster.akmf` |
 
-Manifest replay rebuilds in-memory SST lifecycle state. Malformed or CRC-invalid records are not applied.
+Replay of `manifest.akmf` rebuilds in-memory SST lifecycle state. The cluster manifest is currently used as a durable local event log for startup/shutdown and
+primary-lease breadcrumbs. Malformed or CRC-invalid records are not applied.
 
 ### Version Log
 
@@ -314,6 +320,10 @@ The Version Log records per-key history when enabled. It powers:
 - `rollbackKey(key, seq)`
 
 Each version entry stores sequence, source node id, timestamp, flags, and value bytes. Rollback-generated records use a reserved rollback node id and rollback flag so they can be distinguished from normal writes.
+
+`SYNC` mode writes and durability-syncs the entry before returning. `BATCHED_SYNC` updates the in-memory history immediately, lets a background flusher batch
+entries, and durability-syncs per batch. `ASYNC` also uses the background flusher but does not guarantee batch durability at method return. Corrupt version-log
+headers, malformed entries, truncation, and CRC mismatches fail open with an exception instead of being silently skipped.
 
 Version history is disabled by default in `FAST` and `NORMAL`, and enabled by the `DURABLE` startup preset unless overridden.
 
@@ -347,11 +357,35 @@ Stripe runtime creation is accepted. The router uses deterministic rendezvous ha
 
 Node roles are `Standalone`, `Primary`, and `Replica`. The primary accepts writes and ships records or blobs to replicas. Replicas apply replicated records and blobs through callbacks supplied by the engine.
 
+`ReplicationMode` and runtime role are separate. `Standalone`, `Mirror`, and `Stripe` describe topology; `Primary` and `Replica` describe how a process starts
+inside non-standalone topologies. `Standalone` mode does not require an explicit startup role. `Mirror` and `Stripe` require
+`ClusterRuntimeOptions::startupRole` to be set to `PRIMARY` or `REPLICA`; `AUTO` is rejected at runtime.
+
 Acknowledgement policies are `Async`, `All`, and `Quorum`.
 
-`NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel, and `TransportMode::PLAIN` is allowed only when every node host is loopback or LAN/private address space. Hostnames other than `localhost` are treated as non-private during config validation. Primary selection is deterministic: the coordinator-eligible node with the lowest `node_id` becomes primary. This works across LAN/WAN nodes without shared filesystem state, but it is not quorum consensus and does not provide split-brain-safe automatic failover.
+`NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which
+defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel, and `TransportMode::PLAIN` is
+allowed only when every node host is loopback or LAN/private address space. Hostnames other than `localhost` are treated as non-private during config validation.
 
-TLS support is compiled into the current native target through mbedTLS. API servers and replication links can use TLS or plain transport depending on their runtime options.
+There is no automatic primary election in the current runtime. For `Mirror` and `Stripe`, startup must be explicit:
+
+- `PRIMARY` requires the local `selfNodeId` to exist in the cluster config and to be coordinator-eligible
+- `REPLICA` requires a primary node id plus a reachable primary host and replication port
+- `primaryHost` and `primaryReplPort` may be filled from the config entry identified by `primaryNodeId`
+- `REPLICA` startup cannot target the local node as its own primary
+
+If these requirements are not met, startup fails fast. Split-brain-safe failover, quorum leader election, and automatic primary re-selection are currently out of
+scope.
+
+When running as `PRIMARY`, the runtime opens a `ReplicationServer` on the local node's configured replication port. When running as `REPLICA`, it opens a
+`ReplicationClient` and dials the configured primary. Replication ingress is primary-centric: replicas are replication consumers, not direct external write
+ingress endpoints.
+
+`ClusterManager` also writes a node-local `cluster.akmf` under `{dataDir}`. It records `NodeJoin` after successful startup, `NodeLeave` on clean shutdown, and
+`PrimaryLease` when the node starts as `PRIMARY`.
+
+TLS support is compiled into the current native target through mbedTLS for API-facing endpoints. Replication links use either the native secure channel
+(`TransportMode::SECURE`) or plain TCP (`TransportMode::PLAIN`).
 
 ---
 
@@ -537,7 +571,7 @@ Background work can include:
 - MemTable shard flushing
 - SST compaction workers
 - Manifest fast-mode flusher
-- VersionLog async flusher
+- VersionLog async/batched flusher
 - Blob cleanup
 - API server accept and connection handling
 - Cluster manager and replication endpoints

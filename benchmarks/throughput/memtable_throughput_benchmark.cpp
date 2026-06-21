@@ -55,8 +55,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,6 +73,8 @@ namespace {
     constexpr uint32_t kLatencySampleMask = 0x3F; // sample 1 / 64 ops to reduce benchmark perturbation
     constexpr size_t kScanSampleWindow = 32; // amortize clock resolution/overhead for iterator next()
     constexpr uint64_t kAutoFlushDisabledThreshold = (1ULL << 62);
+    constexpr size_t kKeyChunkSize = 1'000'000;
+    constexpr bool kDefaultIncludeFlushInPutTiming = false;
 
     struct CaseSpec {
         int keySize;
@@ -95,6 +100,8 @@ namespace {
         double getOpsPerSec;
         double scanOpsPerSec;
         double putMs;
+        double putFlushOpsPerSec;
+        double putFlushMs;
         double getMs;
         double scanMs;
         double flushMs;
@@ -106,15 +113,58 @@ namespace {
         LatencyPercentiles scanLatency;
     };
 
+    struct NumericStats {
+        double mean = 0.0;
+        double median = 0.0;
+        double stddev = 0.0;
+        double cov = 0.0;
+    };
+
+    struct ResultStats {
+        NumericStats putOpsPerSec;
+        NumericStats putFlushOpsPerSec;
+        NumericStats getOpsPerSec;
+        NumericStats scanOpsPerSec;
+        NumericStats putMs;
+        NumericStats putFlushMs;
+        NumericStats getMs;
+        NumericStats scanMs;
+        NumericStats flushMs;
+        NumericStats approxBytes;
+        NumericStats flushesCompleted;
+        NumericStats flushRecordsSeen;
+        NumericStats putLatencyP50Us;
+        NumericStats putLatencyP90Us;
+        NumericStats putLatencyP99Us;
+        NumericStats putLatencyP999Us;
+        NumericStats getLatencyP50Us;
+        NumericStats getLatencyP90Us;
+        NumericStats getLatencyP99Us;
+        NumericStats getLatencyP999Us;
+        NumericStats scanLatencyP50Us;
+        NumericStats scanLatencyP90Us;
+        NumericStats scanLatencyP99Us;
+        NumericStats scanLatencyP999Us;
+    };
+
+    struct CaseReport {
+        CaseSpec spec{};
+        ThroughputResult averaged{};
+        ResultStats stats{};
+    };
+
     struct BenchConfig {
-        int opsPerCase = 500000;
+        int opsPerCase = 2500000;
+        int repeats = 50;
         int writerThreads = 16;
-        uint32_t requestedShards = 0;
+        uint32_t requestedShards = 64;
         uint32_t autoShardCountCap = 128;
         uint64_t thresholdBytesPerShard = kAutoFlushDisabledThreshold;
         bool flushAfterScan = false;
+        bool includeFlushInPutTiming = kDefaultIncludeFlushInPutTiming;
         bool usePrehash = false;
-        BackendKind backend = BackendKind::ART;
+        BackendKind backend = BackendKind::BPTree;
+        std::string outputPath;
     };
 
     [[nodiscard]] static uint32_t nextPow2Clamped(uint64_t n, uint32_t minValue, uint32_t maxValue) {
@@ -227,6 +277,348 @@ namespace {
         return std::format("{} B", bytes);
     }
 
+    static void accumulateLatency(LatencyPercentiles& dst, const LatencyPercentiles& src) {
+        dst.p50Us += src.p50Us;
+        dst.p90Us += src.p90Us;
+        dst.p99Us += src.p99Us;
+        dst.p999Us += src.p999Us;
+        dst.sampleCount += src.sampleCount;
+    }
+
+    static void divideLatency(LatencyPercentiles& value, double divisor) {
+        value.p50Us /= divisor;
+        value.p90Us /= divisor;
+        value.p99Us /= divisor;
+        value.p999Us /= divisor;
+        value.sampleCount = static_cast<uint32_t>(std::llround(static_cast<double>(value.sampleCount) / divisor));
+    }
+
+    [[nodiscard]] static ThroughputResult averageResults(const std::vector<ThroughputResult>& runs) {
+        ThroughputResult out{};
+        if (runs.empty()) {
+            return out;
+        }
+
+        for (const auto& run : runs) {
+            out.putOpsPerSec += run.putOpsPerSec;
+            out.putFlushOpsPerSec += run.putFlushOpsPerSec;
+            out.getOpsPerSec += run.getOpsPerSec;
+            out.scanOpsPerSec += run.scanOpsPerSec;
+            out.putMs += run.putMs;
+            out.putFlushMs += run.putFlushMs;
+            out.getMs += run.getMs;
+            out.scanMs += run.scanMs;
+            out.flushMs += run.flushMs;
+            out.approxBytes += run.approxBytes;
+            out.flushesCompleted += run.flushesCompleted;
+            out.flushRecordsSeen += run.flushRecordsSeen;
+            accumulateLatency(out.putLatency, run.putLatency);
+            accumulateLatency(out.getLatency, run.getLatency);
+            accumulateLatency(out.scanLatency, run.scanLatency);
+        }
+
+        const double divisor = static_cast<double>(runs.size());
+        out.putOpsPerSec /= divisor;
+        out.putFlushOpsPerSec /= divisor;
+        out.getOpsPerSec /= divisor;
+        out.scanOpsPerSec /= divisor;
+        out.putMs /= divisor;
+        out.putFlushMs /= divisor;
+        out.getMs /= divisor;
+        out.scanMs /= divisor;
+        out.flushMs /= divisor;
+        out.approxBytes = static_cast<uint64_t>(std::llround(static_cast<double>(out.approxBytes) / divisor));
+        out.flushesCompleted = static_cast<uint64_t>(std::llround(static_cast<double>(out.flushesCompleted) / divisor));
+        out.flushRecordsSeen = static_cast<uint64_t>(std::llround(static_cast<double>(out.flushRecordsSeen) / divisor));
+        divideLatency(out.putLatency, divisor);
+        divideLatency(out.getLatency, divisor);
+        divideLatency(out.scanLatency, divisor);
+        return out;
+    }
+
+    [[nodiscard]] static NumericStats computeNumericStats(std::vector<double> values) {
+        NumericStats out{};
+        if (values.empty()) {
+            return out;
+        }
+
+        const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+        out.mean = sum / static_cast<double>(values.size());
+
+        std::sort(values.begin(), values.end());
+        const size_t mid = values.size() / 2;
+        if ((values.size() & 1U) == 0U) {
+            out.median = (values[mid - 1] + values[mid]) * 0.5;
+        } else {
+            out.median = values[mid];
+        }
+
+        double variance = 0.0;
+        for (const double value : values) {
+            const double delta = value - out.mean;
+            variance += delta * delta;
+        }
+        variance /= static_cast<double>(values.size());
+        out.stddev = std::sqrt(variance);
+        out.cov = out.mean != 0.0 ? (out.stddev / out.mean) : 0.0;
+        return out;
+    }
+
+    [[nodiscard]] static ResultStats computeResultStats(const std::vector<ThroughputResult>& runs) {
+        ResultStats stats{};
+        if (runs.empty()) {
+            return stats;
+        }
+
+        std::vector<double> putOps;
+        std::vector<double> putFlushOps;
+        std::vector<double> getOps;
+        std::vector<double> scanOps;
+        std::vector<double> putMs;
+        std::vector<double> putFlushMs;
+        std::vector<double> getMs;
+        std::vector<double> scanMs;
+        std::vector<double> flushMs;
+        std::vector<double> approxBytes;
+        std::vector<double> flushesCompleted;
+        std::vector<double> flushRecordsSeen;
+        std::vector<double> putP50;
+        std::vector<double> putP90;
+        std::vector<double> putP99;
+        std::vector<double> putP999;
+        std::vector<double> getP50;
+        std::vector<double> getP90;
+        std::vector<double> getP99;
+        std::vector<double> getP999;
+        std::vector<double> scanP50;
+        std::vector<double> scanP90;
+        std::vector<double> scanP99;
+        std::vector<double> scanP999;
+
+        putOps.reserve(runs.size());
+        putFlushOps.reserve(runs.size());
+        getOps.reserve(runs.size());
+        scanOps.reserve(runs.size());
+        putMs.reserve(runs.size());
+        putFlushMs.reserve(runs.size());
+        getMs.reserve(runs.size());
+        scanMs.reserve(runs.size());
+        flushMs.reserve(runs.size());
+        approxBytes.reserve(runs.size());
+        flushesCompleted.reserve(runs.size());
+        flushRecordsSeen.reserve(runs.size());
+        putP50.reserve(runs.size());
+        putP90.reserve(runs.size());
+        putP99.reserve(runs.size());
+        putP999.reserve(runs.size());
+        getP50.reserve(runs.size());
+        getP90.reserve(runs.size());
+        getP99.reserve(runs.size());
+        getP999.reserve(runs.size());
+        scanP50.reserve(runs.size());
+        scanP90.reserve(runs.size());
+        scanP99.reserve(runs.size());
+        scanP999.reserve(runs.size());
+
+        for (const auto& run : runs) {
+            putOps.push_back(run.putOpsPerSec);
+            putFlushOps.push_back(run.putFlushOpsPerSec);
+            getOps.push_back(run.getOpsPerSec);
+            scanOps.push_back(run.scanOpsPerSec);
+            putMs.push_back(run.putMs);
+            putFlushMs.push_back(run.putFlushMs);
+            getMs.push_back(run.getMs);
+            scanMs.push_back(run.scanMs);
+            flushMs.push_back(run.flushMs);
+            approxBytes.push_back(static_cast<double>(run.approxBytes));
+            flushesCompleted.push_back(static_cast<double>(run.flushesCompleted));
+            flushRecordsSeen.push_back(static_cast<double>(run.flushRecordsSeen));
+            putP50.push_back(run.putLatency.p50Us);
+            putP90.push_back(run.putLatency.p90Us);
+            putP99.push_back(run.putLatency.p99Us);
+            putP999.push_back(run.putLatency.p999Us);
+            getP50.push_back(run.getLatency.p50Us);
+            getP90.push_back(run.getLatency.p90Us);
+            getP99.push_back(run.getLatency.p99Us);
+            getP999.push_back(run.getLatency.p999Us);
+            scanP50.push_back(run.scanLatency.p50Us);
+            scanP90.push_back(run.scanLatency.p90Us);
+            scanP99.push_back(run.scanLatency.p99Us);
+            scanP999.push_back(run.scanLatency.p999Us);
+        }
+
+        stats.putOpsPerSec = computeNumericStats(std::move(putOps));
+        stats.putFlushOpsPerSec = computeNumericStats(std::move(putFlushOps));
+        stats.getOpsPerSec = computeNumericStats(std::move(getOps));
+        stats.scanOpsPerSec = computeNumericStats(std::move(scanOps));
+        stats.putMs = computeNumericStats(std::move(putMs));
+        stats.putFlushMs = computeNumericStats(std::move(putFlushMs));
+        stats.getMs = computeNumericStats(std::move(getMs));
+        stats.scanMs = computeNumericStats(std::move(scanMs));
+        stats.flushMs = computeNumericStats(std::move(flushMs));
+        stats.approxBytes = computeNumericStats(std::move(approxBytes));
+        stats.flushesCompleted = computeNumericStats(std::move(flushesCompleted));
+        stats.flushRecordsSeen = computeNumericStats(std::move(flushRecordsSeen));
+        stats.putLatencyP50Us = computeNumericStats(std::move(putP50));
+        stats.putLatencyP90Us = computeNumericStats(std::move(putP90));
+        stats.putLatencyP99Us = computeNumericStats(std::move(putP99));
+        stats.putLatencyP999Us = computeNumericStats(std::move(putP999));
+        stats.getLatencyP50Us = computeNumericStats(std::move(getP50));
+        stats.getLatencyP90Us = computeNumericStats(std::move(getP90));
+        stats.getLatencyP99Us = computeNumericStats(std::move(getP99));
+        stats.getLatencyP999Us = computeNumericStats(std::move(getP999));
+        stats.scanLatencyP50Us = computeNumericStats(std::move(scanP50));
+        stats.scanLatencyP90Us = computeNumericStats(std::move(scanP90));
+        stats.scanLatencyP99Us = computeNumericStats(std::move(scanP99));
+        stats.scanLatencyP999Us = computeNumericStats(std::move(scanP999));
+        return stats;
+    }
+
+    static void writeCsvField(std::ofstream& out, const std::string& value) {
+        bool needsQuotes = false;
+        for (const char ch : value) {
+            if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
+                needsQuotes = true;
+                break;
+            }
+        }
+        if (!needsQuotes) {
+            out << value;
+            return;
+        }
+        out << '"';
+        for (const char ch : value) {
+            if (ch == '"') {
+                out << "\"\"";
+            } else {
+                out << ch;
+            }
+        }
+        out << '"';
+    }
+
+    static void writeStatColumns(std::ofstream& out, const NumericStats& stats) {
+        out << ',' << stats.mean
+            << ',' << stats.median
+            << ',' << stats.stddev
+            << ',' << stats.cov;
+    }
+
+    static void writeReportsCsv(
+        const std::string& path,
+        const BenchConfig& config,
+        const char* backendName,
+        int effectiveWriters,
+        uint32_t shardCount,
+        const std::vector<CaseReport>& reports
+    ) {
+        if (path.empty()) {
+            return;
+        }
+
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("Failed to open benchmark output file: " + path);
+        }
+
+        out << "backend,ops_per_case,repeats,key_size,value_size,shards,writers,flush_after_scan,prehash,"
+               "include_flush_in_put_timing,put_ops_s,put_ms,put_flush_ops_s,put_flush_ms,get_ops_s,get_ms,scan_ops_s,scan_ms,flush_ms,mem_bytes,flushes_completed,flush_records_seen,"
+               "put_smp,get_smp,scan_smp,"
+               "put_p50_us,put_p90_us,put_p99_us,put_p999_us,"
+               "get_p50_us,get_p90_us,get_p99_us,get_p999_us,"
+               "scan_p50_us,scan_p90_us,scan_p99_us,scan_p999_us,"
+               "put_ops_s_mean,put_ops_s_median,put_ops_s_stddev,put_ops_s_cov,"
+               "put_flush_ops_s_mean,put_flush_ops_s_median,put_flush_ops_s_stddev,put_flush_ops_s_cov,"
+               "get_ops_s_mean,get_ops_s_median,get_ops_s_stddev,get_ops_s_cov,"
+               "scan_ops_s_mean,scan_ops_s_median,scan_ops_s_stddev,scan_ops_s_cov,"
+               "put_ms_mean,put_ms_median,put_ms_stddev,put_ms_cov,"
+               "put_flush_ms_mean,put_flush_ms_median,put_flush_ms_stddev,put_flush_ms_cov,"
+               "get_ms_mean,get_ms_median,get_ms_stddev,get_ms_cov,"
+               "scan_ms_mean,scan_ms_median,scan_ms_stddev,scan_ms_cov,"
+               "flush_ms_mean,flush_ms_median,flush_ms_stddev,flush_ms_cov,"
+               "mem_bytes_mean,mem_bytes_median,mem_bytes_stddev,mem_bytes_cov,"
+               "flushes_completed_mean,flushes_completed_median,flushes_completed_stddev,flushes_completed_cov,"
+               "flush_records_seen_mean,flush_records_seen_median,flush_records_seen_stddev,flush_records_seen_cov,"
+               "put_p50_us_mean,put_p50_us_median,put_p50_us_stddev,put_p50_us_cov,"
+               "put_p90_us_mean,put_p90_us_median,put_p90_us_stddev,put_p90_us_cov,"
+               "put_p99_us_mean,put_p99_us_median,put_p99_us_stddev,put_p99_us_cov,"
+               "put_p999_us_mean,put_p999_us_median,put_p999_us_stddev,put_p999_us_cov,"
+               "get_p50_us_mean,get_p50_us_median,get_p50_us_stddev,get_p50_us_cov,"
+               "get_p90_us_mean,get_p90_us_median,get_p90_us_stddev,get_p90_us_cov,"
+               "get_p99_us_mean,get_p99_us_median,get_p99_us_stddev,get_p99_us_cov,"
+               "get_p999_us_mean,get_p999_us_median,get_p999_us_stddev,get_p999_us_cov,"
+               "scan_p50_us_mean,scan_p50_us_median,scan_p50_us_stddev,scan_p50_us_cov,"
+               "scan_p90_us_mean,scan_p90_us_median,scan_p90_us_stddev,scan_p90_us_cov,"
+               "scan_p99_us_mean,scan_p99_us_median,scan_p99_us_stddev,scan_p99_us_cov,"
+               "scan_p999_us_mean,scan_p999_us_median,scan_p999_us_stddev,scan_p999_us_cov\n";
+
+        for (const auto& report : reports) {
+            writeCsvField(out, backendName);
+            out << ',' << config.opsPerCase
+                << ',' << config.repeats
+                << ',' << report.spec.keySize
+                << ',' << report.spec.valueSize
+                << ',' << shardCount
+                << ',' << effectiveWriters
+                << ',' << (config.flushAfterScan ? 1 : 0)
+                << ',' << (config.usePrehash ? 1 : 0)
+                << ',' << (config.includeFlushInPutTiming ? 1 : 0)
+                << ',' << report.averaged.putOpsPerSec
+                << ',' << report.averaged.putMs
+                << ',' << report.averaged.putFlushOpsPerSec
+                << ',' << report.averaged.putFlushMs
+                << ',' << report.averaged.getOpsPerSec
+                << ',' << report.averaged.getMs
+                << ',' << report.averaged.scanOpsPerSec
+                << ',' << report.averaged.scanMs
+                << ',' << report.averaged.flushMs
+                << ',' << report.averaged.approxBytes
+                << ',' << report.averaged.flushesCompleted
+                << ',' << report.averaged.flushRecordsSeen
+                << ',' << report.averaged.putLatency.sampleCount
+                << ',' << report.averaged.getLatency.sampleCount
+                << ',' << report.averaged.scanLatency.sampleCount
+                << ',' << report.averaged.putLatency.p50Us
+                << ',' << report.averaged.putLatency.p90Us
+                << ',' << report.averaged.putLatency.p99Us
+                << ',' << report.averaged.putLatency.p999Us
+                << ',' << report.averaged.getLatency.p50Us
+                << ',' << report.averaged.getLatency.p90Us
+                << ',' << report.averaged.getLatency.p99Us
+                << ',' << report.averaged.getLatency.p999Us
+                << ',' << report.averaged.scanLatency.p50Us
+                << ',' << report.averaged.scanLatency.p90Us
+                << ',' << report.averaged.scanLatency.p99Us
+                << ',' << report.averaged.scanLatency.p999Us;
+
+            writeStatColumns(out, report.stats.putOpsPerSec);
+            writeStatColumns(out, report.stats.putFlushOpsPerSec);
+            writeStatColumns(out, report.stats.getOpsPerSec);
+            writeStatColumns(out, report.stats.scanOpsPerSec);
+            writeStatColumns(out, report.stats.putMs);
+            writeStatColumns(out, report.stats.putFlushMs);
+            writeStatColumns(out, report.stats.getMs);
+            writeStatColumns(out, report.stats.scanMs);
+            writeStatColumns(out, report.stats.flushMs);
+            writeStatColumns(out, report.stats.approxBytes);
+            writeStatColumns(out, report.stats.flushesCompleted);
+            writeStatColumns(out, report.stats.flushRecordsSeen);
+            writeStatColumns(out, report.stats.putLatencyP50Us);
+            writeStatColumns(out, report.stats.putLatencyP90Us);
+            writeStatColumns(out, report.stats.putLatencyP99Us);
+            writeStatColumns(out, report.stats.putLatencyP999Us);
+            writeStatColumns(out, report.stats.getLatencyP50Us);
+            writeStatColumns(out, report.stats.getLatencyP90Us);
+            writeStatColumns(out, report.stats.getLatencyP99Us);
+            writeStatColumns(out, report.stats.getLatencyP999Us);
+            writeStatColumns(out, report.stats.scanLatencyP50Us);
+            writeStatColumns(out, report.stats.scanLatencyP90Us);
+            writeStatColumns(out, report.stats.scanLatencyP99Us);
+            writeStatColumns(out, report.stats.scanLatencyP999Us);
+            out << '\n';
+        }
+    }
+
     [[nodiscard]] static double payloadMibPerSec(size_t bytesPerOp, int ops, double ms) {
         if (ms <= 0.0) {
             return 0.0;
@@ -264,17 +656,57 @@ namespace {
         return out;
     }
 
-    static std::string makeFixedBytes(int size, uint64_t seed) {
-        std::string out;
+    static void fillFixedBytes(std::string& out, int size, uint64_t seed) {
         out.resize(static_cast<size_t>(size));
         uint64_t x = seed ^ 0x9e3779b97f4a7c15ULL;
         for (int i = 0; i < size; ++i) {
             x ^= (x << 13);
             x ^= (x >> 7);
             x ^= (x << 17);
-            out[static_cast<size_t>(i)] = static_cast<char>('a' + (x % 26));
+            out[static_cast<size_t>(i)] = static_cast<char>(x & 0xFFU);
         }
+
+        // Make benchmark keys injective for sizes >= 8 by embedding the seed in the suffix.
+        const int uniqueBytes = std::min(size, 8);
+        for (int i = 0; i < uniqueBytes; ++i) {
+            out[static_cast<size_t>(size - uniqueBytes + i)] = static_cast<char>((seed >> (i * 8)) & 0xFFU);
+        }
+    }
+
+    [[nodiscard]] static std::string makeFixedBytes(int size, uint64_t seed) {
+        std::string out;
+        fillFixedBytes(out, size, seed);
         return out;
+    }
+
+    static void generateKeyChunk(
+        int keySize,
+        size_t beginIndex,
+        size_t count,
+        bool usePrehash,
+        std::vector<std::string>& keys,
+        std::vector<uint64_t>& keyFp64,
+        std::vector<uint64_t>& keyMk
+    ) {
+        keys.clear();
+        keys.reserve(count);
+        if (usePrehash) {
+            keyFp64.clear();
+            keyMk.clear();
+            keyFp64.reserve(count);
+            keyMk.reserve(count);
+        }
+
+        std::string key;
+        for (size_t i = 0; i < count; ++i) {
+            fillFixedBytes(key, keySize, static_cast<uint64_t>(beginIndex + i) + 1);
+            keys.emplace_back(key);
+            if (usePrehash) {
+                const auto keyBytes = asU8(keys.back());
+                keyFp64.push_back(computeKeyFp64(keyBytes));
+                keyMk.push_back(buildMiniKey(keyBytes));
+            }
+        }
     }
 
     static memtable::MemTable::Options makeOptions(
@@ -534,43 +966,24 @@ namespace {
     ) {
         const int warmupOps = std::min(opsPerCase, 100000);
 
-        std::vector<std::string> keys;
-        keys.reserve(static_cast<size_t>(opsPerCase));
-        for (int i = 0; i < opsPerCase; ++i) {
-            std::string key = makeFixedBytes(spec.keySize, static_cast<uint64_t>(i) + 1);
-            if (spec.keySize >= 10) {
-                const auto tail = std::format("{:010d}", i);
-                std::memcpy(key.data() + (spec.keySize - 10), tail.data(), 10);
-            }
-            keys.emplace_back(std::move(key));
-        }
-
         const std::string value = makeFixedBytes(spec.valueSize, 0xA11CEULL);
-
+        std::vector<std::string> keys;
         std::vector<uint64_t> keyFp64;
         std::vector<uint64_t> keyMk;
-        const std::vector<uint64_t>* fpPtr = nullptr;
-        const std::vector<uint64_t>* mkPtr = nullptr;
-
-        if (config.usePrehash) {
-            keyFp64.resize(static_cast<size_t>(opsPerCase));
-            keyMk.resize(static_cast<size_t>(opsPerCase));
-            for (int i = 0; i < opsPerCase; ++i) {
-                const auto& key = keys[static_cast<size_t>(i)];
-                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(key.data());
-                const size_t len = key.size();
-                keyFp64[static_cast<size_t>(i)] = computeKeyFp64(ptr, len);
-                keyMk[static_cast<size_t>(i)] = buildMiniKey(ptr, len);
-            }
-            fpPtr = &keyFp64;
-            mkPtr = &keyMk;
-        }
 
         {
             std::atomic<uint64_t> warmupFlushRecordsSeen{0};
             auto warmup = memtable::MemTable::create(makeOptions(config, writerThreads, &warmupFlushRecordsSeen));
-            const std::vector<std::string> warmupKeys(keys.begin(), keys.begin() + warmupOps);
-            runPutParallel(*warmup, warmupKeys, value, fpPtr, mkPtr, writerThreads, nullptr);
+            generateKeyChunk(spec.keySize, 0, static_cast<size_t>(warmupOps), config.usePrehash, keys, keyFp64, keyMk);
+            runPutParallel(
+                *warmup,
+                keys,
+                value,
+                config.usePrehash ? &keyFp64 : nullptr,
+                config.usePrehash ? &keyMk : nullptr,
+                writerThreads,
+                nullptr
+            );
 
             const uint64_t snapshot = warmup->lastSeq();
             RecordView out;
@@ -588,16 +1001,47 @@ namespace {
         std::vector<uint32_t> getLatencyNs;
         std::vector<uint32_t> scanLatencyNs;
 
-        const auto putT0 = Clock::now();
-        runPutParallel(*memtable, keys, value, fpPtr, mkPtr, writerThreads, &putLatencyNs);
-        const auto putMs = std::chrono::duration<double, std::milli>(Clock::now() - putT0).count();
+        double putMs = 0.0;
+        bool firstPutChunk = true;
+        for (size_t begin = 0; begin < static_cast<size_t>(opsPerCase); begin += kKeyChunkSize) {
+            const size_t count = std::min(kKeyChunkSize, static_cast<size_t>(opsPerCase) - begin);
+            generateKeyChunk(spec.keySize, begin, count, config.usePrehash, keys, keyFp64, keyMk);
+            std::vector<uint32_t>* latencyOut = firstPutChunk ? &putLatencyNs : nullptr;
+            const auto putT0 = Clock::now();
+            runPutParallel(
+                *memtable,
+                keys,
+                value,
+                config.usePrehash ? &keyFp64 : nullptr,
+                config.usePrehash ? &keyMk : nullptr,
+                writerThreads,
+                latencyOut
+            );
+            putMs += std::chrono::duration<double, std::milli>(Clock::now() - putT0).count();
+            firstPutChunk = false;
+        }
 
         const uint64_t snapshot = memtable->lastSeq();
-        const auto getT0 = Clock::now();
-        runGetParallel(*memtable, keys, fpPtr, snapshot, writerThreads, &getLatencyNs);
-        const auto getMs = std::chrono::duration<double, std::milli>(Clock::now() - getT0).count();
+        double getMs = 0.0;
+        bool firstGetChunk = true;
+        for (size_t begin = 0; begin < static_cast<size_t>(opsPerCase); begin += kKeyChunkSize) {
+            const size_t count = std::min(kKeyChunkSize, static_cast<size_t>(opsPerCase) - begin);
+            generateKeyChunk(spec.keySize, begin, count, config.usePrehash, keys, keyFp64, keyMk);
+            std::vector<uint32_t>* latencyOut = firstGetChunk ? &getLatencyNs : nullptr;
+            const auto getT0 = Clock::now();
+            runGetParallel(
+                *memtable,
+                keys,
+                config.usePrehash ? &keyFp64 : nullptr,
+                snapshot,
+                writerThreads,
+                latencyOut
+            );
+            getMs += std::chrono::duration<double, std::milli>(Clock::now() - getT0).count();
+            firstGetChunk = false;
+        }
         const auto scanT0 = Clock::now();
-        const double scanOpsPerSec = runScanSingle(*memtable, snapshot, keys.size(), &scanLatencyNs);
+        const double scanOpsPerSec = runScanSingle(*memtable, snapshot, static_cast<size_t>(opsPerCase), &scanLatencyNs);
         const auto scanMs = std::chrono::duration<double, std::milli>(Clock::now() - scanT0).count();
 
         double flushMs = 0.0;
@@ -606,6 +1050,7 @@ namespace {
             memtable->forceFlush();
             flushMs = std::chrono::duration<double, std::milli>(Clock::now() - flushT0).count();
         }
+        const double putFlushMs = config.includeFlushInPutTiming ? (putMs + flushMs) : putMs;
         const auto snapshotAfter = memtable->snapshot();
 
         return {
@@ -613,6 +1058,8 @@ namespace {
             .getOpsPerSec = static_cast<double>(opsPerCase) * 1000.0 / getMs,
             .scanOpsPerSec = scanOpsPerSec,
             .putMs = putMs,
+            .putFlushOpsPerSec = putFlushMs > 0.0 ? (static_cast<double>(opsPerCase) * 1000.0 / putFlushMs) : 0.0,
+            .putFlushMs = putFlushMs,
             .getMs = getMs,
             .scanMs = scanMs,
             .flushMs = flushMs,
@@ -630,6 +1077,7 @@ int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     BenchConfig config;
+    std::filesystem::path exePath = (argc > 0 && argv[0] != nullptr) ? std::filesystem::path{argv[0]} : std::filesystem::path{};
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -639,6 +1087,14 @@ int main(int argc, char** argv) {
         }
         if (arg == "--flush-after-scan" || arg == "--flush-callback") {
             config.flushAfterScan = true;
+            continue;
+        }
+        if (arg == "--include-flush" || arg == "--include-flush-in-put") {
+            config.includeFlushInPutTiming = true;
+            continue;
+        }
+        if (arg == "--exclude-flush" || arg == "--exclude-flush-in-put") {
+            config.includeFlushInPutTiming = false;
             continue;
         }
         if (arg.rfind("--backend=", 0) == 0) {
@@ -670,6 +1126,14 @@ int main(int argc, char** argv) {
             config.autoShardCountCap = static_cast<uint32_t>(std::max(0, std::atoi(arg.substr(11).c_str())));
             continue;
         }
+        if (arg.rfind("--repeats=", 0) == 0) {
+            config.repeats = std::max(1, std::atoi(arg.substr(10).c_str()));
+            continue;
+        }
+        if (arg.rfind("--output=", 0) == 0) {
+            config.outputPath = arg.substr(9);
+            continue;
+        }
         if (arg.rfind("--threshold-bytes=", 0) == 0) {
             uint64_t parsed = 0;
             if (!parseU64WithSuffix(arg.substr(18), &parsed)) {
@@ -680,6 +1144,11 @@ int main(int argc, char** argv) {
             continue;
         }
         config.opsPerCase = std::max(1000, std::atoi(arg.c_str()));
+    }
+
+    if (config.outputPath.empty()) {
+        const std::filesystem::path baseDir = exePath.has_parent_path() ? exePath.parent_path() : std::filesystem::current_path();
+        config.outputPath = (baseDir / "memtable_throughput_results.csv").string();
     }
 
     const std::array<CaseSpec, 6> cases{{
@@ -707,6 +1176,7 @@ int main(int argc, char** argv) {
 
     std::printf("Sharded MemTable throughput benchmark\n");
     std::printf("opsPerCase = %d\n", config.opsPerCase);
+    std::printf("repeats    = %d\n", config.repeats);
     const char* backendName = "skiplist";
     if (config.backend == BackendKind::BPTree) {
         backendName = "bptree";
@@ -737,16 +1207,30 @@ int main(int argc, char** argv) {
         );
     }
     std::printf("flushAfterScan = %s\n\n", config.flushAfterScan ? "ON" : "OFF");
+    std::printf("includeFlushInPutTiming = %s\n\n", config.includeFlushInPutTiming ? "ON" : "OFF");
     std::printf("warmupOps   = %d\n\n", std::min(config.opsPerCase, 50000));
     std::printf("prehashMode = %s\n\n", config.usePrehash ? "ON (fp64/mk precomputed)" : "OFF (hash inside put)");
+    std::printf("outputPath  = %s\n\n", config.outputPath.c_str());
     std::printf("%-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
                 "key", "value", "shards", "writers", "put(ops/s)", "get(ops/s)", "scan(ops/s)", "memBytes", "putSmp", "getSmp", "scanSmp");
     std::printf("%-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
                 "", "", "", "", "", "", "", "", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)");
     std::printf("------------------------------------------------------------------------------------------------\n");
 
+    std::vector<CaseReport> reports;
+    reports.reserve(cases.size());
     for (const auto& spec : cases) {
-        const ThroughputResult result = runCase(spec, config.opsPerCase, effectiveWriters, config);
+        std::vector<ThroughputResult> runs;
+        runs.reserve(static_cast<size_t>(config.repeats));
+        for (int repeat = 0; repeat < config.repeats; ++repeat) {
+            runs.push_back(runCase(spec, config.opsPerCase, effectiveWriters, config));
+        }
+        const ThroughputResult result = averageResults(runs);
+        reports.push_back(CaseReport{
+            .spec = spec,
+            .averaged = result,
+            .stats = computeResultStats(runs)
+        });
         std::printf("%-10d %-12d %-8u %-8d %-14.0f %-14.0f %-14.0f %-14llu %-8u %-8u %-8u\n",
                     spec.keySize,
                     spec.valueSize,
@@ -773,12 +1257,14 @@ int main(int argc, char** argv) {
                     result.scanLatency.p90Us,
                     result.scanLatency.p99Us,
                     result.scanLatency.p999Us);
-        std::printf("  timings(ms): put=%8.2f get=%8.2f scan=%8.2f flush=%8.2f   payload(MiB/s): put=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flushRecords=%llu\n",
+        std::printf("  timings(ms): put=%8.2f put+flush=%8.2f get=%8.2f scan=%8.2f flush=%8.2f   payload(MiB/s): put=%8.2f put+flush=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flushRecords=%llu\n",
                     result.putMs,
+                    result.putFlushMs,
                     result.getMs,
                     result.scanMs,
                     result.flushMs,
                     payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.putMs),
+                    payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.putFlushMs),
                     payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.getMs),
                     payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.scanMs),
                     static_cast<unsigned long long>(result.flushesCompleted),
@@ -786,6 +1272,8 @@ int main(int argc, char** argv) {
         std::printf("------------------------------------------------------------------------------------------------\n");
         std::fflush(stdout);
     }
+
+    writeReportsCsv(config.outputPath, config, backendName, effectiveWriters, shardCount, reports);
 
     return 0;
 }

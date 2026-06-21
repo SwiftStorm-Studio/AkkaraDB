@@ -56,8 +56,8 @@ namespace akkaradb::engine {
 
         [[nodiscard]] uint32_t shardsForThreads(uint32_t writers, uint32_t cap) noexcept {
             if (writers <= 1) { return 1; }
-            const uint32_t raw = (writers * (writers - 1u) * 9u + 3u) / 4u;
-            return std::min(nextPow2(std::max(raw, 2u)), cap);
+            const uint32_t target = std::max(writers * 4u, 2u);
+            return std::min(nextPow2(target), cap);
         }
 
         void ensureDir(const fs::path& path) { if (!path.empty()) { fs::create_directories(path); } }
@@ -215,12 +215,16 @@ namespace akkaradb::engine {
                 uint8_t flags,
                 uint64_t sourceNodeId,
                 uint64_t precomputedFp64 = 0,
-                uint64_t precomputedMiniKey = 0
+                uint64_t precomputedMiniKey = 0,
+                uint8_t versionLogFlags = 0xFF
             ) {
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
                 const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
                 if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64); }
-                if (versionLog) { versionLog->append(key, seq, sourceNodeId, nowNs(), flags, storedValue); }
+                if (versionLog) {
+                    const uint8_t vlogFlags = versionLogFlags == 0xFF ? flags : versionLogFlags;
+                    versionLog->append(key, seq, sourceNodeId, nowNs(), vlogFlags, storedValue);
+                }
 
                 if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
@@ -237,7 +241,10 @@ namespace akkaradb::engine {
                 std::lock_guard lock(writeMu);
                 uint8_t flags = recordFlags;
                 if (op == cluster::ReplOpType::REMOVE) { flags |= MemHdr16::FLAG_TOMBSTONE; }
-                appendAll(seq, key, value, flags, sourceNodeId);
+                const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE
+                                              ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK)
+                                              : flags;
+                appendAll(seq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
                 memtable->advanceSeq(seq);
             }
     };
@@ -684,12 +691,37 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
         for (const auto& [key, prev] : impl_->versionLog->collectRollbackTargets(targetSeq)) {
-            if (!prev || (prev->flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) { remove(key); }
-            else {
-                auto value = impl_->resolveValue(prev->flags, prev->value);
-                if (value) { put(key, *value); }
-                else { remove(key); }
+            uint64_t seq = 0;
+            uint8_t recordFlags = MemHdr16::FLAG_TOMBSTONE;
+            std::vector<uint8_t> stored;
+            cluster::ReplOpType shipOp = cluster::ReplOpType::REMOVE;
+
+            {
+                std::lock_guard lock(impl_->writeMu);
+                seq = impl_->memtable->reserveSeq(1);
+
+                if (prev && (prev->flags & core::MemHdr16::FLAG_TOMBSTONE) == 0) {
+                    auto value = impl_->resolveValue(prev->flags, prev->value);
+                    if (value) {
+                        recordFlags = MemHdr16::FLAG_NORMAL;
+                        stored = impl_->maybeExternalize(seq, *value, recordFlags);
+                        shipOp = cluster::ReplOpType::PUT;
+                        impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
+                        if ((recordFlags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                    }
+                    else {
+                        impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                else {
+                    impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                const uint8_t vlogFlags = static_cast<uint8_t>(recordFlags | vlog::VLOG_FLAG_ROLLBACK);
+                impl_->appendAll(seq, key, stored, recordFlags, vlog::ROLLBACK_NODE, 0, 0, vlogFlags);
             }
+
+            if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, shipOp, key, stored, recordFlags, vlog::ROLLBACK_NODE); }
         }
     }
 
@@ -697,12 +729,37 @@ namespace akkaradb::engine {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
         const auto prev = impl_->versionLog->getAt(key, targetSeq);
-        if (!prev || (prev->flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) { remove(key); }
-        else {
-            auto value = impl_->resolveValue(prev->flags, prev->value);
-            if (value) { put(key, *value); }
-            else { remove(key); }
+        uint64_t seq = 0;
+        uint8_t recordFlags = MemHdr16::FLAG_TOMBSTONE;
+        std::vector<uint8_t> stored;
+        cluster::ReplOpType shipOp = cluster::ReplOpType::REMOVE;
+
+        {
+            std::lock_guard lock(impl_->writeMu);
+            seq = impl_->memtable->reserveSeq(1);
+
+            if (prev && (prev->flags & core::MemHdr16::FLAG_TOMBSTONE) == 0) {
+                auto value = impl_->resolveValue(prev->flags, prev->value);
+                if (value) {
+                    recordFlags = MemHdr16::FLAG_NORMAL;
+                    stored = impl_->maybeExternalize(seq, *value, recordFlags);
+                    shipOp = cluster::ReplOpType::PUT;
+                    impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    if ((recordFlags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                }
+                else {
+                    impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            else {
+                impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            const uint8_t vlogFlags = static_cast<uint8_t>(recordFlags | vlog::VLOG_FLAG_ROLLBACK);
+            impl_->appendAll(seq, key, stored, recordFlags, vlog::ROLLBACK_NODE, 0, 0, vlogFlags);
         }
+
+        if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, shipOp, key, stored, recordFlags, vlog::ROLLBACK_NODE); }
     }
 
     EngineStats AkkEngine::stats() const noexcept {
@@ -778,7 +835,11 @@ namespace akkaradb::engine {
         return out;
     }
 
-    void AkkEngine::forceSync() { if (impl_ && impl_->walWriter) { impl_->walWriter->forceSync(); } }
+    void AkkEngine::forceSync() {
+        if (!impl_) { return; }
+        if (impl_->walWriter) { impl_->walWriter->forceSync(); }
+        if (impl_->versionLog) { impl_->versionLog->forceSync(); }
+    }
 
     void AkkEngine::forceFlush() { if (impl_ && impl_->memtable) { impl_->memtable->forceFlush(); } }
 

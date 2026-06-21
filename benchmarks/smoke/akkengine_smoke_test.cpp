@@ -20,6 +20,7 @@
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/vlog/VersionLog.hpp"
 
 #include <filesystem>
 #include <span>
@@ -171,6 +172,10 @@ namespace {
         AKK_TEST_CHECK(text(*engine->getAt(bytes("v"), hist[0].seq)) == "one");
         engine->rollbackKey(bytes("v"), hist[0].seq);
         AKK_TEST_CHECK(text(*engine->get(bytes("v"))) == "one");
+        const auto afterRollback = engine->history(bytes("v"));
+        AKK_TEST_CHECK(afterRollback.size() == 3);
+        AKK_TEST_CHECK(afterRollback.back().sourceNodeId == akkaradb::engine::vlog::ROLLBACK_NODE);
+        AKK_TEST_CHECK((afterRollback.back().flags & akkaradb::engine::vlog::VLOG_FLAG_ROLLBACK) != 0);
     }
 }
 

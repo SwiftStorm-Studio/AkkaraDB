@@ -303,6 +303,30 @@ namespace akkaradb::engine::manifest {
                 append(ManifestRecordType::TRUNCATE, encodeTruncate(nowUs(), reason));
             }
 
+            void nodeJoin(uint64_t nodeId, uint16_t replPort, const std::string& host) {
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::NODE_JOIN, encodeNodeJoin(ts, nodeId, replPort, host));
+
+                std::lock_guard lock{mutex_};
+                nodeJoins_.push_back(NodeJoinEvent{nodeId, replPort, host, ts});
+            }
+
+            void nodeLeave(uint64_t nodeId) {
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::NODE_LEAVE, encodeNodeLeave(ts, nodeId));
+
+                std::lock_guard lock{mutex_};
+                nodeLeaves_.push_back(NodeLeaveEvent{nodeId, ts});
+            }
+
+            void primaryLease(uint64_t nodeId, uint64_t leaseUntilUs) {
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::PRIMARY_LEASE, encodePrimaryLease(ts, nodeId, leaseUntilUs));
+
+                std::lock_guard lock{mutex_};
+                lastPrimaryLease_ = PrimaryLeaseEvent{nodeId, leaseUntilUs, ts};
+            }
+
             // ----------------------------------------------------------------
             // Replay
             // ----------------------------------------------------------------
@@ -333,6 +357,21 @@ namespace akkaradb::engine::manifest {
             std::vector<SSTSealEvent> sstSeals() const {
                 std::lock_guard lock{mutex_};
                 return sstSeals_;
+            }
+
+            std::vector<NodeJoinEvent> nodeJoins() const {
+                std::lock_guard lock{mutex_};
+                return nodeJoins_;
+            }
+
+            std::vector<NodeLeaveEvent> nodeLeaves() const {
+                std::lock_guard lock{mutex_};
+                return nodeLeaves_;
+            }
+
+            std::optional<PrimaryLeaseEvent> lastPrimaryLease() const noexcept {
+                std::lock_guard lock{mutex_};
+                return lastPrimaryLease_;
             }
 
         private:
@@ -469,6 +508,9 @@ namespace akkaradb::engine::manifest {
                     liveSst_.clear();
                     deletedSst_.clear();
                     lastCheckpoint_.reset();
+                    nodeJoins_.clear();
+                    nodeLeaves_.clear();
+                    lastPrimaryLease_.reset();
                 }
                 stripesWritten_.store(0, std::memory_order_relaxed);
 
@@ -638,6 +680,9 @@ namespace akkaradb::engine::manifest {
             std::unordered_set<std::string> liveSst_;
             std::unordered_set<std::string> deletedSst_;
             std::optional<CheckpointEvent> lastCheckpoint_;
+            std::vector<NodeJoinEvent> nodeJoins_;
+            std::vector<NodeLeaveEvent> nodeLeaves_;
+            std::optional<PrimaryLeaseEvent> lastPrimaryLease_;
 
             // Fast-mode flusher
             std::thread flusherThread_;
@@ -703,6 +748,12 @@ namespace akkaradb::engine::manifest {
 
     void Manifest::truncate(const std::optional<std::string>& reason) { impl_->truncate(reason); }
 
+    void Manifest::nodeJoin(uint64_t nodeId, uint16_t replPort, const std::string& host) { impl_->nodeJoin(nodeId, replPort, host); }
+
+    void Manifest::nodeLeave(uint64_t nodeId) { impl_->nodeLeave(nodeId); }
+
+    void Manifest::primaryLease(uint64_t nodeId, uint64_t leaseUntilUs) { impl_->primaryLease(nodeId, leaseUntilUs); }
+
     void Manifest::replay() { impl_->replay(); }
 
     uint64_t Manifest::stripesWritten() const noexcept { return impl_->stripesWritten(); }
@@ -712,6 +763,9 @@ namespace akkaradb::engine::manifest {
     std::vector<std::string> Manifest::liveSst() const { return impl_->liveSst(); }
     std::vector<std::string> Manifest::deletedSst() const { return impl_->deletedSst(); }
     std::vector<Manifest::SSTSealEvent> Manifest::sstSeals() const { return impl_->sstSeals(); }
+    std::vector<Manifest::NodeJoinEvent> Manifest::nodeJoins() const { return impl_->nodeJoins(); }
+    std::vector<Manifest::NodeLeaveEvent> Manifest::nodeLeaves() const { return impl_->nodeLeaves(); }
+    std::optional<Manifest::PrimaryLeaseEvent> Manifest::lastPrimaryLease() const noexcept { return impl_->lastPrimaryLease(); }
 
     void Manifest::close() { impl_->close(); }
 } // namespace akkaradb::engine::manifest

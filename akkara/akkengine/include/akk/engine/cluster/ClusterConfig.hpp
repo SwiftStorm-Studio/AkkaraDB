@@ -69,6 +69,15 @@ namespace akkaradb::engine::cluster {
     };
 
     /**
+     * NodeStartupRole - Explicit startup role for non-standalone cluster modes.
+     */
+    enum class NodeStartupRole : uint8_t {
+        AUTO = 0,
+        PRIMARY = 1,
+        REPLICA = 2,
+    };
+
+    /**
      * NodeCapability - Bit flags describing what a node may do.
      */
     enum NodeCapability : uint32_t {
@@ -123,6 +132,10 @@ namespace akkaradb::engine::cluster {
     struct AKDB_API ClusterRuntimeOptions {
         TransportMode transportMode = TransportMode::SECURE;
         std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
+        NodeStartupRole startupRole = NodeStartupRole::AUTO; ///< Explicit startup role used for MIRROR/STRIPE modes.
+        std::string primaryHost; ///< Replica-side configured primary host override.
+        uint16_t primaryReplPort = 0; ///< Replica-side configured primary replication port override.
+        uint64_t primaryNodeId = 0; ///< Replica-side configured primary node id override.
         ClusterSecureOptions secure;
     };
 
