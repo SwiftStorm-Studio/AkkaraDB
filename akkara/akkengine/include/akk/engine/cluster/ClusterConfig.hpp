@@ -57,8 +57,7 @@ namespace akkaradb::engine::cluster {
      * TransportMode - Network transport used by replication links.
      */
     enum class TransportMode : uint8_t {
-        PLAIN = 0,
-        SECURE = 1,
+        PLAIN = 0, SECURE = 1,
     };
 
     /**
@@ -72,9 +71,7 @@ namespace akkaradb::engine::cluster {
      * NodeStartupRole - Explicit startup role for non-standalone cluster modes.
      */
     enum class NodeStartupRole : uint8_t {
-        AUTO = 0,
-        PRIMARY = 1,
-        REPLICA = 2,
+        AUTO = 0, PRIMARY = 1, REPLICA = 2,
     };
 
     /**

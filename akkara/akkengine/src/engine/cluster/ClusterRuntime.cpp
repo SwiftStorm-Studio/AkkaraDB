@@ -92,7 +92,6 @@ namespace akkaradb::engine::cluster {
                 }
             }
         }
-
     } // namespace
 
     class ClusterRuntime::Impl {
@@ -110,9 +109,8 @@ namespace akkaradb::engine::cluster {
                   selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
                   runtimeOptions_{std::move(runtimeOptions)} {
-                if (runtimeOptions_.transportMode == TransportMode::SECURE && runtimeOptions_.secure.identitySeedPath.empty() && !dbDir.empty()) {
-                    runtimeOptions_.secure.identitySeedPath = dbDir / "cluster.identity";
-                }
+                if (runtimeOptions_.transportMode == TransportMode::SECURE && runtimeOptions_.secure.identitySeedPath.empty() && !dbDir.
+                    empty()) { runtimeOptions_.secure.identitySeedPath = dbDir / "cluster.identity"; }
                 validateTransportScope(config_, runtimeOptions_);
                 manager_->setRoleChangeCallback(
                     [this](NodeRole role) {
@@ -263,12 +261,12 @@ namespace akkaradb::engine::cluster {
 extern "C" AKKARADB_CLUSTER_RUNTIME_API bool akkaradb_cluster_register() noexcept {
     return akkaradb::engine::cluster::registerClusterRuntimeFactory(
         [](
-            std::filesystem::path dbDir,
-            akkaradb::engine::cluster::ClusterConfig config,
-            uint64_t selfNodeId,
-            akkaradb::engine::cluster::ClusterEngineCallbacks callbacks,
-            akkaradb::engine::cluster::ClusterRuntimeOptions runtimeOptions
-        ) -> std::unique_ptr<akkaradb::engine::cluster::IClusterRuntime> {
+        std::filesystem::path dbDir,
+        akkaradb::engine::cluster::ClusterConfig config,
+        uint64_t selfNodeId,
+        akkaradb::engine::cluster::ClusterEngineCallbacks callbacks,
+        akkaradb::engine::cluster::ClusterRuntimeOptions runtimeOptions
+    ) -> std::unique_ptr<akkaradb::engine::cluster::IClusterRuntime> {
             return akkaradb::engine::cluster::ClusterRuntime::create(
                 std::move(dbDir),
                 std::move(config),

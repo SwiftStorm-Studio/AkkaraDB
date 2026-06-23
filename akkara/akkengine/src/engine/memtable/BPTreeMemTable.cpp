@@ -547,9 +547,7 @@ namespace akkaradb::engine::memtable {
         uint16_t firstPos = 0;
         bool firstLeaf = true;
 
-        if (start.empty()) {
-            while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
-        }
+        if (start.empty()) { while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); } }
         else {
             while (node != nullptr && !node->isLeaf) {
                 const uint16_t childIndex = findChildIndex(node, start);
@@ -698,9 +696,10 @@ namespace akkaradb::engine::memtable {
 
         std::lock_guard<std::mutex> lock{generatorArenaMutex_};
         if (start.empty() && end.empty()) {
-            return ArenaGenerator<RecordView>::withArena(generatorArena_, [this, snapshotSeq, frozen]() {
-                return frozen ? iterateFrozenSnapshot(snapshotSeq) : iterateSnapshot(snapshotSeq);
-            });
+            return ArenaGenerator<RecordView>::withArena(
+                generatorArena_,
+                [this, snapshotSeq, frozen]() { return frozen ? iterateFrozenSnapshot(snapshotSeq) : iterateSnapshot(snapshotSeq); }
+            );
         }
 
         std::vector<uint8_t> startOwned(start.begin(), start.end());
@@ -708,8 +707,9 @@ namespace akkaradb::engine::memtable {
         return ArenaGenerator<RecordView>::withArena(
             generatorArena_,
             [this, snapshotSeq, frozen, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
-                return frozen ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
-                              : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
+                return frozen
+                           ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                           : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }
         );
     }

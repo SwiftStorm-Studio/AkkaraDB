@@ -1,6 +1,6 @@
 # AkkaraDB - Technical Specification v5
 
-> Version 0.5.0 - C++23 - Native engine specification - AGPL-3.0
+> Version v5 - C++23 - Native engine specification - AGPL-3.0
 
 ---
 
@@ -49,7 +49,7 @@ key/value and BinPack layouts.
 | Writes       | Monotonic sequence assignment under the engine write mutex                          |
 | Compression  | Zstd support for SST blocks and blob payloads                                       |
 | Typed API    | `PackedTable<&T::field>` with BinPack serialization and secondary indexes           |
-| Network      | Embedded HTTP and binary TCP API servers; replication links support TLS/plain modes |
+| Network      | Embedded HTTP/TCP/gRPC frontends with binary payloads; replication links support secure/plain modes |
 
 ### Non-Goals
 
@@ -304,6 +304,13 @@ MemTable and WAL shard counts are derived from writer count using a birthday-par
 | `backend_factory`             | null    | Uses the implementation default      |
 | `on_flush`                    | null    | Called with sorted `RecordView` span |
 
+The standalone `MemTable` auto-shard resolver chooses the next power-of-two of roughly `max(expectedConcurrentWriters * 4, 2)`, capped by
+`autoShardCountCap` and by an implementation hard ceiling of 256 shards. `AkkEngine::runtime.writerThreads` may pre-fill `expectedConcurrentWriters` before
+the MemTable is created.
+
+The current default backend is `SkipListMemTable`. Other ordered backends can be injected through `backend_factory`, but the public contract only guarantees the
+`IMemTable` semantics, not any backend-specific layout.
+
 ### 5.2 Sequence Model
 
 The MemTable owns the monotonic sequence allocator used by `AkkEngine` writes:
@@ -325,10 +332,19 @@ older SST values.
 | `false`   | Found tombstone                                |
 | `true`    | Found live value                               |
 
+In the current default `SkipListMemTable`, each logical key retains up to 4 in-memory versions (`MAX_VERSIONS_PER_KEY = 4`) in a small ring. Snapshot reads
+walk that ring newest-first and return the newest version whose `seq <= snapshotSeq`.
+
 ### 5.4 Flush Lifecycle
 
 When a shard crosses `thresholdBytesPerShard`, it can be sealed and flushed. The engine installs an `on_flush` callback that writes records to
 `SSTManager::flush`, checkpoints the manifest, and prunes WAL segments up to the resulting checkpoint sequence when configured.
+
+Flush is copy-free at the MemTable layer: the active shard backend is `freeze()`d, moved into the shard's immutable list, and replaced with a fresh backend
+instance. Background flush workers then iterate the immutable table in key order and invoke the configured flush callback with a sorted `RecordView` span.
+
+The current flush worker count is `min(shardCount, max(1, hardware_threads / 2))`. `forceFlush()` triggers flush on every shard and waits for the flush pool to
+drain before returning.
 
 ---
 
@@ -340,7 +356,7 @@ When a shard crosses `thresholdBytesPerShard`, it can be sealed and flushed. The
 |---------------------------|----------------------------------------------------------|-----------------------------------------------------------------------------------------|
 | `walDir`                 | `{dataDir}/wal`                                         | Segment directory                                                                       |
 | `syncMode`                | `SYNC` at engine level, changed by `StartupMode` presets | `SYNC`, `ASYNC`, or `OFF`                                                               |
-| `shardCount`              | 0                                                        | Auto, one shard per hardware thread capped by implementation; engine writer auto cap 64 |
+| `shardCount`              | 0                                                        | Auto. `WalWriter` alone resolves to `clamp(hw_threads, 1, 16)`. `AkkEngine::runtime.writerThreads` may pre-fill a higher logical shard count, capped at 64 before writer creation |
 | `groupN`                  | 128                                                      | Async batch entry trigger                                                               |
 | `groupMicros`             | 100                                                      | Async batch time trigger                                                                |
 | `groupBytes`              | 4 MiB                                                    | Async batch byte trigger                                                                |
@@ -467,6 +483,8 @@ Blob reads validate the header and content CRC before returning bytes.
 Each data block stores records in key order. Within a block, keys may be prefix-delta encoded against the previous key before optional block compression. The reader
 expands them back to full keys when loading the block into memory.
 
+Persisted SST filenames use the current pattern `L<level>_<fileId>.aksst`. Flush and compaction first write `<name>.tmp` and then rename atomically into place.
+
 ### 8.3 SSTFileHeaderV2
 
 `SSTFileHeaderV2` is 256 bytes. Important fields:
@@ -499,6 +517,9 @@ Each block is:
 The payload is either raw concatenated SST records or Zstd-compressed bytes. The offsets array contains little-endian `uint32_t` offsets into the uncompressed
 block payload. Block CRC covers payload plus offsets.
 
+In the current writer implementation, prefix compression is attempted block-local first. The prefix-compressed payload is used only when it is smaller than the
+raw block payload; optional Zstd compression is then applied on top of the chosen representation.
+
 ### 8.5 Lookup
 
 SST lookup uses:
@@ -510,6 +531,19 @@ SST lookup uses:
 
 L0 may contain overlapping files; newer files are checked first by manager policy. Higher levels are expected to be non-overlapping after compaction.
 
+The current manager sorts L0 by descending filename, which effectively makes newer flushed files win first. Levels `L1+` are sorted by `firstKey` and searched by
+binary search on block/file key ranges.
+
+`SSTReader` keeps an LRU block cache bounded by `block_cache_bytes`. Cache entries store the decoded block payload plus its decoded offset table; prefix-compressed
+and/or Zstd-compressed blocks are expanded before caching.
+
+Compaction triggers currently work as follows:
+
+- L0 compacts into L1 when `L0.file_count >= max_l0_files`, taking all L0 files plus all current L1 files as inputs.
+- Levels `L1+` compact into the next level when their total bytes exceed the per-level budget.
+- For `L1+`, the source file chosen first is the one with the smallest `maxSeq`, plus all overlapping files in the destination level.
+- Tombstones are preserved during intermediate compactions and dropped only when compacting into the last configured level.
+
 ---
 
 ## 9. Manifest
@@ -518,6 +552,10 @@ L0 may contain overlapping files; newer files are checked first by manager polic
 
 The Manifest is an append-only, CRC-protected log of storage lifecycle events. The main engine manifest (`manifest.akmf`) tracks live SST files, compaction
 transitions, and checkpoints. A separate node-local cluster manifest (`cluster.akmf`) records cluster runtime events.
+
+The active file always keeps the base name (`manifest.akmf` or `cluster.akmf`). When the file grows past the rotation threshold, older generations are kept as
+`manifest-1.akmf`, `manifest-2.akmf`, ... and likewise `cluster-1.akmf`, `cluster-2.akmf`, .... Replay also accepts the legacy suffix form
+`manifest.akmf.1` / `cluster.akmf.1` for backward compatibility.
 
 ### 9.2 File Format
 
@@ -568,8 +606,9 @@ The cluster manifest currently records:
 - `NodeLeave` when a node shuts down cleanly
 - `PrimaryLease` when a node starts as `PRIMARY`
 
-Replay of `manifest.akmf` rebuilds SST lifecycle state. The cluster manifest is a durable local event log for cluster runtime breadcrumbs; it is not a distributed
-leader-election source of truth.
+Replay of `manifest.akmf` rebuilds SST lifecycle state. The cluster manifest is a durable local breadcrumb log only: current replay code intentionally ignores
+`NodeJoin`, `NodeLeave`, `PrimaryLease`, `CompactionStart`, and `Truncate` for state reconstruction. It is not a distributed leader-election source of truth,
+and reopening the process does not rebuild `nodeJoins()`, `nodeLeaves()`, or `lastPrimaryLease()` from prior files.
 
 ---
 
@@ -617,12 +656,12 @@ being silently ignored.
 ### 11.1 Configuration
 
 API servers are enabled through `AkkEngineOptions::components.apiEnabled`. The server set is controlled by `AkkEngineOptions::api.backends`.
-When `backends` is empty, the native server starts HTTP and TCP backends. GRPC is an available backend enum and can be enabled when the gRPC transport factory
-has been registered by the gRPC module.
+When `backends` is empty, the native server enables every API transport compiled into the aggregate API server target. In the current build that usually means
+HTTP and TCP. gRPC is added to the default set only when the build has real Protobuf/gRPC support and defines the gRPC backend macro.
 
 | Field                  | Default     | Description                                              |
 |------------------------|-------------|----------------------------------------------------------|
-| `backends`             | empty       | Values: `HTTP`, `TCP`, `GRPC`; empty means HTTP + TCP    |
+| `backends`             | empty       | Values: `HTTP`, `TCP`, `GRPC`; empty means all compiled-in transport backends |
 | `bindHost`             | empty       | Required when API is enabled                             |
 | `httpPort`             | 7070        | HTTP port                                                |
 | `tcpPort`              | 7071        | Binary TCP port                                          |
@@ -690,40 +729,65 @@ Statuses:
 | `0x01` | `NotFound` |
 | `0xFF` | `Error`    |
 
+Binary TCP operation payload conventions in the current implementation:
+
+- `PUT`, `GET`, `REMOVE`, `EXISTS`, `HISTORY`: `key` is carried in the header/body key field and `value` is the opcode payload.
+- `GET_AT`, `ROLLBACK_TO`, `ROLLBACK_KEY`: `value` payload is exactly one `u64le` sequence number.
+- `COUNT`: request `key` is `startKey`, request `value` is `endKey`.
+- `SCAN`: request `key` is `startKey`, request `value` is `[limit:u32le][endKey bytes...]`; `limit = 0` means unbounded.
+- `BATCH_PUT`: request `key_len` must be `0`; `value` carries the batch payload.
+- `BATCH_GET`: request `key_len` must be `0`; `value` carries the batch payload.
+- `HISTORY` response is `[count:u32le]{entry...}*` without the extra `truncated:u8` flag used by HTTP history.
+- `STATS` response carries the full `EngineStats` snapshot, including API, MemTable, WAL, Blob, SST, and VersionLog counters. This is much richer than the
+  compact HTTP `/v1/stats` payload.
+
 ### 11.3 HTTP API
 
-The HTTP server exposes REST-style endpoints for basic key/value operations. Keys are passed as percent-encoded query parameters and values are request/response
-bodies.
+The HTTP server is a small custom HTTP/1.1 parser with binary request and response bodies. It is not a JSON/REST API in the conventional sense.
+Keys are passed as percent-decoded query parameters, responses use `application/octet-stream`, and most successful mutation endpoints return `204 No Content`.
 
 | Method   | Path           | Query              | Description                                                 |
 |----------|----------------|--------------------|-------------------------------------------------------------|
-| `GET`    | `/v1/ping`     | none               | Health check                                                |
-| `POST`   | `/v1/put`      | `key`              | Store request body as value                                 |
-| `GET`    | `/v1/get`      | `key`              | Return current value                                        |
-| `DELETE` | `/v1/remove`   | `key`              | Write tombstone                                             |
-| `GET`    | `/v1/exists`   | `key`              | Return point existence                                      |
-| `GET`    | `/v1/count`    | `start`, `end`     | Count records in a half-open range                          |
-| `GET`    | `/v1/scan`     | `start`, `end`, `limit` | Return range records, bounded by server limit          |
-| `GET`    | `/v1/getAt`    | `key`, `seq`       | Return value visible at sequence when VersionLog is enabled |
-| `GET`    | `/v1/history`  | `key`, `limit`     | Return version entries                                      |
-| `POST`   | `/v1/rollbackTo` | `seq`            | Roll the engine back to a sequence                          |
-| `POST`   | `/v1/rollbackKey` | `key`, `seq`    | Roll one key back to a sequence                             |
-| `POST`   | `/v1/batchPut` | body               | Store multiple key/value pairs                              |
-| `POST`   | `/v1/batchGet` | body               | Read multiple keys                                          |
-| `POST`   | `/v1/forceSync` | none              | Force WAL sync                                              |
-| `POST`   | `/v1/forceFlush` | none             | Force MemTable flush                                        |
-| `GET`    | `/v1/stats`    | none               | Return engine/server stats                                  |
+| `GET`    | `/v1/ping`     | none               | Returns plain-text `pong`                                   |
+| `POST`   | `/v1/put`      | `key`              | Stores request body as value, returns `204`                 |
+| `GET`    | `/v1/get`      | `key`              | Returns raw value bytes or `404`                            |
+| `DELETE` | `/v1/remove`   | `key`              | Writes tombstone, returns `204`                             |
+| `GET`    | `/v1/exists`   | `key`              | Returns one byte: `0` or `1`                                |
+| `GET`    | `/v1/count`    | `start`, `end`     | Returns `u64le` count for the half-open range               |
+| `GET`    | `/v1/scan`     | `start`, `end`, `limit` | Returns a binary scan payload, bounded by server limit |
+| `GET`    | `/v1/getAt`    | `key`, `seq`       | Returns raw historical value bytes or `404`                 |
+| `GET`    | `/v1/history`  | `key`              | Returns a binary history payload                            |
+| `POST`   | `/v1/rollbackTo` | `seq`            | Rolls the engine back, returns `204`                        |
+| `POST`   | `/v1/rollbackKey` | `key`, `seq`    | Rolls one key back, returns `204`                           |
+| `POST`   | `/v1/batchPut` | body               | Stores multiple key/value pairs, returns `204`              |
+| `POST`   | `/v1/batchGet` | body               | Returns a binary batch-get payload                          |
+| `POST`   | `/v1/forceSync` | none              | Forces WAL sync, returns `204`                              |
+| `POST`   | `/v1/forceFlush` | none             | Forces MemTable flush, returns `204`                        |
+| `GET`    | `/v1/stats`    | none               | Returns a compact binary stats snapshot                     |
 
 HTTP batch request bodies are little-endian binary payloads. `batchPut` uses
 `count:u32le` followed by `count` entries of `key_len:u32le`, `value_len:u32le`, `key bytes`, and `value bytes`. `batchGet` uses `count:u32le` followed by
 `count` entries of `key_len:u32le` and `key bytes`. The `batchGet` response uses `count:u32le` followed by `status:u8`, `value_len:u32le`, and `value bytes` per
 entry. The TCP `BatchPut` and `BatchGet` opcodes use the same entry shapes, except per-entry key lengths are `u16le` to match the TCP request header key limit.
 
+Other HTTP binary payloads are:
+
+- `exists`: `[exists:u8]`
+- `count`: `[count:u64le]`
+- `scan`: `[count:u32le][truncated:u8]{[key_len:u16le][value_len:u32le][key bytes][value bytes]}*`
+- `history`: `[count:u32le][truncated:u8]{[seq:u64le][source_node_id:u64le][timestamp_ns:u64le][flags:u32le][value_len:u32le][value bytes]}*`
+- `stats`: `[currentSeq:u64le][nodeId:u64le][putsTotal:u64le][removesTotal:u64le][getsTotal:u64le][existsTotal:u64le][scansTotal:u64le]`
+
+The HTTP `/v1/history` response does not repeat the key bytes because the key is already carried in the query string.
+
 ### 11.4 gRPC API
 
 The gRPC module defines `akkaradb.grpcapi.v1.AkkaraDB` with unary RPCs for `Ping`, `Put`, `Get`, `Remove`, `Exists`, `Count`, `Scan`, `GetAt`, `History`,
 `RollbackTo`, `RollbackKey`, `BatchPut`, `BatchGet`, `ForceSync`, `ForceFlush`, and `Stats`. It can run with insecure credentials or TLS credentials depending
 on the configured certificate/key/CA paths.
+
+Availability is build-dependent. When Protobuf/gRPC packages are unavailable and `AKKARADB_FETCH_GRPC=OFF`, the build emits a stub backend instead: registration
+returns `false`, and attempting to start the gRPC server throws `std::runtime_error`.
 
 ---
 
@@ -812,6 +876,9 @@ When running as `PRIMARY`, `ClusterRuntime` opens a `ReplicationServer` on the l
 `ClusterManager` also maintains `{dataDir}/cluster.akmf`. On successful startup it records `NodeJoin`; on clean shutdown it records `NodeLeave`; and when the
 node starts as `PRIMARY` it records a `PrimaryLease` event containing the local node id and lease-until timestamp.
 
+Those events are durable breadcrumbs, not replayed cluster state. The current manifest replay path does not rebuild the `ClusterManager` role view or the
+manifest accessors for prior node joins/leaves/leases from disk.
+
 Replication ingress is primary-centric: replicas are replication consumers, not direct write ingress endpoints. In `Stripe` mode, key ownership is still decided by
 the deterministic router, but ownership migration and operational traffic placement remain explicit administrative concerns.
 
@@ -819,7 +886,7 @@ the deterministic router, but ownership migration and operational traffic placem
 
 ## 13. TLS Support
 
-TLS support is compiled into the current native target unconditionally. The CMake file fetches mbedTLS 3.6.2, links `mbedtls`, `mbedcrypto`, and `mbedx509`, and
+TLS support is compiled into the current native target unconditionally. The CMake file fetches mbedTLS 4.1.0, links `mbedtls`, `tfpsacrypto`, and `mbedx509`, and
 defines `AKKARADB_TLS_ENABLED`.
 
 ### 13.1 TlsConfig
@@ -885,6 +952,8 @@ If `paths.dataDir` is set, missing component paths are derived as:
 | `versionLogPath`    | `{dataDir}/history.akvlog` |
 | `clusterConfigPath` | `{dataDir}/cluster.akcc`   |
 | `nodeIdPath`        | `{dataDir}/node.id`        |
+
+Cluster runtime breadcrumbs are additionally written to `{dataDir}/cluster.akmf` when the cluster component is enabled.
 
 ### 14.4 Runtime Options
 
@@ -1338,6 +1407,7 @@ Primitive values and strings can be read for predicates. Struct, list, and map v
 | SST footer v2     | `A2SF` / `0x46533241` | 2          |
 | Blob v5           | `AKB5` / `0x35424B41` | 1          |
 | Manifest v5       | `AMV5` / `0x35564D41` | 1          |
+| VersionLog v5     | `AKV5` / `0x35564B41` | 1          |
 | Cluster config v5 | `AKC5` / `0x35434B41` | 1          |
 | API request       | `AK5Q`                | protocol 2 |
 | API response      | `AK5S`                | protocol 2 |
@@ -1357,9 +1427,11 @@ order.
 | Blob header          | CRC32C over header with `header_crc32c = 0`                |
 | Blob content         | CRC32C over original uncompressed content                  |
 | SST header           | CRC32C over `SSTFileHeaderV2` with `crc32c = 0`            |
+| SST footer           | CRC32C over `SSTFooterV2` with `footerCrc32c = 0`          |
 | SST block            | CRC32C over payload and offsets                            |
 | Manifest file header | CRC32C over header with `crc32c = 0`                       |
 | Manifest record      | CRC32C over payload                                        |
+| VersionLog entry     | CRC32C over serialized entry bytes with the trailing CRC field zeroed |
 
 CRC32C uses the Castagnoli polynomial with hardware dispatch where available.
 
@@ -1470,18 +1542,23 @@ On `AkkEngine::open`:
 | Linux     | GCC/Clang with C++23 support                  |
 | Zstd      | Fetched by CMake, v1.5.6                      |
 | Boost.PFR | Fetched by CMake, boost-1.84.0                |
-| mbedTLS   | Fetched by CMake, v3.6.2                      |
+| mbedTLS   | Fetched by CMake, v4.1.0                      |
 
 ### 19.2 CMake Options
 
-| Option                 | Default | Description                                   |
-|------------------------|---------|-----------------------------------------------|
-| `BUILD_SHARED_LIBS`    | `ON`    | Build shared library                          |
-| `AKKARADB_BUILD_TESTS` | `OFF`   | Build unit tests if test directory is present |
-| `AKKARADB_BUILD_JNI`   | `OFF`   | Build JNI bridge target `akkaradb_jni`        |
+| Option                       | Default | Description                                                           |
+|------------------------------|---------|-----------------------------------------------------------------------|
+| `AKKARADB_BUILD_SHARED_LIBS` | `ON`    | Primary shared/static toggle; also forces `BUILD_SHARED_LIBS`         |
+| `AKKARADB_BUILD_TESTS`       | `OFF`   | Build tests/benchmarks helpers                                        |
+| `AKKARADB_BUILD_JNI`         | `OFF`   | Build JNI bridge target `akkaradb_jni`                                |
+| `AKKARADB_BUILD_API_SERVERS` | `ON`    | Build API server shared libraries                                     |
+| `AKKARADB_BUILD_API_HTTP`    | `ON`    | Build HTTP API transport backend                                      |
+| `AKKARADB_BUILD_API_TCP`     | `ON`    | Build TCP API transport backend                                       |
+| `AKKARADB_BUILD_API_GRPC`    | `ON`    | Build gRPC API transport backend target                               |
+| `AKKARADB_FETCH_GRPC`        | `OFF`   | Fetch gRPC/Protobuf when system packages are unavailable              |
 
-SIMD flags are currently always added by the top-level CMake file (`/arch:AVX2` on MSVC, `-msse4.2 -mavx2` otherwise). TLS is also currently always built and
-linked.
+TLS support is compiled into the current native target set. SIMD dispatch is selected at runtime, while AVX2/AVX512 CRC32C translation units receive
+source-specific compile flags in `cmake/AkkaraTargets.cmake`.
 
 ### 19.3 Build
 

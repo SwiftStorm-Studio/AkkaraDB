@@ -178,7 +178,9 @@ namespace akkaradb::engine::sst {
                 const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.raw.data() + off);
                 const uint8_t* keyPtr = block.raw.data() + off + sizeof(core::SSTHdr32);
                 const uint8_t* valPtr = keyPtr + hdr->kLen;
-                if (valPtr + hdr->vLen > block.raw.data() + block.raw.size()) { throw std::runtime_error("SSTWriter: corrupt source block payload"); }
+                if (valPtr + hdr->vLen > block.raw.data() + block.raw.size()) {
+                    throw std::runtime_error("SSTWriter: corrupt source block payload");
+                }
 
                 std::span<const uint8_t> key{keyPtr, hdr->kLen};
                 const uint16_t shared = static_cast<uint16_t>(std::min<size_t>(sharedPrefixLen(prevKey, key), UINT16_MAX));

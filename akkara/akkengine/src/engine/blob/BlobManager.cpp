@@ -327,7 +327,7 @@ namespace akkaradb::engine::blob {
         if (options.blobDir.empty()) { throw std::invalid_argument("BlobManager: blobDir is required"); }
         if (options.thresholdBytes == 0) { throw std::invalid_argument("BlobManager: thresholdBytes must be > 0"); }
 
-        auto manager = std::unique_ptr<BlobManager>(new BlobManager{});
+        auto manager = std::unique_ptr < BlobManager > (new BlobManager{});
         manager->impl_ = std::make_unique<Impl>(std::move(options));
         return manager;
     }

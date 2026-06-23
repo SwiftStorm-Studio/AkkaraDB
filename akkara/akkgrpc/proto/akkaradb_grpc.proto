@@ -262,6 +262,18 @@ message SSTStats {
 
 message VLogStats {
   bool enabled = 1;
+  uint32 sync_mode = 2;
+  uint32 group_n = 3;
+  uint32 group_micros = 4;
+  uint64 group_bytes = 5;
+  uint64 async_max_pending_bytes = 6;
+  uint64 indexed_keys = 7;
+  uint64 indexed_entries = 8;
+  uint64 rollback_entries = 9;
+  uint64 pending_writes = 10;
+  uint64 pending_bytes = 11;
+  uint64 durable_bytes = 12;
+  bool flush_thread_running = 13;
 }
 
 message EngineStats {

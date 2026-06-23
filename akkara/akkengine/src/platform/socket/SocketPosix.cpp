@@ -128,14 +128,14 @@ namespace akkaradb::platform {
          * @return MSG_NOSIGNAL when available, otherwise 0.
          */
         [[nodiscard]] static int sendFlags() noexcept {
-#if defined(MSG_NOSIGNAL)
-return MSG_NOSIGNAL;
-#else
-return 0;
-#endif
-}
+            #if defined(MSG_NOSIGNAL)
+            return MSG_NOSIGNAL;
+            #else
+            return 0;
+            #endif
+        }
 
-/**
+        /**
 * @brief Formats a connect failure as an exception.
 *
 * @param host Host name or address string.
@@ -143,65 +143,66 @@ return 0;
 * @param err Error code.
 * @return Exception object.
 */
-[[nodiscard]] static std::system_error makeConnectError(const char* host, uint16_t port, int err) {
-    std::string message = "Socket::connect(";
-    message += (host != nullptr) ? host : "(null)";
-    message += ':';
-    message += std::to_string(port);
-    message += ") failed";
-    return std::system_error(err, std::generic_category(), message);
-}} // namespace
+        [[nodiscard]] static std::system_error makeConnectError(const char* host, uint16_t port, int err) {
+            std::string message = "Socket::connect(";
+            message += (host != nullptr) ? host : "(null)";
+            message += ':';
+            message += std::to_string(port);
+            message += ") failed";
+            return std::system_error(err, std::generic_category(), message);
+        }
+    } // namespace
 
-/**
+    /**
 * @brief Constructs an invalid socket.
 */
-Socket::Socket() noexcept : handle_(invalidHandle()) {}
+    Socket::Socket() noexcept : handle_(invalidHandle()) {}
 
-/**
+    /**
 * @brief Destroys the socket and closes the underlying handle.
 */
-Socket::~Socket() { close(); }
+    Socket::~Socket() { close(); }
 
-/**
+    /**
 * @brief Move-constructs a socket.
 *
 * @param other Source socket.
 */
-Socket::Socket(Socket&& other) noexcept : handle_(other.handle_) { other.handle_ = invalidHandle(); }
+    Socket::Socket(Socket&& other) noexcept : handle_(other.handle_) { other.handle_ = invalidHandle(); }
 
-/**
+    /**
 * @brief Move-assigns a socket.
 *
 * @param other Source socket.
 * @return This socket.
 */
-Socket& Socket::operator=(Socket&& other) noexcept {
-    if (this != &other) {
-        close();
-        handle_ = other.handle_;
-        other.handle_ = invalidHandle();
+    Socket& Socket::operator=(Socket&& other) noexcept {
+        if (this != &other) {
+            close();
+            handle_ = other.handle_;
+            other.handle_ = invalidHandle();
+        }
+        return *this;
     }
-    return *this;
-}
 
-/**
+    /**
 * @brief Checks whether the socket is valid.
 *
 * @return true when the socket owns a live file descriptor.
 */
-bool Socket::valid() const noexcept { return handle_ != invalidHandle(); }
+    bool Socket::valid() const noexcept { return handle_ != invalidHandle(); }
 
-/**
+    /**
 * @brief Closes the socket if it is valid.
 */
-void Socket::close() noexcept {
-    if (valid()) {
-        ::close(toFd(handle_));
-        handle_ = invalidHandle();
+    void Socket::close() noexcept {
+        if (valid()) {
+            ::close(toFd(handle_));
+            handle_ = invalidHandle();
+        }
     }
-}
 
-/**
+    /**
 * @brief Resolves host and establishes a TCP connection.
 *
 * The socket is configured as non-blocking for connect and remains
@@ -213,26 +214,24 @@ void Socket::close() noexcept {
 * @throws std::runtime_error on DNS failure.
 * @throws std::system_error on socket or connect failure.
 */
-Socket Socket::connect(const char* host, uint16_t port) {
-    if (host == nullptr) { throw std::invalid_argument("Socket::connect: host is null"); }
+    Socket Socket::connect(const char* host, uint16_t port) {
+        if (host == nullptr) { throw std::invalid_argument("Socket::connect: host is null"); }
 
-    struct addrinfo hints{};
-    struct addrinfo* result = nullptr;
+        struct addrinfo hints{};
+        struct addrinfo* result = nullptr;
 
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-#if defined(AI_ADDRCONFIG)
-hints.ai_flags= AI_ADDRCONFIG;
-#endif
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        #if defined(AI_ADDRCONFIG)
+        hints.ai_flags = AI_ADDRCONFIG;
+        #endif
 
-char portStr[6]; const int portLen = std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port));if (portLen<0 || portLen >=
-    static_cast<int>(sizeof(portStr))) { throw std::invalid_argument("Socket::connect: invalid port"); } const int gai = ::getaddrinfo(
-    host,
-    portStr,
-    &hints,
-    &result
-);if (gai!= 0) {
+        char portStr[6];
+        const int portLen = std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port));
+        if (portLen < 0 || portLen >= static_cast<int>(sizeof(portStr))) { throw std::invalid_argument("Socket::connect: invalid port"); }
+        const int gai = ::getaddrinfo(host, portStr, &hints, &result);
+        if (gai != 0) {
             std::string message = "Socket::connect(";
             message += host;
             message += ':';
@@ -242,7 +241,9 @@ char portStr[6]; const int portLen = std::snprintf(portStr, sizeof(portStr), "%u
             throw std::runtime_error(message);
         }
 
-NativeHandle connected = invalidHandle(); int lastError = 0;for (struct addrinfo* rp = result; rp!= nullptr; rp= rp->ai_next) {
+        NativeHandle connected = invalidHandle();
+        int lastError = 0;
+        for (struct addrinfo* rp = result; rp != nullptr; rp = rp->ai_next) {
             const int fd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (fd < 0) {
                 lastError = errno;
@@ -261,19 +262,20 @@ NativeHandle connected = invalidHandle(); int lastError = 0;for (struct addrinfo
                 continue;
             }
 
-#if defined(SO_NOSIGPIPE)
-{
+            #if defined(SO_NOSIGPIPE)
+            {
                 int one = 1;
                 (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, static_cast<socklen_t>(sizeof(one)));
             }
-#endif
+            #endif
 
-const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);if (rc== 0) {
+            const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);
+            if (rc == 0) {
                 connected = fromFd(fd);
                 break;
             }
 
-            if (errno== EINPROGRESS || errno== EALREADY || errno== EWOULDBLOCK) {
+            if (errno == EINPROGRESS || errno == EALREADY || errno == EWOULDBLOCK) {
                 const int waitRc = waitConnectComplete(fd);
                 if (waitRc == 0) {
                     connected = fromFd(fd);
@@ -285,16 +287,22 @@ const int rc = ::connect(fd, rp->ai_addr, rp->ai_addrlen);if (rc== 0) {
                 continue;
             }
 
-lastError= errno; ::close (fd);}
+            lastError = errno;
+            ::close(fd);
+        }
 
-::freeaddrinfo (result);if (connected== invalidHandle()) {
+        ::freeaddrinfo(result);
+        if (connected == invalidHandle()) {
             if (lastError != 0) { throw makeConnectError(host, port, lastError); }
             throw std::runtime_error("Socket::connect failed");
         }
 
-Socket sock; sock.handle_= connected;return sock;}
+        Socket sock;
+        sock.handle_ = connected;
+        return sock;
+    }
 
-/**
+    /**
 * @brief Sends bytes on the socket.
 *
 * @param data Buffer to send.
@@ -302,35 +310,35 @@ Socket sock; sock.handle_= connected;return sock;}
 * @param outSent Number of bytes actually sent.
 * @return Empty error_code on success, would-block or a POSIX error otherwise.
 */
-std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept {
-    outSent = 0;
+    std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept {
+        outSent = 0;
 
-    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
-    if (size == 0) { return {}; }
+        if (size == 0) { return {}; }
 
-    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
 
-    const auto* ptr = static_cast<const unsigned char*>(data);
+        const auto* ptr = static_cast<const unsigned char*>(data);
 
-    for (;;) {
-        const ssize_t n = ::send(toFd(handle_), ptr, size, sendFlags());
-        if (n >= 0) {
-            outSent = static_cast<std::size_t>(n);
-            return {};
+        for (;;) {
+            const ssize_t n = ::send(toFd(handle_), ptr, size, sendFlags());
+            if (n >= 0) {
+                outSent = static_cast<std::size_t>(n);
+                return {};
+            }
+
+            if (errno == EINTR) { continue; }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
+
+            if (errno == EPIPE) { return std::make_error_code(std::errc::broken_pipe); }
+
+            return std::error_code(errno, std::generic_category());
         }
-
-        if (errno == EINTR) { continue; }
-
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
-
-        if (errno == EPIPE) { return std::make_error_code(std::errc::broken_pipe); }
-
-        return std::error_code(errno, std::generic_category());
     }
-}
 
-/**
+    /**
 * @brief Receives bytes from the socket.
 *
 * @param data Destination buffer.
@@ -338,33 +346,34 @@ std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t
 * @param outRecv Number of bytes actually received.
 * @return Empty error_code on success, would-block or a POSIX error otherwise.
 */
-std::error_code Socket::recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept {
-    outRecv = 0;
+    std::error_code Socket::recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept {
+        outRecv = 0;
 
-    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
-    if (size == 0) { return {}; }
+        if (size == 0) { return {}; }
 
-    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
 
-    auto* ptr = static_cast<unsigned char*>(data);
+        auto* ptr = static_cast<unsigned char*>(data);
 
-    for (;;) {
-        const ssize_t n = ::recv(toFd(handle_), ptr, size, 0);
+        for (;;) {
+            const ssize_t n = ::recv(toFd(handle_), ptr, size, 0);
 
-        if (n > 0) {
-            outRecv = static_cast<std::size_t>(n);
-            return {};
+            if (n > 0) {
+                outRecv = static_cast<std::size_t>(n);
+                return {};
+            }
+
+            if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
+
+            if (errno == EINTR) { continue; }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
+
+            return std::error_code(errno, std::generic_category());
         }
-
-        if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
-
-        if (errno == EINTR) { continue; }
-
-        if (errno == EAGAIN || errno == EWOULDBLOCK) { return wouldBlock(); }
-
-        return std::error_code(errno, std::generic_category());
     }
-}} // namespace akkaradb::platform
+} // namespace akkaradb::platform
 
 #endif

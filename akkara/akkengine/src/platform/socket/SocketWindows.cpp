@@ -194,15 +194,17 @@ namespace akkaradb::platform {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_protocol = IPPROTO_TCP;
-        #if defined(AI_ADDRCONFIG)
-        hints.ai_flags = AI_ADDRCONFIG;
-        #endif
+#if defined(AI_ADDRCONFIG)
+hints.ai_flags= AI_ADDRCONFIG;
+#endif
 
-        char portStr[6];
-        const int portLen = std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port));
-        if (portLen < 0 || portLen >= static_cast<int>(sizeof(portStr))) { throw std::invalid_argument("Socket::connect: invalid port"); }
-        const int gai = getaddrinfo(host, portStr, &hints, &result);
-        if (gai != 0) {
+char portStr[6]; const int portLen = std::snprintf(portStr, sizeof(portStr), "%u", static_cast<unsigned>(port));if (portLen<0 || portLen >=
+    static_cast<int>(sizeof(portStr))) { throw std::invalid_argument("Socket::connect: invalid port"); } const int gai = getaddrinfo(
+    host,
+    portStr,
+    &hints,
+    &result
+);if (gai!= 0) {
             std::string message = "Socket::connect(";
             message += host;
             message += ':';
@@ -212,9 +214,7 @@ namespace akkaradb::platform {
             throw std::runtime_error(message);
         }
 
-        NativeHandle connected = invalidHandle();
-        int lastError = 0;
-        for (auto* rp = result; rp != nullptr; rp = rp->ai_next) {
+NativeHandle connected = invalidHandle(); int lastError = 0;for (auto* rp = result; rp!= nullptr; rp= rp->ai_next) {
             const SOCKET s = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (s == INVALID_SOCKET) {
                 lastError = WSAGetLastError();
@@ -250,18 +250,14 @@ namespace akkaradb::platform {
             closesocket(s);
         }
 
-        freeaddrinfo(result);
-        if (connected == invalidHandle()) {
+freeaddrinfo (result);if (connected== invalidHandle()) {
             if (lastError != 0) { throw makeConnectError(host, port, lastError); }
             throw std::runtime_error("Socket::connect failed");
         }
 
-        Socket sock;
-        sock.handle_ = connected;
-        return sock;
-    }
+Socket sock; sock.handle_= connected;return sock;}
 
-    /**
+/**
          * @brief Sends up to @p size bytes.
          *
          * @param data Input buffer.
@@ -269,38 +265,38 @@ namespace akkaradb::platform {
          * @param outSent Number of bytes actually sent.
          * @return Empty error_code on success, or a portable error on failure.
          */
-    std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept {
-        outSent = 0;
+std::error_code Socket::sendSome(const void* data, std::size_t size, std::size_t& outSent) noexcept {
+    outSent = 0;
 
-        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
-        if (size == 0) { return {}; }
+    if (size == 0) { return {}; }
 
-        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
 
-        const auto* ptr = static_cast<const char*>(data);
-        const std::size_t chunkSize = std::min<std::size_t>(size, INT_MAX);
+    const auto* ptr = static_cast<const char*>(data);
+    const std::size_t chunkSize = std::min<std::size_t>(size, INT_MAX);
 
-        for (;;) {
-            const int n = send(toSocket(handle_), ptr, static_cast<int>(chunkSize), 0);
+    for (;;) {
+        const int n = send(toSocket(handle_), ptr, static_cast<int>(chunkSize), 0);
 
-            if (n >= 0) {
-                outSent = static_cast<std::size_t>(n);
-                return {};
-            }
-
-            const int err = WSAGetLastError();
-            if (err == WSAEINTR) { continue; }
-            if (err == WSAEWOULDBLOCK) { return wouldBlock(); }
-            if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
-                return std::make_error_code(std::errc::connection_reset);
-            }
-
-            return {err, std::system_category()};
+        if (n >= 0) {
+            outSent = static_cast<std::size_t>(n);
+            return {};
         }
-    }
 
-    /**
+        const int err = WSAGetLastError();
+        if (err == WSAEINTR) { continue; }
+        if (err == WSAEWOULDBLOCK) { return wouldBlock(); }
+        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
+            return std::make_error_code(std::errc::connection_reset);
+        }
+
+        return {err, std::system_category()};
+    }
+}
+
+/**
          * @brief Receives up to @p size bytes.
          *
          * @param data Output buffer.
@@ -308,38 +304,37 @@ namespace akkaradb::platform {
          * @param outRecv Number of bytes actually received.
          * @return Empty error_code on success, or a portable error on failure.
          */
-    std::error_code Socket::recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept {
-        outRecv = 0;
+std::error_code Socket::recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept {
+    outRecv = 0;
 
-        if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
+    if (!valid()) { return std::make_error_code(std::errc::bad_file_descriptor); }
 
-        if (size == 0) { return {}; }
+    if (size == 0) { return {}; }
 
-        if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
+    if (data == nullptr) { return std::make_error_code(std::errc::invalid_argument); }
 
-        auto* ptr = static_cast<char*>(data);
-        const std::size_t chunkSize = std::min<std::size_t>(size, INT_MAX);
+    auto* ptr = static_cast<char*>(data);
+    const std::size_t chunkSize = std::min<std::size_t>(size, INT_MAX);
 
-        for (;;) {
-            const int n = recv(toSocket(handle_), ptr, static_cast<int>(chunkSize), 0);
+    for (;;) {
+        const int n = recv(toSocket(handle_), ptr, static_cast<int>(chunkSize), 0);
 
-            if (n > 0) {
-                outRecv = static_cast<std::size_t>(n);
-                return {};
-            }
-
-            if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
-
-            const int err = WSAGetLastError();
-            if (err == WSAEINTR) { continue; }
-            if (err == WSAEWOULDBLOCK) { return wouldBlock(); }
-            if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
-                return std::make_error_code(std::errc::connection_reset);
-            }
-
-            return {err, std::system_category()};
+        if (n > 0) {
+            outRecv = static_cast<std::size_t>(n);
+            return {};
         }
+
+        if (n == 0) { return std::make_error_code(std::errc::connection_reset); }
+
+        const int err = WSAGetLastError();
+        if (err == WSAEINTR) { continue; }
+        if (err == WSAEWOULDBLOCK) { return wouldBlock(); }
+        if (err == WSAECONNRESET || err == WSAECONNABORTED || err == WSAENOTCONN) {
+            return std::make_error_code(std::errc::connection_reset);
+        }
+
+        return {err, std::system_category()};
     }
-} // namespace akkaradb::platform
+}} // namespace akkaradb::platform
 
 #endif

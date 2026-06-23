@@ -46,9 +46,7 @@ namespace akkaradb {
             template <typename U> requires std::constructible_from<T, U&&>
             Immutable& operator=(U&& value) {
                 T next{std::forward<U>(value)};
-                if (sealed_ && !(value_ == next)) {
-                    throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified");
-                }
+                if (sealed_ && !(value_ == next)) { throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified"); }
                 value_ = std::move(next);
                 return *this;
             }
@@ -57,18 +55,21 @@ namespace akkaradb {
             [[nodiscard]] operator const T&() const noexcept { return value_; }
 
             [[nodiscard]] const T& value() const noexcept { return value_; }
+
             [[nodiscard]] T& value() {
                 if (sealed_) { throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified"); }
                 return value_;
             }
 
             [[nodiscard]] const T* operator->() const noexcept { return &value_; }
+
             [[nodiscard]] T* operator->() {
                 if (sealed_) { throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified"); }
                 return &value_;
             }
 
             [[nodiscard]] const T& operator*() const noexcept { return value_; }
+
             [[nodiscard]] T& operator*() {
                 if (sealed_) { throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified"); }
                 return value_;
@@ -76,6 +77,7 @@ namespace akkaradb {
 
             void seal() const noexcept { sealed_ = true; }
             [[nodiscard]] bool sealed() const noexcept { return sealed_; }
+
             void replacePersisted(T value) noexcept(std::is_nothrow_move_assignable_v<T>) {
                 value_ = std::move(value);
                 sealed_ = true;
@@ -98,7 +100,10 @@ namespace akkaradb {
     struct HasRefTraits : std::false_type {};
 
     template <typename T>
-    struct HasRefTraits<T, std::void_t<typename RefTraits<T>::Key>> : std::true_type {};
+    struct HasRefTraits<T, std::void_t < typename RefTraits<T>::Key>
+    >
+    :
+    std::true_type {};
 
     template <typename T>
     inline constexpr bool hasRefTraits = HasRefTraits<T>::value;
@@ -144,19 +149,9 @@ namespace akkaradb {
                 return out;
             }
 
-            Ref(const T& value)
-                : key_{RefTraits<T>::keyOf(value)},
-                  value_{value},
-                  loaded_{true},
-                  dirty_{true},
-                  keyKnown_{true} {}
+            Ref(const T& value) : key_{RefTraits<T>::keyOf(value)}, value_{value}, loaded_{true}, dirty_{true}, keyKnown_{true} {}
 
-            Ref(T&& value)
-                : key_{RefTraits<T>::keyOf(value)},
-                  value_{std::move(value)},
-                  loaded_{true},
-                  dirty_{true},
-                  keyKnown_{true} {}
+            Ref(T&& value) : key_{RefTraits<T>::keyOf(value)}, value_{std::move(value)}, loaded_{true}, dirty_{true}, keyKnown_{true} {}
 
             Ref& operator=(const Key& id) {
                 key_ = id;
@@ -195,20 +190,24 @@ namespace akkaradb {
                 ensureKeyKnown();
                 return key_;
             }
+
             [[nodiscard]] bool loaded() const noexcept { return loaded_; }
             [[nodiscard]] bool dirty() const noexcept { return dirty_; }
             [[nodiscard]] bool attached() const noexcept { return binding_ != nullptr; }
             [[nodiscard]] bool hasRowId() const noexcept { return rowIdKnown_; }
+
             [[nodiscard]] RowId rowId() const {
                 ensureRowIdKnown();
                 return rowId_;
             }
 
             void attach(RefBinding<T>* binding) const noexcept { binding_ = binding; }
+
             void rememberRowId(RowId rowId) const noexcept {
                 rowId_ = rowId;
                 rowIdKnown_ = rowId != 0;
             }
+
             void markClean() const noexcept { dirty_ = false; }
 
             [[nodiscard]] const T& value() const {
@@ -288,14 +287,10 @@ namespace akkaradb {
     };
 
     template <typename T>
-    [[nodiscard]] Ref<T> ref(typename Ref<T>::Key id) {
-        return Ref<T>{std::move(id)};
-    }
+    [[nodiscard]] Ref<T> ref(typename Ref<T>::Key id) { return Ref<T>{std::move(id)}; }
 
     template <typename T>
-    [[nodiscard]] Ref<T> ref(const T& value) {
-        return Ref<T>{value};
-    }
+    [[nodiscard]] Ref<T> ref(const T& value) { return Ref<T>{value}; }
 
     template <typename T>
     struct IsRef : std::false_type {};

@@ -33,9 +33,7 @@ namespace akkaradb::engine::vlog {
     inline constexpr uint8_t VLOG_FLAG_ROLLBACK = 0x04;
 
     enum class VLogSyncMode : uint8_t {
-        SYNC = 0,
-        ASYNC = 1,
-        BATCHED_SYNC = 2,
+        SYNC = 0, ASYNC = 1, BATCHED_SYNC = 2,
     };
 
     struct AKDB_API VersionLogOptions {
@@ -53,6 +51,21 @@ namespace akkaradb::engine::vlog {
         uint64_t timestampNs = 0;
         uint8_t flags = 0;
         std::vector<uint8_t> value;
+    };
+
+    struct AKDB_API VersionLogSnapshot {
+        uint8_t syncMode = static_cast<uint8_t>(VLogSyncMode::ASYNC);
+        uint32_t groupN = 0;
+        uint32_t groupMicros = 0;
+        uint64_t groupBytes = 0;
+        uint64_t asyncMaxPendingBytes = 0;
+        uint64_t indexedKeys = 0;
+        uint64_t indexedEntries = 0;
+        uint64_t rollbackEntries = 0;
+        uint64_t pendingWrites = 0;
+        uint64_t pendingBytes = 0;
+        uint64_t durableBytes = 0;
+        bool flushThreadRunning = false;
     };
 
     class AKDB_API VersionLog {
@@ -82,6 +95,7 @@ namespace akkaradb::engine::vlog {
                 uint64_t targetSeq
             ) const;
 
+            [[nodiscard]] VersionLogSnapshot snapshot() const noexcept;
             void forceSync();
             void close();
 

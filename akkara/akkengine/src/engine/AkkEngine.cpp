@@ -37,6 +37,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace akkaradb::engine {
     namespace fs = std::filesystem;
@@ -85,11 +86,7 @@ namespace akkaradb::engine {
         }
 
         [[nodiscard]] int compareKey(std::span<const uint8_t> a, std::span<const uint8_t> b) {
-            const int cmp = std::ranges::lexicographical_compare(a, b)
-                                ? -1
-                                : std::ranges::lexicographical_compare(b, a)
-                                ? 1
-                                : 0;
+            const int cmp = std::ranges::lexicographical_compare(a, b) ? -1 : std::ranges::lexicographical_compare(b, a) ? 1 : 0;
             return cmp;
         }
 
@@ -99,6 +96,11 @@ namespace akkaradb::engine {
             auto* bytes = reinterpret_cast<uint8_t*>(raw);
             std::memcpy(bytes, in.data(), in.size());
             return {bytes, in.size()};
+        }
+
+        [[nodiscard]] std::optional<uint64_t> decodeBlobIdIfReference(uint8_t flags, std::span<const uint8_t> value) noexcept {
+            if ((flags & core::MemHdr16::FLAG_BLOB) == 0 || value.size() < blob::BLOB_REF_SIZE) { return std::nullopt; }
+            return blob::decodeBlobRef(value.data()).blobId;
         }
     } // namespace
 
@@ -208,6 +210,52 @@ namespace akkaradb::engine {
                 return out;
             }
 
+            [[nodiscard]] bool canRunBlobGc() const noexcept { return blobManager != nullptr && versionLog == nullptr; }
+
+            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
+                std::unordered_set<uint64_t> live;
+                if (!blobManager || !memtable) { return live; }
+
+                const uint64_t snapshotSeq = this->snapshotSeq();
+                memtable::MemTable::KeyRange range;
+                auto mt = memtable->iterator(range, snapshotSeq);
+                sst::SSTManager::Iterator sstIt;
+                if (sstManager) { sstIt = sstManager->scanIter({}, {}); }
+
+                auto mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
+                auto sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
+
+                while (mtCur || sstCur) {
+                    const bool hasMt = mtCur.has_value();
+                    const bool hasSst = sstCur.has_value();
+                    const int cmp = (hasMt && hasSst) ? compareKey(mtCur->key(), sstCur->key) : (hasMt ? -1 : 1);
+
+                    if (cmp <= 0) {
+                        const auto record = *mtCur;
+                        if (!record.isTombstone()) {
+                            if (const auto blobId = decodeBlobIdIfReference(record.flags(), record.value())) { live.insert(*blobId); }
+                        }
+                        mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
+                        if (cmp == 0) { sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{}; }
+                    }
+                    else {
+                        const auto record = std::move(*sstCur);
+                        if (!record.isTombstone()) {
+                            if (const auto blobId = decodeBlobIdIfReference(record.flags, record.value)) { live.insert(*blobId); }
+                        }
+                        sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
+                    }
+                }
+
+                return live;
+            }
+
+            void runBlobGcIfSafe() {
+                if (!canRunBlobGc()) { return; }
+                const auto live = collectReferencedBlobIds();
+                blobManager->scanOrphans([&live](uint64_t blobId) { return live.find(blobId) != live.end(); });
+            }
+
             void appendAll(
                 uint64_t seq,
                 std::span<const uint8_t> key,
@@ -313,6 +361,7 @@ namespace akkaradb::engine {
             const uint64_t checkpointSeq = impl.sstManager->flush(records);
             if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
             if (impl.manifest) { impl.manifest->checkpoint(std::optional<std::string>{"flush"}, std::nullopt, checkpointSeq); }
+            if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
         };
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
 
@@ -709,13 +758,9 @@ namespace akkaradb::engine {
                         impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
                         if ((recordFlags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                     }
-                    else {
-                        impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-                    }
+                    else { impl_->removesTotal.fetch_add(1, std::memory_order_relaxed); }
                 }
-                else {
-                    impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-                }
+                else { impl_->removesTotal.fetch_add(1, std::memory_order_relaxed); }
 
                 const uint8_t vlogFlags = static_cast<uint8_t>(recordFlags | vlog::VLOG_FLAG_ROLLBACK);
                 impl_->appendAll(seq, key, stored, recordFlags, vlog::ROLLBACK_NODE, 0, 0, vlogFlags);
@@ -747,13 +792,9 @@ namespace akkaradb::engine {
                     impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
                     if ((recordFlags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                 }
-                else {
-                    impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-                }
+                else { impl_->removesTotal.fetch_add(1, std::memory_order_relaxed); }
             }
-            else {
-                impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-            }
+            else { impl_->removesTotal.fetch_add(1, std::memory_order_relaxed); }
 
             const uint8_t vlogFlags = static_cast<uint8_t>(recordFlags | vlog::VLOG_FLAG_ROLLBACK);
             impl_->appendAll(seq, key, stored, recordFlags, vlog::ROLLBACK_NODE, 0, 0, vlogFlags);
@@ -832,6 +873,21 @@ namespace akkaradb::engine {
         }
 
         out.vlog.enabled = impl_->versionLog != nullptr;
+        if (impl_->versionLog) {
+            const auto snap = impl_->versionLog->snapshot();
+            out.vlog.syncMode = snap.syncMode;
+            out.vlog.groupN = snap.groupN;
+            out.vlog.groupMicros = snap.groupMicros;
+            out.vlog.groupBytes = snap.groupBytes;
+            out.vlog.asyncMaxPendingBytes = snap.asyncMaxPendingBytes;
+            out.vlog.indexedKeys = snap.indexedKeys;
+            out.vlog.indexedEntries = snap.indexedEntries;
+            out.vlog.rollbackEntries = snap.rollbackEntries;
+            out.vlog.pendingWrites = snap.pendingWrites;
+            out.vlog.pendingBytes = snap.pendingBytes;
+            out.vlog.durableBytes = snap.durableBytes;
+            out.vlog.flushThreadRunning = snap.flushThreadRunning;
+        }
         return out;
     }
 
@@ -842,6 +898,13 @@ namespace akkaradb::engine {
     }
 
     void AkkEngine::forceFlush() { if (impl_ && impl_->memtable) { impl_->memtable->forceFlush(); } }
+
+    void AkkEngine::runBlobGc() {
+        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_->blobManager) { return; }
+        if (impl_->versionLog) { throw std::runtime_error("AkkEngine: blob GC is disabled while version log is enabled"); }
+        impl_->runBlobGcIfSafe();
+    }
 
     void AkkEngine::close() {
         if (!impl_) { return; }
@@ -871,6 +934,7 @@ namespace akkaradb::engine {
             impl_->manifest.reset();
         }
         if (impl_->blobManager) {
+            if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
             impl_->blobManager->close();
             impl_->blobManager.reset();
         }

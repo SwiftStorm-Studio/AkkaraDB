@@ -137,9 +137,7 @@ namespace akkaradb::engine::server {
             for (uint32_t i = 0; i < count; ++i) {
                 uint32_t keyLen = 0;
                 uint32_t valueLen = 0;
-                if (!readPlain(payload, keyLen) || !readPlain(payload, valueLen) || payload.size() < keyLen + valueLen) {
-                    return false;
-                }
+                if (!readPlain(payload, keyLen) || !readPlain(payload, valueLen) || payload.size() < keyLen + valueLen) { return false; }
                 const uint8_t* key = payload.data();
                 payload = payload.subspan(keyLen);
                 const uint8_t* value = payload.data();
@@ -149,7 +147,11 @@ namespace akkaradb::engine::server {
             return payload.empty();
         }
 
-        [[nodiscard]] bool decodeHttpBatchGet(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<std::span<const uint8_t>>& out) {
+        [[nodiscard]] bool decodeHttpBatchGet(
+            std::span<const uint8_t> payload,
+            uint32_t maxItems,
+            std::vector<std::span<const uint8_t>>& out
+        ) {
             uint32_t count = 0;
             if (!readPlain(payload, count) || count > maxItems) { return false; }
             out.clear();
@@ -177,7 +179,10 @@ namespace akkaradb::engine::server {
     HttpApiServer::HttpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options) : engine_{engine}, options_{std::move(options)} {}
 
     std::unique_ptr<HttpApiServer> HttpApiServer::create(AkkEngine& engine, AkkEngineOptions::ApiOptions options) {
-        return std::unique_ptr<HttpApiServer>{new HttpApiServer{engine, std::move(options)}};
+        return std::unique_ptr < HttpApiServer >
+        {
+            new HttpApiServer{engine, std::move(options)}
+        };
     }
 
     HttpApiServer::~HttpApiServer() { close(); }
@@ -434,9 +439,8 @@ namespace akkaradb::engine::server {
     bool HttpApiServer::route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer) {
         requestsTotal_.fetch_add(1, std::memory_order_relaxed);
 
-        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/get" || request.path == "/v1/remove" ||
-            request.path == "/v1/getAt" || request.path == "/v1/exists" || request.path == "/v1/history" ||
-            request.path == "/v1/rollbackKey";
+        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/get" || request.path == "/v1/remove" || request.path ==
+            "/v1/getAt" || request.path == "/v1/exists" || request.path == "/v1/history" || request.path == "/v1/rollbackKey";
         const std::string rawKey = queryParam(request.query, "key");
         if (needsKey && rawKey.empty()) {
             sendEmpty(connection, 400);
@@ -452,11 +456,11 @@ namespace akkaradb::engine::server {
                 sendEmpty(connection, 204);
             }
             else if (request.path == "/v1/get" && request.method == "GET") {
-            valueBuffer.clear();
-            if (engine_.getInto(keySpan, valueBuffer)) {
-                sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
-            }
-            else { sendEmpty(connection, 404); }
+                valueBuffer.clear();
+                if (engine_.getInto(keySpan, valueBuffer)) {
+                    sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
+                }
+                else { sendEmpty(connection, 404); }
             }
             else if (request.path == "/v1/remove" && request.method == "DELETE") {
                 engine_.remove(keySpan);
@@ -479,10 +483,13 @@ namespace akkaradb::engine::server {
             else if (request.path == "/v1/count" && request.method == "GET") {
                 const auto start = urlDecode(queryParam(request.query, "start"));
                 const auto end = urlDecode(queryParam(request.query, "end"));
-                encodeU64(static_cast<uint64_t>(engine_.count(
-                    std::span<const uint8_t>{start.data(), start.size()},
-                    std::span<const uint8_t>{end.data(), end.size()}
-                )), valueBuffer);
+                encodeU64(
+                    static_cast<uint64_t>(engine_.count(
+                        std::span<const uint8_t>{start.data(), start.size()},
+                        std::span<const uint8_t>{end.data(), end.size()}
+                    )),
+                    valueBuffer
+                );
                 sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
             }
             else if (request.path == "/v1/scan" && request.method == "GET") {
@@ -493,8 +500,8 @@ namespace akkaradb::engine::server {
                     return request.keepAlive;
                 }
                 const uint32_t limit = requestedLimit == 0
-                    ? maxScanItems()
-                    : static_cast<uint32_t>(std::min<uint64_t>(requestedLimit, maxScanItems()));
+                                           ? maxScanItems()
+                                           : static_cast<uint32_t>(std::min<uint64_t>(requestedLimit, maxScanItems()));
                 const auto start = urlDecode(queryParam(request.query, "start"));
                 const auto end = urlDecode(queryParam(request.query, "end"));
                 core::BufferArena arena;
@@ -502,10 +509,10 @@ namespace akkaradb::engine::server {
                 records.reserve(limit);
                 bool truncated = false;
                 for (const auto& record : engine_.scan(
-                    arena,
-                    std::span<const uint8_t>{start.data(), start.size()},
-                    std::span<const uint8_t>{end.data(), end.size()}
-                )) {
+                         arena,
+                         std::span<const uint8_t>{start.data(), start.size()},
+                         std::span<const uint8_t>{end.data(), end.size()}
+                     )) {
                     if (records.size() >= limit) {
                         truncated = true;
                         break;
@@ -569,11 +576,7 @@ namespace akkaradb::engine::server {
             }
             else if (request.path == "/v1/batchGet" && request.method == "POST") {
                 std::vector<std::span<const uint8_t>> keys;
-                if (!decodeHttpBatchGet(
-                    std::span<const uint8_t>{request.body.data(), request.body.size()},
-                    maxBatchItems(),
-                    keys
-                )) {
+                if (!decodeHttpBatchGet(std::span<const uint8_t>{request.body.data(), request.body.size()}, maxBatchItems(), keys)) {
                     sendEmpty(connection, 400);
                     return request.keepAlive;
                 }
@@ -581,10 +584,12 @@ namespace akkaradb::engine::server {
                 std::vector<ApiBatchGetResult> results;
                 results.reserve(values.size());
                 for (const auto& value : values) {
-                    results.push_back(ApiBatchGetResult{
-                        value.found ? ApiStatus::OK : ApiStatus::NOT_FOUND,
-                        std::span<const uint8_t>{value.value.data(), value.value.size()}
-                    });
+                    results.push_back(
+                        ApiBatchGetResult{
+                            value.found ? ApiStatus::OK : ApiStatus::NOT_FOUND,
+                            std::span<const uint8_t>{value.value.data(), value.value.size()}
+                        }
+                    );
                 }
                 encodeHttpBatchGet(std::span<const ApiBatchGetResult>{results.data(), results.size()}, valueBuffer);
                 batchGetItemsTotal_.fetch_add(keys.size(), std::memory_order_relaxed);
@@ -637,13 +642,9 @@ namespace akkaradb::engine::server {
         }
     }
 
-    uint32_t HttpApiServer::maxBatchItems() const noexcept {
-        return options_.httpMaxBatchItems == 0 ? 4096u : options_.httpMaxBatchItems;
-    }
+    uint32_t HttpApiServer::maxBatchItems() const noexcept { return options_.httpMaxBatchItems == 0 ? 4096u : options_.httpMaxBatchItems; }
 
-    uint32_t HttpApiServer::maxScanItems() const noexcept {
-        return options_.httpMaxScanItems == 0 ? 4096u : options_.httpMaxScanItems;
-    }
+    uint32_t HttpApiServer::maxScanItems() const noexcept { return options_.httpMaxScanItems == 0 ? 4096u : options_.httpMaxScanItems; }
 
     uint32_t HttpApiServer::maxHistoryEntries() const noexcept {
         return options_.httpMaxHistoryEntries == 0 ? 4096u : options_.httpMaxHistoryEntries;

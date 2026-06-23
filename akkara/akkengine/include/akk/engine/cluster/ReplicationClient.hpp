@@ -50,12 +50,12 @@ namespace akkaradb::engine::cluster {
              * callback invocation.
              */
             using ApplyCallback = std::function<void(
-                uint64_t seq,
-                ReplOpType op,
-                std::span<const uint8_t> key,
-                std::span<const uint8_t> value,
-                uint8_t recordFlags,
-                uint64_t sourceNodeId
+uint64_t seq,
+ ReplOpType op,
+ std::span<const uint8_t> key,
+ std::span<const uint8_t> value,
+ uint8_t recordFlags,
+ uint64_t sourceNodeId
             )>;
 
             /**

@@ -36,6 +36,8 @@ namespace akkaradb::engine::blob {
                 std::filesystem::path blobDir;
                 uint64_t thresholdBytes = DEFAULT_THRESHOLD_BYTES;
                 BlobCodec codec = BlobCodec::NONE;
+                bool gcOnFlush = false;
+                bool gcOnClose = false;
             };
 
             struct Snapshot {

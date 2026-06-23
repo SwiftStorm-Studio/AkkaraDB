@@ -46,7 +46,8 @@ namespace {
             return base;
         }
         for (size_t i = 1; i < 10000; ++i) {
-            auto rotated = base.parent_path() / (base.filename().string() + "." + std::to_string(i));
+            auto rotated = base.parent_path() /
+                (base.stem().string() + "-" + std::to_string(i) + base.extension().string());
             if (std::filesystem::exists(rotated)) {
                 return rotated;
             }
@@ -158,6 +159,31 @@ namespace {
         AKK_TEST_CHECK(lease->nodeId == 7);
         AKK_TEST_CHECK(lease->leaseUntilUs == 123456789);
     }
+
+    static void testRotationNamingUsesDashBeforeExtension() {
+        const auto dir = makeTempDir("rotation");
+        const auto path = dir / "manifest.akmf";
+
+        auto mf = Manifest::create(path, false);
+        mf->start();
+
+        std::string hostChunk(60 * 1024, 'x');
+        bool rotated = false;
+        for (int i = 0; i < 1024; ++i) {
+            mf->nodeJoin(static_cast<uint64_t>(i + 1), static_cast<uint16_t>(20001 + (i % 8)), hostChunk);
+            if (std::filesystem::exists(dir / "manifest-1.akmf")) {
+                rotated = true;
+                break;
+            }
+        }
+        mf->nodeLeave(1);
+        mf->close();
+
+        AKK_TEST_CHECK(std::filesystem::exists(path));
+        AKK_TEST_CHECK(rotated);
+        AKK_TEST_CHECK(std::filesystem::exists(dir / "manifest-1.akmf"));
+        AKK_TEST_CHECK(!std::filesystem::exists(dir / "manifest.akmf.1"));
+    }
 } // namespace
 
 int main() {
@@ -167,6 +193,7 @@ int main() {
     testCompactionCommit();
     testCrcStopOnCorruption();
     testClusterEventsInProcessState();
+    testRotationNamingUsesDashBeforeExtension();
     std::printf("manifest smoke test passed\n");
     return 0;
 }

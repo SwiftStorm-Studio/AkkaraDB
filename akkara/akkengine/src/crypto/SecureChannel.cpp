@@ -46,9 +46,7 @@ namespace akkaradb::crypto {
             DerivedKeys() = default;
 
             DerivedKeys(SecretKey initiator, SecretKey responder, SecretKey handshake)
-                : initiatorToResponder(initiator),
-                  responderToInitiator(responder),
-                  handshakeAuthKey(handshake) {
+                : initiatorToResponder(initiator), responderToInitiator(responder), handshakeAuthKey(handshake) {
                 secureWipe(initiator);
                 secureWipe(responder);
                 secureWipe(handshake);
@@ -62,9 +60,7 @@ namespace akkaradb::crypto {
             DerivedKeys(DerivedKeys&& other) noexcept
                 : initiatorToResponder(other.initiatorToResponder),
                   responderToInitiator(other.responderToInitiator),
-                  handshakeAuthKey(other.handshakeAuthKey) {
-                other.wipe();
-            }
+                  handshakeAuthKey(other.handshakeAuthKey) { other.wipe(); }
 
             DerivedKeys& operator=(DerivedKeys&& other) noexcept {
                 if (this != &other) {
@@ -397,9 +393,7 @@ namespace akkaradb::crypto {
         crypto_x25519_public_key(hello_.ephemeralPublicKey.data(), ephemeralSecret_.data());
     }
 
-    NoiseInitiator::~NoiseInitiator() {
-        secureWipe(ephemeralSecret_);
-    }
+    NoiseInitiator::~NoiseInitiator() { secureWipe(ephemeralSecret_); }
 
     SecureSession NoiseInitiator::finish(const ServerHello& hello, const std::optional<PublicKey>& expectedRemote) {
         if (finished_) { throw std::runtime_error("NoiseInitiator::finish called twice"); }

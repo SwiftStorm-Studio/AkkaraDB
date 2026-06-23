@@ -35,24 +35,20 @@
 
 namespace akkaradb {
     enum class OnDelete : uint8_t {
-        Cascade,
-        Restrict,
-        SetNull,
+        Cascade, Restrict, SetNull,
     };
 
     enum class OnUpdate : uint8_t {
-        Cascade,
-        Restrict,
-        SetNull,
+        Cascade, Restrict, SetNull,
     };
 
     class OnDeleteOptions {
         public:
             constexpr OnDeleteOptions() = default;
+
             constexpr OnDeleteOptions(OnDelete action)
-                : cascade_{action == OnDelete::Cascade},
-                  restrict_{action == OnDelete::Restrict},
-                  setNull_{action == OnDelete::SetNull} {}
+                : cascade_{action == OnDelete::Cascade}, restrict_{action == OnDelete::Restrict}, setNull_{action == OnDelete::SetNull} {}
+
             constexpr OnDeleteOptions(std::initializer_list<OnDelete> actions) {
                 for (const auto action : actions) {
                     if (action == OnDelete::Cascade) { cascade_ = true; }
@@ -80,10 +76,10 @@ namespace akkaradb {
     class OnUpdateOptions {
         public:
             constexpr OnUpdateOptions() = default;
+
             constexpr OnUpdateOptions(OnUpdate action)
-                : cascade_{action == OnUpdate::Cascade},
-                  restrict_{action == OnUpdate::Restrict},
-                  setNull_{action == OnUpdate::SetNull} {}
+                : cascade_{action == OnUpdate::Cascade}, restrict_{action == OnUpdate::Restrict}, setNull_{action == OnUpdate::SetNull} {}
+
             constexpr OnUpdateOptions(std::initializer_list<OnUpdate> actions) {
                 for (const auto action : actions) {
                     if (action == OnUpdate::Cascade) { cascade_ = true; }
@@ -185,9 +181,7 @@ namespace akkaradb {
                 : db_{other.db_},
                   tables_{std::move(other.tables_)},
                   tablesByEntity_{std::move(other.tablesByEntity_)},
-                  refBindingsByEntity_{std::move(other.refBindingsByEntity_)} {
-                rebindRefs();
-            }
+                  refBindingsByEntity_{std::move(other.refBindingsByEntity_)} { rebindRefs(); }
 
             Schema& operator=(Schema&&) = delete;
             Schema(const Schema&) = delete;
@@ -231,9 +225,13 @@ namespace akkaradb {
                 if (ownerHolder == nullptr) { throw std::runtime_error("AkkaraDB schema: foreign key owner primary key binding mismatch"); }
 
                 auto targetIt = tablesByEntity_.find(std::type_index(typeid(Target)));
-                if (targetIt == tablesByEntity_.end()) { throw std::runtime_error("AkkaraDB schema: foreign key target table is not registered"); }
+                if (targetIt == tablesByEntity_.end()) {
+                    throw std::runtime_error("AkkaraDB schema: foreign key target table is not registered");
+                }
                 auto* targetHolder = dynamic_cast<TableHolder<RefTraits<Target>::primaryKey>*>(targetIt->second);
-                if (targetHolder == nullptr) { throw std::runtime_error("AkkaraDB schema: foreign key target primary key binding mismatch"); }
+                if (targetHolder == nullptr) {
+                    throw std::runtime_error("AkkaraDB schema: foreign key target primary key binding mismatch");
+                }
 
                 if constexpr (isRef<Field>) {
                     static_assert(
@@ -246,29 +244,39 @@ namespace akkaradb {
                     ownerHolder->table.template foreignKey<FieldPtr, RefTraits<Target>::primaryKey, TargetFieldPtr>(targetHolder->table);
                 }
                 if (onDelete.hasRestrict()) {
-                    targetHolder->table.template restrictDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template restrictDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 if (onDelete.hasSetNull()) {
-                    targetHolder->table.template setNullDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template setNullDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 if (onDelete.hasCascade()) {
-                    targetHolder->table.template cascadeDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template cascadeDeleteFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 if (onUpdate.hasRestrict()) {
-                    targetHolder->table.template restrictUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template restrictUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 if (onUpdate.hasSetNull()) {
-                    targetHolder->table.template setNullUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template setNullUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 if (onUpdate.hasCascade()) {
-                    targetHolder->table.template cascadeUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(ownerHolder->table);
+                    targetHolder->table.template cascadeUpdateFrom<FieldPtr, RefTraits<Owner>::primaryKey, TargetFieldPtr>(
+                        ownerHolder->table
+                    );
                 }
                 return *this;
             }
 
-            Schema open() {
-                return std::move(*this);
-            }
+            Schema open() { return std::move(*this); }
 
             template <typename Entity>
             [[nodiscard]] auto& table() {
@@ -320,18 +328,12 @@ namespace akkaradb {
                 Binding binding;
             };
 
-            void rebindRefs() {
-                for (const auto& table : tables_) { table->bindRefsFrom(*this); }
-            }
+            void rebindRefs() { for (const auto& table : tables_) { table->bindRefsFrom(*this); } }
 
             template <auto LeftPtr, auto RightPtr>
             static consteval bool sameMemberPointer() {
-                if constexpr (std::is_same_v<decltype(LeftPtr), decltype(RightPtr)>) {
-                    return LeftPtr == RightPtr;
-                }
-                else {
-                    return false;
-                }
+                if constexpr (std::is_same_v<decltype(LeftPtr), decltype(RightPtr)>) { return LeftPtr == RightPtr; }
+                else { return false; }
             }
 
             AkkaraDB& db_;
@@ -339,5 +341,4 @@ namespace akkaradb {
             std::unordered_map<std::type_index, TableHolderBase*> tablesByEntity_;
             std::unordered_map<std::type_index, RefBindingBase*> refBindingsByEntity_;
     };
-
 } // namespace akkaradb

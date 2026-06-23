@@ -126,18 +126,9 @@ namespace akkaradb::engine::memtable {
                 std::vector<uint8_t> end,
                 uint64_t snapshotSeq
             )
-                : sources_{std::move(sources)},
-                  start_{std::move(start)},
-                  end_{std::move(end)},
-                  heap_{CursorCompare{&cursors_}} {
-                const core::ByteView startView{
-                    reinterpret_cast<const std::byte*>(start_.data()),
-                    start_.size()
-                };
-                const core::ByteView endView{
-                    reinterpret_cast<const std::byte*>(end_.data()),
-                    end_.size()
-                };
+                : sources_{std::move(sources)}, start_{std::move(start)}, end_{std::move(end)}, heap_{CursorCompare{&cursors_}} {
+                const core::ByteView startView{reinterpret_cast<const std::byte*>(start_.data()), start_.size()};
+                const core::ByteView endView{reinterpret_cast<const std::byte*>(end_.data()), end_.size()};
 
                 cursors_.reserve(sources_.size());
                 for (const auto& table : sources_) {
@@ -155,9 +146,7 @@ namespace akkaradb::engine::memtable {
                 sameKeyIndices_.reserve(cursors_.size());
             }
 
-            [[nodiscard]] bool hasNext() const noexcept {
-                return const_cast<Impl*>(this)->fillPending();
-            }
+            [[nodiscard]] bool hasNext() const noexcept { return const_cast<Impl*>(this)->fillPending(); }
 
             [[nodiscard]] std::optional<RecordView> next() noexcept {
                 if (!fillPending()) { return std::nullopt; }
@@ -213,9 +202,7 @@ namespace akkaradb::engine::memtable {
                     sameKeyIndices_.push_back(idx);
                 }
 
-                for (const size_t idx : sameKeyIndices_) {
-                    if (advance(cursors_[idx], true)) { heap_.push(idx); }
-                }
+                for (const size_t idx : sameKeyIndices_) { if (advance(cursors_[idx], true)) { heap_.push(idx); } }
 
                 pending_ = best;
                 return true;
@@ -271,9 +258,7 @@ namespace akkaradb::engine::memtable {
                     FlushPool(uint32_t workerCount, FlushCallback callback, FlushDone done)
                         : callback_{std::move(callback)}, onDone_{std::move(done)}, running_{true} {
                         workers_.reserve(workerCount);
-                        for (uint32_t i = 0; i < workerCount; ++i) {
-                            workers_.emplace_back([this]() { run(); });
-                        }
+                        for (uint32_t i = 0; i < workerCount; ++i) { workers_.emplace_back([this]() { run(); }); }
                     }
 
                     ~FlushPool() {
@@ -282,9 +267,7 @@ namespace akkaradb::engine::memtable {
                             running_ = false;
                         }
                         cv_.notify_all();
-                        for (auto& worker : workers_) {
-                            if (worker.joinable()) { worker.join(); }
-                        }
+                        for (auto& worker : workers_) { if (worker.joinable()) { worker.join(); } }
                     }
 
                     FlushPool(const FlushPool&) = delete;
@@ -460,9 +443,7 @@ namespace akkaradb::engine::memtable {
                     for (const auto& immutable : published->immutables) { if (immutable) { sources.push_back(immutable); } }
                 }
 
-                return RangeIterator{
-                    std::make_unique<RangeIterator::Impl>(std::move(sources), range.start, range.end, snapshotSeq)
-                };
+                return RangeIterator{std::make_unique<RangeIterator::Impl>(std::move(sources), range.start, range.end, snapshotSeq)};
             }
 
             [[nodiscard]] uint64_t nextSeq() noexcept { return seqGen_.fetch_add(1, std::memory_order_relaxed); }

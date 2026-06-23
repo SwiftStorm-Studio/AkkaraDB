@@ -19,12 +19,12 @@ namespace akkaradb::engine::cluster {
 
         [[nodiscard]] std::filesystem::path currentModuleDirectory() {
             #ifdef _WIN32
-            HMODULE module = nullptr;
-            constexpr auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-            if (!::GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(&currentModuleDirectory), &module)) { return {}; }
-
-            std::wstring buffer(MAX_PATH, L'\0');
-            for (;;) {
+            HMODULE module = nullptr; constexpr auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT; if (!::GetModuleHandleExW(
+                flags,
+                reinterpret_cast<LPCWSTR>(&currentModuleDirectory),
+                &module
+            )) { return {}; } std::wstring buffer(MAX_PATH, L'\0'); for (;;) {
                 const DWORD len = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
                 if (len == 0) { return {}; }
                 if (len < buffer.size() - 1) {
@@ -87,9 +87,8 @@ namespace akkaradb::engine::cluster {
 
         const auto path = resolveBackendPath(libraryPath);
         #ifdef _WIN32
-        const HMODULE module = ::LoadLibraryW(path.wstring().c_str());
-        if (module == nullptr) { return false; }
-        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, "akkaradb_cluster_register"));
+        const HMODULE module = ::LoadLibraryW(path.wstring().c_str()); if (module == nullptr) { return false; } const auto registerPlugin =
+            reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, "akkaradb_cluster_register"));
         #else
         void* module = ::dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
         if (module == nullptr) { return false; }

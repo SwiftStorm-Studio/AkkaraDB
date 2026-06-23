@@ -46,19 +46,18 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using SocketHandle = SOCKET;
-        constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
-        void shutdownSocket(SocketHandle s) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
+        using SocketHandle = SOCKET; constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET; void shutdownSocket(
+            SocketHandle s
+        ) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
         #else
-        using SocketHandle = int; constexpr SocketHandle INVALID_SOCKET_HANDLE = -1; void shutdownSocket(SocketHandle s) noexcept {
-            if (s >= 0) { ::shutdown(s, SHUT_RDWR); }
-        }
+        using SocketHandle = int;
+        constexpr SocketHandle INVALID_SOCKET_HANDLE = -1;
+        void shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
         #endif
 
         void ensureSocketRuntime() {
             #ifdef _WIN32
-            static std::once_flag once;
-            std::call_once(
+            static std::once_flag once; std::call_once(
                 once,
                 [] {
                     WSADATA data{};
@@ -138,8 +137,8 @@ namespace akkaradb::engine::cluster {
         }
 
         uint32_t readU32Le(const uint8_t* in) noexcept {
-            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (
-                static_cast<uint32_t>(in[3]) << 24);
+            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (static_cast<
+                uint32_t>(in[3]) << 24);
         }
 
         uint64_t readU64Le(const uint8_t* in) noexcept {
@@ -155,9 +154,7 @@ namespace akkaradb::engine::cluster {
 
         std::optional<crypto::PublicKey> pinnedPeerKey(const ClusterRuntimeOptions& options, uint64_t nodeId) {
             if (nodeId == 0) { return std::nullopt; }
-            for (const auto& pin : options.secure.pinnedPeers) {
-                if (pin.nodeId == nodeId) { return pin.publicKey; }
-            }
+            for (const auto& pin : options.secure.pinnedPeers) { if (pin.nodeId == nodeId) { return pin.publicKey; } }
             return std::nullopt;
         }
 
@@ -167,14 +164,20 @@ namespace akkaradb::engine::cluster {
             wire[4] = SECURE_VERSION;
             wire[5] = SECURE_CLIENT_HELLO;
             std::memcpy(wire.data() + SECURE_HELLO_HEADER_SIZE, hello.staticPublicKey.data(), hello.staticPublicKey.size());
-            std::memcpy(wire.data() + SECURE_HELLO_HEADER_SIZE + hello.staticPublicKey.size(), hello.ephemeralPublicKey.data(), hello.ephemeralPublicKey.size());
+            std::memcpy(
+                wire.data() + SECURE_HELLO_HEADER_SIZE + hello.staticPublicKey.size(),
+                hello.ephemeralPublicKey.data(),
+                hello.ephemeralPublicKey.size()
+            );
             return sendAll(socket, wire.data(), wire.size());
         }
 
         bool readSecureServerHello(SocketHandle socket, crypto::ServerHello& hello) {
             std::array<uint8_t, SECURE_SERVER_HELLO_SIZE> wire{};
             if (!recvAll(socket, wire.data(), wire.size())) { return false; }
-            if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_SERVER_HELLO) { return false; }
+            if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_SERVER_HELLO) {
+                return false;
+            }
             std::memcpy(hello.staticPublicKey.data(), wire.data() + SECURE_HELLO_HEADER_SIZE, hello.staticPublicKey.size());
             std::memcpy(
                 hello.ephemeralPublicKey.data(),
@@ -202,8 +205,11 @@ namespace akkaradb::engine::cluster {
             writeU32Le(header.data() + 14, static_cast<uint32_t>(encrypted.ciphertext.size()));
             std::memcpy(header.data() + 18, encrypted.tag.data(), encrypted.tag.size());
 
-            return sendAll(socket, header.data(), header.size()) &&
-                   (encrypted.ciphertext.empty() || sendAll(socket, encrypted.ciphertext.data(), encrypted.ciphertext.size()));
+            return sendAll(socket, header.data(), header.size()) && (encrypted.ciphertext.empty() || sendAll(
+                socket,
+                encrypted.ciphertext.data(),
+                encrypted.ciphertext.size()
+            ));
         }
 
         bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out) {
@@ -263,7 +269,9 @@ namespace akkaradb::engine::cluster {
                   selfNodeId_{selfNodeId},
                   getLastSeq_{std::move(getLastSeq)},
                   runtimeOptions_{std::move(runtimeOptions)},
-                  localIdentity_{runtimeOptions_.transportMode == TransportMode::SECURE ? loadSecureIdentity(runtimeOptions_) : crypto::NodeIdentity{}} {}
+                  localIdentity_{
+                      runtimeOptions_.transportMode == TransportMode::SECURE ? loadSecureIdentity(runtimeOptions_) : crypto::NodeIdentity{}
+                  } {}
 
             ~Impl() { close(); }
 
@@ -352,10 +360,14 @@ namespace akkaradb::engine::cluster {
 
             OpenSecureSession openSecureSession(SocketHandle socket) {
                 crypto::NoiseInitiator initiator{localIdentity_};
-                if (!writeSecureClientHello(socket, initiator.hello())) { throw std::runtime_error("ReplicationClient: secure hello send failed"); }
+                if (!writeSecureClientHello(socket, initiator.hello())) {
+                    throw std::runtime_error("ReplicationClient: secure hello send failed");
+                }
 
                 crypto::ServerHello serverHello{};
-                if (!readSecureServerHello(socket, serverHello)) { throw std::runtime_error("ReplicationClient: secure hello receive failed"); }
+                if (!readSecureServerHello(socket, serverHello)) {
+                    throw std::runtime_error("ReplicationClient: secure hello receive failed");
+                }
 
                 const auto expected = pinnedPeerKey(runtimeOptions_, runtimeOptions_.secure.expectedPrimaryNodeId);
                 auto session = initiator.finish(serverHello, expected);
@@ -371,11 +383,11 @@ namespace akkaradb::engine::cluster {
                 if (!recvFrameFrom(socket, secure, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
                 ServerHello serverHello;
                 if (!decodeServerHello(frame.payload, serverHello) || serverHello.role != NodeRole::PRIMARY) { return false; }
-                if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.expectedPrimaryNodeId) { return false; }
+                if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.
+                    expectedPrimaryNodeId) { return false; }
                 if (secure != nullptr) {
-                    if (const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId); expected && secureRemotePublicKey != *expected) {
-                        return false;
-                    }
+                    if (const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId); expected && secureRemotePublicKey != *
+                        expected) { return false; }
                 }
                 return true;
             }

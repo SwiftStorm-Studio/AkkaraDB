@@ -160,6 +160,18 @@ namespace akkaradb::engine {
 
         struct VLogStats {
             bool enabled = false;
+            uint32_t syncMode = 0;
+            uint32_t groupN = 0;
+            uint32_t groupMicros = 0;
+            uint64_t groupBytes = 0;
+            uint64_t asyncMaxPendingBytes = 0;
+            uint64_t indexedKeys = 0;
+            uint64_t indexedEntries = 0;
+            uint64_t rollbackEntries = 0;
+            uint64_t pendingWrites = 0;
+            uint64_t pendingBytes = 0;
+            uint64_t durableBytes = 0;
+            bool flushThreadRunning = false;
         } vlog;
     };
 } // namespace akkaradb::engine

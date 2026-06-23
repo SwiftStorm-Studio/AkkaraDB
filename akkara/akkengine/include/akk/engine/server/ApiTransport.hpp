@@ -45,10 +45,7 @@
 
 namespace akkaradb::engine::server::detail {
     #ifdef _WIN32
-    using SocketHandle = SOCKET;
-    inline constexpr SocketHandle BAD_SOCKET_VALUE = INVALID_SOCKET;
-
-    inline void netInit() {
+    using SocketHandle = SOCKET; inline constexpr SocketHandle BAD_SOCKET_VALUE = INVALID_SOCKET; inline void netInit() {
         static std::once_flag flag;
         std::call_once(
             flag,
@@ -57,24 +54,24 @@ namespace akkaradb::engine::server::detail {
                 if (::WSAStartup(MAKEWORD(2, 2), &data) != 0) { throw std::runtime_error("ApiServer: WSAStartup failed"); }
             }
         );
-    }
-
-    inline bool socketOk(SocketHandle s) noexcept { return s != INVALID_SOCKET; }
-    inline void closeSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::closesocket(s); } }
-    inline void shutdownSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::shutdown(s, SD_BOTH); } }
+    } inline bool socketOk(SocketHandle s) noexcept { return s != INVALID_SOCKET; } inline void closeSocket(SocketHandle s) noexcept {
+        if (socketOk(s)) { ::closesocket(s); }
+    } inline void shutdownSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::shutdown(s, SD_BOTH); } }
     #else
-    using SocketHandle = int; inline constexpr SocketHandle BAD_SOCKET_VALUE = -1; inline void netInit() {} inline bool
-    socketOk(SocketHandle s) noexcept { return s >= 0; } inline void closeSocket(SocketHandle s) noexcept {
-        if (socketOk(s)) { ::close(s); }
-    } inline void shutdownSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::shutdown(s, SHUT_RDWR); } }
+    using SocketHandle = int;
+    inline constexpr SocketHandle BAD_SOCKET_VALUE = -1;
+    inline void netInit() {}
+    inline bool socketOk(SocketHandle s) noexcept { return s >= 0; }
+    inline void closeSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::close(s); } }
+    inline void shutdownSocket(SocketHandle s) noexcept { if (socketOk(s)) { ::shutdown(s, SHUT_RDWR); } }
     #endif
 
     inline bool lastAcceptErrorIsTransient() noexcept {
         #ifdef _WIN32
-        const int err = WSAGetLastError();
-        return err == WSAEINTR || err == WSAECONNRESET;
+        const int err = WSAGetLastError(); return err == WSAEINTR || err == WSAECONNRESET;
         #else
-        const int err = errno; if (err == EINTR || err == ECONNABORTED) { return true; }
+        const int err = errno;
+        if (err == EINTR || err == ECONNABORTED) { return true; }
         #ifdef EPROTO
         if (err == EPROTO) { return true; }
         #endif
@@ -134,11 +131,12 @@ namespace akkaradb::engine::server::detail {
         if (!socketOk(s) || timeoutMs == 0) { return; }
 
         #ifdef _WIN32
-        const DWORD value = timeoutMs;
-        (void)::setsockopt(s, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
+        const DWORD value = timeoutMs; (void)::setsockopt(s, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
         #else
-        timeval value{}; value.tv_sec = static_cast<time_t>(timeoutMs / 1000u); value.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000u)
-            * 1000u); (void)::setsockopt(s, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
+        timeval value{};
+        value.tv_sec = static_cast<time_t>(timeoutMs / 1000u);
+        value.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000u) * 1000u);
+        (void)::setsockopt(s, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
         #endif
     }
 
@@ -224,10 +222,11 @@ namespace akkaradb::engine::server::detail {
         size_t sent = 0;
         while (sent < size) {
             #ifdef _WIN32
-            const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
-            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
+            const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0); if (rc < 0 &&
+                WSAGetLastError() == WSAEINTR) { continue; }
             #else
-            const ssize_t rc = ::send(s, data + sent, size - sent, sendNoSigpipeFlags()); if (rc < 0 && errno == EINTR) { continue; }
+            const ssize_t rc = ::send(s, data + sent, size - sent, sendNoSigpipeFlags());
+            if (rc < 0 && errno == EINTR) { continue; }
             #endif
             if (rc <= 0) { return false; }
             sent += static_cast<size_t>(rc);
@@ -239,10 +238,11 @@ namespace akkaradb::engine::server::detail {
         size_t got = 0;
         while (got < size) {
             #ifdef _WIN32
-            const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
-            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
+            const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0); if (rc < 0 && WSAGetLastError()
+                == WSAEINTR) { continue; }
             #else
-            const ssize_t rc = ::recv(s, data + got, size - got, 0); if (rc < 0 && errno == EINTR) { continue; }
+            const ssize_t rc = ::recv(s, data + got, size - got, 0);
+            if (rc < 0 && errno == EINTR) { continue; }
             #endif
             if (rc <= 0) { return false; }
             got += static_cast<size_t>(rc);
@@ -253,10 +253,11 @@ namespace akkaradb::engine::server::detail {
     inline size_t recvSome(SocketHandle s, uint8_t* data, size_t size) {
         for (;;) {
             #ifdef _WIN32
-            const int rc = ::recv(s, reinterpret_cast<char*>(data), static_cast<int>(size), 0);
-            if (rc < 0 && WSAGetLastError() == WSAEINTR) { continue; }
+            const int rc = ::recv(s, reinterpret_cast<char*>(data), static_cast<int>(size), 0); if (rc < 0 && WSAGetLastError() ==
+                WSAEINTR) { continue; }
             #else
-            const ssize_t rc = ::recv(s, data, size, 0); if (rc < 0 && errno == EINTR) { continue; }
+            const ssize_t rc = ::recv(s, data, size, 0);
+            if (rc < 0 && errno == EINTR) { continue; }
             #endif
             return rc > 0 ? static_cast<size_t>(rc) : 0;
         }

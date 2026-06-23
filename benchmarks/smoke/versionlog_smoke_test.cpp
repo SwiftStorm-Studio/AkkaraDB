@@ -66,6 +66,15 @@ namespace {
         }
 
         {
+            const auto snap = log->snapshot();
+            AKK_TEST_CHECK(snap.syncMode == static_cast<uint8_t>(VLogSyncMode::ASYNC));
+            AKK_TEST_CHECK(snap.indexedKeys == 1);
+            AKK_TEST_CHECK(snap.indexedEntries == 3);
+            AKK_TEST_CHECK(snap.rollbackEntries == 0);
+            AKK_TEST_CHECK(snap.flushThreadRunning);
+        }
+
+        {
             const auto v = log->getAt(asU8("k"), 5);
             AKK_TEST_CHECK(!v.has_value());
         }
@@ -135,6 +144,11 @@ namespace {
         AKK_TEST_CHECK(std::string(targets[0].first.begin(), targets[0].first.end()) == "k1");
         AKK_TEST_CHECK(targets[0].second.has_value());
         AKK_TEST_CHECK(targets[0].second->seq == 10);
+
+        const auto snap = log->snapshot();
+        AKK_TEST_CHECK(snap.indexedKeys == 2);
+        AKK_TEST_CHECK(snap.indexedEntries == 3);
+        AKK_TEST_CHECK(snap.rollbackEntries == 1);
     }
 
     static void testBatchedSyncRecovery() {

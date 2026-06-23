@@ -39,12 +39,15 @@ namespace akkaradb::engine::server {
             AkkEngineOptions::ApiBackend backend
         ) noexcept {
             switch (backend) {
-                case AkkEngineOptions::ApiBackend::HTTP:
-                    return options.httpBackendPath.empty() ? options.transportBackendPath : options.httpBackendPath;
-                case AkkEngineOptions::ApiBackend::TCP:
-                    return options.tcpBackendPath.empty() ? options.transportBackendPath : options.tcpBackendPath;
-                case AkkEngineOptions::ApiBackend::GRPC:
-                    return options.grpcBackendPath.empty() ? options.transportBackendPath : options.grpcBackendPath;
+                case AkkEngineOptions::ApiBackend::HTTP: return options.httpBackendPath.empty()
+                                                                    ? options.transportBackendPath
+                                                                    : options.httpBackendPath;
+                case AkkEngineOptions::ApiBackend::TCP: return options.tcpBackendPath.empty()
+                                                                   ? options.transportBackendPath
+                                                                   : options.tcpBackendPath;
+                case AkkEngineOptions::ApiBackend::GRPC: return options.grpcBackendPath.empty()
+                                                                    ? options.transportBackendPath
+                                                                    : options.grpcBackendPath;
             }
             return options.transportBackendPath;
         }
@@ -53,16 +56,30 @@ namespace akkaradb::engine::server {
     AkkApiServer::AkkApiServer() = default;
 
     std::unique_ptr<AkkApiServer> AkkApiServer::create(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options) {
-        auto server = std::unique_ptr<AkkApiServer>{new AkkApiServer()};
+        auto server = std::unique_ptr < AkkApiServer >
+        {
+            new AkkApiServer()
+        };
         auto backends = options.backends;
         if (backends.empty()) {
+            #ifdef AKKARADB_API_HAS_HTTP_BACKEND
             backends.push_back(AkkEngineOptions::ApiBackend::HTTP);
+            #endif
+            #ifdef AKKARADB_API_HAS_TCP_BACKEND
             backends.push_back(AkkEngineOptions::ApiBackend::TCP);
+            #endif
+            #ifdef AKKARADB_API_HAS_GRPC_BACKEND
+            backends.push_back(AkkEngineOptions::ApiBackend::GRPC);
+            #endif
         }
+
+        if (backends.empty()) { throw std::runtime_error("AkkApiServer: this build does not contain any API transport backends"); }
 
         for (const auto backend : backends) {
             if (!akkApiTransportFactoryAvailable(backend) && !loadAkkApiTransportBackend(backend, backendPath(options, backend))) {
-                throw std::runtime_error(std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available");
+                throw std::runtime_error(
+                    std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available"
+                );
             }
             server->transports_.push_back(createAkkApiTransport(backend, engine, options));
         }
@@ -72,9 +89,7 @@ namespace akkaradb::engine::server {
     AkkApiServer::~AkkApiServer() { close(); }
 
     void AkkApiServer::start() {
-        try {
-            for (auto& transport : transports_) { transport->start(); }
-        }
+        try { for (auto& transport : transports_) { transport->start(); } }
         catch (...) {
             close();
             throw;

@@ -33,12 +33,11 @@
 #include <unistd.h>
 #endif
 
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
+#include <psa/crypto.h>
 
 #include <array>
 #include <cstring>
@@ -50,10 +49,10 @@
 namespace akkaradb::net {
     namespace {
         #ifdef _WIN32
-        using NativeSocket = SOCKET;
-        constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
+        using NativeSocket = SOCKET; constexpr NativeSocket INVALID_NATIVE_SOCKET = INVALID_SOCKET;
         #else
-        using NativeSocket = int; constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
+        using NativeSocket = int;
+        constexpr NativeSocket INVALID_NATIVE_SOCKET = -1;
         #endif
 
         constexpr std::array<unsigned char, 32> DEFAULT_CLUSTER_PSK{
@@ -102,6 +101,13 @@ namespace akkaradb::net {
             throw std::runtime_error(std::string{what} + " failed: " + std::to_string(code));
         }
 
+        void ensurePsaCryptoInitialized() {
+            const psa_status_t status = psa_crypto_init();
+            if (status != PSA_SUCCESS && status != PSA_ERROR_BAD_STATE) {
+                throw std::runtime_error("psa_crypto_init failed: " + std::to_string(static_cast<int>(status)));
+            }
+        }
+
         [[nodiscard]] bool socketValid(NativeSocket socket) noexcept {
             #ifdef _WIN32
             return socket != INVALID_SOCKET;
@@ -133,11 +139,18 @@ namespace akkaradb::net {
             if (!socketValid(socket) || timeoutMs == 0) { return; }
 
             #ifdef _WIN32
-            const DWORD value = timeoutMs;
-            (void)::setsockopt(socket, SOL_SOCKET, option, reinterpret_cast<const char*>(&value), sizeof(value));
+            const DWORD value = timeoutMs; (void)::setsockopt(
+                socket,
+                SOL_SOCKET,
+                option,
+                reinterpret_cast<const char*>(&value),
+                sizeof(value)
+            );
             #else
-            timeval value{}; value.tv_sec = static_cast<time_t>(timeoutMs / 1000u); value.tv_usec = static_cast<suseconds_t>((timeoutMs %
-                1000u) * 1000u); (void)::setsockopt(socket, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
+            timeval value{};
+            value.tv_sec = static_cast<time_t>(timeoutMs / 1000u);
+            value.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000u) * 1000u);
+            (void)::setsockopt(socket, SOL_SOCKET, option, &value, static_cast<socklen_t>(sizeof(value)));
             #endif
         }
 
@@ -160,8 +173,7 @@ namespace akkaradb::net {
 
         void ensureTlsSocketRuntime() {
             #ifdef _WIN32
-            static std::once_flag once;
-            std::call_once(
+            static std::once_flag once; std::call_once(
                 once,
                 [] {
                     WSADATA data{};
@@ -225,8 +237,7 @@ namespace akkaradb::net {
             auto* bio = static_cast<SocketBio*>(ctx);
             if (bio == nullptr || !socketValid(bio->socket)) { return MBEDTLS_ERR_NET_INVALID_CONTEXT; }
             #ifdef _WIN32
-            const int n = ::send(bio->socket, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0);
-            if (n < 0) {
+            const int n = ::send(bio->socket, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0); if (n < 0) {
                 const int err = WSAGetLastError();
                 if (err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
                 if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) { return MBEDTLS_ERR_NET_SEND_FAILED; }
@@ -234,7 +245,8 @@ namespace akkaradb::net {
                 return MBEDTLS_ERR_NET_SEND_FAILED;
             }
             #else
-            const ssize_t n = ::send(bio->socket, buf, len, sendNoSigpipeFlags()); if (n < 0) {
+            const ssize_t n = ::send(bio->socket, buf, len, sendNoSigpipeFlags());
+            if (n < 0) {
                 if (errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_WRITE; }
                 if (errno == EAGAIN || errno == EWOULDBLOCK) { return MBEDTLS_ERR_NET_SEND_FAILED; }
                 if (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
@@ -248,8 +260,7 @@ namespace akkaradb::net {
             auto* bio = static_cast<SocketBio*>(ctx);
             if (bio == nullptr || !socketValid(bio->socket)) { return MBEDTLS_ERR_NET_INVALID_CONTEXT; }
             #ifdef _WIN32
-            const int n = ::recv(bio->socket, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
-            if (n < 0) {
+            const int n = ::recv(bio->socket, reinterpret_cast<char*>(buf), static_cast<int>(len), 0); if (n < 0) {
                 const int err = WSAGetLastError();
                 if (err == WSAEINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
                 if (err == WSAEWOULDBLOCK || err == WSAETIMEDOUT) { return MBEDTLS_ERR_NET_RECV_FAILED; }
@@ -257,7 +268,8 @@ namespace akkaradb::net {
                 return MBEDTLS_ERR_NET_RECV_FAILED;
             }
             #else
-            const ssize_t n = ::recv(bio->socket, buf, len, 0); if (n < 0) {
+            const ssize_t n = ::recv(bio->socket, buf, len, 0);
+            if (n < 0) {
                 if (errno == EINTR) { return MBEDTLS_ERR_SSL_WANT_READ; }
                 if (errno == EAGAIN || errno == EWOULDBLOCK) { return MBEDTLS_ERR_NET_RECV_FAILED; }
                 if (errno == ECONNRESET || errno == ENOTCONN) { return MBEDTLS_ERR_NET_CONN_RESET; }
@@ -273,8 +285,6 @@ namespace akkaradb::net {
         SocketBio bio{};
         mbedtls_ssl_context ssl{};
         mbedtls_ssl_config cfg{};
-        mbedtls_entropy_context entropy{};
-        mbedtls_ctr_drbg_context drbg{};
         mbedtls_x509_crt ownCert{};
         mbedtls_x509_crt caCert{};
         mbedtls_pk_context ownKey{};
@@ -282,8 +292,6 @@ namespace akkaradb::net {
         Impl() {
             mbedtls_ssl_init(&ssl);
             mbedtls_ssl_config_init(&cfg);
-            mbedtls_entropy_init(&entropy);
-            mbedtls_ctr_drbg_init(&drbg);
             mbedtls_x509_crt_init(&ownCert);
             mbedtls_x509_crt_init(&caCert);
             mbedtls_pk_init(&ownKey);
@@ -292,8 +300,6 @@ namespace akkaradb::net {
         ~Impl() {
             mbedtls_ssl_free(&ssl);
             mbedtls_ssl_config_free(&cfg);
-            mbedtls_ctr_drbg_free(&drbg);
-            mbedtls_entropy_free(&entropy);
             mbedtls_x509_crt_free(&ownCert);
             mbedtls_x509_crt_free(&caCert);
             mbedtls_pk_free(&ownKey);
@@ -346,13 +352,10 @@ namespace akkaradb::net {
     }
 
     void TlsStream::setup(const TlsConfig& config, int endpoint, const char* hostname) {
-        int ret = mbedtls_ctr_drbg_seed(&impl_->drbg, mbedtls_entropy_func, &impl_->entropy, nullptr, 0);
-        if (ret != 0) { throwMbedtls("mbedtls_ctr_drbg_seed", ret); }
+        ensurePsaCryptoInitialized();
 
-        ret = mbedtls_ssl_config_defaults(&impl_->cfg, endpoint, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+        int ret = mbedtls_ssl_config_defaults(&impl_->cfg, endpoint, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
         if (ret != 0) { throwMbedtls("mbedtls_ssl_config_defaults", ret); }
-
-        mbedtls_ssl_conf_rng(&impl_->cfg, mbedtls_ctr_drbg_random, &impl_->drbg);
 
         const bool hasCert = config.certPath != nullptr && config.certPath[0] != '\0' && config.keyPath != nullptr && config.keyPath[0] !=
             '\0';
@@ -367,7 +370,7 @@ namespace akkaradb::net {
         if (hasCert) {
             ret = mbedtls_x509_crt_parse_file(&impl_->ownCert, config.certPath);
             if (ret != 0) { throwMbedtls("mbedtls_x509_crt_parse_file(cert)", ret); }
-            ret = mbedtls_pk_parse_keyfile(&impl_->ownKey, config.keyPath, nullptr, mbedtls_ctr_drbg_random, &impl_->drbg);
+            ret = mbedtls_pk_parse_keyfile(&impl_->ownKey, config.keyPath, nullptr);
             if (ret != 0) { throwMbedtls("mbedtls_pk_parse_keyfile", ret); }
             ret = mbedtls_ssl_conf_own_cert(&impl_->cfg, &impl_->ownCert, &impl_->ownKey);
             if (ret != 0) { throwMbedtls("mbedtls_ssl_conf_own_cert", ret); }

@@ -41,8 +41,10 @@ namespace akkaradb::cpu {
     uint32_t CRC32C_Ref(const std::byte* data, size_t length) noexcept;
 
     #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86)
-    uint32_t CRC32C_X86_SSE42(const std::byte* data, size_t length) noexcept;
-    uint32_t CRC32C_X86_AVX2(const std::byte* data, size_t length) noexcept;
+    uint32_t CRC32C_X86_SSE42(const std::byte* data, size_t length) noexcept; uint32_t CRC32C_X86_AVX2(
+        const std::byte* data,
+        size_t length
+    ) noexcept;
     #if defined(__x86_64__) || defined(_M_X64)
     uint32_t CRC32C_X86_AVX512(const std::byte* data, size_t length) noexcept;
     #endif
@@ -61,61 +63,41 @@ namespace akkaradb::cpu {
             int ebx = 0;
             int ecx = 0;
             int edx = 0;
-        };
-
-        [[nodiscard]] CpuRegs Cpuid(int leaf, int subleaf = 0) noexcept {
+        }; [[nodiscard]] CpuRegs Cpuid(int leaf, int subleaf = 0) noexcept {
             CpuRegs regs{};
-            #if defined(__GNUC__) || defined(__clang__)
-            unsigned int eax = 0; unsigned int ebx = 0; unsigned int ecx = 0; unsigned int edx = 0; __cpuid_count(
-                static_cast<unsigned int>(leaf),
-                static_cast<unsigned int>(subleaf),
-                eax,
-                ebx,
-                ecx,
-                edx
-            ); regs.eax = static_cast<int>(eax); regs.ebx = static_cast<int>(ebx); regs.ecx = static_cast<int>(ecx); regs.edx = static_cast<
-                int>(edx);
-            #elif defined(_MSC_VER)
-            int raw[4]{};
-            __cpuidex(raw, leaf, subleaf);
-            regs.eax = raw[0];
-            regs.ebx = raw[1];
-            regs.ecx = raw[2];
-            regs.edx = raw[3];
-            #endif
-            return regs;
-        }
+        #if defined(__GNUC__) || defined(__clang__)
+        unsigned int eax = 0; unsigned int ebx = 0; unsigned int ecx = 0; unsigned int edx = 0; __cpuid_count (static_cast<unsigned int
+>(leaf), static_cast<unsigned int>(subleaf), eax, ebx, ecx, edx); regs.eax=static_cast<int>(eax); regs.ebx=static_cast<int>(ebx); regs.ecx=
+static_cast<int>(ecx); regs.edx=static_cast<
+        int>(edx);
+        #elif defined(_MSC_VER)
+        int raw[4]{}; __cpuidex(raw, leaf, subleaf); regs.eax= raw[0]; regs.ebx= raw[1]; regs.ecx= raw[2]; regs.edx= raw[3];
+        #endif
+        return regs;}
 
         [[nodiscard]] uint64_t Xgetbv0() noexcept {
-            #if defined(_MSC_VER)
-            return _xgetbv(0);
-            #elif defined(__GNUC__) || defined(__clang__)
-            uint32_t eax = 0; uint32_t edx = 0; __asm__ volatile ("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0)); return (static_cast<uint64_t>(
-                edx) << 32) | eax;
-            #else
-            return 0;
-            #endif
+        #if defined(_MSC_VER)
+        return _xgetbv (0);
+        #elif defined(__GNUC__) || defined(__clang__)
+        uint32_t eax = 0; uint32_t edx = 0; __asm__ volatile ("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));return (static_cast<uint64_t>(edx)
+<< 32) | eax;
+        #else
+        return 0;
+        #endif
         }
 
-        [[nodiscard]] bool HasBit(int value, int bit) noexcept { return (static_cast<uint32_t>(value) & (uint32_t{1} << bit)) != 0; }
-
-        [[nodiscard]] bool SupportsSSE42() noexcept {
+        [[nodiscard]] bool HasBit(int value, int bit) noexcept { return (static_cast<uint32_t>(value) & (uint32_t{1} << bit)) != 0; } [[
+            nodiscard]] bool SupportsSSE42() noexcept {
             const auto regs = Cpuid(1);
             return HasBit(regs.ecx, 20);
-        }
-
-        [[nodiscard]] bool SupportsPCLMULQDQ() noexcept {
+        } [[nodiscard]] bool SupportsPCLMULQDQ() noexcept {
             const auto regs = Cpuid(1);
             return HasBit(regs.ecx, 1);
-        }
-
-        [[nodiscard]] bool SupportsAVXState() noexcept {
+        } [[nodiscard]] bool SupportsAVXState() noexcept {
             const auto regs = Cpuid(1);
             if (!HasBit(regs.ecx, 26) || !HasBit(regs.ecx, 27) || !HasBit(regs.ecx, 28)) { return false; }
             return (Xgetbv0() & 0x6) == 0x6;
-        }
-
-        [[nodiscard]] bool SupportsAVX2PCLMULCRC() noexcept {
+        } [[nodiscard]] bool SupportsAVX2PCLMULCRC() noexcept {
             if (!SupportsSSE42() || !SupportsPCLMULQDQ()) { return false; }
             if (!SupportsAVXState()) { return false; }
             const auto regs = Cpuid(7, 0);
@@ -160,8 +142,7 @@ namespace akkaradb::cpu {
             #if defined(__x86_64__) || defined(_M_X64)
             if (SupportsAVX512()) { return &CRC32C_X86_AVX512; }
             #endif
-            if (SupportsAVX2PCLMULCRC()) { return &CRC32C_X86_AVX2; }
-            if (SupportsSSE42()) { return &CRC32C_X86_SSE42; }
+            if (SupportsAVX2PCLMULCRC()) { return &CRC32C_X86_AVX2; } if (SupportsSSE42()) { return &CRC32C_X86_SSE42; }
             #endif
 
             #if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)

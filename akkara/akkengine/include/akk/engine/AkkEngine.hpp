@@ -210,6 +210,7 @@ namespace akkaradb::engine {
 
             void forceSync();
             void forceFlush();
+            void runBlobGc();
             void close();
 
         private:

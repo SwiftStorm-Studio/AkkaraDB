@@ -88,11 +88,7 @@ namespace akkaradb::engine::server {
             appendPlain(out, value);
         }
 
-        void encodeScanPayload(
-            std::span<const AkkEngine::ScanRecordView> records,
-            bool truncated,
-            std::vector<uint8_t>& out
-        ) {
+        void encodeScanPayload(std::span<const AkkEngine::ScanRecordView> records, bool truncated, std::vector<uint8_t>& out) {
             out.clear();
             appendPlain(out, static_cast<uint32_t>(records.size()));
             appendPlain(out, static_cast<uint8_t>(truncated ? 1 : 0));
@@ -239,6 +235,18 @@ namespace akkaradb::engine::server {
             appendPlain(out, stats.sst.l0Stalls);
 
             appendPlain(out, static_cast<uint8_t>(stats.vlog.enabled));
+            appendPlain(out, stats.vlog.syncMode);
+            appendPlain(out, stats.vlog.groupN);
+            appendPlain(out, stats.vlog.groupMicros);
+            appendPlain(out, stats.vlog.groupBytes);
+            appendPlain(out, stats.vlog.asyncMaxPendingBytes);
+            appendPlain(out, stats.vlog.indexedKeys);
+            appendPlain(out, stats.vlog.indexedEntries);
+            appendPlain(out, stats.vlog.rollbackEntries);
+            appendPlain(out, stats.vlog.pendingWrites);
+            appendPlain(out, stats.vlog.pendingBytes);
+            appendPlain(out, stats.vlog.durableBytes);
+            appendPlain(out, static_cast<uint8_t>(stats.vlog.flushThreadRunning));
         }
 
         void closeClientSocket(detail::SocketHandle client) noexcept {
@@ -346,7 +354,10 @@ namespace akkaradb::engine::server {
     TcpApiServer::TcpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options) : engine_{engine}, options_{std::move(options)} {}
 
     std::unique_ptr<TcpApiServer> TcpApiServer::create(AkkEngine& engine, AkkEngineOptions::ApiOptions options) {
-        return std::unique_ptr<TcpApiServer>{new TcpApiServer{engine, std::move(options)}};
+        return std::unique_ptr < TcpApiServer >
+        {
+            new TcpApiServer{engine, std::move(options)}
+        };
     }
 
     TcpApiServer::~TcpApiServer() { close(); }
@@ -653,8 +664,7 @@ namespace akkaradb::engine::server {
                         );
                         break;
                     }
-                    case ApiOp::EXISTS:
-                        encodeBoolPayload(engine_.exists(frame.key), outputBuffer);
+                    case ApiOp::EXISTS: encodeBoolPayload(engine_.exists(frame.key), outputBuffer);
                         encodeResponse(
                             ApiStatus::OK,
                             frame.header.requestId,
@@ -662,8 +672,7 @@ namespace akkaradb::engine::server {
                             responseBuffer
                         );
                         break;
-                    case ApiOp::COUNT:
-                        encodeU64Payload(static_cast<uint64_t>(engine_.count(frame.key, frame.value)), outputBuffer);
+                    case ApiOp::COUNT: encodeU64Payload(static_cast<uint64_t>(engine_.count(frame.key, frame.value)), outputBuffer);
                         encodeResponse(
                             ApiStatus::OK,
                             frame.header.requestId,
@@ -738,16 +747,13 @@ namespace akkaradb::engine::server {
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
                     }
-                    case ApiOp::FORCE_SYNC:
-                        engine_.forceSync();
+                    case ApiOp::FORCE_SYNC: engine_.forceSync();
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
-                    case ApiOp::FORCE_FLUSH:
-                        engine_.forceFlush();
+                    case ApiOp::FORCE_FLUSH: engine_.forceFlush();
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
-                    case ApiOp::STATS:
-                        encodeStatsPayload(engine_.stats(), outputBuffer);
+                    case ApiOp::STATS: encodeStatsPayload(engine_.stats(), outputBuffer);
                         encodeResponse(
                             ApiStatus::OK,
                             frame.header.requestId,
@@ -755,8 +761,7 @@ namespace akkaradb::engine::server {
                             responseBuffer
                         );
                         break;
-                    default:
-                        protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                    default: protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
                         encodeError(frame.header.requestId, responseBuffer);
                         return false;
                 }

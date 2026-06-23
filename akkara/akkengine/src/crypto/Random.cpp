@@ -106,7 +106,8 @@ namespace akkaradb::crypto {
         #ifdef _WIN32
         (void)::SecureZeroMemory(secret.data(), secret.size());
         #else
-        volatile std::uint8_t* p = secret.data(); for (std::size_t i = 0; i < secret.size(); ++i) { p[i] = 0; }
+        volatile std::uint8_t* p = secret.data();
+        for (std::size_t i = 0; i < secret.size(); ++i) { p[i] = 0; }
         #endif
     }
 } // namespace akkaradb::crypto

@@ -95,7 +95,7 @@ namespace akkaradb::engine::manifest {
              * Opens (or creates) a manifest at the given path.
              *
              * @param path      Base path for the manifest file (e.g. "db/MANIFEST.akmf").
-             *                  Rotated files are stored as "<path>.1", "<path>.2", etc.
+             *                  Rotated files are stored as "<stem>-1<ext>", "<stem>-2<ext>", etc.
              * @param fastMode Enable background-flusher (batched fsync) mode.
              * @throws std::runtime_error on I/O failure.
              */

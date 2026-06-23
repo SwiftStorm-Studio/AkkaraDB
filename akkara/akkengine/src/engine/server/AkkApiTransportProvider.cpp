@@ -74,12 +74,12 @@ namespace akkaradb::engine::server {
 
         [[nodiscard]] std::filesystem::path currentModuleDirectory() {
             #ifdef _WIN32
-            HMODULE module = nullptr;
-            const auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-            if (!::GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(&currentModuleDirectory), &module)) { return {}; }
-
-            std::wstring buffer(MAX_PATH, L'\0');
-            for (;;) {
+            HMODULE module = nullptr; const auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT; if (!::GetModuleHandleExW(
+                flags,
+                reinterpret_cast<LPCWSTR>(&currentModuleDirectory),
+                &module
+            )) { return {}; } std::wstring buffer(MAX_PATH, L'\0'); for (;;) {
                 const DWORD len = ::GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
                 if (len == 0) { return {}; }
                 if (len < buffer.size() - 1) {
@@ -101,10 +101,7 @@ namespace akkaradb::engine::server {
             return dir.empty() ? filename : dir / filename;
         }
 
-        [[nodiscard]] std::filesystem::path resolveBackendPath(
-            AkkEngineOptions::ApiBackend backend,
-            const std::filesystem::path& path
-        ) {
+        [[nodiscard]] std::filesystem::path resolveBackendPath(AkkEngineOptions::ApiBackend backend, const std::filesystem::path& path) {
             if (path.empty()) { return defaultBackendPath(backend); }
             if (std::filesystem::is_directory(path)) { return path / backendFilename(backend); }
             return path;
@@ -130,9 +127,8 @@ namespace akkaradb::engine::server {
 
         const auto path = resolveBackendPath(backend, libraryPath);
         #ifdef _WIN32
-        const HMODULE module = ::LoadLibraryW(path.wstring().c_str());
-        if (module == nullptr) { return false; }
-        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, backendRegisterSymbol(backend)));
+        const HMODULE module = ::LoadLibraryW(path.wstring().c_str()); if (module == nullptr) { return false; } const auto registerPlugin =
+            reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, backendRegisterSymbol(backend)));
         #else
         void* module = ::dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
         if (module == nullptr) { return false; }

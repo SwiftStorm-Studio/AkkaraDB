@@ -121,13 +121,9 @@ namespace akkaradb::binpack {
     template <typename T>
     struct TypeAdapter<akkaradb::Ref<T>> {
         template <typename Out>
-        static void write(const akkaradb::Ref<T>& v, Out& out) {
-            detail::writeU64(v.rowId(), out);
-        }
+        static void write(const akkaradb::Ref<T>& v, Out& out) { detail::writeU64(v.rowId(), out); }
 
-        static akkaradb::Ref<T> read(std::span<const uint8_t>& in) {
-            return akkaradb::Ref<T>::fromRowId(detail::readU64(in));
-        }
+        static akkaradb::Ref<T> read(std::span<const uint8_t>& in) { return akkaradb::Ref<T>::fromRowId(detail::readU64(in)); }
 
         static bool readInto(std::span<const uint8_t>& in, akkaradb::Ref<T>& out) {
             out = read(in);
@@ -140,9 +136,7 @@ namespace akkaradb::binpack {
     template <typename T>
     struct TypeAdapter<akkaradb::Immutable<T>> {
         template <typename Out>
-        static void write(const akkaradb::Immutable<T>& v, Out& out) {
-            TypeAdapter<T>::write(v.get(), out);
-        }
+        static void write(const akkaradb::Immutable<T>& v, Out& out) { TypeAdapter<T>::write(v.get(), out); }
 
         static akkaradb::Immutable<T> read(std::span<const uint8_t>& in) {
             return akkaradb::Immutable<T>::persisted(TypeAdapter<T>::read(in));
@@ -480,7 +474,7 @@ namespace akkaradb::binpack {
             std::apply([&out](const auto&... args) { (TypeAdapter<std::remove_cvref_t<decltype(args)>>::write(args, out), ...); }, v);
         }
 
-        static Tuple read(std::span<const uint8_t>& in) { return readImpl(in, std::index_sequence_for<Ts...>{}); }
+        static Tuple read(std::span<const uint8_t>& in) { return readImpl(in, std::index_sequence_for < Ts...>{}); }
 
         static bool readInto(std::span<const uint8_t>& in, Tuple& out) {
             out = read(in);
@@ -500,7 +494,7 @@ namespace akkaradb::binpack {
             template <size_t... Is>
             static Tuple readImpl(std::span<const uint8_t>& in, std::index_sequence<Is...>) {
                 Tuple out{};
-                ((std::get<Is>(out) = TypeAdapter<std::tuple_element_t<Is, Tuple>>::read(in)), ...);
+                ((std::get < Is > (out) = TypeAdapter<std::tuple_element_t<Is, Tuple>>::read(in)), ...);
                 return out;
             }
     };

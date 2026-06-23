@@ -445,7 +445,7 @@ benchmarks/api/
 |-----------|--------------|-------------------------------------------|
 | Zstandard | 1.5.6        | SST と blob payload の compression          |
 | Boost.PFR | boost-1.84.0 | BinPack 用 aggregate reflection            |
-| mbedTLS   | 3.6.2        | API / replication transport の TLS support |
+| mbedTLS   | 4.1.0        | API / replication transport の TLS support |
 
 dependency は CMake の `FetchContent` で取得されます。
 

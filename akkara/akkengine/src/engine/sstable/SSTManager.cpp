@@ -27,7 +27,7 @@
 #include <format>
 #include <mutex>
 #include <queue>
-#include <set>
+#include <ranges>
 #include <shared_mutex>
 #include <stdexcept>
 #include <thread>
@@ -71,6 +71,10 @@ namespace akkaradb::engine::sst {
         }
 
         [[nodiscard]] uint64_t recordBytes(const SSTRecord& rec) noexcept { return alignUpU64(32 + rec.key.size() + rec.value.size(), 8); }
+
+        [[nodiscard]] bool levelsOverlap(int aSrc, int aDst, int bSrc, int bDst) noexcept {
+            return aSrc == bSrc || aSrc == bDst || aDst == bSrc || aDst == bDst;
+        }
     } // namespace
 
     class SSTManager::Iterator::Impl {
@@ -177,6 +181,11 @@ namespace akkaradb::engine::sst {
                 int src = 0;
                 int dst = 1;
                 std::vector<Meta> inputs;
+            };
+
+            struct BusyWork {
+                int src = 0;
+                int dst = 0;
             };
 
             Impl(Options options, manifest::Manifest* manifest)
@@ -310,11 +319,34 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
-                auto rec = get(key);
-                if (!rec) { return std::nullopt; }
-                if (rec->isTombstone()) { return false; }
-                out = std::move(rec->value);
-                return true;
+                auto snap = snapshot_.load(std::memory_order_acquire);
+                if (!snap) { return std::nullopt; }
+
+                if (!snap->empty()) {
+                    for (const auto& m : (*snap)[0]) {
+                        if (!m.reader) { continue; }
+                        auto hit = m.reader->getInto(key, out);
+                        if (hit.has_value()) { return hit; }
+                    }
+                }
+
+                for (size_t level = 1; level < snap->size(); ++level) {
+                    const auto& files = (*snap)[level];
+                    size_t lo = 0;
+                    size_t hi = files.size();
+                    while (lo < hi) {
+                        const size_t mid = lo + (hi - lo) / 2;
+                        if (compareBytes(files[mid].lastKey, key) < 0) { lo = mid + 1; }
+                        else { hi = mid; }
+                    }
+                    if (lo >= files.size()) { continue; }
+                    if (compareBytes(files[lo].firstKey, key) > 0 || compareBytes(key, files[lo].lastKey) > 0 || !files[lo].reader) {
+                        continue;
+                    }
+                    auto hit = files[lo].reader->getInto(key, out);
+                    if (hit.has_value()) { return hit; }
+                }
+                return std::nullopt;
             }
 
             [[nodiscard]] Iterator scanIter(std::span<const uint8_t> startKey, std::span<const uint8_t> endKey) const {
@@ -450,17 +482,15 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] std::optional<Work> pickWork() {
                 std::unique_lock levelsLock{levelsMu_};
                 std::lock_guard busyLock{busyMu_};
-                if (!busySrc_.empty()) { return std::nullopt; }
-
-                if (levels_[0].size() >= static_cast<size_t>(options_.maxL0Files) && busySrc_.count(0) == 0) {
+                if (levels_[0].size() >= static_cast<size_t>(options_.maxL0Files) && !isBusyLocked(0, 1)) {
                     Work w{0, 1, levels_[0]};
                     if (levels_.size() > 1) { w.inputs.insert(w.inputs.end(), levels_[1].begin(), levels_[1].end()); }
-                    busySrc_.insert(0);
+                    busyWork_.push_back({w.src, w.dst});
                     return w;
                 }
 
                 for (int level = 1; level + 1 < options_.maxLevels; ++level) {
-                    if (busySrc_.count(level) != 0) { continue; }
+                    if (isBusyLocked(level, level + 1)) { continue; }
                     if (levelBytesLocked(level) <= levelBudget(level) || levels_[static_cast<size_t>(level)].empty()) { continue; }
 
                     const auto srcIt = std::min_element(
@@ -474,62 +504,111 @@ namespace akkaradb::engine::sst {
                             w.inputs.push_back(m);
                         }
                     }
-                    busySrc_.insert(level);
+                    busyWork_.push_back({w.src, w.dst});
                     return w;
                 }
                 return std::nullopt;
             }
 
-            static void dedupeInPlace(std::vector<SSTRecord>& records, bool dropTombstones) {
-                std::sort(
-                    records.begin(),
-                    records.end(),
-                    [](const SSTRecord& a, const SSTRecord& b) {
-                        const int c = compareBytes(a.key, b.key);
-                        if (c != 0) { return c < 0; }
-                        return a.seq > b.seq;
-                    }
-                );
-                std::vector<SSTRecord> out;
-                out.reserve(records.size());
-                for (size_t i = 0; i < records.size();) {
-                    SSTRecord best = std::move(records[i]);
-                    ++i;
-                    while (i < records.size() && compareBytes(best.key, records[i].key) == 0) { ++i; }
-                    if (!(dropTombstones && best.isTombstone())) { out.push_back(std::move(best)); }
-                }
-                records = std::move(out);
+            [[nodiscard]] std::vector<Meta> flushOutputChunk(std::vector<SSTRecord>& records, int dst) {
+                if (records.empty()) { return {}; }
+
+                std::vector<core::RecordView> views;
+                views.reserve(records.size());
+                for (const auto& rec : records) { views.push_back(toView(rec)); }
+
+                const auto path = makeFilePath(dst);
+                const auto tmp = path.string() + ".tmp";
+                SSTWriter::Options wopts;
+                wopts.level = dst;
+                wopts.blockSize = options_.blockSize;
+                wopts.targetFileSize = options_.targetFileSize;
+                wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
+                wopts.codec = options_.codec;
+                (void)SSTWriter::write(tmp, views, wopts);
+                std::filesystem::rename(tmp, path);
+                auto reader = SSTReader::open(path, readerOptions());
+                if (!reader) { throw std::runtime_error("SSTManager: cannot reopen compacted SST"); }
+
+                std::vector<Meta> outputs;
+                outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));
+                records.clear();
+                return outputs;
             }
 
-            [[nodiscard]] std::vector<Meta> writeOutputs(std::vector<SSTRecord>& records, int dst) {
+            [[nodiscard]] std::vector<Meta> compactOutputs(const Work& work) {
+                struct Source {
+                    core::ArenaGenerator<SSTRecord> rows;
+                    core::ArenaGenerator<SSTRecord>::iterator it;
+                };
+                struct HeapEntry {
+                    SSTRecord rec;
+                    size_t sourceIdx = 0;
+                };
+                struct HeapGreater {
+                    bool operator()(const HeapEntry& a, const HeapEntry& b) const noexcept {
+                        const int c = compareBytes(a.rec.key, b.rec.key);
+                        if (c != 0) { return c > 0; }
+                        return a.rec.seq < b.rec.seq;
+                    }
+                };
+
+                auto pushCurrent = [](
+                    std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapGreater>& heap,
+                    std::vector<Source>& sources,
+                    size_t idx
+                ) {
+                    auto& source = sources[idx];
+                    if (source.it == std::default_sentinel) { return; }
+                    heap.push(HeapEntry{*source.it, idx});
+                    ++source.it;
+                };
+
+                std::vector<Source> sources;
+                sources.reserve(work.inputs.size());
+                std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapGreater> heap;
+                for (const auto& m : work.inputs) {
+                    if (!m.reader) { continue; }
+                    Source source;
+                    source.rows = m.reader->scan();
+                    source.it = source.rows.begin();
+                    const size_t sourceIdx = sources.size();
+                    sources.push_back(std::move(source));
+                    pushCurrent(heap, sources, sourceIdx);
+                }
+
                 std::vector<Meta> outputs;
-                size_t start = 0;
-                while (start < records.size()) {
-                    uint64_t bytes = 0;
-                    size_t end = start;
-                    while (end < records.size() && (end == start || bytes + recordBytes(records[end]) <= options_.targetFileSize)) {
-                        bytes += recordBytes(records[end]);
-                        ++end;
+                std::vector<SSTRecord> chunk;
+                uint64_t chunkBytes = 0;
+                const bool dropTombstones = work.dst == options_.maxLevels - 1;
+
+                while (!heap.empty()) {
+                    HeapEntry best = heap.top();
+                    heap.pop();
+                    pushCurrent(heap, sources, best.sourceIdx);
+
+                    while (!heap.empty() && compareBytes(heap.top().rec.key, best.rec.key) == 0) {
+                        HeapEntry next = heap.top();
+                        heap.pop();
+                        pushCurrent(heap, sources, next.sourceIdx);
+                        if (next.rec.seq > best.rec.seq) { best.rec = std::move(next.rec); }
                     }
 
-                    std::vector<core::RecordView> views;
-                    views.reserve(end - start);
-                    for (size_t i = start; i < end; ++i) { views.push_back(toView(records[i])); }
+                    if (dropTombstones && best.rec.isTombstone()) { continue; }
 
-                    const auto path = makeFilePath(dst);
-                    const auto tmp = path.string() + ".tmp";
-                    SSTWriter::Options wopts;
-                    wopts.level = dst;
-                    wopts.blockSize = options_.blockSize;
-                    wopts.targetFileSize = options_.targetFileSize;
-                    wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
-                    wopts.codec = options_.codec;
-                    (void)SSTWriter::write(tmp, views, wopts);
-                    std::filesystem::rename(tmp, path);
-                    auto reader = SSTReader::open(path, readerOptions());
-                    if (!reader) { throw std::runtime_error("SSTManager: cannot reopen compacted SST"); }
-                    outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));
-                    start = end;
+                    const uint64_t bytes = recordBytes(best.rec);
+                    if (!chunk.empty() && chunkBytes + bytes > options_.targetFileSize) {
+                        auto flushed = flushOutputChunk(chunk, work.dst);
+                        outputs.insert(outputs.end(), std::make_move_iterator(flushed.begin()), std::make_move_iterator(flushed.end()));
+                        chunkBytes = 0;
+                    }
+                    chunkBytes += bytes;
+                    chunk.push_back(std::move(best.rec));
+                }
+
+                if (!chunk.empty()) {
+                    auto flushed = flushOutputChunk(chunk, work.dst);
+                    outputs.insert(outputs.end(), std::make_move_iterator(flushed.begin()), std::make_move_iterator(flushed.end()));
                 }
                 return outputs;
             }
@@ -543,16 +622,7 @@ namespace akkaradb::engine::sst {
                 for (const auto& m : work.inputs) { inputFiles.push_back(m.filename); }
                 if (manifest_) { manifest_->compactionStart(work.src, inputFiles); }
 
-                std::vector<SSTRecord> merged;
-                for (const auto& m : work.inputs) {
-                    if (!m.reader) { continue; }
-                    auto rows = m.reader->scan();
-                    for (auto&& row : rows) { merged.push_back(std::move(row)); }
-                }
-                dedupeInPlace(merged, work.dst == options_.maxLevels - 1);
-
-                std::vector<Meta> outputs;
-                if (!merged.empty()) { outputs = writeOutputs(merged, work.dst); }
+                std::vector<Meta> outputs = compactOutputs(work);
 
                 std::vector<std::string> outputFiles;
                 uint64_t bytesOut = 0;
@@ -586,9 +656,13 @@ namespace akkaradb::engine::sst {
 
                 {
                     std::lock_guard lock{busyMu_};
-                    busySrc_.erase(work.src);
+                    std::erase_if(busyWork_, [&](const BusyWork& item) { return item.src == work.src && item.dst == work.dst; });
                 }
                 requestCompaction();
+            }
+
+            [[nodiscard]] bool isBusyLocked(int src, int dst) const {
+                return std::ranges::any_of(busyWork_, [=](const BusyWork& item) { return levelsOverlap(src, dst, item.src, item.dst); });
             }
 
             Options options_;
@@ -605,7 +679,7 @@ namespace akkaradb::engine::sst {
             std::atomic<bool> compactRequested_{false};
             std::atomic<bool> shuttingDown_{false};
             std::mutex busyMu_;
-            std::set<int> busySrc_;
+            std::vector<BusyWork> busyWork_;
 
             std::atomic<uint64_t> compactionsCompleted_{0};
             std::atomic<uint64_t> filesCompacted_{0};

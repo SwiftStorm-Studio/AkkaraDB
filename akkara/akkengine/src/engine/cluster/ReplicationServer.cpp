@@ -52,13 +52,11 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using SocketHandle = SOCKET;
-        constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET;
-        void shutdownSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } }
-        void closeSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } }
-        bool socketOk(SocketHandle s) noexcept { return s != INVALID_SOCKET; }
-
-        void netInit() {
+        using SocketHandle = SOCKET; constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET; void shutdownSocket(SocketHandle s) noexcept {
+            if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); }
+        } void closeSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } } bool socketOk(SocketHandle s) noexcept {
+            return s != INVALID_SOCKET;
+        } void netInit() {
             static std::once_flag once;
             std::call_once(
                 once,
@@ -69,10 +67,12 @@ namespace akkaradb::engine::cluster {
             );
         }
         #else
-        using SocketHandle = int; constexpr SocketHandle BAD_SOCKET = -1; void
-        shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } } void closeSocket(SocketHandle s) noexcept {
-            if (s >= 0) { ::close(s); }
-        } bool socketOk(SocketHandle s) noexcept { return s >= 0; } void netInit() {}
+        using SocketHandle = int;
+        constexpr SocketHandle BAD_SOCKET = -1;
+        void shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
+        void closeSocket(SocketHandle s) noexcept { if (s >= 0) { ::close(s); } }
+        bool socketOk(SocketHandle s) noexcept { return s >= 0; }
+        void netInit() {}
         #endif
 
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
@@ -138,8 +138,8 @@ namespace akkaradb::engine::cluster {
         }
 
         uint32_t readU32Le(const uint8_t* in) noexcept {
-            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (
-                static_cast<uint32_t>(in[3]) << 24);
+            return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (static_cast<
+                uint32_t>(in[3]) << 24);
         }
 
         uint64_t readU64Le(const uint8_t* in) noexcept {
@@ -155,16 +155,16 @@ namespace akkaradb::engine::cluster {
 
         std::optional<crypto::PublicKey> pinnedPeerKey(const ClusterRuntimeOptions& options, uint64_t nodeId) {
             if (nodeId == 0) { return std::nullopt; }
-            for (const auto& pin : options.secure.pinnedPeers) {
-                if (pin.nodeId == nodeId) { return pin.publicKey; }
-            }
+            for (const auto& pin : options.secure.pinnedPeers) { if (pin.nodeId == nodeId) { return pin.publicKey; } }
             return std::nullopt;
         }
 
         bool readSecureClientHello(SocketHandle socket, crypto::ClientHello& hello) {
             std::array<uint8_t, SECURE_CLIENT_HELLO_SIZE> wire{};
             if (!recvAll(socket, wire.data(), wire.size())) { return false; }
-            if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_CLIENT_HELLO) { return false; }
+            if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_CLIENT_HELLO) {
+                return false;
+            }
             std::memcpy(hello.staticPublicKey.data(), wire.data() + SECURE_HELLO_HEADER_SIZE, hello.staticPublicKey.size());
             std::memcpy(
                 hello.ephemeralPublicKey.data(),
@@ -206,8 +206,11 @@ namespace akkaradb::engine::cluster {
             writeU32Le(header.data() + 14, static_cast<uint32_t>(encrypted.ciphertext.size()));
             std::memcpy(header.data() + 18, encrypted.tag.data(), encrypted.tag.size());
 
-            return sendAll(socket, header.data(), header.size()) &&
-                   (encrypted.ciphertext.empty() || sendAll(socket, encrypted.ciphertext.data(), encrypted.ciphertext.size()));
+            return sendAll(socket, header.data(), header.size()) && (encrypted.ciphertext.empty() || sendAll(
+                socket,
+                encrypted.ciphertext.data(),
+                encrypted.ciphertext.size()
+            ));
         }
 
         bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out) {
@@ -285,9 +288,7 @@ namespace akkaradb::engine::cluster {
             std::thread sendThread;
             std::thread recvThread;
 
-            ~ReplicaState() {
-                closeSocket(sock);
-            }
+            ~ReplicaState() { closeSocket(sock); }
         };
     } // namespace
 
@@ -377,7 +378,8 @@ namespace akkaradb::engine::cluster {
                         continue;
                     }
                     if (secure) {
-                        if (const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId); expected && secureRemotePublicKey != *expected) {
+                        if (const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId); expected && secureRemotePublicKey != *
+                            expected) {
                             closeSocket(client);
                             continue;
                         }
@@ -521,10 +523,8 @@ namespace akkaradb::engine::cluster {
         impl->getCurrentSeq = std::move(getCurrentSeq);
         impl->ackPolicy = ackPolicy;
         impl->runtimeOptions = std::move(runtimeOptions);
-        if (impl->runtimeOptions.transportMode == TransportMode::SECURE) {
-            impl->localIdentity = loadSecureIdentity(impl->runtimeOptions);
-        }
-        return std::unique_ptr<ReplicationServer>(new ReplicationServer(std::move(impl)));
+        if (impl->runtimeOptions.transportMode == TransportMode::SECURE) { impl->localIdentity = loadSecureIdentity(impl->runtimeOptions); }
+        return std::unique_ptr < ReplicationServer > (new ReplicationServer(std::move(impl)));
     }
 
     void ReplicationServer::start() { impl_->start(); }

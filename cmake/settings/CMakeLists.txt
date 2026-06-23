@@ -1,0 +1,133 @@
+# ==================== Build Options ====================
+option(AKKARADB_BUILD_SHARED_LIBS "Build AkkaraDB shared libraries (.so/.dll)" ON)
+set(BUILD_SHARED_LIBS ${AKKARADB_BUILD_SHARED_LIBS} CACHE BOOL "Build shared libraries (.so/.dll)" FORCE)
+if (BUILD_SHARED_LIBS)
+    set(AKKARADB_LIBRARY_KIND SHARED)
+else ()
+    set(AKKARADB_LIBRARY_KIND STATIC)
+endif ()
+
+option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
+option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" OFF)
+option(AKKARADB_BUILD_API_SERVERS "Build API server shared libraries" ON)
+option(AKKARADB_BUILD_API_HTTP "Build HTTP API transport backend" ON)
+option(AKKARADB_BUILD_API_TCP "Build TCP API transport backend" ON)
+option(AKKARADB_BUILD_API_GRPC "Build gRPC API transport backend" ON)
+option(AKKARADB_FETCH_GRPC "Fetch gRPC with FetchContent when system packages are unavailable" OFF)
+
+set(AKKARADB_REVISION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION_REVISION" CACHE FILEPATH "AkkaraDB release revision counter file")
+set(AKKARADB_DETAIL_VERSION_BASE "126.1.1" CACHE STRING "AkkaraDB detailed release version prefix")
+set(AKKARADB_PRERELEASE "rc.1" CACHE STRING "AkkaraDB prerelease label used in dist artifact names")
+set(AKKARADB_COMPAT_LINE "126.1" CACHE STRING "AkkaraDB native/JNI compatibility line used in library file names")
+set(AKKARADB_RELEASE_VERSION "${AKKARADB_DETAIL_VERSION_BASE}-${AKKARADB_PRERELEASE}")
+
+if (NOT AKKARADB_BUILD_API_SERVERS)
+    set(AKKARADB_BUILD_API_HTTP OFF)
+    set(AKKARADB_BUILD_API_TCP OFF)
+    set(AKKARADB_BUILD_API_GRPC OFF)
+elseif (
+    NOT AKKARADB_BUILD_API_HTTP
+    AND NOT AKKARADB_BUILD_API_TCP
+    AND NOT AKKARADB_BUILD_API_GRPC
+)
+    message(FATAL_ERROR
+            "AKKARADB_BUILD_API_SERVERS=ON requires at least one enabled backend: "
+            "AKKARADB_BUILD_API_HTTP, AKKARADB_BUILD_API_TCP, or AKKARADB_BUILD_API_GRPC")
+endif ()
+
+# ==================== C++ Standard ====================
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# ==================== Directory Configuration ====================
+set(AKKARA_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/akkara)
+set(AKKARADB_DIR ${AKKARA_ROOT}/akkaradb)
+set(AKKENGINE_DIR ${AKKARA_ROOT}/akkengine)
+
+set(AKKARADB_INCLUDE_DIR ${AKKARADB_DIR}/include)
+set(AKKARADB_SRC_DIR ${AKKARADB_DIR}/src)
+
+set(AKKENGINE_INCLUDE_DIR ${AKKENGINE_DIR}/include)
+set(AKKENGINE_SRC_DIR ${AKKENGINE_DIR}/src)
+
+set(AKKGRPC_DIR ${AKKARA_ROOT}/akkgrpc)
+set(AKKGRPC_INCLUDE_DIR ${AKKGRPC_DIR}/include)
+set(AKKGRPC_SRC_DIR ${AKKGRPC_DIR}/src)
+set(AKKGRPC_PROTO_DIR ${AKKGRPC_DIR}/proto)
+
+set(AKKARADB_RUNTIME_OUTPUT_DIR "${CMAKE_BINARY_DIR}/bin")
+set(AKKARADB_TEST_OUTPUT_DIR "${CMAKE_BINARY_DIR}/test")
+file(MAKE_DIRECTORY "${AKKARADB_RUNTIME_OUTPUT_DIR}")
+
+string(TOLOWER "${CMAKE_SYSTEM_NAME}" AKKARADB_DIST_OS)
+if (AKKARADB_DIST_OS STREQUAL "darwin")
+    set(AKKARADB_DIST_OS "macos")
+endif ()
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" AKKARADB_DIST_ARCH)
+if (AKKARADB_DIST_ARCH MATCHES "^(amd64|x86_64)$")
+    set(AKKARADB_DIST_ARCH "x86_64")
+elseif (AKKARADB_DIST_ARCH MATCHES "^(arm64|aarch64)$")
+    set(AKKARADB_DIST_ARCH "aarch64")
+endif ()
+
+set(AKKARADB_DIST_PLATFORM "${AKKARADB_DIST_OS}-${AKKARADB_DIST_ARCH}")
+set(AKKARADB_NATIVE_OUTPUT_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_OUTPUT_NAME "akkaradb-api-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_HTTP_OUTPUT_NAME "akkaradb-api-http-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_TCP_OUTPUT_NAME "akkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_API_GRPC_OUTPUT_NAME "akkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_CLUSTER_OUTPUT_NAME "akkaradb-cluster-${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_JNI_OUTPUT_NAME "akkaradb-jni-${AKKARADB_RELEASE_VERSION}")
+string(REGEX MATCH "^[0-9]+" AKKARADB_NATIVE_GENERATION "${AKKARADB_COMPAT_LINE}")
+
+if (WIN32)
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "akkaradb-native-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "akkaradb-api-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "akkaradb-api-http-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "akkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "akkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.dll")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "akkaradb-cluster-${AKKARADB_RELEASE_VERSION}.dll")
+elseif (APPLE)
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "libakkaradb-api-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "libakkaradb-api-http-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "libakkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "libakkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.dylib")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "libakkaradb-cluster-${AKKARADB_RELEASE_VERSION}.dylib")
+else ()
+    set(AKKARADB_NATIVE_DIST_LIBRARY_NAME "libakkaradb-native-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_DIST_LIBRARY_NAME "libakkaradb-api-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_HTTP_DIST_LIBRARY_NAME "libakkaradb-api-http-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_TCP_DIST_LIBRARY_NAME "libakkaradb-api-tcp-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_API_GRPC_DIST_LIBRARY_NAME "libakkaradb-api-grpc-${AKKARADB_RELEASE_VERSION}.so")
+    set(AKKARADB_CLUSTER_DIST_LIBRARY_NAME "libakkaradb-cluster-${AKKARADB_RELEASE_VERSION}.so")
+endif ()
+
+set(AKKARADB_NATIVE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_JNI_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/jni/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_NATIVE_PACKAGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/native")
+set(AKKARADB_RELEASE_DIST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/dist/${AKKARADB_RELEASE_VERSION}")
+set(AKKARADB_SDK_PACKAGE_NAME "akkaradb-sdk-${AKKARADB_RELEASE_VERSION}-${AKKARADB_DIST_PLATFORM}")
+set(AKKARADB_SDK_EXTRACT_DIR "${CMAKE_BINARY_DIR}/sdk-package/${AKKARADB_SDK_PACKAGE_NAME}")
+set(AKKARADB_SDK_ZIP "${AKKARADB_RELEASE_DIST_DIR}/${AKKARADB_SDK_PACKAGE_NAME}.zip")
+file(MAKE_DIRECTORY "${AKKARADB_NATIVE_DIST_DIR}")
+file(MAKE_DIRECTORY "${AKKARADB_JNI_DIST_DIR}")
+file(MAKE_DIRECTORY "${AKKARADB_RELEASE_DIST_DIR}")
+
+# ==================== Compiler Settings ====================
+if (MSVC)
+    add_compile_options(/W4 /permissive- /utf-8)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    if (AKKARADB_BUILD_JNI)
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL" CACHE STRING "" FORCE)
+    endif ()
+else ()
+    add_compile_options(-Wall -Wextra -pedantic)
+endif ()
+
+# ==================== Windows-specific definitions ====================
+if (WIN32)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif ()

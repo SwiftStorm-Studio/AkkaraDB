@@ -42,8 +42,7 @@ namespace akkaradb::engine::server {
         ROLLBACK_KEY = 0x0D,
         FORCE_SYNC = 0x0E,
         FORCE_FLUSH = 0x0F,
-        STATS = 0x10,
-    };
+        STATS = 0x10, };
 
     enum class ApiStatus : uint8_t {
         OK = 0x00, NOT_FOUND = 0x01, ERROR_STATUS = 0xFF,
@@ -87,9 +86,26 @@ namespace akkaradb::engine::server {
     [[nodiscard]] AKKARADB_API_SERVER_API uint32_t crc32c(std::span<const uint8_t> data) noexcept;
     [[nodiscard]] AKKARADB_API_SERVER_API uint32_t crc32c(std::span<const uint8_t> first, std::span<const uint8_t> second);
 
-    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchPut(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<ApiBatchPutItem>& out);
-    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchGet(std::span<const uint8_t> payload, uint32_t maxItems, std::vector<std::span<const uint8_t>>& out);
-    AKKARADB_API_SERVER_API void encodeResponse(ApiStatus status, uint32_t requestId, std::span<const uint8_t> value, std::vector<uint8_t>& out);
-    AKKARADB_API_SERVER_API void encodeBatchGetResponse(uint32_t requestId, std::span<const ApiBatchGetResult> results, std::vector<uint8_t>& out);
+    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchPut(
+        std::span<const uint8_t> payload,
+        uint32_t maxItems,
+        std::vector<ApiBatchPutItem>& out
+    );
+    [[nodiscard]] AKKARADB_API_SERVER_API bool decodeBatchGet(
+        std::span<const uint8_t> payload,
+        uint32_t maxItems,
+        std::vector<std::span<const uint8_t>>& out
+    );
+    AKKARADB_API_SERVER_API void encodeResponse(
+        ApiStatus status,
+        uint32_t requestId,
+        std::span<const uint8_t> value,
+        std::vector<uint8_t>& out
+    );
+    AKKARADB_API_SERVER_API void encodeBatchGetResponse(
+        uint32_t requestId,
+        std::span<const ApiBatchGetResult> results,
+        std::vector<uint8_t>& out
+    );
     AKKARADB_API_SERVER_API void encodeError(uint32_t requestId, std::vector<uint8_t>& out);
 }

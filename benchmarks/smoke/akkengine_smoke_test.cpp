@@ -23,6 +23,7 @@
 #include "akk/engine/vlog/VersionLog.hpp"
 
 #include <filesystem>
+#include <stdexcept>
 #include <span>
 #include <string>
 #include <string_view>
@@ -125,6 +126,28 @@ namespace {
         AKK_TEST_CHECK(text(*engine->get(bytes("blob"))) == "large-value");
     }
 
+    void testBlobGc() {
+        const auto dir = tempDir("blob_gc");
+        AkkEngineOptions opts;
+        opts.paths.dataDir = dir;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
+        opts.blob.thresholdBytes = 4;
+        opts.blob.gcOnClose = true;
+
+        {
+            auto engine = AkkEngine::open(opts);
+            engine->put(bytes("blob"), bytes("large-value"));
+            const auto oldBlobPath = dir / "blobs" / "00" / "0000000000000001.akblob";
+            AKK_TEST_CHECK(fs::exists(oldBlobPath));
+            engine->put(bytes("blob"), bytes("x"));
+            AKK_TEST_CHECK(text(*engine->get(bytes("blob"))) == "x");
+            engine->runBlobGc();
+            engine->close();
+            AKK_TEST_CHECK(!fs::exists(oldBlobPath));
+        }
+    }
+
     void testFlushAndScan() {
         const auto dir = tempDir("flush");
         AkkEngineOptions opts;
@@ -176,6 +199,37 @@ namespace {
         AKK_TEST_CHECK(afterRollback.size() == 3);
         AKK_TEST_CHECK(afterRollback.back().sourceNodeId == akkaradb::engine::vlog::ROLLBACK_NODE);
         AKK_TEST_CHECK((afterRollback.back().flags & akkaradb::engine::vlog::VLOG_FLAG_ROLLBACK) != 0);
+
+        const auto stats = engine->stats();
+        AKK_TEST_CHECK(stats.vlog.enabled);
+        AKK_TEST_CHECK(stats.vlog.syncMode == static_cast<uint32_t>(akkaradb::engine::vlog::VLogSyncMode::ASYNC));
+        AKK_TEST_CHECK(stats.vlog.indexedKeys == 1);
+        AKK_TEST_CHECK(stats.vlog.indexedEntries == 3);
+        AKK_TEST_CHECK(stats.vlog.rollbackEntries == 1);
+        AKK_TEST_CHECK(stats.vlog.asyncMaxPendingBytes == opts.vlog.asyncMaxPendingBytes);
+        AKK_TEST_CHECK(stats.vlog.flushThreadRunning);
+        AKK_TEST_CHECK(stats.vlog.durableBytes > 0);
+    }
+
+    void testBlobGcRejectedWithVersionLog() {
+        const auto dir = tempDir("blob_gc_vlog");
+        AkkEngineOptions opts;
+        opts.paths.dataDir = dir;
+        opts.components.manifestEnabled = false;
+        opts.components.sstEnabled = false;
+        opts.components.versionLogEnabled = true;
+        opts.blob.thresholdBytes = 4;
+
+        auto engine = AkkEngine::open(opts);
+        engine->put(bytes("blob"), bytes("large-value"));
+        bool threw = false;
+        try {
+            engine->runBlobGc();
+        }
+        catch (const std::runtime_error&) {
+            threw = true;
+        }
+        AKK_TEST_CHECK(threw);
     }
 }
 
@@ -185,7 +239,9 @@ int main() {
     testMemoryBasic();
     testWalRecovery();
     testBlob();
+    testBlobGc();
     testFlushAndScan();
     testVersionLog();
+    testBlobGcRejectedWithVersionLog();
     return 0;
 }

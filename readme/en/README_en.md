@@ -472,7 +472,7 @@ benchmarks/api/
 |-----------|--------------|------------------------------------------------|
 | Zstandard | 1.5.6        | Compression for SST and blob payloads          |
 | Boost.PFR | boost-1.84.0 | Aggregate reflection for BinPack               |
-| mbedTLS   | 3.6.2        | TLS support for API and replication transports |
+| mbedTLS   | 4.1.0        | TLS support for API and replication transports |
 
 Dependencies are fetched by CMake through `FetchContent`.
 

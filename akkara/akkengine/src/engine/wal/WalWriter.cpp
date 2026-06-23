@@ -565,7 +565,7 @@ namespace akkaradb::engine::wal {
     };
 
     std::unique_ptr<WalWriter> WalWriter::create(WalOptions options) {
-        auto writer = std::unique_ptr<WalWriter>(new WalWriter{});
+        auto writer = std::unique_ptr < WalWriter > (new WalWriter{});
         writer->impl_ = std::make_unique<Impl>(std::move(options));
         return writer;
     }

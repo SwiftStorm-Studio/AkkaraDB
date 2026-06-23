@@ -49,34 +49,22 @@ namespace akkaradb::engine::erasure {
             if (layout.parityShards != DUAL_XOR_PARITY_SHARDS) {
                 throw std::invalid_argument("DualXorErasureCodec: DualXOR requires exactly two parity shards");
             }
-            if (layout.dataShards > 255) {
-                throw std::invalid_argument("DualXorErasureCodec: dataShards must be <= 255");
-            }
-            if (layout.totalShards() < layout.dataShards) {
-                throw std::invalid_argument("DualXorErasureCodec: too many shards");
-            }
+            if (layout.dataShards > 255) { throw std::invalid_argument("DualXorErasureCodec: dataShards must be <= 255"); }
+            if (layout.totalShards() < layout.dataShards) { throw std::invalid_argument("DualXorErasureCodec: too many shards"); }
         }
 
         void validateRsLayout(const ErasureLayout& layout) {
             if (layout.dataShards == 0) { throw std::invalid_argument("RsErasureCodec: dataShards must be > 0"); }
             if (layout.parityShards == 0) { throw std::invalid_argument("RsErasureCodec: parityShards must be > 0"); }
-            if (layout.totalShards() > 255) {
-                throw std::invalid_argument("RsErasureCodec: totalShards must be <= 255");
-            }
-            if (layout.totalShards() < layout.dataShards) {
-                throw std::invalid_argument("RsErasureCodec: too many shards");
-            }
+            if (layout.totalShards() > 255) { throw std::invalid_argument("RsErasureCodec: totalShards must be <= 255"); }
+            if (layout.totalShards() < layout.dataShards) { throw std::invalid_argument("RsErasureCodec: too many shards"); }
         }
 
         void validateErsLayout(const ErasureLayout& layout) {
             if (layout.dataShards == 0) { throw std::invalid_argument("ErsCodec: dataShards must be > 0"); }
             if (layout.parityShards == 0) { throw std::invalid_argument("ErsCodec: parityShards must be > 0"); }
-            if (layout.totalShards() > 255) {
-                throw std::invalid_argument("ErsCodec: totalShards must be <= 255");
-            }
-            if (layout.totalShards() < layout.dataShards) {
-                throw std::invalid_argument("ErsCodec: too many shards");
-            }
+            if (layout.totalShards() > 255) { throw std::invalid_argument("ErsCodec: totalShards must be <= 255"); }
+            if (layout.totalShards() < layout.dataShards) { throw std::invalid_argument("ErsCodec: too many shards"); }
         }
 
         uint32_t checksum(std::span<const uint8_t> payload) noexcept {
@@ -159,39 +147,27 @@ namespace akkaradb::engine::erasure {
             static const Gf256Tables tables = [] {
                 Gf256Tables built;
                 for (uint32_t a = 0; a < 256; ++a) {
-                    for (uint32_t b = 0; b < 256; ++b) {
-                        built.mul[a][b] = gfMul(static_cast<uint8_t>(a), static_cast<uint8_t>(b));
-                    }
+                    for (uint32_t b = 0; b < 256; ++b) { built.mul[a][b] = gfMul(static_cast<uint8_t>(a), static_cast<uint8_t>(b)); }
                 }
                 built.inv[0] = 0;
-                for (uint32_t value = 1; value < 256; ++value) {
-                    built.inv[value] = gfInv(static_cast<uint8_t>(value));
-                }
+                for (uint32_t value = 1; value < 256; ++value) { built.inv[value] = gfInv(static_cast<uint8_t>(value)); }
                 return built;
             }();
             return tables;
         }
 
-        [[nodiscard]] const uint8_t* gfMulRow(uint8_t coefficient) noexcept {
-            return gf256Tables().mul[coefficient].data();
-        }
+        [[nodiscard]] const uint8_t* gfMulRow(uint8_t coefficient) noexcept { return gf256Tables().mul[coefficient].data(); }
 
-        [[nodiscard]] uint8_t gfMulFast(uint8_t coefficient, uint8_t value) noexcept {
-            return gf256Tables().mul[coefficient][value];
-        }
+        [[nodiscard]] uint8_t gfMulFast(uint8_t coefficient, uint8_t value) noexcept { return gf256Tables().mul[coefficient][value]; }
 
         [[nodiscard]] uint8_t gfInvFast(uint8_t value) {
             if (value == 0) { throw std::runtime_error("DualXorErasureCodec: coefficient is not invertible"); }
             return gf256Tables().inv[value];
         }
 
-        [[nodiscard]] uint8_t dualXorCoefficient(uint16_t dataIndex) {
-            return static_cast<uint8_t>(dataIndex + 1u);
-        }
+        [[nodiscard]] uint8_t dualXorCoefficient(uint16_t dataIndex) { return static_cast<uint8_t>(dataIndex + 1u); }
 
-        [[nodiscard]] uint8_t rsBaseCoefficient(uint16_t dataIndex) {
-            return static_cast<uint8_t>(dataIndex + 1u);
-        }
+        [[nodiscard]] uint8_t rsBaseCoefficient(uint16_t dataIndex) { return static_cast<uint8_t>(dataIndex + 1u); }
 
         [[nodiscard]] uint8_t rsCoefficient(uint16_t parityOrdinal, uint16_t dataIndex) noexcept {
             return gfPow(rsBaseCoefficient(dataIndex), static_cast<uint8_t>(parityOrdinal + 1u));
@@ -282,8 +258,12 @@ namespace akkaradb::engine::erasure {
                     haveMeta = true;
                 }
                 else {
-                    if (set.originalSize != shard.originalSize) { throw std::invalid_argument("DualXorErasureCodec: originalSize mismatch"); }
-                    if (set.payloadSize != shard.payload.size()) { throw std::invalid_argument("DualXorErasureCodec: payload size mismatch"); }
+                    if (set.originalSize != shard.originalSize) {
+                        throw std::invalid_argument("DualXorErasureCodec: originalSize mismatch");
+                    }
+                    if (set.payloadSize != shard.payload.size()) {
+                        throw std::invalid_argument("DualXorErasureCodec: payload size mismatch");
+                    }
                 }
                 set.byIndex[shard.index] = &shard;
             }
@@ -416,9 +396,7 @@ namespace akkaradb::engine::erasure {
             };
 
             for (uint16_t row = 0; row < dimension; ++row) {
-                for (uint16_t col = 0; col < dimension; ++col) {
-                    at(row, col) = matrix[static_cast<size_t>(row) * dimension + col];
-                }
+                for (uint16_t col = 0; col < dimension; ++col) { at(row, col) = matrix[static_cast<size_t>(row) * dimension + col]; }
                 at(row, static_cast<uint16_t>(dimension + row)) = 1;
             }
 
@@ -427,23 +405,17 @@ namespace akkaradb::engine::erasure {
                 while (pivotRow < dimension && at(pivotRow, pivot) == 0) { ++pivotRow; }
                 if (pivotRow == dimension) { throw std::runtime_error("RsErasureCodec: generator matrix is singular"); }
                 if (pivotRow != pivot) {
-                    for (uint16_t col = 0; col < dimension * 2u; ++col) {
-                        std::swap(at(pivot, col), at(pivotRow, col));
-                    }
+                    for (uint16_t col = 0; col < dimension * 2u; ++col) { std::swap(at(pivot, col), at(pivotRow, col)); }
                 }
 
                 const uint8_t invPivot = gfInv(at(pivot, pivot));
-                for (uint16_t col = 0; col < dimension * 2u; ++col) {
-                    at(pivot, col) = gfMul(at(pivot, col), invPivot);
-                }
+                for (uint16_t col = 0; col < dimension * 2u; ++col) { at(pivot, col) = gfMul(at(pivot, col), invPivot); }
 
                 for (uint16_t row = 0; row < dimension; ++row) {
                     if (row == pivot) { continue; }
                     const uint8_t factor = at(row, pivot);
                     if (factor == 0) { continue; }
-                    for (uint16_t col = 0; col < dimension * 2u; ++col) {
-                        at(row, col) ^= gfMul(factor, at(pivot, col));
-                    }
+                    for (uint16_t col = 0; col < dimension * 2u; ++col) { at(row, col) ^= gfMul(factor, at(pivot, col)); }
                 }
             }
 
@@ -505,13 +477,10 @@ namespace akkaradb::engine::erasure {
         }
 
         [[nodiscard]] bool shardMatches(const ErasureShard& lhs, const ErasureShard& rhs) noexcept {
-            return lhs.index == rhs.index
-                && lhs.originalSize == rhs.originalSize
-                && lhs.payload == rhs.payload
-                && lhs.crc32c == rhs.crc32c;
+            return lhs.index == rhs.index && lhs.originalSize == rhs.originalSize && lhs.payload == rhs.payload && lhs.crc32c == rhs.crc32c;
         }
 
-        template<typename Fn>
+        template <typename Fn>
         bool forEachCombination(const std::vector<uint16_t>& values, size_t choose, Fn&& fn) {
             std::vector<uint16_t> picked;
             picked.reserve(choose);
@@ -570,7 +539,11 @@ namespace akkaradb::engine::erasure {
         for (const auto& shard : data) { shards.push_back(shard); }
 
         for (uint16_t parityOrdinal = 0; parityOrdinal < layout.parityShards; ++parityOrdinal) {
-            ErasureShard parity = makeErsShard(static_cast<uint16_t>(layout.dataShards + parityOrdinal), static_cast<uint64_t>(value.size()), payloadSize);
+            ErasureShard parity = makeErsShard(
+                static_cast<uint16_t>(layout.dataShards + parityOrdinal),
+                static_cast<uint64_t>(value.size()),
+                payloadSize
+            );
             for (uint16_t dataIndex = 0; dataIndex < layout.dataShards; ++dataIndex) {
                 xorMulRowInto(
                     parity.payload.data(),
@@ -586,7 +559,11 @@ namespace akkaradb::engine::erasure {
         return shards;
     }
 
-    ErsRecoveryResult ErsCodec::recover(std::span<const ErasureShard> shards, ErasureLayout layout, std::span<const uint16_t> knownBadIndices) {
+    ErsRecoveryResult ErsCodec::recover(
+        std::span<const ErasureShard> shards,
+        ErasureLayout layout,
+        std::span<const uint16_t> knownBadIndices
+    ) {
         validateErsLayout(layout);
         const ErsShardSet input = validateErsShards(shards, layout);
 
@@ -610,9 +587,7 @@ namespace akkaradb::engine::erasure {
         std::vector<uint16_t> candidatePool;
         candidatePool.reserve(layout.totalShards());
         for (uint16_t shardIndex = 0; shardIndex < layout.totalShards(); ++shardIndex) {
-            if (input.shards.byIndex[shardIndex] != nullptr && forcedBad[shardIndex] == 0) {
-                candidatePool.push_back(shardIndex);
-            }
+            if (input.shards.byIndex[shardIndex] != nullptr && forcedBad[shardIndex] == 0) { candidatePool.push_back(shardIndex); }
         }
 
         ErsRecoveryResult result;
@@ -632,12 +607,8 @@ namespace akkaradb::engine::erasure {
             }
 
             std::vector<ErasureShard> data;
-            try {
-                data = convertRsDataToErs(reconstructRsData(candidate, layout));
-            }
-            catch (const std::runtime_error&) {
-                return false;
-            }
+            try { data = convertRsDataToErs(reconstructRsData(candidate, layout)); }
+            catch (const std::runtime_error&) { return false; }
 
             const std::vector<uint8_t> value = joinDataShards(data, input.shards.originalSize);
             const auto expected = encode(value, layout);
@@ -663,9 +634,7 @@ namespace akkaradb::engine::erasure {
         };
 
         for (size_t extraErrors = 0; extraErrors <= searchUnknownErrors; ++extraErrors) {
-            if (forEachCombination(candidatePool, extraErrors, [&](const std::vector<uint16_t>& picked) {
-                    return tryCandidate(picked);
-                })) {
+            if (forEachCombination(candidatePool, extraErrors, [&](const std::vector<uint16_t>& picked) { return tryCandidate(picked); })) {
                 return result;
             }
         }
@@ -676,9 +645,11 @@ namespace akkaradb::engine::erasure {
         throw std::runtime_error("ErsCodec: failed to identify a recoverable shard error/erasure set");
     }
 
-    std::vector<uint8_t> ErsCodec::decode(std::span<const ErasureShard> shards, ErasureLayout layout, std::span<const uint16_t> knownBadIndices) {
-        return recover(shards, layout, knownBadIndices).value;
-    }
+    std::vector<uint8_t> ErsCodec::decode(
+        std::span<const ErasureShard> shards,
+        ErasureLayout layout,
+        std::span<const uint16_t> knownBadIndices
+    ) { return recover(shards, layout, knownBadIndices).value; }
 
     size_t XorErasureCodec::shardPayloadSize(uint64_t originalSize, uint16_t dataShards) {
         if (dataShards == 0) { throw std::invalid_argument("XorErasureCodec: dataShards must be > 0"); }
@@ -837,12 +808,8 @@ namespace akkaradb::engine::erasure {
         if (set.byIndex[missingIndex] != nullptr) { throw std::invalid_argument("DualXorErasureCodec: missing index is already present"); }
 
         uint16_t missingCount = 0;
-        for (const auto* shard : set.byIndex) {
-            if (shard == nullptr) { ++missingCount; }
-        }
-        if (missingCount != 1) {
-            throw std::runtime_error("DualXorErasureCodec: repairOne requires exactly one missing shard");
-        }
+        for (const auto* shard : set.byIndex) { if (shard == nullptr) { ++missingCount; } }
+        if (missingCount != 1) { throw std::runtime_error("DualXorErasureCodec: repairOne requires exactly one missing shard"); }
 
         const uint16_t pIndex = layout.dataShards;
         const uint16_t qIndex = static_cast<uint16_t>(layout.dataShards + 1u);
@@ -888,9 +855,7 @@ namespace akkaradb::engine::erasure {
                     repaired.payload[byteIndex] = invCoeffRow[value];
                 }
             }
-            else {
-                throw std::runtime_error("DualXorErasureCodec: cannot repair data shard without parity");
-            }
+            else { throw std::runtime_error("DualXorErasureCodec: cannot repair data shard without parity"); }
         }
 
         repaired.crc32c = checksum(repaired.payload);
@@ -904,9 +869,7 @@ namespace akkaradb::engine::erasure {
 
         std::vector<uint16_t> missingData;
         missingData.reserve(2);
-        for (uint16_t i = 0; i < layout.dataShards; ++i) {
-            if (set.byIndex[i] == nullptr) { missingData.push_back(i); }
-        }
+        for (uint16_t i = 0; i < layout.dataShards; ++i) { if (set.byIndex[i] == nullptr) { missingData.push_back(i); } }
         if (missingData.size() > 2) { throw std::runtime_error("DualXorErasureCodec: more than two data shards are missing"); }
 
         std::vector<ErasureShard> data;
@@ -943,9 +906,7 @@ namespace akkaradb::engine::erasure {
                     repaired.payload[byteIndex] = invCoeffRow[value];
                 }
             }
-            else {
-                throw std::runtime_error("DualXorErasureCodec: cannot repair data shard without parity");
-            }
+            else { throw std::runtime_error("DualXorErasureCodec: cannot repair data shard without parity"); }
             repaired.crc32c = checksum(repaired.payload);
             for (uint16_t i = 0; i < layout.dataShards; ++i) {
                 if (i == missingIndex) { data.push_back(repaired); }
@@ -1032,7 +993,11 @@ namespace akkaradb::engine::erasure {
         for (const auto& shard : data) { shards.push_back(shard); }
 
         for (uint16_t parityOrdinal = 0; parityOrdinal < layout.parityShards; ++parityOrdinal) {
-            ErasureShard parity = makeRsShard(static_cast<uint16_t>(layout.dataShards + parityOrdinal), static_cast<uint64_t>(value.size()), payloadSize);
+            ErasureShard parity = makeRsShard(
+                static_cast<uint16_t>(layout.dataShards + parityOrdinal),
+                static_cast<uint64_t>(value.size()),
+                payloadSize
+            );
             for (uint16_t dataIndex = 0; dataIndex < layout.dataShards; ++dataIndex) {
                 xorMulRowInto(
                     parity.payload.data(),
@@ -1060,9 +1025,7 @@ namespace akkaradb::engine::erasure {
         if (set.byIndex[missingIndex] != nullptr) { throw std::invalid_argument("RsErasureCodec: missing index is already present"); }
 
         const auto data = reconstructRsData(set, layout);
-        if (missingIndex < layout.dataShards) {
-            return data[missingIndex];
-        }
+        if (missingIndex < layout.dataShards) { return data[missingIndex]; }
 
         const uint16_t parityOrdinal = static_cast<uint16_t>(missingIndex - layout.dataShards);
         ErasureShard parity = makeRsShard(missingIndex, set.originalSize, set.payloadSize);

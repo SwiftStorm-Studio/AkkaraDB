@@ -53,10 +53,7 @@ namespace akkaradb::grpcapi {
 
     class AKKARADB_GRPC_API AkkaraGRPCServer {
         public:
-            [[nodiscard]] static std::unique_ptr<AkkaraGRPCServer> create(
-                engine::AkkEngine& engine,
-                AkkaraGRPCServerOptions options = {}
-            );
+            [[nodiscard]] static std::unique_ptr<AkkaraGRPCServer> create(engine::AkkEngine& engine, AkkaraGRPCServerOptions options = {});
 
             ~AkkaraGRPCServer();
 

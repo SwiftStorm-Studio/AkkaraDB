@@ -144,7 +144,11 @@ namespace akkaradb::engine::cluster {
     /**
      * Encodes a complete frame with header, payload, and payload CRC32C.
      */
-    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeFrame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags = 0);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeFrame(
+        ReplMsgType type,
+        std::span<const uint8_t> payload,
+        uint8_t flags = 0
+    );
 
     /**
      * Decodes and validates a complete frame.

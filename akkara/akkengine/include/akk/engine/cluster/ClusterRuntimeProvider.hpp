@@ -16,12 +16,12 @@ namespace akkaradb::engine::cluster {
         std::function<uint64_t()> getCurrentSeq;
         std::function<uint64_t()> getLastSeq;
         std::function<void(
-            uint64_t seq,
-            ReplOpType op,
-            std::span<const uint8_t> key,
-            std::span<const uint8_t> value,
-            uint8_t recordFlags,
-            uint64_t sourceNodeId
+uint64_t seq,
+ ReplOpType op,
+ std::span<const uint8_t> key,
+ std::span<const uint8_t> value,
+ uint8_t recordFlags,
+ uint64_t sourceNodeId
         )> apply;
         std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)> applyBlob;
         std::function<void(NodeRole role)> roleChange;

@@ -49,10 +49,10 @@ namespace akkaradb::engine::manifest {
         class FileHandle {
             public:
                 #ifdef _WIN32
-                using NativeHandle = HANDLE;
-                inline static const NativeHandle INVALID = INVALID_HANDLE_VALUE;
+                using NativeHandle = HANDLE; inline static const NativeHandle INVALID = INVALID_HANDLE_VALUE;
                 #else
-                using NativeHandle = int; static constexpr NativeHandle INVALID = -1;
+                using NativeHandle = int;
+                static constexpr NativeHandle INVALID = -1;
                 #endif
 
                 FileHandle() : handle_{INVALID} {}
@@ -83,27 +83,23 @@ namespace akkaradb::engine::manifest {
                         OPEN_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL,
                         nullptr
-                    );
-                    if (fh.handle_ == INVALID) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
+                    ); if (fh.handle_ == INVALID) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
                     ::SetFilePointer(fh.handle_, 0, nullptr, FILE_END);
                     #else
-                    fh.handle_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644); if (fh.handle_ < 0) {
-                        throw std::runtime_error("Failed to open manifest: " + path.string());
-                    }
+                    fh.handle_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+                    if (fh.handle_ < 0) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
                     #endif
                     return fh;
                 }
 
                 void write(const uint8_t* data, size_t size) {
                     #ifdef _WIN32
-                    DWORD written = 0;
-                    if (!::WriteFile(handle_, data, static_cast<DWORD>(size), &written, nullptr)) {
+                    DWORD written = 0; if (!::WriteFile(handle_, data, static_cast<DWORD>(size), &written, nullptr)) {
                         throw std::runtime_error("Manifest write failed");
                     }
                     #else
-                    ssize_t result = ::write(handle_, data, size); if (result < 0 || static_cast<size_t>(result) != size) {
-                        throw std::runtime_error("Manifest write failed");
-                    }
+                    ssize_t result = ::write(handle_, data, size);
+                    if (result < 0 || static_cast<size_t>(result) != size) { throw std::runtime_error("Manifest write failed"); }
                     #endif
                 }
 
@@ -169,7 +165,7 @@ namespace akkaradb::engine::manifest {
 
                 replayInternal();
 
-                rotationCounter_ = findLastRotationNumber() + 1;
+                rotationCounter_ = findLastRotationNumber();
 
                 currentPath_ = makeManifestPath(rotationCounter_);
                 fileHandle_ = FileHandle::open(currentPath_);
@@ -381,16 +377,31 @@ namespace akkaradb::engine::manifest {
             // Path helpers
             // ----------------------------------------------------------------
 
-            [[nodiscard]] std::filesystem::path makeManifestPath(size_t rotationNumber) const {
+            [[nodiscard]] std::filesystem::path makeLegacyManifestPath(size_t rotationNumber) const {
                 if (rotationNumber == 0) { return path_; }
                 return path_.parent_path() / (path_.filename().string() + "." + std::to_string(rotationNumber));
+            }
+
+            [[nodiscard]] std::filesystem::path makeManifestPath(size_t rotationNumber) const {
+                if (rotationNumber == 0) { return path_; }
+                return path_.parent_path() /
+                    (path_.stem().string() + "-" + std::to_string(rotationNumber) + path_.extension().string());
+            }
+
+            [[nodiscard]] std::filesystem::path existingManifestPath(size_t rotationNumber) const {
+                const auto path = makeManifestPath(rotationNumber);
+                if (std::filesystem::exists(path)) { return path; }
+
+                const auto legacyPath = makeLegacyManifestPath(rotationNumber);
+                if (legacyPath != path && std::filesystem::exists(legacyPath)) { return legacyPath; }
+                return {};
             }
 
             [[nodiscard]] size_t findLastRotationNumber() const {
                 size_t maxRotation = 0;
                 if (std::filesystem::exists(path_)) { maxRotation = 0; }
                 for (size_t i = 1; i < 10000; ++i) {
-                    if (std::filesystem::exists(makeManifestPath(i))) { maxRotation = i; }
+                    if (!existingManifestPath(i).empty()) { maxRotation = i; }
                     else { break; }
                 }
                 return maxRotation;
@@ -518,8 +529,8 @@ namespace akkaradb::engine::manifest {
 
                 if (std::filesystem::exists(path_)) { files.push_back(path_); }
                 for (size_t i = 1; i < 10000; ++i) {
-                    auto p = makeManifestPath(i);
-                    if (std::filesystem::exists(p)) { files.push_back(p); }
+                    auto p = existingManifestPath(i);
+                    if (!p.empty()) { files.push_back(std::move(p)); }
                     else { break; }
                 }
 

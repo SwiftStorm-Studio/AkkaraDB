@@ -166,7 +166,20 @@ namespace akkaradb::grpcapi {
                 item->set_budget_bytes(level.budgetBytes);
             }
 
-            out->mutable_vlog()->set_enabled(stats.vlog.enabled);
+            auto* vlog = out->mutable_vlog();
+            vlog->set_enabled(stats.vlog.enabled);
+            vlog->set_sync_mode(stats.vlog.syncMode);
+            vlog->set_group_n(stats.vlog.groupN);
+            vlog->set_group_micros(stats.vlog.groupMicros);
+            vlog->set_group_bytes(stats.vlog.groupBytes);
+            vlog->set_async_max_pending_bytes(stats.vlog.asyncMaxPendingBytes);
+            vlog->set_indexed_keys(stats.vlog.indexedKeys);
+            vlog->set_indexed_entries(stats.vlog.indexedEntries);
+            vlog->set_rollback_entries(stats.vlog.rollbackEntries);
+            vlog->set_pending_writes(stats.vlog.pendingWrites);
+            vlog->set_pending_bytes(stats.vlog.pendingBytes);
+            vlog->set_durable_bytes(stats.vlog.durableBytes);
+            vlog->set_flush_thread_running(stats.vlog.flushThreadRunning);
         }
 
         [[nodiscard]] std::shared_ptr<::grpc::ServerCredentials> makeCredentials(const AkkaraGRPCServerOptions& options) {
@@ -178,16 +191,12 @@ namespace akkaradb::grpcapi {
 
             ::grpc::SslServerCredentialsOptions sslOptions;
             sslOptions.pem_key_cert_pairs.push_back(
-                ::grpc::SslServerCredentialsOptions::PemKeyCertPair{
-                    readTextFile(options.keyPath),
-                    readTextFile(options.certPath)
-                }
+                ::grpc::SslServerCredentialsOptions::PemKeyCertPair{readTextFile(options.keyPath), readTextFile(options.certPath)}
             );
             if (!options.rootCertPath.empty()) {
                 sslOptions.pem_root_certs = readTextFile(options.rootCertPath);
                 if (options.requireClientCert) {
-                    sslOptions.client_certificate_request =
-                        GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+                    sslOptions.client_certificate_request = GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
                 }
             }
             return ::grpc::SslServerCredentials(sslOptions);
@@ -196,7 +205,8 @@ namespace akkaradb::grpcapi {
 
     class AkkaraGRPCServer::Impl {
         public:
-            Impl(engine::AkkEngine& engine, AkkaraGRPCServerOptions options) : engine_{engine}, options_{std::move(options)}, service_{*this} {}
+            Impl(engine::AkkEngine& engine, AkkaraGRPCServerOptions options)
+                : engine_{engine}, options_{std::move(options)}, service_{*this} {}
 
             void start() {
                 if (running_.load(std::memory_order_acquire)) { return; }
@@ -252,7 +262,8 @@ namespace akkaradb::grpcapi {
         private:
             class RequestScope {
                 public:
-                    explicit RequestScope(Impl& owner) noexcept : owner_{owner} {
+                    explicit RequestScope(Impl& owner) noexcept
+                        : owner_{owner} {
                         owner_.requestsTotal_.fetch_add(1, std::memory_order_relaxed);
                         owner_.activeRequests_.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -314,7 +325,11 @@ namespace akkaradb::grpcapi {
                         catch (...) { return owner_.errorStatus("remove failed"); }
                     }
 
-                    ::grpc::Status Exists(::grpc::ServerContext*, const wire::ExistsRequest* request, wire::ExistsResponse* response) override {
+                    ::grpc::Status Exists(
+                        ::grpc::ServerContext*,
+                        const wire::ExistsRequest* request,
+                        wire::ExistsResponse* response
+                    ) override {
                         RequestScope requestScope{owner_};
                         try {
                             response->set_found(owner_.engine_.exists(bytes(request->key())));
@@ -324,12 +339,16 @@ namespace akkaradb::grpcapi {
                         catch (...) { return owner_.errorStatus("exists failed"); }
                     }
 
-                    ::grpc::Status Count(::grpc::ServerContext*, const wire::CountRequest* request, wire::CountResponse* response) override {
+                    ::grpc::Status Count(
+                        ::grpc::ServerContext*,
+                        const wire::CountRequest* request,
+                        wire::CountResponse* response
+                    ) override {
                         RequestScope requestScope{owner_};
                         try {
-                            response->set_count(static_cast<uint64_t>(
-                                owner_.engine_.count(bytes(request->start_key()), bytes(request->end_key()))
-                            ));
+                            response->set_count(
+                                static_cast<uint64_t>(owner_.engine_.count(bytes(request->start_key()), bytes(request->end_key())))
+                            );
                             return ::grpc::Status::OK;
                         }
                         catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
@@ -373,7 +392,11 @@ namespace akkaradb::grpcapi {
                         catch (...) { return owner_.errorStatus("getAt failed"); }
                     }
 
-                    ::grpc::Status History(::grpc::ServerContext*, const wire::HistoryRequest* request, wire::HistoryResponse* response) override {
+                    ::grpc::Status History(
+                        ::grpc::ServerContext*,
+                        const wire::HistoryRequest* request,
+                        wire::HistoryResponse* response
+                    ) override {
                         RequestScope requestScope{owner_};
                         try {
                             uint32_t emitted = 0;
@@ -448,7 +471,9 @@ namespace akkaradb::grpcapi {
                             keys.reserve(static_cast<size_t>(request->keys_size()));
                             for (const auto& key : request->keys()) { keys.push_back(bytes(key)); }
 
-                            const auto values = owner_.engine_.getBatch(std::span<const std::span<const uint8_t>>{keys.data(), keys.size()});
+                            const auto values = owner_.engine_.getBatch(
+                                std::span<const std::span<const uint8_t>>{keys.data(), keys.size()}
+                            );
                             for (const auto& value : values) {
                                 auto* item = response->add_items();
                                 item->set_status(value.found ? wire::ITEM_STATUS_OK : wire::ITEM_STATUS_NOT_FOUND);
@@ -499,13 +524,9 @@ namespace akkaradb::grpcapi {
 
             void recordError() noexcept { errorsTotal_.fetch_add(1, std::memory_order_relaxed); }
 
-            [[nodiscard]] uint32_t maxBatchItems() const noexcept {
-                return options_.maxBatchItems == 0 ? 4096u : options_.maxBatchItems;
-            }
+            [[nodiscard]] uint32_t maxBatchItems() const noexcept { return options_.maxBatchItems == 0 ? 4096u : options_.maxBatchItems; }
 
-            [[nodiscard]] uint32_t maxScanItems() const noexcept {
-                return options_.maxScanItems == 0 ? 4096u : options_.maxScanItems;
-            }
+            [[nodiscard]] uint32_t maxScanItems() const noexcept { return options_.maxScanItems == 0 ? 4096u : options_.maxScanItems; }
 
             [[nodiscard]] uint32_t maxHistoryEntries() const noexcept {
                 return options_.maxHistoryEntries == 0 ? 4096u : options_.maxHistoryEntries;
@@ -530,19 +551,13 @@ namespace akkaradb::grpcapi {
                 if (options_.minPollers != 0) {
                     builder.SetSyncServerOption(
                         ::grpc::ServerBuilder::SyncServerOption::MIN_POLLERS,
-                        static_cast<int>(std::min<uint32_t>(
-                            options_.minPollers,
-                            static_cast<uint32_t>(std::numeric_limits<int>::max())
-                        ))
+                        static_cast<int>(std::min<uint32_t>(options_.minPollers, static_cast<uint32_t>(std::numeric_limits<int>::max())))
                     );
                 }
                 if (options_.maxPollers != 0) {
                     builder.SetSyncServerOption(
                         ::grpc::ServerBuilder::SyncServerOption::MAX_POLLERS,
-                        static_cast<int>(std::min<uint32_t>(
-                            options_.maxPollers,
-                            static_cast<uint32_t>(std::numeric_limits<int>::max())
-                        ))
+                        static_cast<int>(std::min<uint32_t>(options_.maxPollers, static_cast<uint32_t>(std::numeric_limits<int>::max())))
                     );
                 }
                 if (options_.maxConcurrentStreams != 0) {
@@ -557,16 +572,20 @@ namespace akkaradb::grpcapi {
                 if (options_.workerThreads != 0 || options_.resourceQuotaBytes != 0) {
                     ::grpc::ResourceQuota quota{"akkaradb-grpc"};
                     if (options_.workerThreads != 0) {
-                        quota.SetMaxThreads(static_cast<int>(std::min<uint32_t>(
-                            options_.workerThreads,
-                            static_cast<uint32_t>(std::numeric_limits<int>::max())
-                        )));
+                        quota.SetMaxThreads(
+                            static_cast<int>(std::min<uint32_t>(
+                                options_.workerThreads,
+                                static_cast<uint32_t>(std::numeric_limits<int>::max())
+                            ))
+                        );
                     }
                     if (options_.resourceQuotaBytes != 0) {
-                        quota.Resize(static_cast<size_t>(std::min<uint64_t>(
-                            options_.resourceQuotaBytes,
-                            static_cast<uint64_t>(std::numeric_limits<size_t>::max())
-                        )));
+                        quota.Resize(
+                            static_cast<size_t>(std::min<uint64_t>(
+                                options_.resourceQuotaBytes,
+                                static_cast<uint64_t>(std::numeric_limits<size_t>::max())
+                            ))
+                        );
                     }
                     builder.SetResourceQuota(quota);
                 }
@@ -618,8 +637,11 @@ namespace {
         grpcOptions.bindHost = options.bindHost;
         grpcOptions.port = options.grpcPort;
         grpcOptions.maxReceiveMessageBytes = static_cast<int>(options.tcpMaxPendingResponseBytes == 0
-            ? 64ULL * 1024ULL * 1024ULL
-            : std::min<uint64_t>(options.tcpMaxPendingResponseBytes, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+                                                                  ? 64ULL * 1024ULL * 1024ULL
+                                                                  : std::min<uint64_t>(
+                                                                      options.tcpMaxPendingResponseBytes,
+                                                                      static_cast<uint64_t>(std::numeric_limits<int>::max())
+                                                                  ));
         grpcOptions.maxSendMessageBytes = grpcOptions.maxReceiveMessageBytes;
         grpcOptions.workerThreads = options.grpcWorkerThreads;
         grpcOptions.completionQueues = options.grpcCompletionQueues;
@@ -641,10 +663,7 @@ namespace {
 
     class GRPCApiTransport final : public akkaradb::engine::server::IAkkApiTransport {
         public:
-            GRPCApiTransport(
-                akkaradb::engine::AkkEngine& engine,
-                const akkaradb::engine::AkkEngineOptions::ApiOptions& options
-            )
+            GRPCApiTransport(akkaradb::engine::AkkEngine& engine, const akkaradb::engine::AkkEngineOptions::ApiOptions& options)
                 : server_{akkaradb::grpcapi::AkkaraGRPCServer::create(engine, makeGRPCOptions(options))} {}
 
             void start() override { server_->start(); }
@@ -684,8 +703,10 @@ namespace {
 extern "C" AKKARADB_GRPC_API bool akkaradb_api_grpc_register() noexcept {
     return akkaradb::engine::server::registerAkkApiTransportFactory(
         akkaradb::engine::AkkEngineOptions::ApiBackend::GRPC,
-        [](akkaradb::engine::AkkEngine& engine, const akkaradb::engine::AkkEngineOptions::ApiOptions& options)
-            -> std::unique_ptr<akkaradb::engine::server::IAkkApiTransport> {
+        [](
+        akkaradb::engine::AkkEngine& engine,
+        const akkaradb::engine::AkkEngineOptions::ApiOptions& options
+    ) -> std::unique_ptr<akkaradb::engine::server::IAkkApiTransport> {
             return std::make_unique<GRPCApiTransport>(engine, options);
         }
     );

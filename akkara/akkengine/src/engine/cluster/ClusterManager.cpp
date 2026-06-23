@@ -31,9 +31,9 @@ namespace akkaradb::engine::cluster {
         constexpr uint64_t PRIMARY_LEASE_WINDOW_US = 30'000'000;
 
         [[nodiscard]] uint64_t nowUs() noexcept {
-            return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
-            );
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count());
         }
     } // namespace
 
@@ -117,17 +117,13 @@ namespace akkaradb::engine::cluster {
 
             void selectRole() {
                 switch (runtimeOptions_.startupRole) {
-                    case NodeStartupRole::PRIMARY:
-                        configurePrimarySelf();
+                    case NodeStartupRole::PRIMARY: configurePrimarySelf();
                         setRole(NodeRole::PRIMARY);
                         return;
-                    case NodeStartupRole::REPLICA:
-                        configureReplicaPrimary();
+                    case NodeStartupRole::REPLICA: configureReplicaPrimary();
                         setRole(NodeRole::REPLICA);
                         return;
-                    case NodeStartupRole::AUTO:
-                    default:
-                        throw std::runtime_error(
+                    case NodeStartupRole::AUTO: default: throw std::runtime_error(
                             "ClusterManager: explicit startup role is required for MIRROR/STRIPE modes (PRIMARY or REPLICA)"
                         );
                 }
