@@ -7,6 +7,27 @@ endif ()
 # ==================== Benchmarks ====================
 message(STATUS "Building AkkaraDB benchmarks")
 
+set(AKKARADB_DISKSPD_URL "https://github.com/microsoft/diskspd/releases/latest/download/DiskSpd.zip")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^[Aa][Rr][Mm]64$")
+    set(AKKARADB_DISKSPD_ARCH_SUBDIR "arm64")
+elseif (CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(AKKARADB_DISKSPD_ARCH_SUBDIR "amd64")
+else ()
+    set(AKKARADB_DISKSPD_ARCH_SUBDIR "x86")
+endif ()
+set(AKKARADB_DISKSPD_WORK_DIR "${CMAKE_BINARY_DIR}/_deps/diskspd")
+
+add_custom_target(akkaradb_prepare_diskspd
+        COMMAND ${CMAKE_COMMAND}
+        -DDISKSPD_URL=${AKKARADB_DISKSPD_URL}
+        -DDISKSPD_ARCH_SUBDIR=${AKKARADB_DISKSPD_ARCH_SUBDIR}
+        -DDISKSPD_WORK_DIR=${AKKARADB_DISKSPD_WORK_DIR}
+        -DDISKSPD_OUTPUT_DIR=${CMAKE_BINARY_DIR}/bin
+        -DDISKSPD_DIST_DIR=${AKKARADB_NATIVE_DIST_DIR}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EnsureDiskSpd.cmake"
+        COMMENT "Preparing DiskSpd benchmark tool"
+)
+
 add_executable(akkaradb_benchmark
         benchmarks/suite/benchmark.cpp
 )
@@ -102,6 +123,25 @@ foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endforeach ()
+
+add_dependencies(akkaradb_memtable_throughput_benchmark akkaradb_prepare_diskspd)
+add_dependencies(akkaradb_sstable_throughput_benchmark akkaradb_prepare_diskspd)
+
+add_custom_command(TARGET akkaradb_memtable_throughput_benchmark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:akkaradb_memtable_throughput_benchmark>
+        "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_memtable_throughput_benchmark>"
+        COMMENT "Copying memtable throughput benchmark to dist/native/${AKKARADB_RELEASE_VERSION}"
+)
+
+add_custom_command(TARGET akkaradb_sstable_throughput_benchmark POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:akkaradb_sstable_throughput_benchmark>
+        "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_sstable_throughput_benchmark>"
+        COMMENT "Copying sstable throughput benchmark to dist/native/${AKKARADB_RELEASE_VERSION}"
+)
 
 target_link_libraries(akkaradb_cluster_smoke_test PRIVATE akkaradb_cluster)
 

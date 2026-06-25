@@ -1,20 +1,19 @@
-# 複数環境ベンチマーク結果
+﻿# 複数マシンでのベンチマーク結果
 
-このファイルは、複数の開発環境で測定した AkkaraDB native のベンチマーク結果をまとめるための記録です。
-CPU、RAM、SSD、OS、コンパイラ、電源設定の影響を受けるため、異なるマシン間の順位付けではなく、環境差を含めた参考値として扱います。
-回帰確認では、同一マシン・同一 commit・同一ビルド設定・同一コマンドでの before/after 比較を基本にします。
+このファイルは、複数の実行環境で取得した AkkaraDB native の benchmark 結果をまとめたものです。CPU、RAM、storage、OS、compiler、build 設定が異なる環境を並べて比較できるようにし、数値だけでなく前提条件も追えるようにしています。
 
-## 追加ルール
+複数マシンの比較では、同じ command、同じ commit、同じ build 設定で before / after を記録することを前提にしています。
 
-新しい環境を追加するときは、下の `<details>` ブロックをコピーして、Environment、Commands、Results を同じ形式で追記します。
-Storage は CrystalDiskMark や fio など、測定ツールと条件を一緒に残します。公称値を使う場合は `Vendor spec` と明記します。
+## 記録ルール
 
-## Benchmark Environments
+新しい benchmark を追加するときは、上から順に `<details>` block を追加し、`Environment`、`Commands`、`Results` を同じ構成で記録してください。storage の値は CrystalDiskMark や fio など、比較しやすい共通ツールで測った結果を併記するのが望ましいです。手元の値が vendor spec だけの場合は、その旨を明記してください。
+
+## ベンチマーク環境
 
 <details>
 <summary>Machine A - MemTable / WAL / SSTable</summary>
 
-### Environment
+### 実行環境
 
 | Item                      | Value                                            |
 |---------------------------|--------------------------------------------------|
@@ -36,7 +35,7 @@ Storage は CrystalDiskMark や fio など、測定ツールと条件を一緒�
 | Build Type                | Release                                          |
 | Commit                    | `f465a8f`                                        |
 
-### Commands
+### 実行コマンド
 
 ```powershell
 cmake --build cmake-build-release --target akkaradb_memtable_throughput_benchmark --config Release
@@ -307,7 +306,7 @@ Notes:
 <details>
 <summary>Machine B - MemTable / WAL / SSTable</summary>
 
-### Environment
+### 実行環境
 
 | Item                      | Value                                                       |
 |---------------------------|-------------------------------------------------------------|
@@ -329,7 +328,7 @@ Notes:
 | Build Type                | Release                                                     |
 | Commit                    | `9bb1323`                                                   |
 
-### Commands
+### 実行コマンド
 
 ```bash
 cmake --build build --config Release
@@ -590,7 +589,7 @@ Notes:
 
 </details>
 
-### Machine Notes
+### マシン補足
 
 - MemTable `put_smp` / `get_smp` / `scan_smp` are all `7813` samples in this run.
 - MemTable `flush_records` is `0` for every case because `threshold_bytes_per_shard` is disabled.
@@ -599,12 +598,12 @@ Notes:
 
 </details>
 
-## Copy Template
+## コピーテンプレート
 
 <details>
 <summary>Machine X - Benchmark type</summary>
 
-### Environment
+### 実行環境
 
 | Item                      | Value   |
 |---------------------------|---------|
@@ -626,13 +625,13 @@ Notes:
 | Build Type                | Release |
 | Commit                    | `TBD`   |
 
-### Commands
+### 実行コマンド
 
 ```powershell
 TBD
 ```
 
-### Results
+### 結果
 
 | Benchmark | Main Settings | Throughput |    P99 | Notes |
 |-----------|---------------|-----------:|-------:|-------|

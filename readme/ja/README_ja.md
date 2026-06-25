@@ -1,6 +1,6 @@
-# AkkaraDB
+﻿# AkkaraDB
 
-**WAL、LSM ストレージ、型付きテーブル、JNI アクセス、任意のクラスタリングを備えた低レイテンシ組み込み KV エンジンです。**
+**WAL、LSM ストレージ、型付きテーブル、JNI アクセス、任意のクラスタリングを備えた低レイテンシの組み込み KV エンジンです。**
 
 > C++23 | LSM-tree | WAL | SST | Blob store | Version history | HTTP/TCP API | JNI | AGPL-3.0
 
@@ -8,45 +8,47 @@
 
 ## 特徴
 
-| 分類           | 内容                                                                          |
-|--------------|-----------------------------------------------------------------------------|
-| Storage      | multi-shard MemTable、WAL、SST levels、Bloom filter、leveled compaction         |
-| Durability   | CRC32C 付き record、sync/async WAL、manifest による SST lifecycle 管理               |
-| Large values | 大きな値を blob payload に外出しし、MemTable には 20-byte BlobRef を保存                    |
-| Compression  | SST と blob payload に Zstandard を利用可能。codec は file metadata に保持              |
-| Reads        | MemTable を先に見て、必要に応じて SST / BlobManager へ fallback                          |
-| History      | 任意の per-key version log、point-in-time read、global/per-key rollback          |
-| API servers  | HTTP REST と binary TCP backend。default port は 7070 / 7071                   |
-| Typed tables | `PackedTable<&T::id>` による BinPack serialization、scan、helper、secondary index |
-| JVM bridge   | public low-level API は `ByteBufferL` ベース。JNI 経由で native engine を利用          |
-| Clustering   | standalone、mirror、stripe replication 用の設定 primitive                         |
-| Portability  | Windows/MSVC と Linux/GCC/Clang                                              |
+| 分類 | 内容 |
+|---|---|
+| ストレージ | マルチシャード MemTable、WAL、SST レベル、Bloom filter、leveled compaction |
+| 耐久性 | CRC32C で保護されたレコード、sync/async WAL、Manifest による SST ライフサイクル管理 |
+| 大きな値 | 20 バイトの BlobRef を使った自動 blob 外部化 |
+| 圧縮 | SST と blob payload に Zstandard を利用。codec 情報はファイルごとの metadata に保持 |
+| 読み取り | まず MemTable を参照し、必要に応じて SST と BlobManager にフォールバック |
+| 履歴 | 任意の per-key version log、特定時点読み取り、全体またはキー単位の rollback |
+| API サーバー | HTTP REST と binary TCP backend。既定ポートは 7070 / 7071 |
+| 型付きテーブル | `PackedTable<&T::id>`、BinPack serialization、stable `RowId`、scan、join、secondary index |
+| 型付き更新 | `Immutable<T>` / `Const<T>`、`onUpdate<&Field>(...)` hook、foreign-key の `OnDelete` / `OnUpdate` |
+| JVM ブリッジ | public low-level API では `ByteBufferL` を使う Kotlin/JVM + JNI ラッパー |
+| クラスタリング | standalone、mirror、stripe の replication primitive |
+| 消失訂正 | low-level API に `XOR`、`DualXOR`、`RS`、`ERS` codec を同梱 |
+| 可搬性 | Windows/MSVC と Linux/GCC/Clang をサポート |
 
 ---
 
-## Quick Start
+## クイックスタート
 
-### Build
+### ビルド
 
 ```cmake
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
-よく使う CMake flag:
+よく使うフラグ:
 
 ```cmake
--DBUILD_SHARED_LIBS=ON        # shared library を build。default ON
--DBUILD_SHARED_LIBS=OFF       # static library を build
--DAKKARADB_BUILD_TESTS=ON     # tests/ を追加
--DAKKARADB_BUILD_JNI=ON       # JVM wrapper 用の akkaradb_jni を build
+-DBUILD_SHARED_LIBS=ON        # shared library をビルド。既定は ON
+-DBUILD_SHARED_LIBS=OFF       # static library をビルド
+-DAKKARADB_BUILD_TESTS=ON     # tests を追加
+-DAKKARADB_BUILD_JNI=ON       # JVM wrapper 用の akkaradb_jni をビルド
 ```
 
-現状の native CMake configuration では TLS と SIMD は常に有効です。mbedTLS を link し、対応 compiler では SSE4.2/AVX2 の compile flag が追加されます。
+現在の native CMake 設定では TLS と SIMD が有効です。ビルド時には mbedTLS をリンクし、対応するコンパイラでは SSE4.2 / AVX2 のフラグを追加します。
 
-Windows では Visual Studio/MSVC 環境から build してください。compiler、linker、Windows SDK が初期化された状態で実行する必要があります。
+Windows では、compiler、linker、Windows SDK が初期化された Visual Studio / MSVC 環境からビルドしてください。
 
-### Install Target
+### インストール済みターゲットの利用
 
 ```cmake
 find_package(AkkaraDB REQUIRED)
@@ -55,9 +57,9 @@ target_link_libraries(my_app PRIVATE AkkaraDB::akkaradb)
 
 ---
 
-## C++ Low-Level API
+## C++ 低レベル API
 
-key/value の byte 列、scan、durability、history を直接制御したい場合は `AkkEngine` を使います。
+キー、値、scan、耐久性、履歴を byte 指向で制御したい場合は `AkkEngine` を直接使います。
 
 ```cpp
 #include "engine/AkkEngine.hpp"
@@ -89,7 +91,7 @@ if (value) {
 
 std::vector<uint8_t> out;
 if (engine->getInto(bytes("user:1"), out)) {
-    // optional allocation を避ける hot read path
+    // hot read path without optional allocation
 }
 
 engine->remove(bytes("user:1"));
@@ -97,7 +99,7 @@ engine->forceSync();
 engine->close();
 ```
 
-range scan は caller 側で arena を持ちます。
+range scan では caller 側が所有する arena を使います。
 
 ```cpp
 akkaradb::core::BufferArena arena;
@@ -109,7 +111,7 @@ for (auto it = rows.begin(); !(it == rows.end()); ++it) {
 }
 ```
 
-`versionLogEnabled` が有効な場合は version history も使えます。
+`versionLogEnabled` が有効なら履歴 API が使えます。
 
 ```cpp
 auto at = engine->getAt(bytes("user:1"), target_seq);
@@ -119,7 +121,7 @@ engine->rollbackKey(bytes("user:1"), target_seq);
 engine->rollbackTo(target_seq);
 ```
 
-low-level header には erasure coding utility もあります。
+low-level header には erasure coding helper も含まれます。
 
 ```cpp
 #include "akk/engine/erasure/ErasureCodec.hpp"
@@ -135,9 +137,9 @@ auto recovered = ErsCodec::recover(ErsCodec::encode(bytes("payload"), layout), l
 
 ---
 
-## C++ High-Level API
+## C++ 高レベル API
 
-型付き entity、automatic BinPack serialization、table-scoped key を使いたい場合は `AkkaraDB` と `PackedTable` を使います。
+BinPack による自動 serialization と table ごとの key namespace を使いたい場合は `AkkaraDB` と `PackedTable` を使います。
 
 ```cpp
 #include <akkaradb/AkkaraDB.hpp>
@@ -192,14 +194,37 @@ users.remove(1ULL);
 db->close();
 ```
 
-typed table では `rowIdOf(pk)` / `primaryKeyOf(rowId)` / `getByRowId(rowId)` で stable identity を扱えます。persisted 後に変更させたくない field は `akkaradb::Immutable<T>` または `akkaradb::Const<T>` を使えます。local `onUpdate<&Field>(...)` hook は watched field 変更時に replacement entity を保存前に書き換えられます。schema-managed foreign key は `OnDelete` と `OnUpdate` の `Cascade` / `Restrict` / `SetNull` を使えます。
+typed table の key は table ごとに namespace 分離されます。primary key は 8-byte FNV-1a table prefix に encoded primary key を続けた構造で、整数 primary key には sortable な fixed-width big-endian encoding を使うため、range scan でも数値順を保てます。secondary index は `table_name + ":idx:" + field_name` を namespace として使います。
 
-typed table の key は table ごとに namespace 化されます。primary key layout は 8-byte FNV-1a table prefix と encoded primary key です。secondary index は
-`table_name + ":idx:" + field_name` を namespace として使います。
+stable row identity は `rowIdOf(pk)`、`primaryKeyOf(rowId)`、`getByRowId(rowId)` で扱えます。永続化後に変更させたくない field は `akkaradb::Immutable<T>` または `akkaradb::Const<T>` にでき、`onUpdate<&Field>(...)` hook で保存前に replacement entity を書き換えることもできます。
+
+schema 管理の foreign key は `OnDelete` / `OnUpdate` として `Cascade`、`Restrict`、`SetNull` をサポートします。`Ref<T>` は内部に target row id を覚えるため、primary key が更新された後も同じ logical entity を追跡できます。
+
+```cpp
+struct User {
+    uint64_t id;
+    akkaradb::Const<std::string> externalId;
+    std::string email;
+    std::string name;
+};
+
+AKKARADB_QUERYABLE(User, id, externalId, email, name)
+
+users.onUpdate<&User::email>([](const std::string& old_value, std::string& new_value) {
+    if (new_value.empty()) { new_value = old_value; }
+});
+
+if (auto row_id = users.rowIdOf(1ULL)) {
+    auto same_user = users.getByRowId(*row_id);
+    (void)same_user;
+}
+```
+
+高レベル API の詳細は [API_USAGE_ja.md](API_USAGE_ja.md) を参照してください。
 
 ---
 
-## JVM Low-Level API
+## JVM 低レベル API
 
 JVM wrapper の public low-level API は raw `ByteArray` ではなく `ByteBufferL` を使います。
 
@@ -243,13 +268,13 @@ engine.remove(key)
 engine.close()
 ```
 
-`ByteBufferL.allocate(capacity, direct = true)` は little-endian の direct buffer を作ります。test や heap-backed input では `ByteBufferL.wrap(ByteArray)` が使えます。
+`ByteBufferL.allocate(capacity, direct = true)` は little-endian の direct buffer を作ります。heap-backed な入力や test では `ByteBufferL.wrap(ByteArray)` が便利です。
 
 ---
 
-## JVM High-Level API
+## JVM 高レベル API
 
-Kotlin entity を扱う場合は `AkkaraDB.table<T, ID>()` を使います。JVM high-level table は C++ と同じ table namespace / index key layout に合わせています。
+Kotlin entity では `AkkaraDB.table<T, ID>()` を使います。JVM 側の high-level table は、C++ 側と同じ table namespace と index key layout を踏襲します。
 
 ```kotlin
 import dev.swiftstorm.akkaradb.engine.AkkaraDB
@@ -280,36 +305,35 @@ users.remove(2L)
 db.close()
 ```
 
-`runQ(AkkQuery(...))` を使うと query AST を手で組んで実行できます。`query { ... }`、`firstOrNull { ... }`、`runToList { ... }` などの DSL function は compiler
-plugin による rewrite が前提です。plugin が適用されていない場合、runtime では意図的に失敗します。
+手動の query 実行には `runQ(AkkQuery(...))` が使えます。`query { ... }`、`firstOrNull { ... }`、`runToList { ... }` のような DSL は compiler plugin による rewrite を前提としており、plugin なしでは runtime error になる設計です。
 
 ---
 
-## Startup Modes
+## 起動モード
 
-| Mode         | WAL   | close behavior       | version history | 主な用途                       |
-|--------------|-------|----------------------|-----------------|----------------------------|
-| `ULTRA_FAST` | Off   | forced flush/sync なし | Off             | in-memory cache、test、一時データ |
-| `FAST`       | Async | close 時に flush/sync  | Off             | high-throughput ingestion  |
-| `NORMAL`     | Async | close 時に flush/sync  | Off             | general-purpose default    |
-| `DURABLE`    | Sync  | close 時に flush/sync  | On              | audit log、強い durability    |
+| モード | WAL | close 時の挙動 | version history | 主な用途 |
+|---|---|---|---|---|
+| `ULTRA_FAST` | Off | 強制 flush/sync なし | Off | in-memory cache、test、一時データ |
+| `FAST` | Async | close 時に flush/sync | Off | 高スループット ingestion |
+| `NORMAL` | Async | close 時に flush/sync | Off | 一般用途の既定値 |
+| `DURABLE` | Sync | close 時に flush/sync | On | audit log、強い耐久性が必要な用途 |
 
-C++ と JVM の両方で細かい override ができます。
+細かい override は C++ と JVM の両方から設定できます。
 
-| Override                     | C++                            | JVM                         |
-|------------------------------|--------------------------------|-----------------------------|
+| 項目 | C++ | JVM |
+|---|---|---|
 | MemTable threshold per shard | `memtableThresholdPerShard` | `memtableThresholdPerShard` |
-| Version log                  | `versionLogEnabled`          | `versionLogEnabled`         |
-| SST codec                    | `sstCodec`                    | `sstCodec`                  |
-| Blob codec                   | `blobCodec`                   | `blobCodec`                 |
-| Blob threshold               | `blobThresholdBytes`         | `blobThresholdBytes`        |
-| Promote SST reads            | `sstPromoteReads`            | `sstPromoteReads`           |
-| Bloom bits per key           | `sstBloomBitsPerKey`       | `sstBloomBitsPerKey`        |
-| Max L0 SST files             | `maxL0SstFiles`             | `maxL0SstFiles`             |
+| Version log | `versionLogEnabled` | `versionLogEnabled` |
+| SST codec | `sstCodec` | `sstCodec` |
+| Blob codec | `blobCodec` | `blobCodec` |
+| Blob threshold | `blobThresholdBytes` | `blobThresholdBytes` |
+| SST read promotion | `sstPromoteReads` | `sstPromoteReads` |
+| Bloom bits per key | `sstBloomBitsPerKey` | `sstBloomBitsPerKey` |
+| Max L0 SST files | `maxL0SstFiles` | `maxL0SstFiles` |
 
 ---
 
-## Architecture Overview
+## アーキテクチャ概要
 
 ```text
 put(key, value)
@@ -337,11 +361,11 @@ read path:
 MemTable -> SSTManager -> BlobManager when the value is externalized
 ```
 
-SST read は Bloom filter と sparse block index を使います。`sstPromoteReads` が有効な場合、SST hit を MemTable に戻すことができます。
+SST read では Bloom filter と sparse block index を使います。`sstPromoteReads` が有効なら、SST hit を MemTable に昇格できます。
 
 ---
 
-## Configuration Highlights
+## 設定の要点
 
 ```cpp
 akkaradb::AkkaraDB::Options opts;
@@ -360,13 +384,13 @@ opts.overrides.maxL0SstFiles = 8;
 auto db = akkaradb::AkkaraDB::open(std::move(opts));
 ```
 
-native configuration の詳細は [SPEC.md section 14](../../SPEC.md#14-configuration-reference) を参照してください。
+native configuration 全体は [SPEC.md section 14](../../SPEC.md#14-configuration-reference) を参照してください。
 
 ---
 
-## API Servers
+## API サーバー
 
-`components.apiEnabled` を有効にすると、internal engine は HTTP と TCP API backend を起動できます。
+`components.apiEnabled` を有効にすると、internal engine から HTTP と TCP API backend を起動できます。
 
 ```cpp
 AkkEngineOptions opts;
@@ -381,22 +405,21 @@ opts.api.http_port = 7070;
 opts.api.tcp_port = 7071;
 ```
 
-HTTP endpoints:
+HTTP endpoint:
 
-| Method   | Path                                            |
-|----------|-------------------------------------------------|
-| `GET`    | `/v1/ping`                                      |
-| `POST`   | `/v1/put?key=<percent-encoded>`                 |
-| `GET`    | `/v1/get?key=<percent-encoded>`                 |
-| `DELETE` | `/v1/remove?key=<percent-encoded>`              |
-| `GET`    | `/v1/getAt?key=<percent-encoded>&seq=<number>` |
+| Method | Path |
+|---|---|
+| `GET` | `/v1/ping` |
+| `POST` | `/v1/put?key=<percent-encoded>` |
+| `GET` | `/v1/get?key=<percent-encoded>` |
+| `DELETE` | `/v1/remove?key=<percent-encoded>` |
+| `GET` | `/v1/getAt?key=<percent-encoded>&seq=<number>` |
 
-binary TCP protocol は `AK5Q` request frame と `AK5S` response frame を使います。frame layout は [SPEC.md section 11.2](../../SPEC.md#112-binary-protocol-v2)
-にあります。
+binary TCP protocol は `AK5Q` request frame と `AK5S` response frame を使います。frame layout は [SPEC.md section 11.2](../../SPEC.md#112-binary-protocol-v2) を参照してください。
 
 ---
 
-## File Layout
+## ファイル配置
 
 ```text
 {dataDir}/
@@ -415,9 +438,9 @@ binary TCP protocol は `AK5Q` request frame と `AK5S` response frame を使い
 
 ---
 
-## Benchmarks And Smoke Tests
+## ベンチマークと smoke test
 
-native CMake file は benchmark と smoke test executable を `build/bin` に生成します。
+native CMake では benchmark と smoke test の executable を `build/bin` に出力します。
 
 ```powershell
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -428,7 +451,7 @@ cmake --build build --config Release
 .\build\bin\akkaradb_benchmark.exe
 ```
 
-benchmark source は以下にあります。
+benchmark source は次の場所にあります。
 
 ```text
 benchmarks/suite/
@@ -439,41 +462,36 @@ benchmarks/api/
 
 ---
 
-## Dependencies
+## 依存ライブラリ
 
-| Library   | Version      | Notes                                     |
-|-----------|--------------|-------------------------------------------|
-| Zstandard | 1.5.6        | SST と blob payload の compression          |
-| Boost.PFR | boost-1.84.0 | BinPack 用 aggregate reflection            |
-| mbedTLS   | 4.1.0        | API / replication transport の TLS support |
+| Library | Version | Notes |
+|---|---|---|
+| Zstandard | 1.5.6 | SST と blob payload の圧縮 |
+| Boost.PFR | boost-1.84.0 | BinPack 用 aggregate reflection |
+| mbedTLS | 4.1.0 | API と replication transport の TLS |
 
-dependency は CMake の `FetchContent` で取得されます。
-
----
-
-## Specification
-
-現在の native specification は [SPEC.md](../../SPEC.md) です。record layout、WAL/SST/blob/manifest format、API framing、configuration、concurrency、recovery behavior
-をまとめています。
+dependency は CMake の `FetchContent` で取得します。
 
 ---
 
-## Architecture
+## 仕様書
 
-native engine ? subsystem?data flow?recovery?concurrency model ? [readme/ja/ARCHITECTURE_ja.md](ARCHITECTURE_ja.md) ?????????
+現在の native specification は [SPEC.md](../../SPEC.md) です。record layout、WAL / SST / blob / manifest format、API framing、configuration、concurrency、recovery behavior をまとめています。
+
+## アーキテクチャ
+
+native engine の全体像は [ARCHITECTURE_ja.md](ARCHITECTURE_ja.md) を参照してください。public API、`AkkEngine`、MemTable、WAL、Blob Manager、SST Manager、Manifest、VersionLog、API server、cluster runtime、JNI scan path の関係を説明しています。
+
+## Native API の使い方
+
+native low-level / high-level API の詳細は [API_USAGE_ja.md](API_USAGE_ja.md) を参照してください。`AkkEngine` の直接利用と、typed な `AkkaraDB` / `PackedTable` API を扱っています。
 
 ---
 
-## Native API Usage
+## ライセンス
 
-???? `AkkEngine` API ????? typed table API ????? [readme/ja/API_USAGE_ja.md](API_USAGE_ja.md) ?????????
-
----
-
-## License
-
-AkkaraDB は GNU Affero General Public License v3.0 で提供される free software です。
+AkkaraDB は GNU Affero General Public License v3.0 のもとで配布される free software です。
 
 Copyright (C) 2026 Swift Storm Studio.
 
-全文は [LICENSE](../../LICENSE) を参照してください。
+ライセンス全文は [LICENSE](../../LICENSE) を参照してください。

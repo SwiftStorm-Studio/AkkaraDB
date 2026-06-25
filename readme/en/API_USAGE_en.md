@@ -120,8 +120,8 @@ The returned `key` and `value` are non-owning views. They must not be used after
 When retaining data as a native AkkaraDB buffer, prefer `BufferView::to_owned()` strongly. It deep-copies the bytes into an `OwnedBuffer`, a move-only owning type, and cleanly detaches the value lifetime from the arena before it crosses an API boundary.
 
 ```cpp
-#include "core/buffer/BufferView.hpp"
-#include "core/buffer/OwnedBuffer.hpp"
+#include "akk/core/buffer/BufferView.hpp"
+#include "akk/core/buffer/OwnedBuffer.hpp"
 
 auto value_bytes = std::as_bytes(row.value);
 akkaradb::core::BufferView value_view{value_bytes};
@@ -372,7 +372,6 @@ auto joined = posts
     .toVector();
 ```
 
-`foreignKey<&Post::author>()` validates that the referenced entity exists before storing a row. The schema helper currently uses `OnDelete::Cascade`, so deleting the referenced row also deletes rows that reference it. Without `Schema`, a table can be wired manually with `bindRef<&Post::author>(authors)` and `cascadeDeleteFrom<&Post::author>(posts)`.
 `foreignKey<&Post::author>()` validates that the referenced entity exists before storing a row. Schema foreign keys support one `OnDelete` action and one `OnUpdate` action, each chosen from `Cascade`, `Restrict`, or `SetNull`. `SetNull` requires the owner-side field to be `std::optional<...>`. `Ref<T>` foreign keys currently target the referenced entity primary key; arbitrary non-primary target fields are supported only for plain comparable owner fields.
 
 When a referenced target primary key changes through `updatePrimaryKey(oldPk, entity)`, `OnUpdate::Cascade` rewrites owner-side foreign-key values, `OnUpdate::Restrict` rejects the change while references exist, and `OnUpdate::SetNull` clears optional owner-side references. `Ref<T>` remembers the stable row id of the target, so the reference can continue to identify the same logical entity across primary-key rewrites.
