@@ -2,7 +2,7 @@
 
 **WAL、LSM ストレージ、型付きテーブル、JNI アクセス、任意のクラスタリングを備えた低レイテンシの組み込み KV エンジンです。**
 
-> C++23 | LSM-tree | WAL | SST | Blob store | Version history | HTTP/TCP API | JNI | AGPL-3.0
+> C++23 | LSM-tree | WAL | SST | Blob store | Version history | HTTP/TCP API | JNI | MPL-2.0 core + AGPL-3.0 AkkServer
 
 ---
 
@@ -490,8 +490,10 @@ native low-level / high-level API の詳細は [API_USAGE_ja.md](API_USAGE_ja.md
 
 ## ライセンス
 
-AkkaraDB は GNU Affero General Public License v3.0 のもとで配布される free software です。
+AkkaraDB の native core は Mozilla Public License 2.0 のもとで配布されます。
 
 Copyright (C) 2026 Swift Storm Studio.
 
-ライセンス全文は [LICENSE](../../LICENSE) を参照してください。
+`akkara/akkserver/` 配下は別ライセンスで、GNU Affero General Public License v3.0 を適用します。
+
+ライセンス全文は [LICENSE](../../LICENSE) を、AkkServer 側の全文は [LICENSE_SERVER](../../LICENSE_SERVER) を参照してください。

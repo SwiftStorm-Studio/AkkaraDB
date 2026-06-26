@@ -74,6 +74,12 @@ MemTable throughput:
 cmake-build-release\bin\akkaradb_memtable_throughput_benchmark.exe 200000 --writers=16 --backend=art
 ```
 
+The MemTable throughput benchmark writes three CSV files next to the executable by default:
+
+- `memtable_throughput_results.csv`: MemTable benchmark results only
+- `memtable_throughput_results_environment.csv`: machine profile and DiskSpd best-of-5 summary
+- `memtable_throughput_results_diskspd_raw.csv`: per-run DiskSpd raw results
+
 WAL throughput:
 
 ```powershell

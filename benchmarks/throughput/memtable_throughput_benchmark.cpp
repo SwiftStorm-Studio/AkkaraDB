@@ -2,21 +2,12 @@
  * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
  * Copyright (C) 2026 Swift Storm Studio
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- *
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// benchmarks/throughput/memtableThroughputBenchmark.cpp
+// benchmarks/throughput/memtable_throughput_benchmark.cpp
 #include "TestErrorHandlers.hpp"
 
 /*
@@ -32,7 +23,7 @@
  *   akkaradbMemtableThroughputBenchmark [opsPerCase]
  *       [--writers=N] [--shards=N] [--auto-cap=N]
  *       [--prehash] [--backend=skiplist|bptree|art]
- *       [--compare-flush-modes]
+ *       [--compare-flush-modes] [--disk-target=PATH]
  *
  * Default:
  *   opsPerCase = 200000
@@ -70,6 +61,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #include <malloc.h>
 #endif
 
@@ -84,9 +76,10 @@ namespace {
     constexpr size_t kScanSampleWindow = 32; // amortize clock resolution/overhead for iterator next()
     constexpr uint64_t kAutoFlushDisabledThreshold = 0;
     constexpr size_t kKeyChunkSize = 1'000'000;
-    constexpr uint64_t kDiskBenchmarkFileSizeBytes = 64ULL * 1024ULL * 1024ULL;
+    constexpr uint64_t kDiskBenchmarkFileSizeBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     constexpr uint32_t kDiskBenchmarkRuns = 5;
     constexpr uint32_t kDiskBenchmarkDurationSeconds = 5;
+    constexpr uint32_t kDiskBenchmarkIntervalSeconds = 5;
 
     struct CaseSpec {
         int keySize;
@@ -112,32 +105,46 @@ namespace {
         DefaultThreshold
     };
 
-    struct DiskMetricStats {
-        double throughputMeanMiBPerSec = 0.0;
-        double throughputMedianMiBPerSec = 0.0;
-        double iopsMean = 0.0;
-        double iopsMedian = 0.0;
+    struct DiskRunResult {
+        double throughputMBPerSec = 0.0;
+        double iops = 0.0;
+        double averageLatencyUs = 0.0;
+        double p50LatencyUs = 0.0;
+        double p90LatencyUs = 0.0;
+        double p99LatencyUs = 0.0;
+        double p999LatencyUs = 0.0;
     };
 
-    struct DiskRunResult {
-        double throughputMiBPerSec = 0.0;
-        double iops = 0.0;
+    struct DiskBenchmarkItemSpec {
+        std::string key;
+        std::string label;
+        std::vector<std::string> args;
+    };
+
+    struct DiskBenchmarkItemResult {
+        std::string key;
+        std::string label;
+        int bestRunIndex = -1;
+        int lowestAvgLatencyRunIndex = -1;
+        DiskRunResult bestRun{};
+        std::vector<DiskRunResult> rawRuns;
+    };
+
+    struct DiskBenchmarkProfileResult {
+        std::string key;
+        std::string label;
+        std::vector<DiskBenchmarkItemResult> items;
     };
 
     struct DiskBenchmarkSummary {
         bool available = false;
-        std::string tempFilePath;
+        std::string targetFilePath;
         std::string error;
         uint64_t fileSizeBytes = 0;
         uint32_t runs = 0;
-        DiskMetricStats seq1mQ8T1Read;
-        DiskMetricStats seq1mQ8T1Write;
-        DiskMetricStats seq1mQ1T1Read;
-        DiskMetricStats seq1mQ1T1Write;
-        DiskMetricStats rnd4kQ32T1Read;
-        DiskMetricStats rnd4kQ32T1Write;
-        DiskMetricStats rnd4kQ1T1Read;
-        DiskMetricStats rnd4kQ1T1Write;
+        uint32_t durationSeconds = 0;
+        uint32_t intervalSeconds = 0;
+        std::vector<DiskBenchmarkProfileResult> profiles;
     };
 
     struct SystemProfile {
@@ -233,8 +240,24 @@ namespace {
         bool usePrehash = false;
         bool compareFlushModes = false;
         BackendKind backend = BackendKind::BPTree;
+        std::string diskTargetPath;
         std::string outputPath;
     };
+
+#ifdef _WIN32
+    bool gElevatedRetryAttempted = false;
+#endif
+
+    [[nodiscard]] static std::filesystem::path deriveSiblingOutputPath(
+        const std::string& basePath,
+        std::string_view suffix
+    ) {
+        const std::filesystem::path base = std::filesystem::path(basePath);
+        const std::filesystem::path parent = base.has_parent_path() ? base.parent_path() : std::filesystem::current_path();
+        const std::string stem = base.has_stem() ? base.stem().string() : std::string("benchmark_results");
+        const std::string extension = base.has_extension() ? base.extension().string() : std::string(".csv");
+        return parent / (stem + std::string(suffix) + extension);
+    }
 
     [[nodiscard]] static uint32_t nextPow2Clamped(uint64_t n, uint32_t minValue, uint32_t maxValue) {
         uint32_t p = 1;
@@ -248,6 +271,15 @@ namespace {
             p = maxValue;
         }
         return p;
+    }
+
+    [[nodiscard]] static std::string lowerAscii(std::string s) {
+        for (char& ch : s) {
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+        }
+        return s;
     }
 
     [[nodiscard]] static uint32_t resolveShardCount(
@@ -419,18 +451,6 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] static DiskMetricStats computeDiskMetricStats(
-        const std::vector<double>& throughputSamples,
-        const std::vector<double>& iopsSamples
-    ) {
-        DiskMetricStats out{};
-        out.throughputMeanMiBPerSec = computeNumericStats(throughputSamples).mean;
-        out.throughputMedianMiBPerSec = computeNumericStats(throughputSamples).median;
-        out.iopsMean = computeNumericStats(iopsSamples).mean;
-        out.iopsMedian = computeNumericStats(iopsSamples).median;
-        return out;
-    }
-
     [[nodiscard]] static std::string commandOutput(const std::string& command) {
         std::string out;
 #ifdef _WIN32
@@ -452,6 +472,188 @@ namespace {
 #endif
         return out;
     }
+
+#ifdef _WIN32
+    [[nodiscard]] static std::wstring widenAnsi(std::string_view text) {
+        if (text.empty()) {
+            return {};
+        }
+        const int required = MultiByteToWideChar(CP_ACP, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        if (required <= 0) {
+            return std::wstring(text.begin(), text.end());
+        }
+        std::wstring wide(static_cast<size_t>(required), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, text.data(), static_cast<int>(text.size()), wide.data(), required);
+        return wide;
+    }
+
+    [[nodiscard]] static std::string quoteWindowsArg(std::string_view arg) {
+        if (arg.empty()) {
+            return "\"\"";
+        }
+        const bool needsQuotes = arg.find_first_of(" \t\"") != std::string_view::npos;
+        if (!needsQuotes) {
+            return std::string(arg);
+        }
+
+        std::string out;
+        out.push_back('"');
+        size_t backslashes = 0;
+        for (const char ch : arg) {
+            if (ch == '\\') {
+                ++backslashes;
+                continue;
+            }
+            if (ch == '"') {
+                out.append(backslashes * 2 + 1, '\\');
+                out.push_back('"');
+                backslashes = 0;
+                continue;
+            }
+            if (backslashes != 0) {
+                out.append(backslashes, '\\');
+                backslashes = 0;
+            }
+            out.push_back(ch);
+        }
+        if (backslashes != 0) {
+            out.append(backslashes * 2, '\\');
+        }
+        out.push_back('"');
+        return out;
+    }
+
+    [[nodiscard]] static std::string commandOutput(
+        const std::filesystem::path& executable,
+        const std::vector<std::string>& args
+    ) {
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+
+        HANDLE readPipe = nullptr;
+        HANDLE writePipe = nullptr;
+        if (!CreatePipe(&readPipe, &writePipe, &sa, 0)) {
+            return {};
+        }
+        SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+        std::string commandLine = quoteWindowsArg(executable.string());
+        for (const std::string& arg : args) {
+            commandLine.push_back(' ');
+            commandLine += quoteWindowsArg(arg);
+        }
+
+        STARTUPINFOA startupInfo{};
+        startupInfo.cb = sizeof(startupInfo);
+        startupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        startupInfo.hStdOutput = writePipe;
+        startupInfo.hStdError = writePipe;
+
+        PROCESS_INFORMATION processInfo{};
+        std::vector<char> mutableCommandLine(commandLine.begin(), commandLine.end());
+        mutableCommandLine.push_back('\0');
+
+        const BOOL created = CreateProcessA(
+            executable.string().c_str(),
+            mutableCommandLine.data(),
+            nullptr,
+            nullptr,
+            TRUE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            executable.parent_path().string().c_str(),
+            &startupInfo,
+            &processInfo
+        );
+        CloseHandle(writePipe);
+
+        std::string output;
+        if (!created) {
+            CloseHandle(readPipe);
+            return output;
+        }
+
+        std::array<char, 4096> buffer{};
+        DWORD bytesRead = 0;
+        while (ReadFile(readPipe, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr) && bytesRead != 0) {
+            output.append(buffer.data(), buffer.data() + bytesRead);
+        }
+        CloseHandle(readPipe);
+
+        WaitForSingleObject(processInfo.hProcess, INFINITE);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        return output;
+    }
+
+    [[nodiscard]] static bool containsDiskSpdPrivilegeWarning(const std::string& output) {
+        return output.find("SeManageVolumePrivilege") != std::string::npos ||
+               output.find("Could not set privileges for setting valid file size") != std::string::npos;
+    }
+
+    [[nodiscard]] static bool currentProcessIsElevated() {
+        HANDLE token = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+            return false;
+        }
+        TOKEN_ELEVATION elevation{};
+        DWORD size = 0;
+        const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+        CloseHandle(token);
+        return ok && elevation.TokenIsElevated != 0;
+    }
+
+    [[noreturn]] static void relaunchBenchmarkElevatedOrExit(int argc, char** argv) {
+        std::string params;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string_view{argv[i]} == "--akkara-elevated-retry") {
+                continue;
+            }
+            if (i > 1) {
+                params.push_back(' ');
+            }
+            params += quoteWindowsArg(argv[i]);
+        }
+        if (!params.empty()) {
+            params.push_back(' ');
+        }
+        params += "--akkara-elevated-retry";
+
+        wchar_t exePath[MAX_PATH]{};
+        const DWORD exeLen = GetModuleFileNameW(nullptr, exePath, static_cast<DWORD>(std::size(exePath)));
+        if (exeLen == 0 || exeLen >= std::size(exePath)) {
+            throw std::runtime_error("Failed to resolve current benchmark executable path for elevated retry");
+        }
+
+        SHELLEXECUTEINFOW execInfo{};
+        execInfo.cbSize = sizeof(execInfo);
+        execInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
+        execInfo.lpVerb = L"runas";
+        execInfo.lpFile = exePath;
+        const std::wstring wideParams = widenAnsi(params);
+        const std::filesystem::path exeDir = std::filesystem::path(exePath).parent_path();
+        execInfo.lpParameters = wideParams.c_str();
+        execInfo.lpDirectory = exeDir.c_str();
+        execInfo.nShow = SW_SHOWNORMAL;
+
+        if (!ShellExecuteExW(&execInfo)) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_CANCELLED) {
+                throw std::runtime_error("UAC elevation was cancelled while retrying DiskSpd benchmark");
+            }
+            throw std::runtime_error(std::format("Failed to relaunch benchmark with elevation (winerr={})", error));
+        }
+
+        if (execInfo.hProcess != nullptr) {
+            CloseHandle(execInfo.hProcess);
+        }
+        std::printf("DiskSpd requested SeManageVolumePrivilege. Relaunching benchmark elevated.\n");
+        std::fflush(stdout);
+        std::exit(0);
+    }
+#endif
 
     [[nodiscard]] static std::optional<uint64_t> parseU64(const std::string& text) {
         if (text.empty()) {
@@ -501,34 +703,141 @@ namespace {
         return columns;
     }
 
-    [[nodiscard]] static std::optional<DiskRunResult> parseDiskSpdSectionTotals(
-        const std::string& output,
-        std::string_view sectionTitle
-    ) {
-        const std::string marker = std::string(sectionTitle) + "\n";
-        const size_t sectionPos = output.find(marker);
-        if (sectionPos == std::string::npos) {
+    [[nodiscard]] static std::vector<std::string> splitLines(const std::string& text) {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (start <= text.size()) {
+            const size_t end = text.find('\n', start);
+            std::string line = trimAscii(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            lines.push_back(std::move(line));
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+        return lines;
+    }
+
+    [[nodiscard]] static bool startsWithAsciiCaseInsensitive(std::string_view text, std::string_view prefix) {
+        if (text.size() < prefix.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < prefix.size(); ++i) {
+            const unsigned char lhs = static_cast<unsigned char>(text[i]);
+            const unsigned char rhs = static_cast<unsigned char>(prefix[i]);
+            if (std::tolower(lhs) != std::tolower(rhs)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] static double mibToMb(double mibPerSec) {
+        return mibPerSec * (1024.0 * 1024.0) / (1000.0 * 1000.0);
+    }
+
+    [[nodiscard]] static std::optional<double> parseLatencyValueUs(const std::string& text) {
+        const std::optional<double> valueMs = parseDouble(text);
+        if (!valueMs.has_value()) {
             return std::nullopt;
         }
-        const size_t totalPos = output.find("total:", sectionPos);
-        if (totalPos == std::string::npos) {
+        return *valueMs * 1000.0;
+    }
+
+    [[nodiscard]] static std::optional<DiskRunResult> parseDiskSpdResult(const std::string& output) {
+        const std::vector<std::string> lines = splitLines(output);
+        bool inTotalIoSection = false;
+        bool inLatencySection = false;
+        size_t throughputIndex = std::numeric_limits<size_t>::max();
+        size_t iopsIndex = std::numeric_limits<size_t>::max();
+        size_t avgLatencyIndex = std::numeric_limits<size_t>::max();
+        bool throughputIsMiB = false;
+        DiskRunResult parsed{};
+        bool sawTotalIo = false;
+        bool sawLatency = false;
+
+        for (const std::string& line : lines) {
+            if (!inTotalIoSection) {
+                if (line == "Total IO") {
+                    inTotalIoSection = true;
+                    inLatencySection = false;
+                    throughputIndex = std::numeric_limits<size_t>::max();
+                    iopsIndex = std::numeric_limits<size_t>::max();
+                    avgLatencyIndex = std::numeric_limits<size_t>::max();
+                }
+                continue;
+            }
+
+            const std::vector<std::string> columns = splitPipeColumns(line);
+            if (inTotalIoSection && !inLatencySection && startsWithAsciiCaseInsensitive(line, "total latency distribution")) {
+                inLatencySection = true;
+                continue;
+            }
+            if (inTotalIoSection && !inLatencySection) {
+                if (throughputIndex == std::numeric_limits<size_t>::max() && !columns.empty() && columns[0] == "thread") {
+                    for (size_t i = 0; i < columns.size(); ++i) {
+                        if (columns[i] == "MiB/s") {
+                            throughputIndex = i;
+                            throughputIsMiB = true;
+                        } else if (columns[i] == "MB/s") {
+                            throughputIndex = i;
+                            throughputIsMiB = false;
+                        } else if (columns[i] == "I/O per s") {
+                            iopsIndex = i;
+                        } else if (columns[i] == "AvgLat") {
+                            avgLatencyIndex = i;
+                        }
+                    }
+                    continue;
+                }
+
+                if (!columns.empty() && (columns[0] == "total:" || startsWithAsciiCaseInsensitive(columns[0], "total"))) {
+                    if (throughputIndex >= columns.size() || iopsIndex >= columns.size() || avgLatencyIndex >= columns.size()) {
+                        return std::nullopt;
+                    }
+                    const std::optional<double> throughput = parseDouble(columns[throughputIndex]);
+                    const std::optional<double> iops = parseDouble(columns[iopsIndex]);
+                    const std::optional<double> averageLatencyUs = parseLatencyValueUs(columns[avgLatencyIndex]);
+                    if (!throughput.has_value() || !iops.has_value() || !averageLatencyUs.has_value()) {
+                        return std::nullopt;
+                    }
+                    parsed.throughputMBPerSec = throughputIsMiB ? mibToMb(*throughput) : *throughput;
+                    parsed.iops = *iops;
+                    parsed.averageLatencyUs = *averageLatencyUs;
+                    sawTotalIo = true;
+                    continue;
+                }
+            }
+
+            if (inLatencySection) {
+                if (columns.size() < 4) {
+                    continue;
+                }
+                const std::string percentile = lowerAscii(columns[0]);
+                const std::optional<double> totalLatencyUs = parseLatencyValueUs(columns[3]);
+                if (!totalLatencyUs.has_value()) {
+                    continue;
+                }
+                if (percentile == "50th") {
+                    parsed.p50LatencyUs = *totalLatencyUs;
+                    sawLatency = true;
+                } else if (percentile == "90th") {
+                    parsed.p90LatencyUs = *totalLatencyUs;
+                } else if (percentile == "99th") {
+                    parsed.p99LatencyUs = *totalLatencyUs;
+                } else if (percentile == "3-nines") {
+                    parsed.p999LatencyUs = *totalLatencyUs;
+                }
+            }
+        }
+
+        if (!sawTotalIo || !sawLatency || parsed.p90LatencyUs == 0.0 || parsed.p99LatencyUs == 0.0 || parsed.p999LatencyUs == 0.0) {
             return std::nullopt;
         }
-        const size_t lineEnd = output.find('\n', totalPos);
-        const std::string totalLine = trimAscii(output.substr(totalPos, lineEnd == std::string::npos ? std::string::npos : lineEnd - totalPos));
-        const std::vector<std::string> columns = splitPipeColumns(totalLine);
-        if (columns.size() < 5) {
-            return std::nullopt;
-        }
-        const std::optional<double> throughput = parseDouble(columns[2]);
-        const std::optional<double> iops = parseDouble(columns[3]);
-        if (!throughput.has_value() || !iops.has_value()) {
-            return std::nullopt;
-        }
-        return DiskRunResult{
-            .throughputMiBPerSec = *throughput,
-            .iops = *iops
-        };
+        return parsed;
     }
 
     [[nodiscard]] static std::string escapePowerShellSingleQuoted(std::string value) {
@@ -547,6 +856,71 @@ namespace {
             return std::string{static_cast<char>(std::toupper(static_cast<unsigned char>(root[0])))};
         }
         return "C";
+    }
+
+    [[nodiscard]] static std::vector<DiskBenchmarkProfileResult> makeDiskBenchmarkProfiles() {
+        std::vector<DiskBenchmarkProfileResult> profiles;
+
+        DiskBenchmarkProfileResult defaultProfile{};
+        defaultProfile.key = "default";
+        defaultProfile.label = "Default";
+        defaultProfile.items = {
+            {.key = "seq1m_q8t1_read", .label = "SEQ1M Q8T1 Read"},
+            {.key = "seq1m_q8t1_write", .label = "SEQ1M Q8T1 Write"},
+            {.key = "seq1m_q8t1_mix", .label = "SEQ1M Q8T1 Mix R70/W30"},
+            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read"},
+            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write"},
+            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30"},
+            {.key = "rnd4k_q32t1_read", .label = "RND4K Q32T1 Read"},
+            {.key = "rnd4k_q32t1_write", .label = "RND4K Q32T1 Write"},
+            {.key = "rnd4k_q32t1_mix", .label = "RND4K Q32T1 Mix R70/W30"},
+            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read"},
+            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write"},
+            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30"}
+        };
+        profiles.push_back(std::move(defaultProfile));
+
+        DiskBenchmarkProfileResult realWorldProfile{};
+        realWorldProfile.key = "real_world";
+        realWorldProfile.label = "Real World Performance";
+        realWorldProfile.items = {
+            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read"},
+            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write"},
+            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30"},
+            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read"},
+            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write"},
+            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30"}
+        };
+        profiles.push_back(std::move(realWorldProfile));
+
+        return profiles;
+    }
+
+    [[nodiscard]] static std::vector<DiskBenchmarkItemSpec> makeDiskBenchmarkItemSpecs() {
+        return {
+            {.key = "seq1m_q8t1_read", .label = "SEQ1M Q8T1 Read", .args = {"-b1024K", "-o8", "-t1", "-w0"}},
+            {.key = "seq1m_q8t1_write", .label = "SEQ1M Q8T1 Write", .args = {"-b1024K", "-o8", "-t1", "-w100", "-Z1024K"}},
+            {.key = "seq1m_q8t1_mix", .label = "SEQ1M Q8T1 Mix R70/W30", .args = {"-b1024K", "-o8", "-t1", "-w30", "-Z1024K"}},
+            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read", .args = {"-b1024K", "-o1", "-t1", "-w0"}},
+            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write", .args = {"-b1024K", "-o1", "-t1", "-w100", "-Z1024K"}},
+            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30", .args = {"-b1024K", "-o1", "-t1", "-w30", "-Z1024K"}},
+            {.key = "rnd4k_q32t1_read", .label = "RND4K Q32T1 Read", .args = {"-b4K", "-o32", "-t1", "-w0", "-r"}},
+            {.key = "rnd4k_q32t1_write", .label = "RND4K Q32T1 Write", .args = {"-b4K", "-o32", "-t1", "-w100", "-r", "-Z4K"}},
+            {.key = "rnd4k_q32t1_mix", .label = "RND4K Q32T1 Mix R70/W30", .args = {"-b4K", "-o32", "-t1", "-w30", "-r", "-Z4K"}},
+            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read", .args = {"-b4K", "-o1", "-t1", "-w0", "-r"}},
+            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write", .args = {"-b4K", "-o1", "-t1", "-w100", "-r", "-Z4K"}},
+            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30", .args = {"-b4K", "-o1", "-t1", "-w30", "-r", "-Z4K"}}
+        };
+    }
+
+    [[nodiscard]] static const DiskBenchmarkItemSpec* findDiskBenchmarkItemSpec(std::string_view key) {
+        static const std::vector<DiskBenchmarkItemSpec> specs = makeDiskBenchmarkItemSpecs();
+        for (const auto& spec : specs) {
+            if (spec.key == key) {
+                return &spec;
+            }
+        }
+        return nullptr;
     }
 
 #ifdef _WIN32
@@ -788,7 +1162,7 @@ namespace {
 
         DiskRunResult out{};
         if (seconds > 0.0) {
-            out.throughputMiBPerSec = (static_cast<double>(fileSizeBytes) / (1024.0 * 1024.0)) / seconds;
+            out.throughputMBPerSec = mibToMb((static_cast<double>(fileSizeBytes) / (1024.0 * 1024.0)) / seconds);
             out.iops = static_cast<double>(totalOps) / seconds;
         }
         return out;
@@ -796,11 +1170,13 @@ namespace {
 #endif
 
     [[nodiscard]] static SystemProfile collectSystemProfile(
-        const std::filesystem::path& outputPath,
-        const std::filesystem::path& diskSpdPath
+        const std::filesystem::path& diskTargetPath,
+        const std::filesystem::path& diskSpdPath,
+        int argc,
+        char** argv
     ) {
         SystemProfile profile{};
-        profile.benchmarkDrive = benchmarkDriveFromPath(outputPath);
+        profile.benchmarkDrive = benchmarkDriveFromPath(diskTargetPath);
 
 #ifdef _WIN32
         const std::string driveLetter = escapePowerShellSingleQuoted(profile.benchmarkDrive);
@@ -882,56 +1258,90 @@ namespace {
                 throw std::runtime_error("diskspd.exe was not found next to the benchmark executable");
             }
 
-            const std::filesystem::path tempFile = std::filesystem::absolute(outputPath).parent_path() / "memtable_disk_probe.tmp";
-            profile.disk.tempFilePath = tempFile.string();
+            const std::filesystem::path tempFile = std::filesystem::absolute(diskTargetPath);
+            std::error_code createDirEc;
+            if (tempFile.has_parent_path()) {
+                std::filesystem::create_directories(tempFile.parent_path(), createDirEc);
+            }
+            profile.disk.targetFilePath = tempFile.string();
             profile.disk.fileSizeBytes = kDiskBenchmarkFileSizeBytes;
             profile.disk.runs = kDiskBenchmarkRuns;
+            profile.disk.durationSeconds = kDiskBenchmarkDurationSeconds;
+            profile.disk.intervalSeconds = kDiskBenchmarkIntervalSeconds;
+            profile.disk.profiles = makeDiskBenchmarkProfiles();
 
-            auto runMetric = [&](bool writeMode, bool randomAccess, uint32_t queueDepth, size_t blockSize) {
-                std::vector<double> throughputs;
-                std::vector<double> iops;
-                throughputs.reserve(kDiskBenchmarkRuns);
-                iops.reserve(kDiskBenchmarkRuns);
+            uint32_t totalExecutions = 0;
+            for (const auto& profileResult : profile.disk.profiles) {
+                totalExecutions += static_cast<uint32_t>(profileResult.items.size()) * kDiskBenchmarkRuns;
+            }
+            uint32_t completedExecutions = 0;
 
-                const std::string sectionTitle = writeMode ? "Write IO" : "Read IO";
-                const std::string blockArg = blockSize == 1024 * 1024 ? "1M" : "4K";
-                const std::string accessHint = randomAccess ? "-fr" : "-fs";
-                const std::string randomArg = randomAccess ? "-r " : "";
-                const std::string writeArg = writeMode ? "-w100" : "-w0";
-
-                for (uint32_t run = 0; run < kDiskBenchmarkRuns; ++run) {
-                    std::error_code removeEc;
-                    std::filesystem::remove(tempFile, removeEc);
-                    const std::string command = std::format(
-                        "{} -c64M -W0 -C0 -d{} -Sh -L -b{} -o{} -t1 {} {} {} {} 2>&1",
-                        quoteCommandArg(diskSpdPath),
-                        kDiskBenchmarkDurationSeconds,
-                        blockArg,
-                        queueDepth,
-                        accessHint,
-                        randomArg,
-                        writeArg,
-                        quoteCommandArg(tempFile)
-                    );
-                    const std::string output = commandOutput(command);
-                    const std::optional<DiskRunResult> parsed = parseDiskSpdSectionTotals(output, sectionTitle);
-                    if (!parsed.has_value()) {
-                        throw std::runtime_error("Failed to parse DiskSpd output for " + sectionTitle);
-                    }
-                    throughputs.push_back(parsed->throughputMiBPerSec);
-                    iops.push_back(parsed->iops);
-                }
-                return computeDiskMetricStats(throughputs, iops);
+            const std::vector<std::string> commonArgs{
+                "-c2G",
+                "-W0",
+                "-S",
+                "-ag",
+                std::format("-d{}", kDiskBenchmarkDurationSeconds),
+                "-L"
             };
 
-            profile.disk.seq1mQ8T1Write = runMetric(true, false, 8, 1024 * 1024);
-            profile.disk.seq1mQ1T1Write = runMetric(true, false, 1, 1024 * 1024);
-            profile.disk.rnd4kQ32T1Write = runMetric(true, true, 32, 4 * 1024);
-            profile.disk.rnd4kQ1T1Write = runMetric(true, true, 1, 4 * 1024);
-            profile.disk.seq1mQ8T1Read = runMetric(false, false, 8, 1024 * 1024);
-            profile.disk.seq1mQ1T1Read = runMetric(false, false, 1, 1024 * 1024);
-            profile.disk.rnd4kQ32T1Read = runMetric(false, true, 32, 4 * 1024);
-            profile.disk.rnd4kQ1T1Read = runMetric(false, true, 1, 4 * 1024);
+            for (auto& profileResult : profile.disk.profiles) {
+                for (auto& itemResult : profileResult.items) {
+                    const DiskBenchmarkItemSpec* spec = findDiskBenchmarkItemSpec(itemResult.key);
+                    if (spec == nullptr) {
+                        throw std::runtime_error("Unknown disk benchmark item: " + itemResult.key);
+                    }
+                    itemResult.label = spec->label;
+                    itemResult.rawRuns.reserve(kDiskBenchmarkRuns);
+
+                    for (uint32_t run = 0; run < kDiskBenchmarkRuns; ++run) {
+                        std::error_code removeEc;
+                        std::filesystem::remove(tempFile, removeEc);
+                        std::vector<std::string> args = commonArgs;
+                        args.insert(args.end(), spec->args.begin(), spec->args.end());
+                        args.push_back(tempFile.string());
+#ifdef _WIN32
+                        const std::string output = commandOutput(diskSpdPath, args);
+                        if (containsDiskSpdPrivilegeWarning(output) &&
+                            !gElevatedRetryAttempted &&
+                            !currentProcessIsElevated()) {
+                            relaunchBenchmarkElevatedOrExit(argc, argv);
+                        }
+#else
+                    std::string command = quoteCommandArg(diskSpdPath);
+                    for (const std::string& arg : args) {
+                        command.push_back(' ');
+                        command += quoteCommandArg(arg);
+                    }
+                    command += " 2>&1";
+                    const std::string output = commandOutput(command);
+#endif
+                        const std::optional<DiskRunResult> parsed = parseDiskSpdResult(output);
+                    if (!parsed.has_value()) {
+                        throw std::runtime_error(
+                            "Failed to parse DiskSpd output for " + spec->label +
+                            ". Output:\n" + output
+                        );
+                    }
+                        itemResult.rawRuns.push_back(*parsed);
+                        if (itemResult.bestRunIndex < 0 ||
+                            parsed->throughputMBPerSec > itemResult.bestRun.throughputMBPerSec) {
+                            itemResult.bestRunIndex = static_cast<int>(run);
+                            itemResult.bestRun = *parsed;
+                        }
+                        if (itemResult.lowestAvgLatencyRunIndex < 0 ||
+                            parsed->averageLatencyUs < itemResult.rawRuns[static_cast<size_t>(itemResult.lowestAvgLatencyRunIndex)].averageLatencyUs) {
+                            itemResult.lowestAvgLatencyRunIndex = static_cast<int>(run);
+                        }
+
+                        ++completedExecutions;
+                        if (completedExecutions < totalExecutions) {
+                            std::this_thread::sleep_for(std::chrono::seconds(kDiskBenchmarkIntervalSeconds));
+                        }
+                    }
+                }
+            }
+
             profile.disk.available = true;
             std::error_code ignoreEc;
             std::filesystem::remove(tempFile, ignoreEc);
@@ -1082,11 +1492,133 @@ namespace {
             << ',' << stats.cov;
     }
 
-    static void writeDiskMetricColumns(std::ofstream& out, const DiskMetricStats& stats) {
-        out << ',' << stats.throughputMeanMiBPerSec
-            << ',' << stats.throughputMedianMiBPerSec
-            << ',' << stats.iopsMean
-            << ',' << stats.iopsMedian;
+    [[nodiscard]] static double averageWallLatencyUs(int ops, double ms);
+
+    [[nodiscard]] static const DiskBenchmarkProfileResult* findDiskProfileResult(
+        const DiskBenchmarkSummary& summary,
+        std::string_view key
+    ) {
+        for (const auto& profile : summary.profiles) {
+            if (profile.key == key) {
+                return &profile;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] static const DiskBenchmarkItemResult* findDiskItemResult(
+        const DiskBenchmarkProfileResult* profile,
+        std::string_view key
+    ) {
+        if (profile == nullptr) {
+            return nullptr;
+        }
+        for (const auto& item : profile->items) {
+            if (item.key == key) {
+                return &item;
+            }
+        }
+        return nullptr;
+    }
+
+    static void writeDiskItemBestColumns(std::ofstream& out, const DiskBenchmarkItemResult* item) {
+        if (item == nullptr || item->bestRunIndex < 0) {
+            out << ",,,,,,,,";
+            return;
+        }
+        out << ',' << item->bestRun.throughputMBPerSec
+            << ',' << item->bestRun.iops
+            << ',' << item->bestRun.averageLatencyUs
+            << ',' << item->bestRun.p50LatencyUs
+            << ',' << item->bestRun.p90LatencyUs
+            << ',' << item->bestRun.p99LatencyUs
+            << ',' << item->bestRun.p999LatencyUs
+            << ',' << (item->bestRunIndex + 1);
+    }
+
+    static void writeEnvironmentCsv(
+        const std::string& path,
+        const SystemProfile& profile
+    ) {
+        if (path.empty()) {
+            return;
+        }
+
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("Failed to open environment output file: " + path);
+        }
+
+        out << "cpu_name,cpu_physical_cores,cpu_logical_cores,ram_total_bytes,ram_module_count,ram_speed_mean_mtps,ram_speed_list_mtps,os_name,os_architecture,benchmark_drive,ssd_model,ssd_media_type,"
+               "disk_probe_available,disk_probe_error,disk_probe_file_size_bytes,disk_probe_runs,disk_probe_duration_seconds,disk_probe_interval_seconds,disk_probe_target_path,"
+               "default_seq1m_q8t1_read_mb_s,default_seq1m_q8t1_read_iops,default_seq1m_q8t1_read_avg_us,default_seq1m_q8t1_read_p50_us,default_seq1m_q8t1_read_p90_us,default_seq1m_q8t1_read_p99_us,default_seq1m_q8t1_read_p999_us,default_seq1m_q8t1_read_best_run,"
+               "default_seq1m_q8t1_write_mb_s,default_seq1m_q8t1_write_iops,default_seq1m_q8t1_write_avg_us,default_seq1m_q8t1_write_p50_us,default_seq1m_q8t1_write_p90_us,default_seq1m_q8t1_write_p99_us,default_seq1m_q8t1_write_p999_us,default_seq1m_q8t1_write_best_run,"
+               "default_seq1m_q8t1_mix_mb_s,default_seq1m_q8t1_mix_iops,default_seq1m_q8t1_mix_avg_us,default_seq1m_q8t1_mix_p50_us,default_seq1m_q8t1_mix_p90_us,default_seq1m_q8t1_mix_p99_us,default_seq1m_q8t1_mix_p999_us,default_seq1m_q8t1_mix_best_run,"
+               "default_seq1m_q1t1_read_mb_s,default_seq1m_q1t1_read_iops,default_seq1m_q1t1_read_avg_us,default_seq1m_q1t1_read_p50_us,default_seq1m_q1t1_read_p90_us,default_seq1m_q1t1_read_p99_us,default_seq1m_q1t1_read_p999_us,default_seq1m_q1t1_read_best_run,"
+               "default_seq1m_q1t1_write_mb_s,default_seq1m_q1t1_write_iops,default_seq1m_q1t1_write_avg_us,default_seq1m_q1t1_write_p50_us,default_seq1m_q1t1_write_p90_us,default_seq1m_q1t1_write_p99_us,default_seq1m_q1t1_write_p999_us,default_seq1m_q1t1_write_best_run,"
+               "default_seq1m_q1t1_mix_mb_s,default_seq1m_q1t1_mix_iops,default_seq1m_q1t1_mix_avg_us,default_seq1m_q1t1_mix_p50_us,default_seq1m_q1t1_mix_p90_us,default_seq1m_q1t1_mix_p99_us,default_seq1m_q1t1_mix_p999_us,default_seq1m_q1t1_mix_best_run,"
+               "default_rnd4k_q32t1_read_mb_s,default_rnd4k_q32t1_read_iops,default_rnd4k_q32t1_read_avg_us,default_rnd4k_q32t1_read_p50_us,default_rnd4k_q32t1_read_p90_us,default_rnd4k_q32t1_read_p99_us,default_rnd4k_q32t1_read_p999_us,default_rnd4k_q32t1_read_best_run,"
+               "default_rnd4k_q32t1_write_mb_s,default_rnd4k_q32t1_write_iops,default_rnd4k_q32t1_write_avg_us,default_rnd4k_q32t1_write_p50_us,default_rnd4k_q32t1_write_p90_us,default_rnd4k_q32t1_write_p99_us,default_rnd4k_q32t1_write_p999_us,default_rnd4k_q32t1_write_best_run,"
+               "default_rnd4k_q32t1_mix_mb_s,default_rnd4k_q32t1_mix_iops,default_rnd4k_q32t1_mix_avg_us,default_rnd4k_q32t1_mix_p50_us,default_rnd4k_q32t1_mix_p90_us,default_rnd4k_q32t1_mix_p99_us,default_rnd4k_q32t1_mix_p999_us,default_rnd4k_q32t1_mix_best_run,"
+               "default_rnd4k_q1t1_read_mb_s,default_rnd4k_q1t1_read_iops,default_rnd4k_q1t1_read_avg_us,default_rnd4k_q1t1_read_p50_us,default_rnd4k_q1t1_read_p90_us,default_rnd4k_q1t1_read_p99_us,default_rnd4k_q1t1_read_p999_us,default_rnd4k_q1t1_read_best_run,"
+               "default_rnd4k_q1t1_write_mb_s,default_rnd4k_q1t1_write_iops,default_rnd4k_q1t1_write_avg_us,default_rnd4k_q1t1_write_p50_us,default_rnd4k_q1t1_write_p90_us,default_rnd4k_q1t1_write_p99_us,default_rnd4k_q1t1_write_p999_us,default_rnd4k_q1t1_write_best_run,"
+               "default_rnd4k_q1t1_mix_mb_s,default_rnd4k_q1t1_mix_iops,default_rnd4k_q1t1_mix_avg_us,default_rnd4k_q1t1_mix_p50_us,default_rnd4k_q1t1_mix_p90_us,default_rnd4k_q1t1_mix_p99_us,default_rnd4k_q1t1_mix_p999_us,default_rnd4k_q1t1_mix_best_run,"
+               "real_world_seq1m_q1t1_read_mb_s,real_world_seq1m_q1t1_read_iops,real_world_seq1m_q1t1_read_avg_us,real_world_seq1m_q1t1_read_p50_us,real_world_seq1m_q1t1_read_p90_us,real_world_seq1m_q1t1_read_p99_us,real_world_seq1m_q1t1_read_p999_us,real_world_seq1m_q1t1_read_best_run,"
+               "real_world_seq1m_q1t1_write_mb_s,real_world_seq1m_q1t1_write_iops,real_world_seq1m_q1t1_write_avg_us,real_world_seq1m_q1t1_write_p50_us,real_world_seq1m_q1t1_write_p90_us,real_world_seq1m_q1t1_write_p99_us,real_world_seq1m_q1t1_write_p999_us,real_world_seq1m_q1t1_write_best_run,"
+               "real_world_seq1m_q1t1_mix_mb_s,real_world_seq1m_q1t1_mix_iops,real_world_seq1m_q1t1_mix_avg_us,real_world_seq1m_q1t1_mix_p50_us,real_world_seq1m_q1t1_mix_p90_us,real_world_seq1m_q1t1_mix_p99_us,real_world_seq1m_q1t1_mix_p999_us,real_world_seq1m_q1t1_mix_best_run,"
+               "real_world_rnd4k_q1t1_read_mb_s,real_world_rnd4k_q1t1_read_iops,real_world_rnd4k_q1t1_read_avg_us,real_world_rnd4k_q1t1_read_p50_us,real_world_rnd4k_q1t1_read_p90_us,real_world_rnd4k_q1t1_read_p99_us,real_world_rnd4k_q1t1_read_p999_us,real_world_rnd4k_q1t1_read_best_run,"
+               "real_world_rnd4k_q1t1_write_mb_s,real_world_rnd4k_q1t1_write_iops,real_world_rnd4k_q1t1_write_avg_us,real_world_rnd4k_q1t1_write_p50_us,real_world_rnd4k_q1t1_write_p90_us,real_world_rnd4k_q1t1_write_p99_us,real_world_rnd4k_q1t1_write_p999_us,real_world_rnd4k_q1t1_write_best_run,"
+               "real_world_rnd4k_q1t1_mix_mb_s,real_world_rnd4k_q1t1_mix_iops,real_world_rnd4k_q1t1_mix_avg_us,real_world_rnd4k_q1t1_mix_p50_us,real_world_rnd4k_q1t1_mix_p90_us,real_world_rnd4k_q1t1_mix_p99_us,real_world_rnd4k_q1t1_mix_p999_us,real_world_rnd4k_q1t1_mix_best_run\n";
+
+        writeCsvField(out, profile.cpuName);
+        out << ',' << profile.cpuPhysicalCores
+            << ',' << profile.cpuLogicalCores
+            << ',' << profile.ramTotalBytes
+            << ',' << profile.ramModuleCount
+            << ',' << profile.ramSpeedMeanMtps
+            << ',';
+        writeCsvField(out, profile.ramSpeedListMtps);
+        out << ',';
+        writeCsvField(out, profile.osName);
+        out << ',';
+        writeCsvField(out, profile.osArchitecture);
+        out << ',';
+        writeCsvField(out, profile.benchmarkDrive);
+        out << ',';
+        writeCsvField(out, profile.ssdModel);
+        out << ',';
+        writeCsvField(out, profile.ssdMediaType);
+        out << ',' << (profile.disk.available ? 1 : 0)
+            << ',';
+        writeCsvField(out, profile.disk.error);
+        out << ',' << profile.disk.fileSizeBytes
+            << ',' << profile.disk.runs
+            << ',' << profile.disk.durationSeconds
+            << ',' << profile.disk.intervalSeconds
+            << ',';
+        writeCsvField(out, profile.disk.targetFilePath);
+
+        const DiskBenchmarkProfileResult* defaultDisk = findDiskProfileResult(profile.disk, "default");
+        const DiskBenchmarkProfileResult* realWorldDisk = findDiskProfileResult(profile.disk, "real_world");
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q8t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q8t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q8t1_mix"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q1t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q1t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "seq1m_q1t1_mix"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q32t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q32t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q32t1_mix"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q1t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q1t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(defaultDisk, "rnd4k_q1t1_mix"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "seq1m_q1t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "seq1m_q1t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "seq1m_q1t1_mix"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "rnd4k_q1t1_read"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "rnd4k_q1t1_write"));
+        writeDiskItemBestColumns(out, findDiskItemResult(realWorldDisk, "rnd4k_q1t1_mix"));
+        out << '\n';
     }
 
     static void writeReportsCsv(
@@ -1094,7 +1626,6 @@ namespace {
         const BenchConfig& config,
         int effectiveWriters,
         uint32_t shardCount,
-        const SystemProfile& profile,
         const std::vector<BackendReport>& backendReports
     ) {
         if (path.empty()) {
@@ -1107,21 +1638,14 @@ namespace {
         }
 
         out << "backend,flush_mode,ops_per_case,repeats,key_size,value_size,shards,writers,prehash,"
-               "cpu_name,cpu_physical_cores,cpu_logical_cores,ram_total_bytes,ram_module_count,ram_speed_mean_mtps,ram_speed_list_mtps,os_name,os_architecture,benchmark_drive,ssd_model,ssd_media_type,"
-               "disk_probe_available,disk_probe_error,disk_probe_file_size_bytes,disk_probe_runs,disk_probe_temp_path,"
-               "seq1m_q8t1_read_mibps_mean,seq1m_q8t1_read_mibps_median,seq1m_q8t1_read_iops_mean,seq1m_q8t1_read_iops_median,"
-               "seq1m_q8t1_write_mibps_mean,seq1m_q8t1_write_mibps_median,seq1m_q8t1_write_iops_mean,seq1m_q8t1_write_iops_median,"
-               "seq1m_q1t1_read_mibps_mean,seq1m_q1t1_read_mibps_median,seq1m_q1t1_read_iops_mean,seq1m_q1t1_read_iops_median,"
-               "seq1m_q1t1_write_mibps_mean,seq1m_q1t1_write_mibps_median,seq1m_q1t1_write_iops_mean,seq1m_q1t1_write_iops_median,"
-               "rnd4k_q32t1_read_mibps_mean,rnd4k_q32t1_read_mibps_median,rnd4k_q32t1_read_iops_mean,rnd4k_q32t1_read_iops_median,"
-               "rnd4k_q32t1_write_mibps_mean,rnd4k_q32t1_write_mibps_median,rnd4k_q32t1_write_iops_mean,rnd4k_q32t1_write_iops_median,"
-               "rnd4k_q1t1_read_mibps_mean,rnd4k_q1t1_read_mibps_median,rnd4k_q1t1_read_iops_mean,rnd4k_q1t1_read_iops_median,"
-               "rnd4k_q1t1_write_mibps_mean,rnd4k_q1t1_write_mibps_median,rnd4k_q1t1_write_iops_mean,rnd4k_q1t1_write_iops_median,"
-               "put_ops_s,put_ms,put_flush_ops_s,put_flush_ms,get_ops_s,get_ms,scan_ops_s,scan_ms,flush_ms,mem_bytes,flushes_completed,flush_records_seen,"
-               "put_smp,get_smp,scan_smp,"
+               "put_ops_s,put_ms,put_avg_wall_us,put_flush_ops_s,put_flush_ms,get_ops_s,get_ms,get_avg_wall_us,scan_ops_s,scan_ms,scan_avg_wall_us,"
+               "put_logical_payload_mib_s,get_logical_payload_mib_s,scan_logical_payload_mib_s,"
+               "put_resident_mib_s,get_resident_mib_s,scan_resident_mib_s,"
+               "flush_ms,mem_bytes,flushes_completed,flush_records_seen,"
+               "put_sample_count,get_sample_count,scan_next_sample_count,"
                "put_p50_us,put_p90_us,put_p99_us,put_p999_us,"
                "get_p50_us,get_p90_us,get_p99_us,get_p999_us,"
-               "scan_p50_us,scan_p90_us,scan_p99_us,scan_p999_us,"
+               "scan_next_p50_us,scan_next_p90_us,scan_next_p99_us,scan_next_p999_us,"
                "put_ops_s_mean,put_ops_s_median,put_ops_s_stddev,put_ops_s_cov,"
                "put_flush_ops_s_mean,put_flush_ops_s_median,put_flush_ops_s_stddev,put_flush_ops_s_cov,"
                "get_ops_s_mean,get_ops_s_median,get_ops_s_stddev,get_ops_s_cov,"
@@ -1142,10 +1666,10 @@ namespace {
                "get_p90_us_mean,get_p90_us_median,get_p90_us_stddev,get_p90_us_cov,"
                "get_p99_us_mean,get_p99_us_median,get_p99_us_stddev,get_p99_us_cov,"
                "get_p999_us_mean,get_p999_us_median,get_p999_us_stddev,get_p999_us_cov,"
-               "scan_p50_us_mean,scan_p50_us_median,scan_p50_us_stddev,scan_p50_us_cov,"
-               "scan_p90_us_mean,scan_p90_us_median,scan_p90_us_stddev,scan_p90_us_cov,"
-               "scan_p99_us_mean,scan_p99_us_median,scan_p99_us_stddev,scan_p99_us_cov,"
-               "scan_p999_us_mean,scan_p999_us_median,scan_p999_us_stddev,scan_p999_us_cov\n";
+               "scan_next_p50_us_mean,scan_next_p50_us_median,scan_next_p50_us_stddev,scan_next_p50_us_cov,"
+               "scan_next_p90_us_mean,scan_next_p90_us_median,scan_next_p90_us_stddev,scan_next_p90_us_cov,"
+               "scan_next_p99_us_mean,scan_next_p99_us_median,scan_next_p99_us_stddev,scan_next_p99_us_cov,"
+               "scan_next_p999_us_mean,scan_next_p999_us_median,scan_next_p999_us_stddev,scan_next_p999_us_cov\n";
 
         for (const auto& backendReport : backendReports) {
             for (const auto& modeReport : backendReport.modeReports) {
@@ -1153,6 +1677,8 @@ namespace {
                     writeCsvField(out, backendName(backendReport.backend));
                     out << ',';
                     writeCsvField(out, flushModeName(modeReport.flushMode));
+                    const size_t logicalBytesPerOp = static_cast<size_t>(report.spec.keySize + report.spec.valueSize);
+
                     out << ',' << config.opsPerCase
                         << ',' << config.repeats
                         << ',' << report.spec.keySize
@@ -1160,48 +1686,23 @@ namespace {
                         << ',' << shardCount
                         << ',' << effectiveWriters
                         << ',' << (config.usePrehash ? 1 : 0)
-                        << ',';
-                    writeCsvField(out, profile.cpuName);
-                    out << ',' << profile.cpuPhysicalCores
-                        << ',' << profile.cpuLogicalCores
-                        << ',' << profile.ramTotalBytes
-                        << ',' << profile.ramModuleCount
-                        << ',' << profile.ramSpeedMeanMtps
-                        << ',';
-                    writeCsvField(out, profile.ramSpeedListMtps);
-                    out << ',';
-                    writeCsvField(out, profile.osName);
-                    out << ',';
-                    writeCsvField(out, profile.osArchitecture);
-                    out << ',';
-                    writeCsvField(out, profile.benchmarkDrive);
-                    out << ',';
-                    writeCsvField(out, profile.ssdModel);
-                    out << ',';
-                    writeCsvField(out, profile.ssdMediaType);
-                    out << ',' << (profile.disk.available ? 1 : 0)
-                        << ',';
-                    writeCsvField(out, profile.disk.error);
-                    out << ',' << profile.disk.fileSizeBytes
-                        << ',' << profile.disk.runs
-                        << ',';
-                    writeCsvField(out, profile.disk.tempFilePath);
-                    writeDiskMetricColumns(out, profile.disk.seq1mQ8T1Read);
-                    writeDiskMetricColumns(out, profile.disk.seq1mQ8T1Write);
-                    writeDiskMetricColumns(out, profile.disk.seq1mQ1T1Read);
-                    writeDiskMetricColumns(out, profile.disk.seq1mQ1T1Write);
-                    writeDiskMetricColumns(out, profile.disk.rnd4kQ32T1Read);
-                    writeDiskMetricColumns(out, profile.disk.rnd4kQ32T1Write);
-                    writeDiskMetricColumns(out, profile.disk.rnd4kQ1T1Read);
-                    writeDiskMetricColumns(out, profile.disk.rnd4kQ1T1Write);
-                    out << ',' << report.averaged.putOpsPerSec
+                        << ',' << report.averaged.putOpsPerSec
                         << ',' << report.averaged.putMs
+                        << ',' << averageWallLatencyUs(config.opsPerCase, report.averaged.putMs)
                         << ',' << report.averaged.putFlushOpsPerSec
                         << ',' << report.averaged.putFlushMs
                         << ',' << report.averaged.getOpsPerSec
                         << ',' << report.averaged.getMs
+                        << ',' << averageWallLatencyUs(config.opsPerCase, report.averaged.getMs)
                         << ',' << report.averaged.scanOpsPerSec
                         << ',' << report.averaged.scanMs
+                        << ',' << averageWallLatencyUs(config.opsPerCase, report.averaged.scanMs)
+                        << ',' << logicalPayloadMibPerSec(logicalBytesPerOp, config.opsPerCase, report.averaged.putMs)
+                        << ',' << logicalPayloadMibPerSec(logicalBytesPerOp, config.opsPerCase, report.averaged.getMs)
+                        << ',' << logicalPayloadMibPerSec(logicalBytesPerOp, config.opsPerCase, report.averaged.scanMs)
+                        << ',' << residentMibPerSec(report.averaged.approxBytes, report.averaged.putMs)
+                        << ',' << residentMibPerSec(report.averaged.approxBytes, report.averaged.getMs)
+                        << ',' << residentMibPerSec(report.averaged.approxBytes, report.averaged.scanMs)
                         << ',' << report.averaged.flushMs
                         << ',' << report.averaged.approxBytes
                         << ',' << report.averaged.flushesCompleted
@@ -1252,12 +1753,98 @@ namespace {
         }
     }
 
-    [[nodiscard]] static double payloadMibPerSec(size_t bytesPerOp, int ops, double ms) {
+    static void writeDiskRawResultsCsv(const std::string& path, const DiskBenchmarkSummary& summary) {
+        if (path.empty()) {
+            return;
+        }
+
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("Failed to open disk benchmark raw output file: " + path);
+        }
+
+        out << "profile_key,profile_label,item_key,item_label,run_index,selected_best,selected_lowest_avg_latency,mb_s,iops,avg_latency_us,p50_latency_us,p90_latency_us,p99_latency_us,p999_latency_us\n";
+        for (const auto& profile : summary.profiles) {
+            for (const auto& item : profile.items) {
+                for (size_t i = 0; i < item.rawRuns.size(); ++i) {
+                    writeCsvField(out, profile.key);
+                    out << ',';
+                    writeCsvField(out, profile.label);
+                    out << ',';
+                    writeCsvField(out, item.key);
+                    out << ',';
+                    writeCsvField(out, item.label);
+                    out << ',' << (i + 1)
+                        << ',' << (static_cast<int>(i) == item.bestRunIndex ? 1 : 0)
+                        << ',' << (static_cast<int>(i) == item.lowestAvgLatencyRunIndex ? 1 : 0)
+                        << ',' << item.rawRuns[i].throughputMBPerSec
+                        << ',' << item.rawRuns[i].iops
+                        << ',' << item.rawRuns[i].averageLatencyUs
+                        << ',' << item.rawRuns[i].p50LatencyUs
+                        << ',' << item.rawRuns[i].p90LatencyUs
+                        << ',' << item.rawRuns[i].p99LatencyUs
+                        << ',' << item.rawRuns[i].p999LatencyUs
+                        << '\n';
+                }
+            }
+        }
+    }
+
+    static void printDiskBenchmarkSummary(const DiskBenchmarkSummary& summary) {
+        if (!summary.available) {
+            return;
+        }
+
+        std::printf("disk probe target = %s\n", summary.targetFilePath.c_str());
+        std::printf("disk probe policy = best-of-%u, duration=%us, interval=%us\n\n",
+                    summary.runs,
+                    summary.durationSeconds,
+                    summary.intervalSeconds);
+
+        for (const auto& profile : summary.profiles) {
+            std::printf("[%s]\n", profile.label.c_str());
+            for (const auto& item : profile.items) {
+                if (item.bestRunIndex < 0) {
+                    std::printf("  %-28s parse failed\n", item.label.c_str());
+                    continue;
+                }
+                std::printf("  %-28s %9.2f MB/s %10.2f IOPS avg=%9.2f us p50=%9.2f us p90=%9.2f us p99=%9.2f us p99.9=%9.2f us best=%d/%u\n",
+                            item.label.c_str(),
+                            item.bestRun.throughputMBPerSec,
+                            item.bestRun.iops,
+                            item.bestRun.averageLatencyUs,
+                            item.bestRun.p50LatencyUs,
+                            item.bestRun.p90LatencyUs,
+                            item.bestRun.p99LatencyUs,
+                            item.bestRun.p999LatencyUs,
+                            item.bestRunIndex + 1,
+                            summary.runs);
+            }
+            std::printf("\n");
+        }
+    }
+
+    [[nodiscard]] static double logicalPayloadMibPerSec(size_t bytesPerOp, int ops, double ms) {
         if (ms <= 0.0) {
             return 0.0;
         }
         const double totalMib = static_cast<double>(bytesPerOp) * static_cast<double>(ops) / (1024.0 * 1024.0);
         return totalMib * 1000.0 / ms;
+    }
+
+    [[nodiscard]] static double residentMibPerSec(uint64_t residentBytes, double ms) {
+        if (ms <= 0.0) {
+            return 0.0;
+        }
+        const double totalMib = static_cast<double>(residentBytes) / (1024.0 * 1024.0);
+        return totalMib * 1000.0 / ms;
+    }
+
+    [[nodiscard]] static double averageWallLatencyUs(int ops, double ms) {
+        if (ops <= 0 || ms <= 0.0) {
+            return 0.0;
+        }
+        return ms * 1000.0 / static_cast<double>(ops);
     }
 
     [[nodiscard]] static double quantileFromSorted(
@@ -1712,6 +2299,12 @@ int main(int argc, char** argv) {
     if (!kDistributionMode) {
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
+            if (arg == "--akkara-elevated-retry") {
+#ifdef _WIN32
+                gElevatedRetryAttempted = true;
+#endif
+                continue;
+            }
             if (arg == "--prehash") {
                 config.usePrehash = true;
                 continue;
@@ -1757,6 +2350,10 @@ int main(int argc, char** argv) {
                 config.outputPath = arg.substr(9);
                 continue;
             }
+            if (arg.rfind("--disk-target=", 0) == 0) {
+                config.diskTargetPath = arg.substr(14);
+                continue;
+            }
             config.opsPerCase = std::max(1000, std::atoi(arg.c_str()));
         }
     }
@@ -1764,6 +2361,10 @@ int main(int argc, char** argv) {
     if (config.outputPath.empty()) {
         const std::filesystem::path baseDir = exePath.has_parent_path() ? exePath.parent_path() : std::filesystem::current_path();
         config.outputPath = (baseDir / "memtable_throughput_results.csv").string();
+    }
+    if (config.diskTargetPath.empty()) {
+        const std::filesystem::path baseDir = exePath.has_parent_path() ? exePath.parent_path() : std::filesystem::current_path();
+        config.diskTargetPath = (baseDir / "diskspd-test.tmp").string();
     }
 
     const std::array<CaseSpec, 6> cases{{
@@ -1783,7 +2384,7 @@ int main(int argc, char** argv) {
     );
 
     const std::filesystem::path exeDir = exePath.has_parent_path() ? exePath.parent_path() : std::filesystem::current_path();
-    const SystemProfile systemProfile = collectSystemProfile(config.outputPath, exeDir / "diskspd.exe");
+    const SystemProfile systemProfile = collectSystemProfile(config.diskTargetPath, exeDir / "diskspd.exe", argc, argv);
     std::vector<FlushMode> flushModes;
     flushModes.push_back(FlushMode::NoFlush);
     if (config.compareFlushModes || kDistributionMode) {
@@ -1825,6 +2426,9 @@ int main(int argc, char** argv) {
     std::printf("warmupOps   = %d\n\n", std::min(config.opsPerCase, 50000));
     std::printf("prehashMode = %s\n\n", config.usePrehash ? "ON (fp64/mk precomputed)" : "OFF (hash inside put)");
     std::printf("outputPath  = %s\n\n", config.outputPath.c_str());
+    const std::filesystem::path environmentCsvPath = deriveSiblingOutputPath(config.outputPath, "_environment");
+    std::printf("envOutput   = %s\n\n", environmentCsvPath.string().c_str());
+    std::printf("diskTarget  = %s\n\n", config.diskTargetPath.c_str());
     std::printf("system.cpu = %s\n", systemProfile.cpuName.c_str());
     std::printf("system.ram = %s across %u module(s), mean speed %.0f MT/s\n",
                 formatBytes(systemProfile.ramTotalBytes).c_str(),
@@ -1836,11 +2440,14 @@ int main(int argc, char** argv) {
                 systemProfile.ssdMediaType.c_str(),
                 systemProfile.benchmarkDrive.c_str());
     if (systemProfile.disk.available) {
-        std::printf("disk probe = %s, file=%s, size=%s, runs=%u\n\n",
+        std::printf("disk probe = %s, file=%s, size=%s, runs=%u, duration=%us, interval=%us\n\n",
                     "OK",
-                    systemProfile.disk.tempFilePath.c_str(),
+                    systemProfile.disk.targetFilePath.c_str(),
                     formatBytes(systemProfile.disk.fileSizeBytes).c_str(),
-                    systemProfile.disk.runs);
+                    systemProfile.disk.runs,
+                    systemProfile.disk.durationSeconds,
+                    systemProfile.disk.intervalSeconds);
+        printDiskBenchmarkSummary(systemProfile.disk);
     } else if (!systemProfile.disk.error.empty()) {
         std::printf("disk probe = FAILED (%s)\n\n", systemProfile.disk.error.c_str());
     }
@@ -1857,10 +2464,8 @@ int main(int argc, char** argv) {
         backendReport.modeReports.reserve(flushModes.size());
         for (const FlushMode flushMode : flushModes) {
             std::printf("=== flush_mode: %s ===\n", flushModeName(flushMode));
-            std::printf("%-18s %-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
-                        "flush_mode", "key", "value", "shards", "writers", "put(ops/s)", "get(ops/s)", "scan(ops/s)", "memBytes", "putSmp", "getSmp", "scanSmp");
-            std::printf("%-18s %-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %-8s %-8s %-8s\n",
-                        "", "", "", "", "", "", "", "", "", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)", "P50/P90/P99/P999(us)");
+            std::printf("%-18s %-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s\n",
+                        "flush_mode", "key", "value", "shards", "writers", "put(ops/s)", "get(ops/s)", "scan(ops/s)", "memBytes");
             std::printf("----------------------------------------------------------------------------------------------------------------------\n");
 
             FlushModeReport modeReport{};
@@ -1879,7 +2484,7 @@ int main(int argc, char** argv) {
                     .averaged = result,
                     .stats = computeResultStats(runs)
                 });
-                std::printf("%-18s %-10d %-12d %-8u %-8d %-14.0f %-14.0f %-14.0f %-14llu %-8u %-8u %-8u\n",
+                std::printf("%-18s %-10d %-12d %-8u %-8d %-14.0f %-14.0f %-14.0f %-14llu\n",
                             flushModeName(flushMode),
                             spec.keySize,
                             spec.valueSize,
@@ -1888,12 +2493,15 @@ int main(int argc, char** argv) {
                             result.putOpsPerSec,
                             result.getOpsPerSec,
                             result.scanOpsPerSec,
-                            static_cast<unsigned long long>(result.approxBytes),
-                            result.putLatency.sampleCount,
-                            result.getLatency.sampleCount,
-                            result.scanLatency.sampleCount);
-                std::printf("%-18s %-10s %-12s %-8s %-8s %-14s %-14s %-14s %-14s %4.2f/%4.2f/%4.2f/%4.2f %4.2f/%4.2f/%4.2f/%4.2f %4.2f/%4.2f/%4.2f/%4.2f\n",
-                            "", "", "", "", "", "", "", "", "",
+                            static_cast<unsigned long long>(result.approxBytes));
+                std::printf("  timings(ms): put=%8.2f get=%8.2f scan=%8.2f   avg_wall(us/op): put=%8.3f get=%8.3f scan=%8.3f\n",
+                            result.putMs,
+                            result.getMs,
+                            result.scanMs,
+                            averageWallLatencyUs(config.opsPerCase, result.putMs),
+                            averageWallLatencyUs(config.opsPerCase, result.getMs),
+                            averageWallLatencyUs(config.opsPerCase, result.scanMs));
+                std::printf("  sampled_latency(us): put=%4.2f/%4.2f/%4.2f/%4.2f get=%4.2f/%4.2f/%4.2f/%4.2f scan_next=%4.2f/%4.2f/%4.2f/%4.2f   samples=%u/%u/%u\n",
                             result.putLatency.p50Us,
                             result.putLatency.p90Us,
                             result.putLatency.p99Us,
@@ -1905,14 +2513,18 @@ int main(int argc, char** argv) {
                             result.scanLatency.p50Us,
                             result.scanLatency.p90Us,
                             result.scanLatency.p99Us,
-                            result.scanLatency.p999Us);
-                std::printf("  timings(ms): put=%8.2f get=%8.2f scan=%8.2f   payload(MiB/s): put=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flushRecords=%llu\n",
-                            result.putMs,
-                            result.getMs,
-                            result.scanMs,
-                            payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.putMs),
-                            payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.getMs),
-                            payloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.scanMs),
+                            result.scanLatency.p999Us,
+                            result.putLatency.sampleCount,
+                            result.getLatency.sampleCount,
+                            result.scanLatency.sampleCount);
+                std::printf("  logical_payload(MiB/s): put=%8.2f get=%8.2f scan=%8.2f\n",
+                            logicalPayloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.putMs),
+                            logicalPayloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.getMs),
+                            logicalPayloadMibPerSec(static_cast<size_t>(spec.keySize + spec.valueSize), config.opsPerCase, result.scanMs));
+                std::printf("  resident(MiB/s):        put=%8.2f get=%8.2f scan=%8.2f   flushes=%llu flushRecords=%llu\n",
+                            residentMibPerSec(result.approxBytes, result.putMs),
+                            residentMibPerSec(result.approxBytes, result.getMs),
+                            residentMibPerSec(result.approxBytes, result.scanMs),
                             static_cast<unsigned long long>(result.flushesCompleted),
                             static_cast<unsigned long long>(result.flushRecordsSeen));
                 std::printf("----------------------------------------------------------------------------------------------------------------------\n");
@@ -1923,7 +2535,12 @@ int main(int argc, char** argv) {
         backendReports.push_back(std::move(backendReport));
     }
 
-    writeReportsCsv(config.outputPath, config, effectiveWriters, shardCount, systemProfile, backendReports);
+    writeReportsCsv(config.outputPath, config, effectiveWriters, shardCount, backendReports);
+    writeEnvironmentCsv(environmentCsvPath.string(), systemProfile);
+    if (systemProfile.disk.available) {
+        const std::filesystem::path rawDiskCsvPath = deriveSiblingOutputPath(config.outputPath, "_diskspd_raw");
+        writeDiskRawResultsCsv(rawDiskCsvPath.string(), systemProfile.disk);
+    }
 
     return 0;
 }

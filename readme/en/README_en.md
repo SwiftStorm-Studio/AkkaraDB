@@ -2,7 +2,7 @@
 
 **A low-latency embedded KV engine with WAL, LSM storage, typed tables, JNI access, and optional clustering.**
 
-> C++23 | LSM-tree | WAL | SST | Blob store | Version history | HTTP/TCP API | JNI | AGPL-3.0
+> C++23 | LSM-tree | WAL | SST | Blob store | Version history | HTTP/TCP API | JNI | MPL-2.0 core + AGPL-3.0 AkkServer
 
 ---
 
@@ -498,8 +498,10 @@ API.
 
 ## License
 
-AkkaraDB is free software licensed under the GNU Affero General Public License v3.0.
+AkkaraDB native core is licensed under the Mozilla Public License 2.0.
 
 Copyright (C) 2026 Swift Storm Studio.
 
-See [LICENSE](../../LICENSE) for the full license text.
+The `akkara/akkserver/` subtree is licensed separately under the GNU Affero General Public License v3.0.
+
+See [LICENSE](../../LICENSE) for the MPL-2.0 text and [LICENSE_SERVER](../../LICENSE_SERVER) for the AGPL-3.0 text.

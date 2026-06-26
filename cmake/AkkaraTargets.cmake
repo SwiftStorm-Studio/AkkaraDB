@@ -20,9 +20,13 @@ file(GLOB_RECURSE AKKENGINE_HEADERS CONFIGURE_DEPENDS
         "${AKKENGINE_INCLUDE_DIR}/*.hpp"
         "${AKKENGINE_INCLUDE_DIR}/*.h"
 )
+file(GLOB_RECURSE AKKSERVER_HEADERS CONFIGURE_DEPENDS
+        "${AKKSERVER_INCLUDE_DIR}/*.hpp"
+        "${AKKSERVER_INCLUDE_DIR}/*.h"
+)
 target_sources(akkaradb PUBLIC FILE_SET akkengine_headers TYPE HEADERS
-        BASE_DIRS ${AKKENGINE_INCLUDE_DIR}
-        FILES ${AKKENGINE_HEADERS}
+        BASE_DIRS ${AKKENGINE_INCLUDE_DIR} ${AKKSERVER_INCLUDE_DIR}
+        FILES ${AKKENGINE_HEADERS} ${AKKSERVER_HEADERS}
 )
 
 file(GLOB_RECURSE AKKARADB_SOURCES CONFIGURE_DEPENDS
@@ -31,22 +35,23 @@ file(GLOB_RECURSE AKKARADB_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE AKKENGINE_SOURCES CONFIGURE_DEPENDS
         "${AKKENGINE_SRC_DIR}/*.cpp"
 )
-file(GLOB_RECURSE AKKENGINE_API_SERVER_SOURCES CONFIGURE_DEPENDS
-        "${AKKENGINE_SRC_DIR}/engine/server/*.cpp"
+file(GLOB_RECURSE AKKSERVER_SOURCES CONFIGURE_DEPENDS
+        "${AKKSERVER_SRC_DIR}/*.cpp"
 )
 
 set(AKKENGINE_API_CORE_SOURCES
-        "${AKKENGINE_SRC_DIR}/engine/server/AkkApiServer.cpp"
+        "${AKKSERVER_SRC_DIR}/server/AkkApiServer.cpp"
 )
-set(AKKENGINE_API_PROVIDER_SOURCE
-        "${AKKENGINE_SRC_DIR}/engine/server/AkkApiTransportProvider.cpp"
+set(AKKENGINE_API_PROVIDER_SOURCES
+        "${AKKSERVER_SRC_DIR}/server/ApiServerProvider.cpp"
+        "${AKKSERVER_SRC_DIR}/server/AkkApiTransportProvider.cpp"
 )
 set(AKKENGINE_API_HTTP_SOURCES
-        "${AKKENGINE_SRC_DIR}/engine/server/HttpApiServer.cpp"
+        "${AKKSERVER_SRC_DIR}/http/HttpApiServer.cpp"
 )
 set(AKKENGINE_API_TCP_SOURCES
-        "${AKKENGINE_SRC_DIR}/engine/server/TcpApiServer.cpp"
-        "${AKKENGINE_SRC_DIR}/engine/server/ApiFraming.cpp"
+        "${AKKSERVER_SRC_DIR}/tcp/TcpApiServer.cpp"
+        "${AKKSERVER_SRC_DIR}/tcp/ApiFraming.cpp"
 )
 set(AKKENGINE_CLUSTER_RUNTIME_SOURCES
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRuntime.cpp"
@@ -57,13 +62,13 @@ set(AKKENGINE_CLUSTER_RUNTIME_SOURCES
         "${AKKENGINE_SRC_DIR}/engine/cluster/ReplFraming.cpp"
 )
 
-list(REMOVE_ITEM AKKENGINE_SOURCES ${AKKENGINE_API_SERVER_SOURCES})
+list(REMOVE_ITEM AKKENGINE_SOURCES ${AKKSERVER_SOURCES})
 list(REMOVE_ITEM AKKENGINE_SOURCES ${AKKENGINE_CLUSTER_RUNTIME_SOURCES})
 
 target_sources(akkaradb PRIVATE
         ${AKKARADB_SOURCES}
         ${AKKENGINE_SOURCES}
-        ${AKKENGINE_API_PROVIDER_SOURCE}
+        ${AKKENGINE_API_PROVIDER_SOURCES}
 )
 
 add_custom_target(akkaradb_increment_revision
@@ -110,6 +115,7 @@ target_include_directories(akkaradb
         PUBLIC
         $<BUILD_INTERFACE:${AKKARADB_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${AKKENGINE_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${AKKSERVER_INCLUDE_DIR}>
         $<BUILD_INTERFACE:${boost_pfr_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${mbedtls_SOURCE_DIR}/include>
         $<BUILD_INTERFACE:${mbedtls_SOURCE_DIR}/tf-psa-crypto/include>
@@ -124,6 +130,7 @@ if (AKKARADB_BUILD_API_SERVERS)
     target_include_directories(akkaradb_api PRIVATE
             ${AKKARADB_INCLUDE_DIR}
             ${AKKENGINE_INCLUDE_DIR}
+            ${AKKSERVER_INCLUDE_DIR}
             ${boost_pfr_SOURCE_DIR}/include
     )
     target_link_libraries(akkaradb_api PRIVATE akkaradb)
@@ -152,6 +159,7 @@ if (AKKARADB_BUILD_API_SERVERS)
         target_include_directories(akkaradb_api_http PRIVATE
                 ${AKKARADB_INCLUDE_DIR}
                 ${AKKENGINE_INCLUDE_DIR}
+                ${AKKSERVER_INCLUDE_DIR}
                 ${boost_pfr_SOURCE_DIR}/include
         )
         target_link_libraries(akkaradb_api_http PRIVATE akkaradb)
@@ -176,6 +184,7 @@ if (AKKARADB_BUILD_API_SERVERS)
         target_include_directories(akkaradb_api_tcp PRIVATE
                 ${AKKARADB_INCLUDE_DIR}
                 ${AKKENGINE_INCLUDE_DIR}
+                ${AKKSERVER_INCLUDE_DIR}
                 ${boost_pfr_SOURCE_DIR}/include
         )
         target_link_libraries(akkaradb_api_tcp PRIVATE akkaradb)
@@ -199,7 +208,7 @@ if (AKKARADB_BUILD_API_SERVERS)
         target_include_directories(akkaradb_api_grpc PRIVATE
                 ${AKKARADB_INCLUDE_DIR}
                 ${AKKENGINE_INCLUDE_DIR}
-                ${AKKGRPC_INCLUDE_DIR}
+                ${AKKSERVER_INCLUDE_DIR}
                 ${boost_pfr_SOURCE_DIR}/include
         )
         target_link_libraries(akkaradb_api_grpc PRIVATE akkaradb)
@@ -336,8 +345,8 @@ if (TARGET akkaradb_api_grpc)
     endif ()
 
     if (AKKARADB_GRPCPP_TARGET AND AKKARADB_PROTOBUF_TARGET AND AKKARADB_PROTOC_TARGET AND AKKARADB_GRPC_CPP_PLUGIN_TARGET)
-        set(AKKARADB_GRPC_PROTO "${AKKGRPC_PROTO_DIR}/akkaradb_grpc.proto")
-        set(AKKARADB_GRPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/akkgrpc")
+        set(AKKARADB_GRPC_PROTO "${AKKSERVER_PROTO_DIR}/akkaradb_grpc.proto")
+        set(AKKARADB_GRPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/akkserver_grpc")
         file(MAKE_DIRECTORY "${AKKARADB_GRPC_GENERATED_DIR}")
 
         set(AKKARADB_GRPC_GENERATED_SOURCES
@@ -356,7 +365,7 @@ if (TARGET akkaradb_api_grpc)
                 --cpp_out "${AKKARADB_GRPC_GENERATED_DIR}"
                 --grpc_out "${AKKARADB_GRPC_GENERATED_DIR}"
                 --plugin=protoc-gen-grpc=$<TARGET_FILE:${AKKARADB_GRPC_CPP_PLUGIN_TARGET}>
-                -I "${AKKGRPC_PROTO_DIR}"
+                -I "${AKKSERVER_PROTO_DIR}"
                 "${AKKARADB_GRPC_PROTO}"
                 DEPENDS "${AKKARADB_GRPC_PROTO}" ${AKKARADB_PROTOC_TARGET} ${AKKARADB_GRPC_CPP_PLUGIN_TARGET}
                 VERBATIM
@@ -367,14 +376,14 @@ if (TARGET akkaradb_api_grpc)
         )
 
         target_sources(akkaradb_api_grpc PRIVATE
-                "${AKKGRPC_SRC_DIR}/AkkaraGRPCServer.cpp"
+                "${AKKSERVER_SRC_DIR}/grpc/AkkaraGRPCServer.cpp"
                 ${AKKARADB_GRPC_GENERATED_SOURCES}
                 ${AKKARADB_GRPC_GENERATED_HEADERS}
         )
         add_dependencies(akkaradb_api_grpc akkaradb_grpc_codegen)
         if (MSVC)
             set_source_files_properties(
-                    "${AKKGRPC_SRC_DIR}/AkkaraGRPCServer.cpp"
+                    "${AKKSERVER_SRC_DIR}/grpc/AkkaraGRPCServer.cpp"
                     ${AKKARADB_GRPC_GENERATED_SOURCES}
                     PROPERTIES COMPILE_OPTIONS "/WX-"
             )
@@ -389,7 +398,7 @@ if (TARGET akkaradb_api_grpc)
         target_compile_definitions(akkaradb_api PRIVATE AKKARADB_API_HAS_GRPC_BACKEND)
         message(STATUS "AkkaraDB: gRPC backend enabled")
     else ()
-        target_sources(akkaradb_api_grpc PRIVATE "${AKKGRPC_SRC_DIR}/AkkaraGRPCServerStub.cpp")
+        target_sources(akkaradb_api_grpc PRIVATE "${AKKSERVER_SRC_DIR}/grpc/AkkaraGRPCServerStub.cpp")
         message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; gRPC backend disabled")
     endif ()
 endif ()

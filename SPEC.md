@@ -1,6 +1,6 @@
 # AkkaraDB - Technical Specification v5
 
-> Version v5 - C++23 - Native engine specification - AGPL-3.0
+> Version v5 - C++23 - Native engine specification - MPL-2.0
 
 ---
 
