@@ -25,7 +25,7 @@
       "inherits": "release",
       "binaryDir": "${sourceDir}/builds/release-linux",
       "cacheVariables": {
-        "AKKARADB_BUILD_JNI": "OFF",
+        "AKKARADB_BUILD_JNI": "ON",
         "AKKARADB_WARNINGS_AS_ERRORS": "OFF"
       },
       "condition": {

@@ -43,7 +43,7 @@ namespace akkaradb::engine::manifest {
         TRUNCATE = 0x07,
         ///< Manifest truncate marker
         /**
-         * Atomic compaction commit  Ereplaces CompactionEnd + SSTDelete.
+         * Atomic compaction commit - replaces CompactionEnd + SSTDelete.
          *
          * A single CRC-protected record that simultaneously adds all output files
          * and removes all input files from the live set.  If this record is absent
@@ -52,7 +52,7 @@ namespace akkaradb::engine::manifest {
          */
         COMPACTION_COMMIT = 0x08,
 
-        // ── Cluster events (v4) ──────────────────────────────────────────
+        // Cluster events (v4)
         NODE_JOIN = 0x10,
         ///< A node joined the cluster
         NODE_LEAVE = 0x11,
@@ -69,7 +69,7 @@ namespace akkaradb::engine::manifest {
      * ManifestFileHeader - Fixed 32-byte header at the start of every .akmf file.
      *
      * On-disk layout (32 bytes, all fields LE):
-     * [magic:u32][version:u16][flags:u16][fileSeq:u32][createdAtUs:u64][crc32c:u32][reserved:u8ÁE]
+     * [magic:u32][version:u16][flags:u16][fileSeq:u32][createdAtUs:u64][crc32c:u32][reserved:u8 x 8]
      *
      * Design:
      * - magic: Format / corruption detection
@@ -87,7 +87,7 @@ namespace akkaradb::engine::manifest {
         uint16_t version;
         uint16_t flags;
         uint32_t fileSeq; ///< Rotation counter
-        uint64_t createdAtUs; ///< Creation timestamp (μs since epoch)
+        uint64_t createdAtUs; ///< Creation timestamp (microseconds since epoch)
         uint32_t crc32c;
         uint8_t reserved[8];
 
@@ -175,7 +175,7 @@ namespace akkaradb::engine::manifest {
     static constexpr uint64_t MANIFEST_ABSENT_U64 = UINT64_MAX; ///< Optional u64 absent sentinel
 
     // ============================================================================
-    // Encode functions  Eproduce raw payload bytes for each record type
+    // Encode functions - produce raw payload bytes for each record type
     // ============================================================================
 
     /**
@@ -210,7 +210,7 @@ namespace akkaradb::engine::manifest {
     /**
      * Encodes a CompactionStart payload.
      * Payload fixed (12 bytes): [tsUs:u64][level:u8][inputCount:u8][reserved:u16]
-     * Variable: [len:u16][bytes] ÁEinput_count
+     * Variable: [len:u16][bytes] x input_count
      */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCompactionStart(uint64_t tsUs, int level, const std::vector<std::string>& inputs);
 
@@ -220,7 +220,7 @@ namespace akkaradb::engine::manifest {
      * Payload fixed (28 bytes):
      *   [tsUs:u64][entries:u64][level:u8][keyFlags:u8][inputCount:u8][reserved:u8]
      *   [outLen:u16][fkLen:u16][lkLen:u16][reserved:u16]
-     * Variable: output bytes, firstKey bytes, lastKey bytes, [len:u16 + bytes] ÁEinput_count
+     * Variable: output bytes, firstKey bytes, lastKey bytes, [len:u16 + bytes] x input_count
      */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCompactionEnd(
         uint64_t tsUs,
@@ -261,8 +261,8 @@ namespace akkaradb::engine::manifest {
      * Payload fixed (12 bytes):
      *   [tsUs:u64][outputCount:u8][inputCount:u8][reserved:u16]
      * Variable:
-     *   outputCount ÁE[nameLen:u16][name bytes]
-     *   inputCount  ÁE[nameLen:u16][name bytes]
+     *   outputCount x [nameLen:u16][name bytes]
+     *   inputCount  x [nameLen:u16][name bytes]
      *
      * During replay, this record atomically:
      *   - Adds all outputFiles to the live set
@@ -277,7 +277,7 @@ namespace akkaradb::engine::manifest {
     );
 
     // ============================================================================
-    // Decode helpers  Eparse payload bytes into structured fields
+    // Decode helpers - parse payload bytes into structured fields
     // ============================================================================
 
     struct AKDB_API DecodedStripeCommit {

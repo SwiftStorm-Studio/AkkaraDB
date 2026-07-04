@@ -359,7 +359,7 @@ namespace akkaradb::engine::manifest {
         off += nameLen;
 
         if (keyFlags & 0x01) { out.firstKeyHex.emplace(reinterpret_cast<const char*>(payload + off), fkLen); }
-        off += fkLen; // advance unconditionally  Efk bytes always occupy fkLen space
+        off += fkLen; // advance unconditionally - fk bytes always occupy fkLen space
         if (keyFlags & 0x02) { out.lastKeyHex.emplace(reinterpret_cast<const char*>(payload + off), lkLen); }
         return true;
     }
@@ -410,9 +410,9 @@ namespace akkaradb::engine::manifest {
         off += outLen;
 
         if (keyFlags & 0x01) { out.firstKeyHex.emplace(reinterpret_cast<const char*>(payload + off), fkLen); }
-        off += fkLen; // advance unconditionally  Efk bytes always occupy fkLen space
+        off += fkLen; // advance unconditionally - fk bytes always occupy fkLen space
         if (keyFlags & 0x02) { out.lastKeyHex.emplace(reinterpret_cast<const char*>(payload + off), lkLen); }
-        off += lkLen; // advance unconditionally  Einputs follow immediately
+        off += lkLen; // advance unconditionally - inputs follow immediately
 
         out.inputs.clear();
         out.inputs.reserve(inputCount);

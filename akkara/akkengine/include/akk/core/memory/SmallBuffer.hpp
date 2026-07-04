@@ -29,26 +29,26 @@ namespace akkaradb::core {
      * Storage layout (exactly 32 bytes):
      *
      *   [0..7]   uint8_t* activePtr_
-     *            ↁEAlways points to valid data
+     *            -> Always points to valid data
      *              - inl_  (inline storage)
      *              - arena memory
      *
      *   [8..9]   uint16_t meta_
-     *            ↁETotal byte size (key + value), max 65535
+     *            -> Total byte size (key + value), max 65535
      *
      *   [10..31] uint8_t inl_[22]
-     *            ↁEInline storage (INLINE_CAP = 22)
+     *            -> Inline storage (INLINE_CAP = 22)
      *
      * Key design decisions:
      *   - No explicit "kind" field (inline vs arena)
-     *     ↁEDetermined via pointer comparison (activePtr_ != inl_)
-     *     ↁESaves space, preserves 32B invariant
+     *     -> Determined via pointer comparison (activePtr_ != inl_)
+     *     -> Saves space, preserves 32B invariant
      *
      *   - Branch-free data() access
-     *     ↁEactive_ptr_ always valid
+     *     -> active_ptr_ always valid
      *
      *   - No destructor work
-     *     ↁEArena owns memory lifetime
+     *     -> Arena owns memory lifetime
      *
      * Lifetime model:
      *   - Inline: owned by this object
@@ -112,8 +112,8 @@ namespace akkaradb::core {
          * Construct contiguous [key | value].
          *
          * Allocation strategy:
-         *   - <= 22 bytes ↁEinline
-         *   - > 22 bytes  ↁEarena
+         *   - <= 22 bytes -> inline
+         *   - > 22 bytes  -> arena
          */
         SmallBuffer(const uint8_t* key, size_t kLen, const uint8_t* val, size_t vLen, BufferArena& arena) {
             constexpr size_t maxSize = std::numeric_limits<uint16_t>::max();

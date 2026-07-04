@@ -77,6 +77,10 @@ install(FILES
 )
 
 if (BUILD_SHARED_LIBS)
+    set(AKKARADB_CXX_SDK_PACKAGE_DEPENDS ${AKKARADB_SDK_PACKAGE_TARGET})
+    if (TARGET akkaradb_jni)
+        list(APPEND AKKARADB_CXX_SDK_PACKAGE_DEPENDS akkaradb_jni)
+    endif ()
     add_custom_target(akkaradb_package_cxx_sdk
             COMMAND ${CMAKE_COMMAND}
             -DBUILD_DIR="${CMAKE_BINARY_DIR}"
@@ -87,7 +91,7 @@ if (BUILD_SHARED_LIBS)
             -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
             -DZIP_PATH="${AKKARADB_SDK_ZIP}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
-            DEPENDS ${AKKARADB_SDK_PACKAGE_TARGET}
+            DEPENDS ${AKKARADB_CXX_SDK_PACKAGE_DEPENDS}
             COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
     )
     if (WIN32)

@@ -50,7 +50,7 @@ namespace akkaradb::engine::manifest {
                 uint64_t entries;
                 std::optional<std::string> firstKeyHex;
                 std::optional<std::string> lastKeyHex;
-                uint64_t tsUs; ///< Timestamp at seal time (μs since epoch)
+                uint64_t tsUs; ///< Timestamp at seal time (microseconds since epoch)
             };
 
             struct CheckpointEvent {
@@ -160,7 +160,7 @@ namespace akkaradb::engine::manifest {
              * Atomically records all outputs produced and all inputs consumed by a
              * compaction in a single CRC-protected manifest record.
              *
-             * This replaces the non-atomic (CompactionEnd + SSTDelete ÁEN) pattern.
+             * This replaces the non-atomic (CompactionEnd + SSTDelete x N) pattern.
              * During replay, either the full record is applied (all outputs added,
              * all inputs removed) or it is absent (CRC mismatch from partial write),
              * in which case the pre-compaction state is preserved exactly.

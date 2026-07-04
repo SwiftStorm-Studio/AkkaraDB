@@ -295,7 +295,7 @@ namespace akkaradb::engine::manifest {
             }
 
             void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles) {
-                // Single append call ↁEsingle CRC-protected record.
+                // Single append call -> single CRC-protected record.
                 // Either fully applied on replay or entirely absent (CRC mismatch).
                 append(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), outputFiles, inputFiles));
 
@@ -617,7 +617,7 @@ namespace akkaradb::engine::manifest {
                 }
 
                 // --- Read records ---
-                std::vector<uint8_t> payload; // reused across records  Eavoids per-record heap alloc
+                std::vector<uint8_t> payload; // reused across records - avoids per-record heap alloc
                 while (file) {
                     uint8_t rhdrBuf[ManifestRecordHeader::SIZE];
                     file.read(reinterpret_cast<char*>(rhdrBuf), ManifestRecordHeader::SIZE);
@@ -631,7 +631,7 @@ namespace akkaradb::engine::manifest {
                         if (!file || file.gcount() < rhdr.payloadLen) { break; }
 
                         if (!rhdr.verifyPayload(payload.data(), rhdr.payloadLen)) {
-                            break; // CRC mismatch  Estop replay
+                            break; // CRC mismatch - stop replay
                         }
 
                         applyEvent(static_cast<ManifestRecordType>(rhdr.type), payload.data(), rhdr.payloadLen);
@@ -705,7 +705,7 @@ namespace akkaradb::engine::manifest {
                     case ManifestRecordType::NODE_LEAVE:
                     case ManifestRecordType::PRIMARY_LEASE:
                     case ManifestRecordType::TRUNCATE:
-                        // Informational only  Eno state change
+                        // Informational only - no state change
                         break;
                 }
             }
@@ -747,7 +747,7 @@ namespace akkaradb::engine::manifest {
     };
 
     // ============================================================================
-    // Manifest public API  Ethin forwarding layer
+    // Manifest public API - thin forwarding layer
     // ============================================================================
 
     std::unique_ptr<Manifest> Manifest::create(const std::filesystem::path& path, bool fastMode) {

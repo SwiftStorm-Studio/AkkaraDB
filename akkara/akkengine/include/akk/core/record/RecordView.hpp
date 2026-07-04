@@ -37,14 +37,14 @@ namespace akkaradb::core {
      *
      * Layout (no fixed memory layout; logical structure):
      *
-     *   keyPtr_   ↁEkey bytes
-     *   valPtr_   ↁEvalue bytes
-     *   kLen_     ↁEkey length
-     *   vLen_     ↁEvalue length
-     *   seq_       ↁEsequence number
-     *   flags_     ↁEtombstone etc.
-     *   keyFp64_  ↁEhash fingerprint
-     *   miniKey_  ↁEfirst ≤8 bytes of key (LE packed)
+     *   keyPtr_   -> key bytes
+     *   valPtr_   -> value bytes
+     *   kLen_     -> key length
+     *   vLen_     -> value length
+     *   seq_       -> sequence number
+     *   flags_     -> tombstone etc.
+     *   keyFp64_  -> hash fingerprint
+     *   miniKey_  -> first <=8 bytes of key (LE packed)
      *
      * Lifetime:
      *   - MemTable: tied to BufferArena lifetime
@@ -125,7 +125,7 @@ namespace akkaradb::core {
              * Lexicographic key comparison (fast-path optimized).
              *
              * Fast path:
-             *   - Compare miniKey (≤8 bytes, register-only)
+             *   - Compare miniKey (<=8 bytes, register-only)
              *
              * Slow path:
              *   - memcmp remaining bytes

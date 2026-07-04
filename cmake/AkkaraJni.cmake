@@ -27,7 +27,7 @@ if(AKKARADB_BUILD_JNI)
             COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_JNI_DIST_DIR}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:akkaradb_jni>
-            "${AKKARADB_JNI_DIST_DIR}/$<TARGET_FILE_NAME:akkaradb_jni>"
+            "${AKKARADB_JNI_DIST_DIR}/${AKKARADB_JNI_DIST_LIBRARY_NAME}"
             COMMAND ${CMAKE_COMMAND}
             -DDIST_DIR="${AKKARADB_NATIVE_DIST_DIR}"
             -DPACKAGE_DIR="${AKKARADB_NATIVE_PACKAGE_DIR}"
@@ -36,7 +36,7 @@ if(AKKARADB_BUILD_JNI)
             -DPRERELEASE="${AKKARADB_PRERELEASE}"
             -DNATIVE_LIBRARY_NAME="${AKKARADB_NATIVE_DIST_LIBRARY_NAME}"
             -DJNI_DIST_DIR="${AKKARADB_JNI_DIST_DIR}"
-            -DJNI_LIBRARY_NAME=$<TARGET_FILE_NAME:akkaradb_jni>
+            -DJNI_LIBRARY_NAME="${AKKARADB_JNI_DIST_LIBRARY_NAME}"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageNativeDist.cmake"
             COMMENT "Copying akkaradb JNI library to dist/jni/${AKKARADB_RELEASE_VERSION}"
     )
