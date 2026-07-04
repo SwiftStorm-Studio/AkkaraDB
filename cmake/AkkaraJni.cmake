@@ -3,23 +3,12 @@ if(AKKARADB_BUILD_JNI)
     find_package(JNI REQUIRED)
     add_library(akkaradb_jni SHARED
             ${AKKARA_ROOT}/jni/AkkaraJni.cpp
-            ${AKKARADB_SOURCES}
-            ${AKKENGINE_SOURCES}
     )
-    add_dependencies(akkaradb_jni akkaradb)
-
-    target_link_libraries(akkaradb_jni PRIVATE libzstd_static akkaradb_monocypher mbedtls tfpsacrypto mbedx509)
+    target_link_libraries(akkaradb_jni PRIVATE akkaradb)
     target_include_directories(akkaradb_jni PRIVATE
             ${JNI_INCLUDE_DIRS}
-            ${AKKENGINE_INCLUDE_DIR}
-            ${AKKARADB_INCLUDE_DIR}
-            ${boost_pfr_SOURCE_DIR}/include
-            ${mbedtls_SOURCE_DIR}/include
-            ${mbedtls_SOURCE_DIR}/tf-psa-crypto/include
     )
     target_compile_definitions(akkaradb_jni PRIVATE
-            AKKARADB_STATIC
-            AKKARADB_TLS_ENABLED
             AKKARADB_JNI_COMPAT_LINE="${AKKARADB_COMPAT_LINE}"
             AKKARADB_REQUIRED_NATIVE_GENERATION="${AKKARADB_NATIVE_GENERATION}"
     )
@@ -29,7 +18,6 @@ if(AKKARADB_BUILD_JNI)
             OUTPUT_NAME "${AKKARADB_JNI_OUTPUT_NAME}"
     )
     if(WIN32)
-        target_link_libraries(akkaradb_jni PRIVATE ws2_32 bcrypt)
         set_target_properties(akkaradb_jni PROPERTIES
                 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         )

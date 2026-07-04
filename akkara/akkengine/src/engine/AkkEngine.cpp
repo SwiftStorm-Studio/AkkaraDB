@@ -331,12 +331,10 @@ namespace akkaradb::engine {
         if (options.components.apiEnabled && options.api.bindHost.empty()) {
             throw std::invalid_argument("AkkEngine: api.bindHost is required when components.apiEnabled is true");
         }
-
         auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
-
         if (impl.opts.components.manifestEnabled && !impl.opts.paths.manifestPath.empty()) {
             impl.manifest = manifest::Manifest::create(impl.opts.paths.manifestPath, impl.opts.manifest.fastMode);
             impl.manifest->start();
@@ -355,20 +353,23 @@ namespace akkaradb::engine {
             if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
         };
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
-
         if (impl.opts.components.walEnabled && impl.opts.runtime.recoverWal) {
             const auto recovery = wal::WalRecovery::recoverInto(wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir}, *impl.memtable);
             (void)recovery;
         }
 
-        if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
+        if (impl.opts.components.walEnabled) {
+            impl.walWriter = wal::WalWriter::create(impl.opts.wal);
+        }
 
         if (impl.opts.components.blobEnabled) {
             impl.blobManager = blob::BlobManager::create(impl.opts.blob);
             impl.blobManager->start();
         }
 
-        if (impl.opts.components.versionLogEnabled) { impl.versionLog = vlog::VersionLog::create(impl.opts.vlog); }
+        if (impl.opts.components.versionLogEnabled) {
+            impl.versionLog = vlog::VersionLog::create(impl.opts.vlog);
+        }
 
         if (impl.opts.components.clusterEnabled) {
             cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
@@ -377,6 +378,10 @@ namespace akkaradb::engine {
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
             callbacks.getLastSeq = [&impl] { return impl.snapshotSeq(); };
+            callbacks.forceDurable = [&impl] {
+                if (impl.walWriter) { impl.walWriter->forceSync(); }
+                if (impl.versionLog) { impl.versionLog->forceSync(); }
+            };
             callbacks.apply = [&impl](
                 uint64_t seq,
                 cluster::ReplOpType op,

@@ -158,6 +158,23 @@ namespace {
 
     AKKARADB_QUERYABLE(MapUser, id, name, tags, scores)
 
+    struct WideQueryable {
+        uint64_t id;
+        uint32_t f01;
+        uint32_t f02;
+        uint32_t f03;
+        uint32_t f04;
+        uint32_t f05;
+        uint32_t f06;
+        uint32_t f07;
+        uint32_t f08;
+        uint32_t f09;
+        uint32_t f10;
+        std::string label;
+    };
+
+    AKKARADB_QUERYABLE(WideQueryable, id, f01, f02, f03, f04, f05, f06, f07, f08, f09, f10, label)
+
     void testTrivialCrud() {
         using namespace akkaradb;
         TempDir dir{"trivialCrud"};
@@ -531,6 +548,22 @@ namespace {
         AKK_TEST_CHECK(highScores.size() == 2);
     }
 
+    void testWideQueryableMacro() {
+        using namespace akkaradb;
+        TempDir dir{"wideQueryable"};
+        auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
+        auto rows = db->table<&WideQueryable::id>("wide_queryable");
+
+        rows.put({1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "target"});
+        rows.put({2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, "other"});
+
+        auto selected = rows.query([](auto row) {
+            return row.f10 == 10U && row.label == "target";
+        }).toVector();
+        AKK_TEST_CHECK(selected.size() == 1);
+        AKK_TEST_CHECK(selected[0].value.id == 1);
+    }
+
     void testRefLazyResolveAndCascadePut() {
         using namespace akkaradb;
         TempDir dir{"refLazyResolve"};
@@ -800,6 +833,7 @@ int main() {
         testOptionalNullQueryHelpers();
         testNestedFieldQueryHelpers();
         testMapGetQueryHelpers();
+        testWideQueryableMacro();
         testRefLazyResolveAndCascadePut();
         testImmutableFields();
         testFieldUpdateHooks();

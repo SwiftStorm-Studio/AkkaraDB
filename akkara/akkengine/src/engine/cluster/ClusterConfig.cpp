@@ -88,7 +88,8 @@ namespace akkaradb::engine::cluster {
         const auto mode = static_cast<ReplicationMode>(bytes[10]);
         AckPolicy ack{};
         ack.mode = static_cast<AckPolicyMode>(bytes[11]);
-        ack.quorum = readU16(bytes.data(), 12);
+        ack.stage = static_cast<AckStage>(bytes[12]);
+        ack.quorum = readU16(bytes.data(), 14);
 
         size_t cursor = HEADER_SIZE;
         std::vector<NodeInfo> nodes;
@@ -125,7 +126,9 @@ namespace akkaradb::engine::cluster {
         writeU16(bytes.data(), 8, static_cast<uint16_t>(config.nodes_.size()));
         bytes[10] = static_cast<uint8_t>(config.mode_);
         bytes[11] = static_cast<uint8_t>(config.ackPolicy_.mode);
-        writeU16(bytes.data(), 12, config.ackPolicy_.quorum);
+        bytes[12] = static_cast<uint8_t>(config.ackPolicy_.stage);
+        bytes[13] = 0;
+        writeU16(bytes.data(), 14, config.ackPolicy_.quorum);
         writeU64(bytes.data(), 16, nowUs());
         writeU32(bytes.data(), 24, 0);
 
@@ -177,8 +180,11 @@ namespace akkaradb::engine::cluster {
         if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::STRIPE) {
             throw std::invalid_argument("ClusterConfig: invalid replication mode");
         }
-        if (ackPolicy_.mode != AckPolicyMode::ASYNC && ackPolicy_.mode != AckPolicyMode::ALL && ackPolicy_.mode != AckPolicyMode::QUORUM) {
+        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.mode != AckPolicyMode::ALL_TARGETS && ackPolicy_.mode != AckPolicyMode::QUORUM) {
             throw std::invalid_argument("ClusterConfig: invalid ack policy");
+        }
+        if (ackPolicy_.stage != AckStage::RECEIVED && ackPolicy_.stage != AckStage::APPLIED && ackPolicy_.stage != AckStage::DURABLE) {
+            throw std::invalid_argument("ClusterConfig: invalid ack stage");
         }
         if (ackPolicy_.mode == AckPolicyMode::QUORUM && ackPolicy_.quorum == 0) {
             throw std::invalid_argument("ClusterConfig: quorum policy requires quorum > 0");

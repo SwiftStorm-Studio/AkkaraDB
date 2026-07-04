@@ -1,0 +1,24 @@
+function(akkaradb_load_version_properties PROPERTIES_FILE)
+    if (NOT EXISTS "${PROPERTIES_FILE}")
+        message(FATAL_ERROR "AkkaraDB version properties file does not exist: ${PROPERTIES_FILE}")
+    endif ()
+
+    file(STRINGS "${PROPERTIES_FILE}" AKKARADB_VERSION_PROPERTY_LINES ENCODING UTF-8)
+    foreach (AKKARADB_VERSION_PROPERTY_LINE IN LISTS AKKARADB_VERSION_PROPERTY_LINES)
+        string(STRIP "${AKKARADB_VERSION_PROPERTY_LINE}" AKKARADB_VERSION_PROPERTY_LINE)
+
+        if (AKKARADB_VERSION_PROPERTY_LINE STREQUAL "" OR AKKARADB_VERSION_PROPERTY_LINE MATCHES "^[#;]")
+            continue()
+        endif ()
+
+        if (NOT AKKARADB_VERSION_PROPERTY_LINE MATCHES "^([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$")
+            message(FATAL_ERROR "Invalid version property: ${AKKARADB_VERSION_PROPERTY_LINE}")
+        endif ()
+
+        set(AKKARADB_VERSION_PROPERTY_KEY "${CMAKE_MATCH_1}")
+        set(AKKARADB_VERSION_PROPERTY_VALUE "${CMAKE_MATCH_2}")
+        string(STRIP "${AKKARADB_VERSION_PROPERTY_VALUE}" AKKARADB_VERSION_PROPERTY_VALUE)
+
+        set(${AKKARADB_VERSION_PROPERTY_KEY} "${AKKARADB_VERSION_PROPERTY_VALUE}" PARENT_SCOPE)
+    endforeach ()
+endfunction()

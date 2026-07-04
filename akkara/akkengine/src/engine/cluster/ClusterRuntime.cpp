@@ -177,9 +177,11 @@ namespace akkaradb::engine::cluster {
                         manager_->primaryReplPort(),
                         selfNodeId_,
                         callbacks_.getLastSeq,
+                        config_.ackPolicy(),
                         std::move(clientOptions)
                     );
                     client_->setApplyCallback(callbacks_.apply);
+                    client_->setForceDurableCallback(callbacks_.forceDurable);
                     client_->setBlobCallback(callbacks_.applyBlob);
                     client_->start();
                 }

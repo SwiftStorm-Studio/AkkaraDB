@@ -15,6 +15,8 @@
 #include "akk/engine/AkkEngine.hpp"
 
 #include <filesystem>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -119,6 +121,59 @@ namespace akkaradb {
                     std::optional<size_t> sstBloomBitsPerKey;
                     std::optional<size_t> maxL0SstFiles;
                 } overrides;
+
+                struct ApiTlsOptions {
+                    std::filesystem::path certPath;
+                    std::filesystem::path keyPath;
+                    std::filesystem::path caPath;
+                    std::vector<uint8_t> psk;
+                    std::string pskIdentity;
+                    bool verifyPeer = true;
+                };
+
+                struct ApiOptions {
+                    std::vector<engine::AkkEngineOptions::ApiBackend> backends;
+                    std::filesystem::path serverBackendPath;
+                    std::filesystem::path transportBackendPath;
+                    std::filesystem::path httpBackendPath;
+                    std::filesystem::path tcpBackendPath;
+                    std::filesystem::path grpcBackendPath;
+                    std::string bindHost = "127.0.0.1";
+                    uint16_t httpPort = 7070;
+                    uint16_t tcpPort = 7071;
+                    uint16_t grpcPort = 7072;
+                    engine::AkkEngineOptions::ApiTransportMode transportMode = engine::AkkEngineOptions::ApiTransportMode::PLAIN;
+                    uint32_t httpMaxBatchItems = 4096;
+                    uint32_t httpMaxScanItems = 4096;
+                    uint32_t httpMaxHistoryEntries = 4096;
+                    uint64_t httpMaxContentLength = 64ULL * 1024ULL * 1024ULL;
+                    uint32_t grpcWorkerThreads = 0;
+                    uint32_t grpcCompletionQueues = 0;
+                    uint32_t grpcMinPollers = 0;
+                    uint32_t grpcMaxPollers = 0;
+                    uint32_t grpcMaxConcurrentStreams = 0;
+                    uint64_t grpcResourceQuotaBytes = 0;
+                    uint32_t grpcMaxBatchItems = 4096;
+                    uint32_t grpcMaxScanItems = 4096;
+                    uint32_t grpcMaxHistoryEntries = 4096;
+                    engine::AkkEngineOptions::ApiIoBackend tcpIoBackend = engine::AkkEngineOptions::ApiIoBackend::AUTO;
+                    uint32_t tcpWorkerThreads = 0;
+                    uint32_t tcpAcceptQueueLimit = 4096;
+                    uint32_t tcpAcceptQueueTimeoutMs = 60000;
+                    uint32_t tcpListenBacklog = 1024;
+                    uint32_t tcpRecvBufferBytes = 0;
+                    uint32_t tcpSendBufferBytes = 0;
+                    uint32_t tcpPipelineBatchLimit = 64;
+                    uint32_t tcpMaxBatchItems = 4096;
+                    uint64_t tcpMaxPendingResponseBytes = 8ULL * 1024ULL * 1024ULL;
+                    uint32_t tcpReadTimeoutMs = 60000;
+                    uint32_t tcpWriteTimeoutMs = 30000;
+                    bool tcpNoDelay = true;
+                    bool tcpKeepAlive = true;
+                    ApiTlsOptions tls;
+                };
+
+                std::optional<ApiOptions> api;
             };
 
             [[nodiscard]] static std::unique_ptr<AkkaraDB> open(std::filesystem::path dataDir, StartupMode mode = StartupMode::NORMAL);
@@ -192,7 +247,6 @@ namespace akkaradb {
 
             template <auto FieldPtr>
             Schema& foreignKey(OnDeleteOptions onDelete = {}, OnUpdateOptions onUpdate = {}) {
-                using Owner = binpack::detail::classOf<FieldPtr>;
                 using Field = binpack::detail::memberOf<FieldPtr>;
                 static_assert(isRef<Field>, "foreignKey field must be akkaradb::Ref<T>");
                 using Target = typename RefTarget<Field>::Type;
@@ -271,7 +325,6 @@ namespace akkaradb {
 
             template <typename Entity>
             [[nodiscard]] auto& table() {
-                using Table = PackedTable<RefTraits<Entity>::primaryKey>;
                 auto it = tablesByEntity_.find(std::type_index(typeid(Entity)));
                 if (it == tablesByEntity_.end()) { throw std::runtime_error("AkkaraDB schema: table is not registered"); }
                 auto* holder = dynamic_cast<TableHolder<RefTraits<Entity>::primaryKey>*>(it->second);

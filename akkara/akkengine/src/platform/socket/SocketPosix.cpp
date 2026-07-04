@@ -27,6 +27,8 @@
 
 namespace akkaradb::platform {
     namespace {
+        using NativeHandle = Socket::NativeHandle;
+
         /**
          * @brief Returns the invalid native socket handle.
          *

@@ -42,7 +42,10 @@ namespace akkaradb::engine::server {
         ROLLBACK_KEY = 0x0D,
         FORCE_SYNC = 0x0E,
         FORCE_FLUSH = 0x0F,
-        STATS = 0x10, };
+        STATS = 0x10,
+        SCAN_STREAM = 0x11,
+        HISTORY_STREAM = 0x12,
+    };
 
     enum class ApiStatus : uint8_t {
         OK = 0x00, NOT_FOUND = 0x01, ERROR_STATUS = 0xFF,

@@ -12,11 +12,13 @@
 
 #include <jni.h>
 
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <exception>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -39,16 +41,104 @@ namespace {
     using akkaradb::core::BufferArena;
     using akkaradb::engine::AkkEngine;
 
+    struct JniBindings {
+        jclass runtimeExceptionClass = nullptr;
+        jclass byteBufferClass = nullptr;
+        jmethodID byteBufferAllocateDirect = nullptr;
+        jmethodID byteBufferAsReadOnly = nullptr;
+        jclass rowViewClass = nullptr;
+        jmethodID rowViewCtor = nullptr;
+        jclass versionEntryClass = nullptr;
+        jmethodID versionEntryCtor = nullptr;
+        jclass batchGetResultClass = nullptr;
+        jmethodID batchGetResultCtor = nullptr;
+    };
+
+    [[nodiscard]] const JniBindings& bindings(JNIEnv* env) {
+        static JniBindings cached;
+        static std::once_flag once;
+        static std::exception_ptr initError;
+
+        std::call_once(
+            once,
+            [&]() {
+                try {
+                    jclass runtimeExceptionLocal = env->FindClass("java/lang/RuntimeException");
+                    if (runtimeExceptionLocal == nullptr) { throw std::runtime_error("Failed to resolve RuntimeException class"); }
+                    cached.runtimeExceptionClass = static_cast<jclass>(env->NewGlobalRef(runtimeExceptionLocal));
+                    env->DeleteLocalRef(runtimeExceptionLocal);
+                    if (cached.runtimeExceptionClass == nullptr) { throw std::runtime_error("Failed to cache RuntimeException class"); }
+
+                    jclass byteBufferLocal = env->FindClass("java/nio/ByteBuffer");
+                    if (byteBufferLocal == nullptr) { throw std::runtime_error("Failed to resolve ByteBuffer class"); }
+                    cached.byteBufferClass = static_cast<jclass>(env->NewGlobalRef(byteBufferLocal));
+                    env->DeleteLocalRef(byteBufferLocal);
+                    if (cached.byteBufferClass == nullptr) { throw std::runtime_error("Failed to cache ByteBuffer class"); }
+                    cached.byteBufferAllocateDirect = env->GetStaticMethodID(
+                        cached.byteBufferClass,
+                        "allocateDirect",
+                        "(I)Ljava/nio/ByteBuffer;"
+                    );
+                    cached.byteBufferAsReadOnly = env->GetMethodID(
+                        cached.byteBufferClass,
+                        "asReadOnlyBuffer",
+                        "()Ljava/nio/ByteBuffer;"
+                    );
+                    if (cached.byteBufferAllocateDirect == nullptr || cached.byteBufferAsReadOnly == nullptr) {
+                        throw std::runtime_error("Failed to resolve ByteBuffer methods");
+                    }
+
+                    jclass rowViewLocal = env->FindClass("dev/swiftstorm/akkaradb/engine/RowView");
+                    if (rowViewLocal == nullptr) { throw std::runtime_error("Failed to resolve RowView class"); }
+                    cached.rowViewClass = static_cast<jclass>(env->NewGlobalRef(rowViewLocal));
+                    env->DeleteLocalRef(rowViewLocal);
+                    if (cached.rowViewClass == nullptr) { throw std::runtime_error("Failed to cache RowView class"); }
+                    cached.rowViewCtor = env->GetMethodID(
+                        cached.rowViewClass,
+                        "<init>",
+                        "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Lkotlin/jvm/internal/DefaultConstructorMarker;)V"
+                    );
+                    if (cached.rowViewCtor == nullptr) { throw std::runtime_error("Failed to resolve RowView constructor"); }
+
+                    jclass versionEntryLocal = env->FindClass("dev/swiftstorm/akkaradb/engine/VersionEntry");
+                    if (versionEntryLocal == nullptr) { throw std::runtime_error("Failed to resolve VersionEntry class"); }
+                    cached.versionEntryClass = static_cast<jclass>(env->NewGlobalRef(versionEntryLocal));
+                    env->DeleteLocalRef(versionEntryLocal);
+                    if (cached.versionEntryClass == nullptr) { throw std::runtime_error("Failed to cache VersionEntry class"); }
+                    cached.versionEntryCtor = env->GetMethodID(
+                        cached.versionEntryClass,
+                        "<init>",
+                        "(JJJB[B)V"
+                    );
+                    if (cached.versionEntryCtor == nullptr) { throw std::runtime_error("Failed to resolve VersionEntry constructor"); }
+
+                    jclass batchGetResultLocal = env->FindClass("dev/swiftstorm/akkaradb/engine/BatchGetResult");
+                    if (batchGetResultLocal == nullptr) { throw std::runtime_error("Failed to resolve BatchGetResult class"); }
+                    cached.batchGetResultClass = static_cast<jclass>(env->NewGlobalRef(batchGetResultLocal));
+                    env->DeleteLocalRef(batchGetResultLocal);
+                    if (cached.batchGetResultClass == nullptr) { throw std::runtime_error("Failed to cache BatchGetResult class"); }
+                    cached.batchGetResultCtor = env->GetMethodID(
+                        cached.batchGetResultClass,
+                        "<init>",
+                        "()V"
+                    );
+                    if (cached.batchGetResultCtor == nullptr) { throw std::runtime_error("Failed to resolve BatchGetResult constructor"); }
+                }
+                catch (...) { initError = std::current_exception(); }
+            }
+        );
+
+        if (initError != nullptr) { std::rethrow_exception(initError); }
+        return cached;
+    }
+
     [[nodiscard]] AkkaraDB* dbFrom(jlong handle) noexcept { return reinterpret_cast<AkkaraDB*>(static_cast<std::uintptr_t>(handle)); }
 
     [[nodiscard]] jlong toHandle(void* ptr) noexcept { return static_cast<jlong>(reinterpret_cast<std::uintptr_t>(ptr)); }
 
-    void throwJava(JNIEnv* env, const char* className, const char* message) {
-        jclass cls = env->FindClass(className);
-        if (cls != nullptr) { env->ThrowNew(cls, message); }
+    void throwRuntime(JNIEnv* env, const std::exception& ex) {
+        env->ThrowNew(bindings(env).runtimeExceptionClass, ex.what());
     }
-
-    void throwRuntime(JNIEnv* env, const std::exception& ex) { throwJava(env, "java/lang/RuntimeException", ex.what()); }
 
     [[nodiscard]] std::span<const uint8_t> readDirectBuffer(JNIEnv* env, jobject buffer) {
         if (buffer == nullptr) { return {}; }
@@ -62,12 +152,8 @@ namespace {
         if (bytes.size() > static_cast<size_t>(std::numeric_limits<jint>::max())) {
             throw std::runtime_error("AkkaraDB JNI buffer is too large for a JVM ByteBuffer");
         }
-        jclass byteBufferCls = env->FindClass("java/nio/ByteBuffer");
-        if (byteBufferCls == nullptr) { return nullptr; }
-        jmethodID allocateDirect = env->GetStaticMethodID(byteBufferCls, "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
-        if (allocateDirect == nullptr) { return nullptr; }
-
-        jobject out = env->CallStaticObjectMethod(byteBufferCls, allocateDirect, static_cast<jint>(bytes.size()));
+        const auto& ids = bindings(env);
+        jobject out = env->CallStaticObjectMethod(ids.byteBufferClass, ids.byteBufferAllocateDirect, static_cast<jint>(bytes.size()));
         if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
 
         if (!bytes.empty()) {
@@ -83,23 +169,10 @@ namespace {
         if (bytes.size() > static_cast<size_t>(std::numeric_limits<jint>::max())) {
             throw std::runtime_error("AkkaraDB JNI buffer is too large for a JVM ByteBuffer");
         }
+        const auto& ids = bindings(env);
         jobject direct = env->NewDirectByteBuffer(const_cast<uint8_t*>(bytes.data()), static_cast<jlong>(bytes.size()));
         if (direct == nullptr) { return nullptr; }
-
-        jclass byteBufferCls = env->FindClass("java/nio/ByteBuffer");
-        if (byteBufferCls == nullptr) { return nullptr; }
-        jmethodID asReadOnly = env->GetMethodID(byteBufferCls, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;");
-        if (asReadOnly == nullptr) { return nullptr; }
-        return env->CallObjectMethod(direct, asReadOnly);
-    }
-
-    [[nodiscard]] std::string readString(JNIEnv* env, jstring value) {
-        if (value == nullptr) { return {}; }
-        const char* raw = env->GetStringUTFChars(value, nullptr);
-        if (raw == nullptr) { return {}; }
-        std::string out{raw};
-        env->ReleaseStringUTFChars(value, raw);
-        return out;
+        return env->CallObjectMethod(direct, ids.byteBufferAsReadOnly);
     }
 
     [[nodiscard]] StartupMode startupModeFromOrdinal(jint value) {
@@ -120,10 +193,37 @@ namespace {
         }
     }
 
-    template <typename T>
-    void assignOptionalNonNegative(std::optional<T>& target, jlong value) {
-        if (value < 0) { return; }
-        target = static_cast<T>(value);
+    [[nodiscard]] akkaradb::engine::AkkEngineOptions::ApiBackend apiBackendFromOrdinal(jint value) {
+        switch (value) {
+            case 0: return akkaradb::engine::AkkEngineOptions::ApiBackend::HTTP;
+            case 1: return akkaradb::engine::AkkEngineOptions::ApiBackend::TCP;
+            case 2: return akkaradb::engine::AkkEngineOptions::ApiBackend::GRPC;
+            default: throw std::runtime_error("Invalid AkkaraDB ApiBackend ordinal");
+        }
+    }
+
+    [[nodiscard]] akkaradb::engine::AkkEngineOptions::ApiTransportMode apiTransportModeFromOrdinal(jint value) {
+        switch (value) {
+            case 0: return akkaradb::engine::AkkEngineOptions::ApiTransportMode::TLS;
+            case 1: return akkaradb::engine::AkkEngineOptions::ApiTransportMode::PLAIN;
+            default: throw std::runtime_error("Invalid AkkaraDB ApiTransportMode ordinal");
+        }
+    }
+
+    [[nodiscard]] akkaradb::engine::AkkEngineOptions::ApiIoBackend apiIoBackendFromOrdinal(jint value) {
+        switch (value) {
+            case 0: return akkaradb::engine::AkkEngineOptions::ApiIoBackend::AUTO;
+            case 1: return akkaradb::engine::AkkEngineOptions::ApiIoBackend::THREAD_POOL;
+            default: throw std::runtime_error("Invalid AkkaraDB ApiIoBackend ordinal");
+        }
+    }
+
+    [[nodiscard]] bool boolFromInt(jint value, const char* name) {
+        switch (value) {
+            case 0: return false;
+            case 1: return true;
+            default: throw std::runtime_error(std::string("Invalid boolean value for ") + name);
+        }
     }
 
     void assignOptionalBool(std::optional<bool>& target, jint value, const char* name) {
@@ -137,11 +237,30 @@ namespace {
         }
     }
 
+    template <typename T>
+    [[nodiscard]] T checkedCast(jlong value, const char* name) {
+        if (value < 0) { throw std::runtime_error(std::string(name) + " must be >= 0"); }
+        using LimitT = std::numeric_limits<T>;
+        using UnsignedWide = unsigned long long;
+        const auto raw = static_cast<UnsignedWide>(value);
+        if (raw > static_cast<UnsignedWide>(LimitT::max())) {
+            throw std::runtime_error(std::string(name) + " is out of range");
+        }
+        return static_cast<T>(value);
+    }
+
     class BytesReader {
         public:
             explicit BytesReader(std::span<const uint8_t> bytes) : bytes_(bytes) {}
 
             [[nodiscard]] bool eof() const noexcept { return pos_ == bytes_.size(); }
+            [[nodiscard]] size_t position() const noexcept { return pos_; }
+            [[nodiscard]] std::span<const uint8_t> slice(size_t start, size_t len) const {
+                if (start > bytes_.size() || len > bytes_.size() - start) {
+                    throw std::runtime_error("AkkaraDB query payload slice is out of bounds");
+                }
+                return bytes_.subspan(start, len);
+            }
 
             [[nodiscard]] uint8_t u8() {
                 ensure(1);
@@ -164,10 +283,18 @@ namespace {
                 return out;
             }
 
+            [[nodiscard]] int32_t i32() {
+                return static_cast<int32_t>(u32());
+            }
+
             [[nodiscard]] uint64_t u64() {
                 const uint64_t lo = u32();
                 const uint64_t hi = u32();
                 return lo | (hi << 32);
+            }
+
+            [[nodiscard]] int64_t i64() {
+                return static_cast<int64_t>(u64());
             }
 
             [[nodiscard]] std::string strU16() {
@@ -193,6 +320,10 @@ namespace {
             }
 
         private:
+            friend std::string readUtf8String(BytesReader& in);
+            friend std::optional<std::string> readOptionalUtf8String(BytesReader& in);
+            friend std::optional<std::vector<uint8_t>> readOptionalBytes(BytesReader& in);
+
             void ensure(size_t len) const {
                 if (len > bytes_.size() - pos_) { throw std::runtime_error("Truncated AkkaraDB query payload"); }
             }
@@ -201,12 +332,48 @@ namespace {
             size_t pos_ = 0;
     };
 
+    [[nodiscard]] std::string readUtf8String(BytesReader& in) {
+        const auto len = in.i32();
+        if (len < 0) { throw std::runtime_error("Negative string length in AkkaraDB options payload"); }
+        if (len == 0) { return {}; }
+        in.ensure(static_cast<size_t>(len));
+        std::string out(reinterpret_cast<const char*>(in.bytes_.data() + in.pos_), static_cast<size_t>(len));
+        in.skip(static_cast<size_t>(len));
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::string> readOptionalUtf8String(BytesReader& in) {
+        const auto len = in.i32();
+        if (len < 0) { return std::nullopt; }
+        if (len == 0) { return std::string{}; }
+        in.ensure(static_cast<size_t>(len));
+        std::string out(reinterpret_cast<const char*>(in.bytes_.data() + in.pos_), static_cast<size_t>(len));
+        in.skip(static_cast<size_t>(len));
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::vector<uint8_t>> readOptionalBytes(BytesReader& in) {
+        const auto len = in.i32();
+        if (len < 0) { return std::nullopt; }
+        std::vector<uint8_t> out(static_cast<size_t>(len));
+        if (len == 0) { return out; }
+        in.ensure(static_cast<size_t>(len));
+        std::memcpy(out.data(), in.bytes_.data() + in.pos_, static_cast<size_t>(len));
+        in.skip(static_cast<size_t>(len));
+        return out;
+    }
+
     struct TypeDesc;
     using TypePtr = std::shared_ptr<TypeDesc>;
 
     struct FieldDesc {
         std::string name;
         TypePtr type;
+    };
+
+    struct ColumnRef {
+        std::string name;
+        std::vector<uint8_t> fieldPath;
     };
 
     struct TypeDesc {
@@ -437,34 +604,73 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] Value extractFromStruct(BytesReader& in, const TypeDesc& type, const std::vector<std::string>& path, size_t part);
-
-    [[nodiscard]] Value extractNested(BytesReader& in, const TypeDesc& type, const std::vector<std::string>& path, size_t part) {
-        if (type.kind == TypeDesc::NULLABLE) {
-            if (in.u8() == 0) { return Value::null(); }
-            return extractNested(in, *type.elem, path, part);
-        }
-        if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB query column path descends into a non-struct field"); }
-        return extractFromStruct(in, type, path, part);
+    [[nodiscard]] const TypeDesc& unwrapNullableStruct(const TypeDesc& type, const std::string& name) {
+        if (type.kind == TypeDesc::NULLABLE) { return unwrapNullableStruct(*type.elem, name); }
+        if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB query column path descends into a non-struct field: " + name); }
+        return type;
     }
 
-    [[nodiscard]] Value extractFromStruct(BytesReader& in, const TypeDesc& type, const std::vector<std::string>& path, size_t part) {
+    [[nodiscard]] uint8_t resolveFieldIndex(const TypeDesc& type, std::string_view fieldName, const std::string& name) {
+        if (type.fields.size() > static_cast<size_t>(std::numeric_limits<uint8_t>::max())) {
+            throw std::runtime_error("AkkaraDB schema has too many fields for JNI query resolution");
+        }
+        for (size_t i = 0; i < type.fields.size(); ++i) {
+            if (type.fields[i].name == fieldName) { return static_cast<uint8_t>(i); }
+        }
+        throw std::runtime_error("AkkaraDB query column not found in schema: " + name);
+    }
+
+    [[nodiscard]] ColumnRef resolveColumn(const TypeDesc& schema, std::string name) {
+        const auto parts = splitColumnPath(name);
+        if (parts.empty() || parts[0].empty()) { throw std::runtime_error("AkkaraDB query column name is empty"); }
+
+        ColumnRef out;
+        out.name = std::move(name);
+        out.fieldPath.reserve(parts.size());
+
+        const TypeDesc* current = &schema;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const TypeDesc& structType = unwrapNullableStruct(*current, out.name);
+            const uint8_t fieldIndex = resolveFieldIndex(structType, parts[i], out.name);
+            out.fieldPath.push_back(fieldIndex);
+            current = structType.fields[fieldIndex].type.get();
+        }
+        return out;
+    }
+
+    [[nodiscard]] Value extractFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part);
+
+    [[nodiscard]] Value extractNested(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
+        if (type.kind == TypeDesc::NULLABLE) {
+            if (in.u8() == 0) { return Value::null(); }
+            return extractNested(in, *type.elem, column, part);
+        }
+        if (type.kind != TypeDesc::STRUCT) {
+            throw std::runtime_error("AkkaraDB query column path descends into a non-struct field: " + column.name);
+        }
+        return extractFromStruct(in, type, column, part);
+    }
+
+    [[nodiscard]] Value extractFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
         if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB query root schema is not a struct"); }
-        for (const auto& field : type.fields) {
-            if (field.name == path[part]) {
-                if (part + 1 == path.size()) { return readBinpackValue(in, *field.type); }
-                return extractNested(in, *field.type, path, part + 1);
+        const size_t fieldIndex = column.fieldPath[part];
+        if (fieldIndex >= type.fields.size()) {
+            throw std::runtime_error("AkkaraDB query column field index is out of range: " + column.name);
+        }
+        for (size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            if (i == fieldIndex) {
+                if (part + 1 == column.fieldPath.size()) { return readBinpackValue(in, *field.type); }
+                return extractNested(in, *field.type, column, part + 1);
             }
             skipBinpackValue(in, *field.type);
         }
-        throw std::runtime_error("AkkaraDB query column not found in schema: " + path[part]);
+        throw std::runtime_error("AkkaraDB query column not found in schema: " + column.name);
     }
 
-    [[nodiscard]] Value readColumn(std::span<const uint8_t> rowValue, const TypeDesc& schema, const std::string& name) {
-        const auto path = splitColumnPath(name);
-        if (path.empty() || path[0].empty()) { throw std::runtime_error("AkkaraDB query column name is empty"); }
+    [[nodiscard]] Value readColumn(std::span<const uint8_t> rowValue, const TypeDesc& schema, const ColumnRef& column) {
         BytesReader in(rowValue);
-        return extractFromStruct(in, schema, path, 0);
+        return extractFromStruct(in, schema, column, 0);
     }
 
     struct Expr {
@@ -475,7 +681,7 @@ namespace {
         Tag tag = LIT;
         uint8_t op = 0;
         Value literal;
-        std::string column;
+        ColumnRef column;
         uint32_t capture = 0;
         std::unique_ptr<Expr> lhs;
         std::unique_ptr<Expr> rhs;
@@ -520,20 +726,20 @@ namespace {
         }
     }
 
-    [[nodiscard]] Expr parseExpr(BytesReader& in) {
+    [[nodiscard]] Expr parseExpr(BytesReader& in, const TypeDesc& schema) {
         Expr expr;
         expr.tag = static_cast<Expr::Tag>(in.u8());
         switch (expr.tag) {
             case Expr::BIN: expr.op = in.u8();
-                expr.lhs = std::make_unique<Expr>(parseExpr(in));
-                expr.rhs = std::make_unique<Expr>(parseExpr(in));
+                expr.lhs = std::make_unique<Expr>(parseExpr(in, schema));
+                expr.rhs = std::make_unique<Expr>(parseExpr(in, schema));
                 break;
             case Expr::UN: expr.op = in.u8();
-                expr.lhs = std::make_unique<Expr>(parseExpr(in));
+                expr.lhs = std::make_unique<Expr>(parseExpr(in, schema));
                 break;
             case Expr::LIT: expr.literal = parseLiteral(in);
                 break;
-            case Expr::COL: expr.column = in.strU16();
+            case Expr::COL: expr.column = resolveColumn(schema, in.strU16());
                 break;
             case Expr::CAP: expr.capture = in.u32();
                 break;
@@ -545,15 +751,15 @@ namespace {
     [[nodiscard]] QueryProgram parseQuery(std::span<const uint8_t> queryBytes, std::span<const uint8_t> schemaBytes) {
         BytesReader in(queryBytes);
         QueryProgram program;
+        program.schema = parseRootSchema(schemaBytes);
         const auto captureCount = in.u32();
         if (captureCount > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
             throw std::runtime_error("Too many AkkaraDB query captures");
         }
         program.captures.reserve(static_cast<size_t>(captureCount));
         for (uint32_t i = 0; i < captureCount; ++i) { program.captures.push_back(parseLiteral(in)); }
-        program.where = parseExpr(in);
+        program.where = parseExpr(in, program.schema);
         if (!in.eof()) { throw std::runtime_error("Trailing bytes in AkkaraDB query payload"); }
-        program.schema = parseRootSchema(schemaBytes);
         return program;
     }
 
@@ -701,31 +907,647 @@ namespace {
     }
 
     struct ScanCursor {
-        AkkaraDB* db = nullptr;
         BufferArena arena;
         ArenaGenerator<AkkEngine::ScanRecordView> rows;
         ArenaGenerator<AkkEngine::ScanRecordView>::iterator it;
         std::unique_ptr<QueryProgram> query;
+        struct IndexLookup {
+            AkkaraDB* db = nullptr;
+            std::vector<uint8_t> tablePrefix;
+            size_t searchPrefixSize = 0;
+        };
+        std::unique_ptr<IndexLookup> indexLookup;
     };
 
     [[nodiscard]] ScanCursor* cursorFrom(jlong handle) noexcept {
         return reinterpret_cast<ScanCursor*>(static_cast<std::uintptr_t>(handle));
     }
 
+    struct NativeIndexDef {
+        std::string fieldName;
+        std::vector<uint8_t> prefix;
+        ColumnRef column;
+    };
+
+    struct NativeTable {
+        AkkaraDB* db = nullptr;
+        std::vector<uint8_t> tablePrefix;
+        TypeDesc schema{TypeDesc::STRUCT};
+        std::vector<NativeIndexDef> indexes;
+    };
+
+    [[nodiscard]] NativeTable* tableFrom(jlong handle) noexcept {
+        return reinterpret_cast<NativeTable*>(static_cast<std::uintptr_t>(handle));
+    }
+
+    [[nodiscard]] std::string readJavaString(JNIEnv* env, jstring value) {
+        if (value == nullptr) { throw std::runtime_error("AkkaraDB JNI string argument is null"); }
+        const char* chars = env->GetStringUTFChars(value, nullptr);
+        if (chars == nullptr || env->ExceptionCheck()) { throw std::runtime_error("AkkaraDB JNI failed to read string argument"); }
+        std::string out{chars};
+        env->ReleaseStringUTFChars(value, chars);
+        return out;
+    }
+
+    [[nodiscard]] std::vector<uint8_t> concatBytes(std::span<const uint8_t> first, std::span<const uint8_t> second) {
+        std::vector<uint8_t> out;
+        out.reserve(first.size() + second.size());
+        out.insert(out.end(), first.begin(), first.end());
+        out.insert(out.end(), second.begin(), second.end());
+        return out;
+    }
+
+    void appendU32Le(std::vector<uint8_t>& out, uint32_t value) {
+        out.push_back(static_cast<uint8_t>(value & 0xFF));
+        out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+        out.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+        out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+    }
+
+    [[nodiscard]] bool incrementLexicographic(std::vector<uint8_t>& bytes) noexcept {
+        for (size_t i = bytes.size(); i-- > 0;) {
+            const uint16_t next = static_cast<uint16_t>(bytes[i]) + 1;
+            bytes[i] = static_cast<uint8_t>(next);
+            if (next <= 0xFF) { return true; }
+        }
+        return false;
+    }
+
+    void buildIndexSearchPrefix(std::span<const uint8_t> prefix, std::span<const uint8_t> fieldBytes, std::vector<uint8_t>& out) {
+        if (fieldBytes.size() > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("AkkaraDB JNI index field is too large");
+        }
+        out.clear();
+        out.reserve(prefix.size() + 4 + fieldBytes.size());
+        out.insert(out.end(), prefix.begin(), prefix.end());
+        appendU32Le(out, static_cast<uint32_t>(fieldBytes.size()));
+        out.insert(out.end(), fieldBytes.begin(), fieldBytes.end());
+    }
+
+    [[nodiscard]] const NativeIndexDef& requireIndex(const NativeTable& table, std::string_view fieldName) {
+        for (const auto& index : table.indexes) {
+            if (index.fieldName == fieldName) { return index; }
+        }
+        throw std::runtime_error("AkkaraDB secondary index is not registered for field: " + std::string(fieldName));
+    }
+
+    [[nodiscard]] const TypeDesc& resolveColumnLeafType(const TypeDesc& schema, const ColumnRef& column) {
+        const TypeDesc* current = &schema;
+        for (uint8_t part : column.fieldPath) {
+            while (current->kind == TypeDesc::NULLABLE) { current = current->elem.get(); }
+            if (current->kind != TypeDesc::STRUCT || part >= current->fields.size()) {
+                throw std::runtime_error("AkkaraDB index column path is invalid: " + column.name);
+            }
+            current = current->fields[part].type.get();
+        }
+        return *current;
+    }
+
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part);
+
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldNested(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
+        if (type.kind == TypeDesc::NULLABLE) {
+            const size_t start = in.position();
+            if (in.u8() == 0) { return in.slice(start, in.position() - start); }
+            return extractEncodedFieldNested(in, *type.elem, column, part);
+        }
+        if (type.kind != TypeDesc::STRUCT) {
+            throw std::runtime_error("AkkaraDB index column path descends into a non-struct field: " + column.name);
+        }
+        return extractEncodedFieldFromStruct(in, type, column, part);
+    }
+
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
+        if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB index root schema is not a struct"); }
+        const size_t fieldIndex = column.fieldPath[part];
+        if (fieldIndex >= type.fields.size()) {
+            throw std::runtime_error("AkkaraDB index column field index is out of range: " + column.name);
+        }
+        for (size_t i = 0; i < type.fields.size(); ++i) {
+            const auto& field = type.fields[i];
+            if (i == fieldIndex) {
+                if (part + 1 == column.fieldPath.size()) {
+                    const size_t start = in.position();
+                    skipBinpackValue(in, *field.type);
+                    return in.slice(start, in.position() - start);
+                }
+                return extractEncodedFieldNested(in, *field.type, column, part + 1);
+            }
+            skipBinpackValue(in, *field.type);
+        }
+        throw std::runtime_error("AkkaraDB index column not found in schema: " + column.name);
+    }
+
+    [[nodiscard]] std::span<const uint8_t> readEncodedField(std::span<const uint8_t> rowValue, const TypeDesc& schema, const ColumnRef& column) {
+        BytesReader in(rowValue);
+        return extractEncodedFieldFromStruct(in, schema, column, 0);
+    }
+
+    [[nodiscard]] uint16_t readU16Le(std::span<const uint8_t> bytes) {
+        return static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8);
+    }
+
+    [[nodiscard]] uint32_t readU32Le(std::span<const uint8_t> bytes) {
+        return static_cast<uint32_t>(bytes[0])
+            | (static_cast<uint32_t>(bytes[1]) << 8)
+            | (static_cast<uint32_t>(bytes[2]) << 16)
+            | (static_cast<uint32_t>(bytes[3]) << 24);
+    }
+
+    [[nodiscard]] uint64_t readU64Le(std::span<const uint8_t> bytes) {
+        return static_cast<uint64_t>(readU32Le(bytes))
+            | (static_cast<uint64_t>(readU32Le(bytes.subspan(4, 4))) << 32);
+    }
+
+    void appendSortableInt(std::vector<uint8_t>& out, uint64_t value, size_t size) {
+        out.resize(size);
+        for (size_t i = 0; i < size; ++i) {
+            out[i] = static_cast<uint8_t>(value >> ((size - 1 - i) * 8));
+        }
+    }
+
+    void encodeIndexFieldFromRow(
+        std::span<const uint8_t> rowValue,
+        const TypeDesc& schema,
+        const ColumnRef& column,
+        std::vector<uint8_t>& out
+    ) {
+        const auto encoded = readEncodedField(rowValue, schema, column);
+        const TypeDesc& leafType = resolveColumnLeafType(schema, column);
+        out.clear();
+        switch (leafType.kind) {
+            case TypeDesc::INT8:
+                out.push_back(static_cast<uint8_t>(static_cast<int8_t>(encoded[0]) ^ static_cast<int8_t>(0x80)));
+                return;
+            case TypeDesc::INT16: {
+                const auto value = static_cast<uint16_t>(static_cast<int16_t>(readU16Le(encoded)) ^ static_cast<int16_t>(0x8000));
+                appendSortableInt(out, value, 2);
+                return;
+            }
+            case TypeDesc::INT32: {
+                const auto value = static_cast<uint32_t>(static_cast<int32_t>(readU32Le(encoded)) ^ std::numeric_limits<int32_t>::min());
+                appendSortableInt(out, value, 4);
+                return;
+            }
+            case TypeDesc::INT64: {
+                const auto value = readU64Le(encoded) ^ (1ull << 63);
+                appendSortableInt(out, value, 8);
+                return;
+            }
+            case TypeDesc::FLOAT: {
+                const uint32_t raw = readU32Le(encoded);
+                const uint32_t sortable = (raw & 0x80000000u) != 0u ? ~raw : (raw ^ 0x80000000u);
+                appendSortableInt(out, sortable, 4);
+                return;
+            }
+            case TypeDesc::DOUBLE: {
+                const uint64_t raw = readU64Le(encoded);
+                const uint64_t sortable = (raw & (1ull << 63)) != 0ull ? ~raw : (raw ^ (1ull << 63));
+                appendSortableInt(out, sortable, 8);
+                return;
+            }
+            default:
+                out.insert(out.end(), encoded.begin(), encoded.end());
+                return;
+        }
+    }
+
+    void updateIndexEntries(
+        NativeTable& table,
+        std::span<const uint8_t> pkBytes,
+        std::span<const uint8_t> rowValue,
+        bool remove
+    ) {
+        std::vector<uint8_t> fieldBytes;
+        std::vector<uint8_t> key;
+        for (const auto& index : table.indexes) {
+            encodeIndexFieldFromRow(rowValue, table.schema, index.column, fieldBytes);
+            buildIndexSearchPrefix(index.prefix, fieldBytes, key);
+            key.insert(key.end(), pkBytes.begin(), pkBytes.end());
+            if (remove) { table.db->engine().remove(key); }
+            else { table.db->engine().put(key, std::span<const uint8_t>{}); }
+        }
+    }
+
     [[nodiscard]] jobject makeRow(JNIEnv* env, std::span<const uint8_t> key, std::span<const uint8_t> value) {
-        jclass rowCls = env->FindClass("dev/swiftstorm/akkaradb/engine/RowView");
-        if (rowCls == nullptr) { return nullptr; }
-        jmethodID ctor = env->GetMethodID(
-            rowCls,
-            "<init>",
-            "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Lkotlin/jvm/internal/DefaultConstructorMarker;)V"
-        );
-        if (ctor == nullptr) { return nullptr; }
+        const auto& ids = bindings(env);
         jobject keyBuffer = makeDirectView(env, key);
         if (keyBuffer == nullptr || env->ExceptionCheck()) { return nullptr; }
         jobject valueBuffer = makeDirectView(env, value);
         if (valueBuffer == nullptr || env->ExceptionCheck()) { return nullptr; }
-        return env->NewObject(rowCls, ctor, keyBuffer, valueBuffer, nullptr);
+        return env->NewObject(ids.rowViewClass, ids.rowViewCtor, keyBuffer, valueBuffer, nullptr);
+    }
+
+    [[nodiscard]] jbyteArray makeByteArray(JNIEnv* env, std::span<const uint8_t> bytes) {
+        if (bytes.size() > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+            throw std::runtime_error("AkkaraDB JNI byte array is too large");
+        }
+        jbyteArray out = env->NewByteArray(static_cast<jsize>(bytes.size()));
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+        if (!bytes.empty()) {
+            env->SetByteArrayRegion(
+                out,
+                0,
+                static_cast<jsize>(bytes.size()),
+                reinterpret_cast<const jbyte*>(bytes.data())
+            );
+            if (env->ExceptionCheck()) { return nullptr; }
+        }
+        return out;
+    }
+
+    [[nodiscard]] jobject makeVersionEntry(JNIEnv* env, const akkaradb::engine::VersionEntry& entry) {
+        const auto& ids = bindings(env);
+        jbyteArray rawValue = makeByteArray(env, entry.value);
+        if (rawValue == nullptr && env->ExceptionCheck()) { return nullptr; }
+        return env->NewObject(
+            ids.versionEntryClass,
+            ids.versionEntryCtor,
+            static_cast<jlong>(entry.seq),
+            static_cast<jlong>(entry.sourceNodeId),
+            static_cast<jlong>(entry.timestampNs),
+            static_cast<jbyte>(entry.flags),
+            rawValue
+        );
+    }
+
+    jfieldID requireField(JNIEnv* env, jclass cls, const char* name, const char* sig) {
+        jfieldID field = env->GetFieldID(cls, name, sig);
+        if (field == nullptr || env->ExceptionCheck()) {
+            throw std::runtime_error(std::string("Failed to resolve field: ") + name);
+        }
+        return field;
+    }
+
+    void setBooleanField(JNIEnv* env, jobject target, jclass cls, const char* name, bool value) {
+        env->SetBooleanField(target, requireField(env, cls, name, "Z"), value ? JNI_TRUE : JNI_FALSE);
+    }
+
+    void setIntField(JNIEnv* env, jobject target, jclass cls, const char* name, jint value) {
+        env->SetIntField(target, requireField(env, cls, name, "I"), value);
+    }
+
+    void setLongField(JNIEnv* env, jobject target, jclass cls, const char* name, jlong value) {
+        env->SetLongField(target, requireField(env, cls, name, "J"), value);
+    }
+
+    void setObjectField(JNIEnv* env, jobject target, jclass cls, const char* name, const char* sig, jobject value) {
+        env->SetObjectField(target, requireField(env, cls, name, sig), value);
+    }
+
+    void readDirectBufferArray(JNIEnv* env, jobjectArray array, std::vector<std::span<const uint8_t>>& out) {
+        if (array == nullptr) { throw std::runtime_error("JNI buffer array must not be null"); }
+        const jsize size = env->GetArrayLength(array);
+        out.clear();
+        out.reserve(static_cast<size_t>(size));
+        for (jsize i = 0; i < size; ++i) {
+            jobject buffer = env->GetObjectArrayElement(array, i);
+            if (buffer == nullptr) { throw std::runtime_error("JNI buffer array contains null entry"); }
+            out.push_back(readDirectBuffer(env, buffer));
+            env->DeleteLocalRef(buffer);
+        }
+    }
+
+    [[nodiscard]] jobject makeBatchGetResult(JNIEnv* env, const AkkEngine::BatchGetResult& result) {
+        const auto& ids = bindings(env);
+        jobject out = env->NewObject(ids.batchGetResultClass, ids.batchGetResultCtor);
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+        jbyteArray value = makeByteArray(env, result.value);
+        if (value == nullptr && env->ExceptionCheck()) { return nullptr; }
+        setBooleanField(env, out, ids.batchGetResultClass, "found", result.found);
+        setObjectField(env, out, ids.batchGetResultClass, "valueBytes", "[B", value);
+        return out;
+    }
+
+    [[nodiscard]] jobject makeLevelStats(JNIEnv* env, const akkaradb::engine::LevelStats& stats) {
+        jclass cls = env->FindClass("dev/swiftstorm/akkaradb/engine/LevelStats");
+        if (cls == nullptr) { return nullptr; }
+        jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+        if (ctor == nullptr) { return nullptr; }
+        jobject out = env->NewObject(cls, ctor);
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+        setIntField(env, out, cls, "level", static_cast<jint>(stats.level));
+        setLongField(env, out, cls, "fileCount", static_cast<jlong>(stats.fileCount));
+        setLongField(env, out, cls, "bytes", static_cast<jlong>(stats.bytes));
+        setLongField(env, out, cls, "budgetBytes", static_cast<jlong>(stats.budgetBytes));
+        return out;
+    }
+
+    [[nodiscard]] jobject makeApiStats(JNIEnv* env, const akkaradb::engine::EngineStats::ApiStats& stats) {
+        jclass cls = env->FindClass("dev/swiftstorm/akkaradb/engine/ApiStats");
+        if (cls == nullptr) { return nullptr; }
+        jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+        if (ctor == nullptr) { return nullptr; }
+        jobject out = env->NewObject(cls, ctor);
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+        setBooleanField(env, out, cls, "enabled", stats.enabled);
+        setBooleanField(env, out, cls, "httpEnabled", stats.httpEnabled);
+        setBooleanField(env, out, cls, "httpTlsEnabled", stats.httpTlsEnabled);
+        setIntField(env, out, cls, "httpPort", static_cast<jint>(stats.httpPort));
+        setLongField(env, out, cls, "httpMaxBatchItems", static_cast<jlong>(stats.httpMaxBatchItems));
+        setLongField(env, out, cls, "httpMaxScanItems", static_cast<jlong>(stats.httpMaxScanItems));
+        setLongField(env, out, cls, "httpMaxHistoryEntries", static_cast<jlong>(stats.httpMaxHistoryEntries));
+        setLongField(env, out, cls, "httpMaxContentLength", static_cast<jlong>(stats.httpMaxContentLength));
+        setLongField(env, out, cls, "httpConnectionsAcceptedTotal", static_cast<jlong>(stats.httpConnectionsAcceptedTotal));
+        setLongField(env, out, cls, "httpConnectionsClosedTotal", static_cast<jlong>(stats.httpConnectionsClosedTotal));
+        setLongField(env, out, cls, "httpConnectionsActive", static_cast<jlong>(stats.httpConnectionsActive));
+        setLongField(env, out, cls, "httpRequestsTotal", static_cast<jlong>(stats.httpRequestsTotal));
+        setLongField(env, out, cls, "httpResponsesTotal", static_cast<jlong>(stats.httpResponsesTotal));
+        setLongField(env, out, cls, "httpBytesReceivedTotal", static_cast<jlong>(stats.httpBytesReceivedTotal));
+        setLongField(env, out, cls, "httpBytesSentTotal", static_cast<jlong>(stats.httpBytesSentTotal));
+        setLongField(env, out, cls, "httpProtocolErrorsTotal", static_cast<jlong>(stats.httpProtocolErrorsTotal));
+        setLongField(env, out, cls, "httpErrorsTotal", static_cast<jlong>(stats.httpErrorsTotal));
+        setLongField(env, out, cls, "httpBatchPutItemsTotal", static_cast<jlong>(stats.httpBatchPutItemsTotal));
+        setLongField(env, out, cls, "httpBatchGetItemsTotal", static_cast<jlong>(stats.httpBatchGetItemsTotal));
+        setBooleanField(env, out, cls, "tcpEnabled", stats.tcpEnabled);
+        setBooleanField(env, out, cls, "tcpTlsEnabled", stats.tcpTlsEnabled);
+        setIntField(env, out, cls, "tcpIoBackend", static_cast<jint>(stats.tcpIoBackend));
+        setLongField(env, out, cls, "tcpWorkerThreads", static_cast<jlong>(stats.tcpWorkerThreads));
+        setLongField(env, out, cls, "tcpAcceptQueueLimit", static_cast<jlong>(stats.tcpAcceptQueueLimit));
+        setLongField(env, out, cls, "tcpAcceptQueueTimeoutMs", static_cast<jlong>(stats.tcpAcceptQueueTimeoutMs));
+        setLongField(env, out, cls, "tcpListenBacklog", static_cast<jlong>(stats.tcpListenBacklog));
+        setLongField(env, out, cls, "tcpReadTimeoutMs", static_cast<jlong>(stats.tcpReadTimeoutMs));
+        setLongField(env, out, cls, "tcpWriteTimeoutMs", static_cast<jlong>(stats.tcpWriteTimeoutMs));
+        setLongField(env, out, cls, "tcpConnectionsAcceptedTotal", static_cast<jlong>(stats.tcpConnectionsAcceptedTotal));
+        setLongField(env, out, cls, "tcpConnectionsClosedTotal", static_cast<jlong>(stats.tcpConnectionsClosedTotal));
+        setLongField(env, out, cls, "tcpConnectionsActive", static_cast<jlong>(stats.tcpConnectionsActive));
+        setLongField(env, out, cls, "tcpAcceptQueueDepth", static_cast<jlong>(stats.tcpAcceptQueueDepth));
+        setLongField(env, out, cls, "tcpAcceptQueuePeakDepth", static_cast<jlong>(stats.tcpAcceptQueuePeakDepth));
+        setLongField(env, out, cls, "tcpAcceptQueueRejectedTotal", static_cast<jlong>(stats.tcpAcceptQueueRejectedTotal));
+        setLongField(env, out, cls, "tcpAcceptQueueExpiredTotal", static_cast<jlong>(stats.tcpAcceptQueueExpiredTotal));
+        setLongField(env, out, cls, "tcpRequestsTotal", static_cast<jlong>(stats.tcpRequestsTotal));
+        setLongField(env, out, cls, "tcpResponsesTotal", static_cast<jlong>(stats.tcpResponsesTotal));
+        setLongField(env, out, cls, "tcpBytesReceivedTotal", static_cast<jlong>(stats.tcpBytesReceivedTotal));
+        setLongField(env, out, cls, "tcpBytesSentTotal", static_cast<jlong>(stats.tcpBytesSentTotal));
+        setLongField(env, out, cls, "tcpProtocolErrorsTotal", static_cast<jlong>(stats.tcpProtocolErrorsTotal));
+        setLongField(env, out, cls, "tcpCrcErrorsTotal", static_cast<jlong>(stats.tcpCrcErrorsTotal));
+        setLongField(env, out, cls, "tcpPipelineBatchesTotal", static_cast<jlong>(stats.tcpPipelineBatchesTotal));
+        setLongField(env, out, cls, "tcpBackpressureFlushesTotal", static_cast<jlong>(stats.tcpBackpressureFlushesTotal));
+        setLongField(env, out, cls, "tcpBackpressureDisconnectsTotal", static_cast<jlong>(stats.tcpBackpressureDisconnectsTotal));
+        setLongField(env, out, cls, "tcpBatchPutItemsTotal", static_cast<jlong>(stats.tcpBatchPutItemsTotal));
+        setLongField(env, out, cls, "tcpBatchGetItemsTotal", static_cast<jlong>(stats.tcpBatchGetItemsTotal));
+        setBooleanField(env, out, cls, "grpcEnabled", stats.grpcEnabled);
+        setBooleanField(env, out, cls, "grpcTlsEnabled", stats.grpcTlsEnabled);
+        setIntField(env, out, cls, "grpcPort", static_cast<jint>(stats.grpcPort));
+        setLongField(env, out, cls, "grpcWorkerThreads", static_cast<jlong>(stats.grpcWorkerThreads));
+        setLongField(env, out, cls, "grpcCompletionQueues", static_cast<jlong>(stats.grpcCompletionQueues));
+        setLongField(env, out, cls, "grpcMinPollers", static_cast<jlong>(stats.grpcMinPollers));
+        setLongField(env, out, cls, "grpcMaxPollers", static_cast<jlong>(stats.grpcMaxPollers));
+        setLongField(env, out, cls, "grpcMaxConcurrentStreams", static_cast<jlong>(stats.grpcMaxConcurrentStreams));
+        setLongField(env, out, cls, "grpcResourceQuotaBytes", static_cast<jlong>(stats.grpcResourceQuotaBytes));
+        setLongField(env, out, cls, "grpcMaxBatchItems", static_cast<jlong>(stats.grpcMaxBatchItems));
+        setLongField(env, out, cls, "grpcMaxScanItems", static_cast<jlong>(stats.grpcMaxScanItems));
+        setLongField(env, out, cls, "grpcMaxHistoryEntries", static_cast<jlong>(stats.grpcMaxHistoryEntries));
+        setLongField(env, out, cls, "grpcRequestsTotal", static_cast<jlong>(stats.grpcRequestsTotal));
+        setLongField(env, out, cls, "grpcResponsesTotal", static_cast<jlong>(stats.grpcResponsesTotal));
+        setLongField(env, out, cls, "grpcActiveRequests", static_cast<jlong>(stats.grpcActiveRequests));
+        setLongField(env, out, cls, "grpcErrorsTotal", static_cast<jlong>(stats.grpcErrorsTotal));
+        setLongField(env, out, cls, "grpcBatchPutItemsTotal", static_cast<jlong>(stats.grpcBatchPutItemsTotal));
+        setLongField(env, out, cls, "grpcBatchGetItemsTotal", static_cast<jlong>(stats.grpcBatchGetItemsTotal));
+        return out;
+    }
+
+    template <typename TStats>
+    [[nodiscard]] jobject makePlainStats(JNIEnv* env, const char* className, const TStats& /*stats*/, std::initializer_list<std::pair<const char*, jlong>> longs, std::initializer_list<std::pair<const char*, bool>> bools = {}) {
+        jclass cls = env->FindClass(className);
+        if (cls == nullptr) { return nullptr; }
+        jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+        if (ctor == nullptr) { return nullptr; }
+        jobject out = env->NewObject(cls, ctor);
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+        for (const auto& [name, value] : bools) { setBooleanField(env, out, cls, name, value); }
+        for (const auto& [name, value] : longs) { setLongField(env, out, cls, name, value); }
+        return out;
+    }
+
+    [[nodiscard]] jobject makeEngineStats(JNIEnv* env, const akkaradb::engine::EngineStats& stats) {
+        jclass cls = env->FindClass("dev/swiftstorm/akkaradb/engine/EngineStats");
+        if (cls == nullptr) { return nullptr; }
+        jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
+        if (ctor == nullptr) { return nullptr; }
+        jobject out = env->NewObject(cls, ctor);
+        if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+
+        jobject api = makeApiStats(env, stats.api);
+        jobject memtable = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/MemTableStats",
+            stats.memtable,
+            {
+                {"shardCount", static_cast<jlong>(stats.memtable.shardCount)},
+                {"thresholdBytesPerShard", static_cast<jlong>(stats.memtable.thresholdBytesPerShard)},
+                {"approxBytes", static_cast<jlong>(stats.memtable.approxBytes)},
+                {"putsApplied", static_cast<jlong>(stats.memtable.putsApplied)},
+                {"removesApplied", static_cast<jlong>(stats.memtable.removesApplied)},
+                {"flushesCompleted", static_cast<jlong>(stats.memtable.flushesCompleted)},
+                {"bytesFlushed", static_cast<jlong>(stats.memtable.bytesFlushed)}
+            }
+        );
+        jobject wal = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/WalStats",
+            stats.wal,
+            {
+                {"shardCount", static_cast<jlong>(stats.wal.shardCount)},
+                {"entriesWritten", static_cast<jlong>(stats.wal.entriesWritten)},
+                {"bytesWritten", static_cast<jlong>(stats.wal.bytesWritten)},
+                {"batchesFlushed", static_cast<jlong>(stats.wal.batchesFlushed)},
+                {"syncsExecuted", static_cast<jlong>(stats.wal.syncsExecuted)},
+                {"segmentRotations", static_cast<jlong>(stats.wal.segmentRotations)}
+            },
+            {{"enabled", stats.wal.enabled}}
+        );
+        jobject blob = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/BlobStats",
+            stats.blob,
+            {
+                {"thresholdBytes", static_cast<jlong>(stats.blob.thresholdBytes)},
+                {"blobsWritten", static_cast<jlong>(stats.blob.blobsWritten)},
+                {"bytesUncompressed", static_cast<jlong>(stats.blob.bytesUncompressed)},
+                {"bytesOnDisk", static_cast<jlong>(stats.blob.bytesOnDisk)},
+                {"blobsDeleted", static_cast<jlong>(stats.blob.blobsDeleted)},
+                {"gcCycles", static_cast<jlong>(stats.blob.gcCycles)}
+            },
+            {{"enabled", stats.blob.enabled}}
+        );
+        jobject vlog = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/VLogStats",
+            stats.vlog,
+            {
+                {"syncMode", static_cast<jlong>(stats.vlog.syncMode)},
+                {"groupN", static_cast<jlong>(stats.vlog.groupN)},
+                {"groupMicros", static_cast<jlong>(stats.vlog.groupMicros)},
+                {"groupBytes", static_cast<jlong>(stats.vlog.groupBytes)},
+                {"asyncMaxPendingBytes", static_cast<jlong>(stats.vlog.asyncMaxPendingBytes)},
+                {"indexedKeys", static_cast<jlong>(stats.vlog.indexedKeys)},
+                {"indexedEntries", static_cast<jlong>(stats.vlog.indexedEntries)},
+                {"rollbackEntries", static_cast<jlong>(stats.vlog.rollbackEntries)},
+                {"pendingWrites", static_cast<jlong>(stats.vlog.pendingWrites)},
+                {"pendingBytes", static_cast<jlong>(stats.vlog.pendingBytes)},
+                {"durableBytes", static_cast<jlong>(stats.vlog.durableBytes)}
+            },
+            {
+                {"enabled", stats.vlog.enabled},
+                {"flushThreadRunning", stats.vlog.flushThreadRunning}
+            }
+        );
+
+        jclass sstCls = env->FindClass("dev/swiftstorm/akkaradb/engine/SstStats");
+        if (sstCls == nullptr) { return nullptr; }
+        jmethodID sstCtor = env->GetMethodID(sstCls, "<init>", "()V");
+        if (sstCtor == nullptr) { return nullptr; }
+        jobject sst = env->NewObject(sstCls, sstCtor);
+        if (sst == nullptr || env->ExceptionCheck()) { return nullptr; }
+        jclass levelCls = env->FindClass("dev/swiftstorm/akkaradb/engine/LevelStats");
+        if (levelCls == nullptr) { return nullptr; }
+        jobjectArray levels = env->NewObjectArray(static_cast<jsize>(stats.sst.levels.size()), levelCls, nullptr);
+        if (levels == nullptr || env->ExceptionCheck()) { return nullptr; }
+        for (jsize i = 0; i < static_cast<jsize>(stats.sst.levels.size()); ++i) {
+            jobject level = makeLevelStats(env, stats.sst.levels[static_cast<size_t>(i)]);
+            if (level == nullptr || env->ExceptionCheck()) { return nullptr; }
+            env->SetObjectArrayElement(levels, i, level);
+            if (env->ExceptionCheck()) { return nullptr; }
+            env->DeleteLocalRef(level);
+        }
+        setBooleanField(env, sst, sstCls, "enabled", stats.sst.enabled);
+        setObjectField(env, sst, sstCls, "levels", "[Ldev/swiftstorm/akkaradb/engine/LevelStats;", levels);
+        setLongField(env, sst, sstCls, "fileCount", static_cast<jlong>(stats.sst.fileCount));
+        setLongField(env, sst, sstCls, "bytes", static_cast<jlong>(stats.sst.bytes));
+        setLongField(env, sst, sstCls, "l0FileCount", static_cast<jlong>(stats.sst.l0FileCount));
+        setBooleanField(env, sst, sstCls, "compactionPending", stats.sst.compactionPending);
+        setLongField(env, sst, sstCls, "compactionsCompleted", static_cast<jlong>(stats.sst.compactionsCompleted));
+        setLongField(env, sst, sstCls, "filesCompacted", static_cast<jlong>(stats.sst.filesCompacted));
+        setLongField(env, sst, sstCls, "bytesCompactedIn", static_cast<jlong>(stats.sst.bytesCompactedIn));
+        setLongField(env, sst, sstCls, "bytesCompactedOut", static_cast<jlong>(stats.sst.bytesCompactedOut));
+        setLongField(env, sst, sstCls, "l0Stalls", static_cast<jlong>(stats.sst.l0Stalls));
+
+        setLongField(env, out, cls, "currentSeq", static_cast<jlong>(stats.currentSeq));
+        setLongField(env, out, cls, "nodeId", static_cast<jlong>(stats.nodeId));
+        setLongField(env, out, cls, "putsTotal", static_cast<jlong>(stats.putsTotal));
+        setLongField(env, out, cls, "removesTotal", static_cast<jlong>(stats.removesTotal));
+        setLongField(env, out, cls, "getsTotal", static_cast<jlong>(stats.getsTotal));
+        setLongField(env, out, cls, "getsMemtableHit", static_cast<jlong>(stats.getsMemtableHit));
+        setLongField(env, out, cls, "getsSstHit", static_cast<jlong>(stats.getsSstHit));
+        setLongField(env, out, cls, "getsMiss", static_cast<jlong>(stats.getsMiss));
+        setLongField(env, out, cls, "existsTotal", static_cast<jlong>(stats.existsTotal));
+        setLongField(env, out, cls, "scansTotal", static_cast<jlong>(stats.scansTotal));
+        setLongField(env, out, cls, "blobPutsTotal", static_cast<jlong>(stats.blobPutsTotal));
+        setObjectField(env, out, cls, "api", "Ldev/swiftstorm/akkaradb/engine/ApiStats;", api);
+        setObjectField(env, out, cls, "memtable", "Ldev/swiftstorm/akkaradb/engine/MemTableStats;", memtable);
+        setObjectField(env, out, cls, "wal", "Ldev/swiftstorm/akkaradb/engine/WalStats;", wal);
+        setObjectField(env, out, cls, "blob", "Ldev/swiftstorm/akkaradb/engine/BlobStats;", blob);
+        setObjectField(env, out, cls, "sst", "Ldev/swiftstorm/akkaradb/engine/SstStats;", sst);
+        setObjectField(env, out, cls, "vlog", "Ldev/swiftstorm/akkaradb/engine/VLogStats;", vlog);
+        return out;
+    }
+
+    [[nodiscard]] AkkaraDB::Options readOptions(JNIEnv* env, jobject optionsBuffer) {
+        BytesReader in(readDirectBuffer(env, optionsBuffer));
+        const auto version = in.u8();
+        if (version != 1 && version != 2 && version != 3 && version != 4) { throw std::runtime_error("Unsupported AkkaraDB options payload version"); }
+
+        AkkaraDB::Options options;
+        options.mode = startupModeFromOrdinal(static_cast<jint>(in.i32()));
+        options.dataDir = readUtf8String(in);
+
+        const auto memtableThresholdPerShard = static_cast<jlong>(in.i64());
+        if (memtableThresholdPerShard >= 0) {
+            options.overrides.memtableThresholdPerShard = checkedCast<size_t>(memtableThresholdPerShard, "memtableThresholdPerShard");
+        }
+
+        assignOptionalBool(options.overrides.versionLogEnabled, static_cast<jint>(in.i32()), "versionLogEnabled");
+
+        const auto sstCodec = static_cast<jint>(in.i32());
+        if (sstCodec >= 0) { options.overrides.sstCodec = codecFromOrdinal(sstCodec); }
+
+        const auto blobCodec = static_cast<jint>(in.i32());
+        if (blobCodec >= 0) { options.overrides.blobCodec = codecFromOrdinal(blobCodec); }
+
+        const auto blobThresholdBytes = static_cast<jlong>(in.i64());
+        if (blobThresholdBytes >= 0) {
+            options.overrides.blobThresholdBytes = checkedCast<uint64_t>(blobThresholdBytes, "blobThresholdBytes");
+        }
+
+        assignOptionalBool(options.overrides.sstPromoteReads, static_cast<jint>(in.i32()), "sstPromoteReads");
+
+        const auto sstBloomBitsPerKey = static_cast<jlong>(in.i64());
+        if (sstBloomBitsPerKey >= 0) {
+            options.overrides.sstBloomBitsPerKey = checkedCast<size_t>(sstBloomBitsPerKey, "sstBloomBitsPerKey");
+        }
+
+        const auto maxL0SstFiles = static_cast<jlong>(in.i64());
+        if (maxL0SstFiles >= 0) {
+            options.overrides.maxL0SstFiles = checkedCast<size_t>(maxL0SstFiles, "maxL0SstFiles");
+        }
+
+        if (version >= 2) {
+            const auto hasApi = static_cast<jint>(in.i32());
+            if (hasApi != 0) {
+                AkkaraDB::Options::ApiOptions api;
+                const auto backendCount = static_cast<jint>(in.i32());
+                if (backendCount < 0) { throw std::runtime_error("api.backends count must be >= 0"); }
+                api.backends.reserve(static_cast<size_t>(backendCount));
+                for (jint i = 0; i < backendCount; ++i) {
+                    api.backends.push_back(apiBackendFromOrdinal(static_cast<jint>(in.i32())));
+                }
+                api.bindHost = readUtf8String(in);
+                api.httpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.httpPort");
+                api.tcpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.tcpPort");
+                api.grpcPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.grpcPort");
+                api.transportMode = apiTransportModeFromOrdinal(static_cast<jint>(in.i32()));
+                if (const auto value = readOptionalUtf8String(in)) { api.serverBackendPath = *value; }
+                if (const auto value = readOptionalUtf8String(in)) { api.transportBackendPath = *value; }
+                if (const auto value = readOptionalUtf8String(in)) { api.httpBackendPath = *value; }
+                if (const auto value = readOptionalUtf8String(in)) { api.tcpBackendPath = *value; }
+                if (const auto value = readOptionalUtf8String(in)) { api.grpcBackendPath = *value; }
+                if (version >= 3) {
+                    api.httpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxBatchItems");
+                    api.httpMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxScanItems");
+                    api.httpMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxHistoryEntries");
+                    api.httpMaxContentLength = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.httpMaxContentLength");
+                    api.grpcWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcWorkerThreads");
+                    api.grpcCompletionQueues = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcCompletionQueues");
+                    api.grpcMinPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMinPollers");
+                    api.grpcMaxPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxPollers");
+                    api.grpcMaxConcurrentStreams = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxConcurrentStreams");
+                    api.grpcResourceQuotaBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.grpcResourceQuotaBytes");
+                    api.grpcMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxBatchItems");
+                    api.grpcMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxScanItems");
+                    api.grpcMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxHistoryEntries");
+                    api.tcpIoBackend = apiIoBackendFromOrdinal(static_cast<jint>(in.i32()));
+                    api.tcpWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWorkerThreads");
+                    api.tcpAcceptQueueLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueLimit");
+                    api.tcpAcceptQueueTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueTimeoutMs");
+                    api.tcpListenBacklog = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpListenBacklog");
+                    api.tcpRecvBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpRecvBufferBytes");
+                    api.tcpSendBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpSendBufferBytes");
+                    api.tcpPipelineBatchLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpPipelineBatchLimit");
+                    api.tcpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpMaxBatchItems");
+                    api.tcpMaxPendingResponseBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.tcpMaxPendingResponseBytes");
+                    api.tcpReadTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpReadTimeoutMs");
+                    api.tcpWriteTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWriteTimeoutMs");
+                    api.tcpNoDelay = boolFromInt(static_cast<jint>(in.i32()), "api.tcpNoDelay");
+                    api.tcpKeepAlive = boolFromInt(static_cast<jint>(in.i32()), "api.tcpKeepAlive");
+                    if (const auto value = readOptionalUtf8String(in)) { api.tls.certPath = *value; }
+                    if (const auto value = readOptionalUtf8String(in)) { api.tls.keyPath = *value; }
+                    if (const auto value = readOptionalUtf8String(in)) { api.tls.caPath = *value; }
+                    if (version >= 4) {
+                        if (const auto value = readOptionalBytes(in)) { api.tls.psk = std::move(*value); }
+                    }
+                    if (const auto value = readOptionalUtf8String(in)) { api.tls.pskIdentity = *value; }
+                    api.tls.verifyPeer = boolFromInt(static_cast<jint>(in.i32()), "api.tls.verifyPeer");
+                }
+                options.api = std::move(api);
+            }
+        }
+
+        if (!in.eof()) { throw std::runtime_error("Trailing bytes in AkkaraDB options payload"); }
+        if (options.dataDir.empty() && options.mode != StartupMode::ULTRA_FAST) {
+            throw std::runtime_error("dataDir must not be blank unless mode is ULTRA_FAST");
+        }
+        return options;
     }
 
     template <typename F>
@@ -754,35 +1576,189 @@ extern "C" {
     JNIEXPORT jlong JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeOpen(
         JNIEnv* env,
         jclass,
-        jstring path,
-        jint mode,
-        jlong memtableThresholdPerShard,
-        jint versionLogEnabled,
-        jint sstCodec,
-        jint blobCodec,
-        jlong blobThresholdBytes,
-        jint sstPromoteReads,
-        jlong sstBloomBitsPerKey,
-        jlong maxL0SstFiles
+        jobject optionsBuffer
     ) {
         return guard(
             env,
             [&]() -> jlong {
-                AkkaraDB::Options options;
-                options.dataDir = readString(env, path);
-                options.mode = startupModeFromOrdinal(mode);
-
-                assignOptionalNonNegative(options.overrides.memtableThresholdPerShard, memtableThresholdPerShard);
-                assignOptionalBool(options.overrides.versionLogEnabled, versionLogEnabled, "versionLogEnabled");
-                if (sstCodec >= 0) { options.overrides.sstCodec = codecFromOrdinal(sstCodec); }
-                if (blobCodec >= 0) { options.overrides.blobCodec = codecFromOrdinal(blobCodec); }
-                assignOptionalNonNegative(options.overrides.blobThresholdBytes, blobThresholdBytes);
-                assignOptionalBool(options.overrides.sstPromoteReads, sstPromoteReads, "sstPromoteReads");
-                assignOptionalNonNegative(options.overrides.sstBloomBitsPerKey, sstBloomBitsPerKey);
-                assignOptionalNonNegative(options.overrides.maxL0SstFiles, maxL0SstFiles);
-
+                auto options = readOptions(env, optionsBuffer);
                 auto db = AkkaraDB::open(std::move(options));
                 return toHandle(db.release());
+            }
+        );
+    }
+
+    JNIEXPORT jlong JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeOpenTable(
+        JNIEnv* env,
+        jobject,
+        jlong engineHandle,
+        jobject tablePrefix,
+        jobject schemaBytes
+    ) {
+        return guard(
+            env,
+            [&]() -> jlong {
+                auto* db = dbFrom(engineHandle);
+                if (db == nullptr) { throw std::runtime_error("JNIPackedTable engine handle is null"); }
+                auto table = std::make_unique<NativeTable>();
+                table->db = db;
+                const auto prefix = readDirectBuffer(env, tablePrefix);
+                table->tablePrefix.assign(prefix.begin(), prefix.end());
+                table->schema = parseRootSchema(readDirectBuffer(env, schemaBytes));
+                return toHandle(table.release());
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeRegisterIndex(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle,
+        jstring fieldName,
+        jobject indexPrefix
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* table = tableFrom(tableHandle);
+                if (table == nullptr) { throw std::runtime_error("JNIPackedTable handle is null"); }
+                const std::string name = readJavaString(env, fieldName);
+                for (auto& index : table->indexes) {
+                    if (index.fieldName == name) { return 0; }
+                }
+                NativeIndexDef index;
+                index.fieldName = name;
+                const auto prefix = readDirectBuffer(env, indexPrefix);
+                index.prefix.assign(prefix.begin(), prefix.end());
+                index.column = resolveColumn(table->schema, name);
+                table->indexes.push_back(std::move(index));
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativePutIndexed(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle,
+        jobject pkBytes,
+        jobject value
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* table = tableFrom(tableHandle);
+                if (table == nullptr) { throw std::runtime_error("JNIPackedTable handle is null"); }
+                const auto pk = readDirectBuffer(env, pkBytes);
+                const auto rowValue = readDirectBuffer(env, value);
+                const auto pkKey = concatBytes(table->tablePrefix, pk);
+                auto oldValue = table->db->engine().get(pkKey);
+                if (oldValue) { updateIndexEntries(*table, pk, *oldValue, true); }
+                table->db->engine().put(pkKey, rowValue);
+                updateIndexEntries(*table, pk, rowValue, false);
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeRemoveIndexed(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle,
+        jobject pkBytes
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* table = tableFrom(tableHandle);
+                if (table == nullptr) { throw std::runtime_error("JNIPackedTable handle is null"); }
+                const auto pk = readDirectBuffer(env, pkBytes);
+                const auto pkKey = concatBytes(table->tablePrefix, pk);
+                auto oldValue = table->db->engine().get(pkKey);
+                if (oldValue) { updateIndexEntries(*table, pk, *oldValue, true); }
+                table->db->engine().remove(pkKey);
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT jlong JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeOpenIndexScan(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle,
+        jstring fieldName,
+        jobject fieldBytes
+    ) {
+        return guard(
+            env,
+            [&]() -> jlong {
+                auto* table = tableFrom(tableHandle);
+                if (table == nullptr) { throw std::runtime_error("JNIPackedTable handle is null"); }
+                const auto& index = requireIndex(*table, readJavaString(env, fieldName));
+                const auto field = readDirectBuffer(env, fieldBytes);
+                std::vector<uint8_t> startKey;
+                buildIndexSearchPrefix(index.prefix, field, startKey);
+                std::vector<uint8_t> endKey = startKey;
+                if (!incrementLexicographic(endKey)) { endKey.clear(); }
+
+                auto cursor = std::make_unique<ScanCursor>();
+                cursor->indexLookup = std::make_unique<ScanCursor::IndexLookup>();
+                cursor->indexLookup->db = table->db;
+                cursor->indexLookup->tablePrefix = table->tablePrefix;
+                cursor->indexLookup->searchPrefixSize = startKey.size();
+                cursor->rows = table->db->engine().scan(cursor->arena, startKey, endKey);
+                cursor->it = cursor->rows.begin();
+                return toHandle(cursor.release());
+            }
+        );
+    }
+
+    JNIEXPORT jlong JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeOpenQueryIndexScan(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle,
+        jstring fieldName,
+        jobject fieldBytes,
+        jobject queryBytes,
+        jobject schemaBytes
+    ) {
+        return guard(
+            env,
+            [&]() -> jlong {
+                auto* table = tableFrom(tableHandle);
+                if (table == nullptr) { throw std::runtime_error("JNIPackedTable handle is null"); }
+                const auto& index = requireIndex(*table, readJavaString(env, fieldName));
+                const auto field = readDirectBuffer(env, fieldBytes);
+                std::vector<uint8_t> startKey;
+                buildIndexSearchPrefix(index.prefix, field, startKey);
+                std::vector<uint8_t> endKey = startKey;
+                if (!incrementLexicographic(endKey)) { endKey.clear(); }
+
+                auto cursor = std::make_unique<ScanCursor>();
+                cursor->indexLookup = std::make_unique<ScanCursor::IndexLookup>();
+                cursor->indexLookup->db = table->db;
+                cursor->indexLookup->tablePrefix = table->tablePrefix;
+                cursor->indexLookup->searchPrefixSize = startKey.size();
+                cursor->query = std::make_unique<QueryProgram>(
+                    parseQuery(readDirectBuffer(env, queryBytes), readDirectBuffer(env, schemaBytes))
+                );
+                cursor->rows = table->db->engine().scan(cursor->arena, startKey, endKey);
+                cursor->it = cursor->rows.begin();
+                return toHandle(cursor.release());
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_JNIPackedTable_nativeCloseTable(
+        JNIEnv* env,
+        jobject,
+        jlong tableHandle
+    ) {
+        guard(
+            env,
+            [&]() {
+                std::unique_ptr<NativeTable> table{tableFrom(tableHandle)};
+                return 0;
             }
         );
     }
@@ -807,6 +1783,31 @@ extern "C" {
         );
     }
 
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativePutHinted(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject key,
+        jobject value,
+        jlong fp64,
+        jlong miniKey
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().putHinted(
+                    readDirectBuffer(env, key),
+                    readDirectBuffer(env, value),
+                    static_cast<uint64_t>(fp64),
+                    static_cast<uint64_t>(miniKey)
+                );
+                return 0;
+            }
+        );
+    }
+
     JNIEXPORT jobject JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeGet(JNIEnv* env, jobject, jlong handle, jobject key) {
         return guard(
             env,
@@ -821,6 +1822,69 @@ extern "C" {
         );
     }
 
+    JNIEXPORT jobjectArray JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeGetBatch(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobjectArray keys
+    ) {
+        return guard(
+            env,
+            [&]() -> jobjectArray {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                std::vector<std::span<const uint8_t>> keySpans;
+                readDirectBufferArray(env, keys, keySpans);
+                const auto results = db->engine().getBatch(keySpans);
+                const auto& ids = bindings(env);
+                jobjectArray out = env->NewObjectArray(
+                    static_cast<jsize>(results.size()),
+                    ids.batchGetResultClass,
+                    nullptr
+                );
+                if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+                for (jsize i = 0; i < static_cast<jsize>(results.size()); ++i) {
+                    jobject result = makeBatchGetResult(env, results[static_cast<size_t>(i)]);
+                    if (result == nullptr || env->ExceptionCheck()) { return nullptr; }
+                    env->SetObjectArrayElement(out, i, result);
+                    if (env->ExceptionCheck()) { return nullptr; }
+                    env->DeleteLocalRef(result);
+                }
+                return out;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativePutBatch(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobjectArray keys,
+        jobjectArray values
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                const jsize keyCount = env->GetArrayLength(keys);
+                const jsize valueCount = env->GetArrayLength(values);
+                if (keyCount != valueCount) { throw std::runtime_error("putBatch keys and values length mismatch"); }
+                std::vector<std::span<const uint8_t>> keySpans;
+                std::vector<std::span<const uint8_t>> valueSpans;
+                readDirectBufferArray(env, keys, keySpans);
+                readDirectBufferArray(env, values, valueSpans);
+                std::vector<AkkEngine::BatchPutEntry> entries;
+                entries.reserve(static_cast<size_t>(keyCount));
+                for (jsize i = 0; i < keyCount; ++i) {
+                    entries.push_back({keySpans[static_cast<size_t>(i)], valueSpans[static_cast<size_t>(i)]});
+                }
+                db->engine().putBatch(entries);
+                return 0;
+            }
+        );
+    }
+
     JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRemove(JNIEnv* env, jobject, jlong handle, jobject key) {
         guard(
             env,
@@ -829,6 +1893,29 @@ extern "C" {
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
                 const auto k = readDirectBuffer(env, key);
                 db->engine().remove(k);
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRemoveHinted(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject key,
+        jlong fp64,
+        jlong miniKey
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().removeHinted(
+                    readDirectBuffer(env, key),
+                    static_cast<uint64_t>(fp64),
+                    static_cast<uint64_t>(miniKey)
+                );
                 return 0;
             }
         );
@@ -881,7 +1968,6 @@ extern "C" {
                 const auto end = readDirectBuffer(env, endKey);
 
                 auto cursor = std::make_unique<ScanCursor>();
-                cursor->db = db;
                 cursor->rows = db->engine().scan(cursor->arena, start, end);
                 cursor->it = cursor->rows.begin();
                 return toHandle(cursor.release());
@@ -909,11 +1995,65 @@ extern "C" {
                 const auto schema = readDirectBuffer(env, schemaBytes);
 
                 auto cursor = std::make_unique<ScanCursor>();
-                cursor->db = db;
                 cursor->query = std::make_unique<QueryProgram>(parseQuery(query, schema));
                 cursor->rows = db->engine().scan(cursor->arena, start, end);
                 cursor->it = cursor->rows.begin();
                 return toHandle(cursor.release());
+            }
+        );
+    }
+
+    JNIEXPORT jobject JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeGetAt(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject key,
+        jlong targetSeq
+    ) {
+        return guard(
+            env,
+            [&]() -> jobject {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                const auto k = readDirectBuffer(env, key);
+                auto value = db->engine().getAt(k, static_cast<uint64_t>(targetSeq));
+                if (!value) { return nullptr; }
+                return makeDirectBuffer(env, *value);
+            }
+        );
+    }
+
+    JNIEXPORT jobjectArray JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeHistory(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject key
+    ) {
+        return guard(
+            env,
+            [&]() -> jobjectArray {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                const auto k = readDirectBuffer(env, key);
+                const auto history = db->engine().history(k);
+                const auto& ids = bindings(env);
+                if (history.size() > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+                    throw std::runtime_error("AkkaraDB JNI history result is too large");
+                }
+                jobjectArray out = env->NewObjectArray(
+                    static_cast<jsize>(history.size()),
+                    ids.versionEntryClass,
+                    nullptr
+                );
+                if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
+                for (jsize i = 0; i < static_cast<jsize>(history.size()); ++i) {
+                    jobject entry = makeVersionEntry(env, history[static_cast<size_t>(i)]);
+                    if (entry == nullptr || env->ExceptionCheck()) { return nullptr; }
+                    env->SetObjectArrayElement(out, i, entry);
+                    if (env->ExceptionCheck()) { return nullptr; }
+                    env->DeleteLocalRef(entry);
+                }
+                return out;
             }
         );
     }
@@ -930,6 +2070,71 @@ extern "C" {
                 auto* db = dbFrom(handle);
                 if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
                 db->engine().rollbackTo(static_cast<uint64_t>(targetSeq));
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRollbackKey(
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject key,
+        jlong targetSeq
+    ) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().rollbackKey(readDirectBuffer(env, key), static_cast<uint64_t>(targetSeq));
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT jobject JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeStats(JNIEnv* env, jobject, jlong handle) {
+        return guard(
+            env,
+            [&]() -> jobject {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                return makeEngineStats(env, db->engine().stats());
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeForceSync(JNIEnv* env, jobject, jlong handle) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().forceSync();
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeForceFlush(JNIEnv* env, jobject, jlong handle) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().forceFlush();
+                return 0;
+            }
+        );
+    }
+
+    JNIEXPORT void JNICALL Java_dev_swiftstorm_akkaradb_engine_AkkEngine_nativeRunBlobGc(JNIEnv* env, jobject, jlong handle) {
+        guard(
+            env,
+            [&]() {
+                auto* db = dbFrom(handle);
+                if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
+                db->engine().runBlobGc();
                 return 0;
             }
         );
@@ -954,6 +2159,18 @@ extern "C" {
                 if (cursor == nullptr) { throw std::runtime_error("NativeScanCursor handle is null"); }
                 while (cursor->it != cursor->rows.end()) {
                     const auto& row = *cursor->it;
+                    if (cursor->indexLookup != nullptr) {
+                        const auto& state = *cursor->indexLookup;
+                        const auto key = row.key;
+                        ++cursor->it;
+                        if (key.size() <= state.searchPrefixSize) { continue; }
+                        const std::span<const uint8_t> pkBytes{key.data() + state.searchPrefixSize, key.size() - state.searchPrefixSize};
+                        const auto pkKey = concatBytes(state.tablePrefix, pkBytes);
+                        auto value = state.db->engine().get(pkKey);
+                        if (!value) { continue; }
+                        if (cursor->query != nullptr && !matchesQuery(*cursor->query, *value)) { continue; }
+                        return makeRow(env, pkKey, *value);
+                    }
                     const bool matched = cursor->query == nullptr || matchesQuery(*cursor->query, row.value);
                     if (matched) {
                         jobject out = makeRow(env, row.key, row.value);

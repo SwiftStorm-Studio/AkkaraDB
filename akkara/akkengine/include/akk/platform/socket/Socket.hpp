@@ -25,6 +25,8 @@ namespace akkaradb::platform {
      */
     class AKDB_API Socket {
         public:
+            using NativeHandle = std::uintptr_t;
+
             /**
              * @brief Construct an invalid socket.
              */
@@ -83,8 +85,6 @@ namespace akkaradb::platform {
             std::error_code recvSome(void* data, std::size_t size, std::size_t& outRecv) noexcept;
 
         private:
-            typedef std::uintptr_t NativeHandle;
-
             NativeHandle handle_;
     };
 } //akkaradb::socket

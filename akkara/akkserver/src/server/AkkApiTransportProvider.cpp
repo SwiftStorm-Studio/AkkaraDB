@@ -136,7 +136,8 @@ namespace akkaradb::engine::server {
         #endif
 
         if (registerPlugin == nullptr) { return false; }
-        return registerPlugin() && akkApiTransportFactoryAvailable(backend);
+        const bool ok = registerPlugin() && akkApiTransportFactoryAvailable(backend);
+        return ok;
     }
 
     std::unique_ptr<IAkkApiTransport> createAkkApiTransport(

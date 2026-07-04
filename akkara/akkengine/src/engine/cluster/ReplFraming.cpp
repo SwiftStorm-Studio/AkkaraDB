@@ -125,6 +125,8 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeAck(const ReplAck& ack) {
         std::vector<uint8_t> p;
         writeU64(p, ack.seq);
+        p.push_back(static_cast<uint8_t>(ack.stage));
+        p.push_back(0);
         return encodeFrame(ReplMsgType::ACK, p);
     }
 
@@ -187,9 +189,10 @@ namespace akkaradb::engine::cluster {
     }
 
     bool decodeAck(std::span<const uint8_t> payload, ReplAck& out) {
-        if (payload.size() != 8) { return false; }
+        if (payload.size() != 10) { return false; }
         out.seq = readU64(payload, 0);
-        return true;
+        out.stage = static_cast<AckStage>(payload[8]);
+        return out.stage == AckStage::RECEIVED || out.stage == AckStage::APPLIED || out.stage == AckStage::DURABLE;
     }
 
     bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out) {

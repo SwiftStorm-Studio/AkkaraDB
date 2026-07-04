@@ -242,7 +242,7 @@ namespace {
         constexpr uint16_t port = 19971;
         ClusterRuntimeOptions plain{};
         plain.transportMode = TransportMode::PLAIN;
-        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
+        const AckPolicy all{.mode = AckPolicyMode::ALL_TARGETS, .quorum = 0};
 
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, plain);
         std::atomic<int> applied{0};
@@ -295,7 +295,7 @@ namespace {
         AKK_TEST_CHECK(options.replBindHost == "0.0.0.0");
 
         constexpr uint16_t port = 19972;
-        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
+        const AckPolicy all{.mode = AckPolicyMode::ALL_TARGETS, .quorum = 0};
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, options);
         std::atomic<int> applied{0};
 
@@ -348,7 +348,7 @@ namespace {
         clientOptions.secure.expectedPrimaryNodeId = 1;
         clientOptions.secure.pinnedPeers.push_back(ClusterPeerPublicKeyPin{.nodeId = 1, .publicKey = serverIdentity.publicKey});
 
-        const AckPolicy all{.mode = AckPolicyMode::ALL, .quorum = 0};
+        const AckPolicy all{.mode = AckPolicyMode::ALL_TARGETS, .quorum = 0};
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, serverOptions);
         std::atomic<int> applied{0};
 

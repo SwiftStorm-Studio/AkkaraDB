@@ -81,6 +81,16 @@ if (TARGET akkaradb_api AND TARGET akkaradb_api_tcp)
     target_link_libraries(akkaradb_api_server_smoke_test PRIVATE akkaradb akkaradb_api akkaradb_api_tcp)
     target_link_libraries(akkaradb_api_server_test PRIVATE akkaradb akkaradb_api akkaradb_api_tcp)
     target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE akkaradb akkaradb_api akkaradb_api_tcp)
+    if (TARGET akkaradb_api_grpc AND DEFINED AKKARADB_GRPC_GENERATED_SOURCES AND DEFINED AKKARADB_GRPC_GENERATED_DIR)
+        target_sources(akkaradb_api_server_smoke_test PRIVATE ${AKKARADB_GRPC_GENERATED_SOURCES})
+        target_include_directories(akkaradb_api_server_smoke_test PRIVATE ${AKKARADB_GRPC_GENERATED_DIR})
+        target_link_libraries(akkaradb_api_server_smoke_test PRIVATE ${AKKARADB_GRPCPP_TARGET} ${AKKARADB_PROTOBUF_TARGET})
+        target_compile_definitions(akkaradb_api_server_smoke_test PRIVATE AKKARADB_TEST_HAS_GRPC)
+        add_dependencies(akkaradb_api_server_smoke_test akkaradb_grpc_codegen)
+        if (MSVC)
+            set_source_files_properties(${AKKARADB_GRPC_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS "/WX-")
+        endif()
+    endif ()
     if(WIN32)
         target_link_libraries(akkaradb_tcp_api_throughput_benchmark PRIVATE ws2_32)
     endif()
@@ -88,6 +98,7 @@ if (TARGET akkaradb_api AND TARGET akkaradb_api_tcp)
 endif ()
 
 set(AKKARADB_COMMON_TEST_TARGETS
+        akkaradb_akkaradb_open_smoke_test|benchmarks/smoke/akkaradb_open_smoke_test.cpp
         akkaradb_akkengine_smoke_test|benchmarks/smoke/akkengine_smoke_test.cpp
         akkaradb_crypto_identity_smoke_test|benchmarks/smoke/crypto_identity_smoke_test.cpp
         akkaradb_typed_api_smoke_test|benchmarks/smoke/typed_api_smoke_test.cpp
@@ -176,6 +187,7 @@ if (WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
+        akkaradb_akkaradb_open_smoke_test
         akkaradb_akkengine_smoke_test
         akkaradb_crypto_identity_smoke_test
         akkaradb_crc32c_smoke_test

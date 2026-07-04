@@ -41,6 +41,8 @@ namespace akkaradb::crypto {
         std::vector<std::uint8_t> ciphertext;
     };
 
+    struct ResponderHandshake;
+
     class AKDB_API SecureSession {
         public:
             SecureSession() = default;

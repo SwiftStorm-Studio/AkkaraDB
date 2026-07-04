@@ -33,15 +33,27 @@ namespace akkaradb::engine::cluster {
     };
 
     /**
-     * AckPolicyMode - Durability policy for primary-to-replica shipping.
+     * AckPolicyMode - Required acknowledgement count for primary-to-replica shipping.
      */
     enum class AckPolicyMode : uint8_t {
-        ASYNC = 0,
-        ///< Return without waiting for replica acknowledgements.
-        ALL = 1,
-        ///< Wait until all currently live replicas acknowledge.
+        NONE = 0,
+        ///< Require zero replica acknowledgements.
+        ALL_TARGETS = 1,
+        ///< Require acknowledgements from every current replication target.
         QUORUM = 2,
-        ///< Wait until at least AckPolicy::quorum replicas acknowledge.
+        ///< Require acknowledgements from at least AckPolicy::quorum targets.
+    };
+
+    /**
+     * AckStage - Replication lifecycle stage represented by an acknowledgement.
+     */
+    enum class AckStage : uint8_t {
+        RECEIVED = 0,
+        ///< Replica received the entry bytes.
+        APPLIED = 1,
+        ///< Replica applied the entry to the local engine.
+        DURABLE = 2,
+        ///< Replica forced the applied entry through local durability sync.
     };
 
     /**
@@ -79,7 +91,8 @@ namespace akkaradb::engine::cluster {
      * AckPolicy - Acknowledgement rule applied by ReplicationServer.
      */
     struct AKDB_API AckPolicy {
-        AckPolicyMode mode = AckPolicyMode::ASYNC;
+        AckPolicyMode mode = AckPolicyMode::NONE;
+        AckStage stage = AckStage::APPLIED;
         uint16_t quorum = 0; ///< Required replica count when mode == AckPolicyMode::QUORUM.
     };
 

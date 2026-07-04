@@ -41,20 +41,31 @@
 
 namespace akkaradb {
     #define AKKARADB_QUERYABLE_FIELD(Type, Field) ::akkaradb::query::Column<&Type::Field> Field{};
-    #define AKKARADB_QUERYABLE(Type, A, B, C, D) \
+    #define AKKARADB_DETAIL_EMPTY()
+    #define AKKARADB_DETAIL_DEFER(Id) Id AKKARADB_DETAIL_EMPTY()
+    #define AKKARADB_DETAIL_OBSTRUCT(...) __VA_ARGS__ AKKARADB_DETAIL_DEFER(AKKARADB_DETAIL_EMPTY)()
+    #define AKKARADB_DETAIL_EVAL(...) AKKARADB_DETAIL_EVAL1(AKKARADB_DETAIL_EVAL1(AKKARADB_DETAIL_EVAL1(__VA_ARGS__)))
+    #define AKKARADB_DETAIL_EVAL1(...) AKKARADB_DETAIL_EVAL2(AKKARADB_DETAIL_EVAL2(AKKARADB_DETAIL_EVAL2(__VA_ARGS__)))
+    #define AKKARADB_DETAIL_EVAL2(...) AKKARADB_DETAIL_EVAL3(AKKARADB_DETAIL_EVAL3(AKKARADB_DETAIL_EVAL3(__VA_ARGS__)))
+    #define AKKARADB_DETAIL_EVAL3(...) AKKARADB_DETAIL_EVAL4(AKKARADB_DETAIL_EVAL4(AKKARADB_DETAIL_EVAL4(__VA_ARGS__)))
+    #define AKKARADB_DETAIL_EVAL4(...) AKKARADB_DETAIL_EVAL5(AKKARADB_DETAIL_EVAL5(AKKARADB_DETAIL_EVAL5(__VA_ARGS__)))
+    #define AKKARADB_DETAIL_EVAL5(...) __VA_ARGS__
+    #define AKKARADB_DETAIL_FOR_EACH(Macro, Type, Field, ...) \
+        Macro(Type, Field) \
+        __VA_OPT__(AKKARADB_DETAIL_OBSTRUCT(AKKARADB_DETAIL_FOR_EACH_AGAIN)()(Macro, Type, __VA_ARGS__))
+    #define AKKARADB_DETAIL_FOR_EACH_AGAIN() AKKARADB_DETAIL_FOR_EACH
+
+    #define AKKARADB_QUERYABLE(Type, ...) \
         [[nodiscard]] inline auto akkaradbQueryProxy(::akkaradb::query::ProxyTag<Type>) { \
             struct Proxy { \
-                AKKARADB_QUERYABLE_FIELD(Type, A) \
-                AKKARADB_QUERYABLE_FIELD(Type, B) \
-                AKKARADB_QUERYABLE_FIELD(Type, C) \
-                AKKARADB_QUERYABLE_FIELD(Type, D) \
+                AKKARADB_DETAIL_EVAL(AKKARADB_DETAIL_FOR_EACH(AKKARADB_QUERYABLE_FIELD, Type, __VA_ARGS__)) \
             }; \
             return Proxy{}; \
         }
 
-    #define AKKARADB_ENTITY(Type, PrimaryKey, B, C, D) \
+    #define AKKARADB_ENTITY(Type, PrimaryKey, ...) \
         AKKARADB_REF_ENTITY(Type, PrimaryKey); \
-        AKKARADB_QUERYABLE(Type, PrimaryKey, B, C, D)
+        AKKARADB_QUERYABLE(Type, PrimaryKey __VA_OPT__(,) __VA_ARGS__)
 
     template <typename T>
     struct ForeignKeyValueTraits {

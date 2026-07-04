@@ -32,6 +32,11 @@ namespace akkaradb::engine::server {
     namespace {
         constexpr size_t kMaxHttpLineBytes = 8192;
         constexpr size_t kRecvBufferBytes = 4096;
+        constexpr uint8_t kHttpStreamFrameItem = 1;
+        constexpr uint8_t kHttpStreamFrameEnd = 2;
+        constexpr uint8_t kHttpStreamVersion = 1;
+        constexpr std::array<uint8_t, 5> kHttpScanStreamPrelude = {'A', 'K', 'K', 'S', kHttpStreamVersion};
+        constexpr std::array<uint8_t, 5> kHttpHistoryStreamPrelude = {'A', 'K', 'K', 'H', kHttpStreamVersion};
 
         [[nodiscard]] bool iequalPrefix(std::string_view line, std::string_view prefix) noexcept {
             if (line.size() < prefix.size()) { return false; }
@@ -114,6 +119,42 @@ namespace akkaradb::engine::server {
                 appendPlain(out, static_cast<uint32_t>(entry.value.size()));
                 appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
             }
+        }
+
+        void appendStreamFrameHeader(std::vector<uint8_t>& out, uint8_t type, uint32_t payloadBytes) {
+            out.clear();
+            out.reserve(1 + sizeof(payloadBytes) + payloadBytes);
+            appendPlain(out, type);
+            appendPlain(out, payloadBytes);
+        }
+
+        void encodeScanStreamFrame(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out) {
+            const uint32_t payloadBytes =
+                static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.size());
+            appendStreamFrameHeader(out, kHttpStreamFrameItem, payloadBytes);
+            appendPlain(out, static_cast<uint16_t>(record.key.size()));
+            appendPlain(out, static_cast<uint32_t>(record.value.size()));
+            appendBytes(out, record.key);
+            appendBytes(out, record.value);
+        }
+
+        void encodeHistoryStreamFrame(const VersionEntry& entry, std::vector<uint8_t>& out) {
+            const uint32_t payloadBytes =
+                static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) + sizeof(uint32_t) +
+                                      sizeof(uint32_t) + entry.value.size());
+            appendStreamFrameHeader(out, kHttpStreamFrameItem, payloadBytes);
+            appendPlain(out, entry.seq);
+            appendPlain(out, entry.sourceNodeId);
+            appendPlain(out, entry.timestampNs);
+            appendPlain(out, static_cast<uint32_t>(entry.flags));
+            appendPlain(out, static_cast<uint32_t>(entry.value.size()));
+            appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
+        }
+
+        void encodeStreamEndFrame(uint32_t emitted, bool truncated, std::vector<uint8_t>& out) {
+            appendStreamFrameHeader(out, kHttpStreamFrameEnd, static_cast<uint32_t>(sizeof(emitted) + sizeof(uint8_t)));
+            appendPlain(out, emitted);
+            appendPlain(out, static_cast<uint8_t>(truncated ? 1 : 0));
         }
 
         [[nodiscard]] bool readU64Text(std::string_view text, uint64_t& out) noexcept {
@@ -417,6 +458,16 @@ namespace akkaradb::engine::server {
         return out;
     }
 
+    bool HttpApiServer::wantsStreaming(std::string_view value) noexcept {
+        if (value.empty()) { return false; }
+
+        std::string lowered;
+        lowered.reserve(value.size());
+        for (const char c : value) { lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c)))); }
+
+        return lowered != "0" && lowered != "false" && lowered != "off" && lowered != "no";
+    }
+
     bool HttpApiServer::sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body) {
         const std::string header = "HTTP/1.1 " + std::to_string(statusCode) + " " + std::string{reasonPhrase(statusCode)} + "\r\n"
             "Content-Type: application/octet-stream\r\n" "Content-Length: " + std::to_string(body.size()) + "\r\n" "\r\n";
@@ -428,6 +479,49 @@ namespace akkaradb::engine::server {
             if (statusCode >= 400) { errorsTotal_.fetch_add(1, std::memory_order_relaxed); }
         }
         return sent;
+    }
+
+    bool HttpApiServer::sendChunkedResponseHeader(
+        detail::Connection& connection,
+        int statusCode,
+        std::string_view contentType,
+        uint64_t& bytesSent
+    ) {
+        const std::string header = "HTTP/1.1 " + std::to_string(statusCode) + " " + std::string{reasonPhrase(statusCode)} + "\r\n"
+            "Content-Type: " + std::string{contentType} + "\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "X-Akkara-Stream-Version: 1\r\n"
+            "\r\n";
+        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(header.data()), header.size())) { return false; }
+        bytesSent += header.size();
+        return true;
+    }
+
+    bool HttpApiServer::sendChunk(detail::Connection& connection, std::span<const uint8_t> body, uint64_t& bytesSent) {
+        std::array<char, 32> sizeBuffer{};
+        const auto result = std::to_chars(sizeBuffer.data(), sizeBuffer.data() + sizeBuffer.size(), body.size(), 16);
+        if (result.ec != std::errc{}) { return false; }
+
+        static constexpr std::string_view kCrLf = "\r\n";
+        const size_t sizeWidth = static_cast<size_t>(result.ptr - sizeBuffer.data());
+        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(sizeBuffer.data()), sizeWidth) ||
+            !connection.sendAll(reinterpret_cast<const uint8_t*>(kCrLf.data()), kCrLf.size()) ||
+            (!body.empty() && !connection.sendAll(body.data(), body.size())) ||
+            !connection.sendAll(reinterpret_cast<const uint8_t*>(kCrLf.data()), kCrLf.size())) {
+            return false;
+        }
+
+        bytesSent += sizeWidth + kCrLf.size() + body.size() + kCrLf.size();
+        return true;
+    }
+
+    bool HttpApiServer::finishChunkedResponse(detail::Connection& connection, int statusCode, uint64_t bytesSent) {
+        static constexpr std::string_view kChunkedEnd = "0\r\n\r\n";
+        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(kChunkedEnd.data()), kChunkedEnd.size())) { return false; }
+        responsesTotal_.fetch_add(1, std::memory_order_relaxed);
+        bytesSentTotal_.fetch_add(bytesSent + kChunkedEnd.size(), std::memory_order_relaxed);
+        if (statusCode >= 400) { errorsTotal_.fetch_add(1, std::memory_order_relaxed); }
+        return true;
     }
 
     bool HttpApiServer::sendText(detail::Connection& connection, int statusCode, std::string_view body) {
@@ -504,34 +598,104 @@ namespace akkaradb::engine::server {
                                            : static_cast<uint32_t>(std::min<uint64_t>(requestedLimit, maxScanItems()));
                 const auto start = urlDecode(queryParam(request.query, "start"));
                 const auto end = urlDecode(queryParam(request.query, "end"));
+                const bool stream = wantsStreaming(queryParam(request.query, "stream"));
                 core::BufferArena arena;
-                std::vector<AkkEngine::ScanRecordView> records;
-                records.reserve(limit);
-                bool truncated = false;
-                for (const auto& record : engine_.scan(
-                         arena,
-                         std::span<const uint8_t>{start.data(), start.size()},
-                         std::span<const uint8_t>{end.data(), end.size()}
-                     )) {
-                    if (records.size() >= limit) {
-                        truncated = true;
-                        break;
+                auto scanRange = engine_.scan(
+                    arena,
+                    std::span<const uint8_t>{start.data(), start.size()},
+                    std::span<const uint8_t>{end.data(), end.size()}
+                );
+                if (stream) {
+                    uint64_t sentBytes = 0;
+                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.scan-stream", sentBytes) ||
+                        !sendChunk(
+                            connection,
+                            std::span<const uint8_t>{kHttpScanStreamPrelude.data(), kHttpScanStreamPrelude.size()},
+                            sentBytes
+                        )) {
+                        return false;
                     }
-                    records.push_back(record);
+
+                    uint32_t emitted = 0;
+                    bool truncated = false;
+                    for (const auto& record : scanRange) {
+                        if (limit != 0 && emitted >= limit) {
+                            truncated = true;
+                            break;
+                        }
+                        encodeScanStreamFrame(record, valueBuffer);
+                        if (!sendChunk(connection, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()}, sentBytes)) {
+                            return false;
+                        }
+                        ++emitted;
+                    }
+
+                    encodeStreamEndFrame(emitted, truncated, valueBuffer);
+                    if (!sendChunk(connection, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()}, sentBytes)) {
+                        return false;
+                    }
+                    if (!finishChunkedResponse(connection, 200, sentBytes)) { return false; }
                 }
-                encodeScan(std::span<const AkkEngine::ScanRecordView>{records.data(), records.size()}, truncated, valueBuffer);
-                sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
+                else {
+                    std::vector<AkkEngine::ScanRecordView> records;
+                    records.reserve(limit);
+                    bool truncated = false;
+                    for (const auto& record : scanRange) {
+                        if (records.size() >= limit) {
+                            truncated = true;
+                            break;
+                        }
+                        records.push_back(record);
+                    }
+                    encodeScan(std::span<const AkkEngine::ScanRecordView>{records.data(), records.size()}, truncated, valueBuffer);
+                    sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
+                }
             }
             else if (request.path == "/v1/history" && request.method == "GET") {
+                const bool stream = wantsStreaming(queryParam(request.query, "stream"));
                 auto entries = engine_.history(keySpan);
-                bool truncated = false;
-                const uint32_t maxEntries = maxHistoryEntries();
-                if (maxEntries != 0 && entries.size() > maxEntries) {
-                    entries.resize(maxEntries);
-                    truncated = true;
+                if (stream) {
+                    uint64_t sentBytes = 0;
+                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.history-stream", sentBytes) ||
+                        !sendChunk(
+                            connection,
+                            std::span<const uint8_t>{kHttpHistoryStreamPrelude.data(), kHttpHistoryStreamPrelude.size()},
+                            sentBytes
+                        )) {
+                        return false;
+                    }
+
+                    const uint32_t maxEntries = maxHistoryEntries();
+                    uint32_t emitted = 0;
+                    bool truncated = false;
+                    for (const auto& entry : entries) {
+                        if (maxEntries != 0 && emitted >= maxEntries) {
+                            truncated = true;
+                            break;
+                        }
+                        encodeHistoryStreamFrame(entry, valueBuffer);
+                        if (!sendChunk(connection, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()}, sentBytes)) {
+                            return false;
+                        }
+                        ++emitted;
+                    }
+
+                    encodeStreamEndFrame(emitted, truncated, valueBuffer);
+                    if (!sendChunk(connection, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()}, sentBytes)) {
+                        return false;
+                    }
+                    if (!finishChunkedResponse(connection, 200, sentBytes)) { return false; }
                 }
-                encodeHistory(std::span<const VersionEntry>{entries.data(), entries.size()}, truncated, valueBuffer);
-                sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
+                else {
+                    bool truncated = false;
+                    const uint32_t maxEntries = maxHistoryEntries();
+                    if (maxEntries != 0 && entries.size() > maxEntries) {
+                        entries.resize(maxEntries);
+                        truncated = true;
+                    }
+                    encodeHistory(std::span<const VersionEntry>{entries.data(), entries.size()}, truncated, valueBuffer);
+                    sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
+                }
             }
             else if (request.path == "/v1/rollbackTo" && request.method == "POST") {
                 uint64_t targetSeq = 0;

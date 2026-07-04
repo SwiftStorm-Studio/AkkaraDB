@@ -253,12 +253,14 @@ namespace akkaradb::engine::cluster {
                 uint16_t primaryReplPort,
                 uint64_t selfNodeId,
                 std::function<uint64_t()> getLastSeq,
+                AckPolicy ackPolicy,
                 ClusterRuntimeOptions runtimeOptions
             )
                 : primaryHost_{std::move(primaryHost)},
                   primaryReplPort_{primaryReplPort},
                   selfNodeId_{selfNodeId},
                   getLastSeq_{std::move(getLastSeq)},
+                  ackPolicy_{ackPolicy},
                   runtimeOptions_{std::move(runtimeOptions)},
                   localIdentity_{
                       runtimeOptions_.transportMode == TransportMode::SECURE ? loadSecureIdentity(runtimeOptions_) : crypto::NodeIdentity{}
@@ -274,6 +276,11 @@ namespace akkaradb::engine::cluster {
             void setBlobCallback(BlobCallback callback) {
                 std::lock_guard lock{callbackMutex_};
                 blobCallback_ = std::move(callback);
+            }
+
+            void setForceDurableCallback(std::function<void()> callback) {
+                std::lock_guard lock{callbackMutex_};
+                forceDurableCallback_ = std::move(callback);
             }
 
             void start() {
@@ -396,6 +403,12 @@ namespace akkaradb::engine::cluster {
                 return recvFrame(socket, frame);
             }
 
+            bool sendAck(SocketHandle socket, crypto::SecureSession* secure, uint64_t seq, AckStage stage) {
+                if (ackPolicy_.mode == AckPolicyMode::NONE || ackPolicy_.stage != stage) { return true; }
+                const auto ack = encodeAck(ReplAck{.seq = seq, .stage = stage});
+                return sendTo(socket, secure, ack.data(), ack.size());
+            }
+
             void receiveLoop(SocketHandle socket, crypto::SecureSession* secure) {
                 while (running_) {
                     DecodedFrame frame;
@@ -404,14 +417,20 @@ namespace akkaradb::engine::cluster {
                     if (frame.type == ReplMsgType::ENTRY) {
                         ReplEntry entry;
                         if (!decodeEntry(frame.payload, entry)) { return; }
-                        ApplyCallback callback;
+                        ApplyCallback applyCallback;
+                        std::function<void()> forceDurableCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
-                            callback = applyCallback_;
+                            applyCallback = applyCallback_;
+                            forceDurableCallback = forceDurableCallback_;
                         }
-                        if (callback) { callback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId); }
-                        const auto ack = encodeAck(ReplAck{.seq = entry.seq});
-                        if (!sendTo(socket, secure, ack.data(), ack.size())) { return; }
+                        if (!sendAck(socket, secure, entry.seq, AckStage::RECEIVED)) { return; }
+                        if (applyCallback) { applyCallback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId); }
+                        if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
+                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
+                            if (forceDurableCallback) { forceDurableCallback(); }
+                            if (!sendAck(socket, secure, entry.seq, AckStage::DURABLE)) { return; }
+                        }
                     }
                     else if (frame.type == ReplMsgType::BLOB_PUT) {
                         ReplBlob blob;
@@ -431,6 +450,7 @@ namespace akkaradb::engine::cluster {
             uint16_t primaryReplPort_;
             uint64_t selfNodeId_;
             std::function<uint64_t()> getLastSeq_;
+            AckPolicy ackPolicy_;
             ClusterRuntimeOptions runtimeOptions_;
             crypto::NodeIdentity localIdentity_;
 
@@ -444,6 +464,7 @@ namespace akkaradb::engine::cluster {
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;
             BlobCallback blobCallback_;
+            std::function<void()> forceDurableCallback_;
     };
 
     std::unique_ptr<ReplicationClient> ReplicationClient::create(
@@ -451,6 +472,7 @@ namespace akkaradb::engine::cluster {
         uint16_t primaryReplPort,
         uint64_t selfNodeId,
         std::function<uint64_t()> getLastSeq,
+        AckPolicy ackPolicy,
         ClusterRuntimeOptions runtimeOptions
     ) {
         return std::unique_ptr<ReplicationClient>(
@@ -460,6 +482,7 @@ namespace akkaradb::engine::cluster {
                     primaryReplPort,
                     selfNodeId,
                     std::move(getLastSeq),
+                    ackPolicy,
                     std::move(runtimeOptions)
                 )
             )
@@ -473,6 +496,8 @@ namespace akkaradb::engine::cluster {
     void ReplicationClient::setApplyCallback(ApplyCallback callback) { impl_->setApplyCallback(std::move(callback)); }
 
     void ReplicationClient::setBlobCallback(BlobCallback callback) { impl_->setBlobCallback(std::move(callback)); }
+
+    void ReplicationClient::setForceDurableCallback(std::function<void()> callback) { impl_->setForceDurableCallback(std::move(callback)); }
 
     void ReplicationClient::start() { impl_->start(); }
 

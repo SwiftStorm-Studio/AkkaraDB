@@ -95,7 +95,8 @@ namespace akkaradb::engine::server {
         #endif
 
         if (registerPlugin == nullptr) { return false; }
-        return registerPlugin() && akkApiServerFactoryAvailable();
+        const bool ok = registerPlugin() && akkApiServerFactoryAvailable();
+        return ok;
     }
 
     std::unique_ptr<IAkkApiServer> createAkkApiServer(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options) {

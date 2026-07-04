@@ -114,6 +114,7 @@ namespace akkaradb::engine::cluster {
     /** Replica acknowledgement payload. */
     struct AKKARADB_CLUSTER_RUNTIME_API ReplAck {
         uint64_t seq = 0; ///< Highest entry sequence acknowledged by the replica.
+        AckStage stage = AckStage::APPLIED; ///< Replication lifecycle stage reached for seq.
     };
 
     /** Reserved point-in-time read request payload. */

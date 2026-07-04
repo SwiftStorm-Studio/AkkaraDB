@@ -272,6 +272,7 @@ namespace akkaradb::engine::cluster {
             std::unique_ptr<crypto::SecureSession> secure;
             uint64_t nodeId = 0;
             std::atomic<uint64_t> lastAckedSeq{0};
+            std::atomic<uint8_t> lastAckStage{static_cast<uint8_t>(AckStage::DURABLE)};
             std::atomic<bool> dead{false};
             std::mutex queueMutex;
             std::condition_variable queueCv;
@@ -391,6 +392,7 @@ namespace akkaradb::engine::cluster {
                     replica->secure = std::move(secure);
                     replica->nodeId = hello.nodeId;
                     replica->lastAckedSeq.store(hello.lastSeq);
+                    replica->lastAckStage.store(static_cast<uint8_t>(AckStage::DURABLE));
 
                     {
                         std::lock_guard lock{replicasMutex};
@@ -450,6 +452,7 @@ namespace akkaradb::engine::cluster {
                     ReplAck ack;
                     if (!decodeAck(frame.payload, ack)) { break; }
                     replica->lastAckedSeq.store(ack.seq);
+                    replica->lastAckStage.store(static_cast<uint8_t>(ack.stage));
                     ackCv.notify_all();
                 }
                 replica->dead.store(true);
@@ -474,7 +477,7 @@ namespace akkaradb::engine::cluster {
             }
 
             void waitForAcks(uint64_t seq) {
-                if (ackPolicy.mode == AckPolicyMode::ASYNC || seq == 0) { return; }
+                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return; }
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                 while (std::chrono::steady_clock::now() < deadline) {
                     size_t live = 0;
@@ -484,12 +487,14 @@ namespace akkaradb::engine::cluster {
                         for (const auto& replica : replicas) {
                             if (!replica->dead.load()) {
                                 ++live;
-                                if (replica->lastAckedSeq.load() >= seq) { ++acked; }
+                                const uint64_t ackSeq = replica->lastAckedSeq.load();
+                                const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
+                                if (ackSeq > seq || (ackSeq == seq && ackStage >= ackPolicy.stage)) { ++acked; }
                             }
                         }
                     }
 
-                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL ? acked >= live : acked >= ackPolicy.quorum;
+                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS ? acked >= live : acked >= ackPolicy.quorum;
                     if (ok) { return; }
 
                     std::unique_lock lock{ackMutex};

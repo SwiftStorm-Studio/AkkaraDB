@@ -23,6 +23,7 @@ uint64_t seq,
  uint8_t recordFlags,
  uint64_t sourceNodeId
         )> apply;
+        std::function<void()> forceDurable;
         std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)> applyBlob;
         std::function<void(NodeRole role)> roleChange;
     };

@@ -77,6 +77,28 @@ install(FILES
 )
 
 if (BUILD_SHARED_LIBS)
+    add_custom_target(akkaradb_package_cxx_sdk
+            COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR="${CMAKE_BINARY_DIR}"
+            -DINSTALL_CONFIG=$<CONFIG>
+            -DRELEASE_DIST_DIR="${AKKARADB_RELEASE_DIST_DIR}"
+            -DDIST_DIR="${AKKARADB_NATIVE_DIST_DIR}"
+            -DEXTRACT_DIR="${AKKARADB_SDK_EXTRACT_DIR}"
+            -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
+            -DZIP_PATH="${AKKARADB_SDK_ZIP}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
+            DEPENDS ${AKKARADB_SDK_PACKAGE_TARGET}
+            COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
+    )
+    if (WIN32)
+        add_custom_target(akkaradb_package_release_artifacts
+                COMMAND powershell.exe -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/package_release_artifacts.ps1"
+                -SkipWindows
+                DEPENDS akkaradb_package_cxx_sdk
+                COMMENT "Packaging AkkaraDB Windows and Linux release artifacts"
+        )
+    endif ()
     add_custom_command(TARGET akkaradb POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -93,24 +115,39 @@ if (BUILD_SHARED_LIBS)
                 COMMENT "Copying akkaradb API backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
         )
     endif ()
-    foreach (AKKARADB_OPTIONAL_BACKEND_TARGET IN LISTS AKKARADB_SHARED_PLUGIN_TARGETS)
-        add_custom_command(TARGET ${AKKARADB_OPTIONAL_BACKEND_TARGET} POST_BUILD
+    add_custom_command(TARGET akkaradb_cluster POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb_cluster>
+            "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_CLUSTER_DIST_LIBRARY_NAME}"
+            COMMENT "Copying AkkaraDB cluster backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+    )
+    if (TARGET akkaradb_api_http)
+        add_custom_command(TARGET akkaradb_api_http POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:${AKKARADB_OPTIONAL_BACKEND_TARGET}>
-                "${AKKARADB_NATIVE_DIST_DIR}/$<TARGET_FILE_NAME:${AKKARADB_OPTIONAL_BACKEND_TARGET}>"
-                COMMENT "Copying optional AkkaraDB backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+                $<TARGET_FILE:akkaradb_api_http>
+                "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_API_HTTP_DIST_LIBRARY_NAME}"
+                COMMENT "Copying AkkaraDB HTTP API backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
         )
-    endforeach ()
-    add_custom_command(TARGET ${AKKARADB_SDK_PACKAGE_TARGET} POST_BUILD
-            COMMAND ${CMAKE_COMMAND}
-            -DBUILD_DIR="${CMAKE_BINARY_DIR}"
-            -DINSTALL_CONFIG=$<CONFIG>
-            -DRELEASE_DIST_DIR="${AKKARADB_RELEASE_DIST_DIR}"
-            -DEXTRACT_DIR="${AKKARADB_SDK_EXTRACT_DIR}"
-            -DPACKAGE_NAME="${AKKARADB_SDK_PACKAGE_NAME}"
-            -DZIP_PATH="${AKKARADB_SDK_ZIP}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageSdkDist.cmake"
-            COMMENT "Packaging AkkaraDB SDK: dist/${AKKARADB_RELEASE_VERSION}/${AKKARADB_SDK_PACKAGE_NAME}"
-    )
+    endif ()
+    if (TARGET akkaradb_api_tcp)
+        add_custom_command(TARGET akkaradb_api_tcp POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:akkaradb_api_tcp>
+                "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_API_TCP_DIST_LIBRARY_NAME}"
+                COMMENT "Copying AkkaraDB TCP API backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+        )
+    endif ()
+    if (TARGET akkaradb_api_grpc)
+        add_custom_command(TARGET akkaradb_api_grpc POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_NATIVE_DIST_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:akkaradb_api_grpc>
+                "${AKKARADB_NATIVE_DIST_DIR}/${AKKARADB_API_GRPC_DIST_LIBRARY_NAME}"
+                COMMENT "Copying AkkaraDB gRPC API backend library to dist/native/${AKKARADB_RELEASE_VERSION}"
+        )
+    endif ()
+
 endif ()

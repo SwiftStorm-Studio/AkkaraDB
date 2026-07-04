@@ -341,7 +341,7 @@ Supported backends:
 
 The binary protocol uses `AK5Q` request frames and `AK5S` response frames. Current opcodes include `Get`, `Put`, `Remove`, `GetAt`, `BatchPut`, `BatchGet`, `Ping`, `Exists`, `Count`, `Scan`, `History`, `RollbackTo`, `RollbackKey`, `ForceSync`, `ForceFlush`, and `Stats`.
 
-The HTTP API exposes `/v1/ping`, `/v1/put`, `/v1/get`, `/v1/remove`, `/v1/exists`, `/v1/count`, `/v1/scan`, `/v1/getAt`, `/v1/history`, `/v1/rollbackTo`, `/v1/rollbackKey`, `/v1/batchPut`, `/v1/batchGet`, `/v1/forceSync`, `/v1/forceFlush`, and `/v1/stats`.
+The HTTP API exposes `/v1/ping`, `/v1/put`, `/v1/get`, `/v1/remove`, `/v1/exists`, `/v1/count`, `/v1/scan`, `/v1/getAt`, `/v1/history`, `/v1/rollbackTo`, `/v1/rollbackKey`, `/v1/batchPut`, `/v1/batchGet`, `/v1/forceSync`, `/v1/forceFlush`, and `/v1/stats`. `/v1/scan` and `/v1/history` also accept truthy `stream` query values to switch into chunked binary streaming so items can be consumed incrementally. The TCP transport now exposes `ScanStream` / `HistoryStream` opcodes, and gRPC exposes `ScanStream` / `HistoryStream` server-streaming RPCs for the same incremental access pattern over native transports.
 
 ### Cluster Runtime and TLS
 
@@ -361,7 +361,7 @@ Node roles are `Standalone`, `Primary`, and `Replica`. The primary accepts write
 inside non-standalone topologies. `Standalone` mode does not require an explicit startup role. `Mirror` and `Stripe` require
 `ClusterRuntimeOptions::startupRole` to be set to `PRIMARY` or `REPLICA`; `AUTO` is rejected at runtime.
 
-Acknowledgement policies are `Async`, `All`, and `Quorum`.
+Acknowledgement policies are `None`, `AllTargets`, and `Quorum`.
 
 `NodeInfo.host` in the cluster config is the advertise address that peers dial. The primary replication listener binds to the runtime-only `repl_bind_host`, which
 defaults to `0.0.0.0`. Replication links use TCP. `TransportMode::SECURE` wraps the TCP stream with the native secure channel, and `TransportMode::PLAIN` is

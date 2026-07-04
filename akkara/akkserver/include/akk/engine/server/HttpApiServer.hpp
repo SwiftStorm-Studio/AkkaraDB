@@ -64,11 +64,15 @@ namespace akkaradb::engine::server {
             bool readRequest(detail::Connection& connection, ParsedRequest& request, bool& protocolError);
             bool route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer);
             bool sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body);
+            bool sendChunkedResponseHeader(detail::Connection& connection, int statusCode, std::string_view contentType, uint64_t& bytesSent);
+            bool sendChunk(detail::Connection& connection, std::span<const uint8_t> body, uint64_t& bytesSent);
+            bool finishChunkedResponse(detail::Connection& connection, int statusCode, uint64_t bytesSent);
             bool sendText(detail::Connection& connection, int statusCode, std::string_view body);
             bool sendEmpty(detail::Connection& connection, int statusCode);
 
             [[nodiscard]] static std::string queryParam(std::string_view query, std::string_view name);
             [[nodiscard]] static std::vector<uint8_t> urlDecode(std::string_view encoded);
+            [[nodiscard]] static bool wantsStreaming(std::string_view value) noexcept;
             [[nodiscard]] uint32_t maxBatchItems() const noexcept;
             [[nodiscard]] uint32_t maxScanItems() const noexcept;
             [[nodiscard]] uint32_t maxHistoryEntries() const noexcept;

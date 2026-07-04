@@ -37,6 +37,27 @@ namespace akkaradb::engine::manifest {
     // ============================================================================
 
     namespace {
+        [[nodiscard]] bool pathExists(const std::filesystem::path& path) {
+            #ifdef _WIN32
+            const DWORD attrs = ::GetFileAttributesW(path.c_str());
+            return attrs != INVALID_FILE_ATTRIBUTES;
+            #else
+            return std::filesystem::exists(path);
+            #endif
+        }
+
+        [[nodiscard]] uint64_t pathFileSize(const std::filesystem::path& path) {
+            #ifdef _WIN32
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+                throw std::runtime_error("Failed to stat manifest: " + path.string());
+            }
+            return (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | static_cast<uint64_t>(data.nFileSizeLow);
+            #else
+            return std::filesystem::file_size(path);
+            #endif
+        }
+
         class FileHandle {
             public:
                 #ifdef _WIN32
@@ -154,14 +175,17 @@ namespace akkaradb::engine::manifest {
                   rotationCounter_{0} {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
-                replayInternal();
+                const bool manifestExistsNow = pathExists(path_);
+                if (manifestExistsNow) {
+                    replayInternal();
+                }
 
                 rotationCounter_ = findLastRotationNumber();
 
                 currentPath_ = makeManifestPath(rotationCounter_);
                 fileHandle_ = FileHandle::open(currentPath_);
 
-                currentFileSize_ = std::filesystem::file_size(currentPath_);
+                currentFileSize_ = pathFileSize(currentPath_);
                 const bool isNewFile = (currentFileSize_ == 0);
 
                 if (isNewFile) { writeFileHeader(rotationCounter_); }
@@ -381,16 +405,34 @@ namespace akkaradb::engine::manifest {
 
             [[nodiscard]] std::filesystem::path existingManifestPath(size_t rotationNumber) const {
                 const auto path = makeManifestPath(rotationNumber);
-                if (std::filesystem::exists(path)) { return path; }
+                if (pathExists(path)) { return path; }
 
                 const auto legacyPath = makeLegacyManifestPath(rotationNumber);
-                if (legacyPath != path && std::filesystem::exists(legacyPath)) { return legacyPath; }
+                if (legacyPath != path && pathExists(legacyPath)) { return legacyPath; }
                 return {};
             }
 
+            [[nodiscard]] bool mayHaveManifestHistory() const {
+                const auto parent = path_.parent_path();
+                if (parent.empty() || !std::filesystem::exists(parent)) { return false; }
+
+                const std::string baseName = path_.filename().string();
+                const std::string stem = path_.stem().string();
+
+                for (const auto& entry : std::filesystem::directory_iterator(parent)) {
+                    const std::string name = entry.path().filename().string();
+                    if (name == baseName) { return true; }
+                    if (name.rfind(stem + "-", 0) == 0) { return true; }
+                    if (name.rfind(baseName + ".", 0) == 0) { return true; }
+                }
+                return false;
+            }
+
             [[nodiscard]] size_t findLastRotationNumber() const {
+                const bool baseExists = pathExists(path_);
+                if (!baseExists) { return 0; }
                 size_t maxRotation = 0;
-                if (std::filesystem::exists(path_)) { maxRotation = 0; }
+                if (baseExists) { maxRotation = 0; }
                 for (size_t i = 1; i < 10000; ++i) {
                     if (!existingManifestPath(i).empty()) { maxRotation = i; }
                     else { break; }
@@ -516,9 +558,12 @@ namespace akkaradb::engine::manifest {
                 }
                 stripesWritten_.store(0, std::memory_order_relaxed);
 
+                const bool baseExists = pathExists(path_);
+                if (!baseExists) { return; }
+
                 std::vector<std::filesystem::path> files;
 
-                if (std::filesystem::exists(path_)) { files.push_back(path_); }
+                if (baseExists) { files.push_back(path_); }
                 for (size_t i = 1; i < 10000; ++i) {
                     auto p = existingManifestPath(i);
                     if (!p.empty()) { files.push_back(std::move(p)); }
@@ -529,8 +574,8 @@ namespace akkaradb::engine::manifest {
             }
 
             void replaySingleFile(const std::filesystem::path& filePath) {
-                if (!std::filesystem::exists(filePath)) { return; }
-                const auto file_size = std::filesystem::file_size(filePath);
+                if (!pathExists(filePath)) { return; }
+                const auto file_size = pathFileSize(filePath);
                 if (file_size == 0) { return; }
 
                 std::ifstream file(filePath, std::ios::binary);

@@ -18,7 +18,7 @@ namespace akkaradb::engine::cluster {
      *
      * The server listens on the primary replication port, accepts replica
      * handshakes, sends buffered entries newer than each replica's lastSeq,
-     * streams new entries/blobs to all live replicas, and waits for entry
+     * streams new entries/blobs to current replication targets, and waits for entry
      * acknowledgements according to AckPolicy.
      *
      * Thread-safety: start(), close(), shipEntry(), shipBlob(), and
@@ -67,7 +67,7 @@ namespace akkaradb::engine::cluster {
             void close();
 
             /**
-             * Ships a replicated key/value entry to all live replicas.
+             * Ships a replicated key/value entry to all current replication targets.
              *
              * Depending on AckPolicy, this call may wait for replica acknowledgements
              * before returning.
@@ -82,7 +82,7 @@ namespace akkaradb::engine::cluster {
             );
 
             /**
-             * Ships a blob payload to all live replicas.
+             * Ships a blob payload to all current replication targets.
              *
              * Blob frames are sent with an internal buffer seq of zero and are not
              * waited on by the acknowledgement policy.

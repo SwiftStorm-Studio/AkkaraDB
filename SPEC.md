@@ -720,6 +720,8 @@ Opcodes:
 | `0x0E` | `ForceSync` |
 | `0x0F` | `ForceFlush` |
 | `0x10` | `Stats` |
+| `0x11` | `ScanStream` |
+| `0x12` | `HistoryStream` |
 
 Statuses:
 
@@ -735,16 +737,24 @@ Binary TCP operation payload conventions in the current implementation:
 - `GET_AT`, `ROLLBACK_TO`, `ROLLBACK_KEY`: `value` payload is exactly one `u64le` sequence number.
 - `COUNT`: request `key` is `startKey`, request `value` is `endKey`.
 - `SCAN`: request `key` is `startKey`, request `value` is `[limit:u32le][endKey bytes...]`; `limit = 0` means unbounded.
+- `SCAN_STREAM`: request payload matches `SCAN`, but the server sends multiple `AK5S` responses for the same `requestId` until it emits a terminal stream frame.
 - `BATCH_PUT`: request `key_len` must be `0`; `value` carries the batch payload.
 - `BATCH_GET`: request `key_len` must be `0`; `value` carries the batch payload.
 - `HISTORY` response is `[count:u32le]{entry...}*` without the extra `truncated:u8` flag used by HTTP history.
+- `HISTORY_STREAM`: request `value` is empty or `[limit:u32le]`; `limit = 0` means unbounded. The server sends multiple `AK5S` responses for the same `requestId`
+  until it emits a terminal stream frame.
 - `STATS` response carries the full `EngineStats` snapshot, including API, MemTable, WAL, Blob, SST, and VersionLog counters. This is much richer than the
   compact HTTP `/v1/stats` payload.
+
+The streaming TCP opcodes encode each response payload as `[frame_type:u8][payload_len:u32le][payload bytes]`. Frame type `1` is an item frame. For
+`SCAN_STREAM`, the item payload is `[key_len:u16le][value_len:u32le][key bytes][value bytes]`. For `HISTORY_STREAM`, the item payload is
+`[seq:u64le][source_node_id:u64le][timestamp_ns:u64le][flags:u32le][value_len:u32le][value bytes]`. Frame type `2` is the terminal frame:
+`[emitted_count:u32le][truncated:u8]`.
 
 ### 11.3 HTTP API
 
 The HTTP server is a small custom HTTP/1.1 parser with binary request and response bodies. It is not a JSON/REST API in the conventional sense.
-Keys are passed as percent-decoded query parameters, responses use `application/octet-stream`, and most successful mutation endpoints return `204 No Content`.
+Keys are passed as percent-decoded query parameters, responses use `application/octet-stream` by default, and most successful mutation endpoints return `204 No Content`.
 
 | Method   | Path           | Query              | Description                                                 |
 |----------|----------------|--------------------|-------------------------------------------------------------|
@@ -754,9 +764,9 @@ Keys are passed as percent-decoded query parameters, responses use `application/
 | `DELETE` | `/v1/remove`   | `key`              | Writes tombstone, returns `204`                             |
 | `GET`    | `/v1/exists`   | `key`              | Returns one byte: `0` or `1`                                |
 | `GET`    | `/v1/count`    | `start`, `end`     | Returns `u64le` count for the half-open range               |
-| `GET`    | `/v1/scan`     | `start`, `end`, `limit` | Returns a binary scan payload, bounded by server limit |
+| `GET`    | `/v1/scan`     | `start`, `end`, `limit`, `stream` | Returns a binary scan payload, or a chunked stream when `stream` is truthy |
 | `GET`    | `/v1/getAt`    | `key`, `seq`       | Returns raw historical value bytes or `404`                 |
-| `GET`    | `/v1/history`  | `key`              | Returns a binary history payload                            |
+| `GET`    | `/v1/history`  | `key`, `stream`    | Returns a binary history payload, or a chunked stream when `stream` is truthy |
 | `POST`   | `/v1/rollbackTo` | `seq`            | Rolls the engine back, returns `204`                        |
 | `POST`   | `/v1/rollbackKey` | `key`, `seq`    | Rolls one key back, returns `204`                           |
 | `POST`   | `/v1/batchPut` | body               | Stores multiple key/value pairs, returns `204`              |
@@ -780,11 +790,18 @@ Other HTTP binary payloads are:
 
 The HTTP `/v1/history` response does not repeat the key bytes because the key is already carried in the query string.
 
+When `stream` is truthy (`1`, `true`, `on`, and similar), `/v1/scan` and `/v1/history` switch to `Transfer-Encoding: chunked` and use stream-specific content
+types: `application/vnd.akkaradb.scan-stream` and `application/vnd.akkaradb.history-stream`. The de-chunked body begins with a 5-byte prelude (`AKKS\x01` for
+scan, `AKKH\x01` for history), followed by frames encoded as `[frame_type:u8][payload_len:u32le][payload bytes]`. Frame type `1` is an item frame, using the same
+per-item layout as the non-streaming payload without the outer `count/truncated` wrapper. Frame type `2` is the terminal frame:
+`[emitted_count:u32le][truncated:u8]`.
+
 ### 11.4 gRPC API
 
 The gRPC module defines `akkaradb.grpcapi.v1.AkkaraDB` with unary RPCs for `Ping`, `Put`, `Get`, `Remove`, `Exists`, `Count`, `Scan`, `GetAt`, `History`,
-`RollbackTo`, `RollbackKey`, `BatchPut`, `BatchGet`, `ForceSync`, `ForceFlush`, and `Stats`. It can run with insecure credentials or TLS credentials depending
-on the configured certificate/key/CA paths.
+`RollbackTo`, `RollbackKey`, `BatchPut`, `BatchGet`, `ForceSync`, `ForceFlush`, and `Stats`, plus server-streaming RPCs `ScanStream` and `HistoryStream`. The
+streaming RPCs emit item frames followed by an explicit terminal frame that carries `emitted_count` and `truncated`. The service can run with insecure
+credentials or TLS credentials depending on the configured certificate/key/CA paths.
 
 Availability is build-dependent. When Protobuf/gRPC packages are unavailable and `AKKARADB_FETCH_GRPC=OFF`, the build emits a stub backend instead: registration
 returns `false`, and attempting to start the gRPC server throws `std::runtime_error`.
@@ -821,9 +838,9 @@ runtime responsibility inside non-standalone topologies. `Standalone` mode does 
 
 | Mode     | Description                      |
 |----------|----------------------------------|
-| `Async`  | Do not wait for acknowledgements |
-| `All`    | Wait for all live replicas       |
-| `Quorum` | Wait for configured quorum       |
+| `None`        | Require zero replica acknowledgements             |
+| `AllTargets`  | Require acknowledgements from all current targets |
+| `Quorum`      | Require acknowledgements from the configured quorum |
 
 ### 12.4 Cluster Config
 

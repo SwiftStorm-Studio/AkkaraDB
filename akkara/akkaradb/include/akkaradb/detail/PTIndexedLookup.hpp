@@ -15,7 +15,6 @@ static void encodeIndexedSearchFieldValue(const Value& value, Out& out) {
     using Indexed = std::remove_cvref_t<IndexedField>;
     using ValueField = std::remove_cvref_t<Value>;
     if constexpr (query::isOptional<Indexed>) {
-        using Inner = typename ForeignKeyValueTraits<Indexed>::Type;
         if constexpr (query::isOptional<ValueField>) { encodeIndexFieldValue(value, out); }
         else if constexpr (isRef<typename std::remove_cvref_t<decltype(*std::declval<Indexed&>())>>) {
             encodeIndexFieldValue(Indexed{typename std::remove_cvref_t<decltype(*std::declval<Indexed&>())>{value}}, out);

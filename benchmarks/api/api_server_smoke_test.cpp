@@ -14,6 +14,12 @@
 #include "akk/engine/server/ApiFraming.hpp"
 #include "akk/net/tls/TlsStream.hpp"
 
+#ifdef AKKARADB_TEST_HAS_GRPC
+#include "akkaradb_grpc.grpc.pb.h"
+
+#include <grpcpp/grpcpp.h>
+#endif
+
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -29,6 +35,10 @@
 
 using namespace akkaradb::engine;
 using namespace akkaradb::engine::server;
+
+#ifdef AKKARADB_TEST_HAS_GRPC
+namespace wire = ::akkaradb::grpcapi::v1;
+#endif
 
 namespace {
     constexpr uint32_t kSmokeIoTimeoutMs = 5000;
@@ -141,6 +151,11 @@ namespace {
         std::vector<uint8_t> value;
     };
 
+    struct TcpStreamFrame {
+        uint8_t type = 0;
+        std::vector<uint8_t> payload;
+    };
+
     [[nodiscard]] TcpResponse readResponse(akkaradb::net::TlsStream& stream) {
         ApiResponseHeader header{};
         tlsRecvAll(stream, reinterpret_cast<uint8_t*>(&header), sizeof(header));
@@ -156,6 +171,20 @@ namespace {
         tlsRecvAll(stream, reinterpret_cast<uint8_t*>(&receivedCrc), sizeof(receivedCrc));
         AKK_TEST_CHECK(receivedCrc == crc32c(std::span<const uint8_t>{response.value.data(), response.value.size()}));
         return response;
+    }
+
+    [[nodiscard]] TcpStreamFrame decodeTcpStreamFrame(std::span<const uint8_t> payload) {
+        AKK_TEST_CHECK(payload.size() >= sizeof(uint8_t) + sizeof(uint32_t));
+        TcpStreamFrame frame;
+        frame.type = payload[0];
+        payload = payload.subspan(sizeof(uint8_t));
+
+        uint32_t frameSize = 0;
+        std::memcpy(&frameSize, payload.data(), sizeof(frameSize));
+        payload = payload.subspan(sizeof(frameSize));
+        AKK_TEST_CHECK(payload.size() == frameSize);
+        frame.payload.assign(payload.begin(), payload.end());
+        return frame;
     }
 
     struct BatchGetItem {
@@ -228,6 +257,87 @@ namespace {
             reinterpret_cast<const uint8_t*>(response.data() + headerEnd + 4),
             reinterpret_cast<const uint8_t*>(response.data() + response.size())
         };
+    }
+
+    [[nodiscard]] std::string httpHeaderValue(std::string_view response, std::string_view name) {
+        const auto headerEnd = response.find("\r\n\r\n");
+        AKK_TEST_CHECK(headerEnd != std::string_view::npos);
+        size_t pos = 0;
+        while (pos < headerEnd) {
+            const auto lineEnd = response.find("\r\n", pos);
+            if (lineEnd == std::string_view::npos || lineEnd > headerEnd) { break; }
+            const auto line = response.substr(pos, lineEnd - pos);
+            const auto colon = line.find(':');
+            if (colon != std::string_view::npos && line.substr(0, colon) == name) {
+                auto value = line.substr(colon + 1);
+                while (!value.empty() && value.front() == ' ') { value.remove_prefix(1); }
+                return std::string{value};
+            }
+            pos = lineEnd + 2;
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::vector<uint8_t> decodeChunkedHttpBody(std::string_view response) {
+        const auto headerEnd = response.find("\r\n\r\n");
+        AKK_TEST_CHECK(headerEnd != std::string_view::npos);
+
+        size_t pos = headerEnd + 4;
+        std::vector<uint8_t> body;
+        while (pos < response.size()) {
+            const auto sizeEnd = response.find("\r\n", pos);
+            AKK_TEST_CHECK(sizeEnd != std::string_view::npos);
+            std::string_view sizeText = response.substr(pos, sizeEnd - pos);
+            const auto semi = sizeText.find(';');
+            if (semi != std::string_view::npos) { sizeText = sizeText.substr(0, semi); }
+
+            size_t chunkSize = 0;
+            const auto result = std::from_chars(sizeText.data(), sizeText.data() + sizeText.size(), chunkSize, 16);
+            AKK_TEST_CHECK(result.ec == std::errc{});
+            pos = sizeEnd + 2;
+            if (chunkSize == 0) {
+                AKK_TEST_CHECK(response.size() >= pos + 2);
+                break;
+            }
+            AKK_TEST_CHECK(response.size() >= pos + chunkSize + 2);
+            body.insert(
+                body.end(),
+                reinterpret_cast<const uint8_t*>(response.data() + pos),
+                reinterpret_cast<const uint8_t*>(response.data() + pos + chunkSize)
+            );
+            pos += chunkSize;
+            AKK_TEST_CHECK(response.substr(pos, 2) == "\r\n");
+            pos += 2;
+        }
+        return body;
+    }
+
+    struct HttpStreamFrame {
+        uint8_t type = 0;
+        std::vector<uint8_t> payload;
+    };
+
+    [[nodiscard]] std::vector<HttpStreamFrame> decodeHttpStreamFrames(std::span<const uint8_t> payload, std::string_view prelude) {
+        AKK_TEST_CHECK(payload.size() >= prelude.size());
+        AKK_TEST_CHECK(std::memcmp(payload.data(), prelude.data(), prelude.size()) == 0);
+
+        payload = payload.subspan(prelude.size());
+        std::vector<HttpStreamFrame> frames;
+        while (!payload.empty()) {
+            AKK_TEST_CHECK(payload.size() >= sizeof(uint8_t) + sizeof(uint32_t));
+            HttpStreamFrame frame;
+            frame.type = payload[0];
+            payload = payload.subspan(sizeof(uint8_t));
+
+            uint32_t frameSize = 0;
+            std::memcpy(&frameSize, payload.data(), sizeof(frameSize));
+            payload = payload.subspan(sizeof(frameSize));
+            AKK_TEST_CHECK(payload.size() >= frameSize);
+            frame.payload.assign(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(frameSize));
+            payload = payload.subspan(frameSize);
+            frames.push_back(std::move(frame));
+        }
+        return frames;
     }
 
     [[nodiscard]] std::string httpRequestWithBody(uint16_t port, std::string_view header, std::span<const uint8_t> body) {
@@ -328,6 +438,20 @@ namespace {
         AKK_TEST_CHECK(scanned == 2);
         AKK_TEST_CHECK(scanResponse.value[sizeof(uint32_t)] == 1);
 
+        auto scanStream = makeRequest(24, ApiOp::SCAN_STREAM, bytes("b"), std::span<const uint8_t>{scanPayload.data(), scanPayload.size()});
+        tlsSendAll(stream, scanStream.data(), scanStream.size());
+        auto scanStreamItem1 = decodeTcpStreamFrame(readResponse(stream).value);
+        auto scanStreamItem2 = decodeTcpStreamFrame(readResponse(stream).value);
+        auto scanStreamEnd = decodeTcpStreamFrame(readResponse(stream).value);
+        AKK_TEST_CHECK(scanStreamItem1.type == 1);
+        AKK_TEST_CHECK(scanStreamItem2.type == 1);
+        AKK_TEST_CHECK(scanStreamEnd.type == 2);
+        uint32_t tcpScanStreamCount = 0;
+        AKK_TEST_CHECK(scanStreamEnd.payload.size() == sizeof(uint32_t) + sizeof(uint8_t));
+        std::memcpy(&tcpScanStreamCount, scanStreamEnd.payload.data(), sizeof(tcpScanStreamCount));
+        AKK_TEST_CHECK(tcpScanStreamCount == 2);
+        AKK_TEST_CHECK(scanStreamEnd.payload[sizeof(uint32_t)] == 1);
+
         auto historyRequest = makeRequest(21, ApiOp::HISTORY, bytes("history"));
         tlsSendAll(stream, historyRequest.data(), historyRequest.size());
         auto historyResponse = readResponse(stream);
@@ -337,11 +461,30 @@ namespace {
         std::memcpy(&tcpHistoryCount, historyResponse.value.data(), sizeof(tcpHistoryCount));
         AKK_TEST_CHECK(tcpHistoryCount >= 2);
 
-        auto forceSync = makeRequest(22, ApiOp::FORCE_SYNC, {});
+        std::vector<uint8_t> historyStreamPayload;
+        appendPlain(historyStreamPayload, static_cast<uint32_t>(1));
+        auto historyStream = makeRequest(
+            22,
+            ApiOp::HISTORY_STREAM,
+            bytes("history"),
+            std::span<const uint8_t>{historyStreamPayload.data(), historyStreamPayload.size()}
+        );
+        tlsSendAll(stream, historyStream.data(), historyStream.size());
+        auto historyStreamItem = decodeTcpStreamFrame(readResponse(stream).value);
+        auto historyStreamEnd = decodeTcpStreamFrame(readResponse(stream).value);
+        AKK_TEST_CHECK(historyStreamItem.type == 1);
+        AKK_TEST_CHECK(historyStreamEnd.type == 2);
+        uint32_t tcpHistoryStreamCount = 0;
+        AKK_TEST_CHECK(historyStreamEnd.payload.size() == sizeof(uint32_t) + sizeof(uint8_t));
+        std::memcpy(&tcpHistoryStreamCount, historyStreamEnd.payload.data(), sizeof(tcpHistoryStreamCount));
+        AKK_TEST_CHECK(tcpHistoryStreamCount == 1);
+        AKK_TEST_CHECK(historyStreamEnd.payload[sizeof(uint32_t)] == 1);
+
+        auto forceSync = makeRequest(23, ApiOp::FORCE_SYNC, {});
         tlsSendAll(stream, forceSync.data(), forceSync.size());
         AKK_TEST_CHECK(readResponse(stream).status == ApiStatus::OK);
 
-        auto stats = makeRequest(23, ApiOp::STATS, {});
+        auto stats = makeRequest(40, ApiOp::STATS, {});
         tlsSendAll(stream, stats.data(), stats.size());
         auto statsResponse = readResponse(stream);
         AKK_TEST_CHECK(statsResponse.status == ApiStatus::OK);
@@ -360,6 +503,75 @@ namespace {
             AKK_TEST_CHECK(text(response.value) == "x");
         }
     }
+
+#ifdef AKKARADB_TEST_HAS_GRPC
+    void testGrpc(uint16_t port) {
+        auto channel = ::grpc::CreateChannel("127.0.0.1:" + std::to_string(port), ::grpc::InsecureChannelCredentials());
+        AKK_TEST_CHECK(channel->WaitForConnected(std::chrono::system_clock::now() + std::chrono::seconds(5)));
+        auto stub = wire::AkkaraDB::NewStub(channel);
+
+        {
+            ::grpc::ClientContext context;
+            wire::PingRequest request;
+            wire::PingResponse response;
+            const auto status = stub->Ping(&context, request, &response);
+            AKK_TEST_CHECK(status.ok());
+            AKK_TEST_CHECK(response.message() == "pong");
+        }
+
+        {
+            ::grpc::ClientContext context;
+            wire::ScanRequest request;
+            request.set_start_key("b");
+            request.set_end_key("c");
+            request.set_limit(2);
+            auto reader = stub->ScanStream(&context, request);
+
+            size_t itemCount = 0;
+            bool sawEnd = false;
+            wire::ScanStreamFrame frame;
+            while (reader->Read(&frame)) {
+                if (frame.has_item()) {
+                    ++itemCount;
+                }
+                else if (frame.has_end()) {
+                    AKK_TEST_CHECK(frame.end().emitted_count() == 2);
+                    AKK_TEST_CHECK(frame.end().truncated());
+                    sawEnd = true;
+                }
+            }
+            const auto status = reader->Finish();
+            AKK_TEST_CHECK(status.ok());
+            AKK_TEST_CHECK(itemCount == 2);
+            AKK_TEST_CHECK(sawEnd);
+        }
+
+        {
+            ::grpc::ClientContext context;
+            wire::HistoryRequest request;
+            request.set_key("history");
+            auto reader = stub->HistoryStream(&context, request);
+
+            size_t itemCount = 0;
+            bool sawEnd = false;
+            wire::HistoryStreamFrame frame;
+            while (reader->Read(&frame)) {
+                if (frame.has_item()) {
+                    ++itemCount;
+                }
+                else if (frame.has_end()) {
+                    AKK_TEST_CHECK(frame.end().emitted_count() >= 2);
+                    AKK_TEST_CHECK(!frame.end().truncated());
+                    sawEnd = true;
+                }
+            }
+            const auto status = reader->Finish();
+            AKK_TEST_CHECK(status.ok());
+            AKK_TEST_CHECK(itemCount >= 2);
+            AKK_TEST_CHECK(sawEnd);
+        }
+    }
+#endif
 
     void testTcpProtocolError(uint16_t port) {
         akkaradb::net::TlsStream stream;
@@ -454,6 +666,28 @@ namespace {
         std::memcpy(&httpScanned, scanBody.data(), sizeof(httpScanned));
         AKK_TEST_CHECK(httpScanned == 1);
 
+        const auto scanStream = httpRequest(
+            port,
+            "GET /v1/scan?start=h&end=i&limit=1&stream=1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(scanStream.find("200 OK") != std::string::npos);
+        AKK_TEST_CHECK(httpHeaderValue(scanStream, "Transfer-Encoding") == "chunked");
+        AKK_TEST_CHECK(httpHeaderValue(scanStream, "Content-Type") == "application/vnd.akkaradb.scan-stream");
+        const auto scanStreamFrames =
+            decodeHttpStreamFrames(decodeChunkedHttpBody(scanStream), std::string_view{"AKKS\x01", 5});
+        AKK_TEST_CHECK(scanStreamFrames.size() == 2);
+        AKK_TEST_CHECK(scanStreamFrames[0].type == 1);
+        AKK_TEST_CHECK(scanStreamFrames[1].type == 2);
+        AKK_TEST_CHECK(scanStreamFrames[0].payload.size() >= sizeof(uint16_t) + sizeof(uint32_t));
+        uint32_t scanStreamCount = 0;
+        AKK_TEST_CHECK(scanStreamFrames[1].payload.size() == sizeof(uint32_t) + sizeof(uint8_t));
+        std::memcpy(&scanStreamCount, scanStreamFrames[1].payload.data(), sizeof(scanStreamCount));
+        AKK_TEST_CHECK(scanStreamCount == 1);
+        AKK_TEST_CHECK(scanStreamFrames[1].payload[sizeof(uint32_t)] == 1);
+
         const auto history = httpRequest(
             port,
             "GET /v1/history?key=history HTTP/1.1\r\n"
@@ -467,6 +701,26 @@ namespace {
         uint32_t httpHistoryCount = 0;
         std::memcpy(&httpHistoryCount, historyBody.data(), sizeof(httpHistoryCount));
         AKK_TEST_CHECK(httpHistoryCount >= 2);
+
+        const auto historyStream = httpRequest(
+            port,
+            "GET /v1/history?key=history&stream=1 HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        );
+        AKK_TEST_CHECK(historyStream.find("200 OK") != std::string::npos);
+        AKK_TEST_CHECK(httpHeaderValue(historyStream, "Transfer-Encoding") == "chunked");
+        AKK_TEST_CHECK(httpHeaderValue(historyStream, "Content-Type") == "application/vnd.akkaradb.history-stream");
+        const auto historyStreamFrames =
+            decodeHttpStreamFrames(decodeChunkedHttpBody(historyStream), std::string_view{"AKKH\x01", 5});
+        AKK_TEST_CHECK(historyStreamFrames.size() >= 2);
+        AKK_TEST_CHECK(historyStreamFrames.back().type == 2);
+        uint32_t historyStreamCount = 0;
+        AKK_TEST_CHECK(historyStreamFrames.back().payload.size() == sizeof(uint32_t) + sizeof(uint8_t));
+        std::memcpy(&historyStreamCount, historyStreamFrames.back().payload.data(), sizeof(historyStreamCount));
+        AKK_TEST_CHECK(historyStreamCount >= 2);
+        AKK_TEST_CHECK(historyStreamFrames.back().payload[sizeof(uint32_t)] == 0);
 
         const std::pair<std::string_view, std::string_view> httpBatchPutItems[] = {
             {"hb1", "one"},
@@ -537,6 +791,7 @@ int main() try {
 
     const uint16_t httpPort = basePort();
     const uint16_t tcpPort = static_cast<uint16_t>(httpPort + 1);
+    const uint16_t grpcPort = static_cast<uint16_t>(httpPort + 2);
 
     AkkEngineOptions options;
     options.paths.dataDir = tempDir();
@@ -548,6 +803,7 @@ int main() try {
     options.api.bindHost = "127.0.0.1";
     options.api.httpPort = httpPort;
     options.api.tcpPort = tcpPort;
+    options.api.grpcPort = grpcPort;
     options.api.tcpReadTimeoutMs = kSmokeIoTimeoutMs;
     options.api.tcpWriteTimeoutMs = kSmokeIoTimeoutMs;
 
@@ -560,6 +816,9 @@ int main() try {
     testTcp(tcpPort, history);
     testTcpProtocolError(tcpPort);
     testHttp(httpPort);
+#ifdef AKKARADB_TEST_HAS_GRPC
+    testGrpc(grpcPort);
+#endif
 
     const auto stats = engine->stats();
     AKK_TEST_CHECK(stats.api.tcpEnabled);

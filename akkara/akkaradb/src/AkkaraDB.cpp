@@ -12,11 +12,11 @@
 
 #include "akk/engine/wal/WalWriter.hpp"
 
-#include <stdexcept>
 #include <utility>
 
 namespace akkaradb {
     namespace {
+
         [[nodiscard]] engine::sst::SSTWriter::Codec toSstCodec(engine::Codec codec) noexcept {
             switch (codec) {
                 case engine::Codec::NONE: return engine::sst::SSTWriter::Codec::NONE;
@@ -71,6 +71,53 @@ namespace akkaradb {
                 out.sst.bloomBitsPerKey = static_cast<uint32_t>(*options.overrides.sstBloomBitsPerKey);
             }
             if (options.overrides.maxL0SstFiles) { out.sst.maxL0Files = static_cast<int>(*options.overrides.maxL0SstFiles); }
+            if (options.api) {
+                out.components.apiEnabled = true;
+                out.api.backends = options.api->backends;
+                out.api.serverBackendPath = options.api->serverBackendPath;
+                out.api.transportBackendPath = options.api->transportBackendPath;
+                out.api.httpBackendPath = options.api->httpBackendPath;
+                out.api.tcpBackendPath = options.api->tcpBackendPath;
+                out.api.grpcBackendPath = options.api->grpcBackendPath;
+                out.api.bindHost = options.api->bindHost;
+                out.api.httpPort = options.api->httpPort;
+                out.api.tcpPort = options.api->tcpPort;
+                out.api.grpcPort = options.api->grpcPort;
+                out.api.transportMode = options.api->transportMode;
+                out.api.httpMaxBatchItems = options.api->httpMaxBatchItems;
+                out.api.httpMaxScanItems = options.api->httpMaxScanItems;
+                out.api.httpMaxHistoryEntries = options.api->httpMaxHistoryEntries;
+                out.api.httpMaxContentLength = options.api->httpMaxContentLength;
+                out.api.grpcWorkerThreads = options.api->grpcWorkerThreads;
+                out.api.grpcCompletionQueues = options.api->grpcCompletionQueues;
+                out.api.grpcMinPollers = options.api->grpcMinPollers;
+                out.api.grpcMaxPollers = options.api->grpcMaxPollers;
+                out.api.grpcMaxConcurrentStreams = options.api->grpcMaxConcurrentStreams;
+                out.api.grpcResourceQuotaBytes = options.api->grpcResourceQuotaBytes;
+                out.api.grpcMaxBatchItems = options.api->grpcMaxBatchItems;
+                out.api.grpcMaxScanItems = options.api->grpcMaxScanItems;
+                out.api.grpcMaxHistoryEntries = options.api->grpcMaxHistoryEntries;
+                out.api.tcpIoBackend = options.api->tcpIoBackend;
+                out.api.tcpWorkerThreads = options.api->tcpWorkerThreads;
+                out.api.tcpAcceptQueueLimit = options.api->tcpAcceptQueueLimit;
+                out.api.tcpAcceptQueueTimeoutMs = options.api->tcpAcceptQueueTimeoutMs;
+                out.api.tcpListenBacklog = options.api->tcpListenBacklog;
+                out.api.tcpRecvBufferBytes = options.api->tcpRecvBufferBytes;
+                out.api.tcpSendBufferBytes = options.api->tcpSendBufferBytes;
+                out.api.tcpPipelineBatchLimit = options.api->tcpPipelineBatchLimit;
+                out.api.tcpMaxBatchItems = options.api->tcpMaxBatchItems;
+                out.api.tcpMaxPendingResponseBytes = options.api->tcpMaxPendingResponseBytes;
+                out.api.tcpReadTimeoutMs = options.api->tcpReadTimeoutMs;
+                out.api.tcpWriteTimeoutMs = options.api->tcpWriteTimeoutMs;
+                out.api.tcpNoDelay = options.api->tcpNoDelay;
+                out.api.tcpKeepAlive = options.api->tcpKeepAlive;
+                out.api.tls.certPath = options.api->tls.certPath;
+                out.api.tls.keyPath = options.api->tls.keyPath;
+                out.api.tls.caPath = options.api->tls.caPath;
+                out.api.tls.psk = options.api->tls.psk;
+                out.api.tls.pskIdentity = options.api->tls.pskIdentity;
+                out.api.tls.verifyPeer = options.api->tls.verifyPeer;
+            }
 
             return out;
         }

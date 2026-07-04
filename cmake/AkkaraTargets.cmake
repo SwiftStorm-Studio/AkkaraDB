@@ -1,10 +1,12 @@
 # ==================== Main Library ====================
 add_library(akkaradb ${AKKARADB_LIBRARY_KIND})
 
-if (MSVC)
-    target_compile_options(akkaradb PRIVATE /WX)
-else ()
-    target_compile_options(akkaradb PRIVATE -Werror)
+if (AKKARADB_WARNINGS_AS_ERRORS)
+    if (MSVC)
+        target_compile_options(akkaradb PRIVATE /WX)
+    else ()
+        target_compile_options(akkaradb PRIVATE -Werror)
+    endif ()
 endif ()
 
 file(GLOB_RECURSE PUBLIC_HEADERS CONFIGURE_DEPENDS
@@ -80,6 +82,7 @@ add_custom_target(akkaradb_increment_revision
 )
 add_dependencies(akkaradb akkaradb_increment_revision)
 
+set(AKKARADB_CRC32C_SSE42_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86SSE42.cpp")
 set(AKKARADB_CRC32C_AVX2_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp")
 set(AKKARADB_CRC32C_AVX512_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp")
 if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
@@ -89,10 +92,12 @@ if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
         set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set_source_files_properties(${AKKARADB_CRC32C_SSE42_SOURCE}
+                PROPERTIES COMPILE_OPTIONS "-msse4.2")
         set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
-                PROPERTIES COMPILE_OPTIONS "-mavx2;-mpclmul")
+                PROPERTIES COMPILE_OPTIONS "-mavx2;-mpclmul;-msse4.2")
         set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
-                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mvpclmulqdq")
+                PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512vl;-mvpclmulqdq;-mpclmul;-msse4.2")
     endif ()
 endif ()
 
@@ -144,10 +149,18 @@ if (AKKARADB_BUILD_API_SERVERS)
     if (AKKARADB_BUILD_API_TCP)
         target_compile_definitions(akkaradb_api PRIVATE AKKARADB_API_HAS_TCP_BACKEND)
     endif ()
-    if (MSVC)
-        target_compile_options(akkaradb_api PRIVATE /WX)
-    else ()
-        target_compile_options(akkaradb_api PRIVATE -Werror)
+    if (AKKARADB_WARNINGS_AS_ERRORS)
+
+        if (MSVC)
+
+            target_compile_options(akkaradb_api PRIVATE /WX)
+
+        else ()
+
+            target_compile_options(akkaradb_api PRIVATE -Werror)
+
+        endif ()
+
     endif ()
     if(WIN32)
         target_link_libraries(akkaradb_api PRIVATE ws2_32 bcrypt)
@@ -167,10 +180,20 @@ if (AKKARADB_BUILD_API_SERVERS)
                 AKKARADB_API_SERVER_BUILD_SHARED
                 AKKARADB_TLS_ENABLED
         )
-        if (MSVC)
-            target_compile_options(akkaradb_api_http PRIVATE /WX)
-        else ()
-            target_compile_options(akkaradb_api_http PRIVATE -Werror)
+        if (AKKARADB_WARNINGS_AS_ERRORS)
+            if (AKKARADB_WARNINGS_AS_ERRORS)
+
+                if (MSVC)
+
+                    target_compile_options(akkaradb_api_http PRIVATE /WX)
+
+                else ()
+
+                    target_compile_options(akkaradb_api_http PRIVATE -Werror)
+
+                endif ()
+
+            endif ()
         endif ()
         if(WIN32)
             target_link_libraries(akkaradb_api_http PRIVATE ws2_32 bcrypt)
@@ -192,10 +215,20 @@ if (AKKARADB_BUILD_API_SERVERS)
                 AKKARADB_API_SERVER_BUILD_SHARED
                 AKKARADB_TLS_ENABLED
         )
-        if (MSVC)
-            target_compile_options(akkaradb_api_tcp PRIVATE /WX)
-        else ()
-            target_compile_options(akkaradb_api_tcp PRIVATE -Werror)
+        if (AKKARADB_WARNINGS_AS_ERRORS)
+            if (AKKARADB_WARNINGS_AS_ERRORS)
+
+                if (MSVC)
+
+                    target_compile_options(akkaradb_api_tcp PRIVATE /WX)
+
+                else ()
+
+                    target_compile_options(akkaradb_api_tcp PRIVATE -Werror)
+
+                endif ()
+
+            endif ()
         endif ()
         if(WIN32)
             target_link_libraries(akkaradb_api_tcp PRIVATE ws2_32 bcrypt)
@@ -216,10 +249,20 @@ if (AKKARADB_BUILD_API_SERVERS)
                 AKKARADB_API_SERVER_BUILD_SHARED
                 AKKARADB_TLS_ENABLED
         )
-        if (MSVC)
-            target_compile_options(akkaradb_api_grpc PRIVATE /WX)
-        else ()
-            target_compile_options(akkaradb_api_grpc PRIVATE -Werror)
+        if (AKKARADB_WARNINGS_AS_ERRORS)
+            if (AKKARADB_WARNINGS_AS_ERRORS)
+
+                if (MSVC)
+
+                    target_compile_options(akkaradb_api_grpc PRIVATE /WX)
+
+                else ()
+
+                    target_compile_options(akkaradb_api_grpc PRIVATE -Werror)
+
+                endif ()
+
+            endif ()
         endif ()
         if(WIN32)
             target_link_libraries(akkaradb_api_grpc PRIVATE ws2_32 bcrypt)
@@ -240,10 +283,20 @@ target_compile_definitions(akkaradb_cluster PRIVATE
         AKKARADB_CLUSTER_RUNTIME_BUILD_SHARED
         AKKARADB_TLS_ENABLED
 )
-if (MSVC)
-    target_compile_options(akkaradb_cluster PRIVATE /WX)
-else ()
-    target_compile_options(akkaradb_cluster PRIVATE -Werror)
+if (AKKARADB_WARNINGS_AS_ERRORS)
+    if (AKKARADB_WARNINGS_AS_ERRORS)
+
+        if (MSVC)
+
+            target_compile_options(akkaradb_cluster PRIVATE /WX)
+
+        else ()
+
+            target_compile_options(akkaradb_cluster PRIVATE -Werror)
+
+        endif ()
+
+    endif ()
 endif ()
 if(WIN32)
     target_link_libraries(akkaradb_cluster PRIVATE ws2_32 bcrypt)

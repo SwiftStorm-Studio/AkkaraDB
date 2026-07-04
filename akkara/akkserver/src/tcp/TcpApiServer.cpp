@@ -32,6 +32,8 @@ namespace akkaradb::engine::server {
         constexpr uint32_t kMaxValueBytes = 64u * 1024u * 1024u;
         constexpr uint32_t kDefaultMaxBatchItems = 4096u;
         constexpr size_t kReadBufferBytes = 64u * 1024u;
+        constexpr uint8_t kStreamFrameItem = 1;
+        constexpr uint8_t kStreamFrameEnd = 2;
 
         [[nodiscard]] bool validMagic(const ApiRequestHeader& header) noexcept {
             return std::memcmp(header.magic, REQUEST_MAGIC, sizeof(header.magic)) == 0;
@@ -78,6 +80,16 @@ namespace akkaradb::engine::server {
             return true;
         }
 
+        [[nodiscard]] bool readOptionalLimit(std::span<const uint8_t> payload, uint32_t& limit) noexcept {
+            if (payload.empty()) {
+                limit = 0;
+                return true;
+            }
+            if (payload.size() != sizeof(limit)) { return false; }
+            std::memcpy(&limit, payload.data(), sizeof(limit));
+            return true;
+        }
+
         void encodeBoolPayload(bool value, std::vector<uint8_t>& out) {
             out.clear();
             out.push_back(value ? uint8_t{1} : uint8_t{0});
@@ -111,6 +123,42 @@ namespace akkaradb::engine::server {
                 appendPlain(out, static_cast<uint32_t>(entry.value.size()));
                 appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
             }
+        }
+
+        void appendStreamFrameHeader(std::vector<uint8_t>& out, uint8_t type, uint32_t payloadBytes) {
+            out.clear();
+            out.reserve(1 + sizeof(payloadBytes) + payloadBytes);
+            appendPlain(out, type);
+            appendPlain(out, payloadBytes);
+        }
+
+        void encodeScanStreamPayload(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out) {
+            const uint32_t payloadBytes =
+                static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.size());
+            appendStreamFrameHeader(out, kStreamFrameItem, payloadBytes);
+            appendPlain(out, static_cast<uint16_t>(record.key.size()));
+            appendPlain(out, static_cast<uint32_t>(record.value.size()));
+            appendBytes(out, record.key);
+            appendBytes(out, record.value);
+        }
+
+        void encodeHistoryStreamPayload(const VersionEntry& entry, std::vector<uint8_t>& out) {
+            const uint32_t payloadBytes =
+                static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) + sizeof(uint32_t) +
+                                      sizeof(uint32_t) + entry.value.size());
+            appendStreamFrameHeader(out, kStreamFrameItem, payloadBytes);
+            appendPlain(out, entry.seq);
+            appendPlain(out, entry.sourceNodeId);
+            appendPlain(out, entry.timestampNs);
+            appendPlain(out, static_cast<uint32_t>(entry.flags));
+            appendPlain(out, static_cast<uint32_t>(entry.value.size()));
+            appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
+        }
+
+        void encodeStreamEndPayload(uint32_t emitted, bool truncated, std::vector<uint8_t>& out) {
+            appendStreamFrameHeader(out, kStreamFrameEnd, static_cast<uint32_t>(sizeof(emitted) + sizeof(uint8_t)));
+            appendPlain(out, emitted);
+            appendPlain(out, static_cast<uint8_t>(truncated ? 1 : 0));
         }
 
         void encodeStatsPayload(const EngineStats& stats, std::vector<uint8_t>& out) {
@@ -550,9 +598,15 @@ namespace akkaradb::engine::server {
             return true;
         };
 
+        const auto sendResponsePayload = [&](ApiStatus status, uint32_t requestId, std::span<const uint8_t> payload) -> bool {
+            encodeResponse(status, requestId, payload, responseBuffer);
+            return appendResponse(responseBuffer);
+        };
+
         const auto processFrame = [&](const RequestFrame& frame) -> bool {
             requestsTotal_.fetch_add(1, std::memory_order_relaxed);
             bytesReceivedTotal_.fetch_add(frame.wireSize, std::memory_order_relaxed);
+            responseBuffer.clear();
 
             if (frame.receivedCrc != crc32c(frame.key, frame.value)) {
                 crcErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
@@ -723,6 +777,86 @@ namespace akkaradb::engine::server {
                             std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()},
                             responseBuffer
                         );
+                        break;
+                    }
+                    case ApiOp::SCAN_STREAM: {
+                        uint32_t limit = 0;
+                        std::span<const uint8_t> endKey;
+                        if (!readScanPayload(frame.value, limit, endKey)) {
+                            protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                            encodeError(frame.header.requestId, responseBuffer);
+                            return false;
+                        }
+
+                        core::BufferArena arena;
+                        uint32_t emitted = 0;
+                        bool truncated = false;
+                        for (const auto& record : engine_.scan(arena, frame.key, endKey)) {
+                            if (limit != 0 && emitted >= limit) {
+                                truncated = true;
+                                break;
+                            }
+                            encodeScanStreamPayload(record, outputBuffer);
+                            if (!sendResponsePayload(
+                                    ApiStatus::OK,
+                                    frame.header.requestId,
+                                    std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                                )) {
+                                responseBuffer.clear();
+                                return false;
+                            }
+                            ++emitted;
+                        }
+
+                        encodeStreamEndPayload(emitted, truncated, outputBuffer);
+                        if (!sendResponsePayload(
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                            )) {
+                            responseBuffer.clear();
+                            return false;
+                        }
+                        responseBuffer.clear();
+                        break;
+                    }
+                    case ApiOp::HISTORY_STREAM: {
+                        uint32_t limit = 0;
+                        if (!readOptionalLimit(frame.value, limit)) {
+                            protocolErrorsTotal_.fetch_add(1, std::memory_order_relaxed);
+                            encodeError(frame.header.requestId, responseBuffer);
+                            return false;
+                        }
+
+                        uint32_t emitted = 0;
+                        bool truncated = false;
+                        for (const auto& entry : engine_.history(frame.key)) {
+                            if (limit != 0 && emitted >= limit) {
+                                truncated = true;
+                                break;
+                            }
+                            encodeHistoryStreamPayload(entry, outputBuffer);
+                            if (!sendResponsePayload(
+                                    ApiStatus::OK,
+                                    frame.header.requestId,
+                                    std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                                )) {
+                                responseBuffer.clear();
+                                return false;
+                            }
+                            ++emitted;
+                        }
+
+                        encodeStreamEndPayload(emitted, truncated, outputBuffer);
+                        if (!sendResponsePayload(
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                            )) {
+                            responseBuffer.clear();
+                            return false;
+                        }
+                        responseBuffer.clear();
                         break;
                     }
                     case ApiOp::ROLLBACK_TO: {

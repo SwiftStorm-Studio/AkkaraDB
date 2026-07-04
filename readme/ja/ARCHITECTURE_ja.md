@@ -1,47 +1,41 @@
-﻿# AkkaraDB Native アーキテクチャ
+# AkkaraDB Native 繧｢繝ｼ繧ｭ繝・け繝√Ε
 
-この文書は、AkkaraDB の native C++23 engine の全体像を説明します。v5 technical specification の補助資料であり、`SPEC.md` が正確な format と compatibility rule を定義する source of truth であるのに対して、ここでは各 subsystem の責務と data flow を説明します。
+縺薙・譁・嶌縺ｯ縲、kkaraDB 縺ｮ native C++23 engine 縺ｮ蜈ｨ菴灘ワ繧定ｪｬ譏弱＠縺ｾ縺吶Ｗ5 technical specification 縺ｮ陬懷勧雉・侭縺ｧ縺ゅｊ縲～SPEC.md` 縺梧ｭ｣遒ｺ縺ｪ format 縺ｨ compatibility rule 繧貞ｮ夂ｾｩ縺吶ｋ source of truth 縺ｧ縺ゅｋ縺ｮ縺ｫ蟇ｾ縺励※縲√％縺薙〒縺ｯ蜷・subsystem 縺ｮ雋ｬ蜍吶→ data flow 繧定ｪｬ譏弱＠縺ｾ縺吶・
+## 逶ｮ谺｡
 
-## 目次
-
-- [概要](#概要)
-- [ストレージ構成](#ストレージ構成)
-- [主要コンポーネント](#主要コンポーネント)
-  - [公開 API 層](#公開-api-層)
+- [讎りｦ‐(#讎りｦ・
+- [繧ｹ繝医Ξ繝ｼ繧ｸ讒区・](#繧ｹ繝医Ξ繝ｼ繧ｸ讒区・)
+- [荳ｻ隕√さ繝ｳ繝昴・繝阪Φ繝・(#荳ｻ隕√さ繝ｳ繝昴・繝阪Φ繝・
+  - [蜈ｬ髢・API 螻､](#蜈ｬ髢・api-螻､)
   - [AkkEngine](#akkengine)
-  - [レコードとキーのモデル](#レコードとキーのモデル)
-  - [メモリ管理](#メモリ管理)
+  - [繝ｬ繧ｳ繝ｼ繝峨→繧ｭ繝ｼ縺ｮ繝｢繝・Ν](#繝ｬ繧ｳ繝ｼ繝峨→繧ｭ繝ｼ縺ｮ繝｢繝・Ν)
+  - [繝｡繝｢繝ｪ邂｡逅・(#繝｡繝｢繝ｪ邂｡逅・
   - [MemTable](#memtable)
-  - [書き込み先行ログ](#書き込み先行ログ)
-  - [Blob マネージャ](#blob-マネージャ)
-  - [SST マネージャ](#sst-マネージャ)
-  - [マニフェスト](#マニフェスト)
-  - [バージョンログ](#バージョンログ)
-  - [API サーバー](#api-サーバー)
-  - [Cluster Runtime と TLS](#cluster-runtime-と-tls)
-- [データフロー](#データフロー)
-- [リカバリとシャットダウン](#リカバリとシャットダウン)
-- [並行性モデル](#並行性モデル)
-- [起動モード](#起動モード)
+  - [譖ｸ縺崎ｾｼ縺ｿ蜈郁｡後Ο繧ｰ](#譖ｸ縺崎ｾｼ縺ｿ蜈郁｡後Ο繧ｰ)
+  - [Blob 繝槭ロ繝ｼ繧ｸ繝｣](#blob-繝槭ロ繝ｼ繧ｸ繝｣)
+  - [SST 繝槭ロ繝ｼ繧ｸ繝｣](#sst-繝槭ロ繝ｼ繧ｸ繝｣)
+  - [繝槭ル繝輔ぉ繧ｹ繝・(#繝槭ル繝輔ぉ繧ｹ繝・
+  - [繝舌・繧ｸ繝ｧ繝ｳ繝ｭ繧ｰ](#繝舌・繧ｸ繝ｧ繝ｳ繝ｭ繧ｰ)
+  - [API 繧ｵ繝ｼ繝舌・](#api-繧ｵ繝ｼ繝舌・)
+  - [Cluster Runtime 縺ｨ TLS](#cluster-runtime-縺ｨ-tls)
+- [繝・・繧ｿ繝輔Ο繝ｼ](#繝・・繧ｿ繝輔Ο繝ｼ)
+- [繝ｪ繧ｫ繝舌Μ縺ｨ繧ｷ繝｣繝・ヨ繝繧ｦ繝ｳ](#繝ｪ繧ｫ繝舌Μ縺ｨ繧ｷ繝｣繝・ヨ繝繧ｦ繝ｳ)
+- [荳ｦ陦梧ｧ繝｢繝・Ν](#荳ｦ陦梧ｧ繝｢繝・Ν)
+- [襍ｷ蜍輔Δ繝ｼ繝云(#襍ｷ蜍輔Δ繝ｼ繝・
 
 ---
 
-## 概要
+## 讎りｦ・
+AkkaraDB native 縺ｯ縲、kkaraDB 縺ｫ縺翫￠繧・canonical 縺ｪ C++23 storage engine 縺ｧ縺吶Ｃinary-safe 縺ｪ key/value 繧・LSM-tree 縺ｧ菫晏ｭ倥＠縲『rite 縺ｯ縺ｾ縺・in-memory 縺ｮ MemTable 縺ｫ蜈･繧翫‥urable 讒区・縺ｧ縺ｯ WAL segment 縺ｫ霑ｽ險倥＆繧後’lush 縺ｫ繧医▲縺ｦ immutable 縺ｪ SST file 縺御ｽ懊ｉ繧後〕evel 髢薙〒 compaction 縺輔ｌ縺ｾ縺吶・
+native engine 縺ｫ縺ｯ縲∵怙蟆乗ｧ区・縺ｮ LSM 螳溯｣・ｒ雜・∴繧・subsystem 繧ょ性縺ｾ繧後∪縺吶・
+- Blob Manager 縺ｫ繧医ｋ large value 縺ｮ螟夜Κ蛹・- Version Log 縺ｫ繧医ｋ莉ｻ諢上・ per-key history
+- BinPack serialization 縺ｨ secondary index key 繧剃ｽｿ縺・typed C++ table
+- Kotlin/JVM layer 縺御ｽｿ縺・JNI entry point
+- 邨・∩霎ｼ縺ｿ縺ｮ HTTP / binary TCP API server
+- standalone縲［irror縲《tripe deployment 蜷代￠縺ｮ cluster / replication primitive
+- mbedTLS 縺ｫ繧医ｋ TLS transport support
 
-AkkaraDB native は、AkkaraDB における canonical な C++23 storage engine です。binary-safe な key/value を LSM-tree で保存し、write はまず in-memory の MemTable に入り、durable 構成では WAL segment に追記され、flush によって immutable な SST file が作られ、level 間で compaction されます。
-
-native engine には、最小構成の LSM 実装を超える subsystem も含まれます。
-
-- Blob Manager による large value の外部化
-- Version Log による任意の per-key history
-- BinPack serialization と secondary index key を使う typed C++ table
-- Kotlin/JVM layer が使う JNI entry point
-- 組み込みの HTTP / binary TCP API server
-- standalone、mirror、stripe deployment 向けの cluster / replication primitive
-- mbedTLS による TLS transport support
-
-全体像は次の通りです。
-
+蜈ｨ菴灘ワ縺ｯ谺｡縺ｮ騾壹ｊ縺ｧ縺吶・
 ```text
 +---------------------------------------------------------------+
 |                         Public API                            |
@@ -82,10 +76,9 @@ native engine には、最小構成の LSM 実装を超える subsystem も含�
 
 ---
 
-## ストレージ構成
+## 繧ｹ繝医Ξ繝ｼ繧ｸ讒区・
 
-`paths.dataDir` が設定されている場合、未設定の component path はそこから自動導出されます。
-
+`paths.dataDir` 縺瑚ｨｭ螳壹＆繧後※縺・ｋ蝣ｴ蜷医∵悴險ｭ螳壹・ component path 縺ｯ縺昴％縺九ｉ閾ｪ蜍募ｰ主・縺輔ｌ縺ｾ縺吶・
 ```text
 {dataDir}/
 |-- wal/             WAL segment files
@@ -102,59 +95,45 @@ native engine には、最小構成の LSM 実装を超える subsystem も含�
 `-- node.id          Persistent node identity
 ```
 
-正確な binary format は `SPEC.md` にあります。アーキテクチャ上重要なのは、各 persistent subsystem の責務が分離されていることです。
-
-| Component | 役割 |
+豁｣遒ｺ縺ｪ binary format 縺ｯ `SPEC.md` 縺ｫ縺ゅｊ縺ｾ縺吶ゅい繝ｼ繧ｭ繝・け繝√Ε荳企㍾隕√↑縺ｮ縺ｯ縲∝推 persistent subsystem 縺ｮ雋ｬ蜍吶′蛻・屬縺輔ｌ縺ｦ縺・ｋ縺薙→縺ｧ縺吶・
+| Component | 蠖ｹ蜑ｲ |
 |---|---|
-| WAL | crash 後に acknowledged / pending write を replay する |
-| SST | immutable な sorted key/value record を保持する |
-| Manifest | SST lifecycle、checkpoint、cluster runtime event を追跡する |
-| Blob files | MemTable / WAL / SST payload の外に大きな値を保存する |
-| Version Log | point-in-time read と rollback 用の履歴を保存する |
-| Cluster config | runtime TLS path ではなく durable な cluster topology を保存する |
+| WAL | crash 蠕後↓ acknowledged / pending write 繧・replay 縺吶ｋ |
+| SST | immutable 縺ｪ sorted key/value record 繧剃ｿ晄戟縺吶ｋ |
+| Manifest | SST lifecycle縲…heckpoint縲…luster runtime event 繧定ｿｽ霍｡縺吶ｋ |
+| Blob files | MemTable / WAL / SST payload 縺ｮ螟悶↓螟ｧ縺阪↑蛟､繧剃ｿ晏ｭ倥☆繧・|
+| Version Log | point-in-time read 縺ｨ rollback 逕ｨ縺ｮ螻･豁ｴ繧剃ｿ晏ｭ倥☆繧・|
+| Cluster config | runtime TLS path 縺ｧ縺ｯ縺ｪ縺・durable 縺ｪ cluster topology 繧剃ｿ晏ｭ倥☆繧・|
 
 ---
 
-## 主要コンポーネント
+## 荳ｻ隕√さ繝ｳ繝昴・繝阪Φ繝・
+### 蜈ｬ髢・API 螻､
 
-### 公開 API 層
+native repository 縺ｫ縺ｯ 2 谿ｵ髫弱・ API 縺後≠繧翫∪縺吶・
+`engine::AkkEngine` 縺ｯ byte 謖・髄縺ｮ core API 縺ｧ縺吶Ｓaw byte span 縺ｮ key/value 繧貞女縺大叙繧翫｝oint read縲『rite縲〉emove縲《can縲”istory縲〉ollback縲’lush縲《ync縲…lose 繧呈署萓帙＠縺ｾ縺吶・
+`AkkaraDB` 縺ｨ `PackedTable<&T::id>` 縺ｯ high-level typed API 縺ｧ縺吶・++ aggregate entity 繧・BinPack 縺ｧ raw key/value row 縺ｫ螟画鋤縺励∪縺吶Ｕable key 縺ｯ 8-byte FNV-1a table prefix 縺ｧ namespace 蛻・屬縺輔ｌ縲《econdary index 縺ｯ `table_name + ":idx:" + field_name` 縺九ｉ蟆弱＞縺溷挨 prefix 繧剃ｽｿ縺・∪縺吶ょ推 row 縺ｫ縺ｯ primary key 縺ｨ縺ｯ迢ｬ遶九＠縺・stable `RowId` 繧ょ牡繧雁ｽ薙※繧峨ｌ縺ｾ縺吶・
+high-level API 縺ｯ `Ref<T>` 縺ｮ lazy resolve縲’oreign-key validation縲～OnDelete` / `OnUpdate` action縲～Immutable<T>` / `Const<T>` 縺ｫ繧医ｋ immutable field縲《table row-id lookup縲～onUpdate<&Field>(...)` hook 繧よ球蠖薙＠縺ｾ縺吶・
+low-level public header 縺ｫ縺ｯ縲《torage engine 縺ｮ open/close path 縺ｨ迢ｬ遶九＠縺ｦ `XorErasureCodec`縲～DualXorErasureCodec`縲～RsErasureCodec`縲～ErsCodec` 縺ｪ縺ｩ縺ｮ erasure coding utility 繧ょ性縺ｾ繧後∪縺吶・
+`AKKARADB_BUILD_JNI=ON` 縺ｮ蝣ｴ蜷医゛VM layer 縺ｯ JNI 繧帝壹§縺ｦ蜷後§ native engine 縺ｫ謗･邯壹＠縺ｾ縺吶・NI bridge 縺ｯ raw operation縲《can cursor縲〈uery scan payload evaluation縲｛ption-based open縲〉ollback entry point 繧・Kotlin module 縺ｫ蜈ｬ髢九＠縺ｾ縺吶・
+API error 縺ｮ蠅・阜縺ｯ `SPEC.md` 縺ｨ謠・▲縺ｦ縺・∪縺吶よ悄蠕・＆繧後ｋ縲悟ｭ伜惠縺励↑縺・阪・ `std::optional`縲～bool`縲∫ｩｺ縺ｮ range 縺ｧ陦ｨ縺励∽ｸ肴ｭ｣縺ｪ菴ｿ縺・婿繧・storage operation failure 縺ｯ exception 繧呈兜縺偵∪縺吶Ｎissing key 閾ｪ菴薙・萓句､悶〒縺ｯ縺ゅｊ縺ｾ縺帙ｓ縺後…losed engine縲（nvalid option縲》yped foreign-key target 縺ｮ谺關ｽ縲∵悴逋ｻ骭ｲ index 縺ｫ蟇ｾ縺吶ｋ `findBy()`縲｝ersisted data 縺ｮ遐ｴ謳阪！/O failure 縺ｪ縺ｩ縺ｯ standard exception 縺ｨ縺励※ surface 縺励∪縺吶・PI server 縺ｯ protocol boundary 縺ｧ縺昴ｌ繧峨ｒ catch 縺励…lient 縺ｫ縺ｯ error response / status 縺ｨ縺励※霑斐＠縺ｾ縺吶・
+### AkkEngine 譛ｬ菴・
+`AkkEngine` 縺ｯ coordinator 縺ｧ縺吶Ｔtorage component 繧呈園譛峨∪縺溘・謗･邯壹＠縲《ystem 蜈ｨ菴薙↓ thread-safe 縺ｪ read/write surface 繧剃ｸ弱∴縺ｾ縺吶・
+荳ｻ縺ｪ雋ｬ蜍・
 
-native repository には 2 段階の API があります。
+- `dataDir` 縺九ｉ component path 繧貞ｰ主・縺吶ｋ
+- option 縺ｫ蠢懊§縺ｦ WAL縲ヾST縲。lob縲｀anifest縲〃ersionLog縲、PI縲…luster component 繧・create/open 縺吶ｋ
+- top-level write 縺ｮ sequence assignment 繧・serialize 縺吶ｋ
+- record 繧呈嶌縺丞燕縺ｫ large value 繧貞､夜Κ蛹悶☆繧・- 譛牙柑縺ｪ蝣ｴ蜷医・ MemTable mutation 縺ｮ蜑阪↓ WAL 縺ｨ VersionLog 縺ｫ append 縺吶ｋ
+- MemTable record 繧・SST 縺ｫ flush 縺吶ｋ
+- read 繧・MemTable縲ヾST縲。lobManager 縺ｫ route 縺吶ｋ
+- primary 縺ｨ縺励※蜍穂ｽ懊＠縺ｦ縺・ｋ蝣ｴ蜷医・ cluster runtime 縺ｸ write/blob 繧・ship 縺吶ｋ
+- component 繧貞宛蠕｡縺輔ｌ縺滄・ｺ上〒 close 縺吶ｋ
 
-`engine::AkkEngine` は byte 指向の core API です。raw byte span の key/value を受け取り、point read、write、remove、scan、history、rollback、flush、sync、close を提供します。
+### 繝ｬ繧ｳ繝ｼ繝峨→繧ｭ繝ｼ縺ｮ繝｢繝・Ν
 
-`AkkaraDB` と `PackedTable<&T::id>` は high-level typed API です。C++ aggregate entity を BinPack で raw key/value row に変換します。table key は 8-byte FNV-1a table prefix で namespace 分離され、secondary index は `table_name + ":idx:" + field_name` から導いた別 prefix を使います。各 row には primary key とは独立した stable `RowId` も割り当てられます。
-
-high-level API は `Ref<T>` の lazy resolve、foreign-key validation、`OnDelete` / `OnUpdate` action、`Immutable<T>` / `Const<T>` による immutable field、stable row-id lookup、`onUpdate<&Field>(...)` hook も担当します。
-
-low-level public header には、storage engine の open/close path と独立して `XorErasureCodec`、`DualXorErasureCodec`、`RsErasureCodec`、`ErsCodec` などの erasure coding utility も含まれます。
-
-`AKKARADB_BUILD_JNI=ON` の場合、JVM layer は JNI を通じて同じ native engine に接続します。JNI bridge は raw operation、scan cursor、query scan payload evaluation、option-based open、rollback entry point を Kotlin module に公開します。
-
-API error の境界は `SPEC.md` と揃っています。期待される「存在しない」は `std::optional`、`bool`、空の range で表し、不正な使い方や storage operation failure は exception を投げます。missing key 自体は例外ではありませんが、closed engine、invalid option、typed foreign-key target の欠落、未登録 index に対する `findBy()`、persisted data の破損、I/O failure などは standard exception として surface します。API server は protocol boundary でそれらを catch し、client には error response / status として返します。
-
-### AkkEngine 本体
-
-`AkkEngine` は coordinator です。storage component を所有または接続し、system 全体に thread-safe な read/write surface を与えます。
-
-主な責務:
-
-- `dataDir` から component path を導出する
-- option に応じて WAL、SST、Blob、Manifest、VersionLog、API、cluster component を create/open する
-- top-level write の sequence assignment を serialize する
-- record を書く前に large value を外部化する
-- 有効な場合は MemTable mutation の前に WAL と VersionLog に append する
-- MemTable record を SST に flush する
-- read を MemTable、SST、BlobManager に route する
-- primary として動作している場合は cluster runtime へ write/blob を ship する
-- component を制御された順序で close する
-
-### レコードとキーのモデル
-
-raw engine は key を bytewise lexicographic order で比較します。必要な順序性を得るための key encoding は higher layer の責務です。`PackedTable` は整数 primary key に sortable な fixed-width big-endian encoding を使うので、typed primary-key scan でも数値順が保たれます。secondary index も arithmetic field には同じ sortable encoding 方針を使います。
-
-in-memory では `OwnedRecord` が compact な 64-byte metadata object として record を保持します。
-
+raw engine 縺ｯ key 繧・bytewise lexicographic order 縺ｧ豈碑ｼ・＠縺ｾ縺吶ょｿ・ｦ√↑鬆・ｺ乗ｧ繧貞ｾ励ｋ縺溘ａ縺ｮ key encoding 縺ｯ higher layer 縺ｮ雋ｬ蜍吶〒縺吶ＡPackedTable` 縺ｯ謨ｴ謨ｰ primary key 縺ｫ sortable 縺ｪ fixed-width big-endian encoding 繧剃ｽｿ縺・・縺ｧ縲》yped primary-key scan 縺ｧ繧よ焚蛟､鬆・′菫昴◆繧後∪縺吶Ｔecondary index 繧・arithmetic field 縺ｫ縺ｯ蜷後§ sortable encoding 譁ｹ驥昴ｒ菴ｿ縺・∪縺吶・
+in-memory 縺ｧ縺ｯ `OwnedRecord` 縺・compact 縺ｪ 64-byte metadata object 縺ｨ縺励※ record 繧剃ｿ晄戟縺励∪縺吶・
 ```text
 +-------------------+------------------------------------------+
 | MemHdr16          | seq, key length, value length, flags     |
@@ -164,34 +143,24 @@ in-memory では `OwnedRecord` が compact な 64-byte metadata object として
 +-------------------+------------------------------------------+
 ```
 
-on-disk の SST record は 32-byte の `SSTHdr32` と、それに続く key bytes / value bytes です。`key_fp64` と `mini_key` は fast reject / in-block search 用の hint であり、最終的な正当性は full key compare が担保します。
-
-Blob Manager に保存される value は、record value が 20-byte の `BlobRef` に置き換わり、blob flag が立ちます。read path ではそれを indirection として扱い、blob header と content CRC を検証した上で元の value を返します。
-
-### メモリ管理
-
-native engine は hot path の挙動を予測しやすくするため、小さく明示的な buffer abstraction を使います。
-
-`BufferArena` は scan や API call の一時 allocation を所有します。`AkkEngine::scan` が返す key/value span は arena の寿命に依存します。
-
-`OwnedBuffer` は I/O 向けの aligned owning storage で、`BufferView` は対応する non-owning view です。
-
-`SmallBuffer` は `OwnedRecord` に埋め込まれています。短い `[key][value]` payload は inline に収まり、大きい payload だけが arena-backed storage に逃がされます。これにより common case を compact に保てます。
-
+on-disk 縺ｮ SST record 縺ｯ 32-byte 縺ｮ `SSTHdr32` 縺ｨ縲√◎繧後↓邯壹￥ key bytes / value bytes 縺ｧ縺吶Ａkey_fp64` 縺ｨ `mini_key` 縺ｯ fast reject / in-block search 逕ｨ縺ｮ hint 縺ｧ縺ゅｊ縲∵怙邨ら噪縺ｪ豁｣蠖捺ｧ縺ｯ full key compare 縺梧球菫昴＠縺ｾ縺吶・
+Blob Manager 縺ｫ菫晏ｭ倥＆繧後ｋ value 縺ｯ縲〉ecord value 縺・20-byte 縺ｮ `BlobRef` 縺ｫ鄂ｮ縺肴鋤繧上ｊ縲｜lob flag 縺檎ｫ九■縺ｾ縺吶Ｓead path 縺ｧ縺ｯ縺昴ｌ繧・indirection 縺ｨ縺励※謇ｱ縺・｜lob header 縺ｨ content CRC 繧呈､懆ｨｼ縺励◆荳翫〒蜈・・ value 繧定ｿ斐＠縺ｾ縺吶・
+### 繝｡繝｢繝ｪ邂｡逅・
+native engine 縺ｯ hot path 縺ｮ謖吝虚繧剃ｺ域ｸｬ縺励ｄ縺吶￥縺吶ｋ縺溘ａ縲∝ｰ上＆縺乗・遉ｺ逧・↑ buffer abstraction 繧剃ｽｿ縺・∪縺吶・
+`BufferArena` 縺ｯ scan 繧・API call 縺ｮ荳譎・allocation 繧呈園譛峨＠縺ｾ縺吶ＡAkkEngine::scan` 縺瑚ｿ斐☆ key/value span 縺ｯ arena 縺ｮ蟇ｿ蜻ｽ縺ｫ萓晏ｭ倥＠縺ｾ縺吶・
+`OwnedBuffer` 縺ｯ I/O 蜷代￠縺ｮ aligned owning storage 縺ｧ縲～BufferView` 縺ｯ蟇ｾ蠢懊☆繧・non-owning view 縺ｧ縺吶・
+`SmallBuffer` 縺ｯ `OwnedRecord` 縺ｫ蝓九ａ霎ｼ縺ｾ繧後※縺・∪縺吶ら洒縺・`[key][value]` payload 縺ｯ inline 縺ｫ蜿弱∪繧翫∝､ｧ縺阪＞ payload 縺縺代′ arena-backed storage 縺ｫ騾・′縺輔ｌ縺ｾ縺吶ゅ％繧後↓繧医ｊ common case 繧・compact 縺ｫ菫昴※縺ｾ縺吶・
 ### MemTable
 
-MemTable は最初の read/write target です。contention を下げるため sharding されており、`RuntimeOptions::writer_threads` が設定されている場合は MemTable と WAL の shard count を writer count から導出できます。
-
-write sequence は MemTable の sequence model を通じて割り当てられます。
-
+MemTable 縺ｯ譛蛻昴・ read/write target 縺ｧ縺吶Ｄontention 繧剃ｸ九￡繧九◆繧・sharding 縺輔ｌ縺ｦ縺翫ｊ縲～RuntimeOptions::writer_threads` 縺瑚ｨｭ螳壹＆繧後※縺・ｋ蝣ｴ蜷医・ MemTable 縺ｨ WAL 縺ｮ shard count 繧・writer count 縺九ｉ蟆主・縺ｧ縺阪∪縺吶・
+write sequence 縺ｯ MemTable 縺ｮ sequence model 繧帝壹§縺ｦ蜑ｲ繧雁ｽ薙※繧峨ｌ縺ｾ縺吶・
 ```text
 reserve_seq(1) -> globally monotonic seq
 last_seq()     -> read snapshot for point reads and scans
 replay(seq)    -> advances sequence state during recovery
 ```
 
-lookup は指定 snapshot で可視な record を返します。tombstone は MemTable 内で隠蔽せず caller に返されます。これは古い SST value を suppress する必要があるためです。
-
+lookup 縺ｯ謖・ｮ・snapshot 縺ｧ蜿ｯ隕悶↑ record 繧定ｿ斐＠縺ｾ縺吶Ｕombstone 縺ｯ MemTable 蜀・〒髫阡ｽ縺帙★ caller 縺ｫ霑斐＆繧後∪縺吶ゅ％繧後・蜿､縺・SST value 繧・suppress 縺吶ｋ蠢・ｦ√′縺ゅｋ縺溘ａ縺ｧ縺吶・
 flush lifecycle:
 
 ```text
@@ -204,32 +173,28 @@ shard crosses thresholdBytesPerShard
   +-- WAL segments are pruned up to checkpoint when configured
 ```
 
-### 書き込み先行ログ
+### 譖ｸ縺崎ｾｼ縺ｿ蜈郁｡後Ο繧ｰ
 
-WAL は crash recovery のための append-only mutation log です。native v5 では `{dataDir}/wal` 以下に segmented WAL を持ち、各 segment は CRC 保護された `WalSegmentHeader` で始まります。
-
-entry の format:
+WAL 縺ｯ crash recovery 縺ｮ縺溘ａ縺ｮ append-only mutation log 縺ｧ縺吶Ｏative v5 縺ｧ縺ｯ `{dataDir}/wal` 莉･荳九↓ segmented WAL 繧呈戟縺｡縲∝推 segment 縺ｯ CRC 菫晁ｭｷ縺輔ｌ縺・`WalSegmentHeader` 縺ｧ蟋九∪繧翫∪縺吶・
+entry 縺ｮ format:
 
 ```text
 [WalEntryHeader:32][key bytes][value bytes]
 ```
 
-entry header には record sequence、key fingerprint、entry length、value length、key length、flags、そして header-with-zero-crc + key + value に対する CRC32C が含まれます。
+entry header 縺ｫ縺ｯ record sequence縲〔ey fingerprint縲‘ntry length縲」alue length縲〔ey length縲’lags縲√◎縺励※ header-with-zero-crc + key + value 縺ｫ蟇ｾ縺吶ｋ CRC32C 縺悟性縺ｾ繧後∪縺吶・
+WAL 縺ｮ sync mode:
 
-WAL の sync mode:
-
-| モード | 意味 |
+| 繝｢繝ｼ繝・| 諢丞袖 |
 |---|---|
-| `Sync` | 同期的な durability path |
+| `Sync` | 蜷梧悄逧・↑ durability path |
 | `Async` | grouped background flush path |
-| `Off` | 明示 sync なし。cache / test 向け |
+| `Off` | 譏守､ｺ sync 縺ｪ縺励Ｄache / test 蜷代￠ |
 
-startup recovery では segment header と entry CRC を検証してから fresh MemTable に適用します。
+startup recovery 縺ｧ縺ｯ segment header 縺ｨ entry CRC 繧呈､懆ｨｼ縺励※縺九ｉ fresh MemTable 縺ｫ驕ｩ逕ｨ縺励∪縺吶・
+### Blob 繝槭ロ繝ｼ繧ｸ繝｣
 
-### Blob マネージャ
-
-Blob Manager は `blob.thresholdBytes` 以上の value を外部化します。既定値は 16 KiB です。これにより MemTable record、WAL entry、SST block を小さく保ちながら、通常の `get` API 形状は変えずに済みます。
-
+Blob Manager 縺ｯ `blob.thresholdBytes` 莉･荳翫・ value 繧貞､夜Κ蛹悶＠縺ｾ縺吶よ里螳壼､縺ｯ 16 KiB 縺ｧ縺吶ゅ％繧後↓繧医ｊ MemTable record縲仝AL entry縲ヾST block 繧貞ｰ上＆縺丈ｿ昴■縺ｪ縺後ｉ縲・壼ｸｸ縺ｮ `get` API 蠖｢迥ｶ縺ｯ螟峨∴縺壹↓貂医∩縺ｾ縺吶・
 write path:
 
 ```text
@@ -253,10 +218,9 @@ record flag includes blob
   +-- return original value bytes
 ```
 
-### SST マネージャ
+### SST 繝槭ロ繝ｼ繧ｸ繝｣
 
-SST Manager は immutable sorted file と compaction を担当します。既定では 7 level、`L0..L6` を管理します。L0 は overlapping file を持ち得ますが、高い level では compaction 後に non-overlapping になる想定です。
-
+SST Manager 縺ｯ immutable sorted file 縺ｨ compaction 繧呈球蠖薙＠縺ｾ縺吶よ里螳壹〒縺ｯ 7 level縲～L0..L6` 繧堤ｮ｡逅・＠縺ｾ縺吶・0 縺ｯ overlapping file 繧呈戟縺｡蠕励∪縺吶′縲・ｫ倥＞ level 縺ｧ縺ｯ compaction 蠕後↓ non-overlapping 縺ｫ縺ｪ繧区Φ螳壹〒縺吶・
 SST v2 file layout:
 
 ```text
@@ -268,9 +232,8 @@ SST v2 file layout:
 [SSTFooterV2:48]
 ```
 
-record は block 内で key order を保ちます。key は optional な block compression の前に previous key に対する prefix-delta encoding になっていることがあり、reader は block load 時に full key を再構成します。
-
-lookup 前段:
+record 縺ｯ block 蜀・〒 key order 繧剃ｿ昴■縺ｾ縺吶Ｌey 縺ｯ optional 縺ｪ block compression 縺ｮ蜑阪↓ previous key 縺ｫ蟇ｾ縺吶ｋ prefix-delta encoding 縺ｫ縺ｪ縺｣縺ｦ縺・ｋ縺薙→縺後≠繧翫〉eader 縺ｯ block load 譎ゅ↓ full key 繧貞・讒区・縺励∪縺吶・
+lookup 蜑肴ｮｵ:
 
 ```text
 file min/max key check
@@ -280,104 +243,81 @@ file min/max key check
   +-- in-block binary search using SSTHdr32, mini_key, and full key compare
 ```
 
-data block は raw concatenated SST record か Zstd-compressed bytes です。block index は key boundary を持ち、Bloom filter は absent key に対する disk / cache work を減らします。
-
-flush は sorted MemTable record から新しい SST を作ります。compaction は overlapping もしくは budget 超過の SST set を lower level に rewrite し、その transition を Manifest に記録します。`CompactionCommit` を使うことで replay 時に input/output file change を atomic に適用できます。
-
-### マニフェスト
-
-Manifest は append-only かつ CRC 保護された storage lifecycle log です。main engine manifest (`manifest.akmf`) は live SST file、compaction transition、checkpoint を追跡し、別の node-local cluster manifest (`cluster.akmf`) は cluster runtime event を記録します。
-
+data block 縺ｯ raw concatenated SST record 縺・Zstd-compressed bytes 縺ｧ縺吶Ｃlock index 縺ｯ key boundary 繧呈戟縺｡縲。loom filter 縺ｯ absent key 縺ｫ蟇ｾ縺吶ｋ disk / cache work 繧呈ｸ帙ｉ縺励∪縺吶・
+flush 縺ｯ sorted MemTable record 縺九ｉ譁ｰ縺励＞ SST 繧剃ｽ懊ｊ縺ｾ縺吶Ｄompaction 縺ｯ overlapping 繧ゅ＠縺上・ budget 雜・℃縺ｮ SST set 繧・lower level 縺ｫ rewrite 縺励√◎縺ｮ transition 繧・Manifest 縺ｫ險倬鹸縺励∪縺吶ＡCompactionCommit` 繧剃ｽｿ縺・％縺ｨ縺ｧ replay 譎ゅ↓ input/output file change 繧・atomic 縺ｫ驕ｩ逕ｨ縺ｧ縺阪∪縺吶・
+### 繝槭ル繝輔ぉ繧ｹ繝・
+Manifest 縺ｯ append-only 縺九▽ CRC 菫晁ｭｷ縺輔ｌ縺・storage lifecycle log 縺ｧ縺吶Ｎain engine manifest (`manifest.akmf`) 縺ｯ live SST file縲…ompaction transition縲…heckpoint 繧定ｿｽ霍｡縺励∝挨縺ｮ node-local cluster manifest (`cluster.akmf`) 縺ｯ cluster runtime event 繧定ｨ倬鹸縺励∪縺吶・
 format:
 
 ```text
 [ManifestFileHeader:32][ManifestRecordHeader:8][payload]...
 ```
 
-主な record type:
+荳ｻ縺ｪ record type:
 
-| Event | 役割 |
+| Event | 蠖ｹ蜑ｲ |
 |---|---|
-| `SSTSeal` | 新しい SST file が seal された |
+| `SSTSeal` | 譁ｰ縺励＞ SST file 縺・seal 縺輔ｌ縺・|
 | `Checkpoint` | named / unnamed checkpoint |
-| `CompactionStart` | 情報用の start marker |
-| `CompactionCommit` | atomic な compaction input/output transition |
-| `Truncate` | 情報用の truncation marker |
-| `NodeJoin`, `NodeLeave`, `PrimaryLease` | `cluster.akmf` に書かれる cluster runtime event |
+| `CompactionStart` | 諠・ｱ逕ｨ縺ｮ start marker |
+| `CompactionCommit` | atomic 縺ｪ compaction input/output transition |
+| `Truncate` | 諠・ｱ逕ｨ縺ｮ truncation marker |
+| `NodeJoin`, `NodeLeave`, `PrimaryLease` | `cluster.akmf` 縺ｫ譖ｸ縺九ｌ繧・cluster runtime event |
 
-`manifest.akmf` の replay で in-memory SST lifecycle state を再構築します。cluster manifest は現在、startup / shutdown や primary lease の breadcrumb を残す local durable event log として使われます。malformed または CRC-invalid な record は適用されません。
+`manifest.akmf` 縺ｮ replay 縺ｧ in-memory SST lifecycle state 繧貞・讒狗ｯ峨＠縺ｾ縺吶Ｄluster manifest 縺ｯ迴ｾ蝨ｨ縲《tartup / shutdown 繧・primary lease 縺ｮ breadcrumb 繧呈ｮ九☆ local durable event log 縺ｨ縺励※菴ｿ繧上ｌ縺ｾ縺吶Ｎalformed 縺ｾ縺溘・ CRC-invalid 縺ｪ record 縺ｯ驕ｩ逕ｨ縺輔ｌ縺ｾ縺帙ｓ縲・
+### 繝舌・繧ｸ繝ｧ繝ｳ繝ｭ繧ｰ
 
-### バージョンログ
-
-Version Log は有効時に per-key history を保存し、次を支えます。
-
+Version Log 縺ｯ譛牙柑譎ゅ↓ per-key history 繧剃ｿ晏ｭ倥＠縲∵ｬ｡繧呈髪縺医∪縺吶・
 - `getAt(key, seq)`
 - `history(key)`
 - `rollbackTo(seq)`
 - `rollbackKey(key, seq)`
 
-各 version entry には sequence、source node id、timestamp、flags、value bytes が入ります。rollback 由来の record は reserved rollback node id と rollback flag を使って通常 write と区別されます。
+蜷・version entry 縺ｫ縺ｯ sequence縲《ource node id縲》imestamp縲’lags縲」alue bytes 縺悟・繧翫∪縺吶Ｓollback 逕ｱ譚･縺ｮ record 縺ｯ reserved rollback node id 縺ｨ rollback flag 繧剃ｽｿ縺｣縺ｦ騾壼ｸｸ write 縺ｨ蛹ｺ蛻･縺輔ｌ縺ｾ縺吶・
+`SYNC` mode 縺ｯ entry 繧呈嶌縺崎ｾｼ繧薙〒 durability sync 縺励※縺九ｉ return 縺励∪縺吶ＡBATCHED_SYNC` 縺ｯ in-memory history 繧貞・縺ｫ譖ｴ譁ｰ縺励｜ackground flusher 縺ｫ batch sync 縺輔○縺ｾ縺吶ＡASYNC` 繧・background flusher 繧剃ｽｿ縺・∪縺吶′縲［ethod return 譎らせ縺ｧ batch durability 縺ｯ菫晁ｨｼ縺励∪縺帙ｓ縲Ｉeader corruption縲［alformed entry縲》runcation縲，RC mismatch 縺ｯ silent skip 縺ｧ縺ｯ縺ｪ縺・exception 縺ｫ縺ｪ繧翫∪縺吶・
+Version history 縺ｯ `FAST` / `NORMAL` 縺ｧ縺ｯ default disabled縲～DURABLE` 縺ｧ縺ｯ default enabled 縺ｧ縺吶・
+### API 繧ｵ繝ｼ繝舌・
 
-`SYNC` mode は entry を書き込んで durability sync してから return します。`BATCHED_SYNC` は in-memory history を先に更新し、background flusher に batch sync させます。`ASYNC` も background flusher を使いますが、method return 時点で batch durability は保証しません。header corruption、malformed entry、truncation、CRC mismatch は silent skip ではなく exception になります。
+`components.apiEnabled` 縺梧怏蜉ｹ縺ｪ繧峨‘ngine 縺ｯ embedded API backend 繧定ｵｷ蜍輔〒縺阪∪縺吶・
+蟇ｾ蠢・backend:
 
-Version history は `FAST` / `NORMAL` では default disabled、`DURABLE` では default enabled です。
-
-### API サーバー
-
-`components.apiEnabled` が有効なら、engine は embedded API backend を起動できます。
-
-対応 backend:
-
-| Backend | Default port | 用途 |
+| Backend | Default port | 逕ｨ騾・|
 |---|---:|---|
-| HTTP | 7070 | REST 風の key/value operation |
+| HTTP | 7070 | REST 鬚ｨ縺ｮ key/value operation |
 | TCP | 7071 | binary AK5 request/response protocol |
-| GRPC | 7072 | gRPC module が登録されている場合の Protobuf/gRPC service |
+| GRPC | 7072 | gRPC module 縺檎匳骭ｲ縺輔ｌ縺ｦ縺・ｋ蝣ｴ蜷医・ Protobuf/gRPC service |
 
-binary protocol は `AK5Q` request frame と `AK5S` response frame を使います。現在の opcode には `Get`、`Put`、`Remove`、`GetAt`、`BatchPut`、`BatchGet`、`Ping`、`Exists`、`Count`、`Scan`、`History`、`RollbackTo`、`RollbackKey`、`ForceSync`、`ForceFlush`、`Stats` があります。
+binary protocol 縺ｯ `AK5Q` request frame 縺ｨ `AK5S` response frame 繧剃ｽｿ縺・∪縺吶ら樟蝨ｨ縺ｮ opcode 縺ｫ縺ｯ `Get`縲～Put`縲～Remove`縲～GetAt`縲～BatchPut`縲～BatchGet`縲～Ping`縲～Exists`縲～Count`縲～Scan`縲～History`縲～RollbackTo`縲～RollbackKey`縲～ForceSync`縲～ForceFlush`縲～Stats` 縺後≠繧翫∪縺吶・
+HTTP API 縺ｯ `/v1/ping`縲～/v1/put`縲～/v1/get`縲～/v1/remove`縲～/v1/exists`縲～/v1/count`縲～/v1/scan`縲～/v1/getAt`縲～/v1/history`縲～/v1/rollbackTo`縲～/v1/rollbackKey`縲～/v1/batchPut`縲～/v1/batchGet`縲～/v1/forceSync`縲～/v1/forceFlush`縲～/v1/stats` 繧呈署萓帙＠縺ｾ縺吶Ａ/v1/scan` 縺ｨ `/v1/history` 縺ｯ `stream=1` 縺ｪ縺ｩ truthy 縺ｪ query 繧剃ｻ倥￠繧九→縲～Transfer-Encoding: chunked` 縺ｧ item 蜊倅ｽ阪・ binary frame 繧帝先ｬ｡霑斐○縺ｾ縺吶５CP 縺ｫ縺ｯ `ScanStream` / `HistoryStream` opcode縲“RPC 縺ｫ縺ｯ `ScanStream` / `HistoryStream` server-streaming RPC 縺後≠繧翫∝酔縺倡畑騾斐ｒ native transport 縺ｧ菴ｿ縺医∪縺吶・
+### 繧ｯ繝ｩ繧ｹ繧ｿ螳溯｡檎ｳｻ縺ｨ TLS
 
-HTTP API は `/v1/ping`、`/v1/put`、`/v1/get`、`/v1/remove`、`/v1/exists`、`/v1/count`、`/v1/scan`、`/v1/getAt`、`/v1/history`、`/v1/rollbackTo`、`/v1/rollbackKey`、`/v1/batchPut`、`/v1/batchGet`、`/v1/forceSync`、`/v1/forceFlush`、`/v1/stats` を提供します。
-
-### クラスタ実行系と TLS
-
-cluster layer は 3 種類の deployment mode を持ちます。
-
-| モード | 意味 |
+cluster layer 縺ｯ 3 遞ｮ鬘槭・ deployment mode 繧呈戟縺｡縺ｾ縺吶・
+| 繝｢繝ｼ繝・| 諢丞袖 |
 |---|---|
 | `Standalone` | local-only operation |
-| `Mirror` | 全 data-bearing node へ write を mirror する |
-| `Stripe` | router policy により key を data node に割り当てる |
+| `Mirror` | 蜈ｨ data-bearing node 縺ｸ write 繧・mirror 縺吶ｋ |
+| `Stripe` | router policy 縺ｫ繧医ｊ key 繧・data node 縺ｫ蜑ｲ繧雁ｽ薙※繧・|
 
-Stripe runtime 自体は生成できます。router は deterministic rendezvous hashing で key ごとに 1 つの data-bearing owner を選び、選択結果は `ClusterRuntime::router()` から取得できます。node set や placement policy 変更後の ownership migration は、まだ自動ではなく明示的な運用手順として扱う前提です。
+Stripe runtime 閾ｪ菴薙・逕滓・縺ｧ縺阪∪縺吶Ｓouter 縺ｯ deterministic rendezvous hashing 縺ｧ key 縺斐→縺ｫ 1 縺､縺ｮ data-bearing owner 繧帝∈縺ｳ縲・∈謚樒ｵ先棡縺ｯ `ClusterRuntime::router()` 縺九ｉ蜿門ｾ励〒縺阪∪縺吶Ｏode set 繧・placement policy 螟画峩蠕後・ ownership migration 縺ｯ縲√∪縺閾ｪ蜍輔〒縺ｯ縺ｪ縺乗・遉ｺ逧・↑驕狗畑謇矩・→縺励※謇ｱ縺・燕謠舌〒縺吶・
+node role 縺ｯ `Standalone`縲～Primary`縲～Replica` 縺ｧ縺吶Ｑrimary 縺ｯ write 繧貞女縺台ｻ倥￠縺ｦ replica 縺ｸ record / blob 繧・ship 縺励〉eplica 縺ｯ engine 縺九ｉ貂｡縺輔ｌ縺・callback 縺ｧ replicated record / blob 繧帝←逕ｨ縺励∪縺吶・
+`ReplicationMode` 縺ｨ runtime role 縺ｯ蛻･讎ょｿｵ縺ｧ縺吶ＡStandalone`縲～Mirror`縲～Stripe` 縺ｯ topology 繧偵～Primary` 縺ｨ `Replica` 縺ｯ process 縺ｮ襍ｷ蜍募ｽ｢諷九ｒ陦ｨ縺励∪縺吶ＡStandalone` mode 縺ｧ縺ｯ譏守､ｺ startup role 縺ｯ荳崎ｦ√〒縺吶ＡMirror` 縺ｨ `Stripe` 縺ｧ縺ｯ `ClusterRuntimeOptions::startupRole` 繧・`PRIMARY` 縺・`REPLICA` 縺ｫ險ｭ螳壹☆繧句ｿ・ｦ√′縺ゅｊ縲～AUTO` 縺ｯ runtime error 縺ｫ縺ｪ繧翫∪縺吶・
+ack policy 縺ｯ `Async`縲～All`縲～Quorum` 縺ｧ縺吶・
+cluster config 縺ｮ `NodeInfo.host` 縺ｯ peer 縺・dial 縺吶ｋ advertise address 縺ｧ縺吶Ｑrimary 縺ｮ replication listener 縺ｯ runtime-only 縺ｪ `repl_bind_host` 縺ｫ bind 縺励∵里螳壹・ `0.0.0.0` 縺ｧ縺吶Ｓeplication link 縺ｯ TCP 繧剃ｽｿ縺・～TransportMode::SECURE` 縺ｧ縺ｯ native secure channel 縺ｧ蛹・∩縲～TransportMode::PLAIN` 縺ｯ蜈ｨ node host 縺・loopback 縺ｾ縺溘・ private/LAN address 縺ｮ蝣ｴ蜷医・縺ｿ險ｱ蜿ｯ縺輔ｌ縺ｾ縺吶Ａlocalhost` 莉･螟悶・ hostname 縺ｯ config validation 譎ゅ↓縺ｯ non-private 縺ｨ縺ｿ縺ｪ縺励∪縺吶・
+迴ｾ譎らせ縺ｮ runtime 縺ｫ縺ｯ閾ｪ蜍・primary election 縺ｯ縺ゅｊ縺ｾ縺帙ｓ縲ＡMirror` / `Stripe` 縺ｮ startup 隕∽ｻｶ:
 
-node role は `Standalone`、`Primary`、`Replica` です。primary は write を受け付けて replica へ record / blob を ship し、replica は engine から渡された callback で replicated record / blob を適用します。
-
-`ReplicationMode` と runtime role は別概念です。`Standalone`、`Mirror`、`Stripe` は topology を、`Primary` と `Replica` は process の起動形態を表します。`Standalone` mode では明示 startup role は不要です。`Mirror` と `Stripe` では `ClusterRuntimeOptions::startupRole` を `PRIMARY` か `REPLICA` に設定する必要があり、`AUTO` は runtime error になります。
-
-ack policy は `Async`、`All`、`Quorum` です。
-
-cluster config の `NodeInfo.host` は peer が dial する advertise address です。primary の replication listener は runtime-only な `repl_bind_host` に bind し、既定は `0.0.0.0` です。replication link は TCP を使い、`TransportMode::SECURE` では native secure channel で包み、`TransportMode::PLAIN` は全 node host が loopback または private/LAN address の場合のみ許可されます。`localhost` 以外の hostname は config validation 時には non-private とみなします。
-
-現時点の runtime には自動 primary election はありません。`Mirror` / `Stripe` の startup 要件:
-
-- `PRIMARY` は local `selfNodeId` が cluster config に存在し、coordinator-eligible であること
-- `REPLICA` は primary node id と到達可能な primary host / replication port を持つこと
-- `primaryHost` と `primaryReplPort` は `primaryNodeId` に対応する config entry から補完可能
-- `REPLICA` は自分自身を primary として指定できない
-
-満たさなければ startup は fail fast します。split-brain-safe failover、quorum leader election、自動 primary re-selection は現在 scope 外です。
-
-`PRIMARY` として動作する場合、runtime は local node の replication port で `ReplicationServer` を開きます。`REPLICA` の場合は `ReplicationClient` を開き、configured primary に dial します。replication ingress は primary 中心で、replica は consumer であり direct external write endpoint ではありません。
-
-`ClusterManager` は `{dataDir}` 以下に node-local な `cluster.akmf` も書きます。successful startup 後に `NodeJoin`、clean shutdown 時に `NodeLeave`、`PRIMARY` として起動したときに `PrimaryLease` を記録します。
-
-TLS support は current native target では mbedTLS でコンパイルされています。replication link は native secure channel (`TransportMode::SECURE`) または plain TCP (`TransportMode::PLAIN`) を使います。
-
+- `PRIMARY` 縺ｯ local `selfNodeId` 縺・cluster config 縺ｫ蟄伜惠縺励…oordinator-eligible 縺ｧ縺ゅｋ縺薙→
+- `REPLICA` 縺ｯ primary node id 縺ｨ蛻ｰ驕泌庄閭ｽ縺ｪ primary host / replication port 繧呈戟縺､縺薙→
+- `primaryHost` 縺ｨ `primaryReplPort` 縺ｯ `primaryNodeId` 縺ｫ蟇ｾ蠢懊☆繧・config entry 縺九ｉ陬懷ｮ悟庄閭ｽ
+- `REPLICA` 縺ｯ閾ｪ蛻・・霄ｫ繧・primary 縺ｨ縺励※謖・ｮ壹〒縺阪↑縺・
+貅縺溘＆縺ｪ縺代ｌ縺ｰ startup 縺ｯ fail fast 縺励∪縺吶Ｔplit-brain-safe failover縲〈uorum leader election縲∬・蜍・primary re-selection 縺ｯ迴ｾ蝨ｨ scope 螟悶〒縺吶・
+`PRIMARY` 縺ｨ縺励※蜍穂ｽ懊☆繧句ｴ蜷医〉untime 縺ｯ local node 縺ｮ replication port 縺ｧ `ReplicationServer` 繧帝幕縺阪∪縺吶ＡREPLICA` 縺ｮ蝣ｴ蜷医・ `ReplicationClient` 繧帝幕縺阪…onfigured primary 縺ｫ dial 縺励∪縺吶Ｓeplication ingress 縺ｯ primary 荳ｭ蠢・〒縲〉eplica 縺ｯ consumer 縺ｧ縺ゅｊ direct external write endpoint 縺ｧ縺ｯ縺ゅｊ縺ｾ縺帙ｓ縲・
+`ClusterManager` 縺ｯ `{dataDir}` 莉･荳九↓ node-local 縺ｪ `cluster.akmf` 繧よ嶌縺阪∪縺吶Ｔuccessful startup 蠕後↓ `NodeJoin`縲…lean shutdown 譎ゅ↓ `NodeLeave`縲～PRIMARY` 縺ｨ縺励※襍ｷ蜍輔＠縺溘→縺阪↓ `PrimaryLease` 繧定ｨ倬鹸縺励∪縺吶・
+TLS support 縺ｯ current native target 縺ｧ縺ｯ mbedTLS 縺ｧ繧ｳ繝ｳ繝代う繝ｫ縺輔ｌ縺ｦ縺・∪縺吶Ｓeplication link 縺ｯ native secure channel (`TransportMode::SECURE`) 縺ｾ縺溘・ plain TCP (`TransportMode::PLAIN`) 繧剃ｽｿ縺・∪縺吶・
 ---
 
-## データフロー
+## 繝・・繧ｿ繝輔Ο繝ｼ
 
-### 書き込みパス
+### 譖ｸ縺崎ｾｼ縺ｿ繝代せ
 
 ```text
 put(key, value)
@@ -398,9 +338,8 @@ put(key, value)
         +-- Cluster ship_entry if enabled and this node is primary
 ```
 
-sequence assignment、WAL append、version-log append、MemTable mutation、blob externalization、replication shipping は engine write mutex の下で順序付けられます。これにより、public method が並行に呼ばれても mutation order が一貫します。
-
-### 読み取りパス
+sequence assignment縲仝AL append縲」ersion-log append縲｀emTable mutation縲｜lob externalization縲〉eplication shipping 縺ｯ engine write mutex 縺ｮ荳九〒鬆・ｺ丈ｻ倥￠繧峨ｌ縺ｾ縺吶ゅ％繧後↓繧医ｊ縲｝ublic method 縺御ｸｦ陦後↓蜻ｼ縺ｰ繧後※繧・mutation order 縺御ｸ雋ｫ縺励∪縺吶・
+### 隱ｭ縺ｿ蜿悶ｊ繝代せ
 
 ```text
 get(key)
@@ -420,9 +359,8 @@ get(key)
         +-- optional sstPromoteReads -> insert SST hit into MemTable
 ```
 
-現在の snapshot については MemTable が常に最初の authority です。SST は flush 済みデータの fallback で、Blob dereference は勝った record が決まってから行います。
-
-### 範囲走査パス
+迴ｾ蝨ｨ縺ｮ snapshot 縺ｫ縺､縺・※縺ｯ MemTable 縺悟ｸｸ縺ｫ譛蛻昴・ authority 縺ｧ縺吶４ST 縺ｯ flush 貂医∩繝・・繧ｿ縺ｮ fallback 縺ｧ縲。lob dereference 縺ｯ蜍昴▲縺・record 縺梧ｱｺ縺ｾ縺｣縺ｦ縺九ｉ陦後＞縺ｾ縺吶・
+### 遽・峇襍ｰ譟ｻ繝代せ
 
 ```text
 scan(start, end)
@@ -436,9 +374,8 @@ scan(start, end)
   +-- return ArenaGenerator<ScanRecordView>
 ```
 
-返される view は arena の寿命に紐付きます。各 scanned key/value を独立した heap object に都度コピーしないための設計です。
-
-### 型付きテーブルのパス
+霑斐＆繧後ｋ view 縺ｯ arena 縺ｮ蟇ｿ蜻ｽ縺ｫ邏蝉ｻ倥″縺ｾ縺吶ょ推 scanned key/value 繧堤峡遶九＠縺・heap object 縺ｫ驛ｽ蠎ｦ繧ｳ繝斐・縺励↑縺・◆繧√・險ｭ險医〒縺吶・
+### 蝙倶ｻ倥″繝・・繝悶Ν縺ｮ繝代せ
 
 ```text
 PackedTable<User, id>.put(user)
@@ -456,11 +393,9 @@ PackedTable<User, id>.put(user)
         [index_prefix:8][field_len:u32le][encoded_field][encoded_pk] -> empty value
 ```
 
-secondary index entry は non-unique です。encoded primary key の suffix が duplicate field value を区別し、index scan から primary row を復元できるようにします。
-
-entity に `Ref<T>` field がある場合、dirty reference は attached table binding を通じて先に書かれます。その後 foreign-key validation が target の存在を確認します。target primary key が `updatePrimaryKey(...)` で変わったときは、schema 設定に応じて `OnUpdate` action が propagate / reject / null 化を行います。watched field が変化していた場合は、保存前に local `onUpdate<&Field>(...)` hook が replacement entity を書き換えることもできます。
-
-### JNI クエリ走査パス
+secondary index entry 縺ｯ non-unique 縺ｧ縺吶Ｆncoded primary key 縺ｮ suffix 縺・duplicate field value 繧貞玄蛻･縺励（ndex scan 縺九ｉ primary row 繧貞ｾｩ蜈・〒縺阪ｋ繧医≧縺ｫ縺励∪縺吶・
+entity 縺ｫ `Ref<T>` field 縺後≠繧句ｴ蜷医‥irty reference 縺ｯ attached table binding 繧帝壹§縺ｦ蜈医↓譖ｸ縺九ｌ縺ｾ縺吶ゅ◎縺ｮ蠕・foreign-key validation 縺・target 縺ｮ蟄伜惠繧堤｢ｺ隱阪＠縺ｾ縺吶Ｕarget primary key 縺・`updatePrimaryKey(...)` 縺ｧ螟峨ｏ縺｣縺溘→縺阪・縲《chema 險ｭ螳壹↓蠢懊§縺ｦ `OnUpdate` action 縺・propagate / reject / null 蛹悶ｒ陦後＞縺ｾ縺吶Ｘatched field 縺悟､牙喧縺励※縺・◆蝣ｴ蜷医・縲∽ｿ晏ｭ伜燕縺ｫ local `onUpdate<&Field>(...)` hook 縺・replacement entity 繧呈嶌縺肴鋤縺医ｋ縺薙→繧ゅ〒縺阪∪縺吶・
+### JNI 繧ｯ繧ｨ繝ｪ襍ｰ譟ｻ繝代せ
 
 ```text
 JVM scanQuery(start, end, queryBytes, schemaBytes)
@@ -472,16 +407,14 @@ JVM scanQuery(start, end, queryBytes, schemaBytes)
   +-- matching rows are returned to JVM RowView(ByteBufferL key, ByteBufferL value)
 ```
 
-query と schema の payload integer は little-endian です。unsupported operator は silent match ではなく query-evaluation error として扱う必要があります。
-
+query 縺ｨ schema 縺ｮ payload integer 縺ｯ little-endian 縺ｧ縺吶Ｖnsupported operator 縺ｯ silent match 縺ｧ縺ｯ縺ｪ縺・query-evaluation error 縺ｨ縺励※謇ｱ縺・ｿ・ｦ√′縺ゅｊ縺ｾ縺吶・
 ---
 
-## リカバリとシャットダウン
+## 繝ｪ繧ｫ繝舌Μ縺ｨ繧ｷ繝｣繝・ヨ繝繧ｦ繝ｳ
 
-### 起動時リカバリ
+### 襍ｷ蜍墓凾繝ｪ繧ｫ繝舌Μ
 
-`AkkEngine::open` は固定順序で startup します。
-
+`AkkEngine::open` 縺ｯ蝗ｺ螳夐・ｺ上〒 startup 縺励∪縺吶・
 ```text
 1. Derive missing component paths from dataDir
 2. Create required directories
@@ -492,14 +425,12 @@ query と schema の payload integer は little-endian です。unsupported oper
 7. Start WAL writer, BlobManager, VersionLog, ClusterRuntime, and API server as configured
 ```
 
-recovery policy は component ごとに分離されています。
-
-- WAL recovery は segment header と entry CRC を検証してから entry を適用する
-- SST reader は header、footer、block metadata、block CRC を検証する
-- Blob read は header CRC と original content CRC の両方を検証する
-- Manifest replay は malformed / CRC-invalid な record を適用しない
-
-### 障害時シナリオ
+recovery policy 縺ｯ component 縺斐→縺ｫ蛻・屬縺輔ｌ縺ｦ縺・∪縺吶・
+- WAL recovery 縺ｯ segment header 縺ｨ entry CRC 繧呈､懆ｨｼ縺励※縺九ｉ entry 繧帝←逕ｨ縺吶ｋ
+- SST reader 縺ｯ header縲’ooter縲｜lock metadata縲｜lock CRC 繧呈､懆ｨｼ縺吶ｋ
+- Blob read 縺ｯ header CRC 縺ｨ original content CRC 縺ｮ荳｡譁ｹ繧呈､懆ｨｼ縺吶ｋ
+- Manifest replay 縺ｯ malformed / CRC-invalid 縺ｪ record 繧帝←逕ｨ縺励↑縺・
+### 髫懷ｮｳ譎ゅす繝翫Μ繧ｪ
 
 ```text
 Power loss during WAL append
@@ -515,10 +446,9 @@ Power loss during blob write
   -> blob reads validate header and content CRC; unreferenced or corrupt blob payloads are not trusted
 ```
 
-### シャットダウン
+### 繧ｷ繝｣繝・ヨ繝繧ｦ繝ｳ
 
-`AkkEngine::close` は idempotent です。component は次の順序で close されます。
-
+`AkkEngine::close` 縺ｯ idempotent 縺ｧ縺吶Ｄomponent 縺ｯ谺｡縺ｮ鬆・ｺ上〒 close 縺輔ｌ縺ｾ縺吶・
 ```text
 1. API server
 2. Cluster runtime
@@ -531,27 +461,24 @@ Power loss during blob write
 9. MemTable release
 ```
 
-まず外部 traffic を止め、その後 mutable state を drain し、最後に persistent component を閉じる流れです。
-
+縺ｾ縺壼､夜Κ traffic 繧呈ｭ｢繧√√◎縺ｮ蠕・mutable state 繧・drain 縺励∵怙蠕後↓ persistent component 繧帝哩縺倥ｋ豬√ｌ縺ｧ縺吶・
 ---
 
-## 並行性モデル
+## 荳ｦ陦梧ｧ繝｢繝・Ν
 
-public storage component は public method 境界で thread-safe になるよう設計されています。
-
-| Component | 保証 |
+public storage component 縺ｯ public method 蠅・阜縺ｧ thread-safe 縺ｫ縺ｪ繧九ｈ縺・ｨｭ險医＆繧後※縺・∪縺吶・
+| Component | 菫晁ｨｼ |
 |---|---|
-| `AkkEngine` | public method は thread-safe |
-| `MemTable` | public method は thread-safe |
-| `WalWriter` | append、sync、close path は thread-safe |
-| `BlobManager` | read、write、delete scheduling は thread-safe |
-| `Manifest` | public method は thread-safe |
-| `VersionLog` | public method は thread-safe |
-| `ClusterRuntime` | start、close、ship path では endpoint access を serialize する |
+| `AkkEngine` | public method 縺ｯ thread-safe |
+| `MemTable` | public method 縺ｯ thread-safe |
+| `WalWriter` | append縲《ync縲…lose path 縺ｯ thread-safe |
+| `BlobManager` | read縲『rite縲‥elete scheduling 縺ｯ thread-safe |
+| `Manifest` | public method 縺ｯ thread-safe |
+| `VersionLog` | public method 縺ｯ thread-safe |
+| `ClusterRuntime` | start縲…lose縲《hip path 縺ｧ縺ｯ endpoint access 繧・serialize 縺吶ｋ |
 
-top-level write は `AkkEngine::Impl::write_mu` で serialize されます。これは意図的な設計で、sequence assignment と write の副作用全体を一貫した順序に保つためです。
-
-background work の例:
+top-level write 縺ｯ `AkkEngine::Impl::write_mu` 縺ｧ serialize 縺輔ｌ縺ｾ縺吶ゅ％繧後・諢丞峙逧・↑險ｭ險医〒縲《equence assignment 縺ｨ write 縺ｮ蜑ｯ菴懃畑蜈ｨ菴薙ｒ荳雋ｫ縺励◆鬆・ｺ上↓菫昴▽縺溘ａ縺ｧ縺吶・
+background work 縺ｮ萓・
 
 - WAL async flusher thread
 - MemTable shard flushing
@@ -559,26 +486,22 @@ background work の例:
 - Manifest fast-mode flusher
 - VersionLog async / batched flusher
 - Blob cleanup
-- API server の accept / connection handling
-- Cluster manager と replication endpoint
+- API server 縺ｮ accept / connection handling
+- Cluster manager 縺ｨ replication endpoint
 
 ---
 
-## 起動モード
-
-high-level `AkkaraDB::open` は `StartupMode` preset を `AkkEngineOptions` に変換します。
-
-| モード | WAL | Blob | マニフェスト | SST | バージョンログ | close 時の挙動 | MemTable しきい値 |
+## 襍ｷ蜍輔Δ繝ｼ繝・
+high-level `AkkaraDB::open` 縺ｯ `StartupMode` preset 繧・`AkkEngineOptions` 縺ｫ螟画鋤縺励∪縺吶・
+| 繝｢繝ｼ繝・| WAL | Blob | 繝槭ル繝輔ぉ繧ｹ繝・| SST | 繝舌・繧ｸ繝ｧ繝ｳ繝ｭ繧ｰ | close 譎ゅ・謖吝虚 | MemTable 縺励″縺・､ |
 |---|---|---|---|---|---|---|---|
-| `ULTRA_FAST` | disabled | disabled | disabled | disabled | disabled | force flush/sync なし | 512 MiB/shard |
-| `FAST` | async | enabled | enabled | enabled | disabled | force flush/sync あり | 256 MiB/shard |
-| `NORMAL` | async | enabled | enabled | enabled | disabled | force flush/sync あり | 64 MiB/shard |
-| `DURABLE` | sync | enabled | enabled | enabled | enabled | force flush/sync あり | 64 MiB/shard |
+| `ULTRA_FAST` | disabled | disabled | disabled | disabled | disabled | force flush/sync 縺ｪ縺・| 512 MiB/shard |
+| `FAST` | async | enabled | enabled | enabled | disabled | force flush/sync 縺ゅｊ | 256 MiB/shard |
+| `NORMAL` | async | enabled | enabled | enabled | disabled | force flush/sync 縺ゅｊ | 64 MiB/shard |
+| `DURABLE` | sync | enabled | enabled | enabled | enabled | force flush/sync 縺ゅｊ | 64 MiB/shard |
 
-`FAST` では SST read promotion も有効です。細かい override では MemTable しきい値、VersionLog、SST / blob codec、blob threshold、Bloom filter density、L0 compaction trigger、SST read promotion を変更できます。
-
+`FAST` 縺ｧ縺ｯ SST read promotion 繧よ怏蜉ｹ縺ｧ縺吶らｴｰ縺九＞ override 縺ｧ縺ｯ MemTable 縺励″縺・､縲〃ersionLog縲ヾST / blob codec縲｜lob threshold縲。loom filter density縲´0 compaction trigger縲ヾST read promotion 繧貞､画峩縺ｧ縺阪∪縺吶・
 ---
 
-## SPEC.md との関係
-
-この文書は `SPEC.md` の代わりになるものではありません。component の責務と data flow を把握するためにはこの文書を使い、正確な binary layout、magic number、CRC 範囲、protocol frame、configuration field、compatibility rule は `SPEC.md` を参照してください。
+## SPEC.md 縺ｨ縺ｮ髢｢菫・
+縺薙・譁・嶌縺ｯ `SPEC.md` 縺ｮ莉｣繧上ｊ縺ｫ縺ｪ繧九ｂ縺ｮ縺ｧ縺ｯ縺ゅｊ縺ｾ縺帙ｓ縲Ｄomponent 縺ｮ雋ｬ蜍吶→ data flow 繧呈滑謠｡縺吶ｋ縺溘ａ縺ｫ縺ｯ縺薙・譁・嶌繧剃ｽｿ縺・∵ｭ｣遒ｺ縺ｪ binary layout縲［agic number縲，RC 遽・峇縲｝rotocol frame縲…onfiguration field縲…ompatibility rule 縺ｯ `SPEC.md` 繧貞盾辣ｧ縺励※縺上□縺輔＞縲・

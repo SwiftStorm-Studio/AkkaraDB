@@ -377,6 +377,47 @@ namespace akkaradb::grpcapi {
                         catch (...) { return owner_.errorStatus("scan failed"); }
                     }
 
+                    ::grpc::Status ScanStream(
+                        ::grpc::ServerContext*,
+                        const wire::ScanRequest* request,
+                        ::grpc::ServerWriter<wire::ScanStreamFrame>* writer
+                    ) override {
+                        RequestScope requestScope{owner_};
+                        try {
+                            core::BufferArena arena;
+                            uint32_t emitted = 0;
+                            bool truncated = false;
+                            const uint32_t limit = owner_.boundedLimit(request->limit(), owner_.maxScanItems());
+                            for (const auto& record : owner_.engine_.scan(arena, bytes(request->start_key()), bytes(request->end_key()))) {
+                                if (limit != 0 && emitted >= limit) {
+                                    truncated = true;
+                                    break;
+                                }
+                                wire::ScanStreamFrame frame;
+                                auto* item = frame.mutable_item();
+                                setBytes(item->mutable_key(), record.key);
+                                setBytes(item->mutable_value(), record.value);
+                                if (!writer->Write(frame)) {
+                                    owner_.recordError();
+                                    return {::grpc::StatusCode::CANCELLED, "scan stream cancelled"};
+                                }
+                                ++emitted;
+                            }
+
+                            wire::ScanStreamFrame endFrame;
+                            auto* end = endFrame.mutable_end();
+                            end->set_emitted_count(emitted);
+                            end->set_truncated(truncated);
+                            if (!writer->Write(endFrame)) {
+                                owner_.recordError();
+                                return {::grpc::StatusCode::CANCELLED, "scan stream cancelled"};
+                            }
+                            return ::grpc::Status::OK;
+                        }
+                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (...) { return owner_.errorStatus("scan stream failed"); }
+                    }
+
                     ::grpc::Status GetAt(::grpc::ServerContext*, const wire::GetAtRequest* request, wire::GetResponse* response) override {
                         RequestScope requestScope{owner_};
                         try {
@@ -418,6 +459,49 @@ namespace akkaradb::grpcapi {
                         }
                         catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
                         catch (...) { return owner_.errorStatus("history failed"); }
+                    }
+
+                    ::grpc::Status HistoryStream(
+                        ::grpc::ServerContext*,
+                        const wire::HistoryRequest* request,
+                        ::grpc::ServerWriter<wire::HistoryStreamFrame>* writer
+                    ) override {
+                        RequestScope requestScope{owner_};
+                        try {
+                            uint32_t emitted = 0;
+                            bool truncated = false;
+                            const uint32_t limit = owner_.maxHistoryEntries();
+                            for (const auto& entry : owner_.engine_.history(bytes(request->key()))) {
+                                if (limit != 0 && emitted >= limit) {
+                                    truncated = true;
+                                    break;
+                                }
+                                wire::HistoryStreamFrame frame;
+                                auto* item = frame.mutable_item();
+                                item->set_seq(entry.seq);
+                                item->set_source_node_id(entry.sourceNodeId);
+                                item->set_timestamp_ns(entry.timestampNs);
+                                item->set_flags(entry.flags);
+                                setBytes(item->mutable_value(), std::span<const uint8_t>{entry.value.data(), entry.value.size()});
+                                if (!writer->Write(frame)) {
+                                    owner_.recordError();
+                                    return {::grpc::StatusCode::CANCELLED, "history stream cancelled"};
+                                }
+                                ++emitted;
+                            }
+
+                            wire::HistoryStreamFrame endFrame;
+                            auto* end = endFrame.mutable_end();
+                            end->set_emitted_count(emitted);
+                            end->set_truncated(truncated);
+                            if (!writer->Write(endFrame)) {
+                                owner_.recordError();
+                                return {::grpc::StatusCode::CANCELLED, "history stream cancelled"};
+                            }
+                            return ::grpc::Status::OK;
+                        }
+                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (...) { return owner_.errorStatus("history stream failed"); }
                     }
 
                     ::grpc::Status RollbackTo(::grpc::ServerContext*, const wire::RollbackToRequest* request, wire::Empty*) override {

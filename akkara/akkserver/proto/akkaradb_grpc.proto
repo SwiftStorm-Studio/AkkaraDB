@@ -12,8 +12,10 @@ service AkkaraDB {
   rpc Exists(ExistsRequest) returns (ExistsResponse);
   rpc Count(CountRequest) returns (CountResponse);
   rpc Scan(ScanRequest) returns (ScanResponse);
+  rpc ScanStream(ScanRequest) returns (stream ScanStreamFrame);
   rpc GetAt(GetAtRequest) returns (GetResponse);
   rpc History(HistoryRequest) returns (HistoryResponse);
+  rpc HistoryStream(HistoryRequest) returns (stream HistoryStreamFrame);
   rpc RollbackTo(RollbackToRequest) returns (Empty);
   rpc RollbackKey(RollbackKeyRequest) returns (Empty);
   rpc BatchPut(BatchPutRequest) returns (Empty);
@@ -77,6 +79,18 @@ message ScanResponse {
   bool truncated = 2;
 }
 
+message ScanStreamEnd {
+  uint32 emitted_count = 1;
+  bool truncated = 2;
+}
+
+message ScanStreamFrame {
+  oneof frame {
+    KeyValue item = 1;
+    ScanStreamEnd end = 2;
+  }
+}
+
 message GetAtRequest {
   bytes key = 1;
   uint64 seq = 2;
@@ -101,6 +115,18 @@ message VersionEntry {
 message HistoryResponse {
   repeated VersionEntry entries = 1;
   bool truncated = 2;
+}
+
+message HistoryStreamEnd {
+  uint32 emitted_count = 1;
+  bool truncated = 2;
+}
+
+message HistoryStreamFrame {
+  oneof frame {
+    VersionEntry item = 1;
+    HistoryStreamEnd end = 2;
+  }
 }
 
 message RollbackToRequest {
