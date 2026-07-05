@@ -123,7 +123,7 @@ void remove(const PK& pk) {
     return engine_->exists(pkKeyBuffer_);
 }
 
-void upsert(const PK& pk, std::function<void(Entity&)> update) {
+void upsert(const PK& pk, std::function<void(Entity &)> update) {
     Entity entity = get(pk).value_or(Entity{});
     entity.*PrimaryKeyPtr = pk;
     update(entity);

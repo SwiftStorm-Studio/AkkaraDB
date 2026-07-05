@@ -46,9 +46,7 @@ namespace akkaradb {
 
         template <typename Needle, typename Haystack>
         [[nodiscard]] bool containsValue(const Haystack& haystack, const Needle& needle) {
-            for (const auto& value : haystack) {
-                if (value == needle) { return true; }
-            }
+            for (const auto& value : haystack) { if (value == needle) { return true; } }
             return false;
         }
 
@@ -71,9 +69,7 @@ namespace akkaradb {
                 if (pattern[pi] == '%') {
                     while (pi + 1 < pattern.size() && pattern[pi + 1] == '%') { ++pi; }
                     if (pi + 1 == pattern.size()) { return true; }
-                    for (size_t next = vi; next <= value.size(); ++next) {
-                        if (likeMatch(value, next, pattern, pi + 1)) { return true; }
-                    }
+                    for (size_t next = vi; next <= value.size(); ++next) { if (likeMatch(value, next, pattern, pi + 1)) { return true; } }
                     return false;
                 }
                 if (pattern[pi] == '_') {
@@ -105,13 +101,13 @@ namespace akkaradb {
 
         template <typename L, typename R>
         [[nodiscard]] bool valueEq(const L& lhs, const R& rhs) {
-            if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_equal(lhs, rhs); }
+            if constexpr (std::is_integral_v<L>&& std::is_integral_v<R>) { return std::cmp_equal(lhs, rhs); }
             else { return lhs == rhs; }
         }
 
         template <typename L, typename R>
         [[nodiscard]] bool valueLt(const L& lhs, const R& rhs) {
-            if constexpr (std::is_integral_v<L> && std::is_integral_v<R>) { return std::cmp_less(lhs, rhs); }
+            if constexpr (std::is_integral_v<L>&& std::is_integral_v<R>) { return std::cmp_less(lhs, rhs); }
             else { return lhs < rhs; }
         }
 

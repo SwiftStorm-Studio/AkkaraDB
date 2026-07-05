@@ -80,7 +80,7 @@ struct UpdateSetNullDef {
 struct UpdateFieldHookDef {
     std::string fieldName;
     bool (*unchanged)(const Entity&, const Entity&);
-    std::function<void(const Entity&, Entity&)> callback;
+    std::function<void(const Entity &, Entity &)> callback;
 };
 
 template <auto TargetPrimaryKeyPtr>

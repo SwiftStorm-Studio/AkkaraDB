@@ -300,6 +300,16 @@ namespace akkaradb::grpcapi {
                         catch (...) { return owner_.errorStatus("put failed"); }
                     }
 
+                    ::grpc::Status PutHinted(::grpc::ServerContext*, const wire::PutHintedRequest* request, wire::Empty*) override {
+                        RequestScope requestScope{owner_};
+                        try {
+                            owner_.engine_.putHinted(bytes(request->key()), bytes(request->value()), request->fp64(), request->mini_key());
+                            return ::grpc::Status::OK;
+                        }
+                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (...) { return owner_.errorStatus("put hinted failed"); }
+                    }
+
                     ::grpc::Status Get(::grpc::ServerContext*, const wire::GetRequest* request, wire::GetResponse* response) override {
                         RequestScope requestScope{owner_};
                         try {
@@ -323,6 +333,16 @@ namespace akkaradb::grpcapi {
                         }
                         catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
                         catch (...) { return owner_.errorStatus("remove failed"); }
+                    }
+
+                    ::grpc::Status RemoveHinted(::grpc::ServerContext*, const wire::RemoveHintedRequest* request, wire::Empty*) override {
+                        RequestScope requestScope{owner_};
+                        try {
+                            owner_.engine_.removeHinted(bytes(request->key()), request->fp64(), request->mini_key());
+                            return ::grpc::Status::OK;
+                        }
+                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (...) { return owner_.errorStatus("remove hinted failed"); }
                     }
 
                     ::grpc::Status Exists(
@@ -590,6 +610,16 @@ namespace akkaradb::grpcapi {
                         }
                         catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
                         catch (...) { return owner_.errorStatus("force flush failed"); }
+                    }
+
+                    ::grpc::Status RunBlobGc(::grpc::ServerContext*, const wire::Empty*, wire::Empty*) override {
+                        RequestScope requestScope{owner_};
+                        try {
+                            owner_.engine_.runBlobGc();
+                            return ::grpc::Status::OK;
+                        }
+                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (...) { return owner_.errorStatus("run blob gc failed"); }
                     }
 
                     ::grpc::Status Stats(::grpc::ServerContext*, const wire::StatsRequest*, wire::StatsResponse* response) override {

@@ -81,9 +81,7 @@ PackedTable& foreignKey() {
                 auto* table = static_cast<const PackedTable*>(rawTable);
                 using Target = typename RefTarget<Field>::Type;
                 const auto* binding = table->template findRefBinding<Target>();
-                if (binding == nullptr) {
-                    throw std::runtime_error("AkkaraDB foreign key: Ref target table is not registered");
-                }
+                if (binding == nullptr) { throw std::runtime_error("AkkaraDB foreign key: Ref target table is not registered"); }
 
                 const auto& ref = entity.*FieldPtr;
                 const bool exists = ref.hasRowId() ? binding->existsByRowId(ref.rowId()) : binding->exists(ref.id());
@@ -100,7 +98,8 @@ PackedTable& foreignKey() {
     return *this;
 }
 
-private:
+private
+:
 template <typename X>
 static decltype(auto) foreignKeyComparable(const X& value) {
     using Field = std::remove_cvref_t<X>;
@@ -125,9 +124,8 @@ static void setForeignKeyNull(X& value) {
 }
 
 void validateForeignKeys(const Entity& entity) const {
-    for (const auto& fk : foreignKeys_) {
-        fk.validate(entity, fk.target == nullptr ? const_cast<PackedTable*>(this) : fk.target);
-    }
+    for (const auto& fk : foreignKeys_) { fk.validate(entity, fk.target == nullptr ? const_cast<PackedTable*>(this) : fk.target); }
 }
 
-public:
+public
+:

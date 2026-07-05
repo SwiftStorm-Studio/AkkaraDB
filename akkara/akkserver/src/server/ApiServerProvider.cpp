@@ -1,20 +1,21 @@
 #include "akk/engine/server/AkkApiServerProvider.hpp"
 
+#include "akk/core/utils/DynamicLibrary.hpp"
+
 #include <atomic>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
+#include <vector>
 
 namespace akkaradb::engine::server {
     namespace {
         using RegisterPluginFn = bool (*)() noexcept;
 
         std::atomic<AkkApiServerFactory> g_factory{nullptr};
+        std::mutex g_loadMutex;
+        std::string g_lastLoadError;
+        std::vector<core::DynamicLibrary> g_loadedModules;
 
         [[nodiscard]] std::filesystem::path currentModuleDirectory() {
             #ifdef _WIN32
@@ -82,21 +83,42 @@ namespace akkaradb::engine::server {
     bool akkApiServerFactoryAvailable() noexcept { return g_factory.load(std::memory_order_acquire) != nullptr; }
 
     bool loadAkkApiServerBackend(const std::filesystem::path& libraryPath) {
+        std::lock_guard loadLock{g_loadMutex};
         if (akkApiServerFactoryAvailable()) { return true; }
 
         const auto path = resolveBackendPath(libraryPath);
-        #ifdef _WIN32
-        const HMODULE module = ::LoadLibraryW(path.wstring().c_str()); if (module == nullptr) { return false; } const auto registerPlugin =
-            reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, "akkaradb_api_server_register"));
-        #else
-        void* module = ::dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (module == nullptr) { return false; }
-        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(::dlsym(module, "akkaradb_api_server_register"));
-        #endif
+        std::string error;
+        auto module = core::DynamicLibrary::open(path, error);
+        if (!module.valid()) {
+            g_lastLoadError = std::move(error);
+            return false;
+        }
 
-        if (registerPlugin == nullptr) { return false; }
-        const bool ok = registerPlugin() && akkApiServerFactoryAvailable();
-        return ok;
+        constexpr const char* kRegisterSymbol = "akkaradb_api_server_register";
+        auto* symbol = module.symbol(kRegisterSymbol, error);
+        if (symbol == nullptr) {
+            g_lastLoadError = std::move(error);
+            return false;
+        }
+
+        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(symbol);
+        if (!registerPlugin()) {
+            g_lastLoadError = "API server backend " + path.string() + " returned false from " + kRegisterSymbol;
+            return false;
+        }
+        if (!akkApiServerFactoryAvailable()) {
+            g_lastLoadError = "API server backend " + path.string() + " did not register a factory";
+            return false;
+        }
+
+        g_loadedModules.push_back(std::move(module));
+        g_lastLoadError.clear();
+        return true;
+    }
+
+    std::string lastAkkApiServerBackendLoadError() {
+        std::lock_guard lock{g_loadMutex};
+        return g_lastLoadError;
     }
 
     std::unique_ptr<IAkkApiServer> createAkkApiServer(AkkEngine& engine, const AkkEngineOptions::ApiOptions& options) {

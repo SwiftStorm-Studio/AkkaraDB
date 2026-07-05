@@ -1,0 +1,500 @@
+---
+title: 低レベル API
+description: akkaradb::engine::AkkEngine を直接制御するための開発者ガイドです。
+---
+
+低レベル API である `akkaradb::engine::AkkEngine` は、バイト列指向の低レベルなキー/値ストレージエンジンです。キーと値は `std::span<const uint8_t>` として渡され、エンジン自体はスキーマを一切解釈しません。
+
+この層を使用することで、キーのレイアウト、値のエンコード、耐久性（WAL）、範囲スキャン、バージョン履歴、およびストレージエンジン全体の挙動を、呼び出し側から直接制御できます。
+
+## ユースケース（使うべき場面）
+
+`AkkEngine` を直接制御するのが向いているのは、以下のようなユースケースです。
+
+- バイト列のハンドリングを前提としたネットワークサーバー、JNI ブリッジ、プロトコル層を実装する。
+- 独自のバイナリキー/値形式がすでに存在しており、高レベルな型付きテーブルのエンコード処理を挟みたくない。
+- WAL、MemTable、SST、Blob、VersionLog、およびスキャンの挙動を直接検証・カスタマイズしたい。
+- 耐久性の担保レベルや、ストレージのコンポーネント構成を明示的にコントロールしたい。
+
+なお、C++ の構造体（モデルクラス）を中心とした一般的なアプリケーションコードでは、通常は高レベルの `AkkaraDB` や `PackedTable` API を使用した方が、コードの可読性と生産性が向上します。
+
+## インクルードと名前空間
+```cpp
+#include "akk/engine/AkkEngine.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace engine = akkaradb::engine;
+
+```
+
+低レベル API は C++23 を前提として設計されており、インターフェースには `std::span` が多用されています。コードの記述を簡潔にするため、以下のようなバイト列変換用のヘルパー関数を用意しておくことを推奨します。
+
+```cpp
+std::span<const uint8_t> bytes(std::string_view value) {
+    return {
+        reinterpret_cast<const uint8_t*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(std::span<const uint8_t> value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(const std::vector<uint8_t>& value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+
+```
+
+> **⚠️ 注意**
+> `bytes()` が返すのは対象オブジェクトの「ビュー（参照）」です。エンジンへの各種呼び出しが完了するまで、元となる文字列やバッファのライフタイムが維持されている（有効である）必要があります。文字列リテラルを渡す場合は安全ですが、破棄直前の一時オブジェクト（右辺値）に対する span を渡しないよう注意してください。
+
+## エンジンのオープン
+
+インメモリでのテストや動作検証では、永続化コンポーネントをすべて無効化して起動できます。
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.components.walEnabled = false;
+opts.components.blobEnabled = false;
+opts.components.manifestEnabled = false;
+opts.components.sstEnabled = false;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+
+```
+
+通常の組み込みデータベースとして永続化を行う場合は、基点となる `paths.dataDir` を設定します。各コンポーネントの個別のパスが空の場合、エンジンは `dataDir` をベースに自動で以下のサブパスを補完します。
+
+| オプション | `dataDir` 設定時のデフォルト値 |
+| --- | --- |
+| `paths.walDir` | `<dataDir>/wal` |
+| `paths.blobDir` | `<dataDir>/blobs` |
+| `paths.sstDir` | `<dataDir>/sstable` |
+| `paths.manifestPath` | `<dataDir>/manifest.akmf` |
+| `paths.versionLogPath` | `<dataDir>/history.akvlog` |
+| `paths.clusterConfigPath` | `<dataDir>/cluster.akcc` |
+| `paths.nodeIdPath` | `<dataDir>/node.id` |
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/akkaradb";
+
+opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+opts.blob.thresholdBytes = 32ULL * 1024ULL;
+opts.runtime.sstPromoteReads = true;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+
+```
+
+WAL のデフォルト同期モードは `SYNC`（強固な永続化）です。`ASYNC` を指定すると、バックグラウンドでのフラッシュ処理により書き込みスループットを最大化できます。`OFF` は WAL 自体を出力しないため、一時データのキャッシュ用途や、厳密に制御されたベンチマーク測定環境以外での使用は避けてください。
+
+## 基本的な CRUD 操作
+
+`put()` は指定したキーで値を書き込み、すでに同一キーが存在する場合は上書きします。`remove()` は対象キーに削除マーカー（Tombstone）を書き込みます。最も標準的な読み取り API である `get()` の戻り値は `std::optional<std::vector<uint8_t>>` です。
+
+```cpp
+db->put(bytes("user:1"), bytes("Alice"));
+db->put(bytes("user:2"), bytes("Bob"));
+
+if (auto value = db->get(bytes("user:1"))) {
+    const std::string name = text(*value);
+}
+
+db->put(bytes("user:1"), bytes("Alice Updated"));
+
+const bool exists = db->exists(bytes("user:1"));
+const bool missing = !db->exists(bytes("user:404"));
+
+db->remove(bytes("user:2"));
+
+```
+
+ホットパスにおいて呼び出し側のバッファ（`std::vector`）を再利用し、追加のアロケーションを回避したい場合は `getInto()` を使用します。
+
+```cpp
+std::vector<uint8_t> out;
+if (db->getInto(bytes("user:1"), out)) {
+    const std::string name = text(out);
+}
+
+```
+
+対象のキーが存在しない場合、`get()` は `std::nullopt` を返し、`getInto()` は `false` を返します。
+
+## バッチ処理
+
+一括書き込み（バルクインサート）を行うには、`AkkEngine::BatchPutEntry` の配列を使用します。各エントリは生のバイト列への span を保持するため、バッチ処理の呼び出しが完了するまで入力バッファが存続している必要があります。
+
+```cpp
+std::array<engine::AkkEngine::BatchPutEntry, 3> entries{{
+    {bytes("user:1"), bytes("Alice")},
+    {bytes("user:2"), bytes("Bob")},
+    {bytes("user:3"), bytes("Carol")},
+}};
+
+db->putBatch(entries);
+
+```
+
+バッチ読み取り（マルチゲット）は、キーを表す span の配列を受け取り、それぞれのキーに対応する検索結果をまとめて返します。
+
+```cpp
+std::array<std::span<const uint8_t>, 3> keys{
+    bytes("user:1"),
+    bytes("user:2"),
+    bytes("user:404"),
+};
+
+auto results = db->getBatch(keys);
+for (const auto& result : results) {
+    if (result.found) {
+        const std::string value = text(result.value);
+    }
+}
+
+```
+
+## キーの設計（キーレイアウト）
+
+ストレージエンジンは、生のバイト列を「辞書順（レキシカル順）」でソートして管理します。そのため、適切なキーレイアウトの設計はアプリケーション側の重要な責任となります。
+
+最も管理しやすい標準的なレイアウトは、コロンで区切った以下の構成です。
+
+```text
+<ドメイン>:<一意の識別子>
+
+```
+
+例:
+
+```text
+user:0000000000000001
+user:0000000000000002
+order:0000000000000001
+
+```
+
+数値 ID を文字列としてエンコードする場合は、必ず固定幅で**ゼロパディング**を行ってください。パディングを行わない場合、文字列比較のルールにより `"user:10"` が `"user:2"` よりも前にソートされてしまいます。
+
+バイナリ形式の数値キーを設計する場合は、整数値を**ビッグエンディアン**（ソート可能形式）に変換してエンコードします。
+
+```cpp
+std::vector<uint8_t> userKey(uint64_t id) {
+    std::vector<uint8_t> key{'u', 's', 'e', 'r', ':'};
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        key.push_back(static_cast<uint8_t>((id >> shift) & 0xff));
+    }
+    return key;
+}
+
+```
+
+このエンコードにより、バイト列としての前方一致・範囲スキャン（Iterator）の結果と、本来の数値の大小順が完全に一致するようになります。
+
+## プレフィックススキャン
+
+`scan()` は、半開区間 `[startKey, endKey)` を読み取ります。返されるイテレータのビューは、呼び出し側が所有する `BufferArena` のライフタイムに依存するため、スキャン処理が完了するまで arena を破棄せずに生存させておく必要があります。
+
+```cpp
+akkaradb::core::BufferArena arena;
+
+auto rows = db->scan(arena, bytes("user:"), bytes("user;"));
+for (auto it = rows.begin(); !(it == rows.end()); ++it) {
+    const auto& row = *it;
+    const std::string key = text(row.key);
+    const std::string value = text(row.value);
+}
+
+```
+
+`"user:"` から `"user;"` の範囲指定は、ASCII コードにおいて `';'` が `':'` の直後のバイトであるために成立しています。任意のバイナリプレフィックスに対して範囲を決定する場合は、次のように「インクリメントした次のプレフィックス」を動的に計算します。
+
+```cpp
+std::optional<std::vector<uint8_t>> nextPrefix(std::span<const uint8_t> prefix) {
+    std::vector<uint8_t> end{prefix.begin(), prefix.end()};
+    for (auto it = end.rbegin(); it != end.rend(); ++it) {
+        if (*it != 0xff) {
+            ++(*it);
+            end.erase(it.base(), end.end());
+            return end;
+        }
+    }
+    return std::nullopt;
+}
+
+```
+
+計算した結果を元に、`[prefix, nextPrefix(prefix))` の半開区間でスキャンを実行します。次のプレフィックスが存在しない（すべて `0xff` の）場合は、上限なしの範囲として扱います。
+
+```cpp
+auto prefix = bytes("user:");
+auto end = nextPrefix(prefix);
+
+auto rows = end
+    ? db->scan(arena, prefix, *end)
+    : db->scan(arena, prefix);
+
+```
+
+## Arena のライフタイム管理
+
+`scan()` および `getIntoArena()` が返す結果は、所有権を持たない内部データへのビュー（参照）です。そのため、割り当て元の `BufferArena` をリセット（`reset()`）、クリア、またはスコープ外で破棄した場合、これらのビューはすべて無効化されます。
+
+```cpp
+akkaradb::core::BufferArena arena;
+std::span<const uint8_t> value;
+
+if (db->getIntoArena(bytes("user:1"), arena, value)) {
+    // データを安全に持ち出すために vector へディープコピー
+    std::vector<uint8_t> owned{value.begin(), value.end()};
+    arena.reset();
+
+    // owned は引き続き安全にアクセス可能（value のビューは無効）
+}
+
+```
+
+非同期リクエストの境界、スレッド間、または独立した API 境界をまたいで値を引き渡す場合は、`std::vector<uint8_t>` にコピーして所有権を移譲するのが安全です。arena を利用したビューのハンドリングは、ライフタイムが明確に閉じているローカルなループ処理や短寿命なリクエスト処理に向いています。
+
+## フラッシュ、永続化同期、クローズ
+
+エンジンは、明示的にリソースのクリーンアップと終了処理を行うことができます。
+
+```cpp
+db->forceFlush();
+db->forceSync();
+db->close();
+
+```
+
+`forceFlush()` は MemTable の全内容を強制的に SST（Sorted String Table）へ書き出します。`forceSync()` は WAL（Write-Ahead Log）やマニフェスト、バージョン履歴などの未同期な永続状態をディスクに完全にフラッシュ（fsync）します。`close()` はエンジンを安全にシャットダウンする API で、複数回呼び出しても安全です。シャットダウン時の挙動は設定オプションの `runtime.forceFlushOnClose` および `runtime.forceSyncOnClose` に従います。
+
+単体テストやベンチマーク環境のフィクスチャ（Setup/Teardown）では、これらを明示的に呼び出すことでリソースのライフタイムを厳密に制御できます。本番環境の運用では、`forceSync()` を「一連の重要な書き込みを、次のビジネスロジックに進む前に完全に永続化したい」というトランザクション風のチェックポイント境界として活用します。
+
+## バージョン履歴（タイムトラベルクエリ）
+
+履歴管理機能はデフォルトでは無効化されています。この機能を使用するには、エンジンをオープンする前に `components.versionLogEnabled` を明示的に有効に設定する必要があります。
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/history";
+opts.components.versionLogEnabled = true;
+opts.vlog.syncMode = engine::vlog::VLogSyncMode::ASYNC;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+
+```
+
+このオプションを有効にすると、キーに対するすべての変更操作（Put/Remove）が内部のバージョンログに履歴として記録されます。
+
+```cpp
+db->put(bytes("profile:1"), bytes("v1"));
+db->put(bytes("profile:1"), bytes("v2"));
+
+auto history = db->history(bytes("profile:1"));
+if (!history.empty()) {
+    // 最初の変更時のシーケンス番号を取得
+    const uint64_t firstSeq = history.front().seq;
+
+    // 特定のシーケンス時点の過去データをピンポイントで読み取り
+    auto oldValue = db->getAt(bytes("profile:1"), firstSeq);
+
+    // 対象キーのみを過去の特定バージョンにロールバック
+    db->rollbackKey(bytes("profile:1"), firstSeq);
+}
+
+```
+
+`rollbackKey()` は指定した単一のキーのみを過去の状態に巻き戻します。一方で、`rollbackTo()` はエンジン全体のデータ状態を指定したシーケンス番号時点まで一括でロールバックするため、極めて影響範囲の広い破壊的な操作となります。運用の意図が明確な保守フェーズ等でのみ慎重に使用してください。
+
+なお、バージョンログが無効な環境では、`history()` は常に空の vector を返し、`getAt()` による過去データの復元やロールバック操作は行えません。
+
+## 大規模データ（Blob 値）の格納
+
+`blob.thresholdBytes` を設定することで、一定サイズ以上の大きなデータ（ペイロード）をインラインの LSM-Tree から切り離し、外部の Blob ストレージへ自動的に退避させることができます。これにより、ライトアンプリフィケーション（書き込み増幅）を抑え、キー値スキャンのパフォーマンスを高く維持できます。
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/blob";
+opts.blob.thresholdBytes = 8ULL * 1024ULL; // 8KB しきい値
+
+auto db = engine::AkkEngine::open(std::move(opts));
+db->put(bytes("file:1"), bytes("large payload...")); // 8KB以上なら自動でBlob化
+
+```
+
+外部に隔離され、どのキーからも参照されなくなった孤立 Blob データは、`runBlobGc()` を呼び出すことでバックグラウンドでガベージコレクション（回収）できます。
+
+```cpp
+db->runBlobGc();
+
+```
+
+> **⚠️ 重大な制約**
+> バージョン履歴（VersionLog）が有効化されている状態では、Blob GC を実行することはできません。過去の歴史バージョンが、古い Blob 領域のデータを参照している可能性があるためです。この 2 つの機能の同時併用および実行は、エンジン内部のバリデーションによって明示的に拒否（エラー）されます。
+
+## 統計情報の取得（メトリクス）
+
+`stats()` を呼び出すことで、エンジンの内部カウンタや各サブシステムの状態を表すスナップショット（メトリクス）を取得できます。
+
+```cpp
+auto stats = db->stats();
+
+const auto puts = stats.putsTotal;
+const auto gets = stats.getsTotal;
+const auto memtableBytes = stats.memtable.approxBytes;
+
+if (stats.wal.enabled) {
+    const auto walBytes = stats.wal.bytesWritten;
+}
+
+if (stats.sst.enabled) {
+    const auto fileCount = stats.sst.fileCount;
+}
+
+```
+
+モニタリングやチューニングで特によく参照される主要なフィールドは以下の通りです。
+
+| フィールド | 概要 |
+| --- | --- |
+| `currentSeq` | エンジンの現在の最新シーケンス番号 |
+| `putsTotal`, `removesTotal`, `getsTotal` | 最上位レイヤーでの各操作の実行総数 |
+| `getsMemtableHit`, `getsSstHit`, `getsMiss` | 読み取りパスにおける各コンポーネントのヒット/ミス数 |
+| `memtable.approxBytes` | MemTable がメモリ上で占有している概算バイト数 |
+| `wal.bytesWritten`, `wal.syncsExecuted` | WAL の総書き込みバイト数および fsync 同期の実行回数 |
+| `sst.fileCount`, `sst.levels` | 永続化された SST ファイルの総数および LSM-Tree の現在の階層の深さ |
+| `blob.bytesOnDisk`, `blob.gcCycles` | ディスク上の総 Blob 容量および Blob GC の実行サイクル回数 |
+| `vlog.indexedEntries`, `vlog.rollbackEntries` | バージョン履歴にインデックスされたエントリ数およびロールバック実行数 |
+
+## 操作 API リファレンス
+
+| 操作機能 | 実行 API | 挙動・詳細 |
+| --- | --- | --- |
+| オープン | `AkkEngine::open(options)` | エンジンインスタンスを新規作成、または既存のディスクデータから復旧 |
+| データの書込 | `put(key, value)` | 指定したキーで値を永続化、または既存データを上書き |
+| ヒント付書込 | `putHinted(key, value, fp64, miniKey)` | 呼び出し側でフィンガープリント等の計算を済ませているホットパス用の高速化書き込み |
+| 一括書込 | `putBatch(entries)` | 複数のキー/値ペアをアトミックに一括書き込み |
+| データの削除 | `remove(key)` | 対象キーに削除マーカー（Tombstone）を論理書き込み |
+| ヒント付削除 | `removeHinted(key, fp64, miniKey)` | フィンガープリント計算済みの最適化された削除操作 |
+| 単一読取 | `get(key)` | キーを検索し、`std::optional<std::vector<uint8_t>>` を返却 |
+| 一括読取 | `getBatch(keys)` | 複数キーを同時検索し、それぞれの結果を `BatchGetResult` 配列で返却 |
+| vector読取 | `getInto(key, out)` | 呼び出し側が所有する既存の vector バッファを再利用してアロケーションを抑える読取 |
+| Arena読取 | `getIntoArena(key, arena, out)` | `BufferArena` のライフタイムに紐づく、アロケーションフリーなビュー（span）を返却 |
+| 存在確認 | `exists(key)` | 対象のキーがアクティブに存在しているかを高速に判定 |
+| 範囲件数 | `count(start, end)` | 指定した半開区間内に含まれる有効なキーの総数をカウント |
+| 範囲スキャン | `scan(arena, start, end)` | 条件にマッチするキー/値の行セットを反復するためのイテレータビューを生成 |
+| 履歴取得 | `history(key)` | VersionLog 有効時、対象キーのすべての変更履歴バージョンの一覧を返却 |
+| 過去時点読取 | `getAt(key, seq)` | 特定のシーケンス番号時点における過去の値をピンポイントで読取 |
+| キー修復 | `rollbackKey(key, seq)` | 単一の特定キーのみを過去の指定シーケンス時点の状態に巻き戻す |
+| 全体修復 | `rollbackTo(seq)` | データベース全体の全データを、指定した過去のシーケンス時点の状態に一括ロールバック |
+| 統計情報 | `stats()` | エンジン内部の各種カウンタやメトリクスを保持する構造体を返却 |
+| メモリ強制同期 | `forceFlush()` | 揮発性の MemTable の内容を、ディスク上の SST ファイルへ即座に強制フラッシュ |
+| ディスク完全同期 | `forceSync()` | WAL や管理メタデータなどの未同期データを物理ディスクへ完全同期（fsync） |
+| 領域回収 | `runBlobGc()` | どのキーからも参照されなくなった孤立 Blob 領域をスキャンしてガベージコレクションを実行 |
+| クローズ | `close()` | エンジンを安全にシャットダウンし、各種ファイルハンドルを解放（複数回呼び出し可） |
+
+## エラーハンドリングの設計
+
+「対象データが存在しない」といった、アプリケーション層で発生することが期待される正常系の準エラーケースは、例外ではなく一貫して**戻り値のステータス**で表現されます。
+
+* `get()` や `getAt()` などの読取操作は、データ不在時に `std::nullopt` を返します。
+* `getInto()` や `getIntoArena()` は、データ不在時に `false` を返します。
+* 条件に合致するデータがない場合のスキャン（`scan()`）や履歴取得（`history()`）は、クラッシュせず単に空のイテレータや空の vector を返します。
+
+一方で、プログラムの不正な利用（ロジックエラー）や、ハードウェア・ストレージ層の致命的な障害は例外（Exception）としてスローされます。
+具体的には、不正な組み合わせの設定オプション、ディスクの満杯や権限不足に伴う I/O 障害、チェックサム不一致（CRCエラー）によるデータ破損の検知、すでに `close()` されたエンジンインスタンスへのアクセス、および「バージョン履歴機能が有効な状態での Blob GC」といったデータ消失リスクのある危険な操作の実行などがこれに該当します。
+
+## 最小限の自己完結コード例（スタンドアロン・サンプル）
+
+```cpp
+#include "akk/engine/AkkEngine.hpp"
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace engine = akkaradb::engine;
+
+std::span<const uint8_t> bytes(std::string_view value) {
+    return {
+        reinterpret_cast<const uint8_t*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(const std::vector<uint8_t>& value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+
+int main() {
+    // 1. 各種オプションの設定
+    engine::AkkEngineOptions opts;
+    opts.paths.dataDir = "data";
+    opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+    opts.components.versionLogEnabled = true; // 履歴を有効化
+    opts.blob.thresholdBytes = 32ULL * 1024ULL; // 32KB
+
+    // 2. エンジンのオープン
+    auto db = engine::AkkEngine::open(std::move(opts));
+
+    // 3. 基本的なデータ書き込み
+    db->put(bytes("user:1"), bytes("Alice"));
+    db->put(bytes("user:2"), bytes("Bob"));
+
+    // 4. 単一キーの読み取り
+    if (auto value = db->get(bytes("user:1"))) {
+        const std::string name = text(*value);
+    }
+
+    // 5. Arena を使用した高速な範囲スキャン
+    akkaradb::core::BufferArena arena;
+    auto rows = db->scan(arena, bytes("user:"), bytes("user;"));
+    for (auto it = rows.begin(); !(it == rows.end()); ++it) {
+        const auto& row = *it;
+        const auto key = row.key;
+        const auto value = row.value;
+    }
+
+    // 6. 履歴機能を利用した過去データの参照
+    auto history = db->history(bytes("user:1"));
+    if (!history.empty()) {
+        auto oldValue = db->getAt(bytes("user:1"), history.front().seq);
+    }
+
+    // 7. 同期と安全なシャットダウン
+    db->forceSync();
+    db->close();
+}
+
+```
+
+"""
+
+with open("low_level_api_guide.mdoc", "w", encoding="utf-8") as f:
+f.write(content)
+
+print("File generated successfully.")

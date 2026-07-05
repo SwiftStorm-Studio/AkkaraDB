@@ -358,18 +358,14 @@ namespace akkaradb::engine {
             (void)recovery;
         }
 
-        if (impl.opts.components.walEnabled) {
-            impl.walWriter = wal::WalWriter::create(impl.opts.wal);
-        }
+        if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
 
         if (impl.opts.components.blobEnabled) {
             impl.blobManager = blob::BlobManager::create(impl.opts.blob);
             impl.blobManager->start();
         }
 
-        if (impl.opts.components.versionLogEnabled) {
-            impl.versionLog = vlog::VersionLog::create(impl.opts.vlog);
-        }
+        if (impl.opts.components.versionLogEnabled) { impl.versionLog = vlog::VersionLog::create(impl.opts.vlog); }
 
         if (impl.opts.components.clusterEnabled) {
             cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
@@ -397,8 +393,11 @@ namespace akkaradb::engine {
             };
 
             if (!cluster::clusterRuntimeFactoryAvailable() && !cluster::loadClusterRuntimeBackend(impl.opts.cluster.runtimeBackendPath)) {
+                const auto detail = cluster::lastClusterRuntimeBackendLoadError();
                 throw std::runtime_error(
-                    "AkkEngine: cluster component is enabled, but the cluster runtime backend library is not available"
+                    detail.empty()
+                        ? "AkkEngine: cluster component is enabled, but the cluster runtime backend library is not available"
+                        : "AkkEngine: cluster component is enabled, but the cluster runtime backend library is not available: " + detail
                 );
             }
             impl.clusterRuntime = cluster::createClusterRuntime(
@@ -413,7 +412,12 @@ namespace akkaradb::engine {
 
         if (impl.opts.components.apiEnabled) {
             if (!server::akkApiServerFactoryAvailable() && !server::loadAkkApiServerBackend(impl.opts.api.serverBackendPath)) {
-                throw std::runtime_error("AkkEngine: API server component is enabled, but the API server backend library is not available");
+                const auto detail = server::lastAkkApiServerBackendLoadError();
+                throw std::runtime_error(
+                    detail.empty()
+                        ? "AkkEngine: API server component is enabled, but the API server backend library is not available"
+                        : "AkkEngine: API server component is enabled, but the API server backend library is not available: " + detail
+                );
             }
             impl.apiServer = server::createAkkApiServer(*engine, impl.opts.api);
             impl.apiServer->start();

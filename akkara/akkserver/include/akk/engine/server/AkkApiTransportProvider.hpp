@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 
 namespace akkaradb::engine::server {
     class AKDB_API IAkkApiTransport {
@@ -31,6 +32,7 @@ namespace akkaradb::engine::server {
         AkkEngineOptions::ApiBackend backend,
         const std::filesystem::path& libraryPath = {}
     );
+    [[nodiscard]] AKDB_API std::string lastAkkApiTransportBackendLoadError(AkkEngineOptions::ApiBackend backend);
     [[nodiscard]] AKDB_API std::unique_ptr<IAkkApiTransport> createAkkApiTransport(
         AkkEngineOptions::ApiBackend backend,
         AkkEngine& engine,

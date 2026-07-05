@@ -11,13 +11,13 @@
 #pragma once
 
 [[nodiscard]] static uint32_t readLe32(const uint8_t* src) noexcept {
-    return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) | (static_cast<uint32_t>(src[2]) << 16) | (
-        static_cast<uint32_t>(src[3]) << 24);
+    return static_cast<uint32_t>(src[0]) | (static_cast<uint32_t>(src[1]) << 8) | (static_cast<uint32_t>(src[2]) << 16) | (static_cast<
+        uint32_t>(src[3]) << 24);
 }
 
 [[nodiscard]] static uint32_t readBe32(const uint8_t* src) noexcept {
-    return (static_cast<uint32_t>(src[0]) << 24) | (static_cast<uint32_t>(src[1]) << 16) | (static_cast<uint32_t>(src[2]) << 8)
-        | static_cast<uint32_t>(src[3]);
+    return (static_cast<uint32_t>(src[0]) << 24) | (static_cast<uint32_t>(src[1]) << 16) | (static_cast<uint32_t>(src[2]) << 8) |
+        static_cast<uint32_t>(src[3]);
 }
 
 template <typename Field, typename Out>
@@ -62,9 +62,7 @@ void makePkKey(const PK& pk, ArenaByteBuffer& out) const {
 
 template <typename Key>
 static void encodePrimaryKeyBytes(const Key& pk, ArenaByteBuffer& out) {
-    if constexpr (std::is_integral_v<Key> && !std::is_same_v<Key, bool> && sizeof(Key) <= 8) {
-        encodeSortableIntegral(pk, out);
-    }
+    if constexpr (std::is_integral_v<Key> && !std::is_same_v<Key, bool> && sizeof(Key) <= 8) { encodeSortableIntegral(pk, out); }
     else { binpack::BinPack::encodeInto(pk, out); }
 }
 
@@ -83,9 +81,7 @@ static void encodePrimaryKeyBytes(const Key& pk, ArenaByteBuffer& out) {
 }
 
 [[nodiscard]] static PK decodePrimaryKeyBytes(std::span<const uint8_t> pkBytes) {
-    if constexpr (std::is_integral_v<PK> && !std::is_same_v<PK, bool> && sizeof(PK) <= 8) {
-        return decodeSortableIntegral<PK>(pkBytes);
-    }
+    if constexpr (std::is_integral_v<PK> && !std::is_same_v<PK, bool> && sizeof(PK) <= 8) { return decodeSortableIntegral<PK>(pkBytes); }
     else { return binpack::BinPack::decode<PK>(pkBytes); }
 }
 

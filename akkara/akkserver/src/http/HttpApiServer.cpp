@@ -129,8 +129,8 @@ namespace akkaradb::engine::server {
         }
 
         void encodeScanStreamFrame(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out) {
-            const uint32_t payloadBytes =
-                static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.size());
+            const uint32_t payloadBytes = static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.
+                size());
             appendStreamFrameHeader(out, kHttpStreamFrameItem, payloadBytes);
             appendPlain(out, static_cast<uint16_t>(record.key.size()));
             appendPlain(out, static_cast<uint32_t>(record.value.size()));
@@ -139,9 +139,8 @@ namespace akkaradb::engine::server {
         }
 
         void encodeHistoryStreamFrame(const VersionEntry& entry, std::vector<uint8_t>& out) {
-            const uint32_t payloadBytes =
-                static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) + sizeof(uint32_t) +
-                                      sizeof(uint32_t) + entry.value.size());
+            const uint32_t payloadBytes = static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) +
+                sizeof(uint32_t) + sizeof(uint32_t) + entry.value.size());
             appendStreamFrameHeader(out, kHttpStreamFrameItem, payloadBytes);
             appendPlain(out, entry.seq);
             appendPlain(out, entry.sourceNodeId);
@@ -214,6 +213,142 @@ namespace akkaradb::engine::server {
                 appendPlain(out, static_cast<uint32_t>(result.value.size()));
                 appendBytes(out, result.value);
             }
+        }
+
+        void encodeStatsPayload(const EngineStats& stats, std::vector<uint8_t>& out) {
+            out.clear();
+            appendPlain(out, stats.currentSeq);
+            appendPlain(out, stats.nodeId);
+            appendPlain(out, stats.putsTotal);
+            appendPlain(out, stats.removesTotal);
+            appendPlain(out, stats.getsTotal);
+            appendPlain(out, stats.getsMemtableHit);
+            appendPlain(out, stats.getsSstHit);
+            appendPlain(out, stats.getsMiss);
+            appendPlain(out, stats.existsTotal);
+            appendPlain(out, stats.scansTotal);
+            appendPlain(out, stats.blobPutsTotal);
+
+            appendPlain(out, static_cast<uint8_t>(stats.api.enabled));
+            appendPlain(out, static_cast<uint8_t>(stats.api.httpEnabled));
+            appendPlain(out, static_cast<uint8_t>(stats.api.httpTlsEnabled));
+            appendPlain(out, stats.api.httpPort);
+            appendPlain(out, stats.api.httpMaxBatchItems);
+            appendPlain(out, stats.api.httpMaxScanItems);
+            appendPlain(out, stats.api.httpMaxHistoryEntries);
+            appendPlain(out, stats.api.httpMaxContentLength);
+            appendPlain(out, stats.api.httpConnectionsAcceptedTotal);
+            appendPlain(out, stats.api.httpConnectionsClosedTotal);
+            appendPlain(out, stats.api.httpConnectionsActive);
+            appendPlain(out, stats.api.httpRequestsTotal);
+            appendPlain(out, stats.api.httpResponsesTotal);
+            appendPlain(out, stats.api.httpBytesReceivedTotal);
+            appendPlain(out, stats.api.httpBytesSentTotal);
+            appendPlain(out, stats.api.httpProtocolErrorsTotal);
+            appendPlain(out, stats.api.httpErrorsTotal);
+            appendPlain(out, stats.api.httpBatchPutItemsTotal);
+            appendPlain(out, stats.api.httpBatchGetItemsTotal);
+            appendPlain(out, static_cast<uint8_t>(stats.api.tcpEnabled));
+            appendPlain(out, static_cast<uint8_t>(stats.api.tcpTlsEnabled));
+            appendPlain(out, stats.api.tcpIoBackend);
+            appendPlain(out, stats.api.tcpWorkerThreads);
+            appendPlain(out, stats.api.tcpAcceptQueueLimit);
+            appendPlain(out, stats.api.tcpAcceptQueueTimeoutMs);
+            appendPlain(out, stats.api.tcpListenBacklog);
+            appendPlain(out, stats.api.tcpReadTimeoutMs);
+            appendPlain(out, stats.api.tcpWriteTimeoutMs);
+            appendPlain(out, stats.api.tcpConnectionsAcceptedTotal);
+            appendPlain(out, stats.api.tcpConnectionsClosedTotal);
+            appendPlain(out, stats.api.tcpConnectionsActive);
+            appendPlain(out, stats.api.tcpAcceptQueueDepth);
+            appendPlain(out, stats.api.tcpAcceptQueuePeakDepth);
+            appendPlain(out, stats.api.tcpAcceptQueueRejectedTotal);
+            appendPlain(out, stats.api.tcpAcceptQueueExpiredTotal);
+            appendPlain(out, stats.api.tcpRequestsTotal);
+            appendPlain(out, stats.api.tcpResponsesTotal);
+            appendPlain(out, stats.api.tcpBytesReceivedTotal);
+            appendPlain(out, stats.api.tcpBytesSentTotal);
+            appendPlain(out, stats.api.tcpProtocolErrorsTotal);
+            appendPlain(out, stats.api.tcpCrcErrorsTotal);
+            appendPlain(out, stats.api.tcpPipelineBatchesTotal);
+            appendPlain(out, stats.api.tcpBackpressureFlushesTotal);
+            appendPlain(out, stats.api.tcpBackpressureDisconnectsTotal);
+            appendPlain(out, stats.api.tcpBatchPutItemsTotal);
+            appendPlain(out, stats.api.tcpBatchGetItemsTotal);
+            appendPlain(out, static_cast<uint8_t>(stats.api.grpcEnabled));
+            appendPlain(out, static_cast<uint8_t>(stats.api.grpcTlsEnabled));
+            appendPlain(out, stats.api.grpcPort);
+            appendPlain(out, stats.api.grpcWorkerThreads);
+            appendPlain(out, stats.api.grpcCompletionQueues);
+            appendPlain(out, stats.api.grpcMinPollers);
+            appendPlain(out, stats.api.grpcMaxPollers);
+            appendPlain(out, stats.api.grpcMaxConcurrentStreams);
+            appendPlain(out, stats.api.grpcResourceQuotaBytes);
+            appendPlain(out, stats.api.grpcMaxBatchItems);
+            appendPlain(out, stats.api.grpcMaxScanItems);
+            appendPlain(out, stats.api.grpcMaxHistoryEntries);
+            appendPlain(out, stats.api.grpcRequestsTotal);
+            appendPlain(out, stats.api.grpcResponsesTotal);
+            appendPlain(out, stats.api.grpcActiveRequests);
+            appendPlain(out, stats.api.grpcErrorsTotal);
+            appendPlain(out, stats.api.grpcBatchPutItemsTotal);
+            appendPlain(out, stats.api.grpcBatchGetItemsTotal);
+
+            appendPlain(out, stats.memtable.shardCount);
+            appendPlain(out, stats.memtable.thresholdBytesPerShard);
+            appendPlain(out, stats.memtable.approxBytes);
+            appendPlain(out, stats.memtable.putsApplied);
+            appendPlain(out, stats.memtable.removesApplied);
+            appendPlain(out, stats.memtable.flushesCompleted);
+            appendPlain(out, stats.memtable.bytesFlushed);
+
+            appendPlain(out, static_cast<uint8_t>(stats.wal.enabled));
+            appendPlain(out, stats.wal.shardCount);
+            appendPlain(out, stats.wal.entriesWritten);
+            appendPlain(out, stats.wal.bytesWritten);
+            appendPlain(out, stats.wal.batchesFlushed);
+            appendPlain(out, stats.wal.syncsExecuted);
+            appendPlain(out, stats.wal.segmentRotations);
+
+            appendPlain(out, static_cast<uint8_t>(stats.blob.enabled));
+            appendPlain(out, stats.blob.thresholdBytes);
+            appendPlain(out, stats.blob.blobsWritten);
+            appendPlain(out, stats.blob.bytesUncompressed);
+            appendPlain(out, stats.blob.bytesOnDisk);
+            appendPlain(out, stats.blob.blobsDeleted);
+            appendPlain(out, stats.blob.gcCycles);
+
+            appendPlain(out, static_cast<uint8_t>(stats.sst.enabled));
+            appendPlain(out, static_cast<uint32_t>(stats.sst.levels.size()));
+            for (const auto& level : stats.sst.levels) {
+                appendPlain(out, static_cast<int32_t>(level.level));
+                appendPlain(out, static_cast<uint64_t>(level.fileCount));
+                appendPlain(out, level.bytes);
+                appendPlain(out, level.budgetBytes);
+            }
+            appendPlain(out, static_cast<uint64_t>(stats.sst.fileCount));
+            appendPlain(out, stats.sst.bytes);
+            appendPlain(out, static_cast<uint64_t>(stats.sst.l0FileCount));
+            appendPlain(out, static_cast<uint8_t>(stats.sst.compactionPending));
+            appendPlain(out, stats.sst.compactionsCompleted);
+            appendPlain(out, stats.sst.filesCompacted);
+            appendPlain(out, stats.sst.bytesCompactedIn);
+            appendPlain(out, stats.sst.bytesCompactedOut);
+            appendPlain(out, stats.sst.l0Stalls);
+
+            appendPlain(out, static_cast<uint8_t>(stats.vlog.enabled));
+            appendPlain(out, stats.vlog.syncMode);
+            appendPlain(out, stats.vlog.groupN);
+            appendPlain(out, stats.vlog.groupMicros);
+            appendPlain(out, stats.vlog.groupBytes);
+            appendPlain(out, stats.vlog.asyncMaxPendingBytes);
+            appendPlain(out, stats.vlog.indexedKeys);
+            appendPlain(out, stats.vlog.indexedEntries);
+            appendPlain(out, stats.vlog.rollbackEntries);
+            appendPlain(out, stats.vlog.pendingWrites);
+            appendPlain(out, stats.vlog.pendingBytes);
+            appendPlain(out, stats.vlog.durableBytes);
+            appendPlain(out, static_cast<uint8_t>(stats.vlog.flushThreadRunning));
         }
     }
 
@@ -488,28 +623,26 @@ namespace akkaradb::engine::server {
         uint64_t& bytesSent
     ) {
         const std::string header = "HTTP/1.1 " + std::to_string(statusCode) + " " + std::string{reasonPhrase(statusCode)} + "\r\n"
-            "Content-Type: " + std::string{contentType} + "\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "X-Akkara-Stream-Version: 1\r\n"
-            "\r\n";
+            "Content-Type: " + std::string{contentType} + "\r\n" "Transfer-Encoding: chunked\r\n" "X-Akkara-Stream-Version: 1\r\n" "\r\n";
         if (!connection.sendAll(reinterpret_cast<const uint8_t*>(header.data()), header.size())) { return false; }
         bytesSent += header.size();
         return true;
     }
 
     bool HttpApiServer::sendChunk(detail::Connection& connection, std::span<const uint8_t> body, uint64_t& bytesSent) {
-        std::array<char, 32> sizeBuffer{};
+        std::array < char, 32 > sizeBuffer{};
         const auto result = std::to_chars(sizeBuffer.data(), sizeBuffer.data() + sizeBuffer.size(), body.size(), 16);
         if (result.ec != std::errc{}) { return false; }
 
         static constexpr std::string_view kCrLf = "\r\n";
         const size_t sizeWidth = static_cast<size_t>(result.ptr - sizeBuffer.data());
-        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(sizeBuffer.data()), sizeWidth) ||
-            !connection.sendAll(reinterpret_cast<const uint8_t*>(kCrLf.data()), kCrLf.size()) ||
-            (!body.empty() && !connection.sendAll(body.data(), body.size())) ||
-            !connection.sendAll(reinterpret_cast<const uint8_t*>(kCrLf.data()), kCrLf.size())) {
-            return false;
-        }
+        if (!connection.sendAll(reinterpret_cast<const uint8_t*>(sizeBuffer.data()), sizeWidth) || !connection.sendAll(
+            reinterpret_cast<const uint8_t*>(kCrLf.data()),
+            kCrLf.size()
+        ) || (!body.empty() && !connection.sendAll(body.data(), body.size())) || !connection.sendAll(
+            reinterpret_cast<const uint8_t*>(kCrLf.data()),
+            kCrLf.size()
+        )) { return false; }
 
         bytesSent += sizeWidth + kCrLf.size() + body.size() + kCrLf.size();
         return true;
@@ -533,8 +666,9 @@ namespace akkaradb::engine::server {
     bool HttpApiServer::route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer) {
         requestsTotal_.fetch_add(1, std::memory_order_relaxed);
 
-        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/get" || request.path == "/v1/remove" || request.path ==
-            "/v1/getAt" || request.path == "/v1/exists" || request.path == "/v1/history" || request.path == "/v1/rollbackKey";
+        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/putHinted" || request.path == "/v1/get" ||
+            request.path == "/v1/remove" || request.path == "/v1/removeHinted" || request.path == "/v1/getAt" || request.path ==
+            "/v1/exists" || request.path == "/v1/history" || request.path == "/v1/rollbackKey";
         const std::string rawKey = queryParam(request.query, "key");
         if (needsKey && rawKey.empty()) {
             sendEmpty(connection, 400);
@@ -549,6 +683,16 @@ namespace akkaradb::engine::server {
                 engine_.put(keySpan, std::span<const uint8_t>{request.body.data(), request.body.size()});
                 sendEmpty(connection, 204);
             }
+            else if (request.path == "/v1/putHinted" && request.method == "POST") {
+                uint64_t fp64 = 0;
+                uint64_t miniKey = 0;
+                if (!readU64Text(queryParam(request.query, "fp64"), fp64) || !readU64Text(queryParam(request.query, "miniKey"), miniKey)) {
+                    sendEmpty(connection, 400);
+                    return request.keepAlive;
+                }
+                engine_.putHinted(keySpan, std::span<const uint8_t>{request.body.data(), request.body.size()}, fp64, miniKey);
+                sendEmpty(connection, 204);
+            }
             else if (request.path == "/v1/get" && request.method == "GET") {
                 valueBuffer.clear();
                 if (engine_.getInto(keySpan, valueBuffer)) {
@@ -558,6 +702,16 @@ namespace akkaradb::engine::server {
             }
             else if (request.path == "/v1/remove" && request.method == "DELETE") {
                 engine_.remove(keySpan);
+                sendEmpty(connection, 204);
+            }
+            else if (request.path == "/v1/removeHinted" && request.method == "DELETE") {
+                uint64_t fp64 = 0;
+                uint64_t miniKey = 0;
+                if (!readU64Text(queryParam(request.query, "fp64"), fp64) || !readU64Text(queryParam(request.query, "miniKey"), miniKey)) {
+                    sendEmpty(connection, 400);
+                    return request.keepAlive;
+                }
+                engine_.removeHinted(keySpan, fp64, miniKey);
                 sendEmpty(connection, 204);
             }
             else if (request.path == "/v1/getAt" && request.method == "GET") {
@@ -607,14 +761,11 @@ namespace akkaradb::engine::server {
                 );
                 if (stream) {
                     uint64_t sentBytes = 0;
-                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.scan-stream", sentBytes) ||
-                        !sendChunk(
-                            connection,
-                            std::span<const uint8_t>{kHttpScanStreamPrelude.data(), kHttpScanStreamPrelude.size()},
-                            sentBytes
-                        )) {
-                        return false;
-                    }
+                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.scan-stream", sentBytes) || !sendChunk(
+                        connection,
+                        std::span<const uint8_t>{kHttpScanStreamPrelude.data(), kHttpScanStreamPrelude.size()},
+                        sentBytes
+                    )) { return false; }
 
                     uint32_t emitted = 0;
                     bool truncated = false;
@@ -656,14 +807,11 @@ namespace akkaradb::engine::server {
                 auto entries = engine_.history(keySpan);
                 if (stream) {
                     uint64_t sentBytes = 0;
-                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.history-stream", sentBytes) ||
-                        !sendChunk(
-                            connection,
-                            std::span<const uint8_t>{kHttpHistoryStreamPrelude.data(), kHttpHistoryStreamPrelude.size()},
-                            sentBytes
-                        )) {
-                        return false;
-                    }
+                    if (!sendChunkedResponseHeader(connection, 200, "application/vnd.akkaradb.history-stream", sentBytes) || !sendChunk(
+                        connection,
+                        std::span<const uint8_t>{kHttpHistoryStreamPrelude.data(), kHttpHistoryStreamPrelude.size()},
+                        sentBytes
+                    )) { return false; }
 
                     const uint32_t maxEntries = maxHistoryEntries();
                     uint32_t emitted = 0;
@@ -767,16 +915,12 @@ namespace akkaradb::engine::server {
                 engine_.forceFlush();
                 sendEmpty(connection, 204);
             }
+            else if (request.path == "/v1/runBlobGc" && request.method == "POST") {
+                engine_.runBlobGc();
+                sendEmpty(connection, 204);
+            }
             else if (request.path == "/v1/stats" && request.method == "GET") {
-                const auto stats = engine_.stats();
-                valueBuffer.clear();
-                appendPlain(valueBuffer, stats.currentSeq);
-                appendPlain(valueBuffer, stats.nodeId);
-                appendPlain(valueBuffer, stats.putsTotal);
-                appendPlain(valueBuffer, stats.removesTotal);
-                appendPlain(valueBuffer, stats.getsTotal);
-                appendPlain(valueBuffer, stats.existsTotal);
-                appendPlain(valueBuffer, stats.scansTotal);
+                encodeStatsPayload(engine_.stats(), valueBuffer);
                 sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
             }
             else if (request.path == "/v1/ping" && request.method == "GET") {

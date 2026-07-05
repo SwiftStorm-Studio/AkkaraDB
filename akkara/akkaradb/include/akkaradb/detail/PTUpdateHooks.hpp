@@ -25,8 +25,8 @@ static void invokeFieldUpdateHandler(Handler& handler, const Entity& oldEntity, 
     }
     else if constexpr (std::invocable<Handler&, const Field&, Field&>) { handler(oldEntity.*FieldPtr, newEntity.*FieldPtr); }
     else if constexpr (std::invocable<Handler&, const Entity&, Entity&>) { handler(oldEntity, newEntity); }
-    else if constexpr (std::invocable<Handler&, const decltype(oldEntity.*FieldPtr)&, const decltype(newEntity.*FieldPtr)&,
-        const Entity&, const Entity&>) { handler(oldEntity.*FieldPtr, newEntity.*FieldPtr, oldEntity, newEntity); }
+    else if constexpr (std::invocable<Handler&, const decltype(oldEntity.*FieldPtr)&, const decltype(newEntity.*FieldPtr)&, const Entity&,
+        const Entity&>) { handler(oldEntity.*FieldPtr, newEntity.*FieldPtr, oldEntity, newEntity); }
     else if constexpr (std::invocable<Handler&, const decltype(oldEntity.*FieldPtr)&, const decltype(newEntity.*FieldPtr)&>) {
         handler(oldEntity.*FieldPtr, newEntity.*FieldPtr);
     }
@@ -35,8 +35,8 @@ static void invokeFieldUpdateHandler(Handler& handler, const Entity& oldEntity, 
         static_assert(
             !sizeof(Handler),
             "onUpdate handler must accept one of: " "(oldField, Field& newField), "
-            "(oldField, Field& newField, oldEntity, Entity& newEntity), " "(oldEntity, Entity& newEntity), "
-            "(oldField, newField), " "(oldField, newField, oldEntity, newEntity), " "or (oldEntity, newEntity)"
+            "(oldField, Field& newField, oldEntity, Entity& newEntity), " "(oldEntity, Entity& newEntity), " "(oldField, newField), "
+            "(oldField, newField, oldEntity, newEntity), " "or (oldEntity, newEntity)"
         );
     }
 }

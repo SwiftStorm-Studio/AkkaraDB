@@ -1,0 +1,457 @@
+---
+title: Low-Level API
+description: Direct usage guide for akkaradb::engine::AkkEngine.
+---
+
+The low-level API is `akkaradb::engine::AkkEngine`. It is a raw byte-oriented key/value engine: keys and values are passed as `std::span<const uint8_t>`, and the engine does not know your schema.
+
+Use this layer when you want direct control over key layout, value encoding, durability options, scans, history, and storage-engine behavior.
+
+## When To Use It
+
+Choose `AkkEngine` directly when:
+
+- You are building a server, JNI bridge, or protocol layer on top of byte buffers.
+- You already have a binary key/value format and do not want typed table encoding.
+- You need to test WAL, MemTable, SST, Blob, VersionLog, or scan behavior directly.
+- You want explicit control over durability and storage components.
+
+For application code built around C++ structs, the high-level `AkkaraDB` / `PackedTable` API will usually be easier to read.
+
+## Include And Namespace
+
+```cpp
+#include "akk/engine/AkkEngine.hpp"
+
+#include <array>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace engine = akkaradb::engine;
+```
+
+The public low-level API is C++23-oriented and uses `std::span` heavily. A small conversion helper keeps examples readable:
+
+```cpp
+std::span<const uint8_t> bytes(std::string_view value) {
+    return {
+        reinterpret_cast<const uint8_t*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(std::span<const uint8_t> value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(const std::vector<uint8_t>& value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+```
+
+`bytes()` returns a view. The underlying string or buffer must remain alive until the engine call has consumed it. Passing string literals is fine; passing a span into a destroyed temporary is not.
+
+## Open An Engine
+
+For an in-memory smoke test, disable the persistent components:
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.components.walEnabled = false;
+opts.components.blobEnabled = false;
+opts.components.manifestEnabled = false;
+opts.components.sstEnabled = false;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+```
+
+For a normal embedded database, set `paths.dataDir`. If individual paths are empty, the engine derives subpaths from `dataDir`:
+
+| Option | Default when `dataDir` is set |
+|---|---|
+| `paths.walDir` | `<dataDir>/wal` |
+| `paths.blobDir` | `<dataDir>/blobs` |
+| `paths.sstDir` | `<dataDir>/sstable` |
+| `paths.manifestPath` | `<dataDir>/manifest.akmf` |
+| `paths.versionLogPath` | `<dataDir>/history.akvlog` |
+| `paths.clusterConfigPath` | `<dataDir>/cluster.akcc` |
+| `paths.nodeIdPath` | `<dataDir>/node.id` |
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/akkaradb";
+
+opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+opts.blob.thresholdBytes = 32ULL * 1024ULL;
+opts.runtime.sstPromoteReads = true;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+```
+
+The default WAL mode is `SYNC`. `ASYNC` improves write throughput by flushing in the background. `OFF` disables WAL writes and should be reserved for temporary data or controlled benchmark scenarios.
+
+## Basic Read And Write
+
+`put()` writes or replaces a value. `remove()` writes a tombstone. Reads use `std::optional<std::vector<uint8_t>>` by default.
+
+```cpp
+db->put(bytes("user:1"), bytes("Alice"));
+db->put(bytes("user:2"), bytes("Bob"));
+
+if (auto value = db->get(bytes("user:1"))) {
+    const std::string name = text(*value);
+}
+
+db->put(bytes("user:1"), bytes("Alice Updated"));
+
+const bool exists = db->exists(bytes("user:1"));
+const bool missing = !db->exists(bytes("user:404"));
+
+db->remove(bytes("user:2"));
+```
+
+Use `getInto()` when you want to reuse caller-owned storage on hot paths:
+
+```cpp
+std::vector<uint8_t> out;
+if (db->getInto(bytes("user:1"), out)) {
+    const std::string name = text(out);
+}
+```
+
+`get()` returns `std::nullopt` for a missing key. `getInto()` returns `false` for the same case.
+
+## Batches
+
+Batch writes use `AkkEngine::BatchPutEntry`. Entries are still raw byte spans, so the input buffers must stay alive for the duration of the call.
+
+```cpp
+std::array<engine::AkkEngine::BatchPutEntry, 3> entries{{
+    {bytes("user:1"), bytes("Alice")},
+    {bytes("user:2"), bytes("Bob")},
+    {bytes("user:3"), bytes("Carol")},
+}};
+
+db->putBatch(entries);
+```
+
+Batch reads accept a span of key spans and return one result per key:
+
+```cpp
+std::array<std::span<const uint8_t>, 3> keys{
+    bytes("user:1"),
+    bytes("user:2"),
+    bytes("user:404"),
+};
+
+auto results = db->getBatch(keys);
+for (const auto& result : results) {
+    if (result.found) {
+        const std::string value = text(result.value);
+    }
+}
+```
+
+## Key Layout
+
+The engine orders keys lexicographically by raw bytes. That means key design is part of your API contract.
+
+A practical layout is:
+
+```text
+<domain>:<stable-id>
+```
+
+For example:
+
+```text
+user:0000000000000001
+user:0000000000000002
+order:0000000000000001
+```
+
+If you encode numeric IDs as text, pad them to a fixed width. Without padding, `"user:10"` sorts before `"user:2"`.
+
+For binary numeric keys, encode integers in sortable big-endian order:
+
+```cpp
+std::vector<uint8_t> userKey(uint64_t id) {
+    std::vector<uint8_t> key{'u', 's', 'e', 'r', ':'};
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        key.push_back(static_cast<uint8_t>((id >> shift) & 0xff));
+    }
+    return key;
+}
+```
+
+This keeps bytewise range scans aligned with numeric order.
+
+## Prefix Scans
+
+`scan()` reads a half-open range: `[startKey, endKey)`. The returned iterator views depend on a caller-owned `BufferArena`, so the arena must outlive the scan.
+
+```cpp
+akkaradb::core::BufferArena arena;
+
+auto rows = db->scan(arena, bytes("user:"), bytes("user;"));
+for (auto it = rows.begin(); !(it == rows.end()); ++it) {
+    const auto& row = *it;
+    const std::string key = text(row.key);
+    const std::string value = text(row.value);
+}
+```
+
+The `"user:"` to `"user;"` range works because `';'` is the next ASCII byte after `':'`. For arbitrary binary prefixes, compute the next prefix:
+
+```cpp
+std::optional<std::vector<uint8_t>> nextPrefix(std::span<const uint8_t> prefix) {
+    std::vector<uint8_t> end{prefix.begin(), prefix.end()};
+    for (auto it = end.rbegin(); it != end.rend(); ++it) {
+        if (*it != 0xff) {
+            ++(*it);
+            end.erase(it.base(), end.end());
+            return end;
+        }
+    }
+    return std::nullopt;
+}
+```
+
+Then scan either `[prefix, nextPrefix(prefix))` or `[prefix, unbounded)` when no larger prefix exists:
+
+```cpp
+auto prefix = bytes("user:");
+auto end = nextPrefix(prefix);
+
+auto rows = end
+    ? db->scan(arena, prefix, *end)
+    : db->scan(arena, prefix);
+```
+
+## Arena Lifetimes
+
+`scan()` and `getIntoArena()` return non-owning views. They become invalid when the arena is reset, cleared, or destroyed.
+
+```cpp
+akkaradb::core::BufferArena arena;
+std::span<const uint8_t> value;
+
+if (db->getIntoArena(bytes("user:1"), arena, value)) {
+    std::vector<uint8_t> owned{value.begin(), value.end()};
+    arena.reset();
+
+    // owned is still valid; value is not.
+}
+```
+
+Use `std::vector<uint8_t>` when values need to cross request, thread, or API boundaries. Use arena views for local read pipelines where the lifetime is obvious.
+
+## Flush, Sync, And Close
+
+The engine can be closed explicitly:
+
+```cpp
+db->forceFlush();
+db->forceSync();
+db->close();
+```
+
+`forceFlush()` moves MemTable data toward SST storage. `forceSync()` synchronizes durable state such as WAL and version history. `close()` is idempotent and also follows `runtime.forceFlushOnClose` and `runtime.forceSyncOnClose`.
+
+For tests and benchmark fixtures, closing explicitly makes resource lifetime clearer. In production code, treat `forceSync()` as the boundary for writes that must be durable before the next operation continues.
+
+## Version History
+
+History is disabled by default. Enable `components.versionLogEnabled` before opening the engine:
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/history";
+opts.components.versionLogEnabled = true;
+opts.vlog.syncMode = engine::vlog::VLogSyncMode::ASYNC;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+```
+
+After that, each write for a key is recorded in the version log:
+
+```cpp
+db->put(bytes("profile:1"), bytes("v1"));
+db->put(bytes("profile:1"), bytes("v2"));
+
+auto history = db->history(bytes("profile:1"));
+if (!history.empty()) {
+    const uint64_t firstSeq = history.front().seq;
+
+    auto oldValue = db->getAt(bytes("profile:1"), firstSeq);
+    db->rollbackKey(bytes("profile:1"), firstSeq);
+}
+```
+
+`rollbackKey()` affects one key. `rollbackTo()` rolls the whole engine back to a sequence and has a much wider blast radius. Use it only when the operational semantics are explicit.
+
+When the version log is disabled, `history()` returns an empty vector and point-in-time reads cannot recover previous values.
+
+## Blob Values
+
+Large values can be moved to Blob storage by setting `blob.thresholdBytes`. Values at or above the threshold are stored as blobs while the key still behaves like a normal key/value entry.
+
+```cpp
+engine::AkkEngineOptions opts;
+opts.paths.dataDir = "data/blob";
+opts.blob.thresholdBytes = 8ULL * 1024ULL;
+
+auto db = engine::AkkEngine::open(std::move(opts));
+db->put(bytes("file:1"), bytes("large payload"));
+```
+
+`runBlobGc()` can reclaim unreferenced blobs:
+
+```cpp
+db->runBlobGc();
+```
+
+Do not run blob GC while version history is enabled. Old versions may still reference previous blob values, and the engine rejects this combination.
+
+## Stats
+
+`stats()` returns a snapshot of engine counters and subsystem state.
+
+```cpp
+auto stats = db->stats();
+
+const auto puts = stats.putsTotal;
+const auto gets = stats.getsTotal;
+const auto memtableBytes = stats.memtable.approxBytes;
+
+if (stats.wal.enabled) {
+    const auto walBytes = stats.wal.bytesWritten;
+}
+
+if (stats.sst.enabled) {
+    const auto fileCount = stats.sst.fileCount;
+}
+```
+
+Useful fields include:
+
+| Field | Meaning |
+|---|---|
+| `currentSeq` | Current engine sequence number |
+| `putsTotal`, `removesTotal`, `getsTotal` | Top-level operation counters |
+| `getsMemtableHit`, `getsSstHit`, `getsMiss` | Read-path hit/miss counters |
+| `memtable.approxBytes` | Approximate in-memory MemTable bytes |
+| `wal.bytesWritten`, `wal.syncsExecuted` | WAL write/sync counters |
+| `sst.fileCount`, `sst.levels` | SST storage shape |
+| `blob.bytesOnDisk`, `blob.gcCycles` | Blob storage and GC state |
+| `vlog.indexedEntries`, `vlog.rollbackEntries` | Version history state |
+
+## Operation Reference
+
+| Operation | API | Behavior |
+|---|---|---|
+| Open | `AkkEngine::open(options)` | Creates or recovers an engine instance |
+| Write | `put(key, value)` | Stores or replaces a key/value pair |
+| Write with hint | `putHinted(key, value, fp64, miniKey)` | Hot path when the caller already computed key fingerprints |
+| Batch write | `putBatch(entries)` | Writes multiple key/value pairs |
+| Delete | `remove(key)` | Writes a tombstone |
+| Delete with hint | `removeHinted(key, fp64, miniKey)` | Deletes with precomputed key fingerprints |
+| Read | `get(key)` | Returns `std::optional<std::vector<uint8_t>>` |
+| Batch read | `getBatch(keys)` | Returns one `BatchGetResult` per key |
+| Read into vector | `getInto(key, out)` | Reuses caller-owned storage |
+| Read into arena | `getIntoArena(key, arena, out)` | Returns a view tied to arena lifetime |
+| Exists | `exists(key)` | Checks current-key existence |
+| Count | `count(start, end)` | Counts keys in a half-open range |
+| Scan | `scan(arena, start, end)` | Iterates current key/value rows |
+| History | `history(key)` | Returns per-key version entries when VersionLog is enabled |
+| Point-in-time read | `getAt(key, seq)` | Reads the value visible at a sequence |
+| Rollback key | `rollbackKey(key, seq)` | Rolls one key back |
+| Rollback engine | `rollbackTo(seq)` | Rolls all keys back |
+| Stats | `stats()` | Returns subsystem counters |
+| Flush | `forceFlush()` | Flushes MemTable state toward SST |
+| Sync | `forceSync()` | Synchronizes durable state |
+| Blob GC | `runBlobGc()` | Reclaims unreferenced blobs |
+| Close | `close()` | Closes the engine; safe to call more than once |
+
+## Error Handling
+
+Expected absence is represented by return values:
+
+- `get()` and `getAt()` return `std::nullopt`.
+- `getInto()` and `getIntoArena()` return `false`.
+- Empty scans and histories produce empty iterators or vectors.
+
+Invalid use and storage failures are exceptions. Common examples are invalid configuration, I/O failures, corrupt persisted data, CRC mismatches, closed-engine access, and unsafe operations such as blob GC while version history is enabled.
+
+## Minimal Full Example
+
+```cpp
+#include "akk/engine/AkkEngine.hpp"
+
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace engine = akkaradb::engine;
+
+std::span<const uint8_t> bytes(std::string_view value) {
+    return {
+        reinterpret_cast<const uint8_t*>(value.data()),
+        value.size(),
+    };
+}
+
+std::string text(const std::vector<uint8_t>& value) {
+    return {
+        reinterpret_cast<const char*>(value.data()),
+        value.size(),
+    };
+}
+
+int main() {
+    engine::AkkEngineOptions opts;
+    opts.paths.dataDir = "data";
+    opts.wal.syncMode = engine::wal::WalSyncMode::ASYNC;
+    opts.components.versionLogEnabled = true;
+    opts.blob.thresholdBytes = 32ULL * 1024ULL;
+
+    auto db = engine::AkkEngine::open(std::move(opts));
+
+    db->put(bytes("user:1"), bytes("Alice"));
+    db->put(bytes("user:2"), bytes("Bob"));
+
+    if (auto value = db->get(bytes("user:1"))) {
+        const std::string name = text(*value);
+    }
+
+    akkaradb::core::BufferArena arena;
+    auto rows = db->scan(arena, bytes("user:"), bytes("user;"));
+    for (auto it = rows.begin(); !(it == rows.end()); ++it) {
+        const auto& row = *it;
+        const auto key = row.key;
+        const auto value = row.value;
+    }
+
+    auto history = db->history(bytes("user:1"));
+    if (!history.empty()) {
+        auto oldValue = db->getAt(bytes("user:1"), history.front().seq);
+    }
+
+    db->forceSync();
+    db->close();
+}
+```

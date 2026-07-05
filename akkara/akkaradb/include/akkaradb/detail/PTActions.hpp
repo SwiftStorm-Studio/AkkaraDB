@@ -40,8 +40,8 @@ PackedTable& cascadeDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
 
     const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
     for (const auto& cascade : cascadeDeletes_) {
-        if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName ==
-            binpack::detail::memberName<TargetFieldPtr>()) { return *this; }
+        if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName == binpack::detail::memberName<
+            TargetFieldPtr>()) { return *this; }
     }
 
     (void)source.template index<RefFieldPtr>();
@@ -54,7 +54,7 @@ PackedTable& cascadeDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
             [](const Entity& targetEntity, void* rawSource, void* rawTarget) {
                 auto* sourceTable = static_cast<SourceTable*>(rawSource);
                 auto* targetTable = static_cast<PackedTable*>(rawTarget);
-                std::vector < typename SourceTable::PK > removeKeys;
+                std::vector<typename SourceTable::PK> removeKeys;
                 const auto targetValue = [&]() -> ComparableTargetField {
                     if constexpr (isRef<Field>) { return *targetTable->rowIdOf(targetEntity.*TargetFieldPtr); }
                     else { return foreignKeyComparable(targetEntity.*TargetFieldPtr); }
@@ -132,9 +132,7 @@ PackedTable& restrictDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
                         break;
                     }
                 }
-                if (hasReferences) {
-                    throw std::runtime_error("AkkaraDB foreign key: delete restricted by referencing entities");
-                }
+                if (hasReferences) { throw std::runtime_error("AkkaraDB foreign key: delete restricted by referencing entities"); }
             }
         }
     );
@@ -188,7 +186,7 @@ PackedTable& setNullDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
                 [](const Entity& targetEntity, void* rawSource, void* rawTarget) {
                     auto* sourceTable = static_cast<SourceTable*>(rawSource);
                     auto* targetTable = static_cast<PackedTable*>(rawTarget);
-                    std::vector < typename SourceTable::PK > updateKeys;
+                    std::vector<typename SourceTable::PK> updateKeys;
                     const auto targetValue = [&]() -> ComparableTargetField {
                         if constexpr (isRef<Field>) { return *targetTable->rowIdOf(targetEntity.*TargetFieldPtr); }
                         else { return foreignKeyComparable(targetEntity.*TargetFieldPtr); }
@@ -239,8 +237,8 @@ PackedTable& cascadeUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
 
     const std::string_view fieldName = binpack::detail::memberName<RefFieldPtr>();
     for (const auto& cascade : cascadeUpdates_) {
-        if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName ==
-            binpack::detail::memberName<TargetFieldPtr>()) { return *this; }
+        if (cascade.source == &source && cascade.fieldName == fieldName && cascade.targetFieldName == binpack::detail::memberName<
+            TargetFieldPtr>()) { return *this; }
     }
     if constexpr (isRef<Field>) { return *this; }
 
@@ -262,7 +260,7 @@ PackedTable& cascadeUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
                 }();
                 if (oldTargetValue == newTargetValue) { return; }
 
-                std::vector < typename SourceTable::PK > updateKeys;
+                std::vector<typename SourceTable::PK> updateKeys;
                 auto scan = sourceTable->scanAll();
                 while (scan.hasNext()) {
                     auto entry = scan.next();
@@ -389,7 +387,7 @@ PackedTable& setNullUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
                     const auto newTargetValue = foreignKeyComparable(newTargetEntity.*TargetFieldPtr);
                     if (oldTargetValue == newTargetValue) { return; }
 
-                    std::vector < typename SourceTable::PK > updateKeys;
+                    std::vector<typename SourceTable::PK> updateKeys;
                     auto scan = sourceTable->scanAll();
                     while (scan.hasNext()) {
                         auto entry = scan.next();
@@ -411,7 +409,8 @@ PackedTable& setNullUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     }
 }
 
-private:
+private
+:
 void runCascadeDeletes(const Entity& entity) {
     for (const auto& cascade : cascadeDeletes_) { cascade.cascade(entity, cascade.source, cascade.target); }
 }
@@ -423,9 +422,7 @@ void runRestrictDeletes(const Entity& entity) {
 }
 
 void runSetNullDeletes(const Entity& entity) {
-    for (const auto& setNullDelete : setNullDeletes_) {
-        setNullDelete.setNullDelete(entity, setNullDelete.source, setNullDelete.target);
-    }
+    for (const auto& setNullDelete : setNullDeletes_) { setNullDelete.setNullDelete(entity, setNullDelete.source, setNullDelete.target); }
 }
 
 void runCascadeUpdates(const Entity& oldEntity, const Entity& newEntity) {
@@ -446,4 +443,5 @@ void runSetNullUpdates(const Entity& oldEntity, const Entity& newEntity) {
     }
 }
 
-public:
+public
+:

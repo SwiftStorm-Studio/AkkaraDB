@@ -16,7 +16,6 @@
 
 namespace akkaradb {
     namespace {
-
         [[nodiscard]] engine::sst::SSTWriter::Codec toSstCodec(engine::Codec codec) noexcept {
             switch (codec) {
                 case engine::Codec::NONE: return engine::sst::SSTWriter::Codec::NONE;

@@ -133,8 +133,8 @@ namespace akkaradb::engine::server {
         }
 
         void encodeScanStreamPayload(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out) {
-            const uint32_t payloadBytes =
-                static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.size());
+            const uint32_t payloadBytes = static_cast<uint32_t>(sizeof(uint16_t) + sizeof(uint32_t) + record.key.size() + record.value.
+                size());
             appendStreamFrameHeader(out, kStreamFrameItem, payloadBytes);
             appendPlain(out, static_cast<uint16_t>(record.key.size()));
             appendPlain(out, static_cast<uint32_t>(record.value.size()));
@@ -143,9 +143,8 @@ namespace akkaradb::engine::server {
         }
 
         void encodeHistoryStreamPayload(const VersionEntry& entry, std::vector<uint8_t>& out) {
-            const uint32_t payloadBytes =
-                static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) + sizeof(uint32_t) +
-                                      sizeof(uint32_t) + entry.value.size());
+            const uint32_t payloadBytes = static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) +
+                sizeof(uint32_t) + sizeof(uint32_t) + entry.value.size());
             appendStreamFrameHeader(out, kStreamFrameItem, payloadBytes);
             appendPlain(out, entry.seq);
             appendPlain(out, entry.sourceNodeId);
@@ -798,10 +797,10 @@ namespace akkaradb::engine::server {
                             }
                             encodeScanStreamPayload(record, outputBuffer);
                             if (!sendResponsePayload(
-                                    ApiStatus::OK,
-                                    frame.header.requestId,
-                                    std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
-                                )) {
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                            )) {
                                 responseBuffer.clear();
                                 return false;
                             }
@@ -810,10 +809,10 @@ namespace akkaradb::engine::server {
 
                         encodeStreamEndPayload(emitted, truncated, outputBuffer);
                         if (!sendResponsePayload(
-                                ApiStatus::OK,
-                                frame.header.requestId,
-                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
-                            )) {
+                            ApiStatus::OK,
+                            frame.header.requestId,
+                            std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                        )) {
                             responseBuffer.clear();
                             return false;
                         }
@@ -837,10 +836,10 @@ namespace akkaradb::engine::server {
                             }
                             encodeHistoryStreamPayload(entry, outputBuffer);
                             if (!sendResponsePayload(
-                                    ApiStatus::OK,
-                                    frame.header.requestId,
-                                    std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
-                                )) {
+                                ApiStatus::OK,
+                                frame.header.requestId,
+                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                            )) {
                                 responseBuffer.clear();
                                 return false;
                             }
@@ -849,10 +848,10 @@ namespace akkaradb::engine::server {
 
                         encodeStreamEndPayload(emitted, truncated, outputBuffer);
                         if (!sendResponsePayload(
-                                ApiStatus::OK,
-                                frame.header.requestId,
-                                std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
-                            )) {
+                            ApiStatus::OK,
+                            frame.header.requestId,
+                            std::span<const uint8_t>{outputBuffer.data(), outputBuffer.size()}
+                        )) {
                             responseBuffer.clear();
                             return false;
                         }

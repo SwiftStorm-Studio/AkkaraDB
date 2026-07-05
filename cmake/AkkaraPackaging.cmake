@@ -96,9 +96,11 @@ if (BUILD_SHARED_LIBS)
     )
     if (WIN32)
         add_custom_target(akkaradb_package_release_artifacts
-                COMMAND powershell.exe -ExecutionPolicy Bypass
-                -File "${CMAKE_CURRENT_SOURCE_DIR}/scripts/package_release_artifacts.ps1"
-                -SkipWindows
+                COMMAND ${CMAKE_COMMAND}
+                -DSOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+                -DINSTALL_CONFIG=$<CONFIG>
+                -DLINUX_PRESET=release-linux
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageReleaseArtifacts.cmake"
                 DEPENDS akkaradb_package_cxx_sdk
                 COMMENT "Packaging AkkaraDB Windows and Linux release artifacts"
         )

@@ -1,0 +1,34 @@
+---
+title: AKkaraDB Native
+description: Native C++ documentation for the AKkaraDB storage engine and typed table API.
+---
+
+AKkaraDB Native is the C++ storage engine layer of AKkaraDB.
+
+AKkaraDB is an embedded database for applications that need low-latency local storage with WAL-backed durability, LSM-based persistence, and typed C++ access.
+
+The Native layer is where the storage engine, table API, and server-facing byte interfaces are implemented.
+
+## Choose An API
+
+AKkaraDB Native has two API layers. Pick the layer that matches the shape of your application before diving into details.
+
+- Use `AkkEngine` when your code already works with byte buffers, custom key layouts, JNI/server/protocol boundaries, or storage-engine tests.
+- Use `AkkaraDB` and `PackedTable` when your code works with C++ entities and you want table-scoped keys, serialization, indexes, and query helpers handled for you.
+
+[Read the Low-Level API guide](/akkaradb-native/api/low-level/)
+
+## Documentation Map
+
+| Area | Status | Notes |
+|---|---:|---|
+| Low-Level API | Available | Direct `AkkEngine` usage, options, scans, history, batching, and lifecycle |
+| High-Level API | Planned | `AkkaraDB`, `PackedTable`, indexes, query helpers, joins, and schema |
+| Architecture | Planned | WAL, MemTable, SST, Blob, Manifest, VersionLog, and API server layers |
+| Benchmarks | Planned | Native benchmark results and environment notes |
+
+## Japanese
+
+日本語版はこちらです。
+
+[日本語の概要を読む](/akkaradb-native/ja/)

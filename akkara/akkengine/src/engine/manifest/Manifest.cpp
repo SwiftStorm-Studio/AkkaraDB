@@ -39,8 +39,7 @@ namespace akkaradb::engine::manifest {
     namespace {
         [[nodiscard]] bool pathExists(const std::filesystem::path& path) {
             #ifdef _WIN32
-            const DWORD attrs = ::GetFileAttributesW(path.c_str());
-            return attrs != INVALID_FILE_ATTRIBUTES;
+            const DWORD attrs = ::GetFileAttributesW(path.c_str()); return attrs != INVALID_FILE_ATTRIBUTES;
             #else
             return std::filesystem::exists(path);
             #endif
@@ -48,11 +47,9 @@ namespace akkaradb::engine::manifest {
 
         [[nodiscard]] uint64_t pathFileSize(const std::filesystem::path& path) {
             #ifdef _WIN32
-            WIN32_FILE_ATTRIBUTE_DATA data{};
-            if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+            WIN32_FILE_ATTRIBUTE_DATA data{}; if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
                 throw std::runtime_error("Failed to stat manifest: " + path.string());
-            }
-            return (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | static_cast<uint64_t>(data.nFileSizeLow);
+            } return (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | static_cast<uint64_t>(data.nFileSizeLow);
             #else
             return std::filesystem::file_size(path);
             #endif
@@ -176,9 +173,7 @@ namespace akkaradb::engine::manifest {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
                 const bool manifestExistsNow = pathExists(path_);
-                if (manifestExistsNow) {
-                    replayInternal();
-                }
+                if (manifestExistsNow) { replayInternal(); }
 
                 rotationCounter_ = findLastRotationNumber();
 
@@ -399,8 +394,7 @@ namespace akkaradb::engine::manifest {
 
             [[nodiscard]] std::filesystem::path makeManifestPath(size_t rotationNumber) const {
                 if (rotationNumber == 0) { return path_; }
-                return path_.parent_path() /
-                    (path_.stem().string() + "-" + std::to_string(rotationNumber) + path_.extension().string());
+                return path_.parent_path() / (path_.stem().string() + "-" + std::to_string(rotationNumber) + path_.extension().string());
             }
 
             [[nodiscard]] std::filesystem::path existingManifestPath(size_t rotationNumber) const {

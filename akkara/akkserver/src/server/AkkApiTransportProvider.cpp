@@ -1,15 +1,13 @@
 #include "akk/engine/server/AkkApiTransportProvider.hpp"
 
+#include "akk/core/utils/DynamicLibrary.hpp"
+
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
+#include <vector>
 
 namespace akkaradb::engine::server {
     namespace {
@@ -17,6 +15,9 @@ namespace akkaradb::engine::server {
 
         constexpr size_t kBackendCount = 3;
         std::array<std::atomic<AkkApiTransportFactory>, kBackendCount> g_factories{};
+        std::mutex g_loadMutex;
+        std::array<std::string, kBackendCount> g_lastLoadErrors{};
+        std::vector<core::DynamicLibrary> g_loadedModules;
 
         [[nodiscard]] size_t backendIndex(AkkEngineOptions::ApiBackend backend) {
             switch (backend) {
@@ -123,21 +124,43 @@ namespace akkaradb::engine::server {
     }
 
     bool loadAkkApiTransportBackend(AkkEngineOptions::ApiBackend backend, const std::filesystem::path& libraryPath) {
+        std::lock_guard loadLock{g_loadMutex};
         if (akkApiTransportFactoryAvailable(backend)) { return true; }
 
+        const auto idx = backendIndex(backend);
         const auto path = resolveBackendPath(backend, libraryPath);
-        #ifdef _WIN32
-        const HMODULE module = ::LoadLibraryW(path.wstring().c_str()); if (module == nullptr) { return false; } const auto registerPlugin =
-            reinterpret_cast<RegisterPluginFn>(::GetProcAddress(module, backendRegisterSymbol(backend)));
-        #else
-        void* module = ::dlopen(path.string().c_str(), RTLD_NOW | RTLD_LOCAL);
-        if (module == nullptr) { return false; }
-        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(::dlsym(module, backendRegisterSymbol(backend)));
-        #endif
+        std::string error;
+        auto module = core::DynamicLibrary::open(path, error);
+        if (!module.valid()) {
+            g_lastLoadErrors[idx] = std::move(error);
+            return false;
+        }
 
-        if (registerPlugin == nullptr) { return false; }
-        const bool ok = registerPlugin() && akkApiTransportFactoryAvailable(backend);
-        return ok;
+        const char* registerSymbol = backendRegisterSymbol(backend);
+        auto* symbol = module.symbol(registerSymbol, error);
+        if (symbol == nullptr) {
+            g_lastLoadErrors[idx] = std::move(error);
+            return false;
+        }
+
+        const auto registerPlugin = reinterpret_cast<RegisterPluginFn>(symbol);
+        if (!registerPlugin()) {
+            g_lastLoadErrors[idx] = std::string{"API transport backend "} + path.string() + " returned false from " + registerSymbol;
+            return false;
+        }
+        if (!akkApiTransportFactoryAvailable(backend)) {
+            g_lastLoadErrors[idx] = std::string{"API transport backend "} + path.string() + " did not register a factory";
+            return false;
+        }
+
+        g_loadedModules.push_back(std::move(module));
+        g_lastLoadErrors[idx].clear();
+        return true;
+    }
+
+    std::string lastAkkApiTransportBackendLoadError(AkkEngineOptions::ApiBackend backend) {
+        std::lock_guard lock{g_loadMutex};
+        return g_lastLoadErrors[backendIndex(backend)];
     }
 
     std::unique_ptr<IAkkApiTransport> createAkkApiTransport(

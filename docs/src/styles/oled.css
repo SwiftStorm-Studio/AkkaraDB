@@ -1,0 +1,146 @@
+@layer starlight.base {
+	:root[data-theme='oled'],
+	[data-theme='oled'] ::backdrop {
+		color-scheme: dark;
+
+		--sl-color-white: hsl(214, 100%, 99%);
+		--sl-color-gray-1: hsl(214, 42%, 94%);
+		--sl-color-gray-2: hsl(214, 24%, 82%);
+		--sl-color-gray-3: hsl(214, 14%, 63%);
+		--sl-color-gray-4: hsl(214, 12%, 43%);
+		--sl-color-gray-5: hsl(214, 22%, 20%);
+		--sl-color-gray-6: hsl(216, 42%, 5%);
+		--sl-color-gray-7: hsl(216, 54%, 3%);
+		--sl-color-black: hsl(0, 0%, 0%);
+
+		--sl-color-orange-low: hsl(var(--sl-hue-orange), 42%, 16%);
+		--sl-color-orange: hsl(var(--sl-hue-orange), 88%, 65%);
+		--sl-color-orange-high: hsl(var(--sl-hue-orange), 95%, 86%);
+		--sl-color-green-low: hsl(var(--sl-hue-green), 44%, 14%);
+		--sl-color-green: hsl(var(--sl-hue-green), 82%, 64%);
+		--sl-color-green-high: hsl(var(--sl-hue-green), 88%, 82%);
+		--sl-color-blue-low: hsl(210, 74%, 15%);
+		--sl-color-blue: hsl(209, 100%, 66%);
+		--sl-color-blue-high: hsl(205, 100%, 87%);
+		--sl-color-purple-low: hsl(var(--sl-hue-purple), 48%, 16%);
+		--sl-color-purple: hsl(var(--sl-hue-purple), 84%, 72%);
+		--sl-color-purple-high: hsl(var(--sl-hue-purple), 86%, 90%);
+		--sl-color-red-low: hsl(var(--sl-hue-red), 50%, 16%);
+		--sl-color-red: hsl(var(--sl-hue-red), 86%, 68%);
+		--sl-color-red-high: hsl(var(--sl-hue-red), 88%, 88%);
+
+		--sl-color-accent-low: hsl(210, 80%, 14%);
+		--sl-color-accent: hsl(207, 100%, 66%);
+		--sl-color-accent-high: hsl(202, 100%, 88%);
+
+		--sl-color-text: var(--sl-color-gray-2);
+		--sl-color-text-accent: var(--sl-color-accent-high);
+		--sl-color-text-invert: var(--sl-color-white);
+		--sl-color-bg: var(--sl-color-black);
+		--sl-color-bg-nav: hsl(216, 64%, 4%);
+		--sl-color-bg-sidebar: hsl(216, 64%, 4%);
+		--sl-color-bg-inline-code: hsl(216, 40%, 10%);
+		--sl-color-bg-accent: hsl(210, 86%, 20%);
+		--sl-color-hairline-light: hsl(214, 34%, 18%);
+		--sl-color-hairline: hsl(214, 34%, 14%);
+		--sl-color-hairline-shade: var(--sl-color-black);
+		--sl-color-backdrop-overlay: hsla(0, 0%, 0%, 0.82);
+
+		--sl-shadow-sm: 0 0 0 1px hsla(210, 72%, 42%, 0.12), 0 2px 8px hsla(0, 0%, 0%, 0.6);
+		--sl-shadow-md: 0 0 0 1px hsla(210, 72%, 42%, 0.14), 0 10px 24px hsla(0, 0%, 0%, 0.7);
+		--sl-shadow-lg: 0 0 0 1px hsla(210, 72%, 42%, 0.18), 0 18px 48px hsla(0, 0%, 0%, 0.78);
+	}
+}
+
+@layer starlight.components {
+	:root[data-theme='oled'] {
+		scrollbar-color: hsl(214, 22%, 30%) var(--sl-color-black);
+	}
+
+	:root[data-theme='oled'] ::selection {
+		color: var(--sl-color-black);
+		background: var(--sl-color-accent-high);
+	}
+
+	:root[data-theme='oled'] .sl-markdown-content a:not(:where(.not-content *)),
+	:root[data-theme='oled'] .right-sidebar a[aria-current='true'],
+	:root[data-theme='oled'] .sidebar-pane a[aria-current='page'] {
+		text-decoration-color: color-mix(in srgb, var(--sl-color-accent-high), transparent 35%);
+		text-underline-offset: 0.18em;
+	}
+
+	:root[data-theme='oled'] .right-sidebar-panel :where(a) {
+		color: hsl(214, 16%, 68%);
+	}
+
+	:root[data-theme='oled'] .right-sidebar-panel :where(a:hover),
+	:root[data-theme='oled'] .right-sidebar-panel :where(a[aria-current='true']) {
+		color: var(--sl-color-white);
+	}
+
+	:root[data-theme='oled'] .sidebar-pane {
+		--sl-color-text-accent: var(--sl-color-bg-accent);
+		--sl-color-text-invert: var(--sl-color-white);
+	}
+
+	:root[data-theme='oled'] .sidebar-pane a[aria-current='page'],
+	:root[data-theme='oled'] .sidebar-pane a[aria-current='page']:hover,
+	:root[data-theme='oled'] .sidebar-pane a[aria-current='page']:focus {
+		color: var(--sl-color-white) !important;
+		background-color: var(--sl-color-bg-accent) !important;
+		box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sl-color-accent), transparent 30%);
+	}
+
+	:root[data-theme='oled'] .content-panel + .content-panel,
+	:root[data-theme='oled'] header.header,
+	:root[data-theme='oled'] .right-sidebar-panel {
+		border-color: var(--sl-color-hairline-light);
+	}
+
+	:root[data-theme='oled'] .sl-markdown-content code:not(:where(.not-content *)) {
+		color: var(--sl-color-gray-1);
+		box-shadow: inset 0 0 0 1px var(--sl-color-hairline-light);
+	}
+
+	:root[data-theme='oled'] .expressive-code {
+		--ec-codeBg: hsl(216, 64%, 4%);
+		--ec-codeFg: var(--sl-color-gray-1);
+		--ec-codeSelBg: hsl(209, 92%, 22%);
+		--ec-gtrFg: hsl(214, 16%, 55%);
+		--ec-gtrBrdCol: hsla(214, 34%, 26%, 0.55);
+		--ec-gtrHlFg: var(--sl-color-accent-high);
+		--ec-uiSelBg: hsl(209, 92%, 22%);
+		--ec-uiSelFg: var(--sl-color-white);
+		--ec-focusBrd: var(--sl-color-accent);
+		--ec-sbThumbCol: hsla(214, 24%, 82%, 0.14);
+		--ec-sbThumbHoverCol: hsla(214, 24%, 82%, 0.34);
+		--ec-brdCol: var(--sl-color-hairline-light);
+		--ec-tm-markBg: hsla(207, 100%, 66%, 0.12);
+		--ec-tm-markBrdCol: hsla(207, 100%, 66%, 0.45);
+		--ec-frm-edActTabBg: hsl(216, 48%, 7%);
+		--ec-frm-edActTabFg: var(--sl-color-gray-1);
+		--ec-frm-edActTabIndTopCol: var(--sl-color-accent-high);
+		--ec-frm-edTabBarBg: var(--sl-color-black);
+		--ec-frm-edTabBarBrdCol: var(--sl-color-hairline-light);
+		--ec-frm-edTabBarBrdBtmCol: var(--sl-color-hairline-light);
+		--ec-frm-edBg: hsl(216, 64%, 4%);
+		--ec-frm-trmTtbDotsFg: var(--sl-color-gray-3);
+		--ec-frm-trmTtbBg: var(--sl-color-black);
+		--ec-frm-trmTtbFg: var(--sl-color-gray-1);
+		--ec-frm-trmTtbBrdBtmCol: var(--sl-color-hairline-light);
+		--ec-frm-trmBg: hsl(216, 64%, 4%);
+		--ec-frm-inlBtnFg: var(--sl-color-gray-1);
+		--ec-frm-inlBtnBg: var(--sl-color-gray-1);
+		--ec-frm-inlBtnBrd: var(--sl-color-gray-1);
+		--ec-frm-tooltipSuccessBg: hsl(151, 82%, 32%);
+		--ec-frm-tooltipSuccessFg: var(--sl-color-white);
+	}
+
+	:root[data-theme='oled'] .expressive-code .ec-line :where(span[style^='--']:not([class])) {
+		color: var(--0, inherit);
+		background-color: var(--0bg, transparent);
+		font-style: var(--0fs, inherit);
+		font-weight: var(--0fw, inherit);
+		text-decoration: var(--0td, inherit);
+	}
+}

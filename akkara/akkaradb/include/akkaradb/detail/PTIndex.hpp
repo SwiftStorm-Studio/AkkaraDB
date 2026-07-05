@@ -34,12 +34,7 @@ class Index {
             private:
                 friend class Index;
 
-                FindRange(
-                    PackedTable* table,
-                    size_t searchPrefixSize,
-                    std::span<const uint8_t> startKey,
-                    std::span<const uint8_t> endKey
-                )
+                FindRange(PackedTable* table, size_t searchPrefixSize, std::span<const uint8_t> startKey, std::span<const uint8_t> endKey)
                     : table_{table},
                       searchPrefixSize_{searchPrefixSize},
                       scanArena_{std::make_unique<core::BufferArena>()},

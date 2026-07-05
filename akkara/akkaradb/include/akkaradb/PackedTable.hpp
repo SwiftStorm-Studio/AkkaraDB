@@ -201,141 +201,153 @@ namespace akkaradb {
             template <auto FieldPtr>
             class Index;
 
-            #include "detail/PTRefs.hpp"
+    #include "detail/PTRefs.hpp"
 
-            template <auto FieldPtr>
-            [[nodiscard]] Index<FieldPtr> index() {
-                static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-                Entity >, "index field must belong to the table entity"
-                )
-                ;
-                const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
-                const auto prefix = makeIndexPrefix(tableName_, fieldName);
+    template <auto FieldPtr>
+    [[nodiscard]] Index<FieldPtr> index() {
+        static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
+        Entity >, "index field must belong to the table entity"
+        )
+        ;
+        const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+        const auto prefix = makeIndexPrefix(tableName_, fieldName);
 
-                for (const auto& idx : indexes_) { if (idx.fieldName == fieldName) { return Index<FieldPtr>{this, prefix}; } }
-
-                indexes_.push_back(
-                    IndexDef{
-                        prefix,
-                        std::string(fieldName),
-                        [](const Entity& entity, ArenaByteBuffer& out) {
-                            out.clear();
-                            encodeIndexFieldValue(entity.*FieldPtr, out);
-                        }
-                    }
-                );
-                return Index<FieldPtr>{this, prefix};
+        for (const auto& idx : indexes_) {
+            if (idx.fieldName == fieldName) {
+                return Index < FieldPtr >
+                {
+                    this, prefix
+                };
             }
+        }
 
-            template <auto FieldPtr>
-            PackedTable& indexed() {
-                (void)index<FieldPtr>();
-                return *this;
+        indexes_.push_back(
+            IndexDef{
+                prefix,
+                std::string(fieldName),
+                [](const Entity& entity, ArenaByteBuffer& out) {
+                    out.clear();
+                    encodeIndexFieldValue(entity.*FieldPtr, out);
+                }
             }
+        );
+        return Index < FieldPtr >
+        {
+            this, prefix
+        };
+    }
 
-            template <auto FieldPtr, typename Handler>
-            PackedTable& onUpdate(Handler&& handler) {
-                static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-                Entity >, "update field must belong to the table entity"
-                )
-                ;
-                using Field = binpack::detail::memberOf<FieldPtr>;
-                static_assert(
-                    requires(const Field& lhs, const Field& rhs) {
-                        { lhs == rhs } -> std::convertible_to<bool>;
-                    },
-                    "update field handlers require equality comparable fields"
-                );
+    template <auto FieldPtr>
+    PackedTable& indexed() {
+        (void)index<FieldPtr>();
+        return *this;
+    }
 
-                updateFieldHooks_.push_back(
-                    UpdateFieldHookDef{
-                        std::string(binpack::detail::memberName<FieldPtr>()),
-                        [](const Entity& oldEntity, const Entity& newEntity) {
-                            return static_cast<bool>((oldEntity.*FieldPtr) == (newEntity.*FieldPtr));
-                        },
-                        [callback = std::forward<Handler>(handler)](const Entity& oldEntity, Entity& newEntity) mutable {
-                            invokeFieldUpdateHandler<FieldPtr>(callback, oldEntity, newEntity);
-                        }
-                    }
-                );
-                return *this;
+    template <auto FieldPtr, typename Handler>
+    PackedTable& onUpdate(Handler&& handler) {
+        static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
+        Entity >, "update field must belong to the table entity"
+        )
+        ;
+        using Field = binpack::detail::memberOf<FieldPtr>;
+        static_assert(
+            requires(const Field& lhs, const Field& rhs) {
+                { lhs == rhs } -> std::convertible_to<bool>;
+            },
+            "update field handlers require equality comparable fields"
+        );
+
+        updateFieldHooks_.push_back(
+            UpdateFieldHookDef{
+                std::string(binpack::detail::memberName<FieldPtr>()),
+                [](const Entity& oldEntity, const Entity& newEntity) {
+                    return static_cast<bool>((oldEntity.*FieldPtr) == (newEntity.*FieldPtr));
+                },
+                [callback = std::forward<Handler>(handler)](const Entity& oldEntity, Entity& newEntity) mutable {
+                    invokeFieldUpdateHandler < FieldPtr > (callback, oldEntity, newEntity);
+                }
             }
+        );
+        return *this;
+    }
 
-            #include "detail/PTForeignKey.hpp"
-            #include "detail/PTActions.hpp"
+    #include "detail/PTForeignKey.hpp"
+    #include "detail/PTActions.hpp"
 
-            #include "detail/PTMutation.hpp"
+    #include "detail/PTMutation.hpp"
 
-            #include "detail/PTFind.hpp"
+    #include "detail/PTFind.hpp"
 
-            #include "detail/PTScan.hpp"
-            #include "detail/query/Plan.hpp"
-            #include "detail/query/Join.hpp"
+    #include "detail/PTScan.hpp"
+    #include "detail/query/Plan.hpp"
+    #include "detail/query/Join.hpp"
 
-            [[nodiscard]] std::string_view tableName() const noexcept { return tableName_; }
-            [[nodiscard]] engine::AkkEngine& engine() noexcept { return *engine_; }
-            [[nodiscard]] const engine::AkkEngine& engine() const noexcept { return *engine_; }
+    [[nodiscard]] std::string_view tableName() const noexcept { return tableName_; }
+    [[nodiscard]] engine::AkkEngine& engine() noexcept { return *engine_; }
+    [[nodiscard]] const engine::AkkEngine& engine() const noexcept { return *engine_; }
 
-            #include "detail/PTIndex.hpp"
+    #include "detail/PTIndex.hpp"
 
-        private:
-            friend class AkkaraDB;
-            template <auto>
-            friend class PackedTable;
+    private
+    :
+    friend class AkkaraDB;
+    template <auto>
+    friend class PackedTable;
 
-            #include "detail/PTDefs.hpp"
+    #include "detail/PTDefs.hpp"
 
-            engine::AkkEngine* engine_ = nullptr;
-            std::string tableName_;
-            std::array<uint8_t, 8> pkPrefix_{};
-            std::array<uint8_t, 8> pkToRowIdPrefix_{};
-            std::array<uint8_t, 8> rowIdToPkPrefix_{};
-            std::array<uint8_t, 8> nextRowIdKey_{};
-            std::vector<IndexDef> indexes_;
-            std::vector<RefFieldDef> refFields_;
-            std::vector<ForeignKeyDef> foreignKeys_;
-            std::vector<CascadeDeleteDef> cascadeDeletes_;
-            std::vector<RestrictDeleteDef> restrictDeletes_;
-            std::vector<SetNullDeleteDef> setNullDeletes_;
-            std::vector<UpdateCascadeDef> cascadeUpdates_;
-            std::vector<UpdateRestrictDef> restrictUpdates_;
-            std::vector<UpdateSetNullDef> setNullUpdates_;
-            std::vector<UpdateFieldHookDef> updateFieldHooks_;
-            std::vector<std::unique_ptr<RefBindingBase>> refBindings_;
-            const RefBindingLookup* refBindingLookup_ = nullptr;
-            bool updateActionsNeedTargetWrite_ = false;
+    engine::AkkEngine* engine_ = nullptr;
+    std::string tableName_;
+    std::array<uint8_t, 8> pkPrefix_{};
+    std::array<uint8_t, 8> pkToRowIdPrefix_{};
+    std::array<uint8_t, 8> rowIdToPkPrefix_{};
+    std::array<uint8_t, 8> nextRowIdKey_{};
+    std::vector<IndexDef> indexes_;
+    std::vector<RefFieldDef> refFields_;
+    std::vector<ForeignKeyDef> foreignKeys_;
+    std::vector<CascadeDeleteDef> cascadeDeletes_;
+    std::vector<RestrictDeleteDef> restrictDeletes_;
+    std::vector<SetNullDeleteDef> setNullDeletes_;
+    std::vector<UpdateCascadeDef> cascadeUpdates_;
+    std::vector<UpdateRestrictDef> restrictUpdates_;
+    std::vector<UpdateSetNullDef> setNullUpdates_;
+    std::vector<UpdateFieldHookDef> updateFieldHooks_;
+    std::vector<std::unique_ptr<RefBindingBase>> refBindings_;
+    const RefBindingLookup* refBindingLookup_ = nullptr;
+    bool updateActionsNeedTargetWrite_ = false;
 
-            mutable std::unique_ptr<core::BufferArena> tempArena_ = std::make_unique<core::BufferArena>();
-            mutable ArenaByteBuffer pkKeyBuffer_{tempArena_.get()};
-            mutable ArenaByteBuffer valueBuffer_{tempArena_.get()};
-            mutable ArenaByteBuffer indexKeyBuffer_{tempArena_.get()};
-            mutable ArenaByteBuffer fieldBuffer_{tempArena_.get()};
-            mutable ArenaByteBuffer scanStartBuffer_{tempArena_.get()};
-            mutable ArenaByteBuffer scanEndBuffer_{tempArena_.get()};
+    mutable std::unique_ptr<core::BufferArena> tempArena_ = std::make_unique<core::BufferArena>();
+    mutable ArenaByteBuffer pkKeyBuffer_{tempArena_.get()};
+    mutable ArenaByteBuffer valueBuffer_{tempArena_.get()};
+    mutable ArenaByteBuffer indexKeyBuffer_{tempArena_.get()};
+    mutable ArenaByteBuffer fieldBuffer_{tempArena_.get()};
+    mutable ArenaByteBuffer scanStartBuffer_{tempArena_.get()};
+    mutable ArenaByteBuffer scanEndBuffer_{tempArena_.get()};
 
-            PackedTable() = default;
+    PackedTable() = default;
 
-            void resetTempBuffers() const {
-                tempArena_->reset();
-                pkKeyBuffer_.bind(tempArena_.get());
-                valueBuffer_.bind(tempArena_.get());
-                indexKeyBuffer_.bind(tempArena_.get());
-                fieldBuffer_.bind(tempArena_.get());
-                scanStartBuffer_.bind(tempArena_.get());
-                scanEndBuffer_.bind(tempArena_.get());
-            }
+    void resetTempBuffers() const {
+        tempArena_->reset();
+        pkKeyBuffer_.bind(tempArena_.get());
+        valueBuffer_.bind(tempArena_.get());
+        indexKeyBuffer_.bind(tempArena_.get());
+        fieldBuffer_.bind(tempArena_.get());
+        scanStartBuffer_.bind(tempArena_.get());
+        scanEndBuffer_.bind(tempArena_.get());
+    }
 
-            #include "detail/PTImmutable.hpp"
+    #include "detail/PTImmutable.hpp"
 
-            template <auto LeftPtr, auto RightPtr>
-            static consteval bool sameMemberPointer() {
-                if constexpr (std::is_same_v<decltype(LeftPtr), decltype(RightPtr)>) { return LeftPtr == RightPtr; }
-                else { return false; }
-            }
+    template <auto LeftPtr, auto RightPtr>
+    static consteval bool sameMemberPointer() {
+        if constexpr (std::is_same_v<decltype(LeftPtr), decltype(RightPtr)>) { return LeftPtr == RightPtr; }
+        else { return false; }
+    }
 
-            #include "detail/PTUpdateHooks.hpp"
-            #include "detail/PTIndexedLookup.hpp"
-            #include "detail/query/Optimize.hpp"
-            #include "detail/PTCodec.hpp"
-    };
+    #include "detail/PTUpdateHooks.hpp"
+    #include "detail/PTIndexedLookup.hpp"
+    #include "detail/query/Optimize.hpp"
+    #include "detail/PTCodec.hpp"
+};
+
 } // namespace akkaradb

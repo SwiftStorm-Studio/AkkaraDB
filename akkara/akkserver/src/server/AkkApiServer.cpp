@@ -77,8 +77,12 @@ namespace akkaradb::engine::server {
 
         for (const auto backend : backends) {
             if (!akkApiTransportFactoryAvailable(backend) && !loadAkkApiTransportBackend(backend, backendPath(options, backend))) {
+                const auto detail = lastAkkApiTransportBackendLoadError(backend);
                 throw std::runtime_error(
-                    std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available"
+                    detail.empty()
+                        ? std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available"
+                        : std::string{"AkkApiServer: "} + backendName(backend) + " API transport backend library is not available: " +
+                        detail
                 );
             }
             server->transports_.push_back(createAkkApiTransport(backend, engine, options));

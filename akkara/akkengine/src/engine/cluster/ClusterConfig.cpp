@@ -180,9 +180,8 @@ namespace akkaradb::engine::cluster {
         if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::STRIPE) {
             throw std::invalid_argument("ClusterConfig: invalid replication mode");
         }
-        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.mode != AckPolicyMode::ALL_TARGETS && ackPolicy_.mode != AckPolicyMode::QUORUM) {
-            throw std::invalid_argument("ClusterConfig: invalid ack policy");
-        }
+        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.mode != AckPolicyMode::ALL_TARGETS && ackPolicy_.mode !=
+            AckPolicyMode::QUORUM) { throw std::invalid_argument("ClusterConfig: invalid ack policy"); }
         if (ackPolicy_.stage != AckStage::RECEIVED && ackPolicy_.stage != AckStage::APPLIED && ackPolicy_.stage != AckStage::DURABLE) {
             throw std::invalid_argument("ClusterConfig: invalid ack stage");
         }

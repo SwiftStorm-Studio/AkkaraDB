@@ -10,6 +10,7 @@ endif ()
 
 option(AKKARADB_BUILD_TESTS "Build unit tests" OFF)
 option(AKKARADB_BUILD_JNI "Build JNI bridge for JVM integration" ON)
+option(AKKARADB_PACKAGE_JNI_WITH_NATIVE "Package JNI together with the native library artifact" OFF)
 option(AKKARADB_BUILD_API_SERVERS "Build API server shared libraries" ON)
 option(AKKARADB_BUILD_API_HTTP "Build HTTP API transport backend" ON)
 option(AKKARADB_BUILD_API_TCP "Build TCP API transport backend" ON)

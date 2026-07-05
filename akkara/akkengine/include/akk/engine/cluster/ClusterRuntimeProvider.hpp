@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
 
 namespace akkaradb::engine::cluster {
     struct AKDB_API ClusterEngineCallbacks {
@@ -62,6 +63,7 @@ uint64_t seq,
     AKDB_API bool registerClusterRuntimeFactory(ClusterRuntimeFactory factory) noexcept;
     [[nodiscard]] AKDB_API bool clusterRuntimeFactoryAvailable() noexcept;
     [[nodiscard]] AKDB_API bool loadClusterRuntimeBackend(const std::filesystem::path& libraryPath = {});
+    [[nodiscard]] AKDB_API std::string lastClusterRuntimeBackendLoadError();
     [[nodiscard]] AKDB_API std::unique_ptr<IClusterRuntime> createClusterRuntime(
         std::filesystem::path dbDir,
         ClusterConfig config,

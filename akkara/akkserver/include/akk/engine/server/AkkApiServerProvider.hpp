@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
 
 namespace akkaradb::engine::server {
     class AKDB_API IAkkApiServer {
@@ -28,6 +29,7 @@ namespace akkaradb::engine::server {
     AKDB_API bool registerAkkApiServerFactory(AkkApiServerFactory factory) noexcept;
     [[nodiscard]] AKDB_API bool akkApiServerFactoryAvailable() noexcept;
     [[nodiscard]] AKDB_API bool loadAkkApiServerBackend(const std::filesystem::path& libraryPath = {});
+    [[nodiscard]] AKDB_API std::string lastAkkApiServerBackendLoadError();
     [[nodiscard]] AKDB_API std::unique_ptr<IAkkApiServer> createAkkApiServer(
         AkkEngine& engine,
         const AkkEngineOptions::ApiOptions& options

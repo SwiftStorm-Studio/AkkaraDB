@@ -20,14 +20,8 @@ PackedTable& bindRef(PackedTable<TargetPrimaryKeyPtr>& target) {
     static_assert(isRef<Field>, "bindRef field must be akkaradb::Ref<T>");
     using Target = typename RefTarget<Field>::Type;
     using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
-    static_assert(std::is_same_v < typename TargetTable::Entity,
-    Target >, "ref target table entity does not match Ref<T>"
-    )
-    ;
-    static_assert(
-        std::is_same_v<typename Field::Key, typename TargetTable::PK>,
-        "ref key type does not match target table primary key"
-    );
+    static_assert(std::is_same_v<typename TargetTable::Entity, Target>, "ref target table entity does not match Ref<T>") ;
+    static_assert(std::is_same_v<typename Field::Key, typename TargetTable::PK>, "ref key type does not match target table primary key");
 
     const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
     for (auto& refField : refFields_) {
@@ -71,7 +65,8 @@ PackedTable& bindRefsFrom(const RefBindingLookup& lookup) {
     return *this;
 }
 
-private:
+private
+:
 void attachRefBindings(const Entity& entity) const {
     if (refFields_.empty() && refBindingLookup_ == nullptr) { return; }
     for (const auto& refField : refFields_) { refField.attach(entity, refField.binding); }
@@ -129,4 +124,5 @@ void flushAutoRefs(const X& value) const {
     }
 }
 
-public:
+public
+:

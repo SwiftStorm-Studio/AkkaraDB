@@ -99,7 +99,8 @@ class JoinView {
         template <typename Pred>
         [[nodiscard]] JoinView where(Pred&& predicate) const {
             auto previous = predicate_;
-            auto next = std::function<bool(const Entity&, const RightEntity&)>{
+            auto next = std::function < bool(const Entity &, const RightEntity &) >
+            {
                 [previous = std::move(previous), predicate = std::forward<Pred>(predicate)](
                     const Entity& left,
                     const RightEntity& right
@@ -140,9 +141,7 @@ class JoinView {
         JoinView(
             const PackedTable* left,
             const RightTable* right,
-            std::function<bool(const Entity&, const RightEntity&)> predicate = [](const Entity&, const RightEntity&) {
-                return true;
-            }
+            std::function<bool(const Entity &, const RightEntity &)> predicate = [](const Entity&, const RightEntity&) { return true; }
         ) : left_{left}, right_{right}, predicate_{std::move(predicate)} {}
 
         template <typename X>
@@ -165,13 +164,11 @@ class JoinView {
 
         const PackedTable* left_;
         const RightTable* right_;
-        std::function<bool(const Entity&, const RightEntity&)> predicate_;
+        std::function<bool(const Entity &, const RightEntity &)> predicate_;
 };
 
 template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
-[[nodiscard]] JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr> join(
-    const PackedTable<TargetPrimaryKeyPtr>& target
-) const {
+[[nodiscard]] JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr> join(const PackedTable<TargetPrimaryKeyPtr>& target) const {
     static_assert(std::is_same_v < binpack::detail::classOf < LeftFieldPtr >,
     Entity >, "join left field must belong to the left table entity"
     )
@@ -187,8 +184,8 @@ template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
     static_assert(
         requires(const LeftField& left, const RightField& right) {
             {
-                JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr>::joinKey(left) == JoinView<LeftFieldPtr,
-                    RightFieldPtr, TargetPrimaryKeyPtr>::joinKey(right)
+                JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr>::joinKey(left) == JoinView<LeftFieldPtr, RightFieldPtr,
+                    TargetPrimaryKeyPtr>::joinKey(right)
             } -> std::convertible_to<bool>;
         },
         "join fields must be comparable"
@@ -205,13 +202,7 @@ template <auto RefFieldPtr, auto TargetPrimaryKeyPtr> requires(isRef<binpack::de
     using Field = binpack::detail::memberOf<RefFieldPtr>;
     using Target = typename RefTarget<Field>::Type;
     using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
-    static_assert(std::is_same_v < typename TargetTable::Entity,
-    Target >, "join target table entity does not match Ref<T>"
-    )
-    ;
-    static_assert(
-        std::is_same_v<typename Field::Key, typename TargetTable::PK>,
-        "join key type does not match target table primary key"
-    );
+    static_assert(std::is_same_v<typename TargetTable::Entity, Target>, "join target table entity does not match Ref<T>") ;
+    static_assert(std::is_same_v<typename Field::Key, typename TargetTable::PK>, "join key type does not match target table primary key");
     return join<RefFieldPtr, TargetPrimaryKeyPtr, TargetPrimaryKeyPtr>(target);
 }

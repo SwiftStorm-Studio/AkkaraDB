@@ -7,8 +7,10 @@ option cc_enable_arenas = true;
 service AkkaraDB {
   rpc Ping(PingRequest) returns (PingResponse);
   rpc Put(PutRequest) returns (Empty);
+  rpc PutHinted(PutHintedRequest) returns (Empty);
   rpc Get(GetRequest) returns (GetResponse);
   rpc Remove(RemoveRequest) returns (Empty);
+  rpc RemoveHinted(RemoveHintedRequest) returns (Empty);
   rpc Exists(ExistsRequest) returns (ExistsResponse);
   rpc Count(CountRequest) returns (CountResponse);
   rpc Scan(ScanRequest) returns (ScanResponse);
@@ -22,6 +24,7 @@ service AkkaraDB {
   rpc BatchGet(BatchGetRequest) returns (BatchGetResponse);
   rpc ForceSync(Empty) returns (Empty);
   rpc ForceFlush(Empty) returns (Empty);
+  rpc RunBlobGc(Empty) returns (Empty);
   rpc Stats(StatsRequest) returns (StatsResponse);
 }
 
@@ -38,12 +41,25 @@ message PutRequest {
   bytes value = 2;
 }
 
+message PutHintedRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 fp64 = 3;
+  uint64 mini_key = 4;
+}
+
 message GetRequest {
   bytes key = 1;
 }
 
 message RemoveRequest {
   bytes key = 1;
+}
+
+message RemoveHintedRequest {
+  bytes key = 1;
+  uint64 fp64 = 2;
+  uint64 mini_key = 3;
 }
 
 message ExistsRequest {

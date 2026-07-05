@@ -24,9 +24,7 @@ template <typename X>
 static void ensureImmutableFieldsUnchanged(const X& oldValue, const X& newValue) {
     using Field = std::remove_cvref_t<X>;
     if constexpr (isImmutableField<Field>) {
-        if (!(oldValue.get() == newValue.get())) {
-            throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified");
-        }
+        if (!(oldValue.get() == newValue.get())) { throw std::runtime_error("AkkaraDB Immutable: persisted field cannot be modified"); }
     }
     else if constexpr (query::isOptional<Field>) {
         using Inner = std::remove_cvref_t<decltype(*std::declval<const Field&>())>;
@@ -39,11 +37,7 @@ static void ensureImmutableFieldsUnchanged(const X& oldValue, const X& newValue)
         ensureImmutableFieldsUnchanged(*oldValue, *newValue);
     }
     else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
-        ensureImmutableAggregateFieldsUnchanged(
-            oldValue,
-            newValue,
-            std::make_index_sequence<boost::pfr::tuple_size_v<Field>>{}
-        );
+        ensureImmutableAggregateFieldsUnchanged(oldValue, newValue, std::make_index_sequence<boost::pfr::tuple_size_v<Field>>{});
     }
 }
 

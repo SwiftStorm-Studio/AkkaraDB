@@ -50,14 +50,13 @@ template <typename Expr>
 
 template <query::Op Operator, typename L, typename R>
 [[nodiscard]] bool tryMakeCompareIndexPlan(const query::Compare<Operator, L, R>& expr, QueryPlan& plan) const {
-    if constexpr (query::isColumn<L> && query::isLiteral<R>) {
-        return tryMakeFieldIndexPlan<Operator, std::remove_cvref_t<L>::fieldPtr>(query::literalValue(expr.rhs), plan);
+    if constexpr (query::isColumn<L>&& query::isLiteral<R>) {
+        return tryMakeFieldIndexPlan < Operator, std::remove_cvref_t<L>::fieldPtr > (query::literalValue(expr.rhs), plan);
     }
-    else if constexpr (query::isLiteral<L> && query::isColumn<R>) {
-        return tryMakeFieldIndexPlan<query::swappedCompareOp<Operator>, std::remove_cvref_t<R>::fieldPtr>(
-            query::literalValue(expr.lhs),
-            plan
-        );
+    else if constexpr (query::isLiteral<L>&& query::isColumn<R>) {
+        return tryMakeFieldIndexPlan < query::swappedCompareOp < Operator >, std::remove_cvref_t<R>::fieldPtr > (query::literalValue(
+            expr.lhs
+        ), plan);
     }
     else { return false; }
 }
@@ -72,10 +71,8 @@ template <typename X>
 
 template <query::Op Operator, typename L, typename R>
 [[nodiscard]] bool tryMakeCompareIndexSourcePlan(const query::Compare<Operator, L, R>&, QueryPlan& plan) const {
-    if constexpr (query::isColumn<L> && query::isLiteral<R>) {
-        return tryMakeFieldIndexSourcePlan<std::remove_cvref_t<L>::fieldPtr>(plan);
-    }
-    else if constexpr (query::isLiteral<L> && query::isColumn<R>) {
+    if constexpr (query::isColumn<L>&& query::isLiteral<R>) { return tryMakeFieldIndexSourcePlan<std::remove_cvref_t<L>::fieldPtr>(plan); }
+    else if constexpr (query::isLiteral<L>&& query::isColumn<R>) {
         return tryMakeFieldIndexSourcePlan<std::remove_cvref_t<R>::fieldPtr>(plan);
     }
     else { return false; }
@@ -84,7 +81,7 @@ template <query::Op Operator, typename L, typename R>
 template <query::Op Operator, typename X>
 [[nodiscard]] bool tryMakeUnaryIndexPlan(const query::Unary<Operator, X>&, QueryPlan& plan) const {
     if constexpr ((Operator == query::Op::IS_NULL || Operator == query::Op::IS_NOT_NULL) && query::isColumn<X>) {
-        return tryMakeNullIndexPlan<Operator, std::remove_cvref_t<X>::fieldPtr>(plan);
+        return tryMakeNullIndexPlan < Operator, std::remove_cvref_t<X>::fieldPtr > (plan);
     }
     else { return false; }
 }
@@ -108,8 +105,8 @@ template <typename Field, typename Lit>
     else if constexpr (std::is_arithmetic_v<Field>&& std::is_arithmetic_v<Lit>) {
         if constexpr (std::is_unsigned_v<Field>&& std::is_signed_v<Lit>) { if (literal < 0) { return false; } }
         const auto value = static_cast<long double>(literal);
-        if (value < static_cast<long double>(std::numeric_limits<Field>::lowest()) || value > static_cast<long double>(
-            std::numeric_limits<Field>::max())) { return false; }
+        if (value < static_cast<long double>(std::numeric_limits<Field>::lowest()) || value > static_cast<long double>(std::numeric_limits<
+            Field>::max())) { return false; }
         out = static_cast<Field>(literal);
         return true;
     }
@@ -135,11 +132,7 @@ template <typename Field, typename Lit>
     return true;
 }
 
-[[nodiscard]] bool tryMakeStringPrefixIndexPlan(
-    const std::array<uint8_t, 8>& indexPrefix,
-    std::string_view prefix,
-    QueryPlan& plan
-) const {
+[[nodiscard]] bool tryMakeStringPrefixIndexPlan(const std::array<uint8_t, 8>& indexPrefix, std::string_view prefix, QueryPlan& plan) const {
     (void)prefix;
     return tryMakeFullFieldIndexPlan(indexPrefix, plan);
 }
@@ -182,9 +175,7 @@ void addOrderedIndexRange(const IndexDef& idx, const Field& value, QueryPlan& pl
 
     if constexpr (Operator == query::Op::GT) {
         scanStartBuffer_ = boundary;
-        if (!detail::incrementLexicographicBytes(scanStartBuffer_.data(), scanStartBuffer_.size())) {
-            scanStartBuffer_.clear();
-        }
+        if (!detail::incrementLexicographicBytes(scanStartBuffer_.data(), scanStartBuffer_.size())) { scanStartBuffer_.clear(); }
     }
     else if constexpr (Operator == query::Op::GE) { scanStartBuffer_ = boundary; }
     else if constexpr (Operator == query::Op::LT) { scanEndBuffer_ = boundary; }
@@ -253,19 +244,17 @@ template <query::Op Operator, auto FieldPtr, typename Lit>
     }
     else if constexpr (Operator == query::Op::IN_LIST) { return tryMakeInIndexPlan<Field>(*idx, literal, plan); }
     else if constexpr (Operator == query::Op::NOT_IN) {
-        if constexpr (requires { std::begin(literal); std::end(literal); }) {
-            return tryMakeFullFieldIndexPlan(idx->prefix, plan);
-        }
+        if constexpr (requires { std::begin(literal); std::end(literal); }) { return tryMakeFullFieldIndexPlan(idx->prefix, plan); }
         else { return false; }
     }
     else if constexpr (Operator == query::Op::STARTS_WITH) {
-        if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
+        if constexpr (query::isStringLikeV<Field>&& query::isStringLikeV<Lit>) {
             return tryMakeStringPrefixIndexPlan(idx->prefix, std::string_view{literal}, plan);
         }
         else { return false; }
     }
     else if constexpr (Operator == query::Op::LIKE) {
-        if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
+        if constexpr (query::isStringLikeV<Field>&& query::isStringLikeV<Lit>) {
             const std::string_view pattern{literal};
             if (pattern.find_first_of("%_") == std::string_view::npos) {
                 Field value{};
@@ -282,13 +271,10 @@ template <query::Op Operator, auto FieldPtr, typename Lit>
         else { return false; }
     }
     else if constexpr (Operator == query::Op::CONTAINS) {
-        if constexpr (query::isStringLikeV<Field> && query::isStringLikeV<Lit>) {
-            return tryMakeFullFieldIndexPlan(idx->prefix, plan);
-        }
+        if constexpr (query::isStringLikeV<Field>&& query::isStringLikeV<Lit>) { return tryMakeFullFieldIndexPlan(idx->prefix, plan); }
         else { return false; }
     }
-    else if constexpr (Operator == query::Op::GT || Operator == query::Op::GE || Operator == query::Op::LT || Operator ==
-        query::Op::LE) {
+    else if constexpr (Operator == query::Op::GT || Operator == query::Op::GE || Operator == query::Op::LT || Operator == query::Op::LE) {
         if constexpr (orderedIndexRangeSupportedV<Field>) {
             Field value{};
             if (!literalToField<Field>(literal, value)) { return false; }

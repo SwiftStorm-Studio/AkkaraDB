@@ -191,11 +191,8 @@ namespace akkaradb {
         inline constexpr bool isExpr = IsExpr<std::remove_cvref_t<T>>::value;
 
         template <typename T>
-        using LiteralStorage = std::conditional_t<
-            std::is_convertible_v<T, std::string_view> && !std::is_arithmetic_v<std::remove_cvref_t<T>>,
-            std::string,
-            std::remove_cvref_t<T>
-        >;
+        using LiteralStorage = std::conditional_t<std::is_convertible_v<T, std::string_view> && !std::is_arithmetic_v<std::remove_cvref_t<
+            T>>, std::string, std::remove_cvref_t<T>>;
 
         template <typename T>
         [[nodiscard]] auto normalizeLiteral(T&& value) {

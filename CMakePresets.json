@@ -16,7 +16,8 @@
       "binaryDir": "${sourceDir}/builds/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "AKKARADB_BUILD_SHARED_LIBS": "ON"
+        "AKKARADB_BUILD_SHARED_LIBS": "ON",
+        "AKKARADB_BUILD_JNI": "ON"
       }
     },
     {
@@ -42,6 +43,36 @@
         "CMAKE_BUILD_TYPE": "Release",
         "AKKARADB_BUILD_SHARED_LIBS": "ON",
         "AKKARADB_BUILD_JNI": "ON"
+      }
+    },
+    {
+      "name": "jni",
+      "displayName": "JNI Release Artifact",
+      "binaryDir": "${sourceDir}/builds/jni",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AKKARADB_BUILD_SHARED_LIBS": "ON",
+        "AKKARADB_BUILD_JNI": "ON",
+        "AKKARADB_BUILD_API_SERVERS": "OFF",
+        "AKKARADB_PACKAGE_JNI_WITH_NATIVE": "OFF"
+      }
+    },
+    {
+      "name": "jni-linux",
+      "displayName": "JNI Linux Release Artifact",
+      "binaryDir": "${sourceDir}/builds/jni-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "AKKARADB_BUILD_SHARED_LIBS": "ON",
+        "AKKARADB_BUILD_JNI": "ON",
+        "AKKARADB_BUILD_API_SERVERS": "OFF",
+        "AKKARADB_PACKAGE_JNI_WITH_NATIVE": "OFF",
+        "AKKARADB_WARNINGS_AS_ERRORS": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
       }
     },
     {
@@ -71,6 +102,22 @@
       "name": "release-jni",
       "configurePreset": "release-jni",
       "configuration": "Release"
+    },
+    {
+      "name": "jni",
+      "configurePreset": "jni",
+      "configuration": "Release",
+      "targets": [
+        "akkaradb_jni_dist"
+      ]
+    },
+    {
+      "name": "jni-linux",
+      "configurePreset": "jni-linux",
+      "configuration": "Release",
+      "targets": [
+        "akkaradb_jni_dist"
+      ]
     },
     {
       "name": "rc-126.1.1.r1-rc.1+shad667184",

@@ -16,6 +16,7 @@
 #include <memory>
 #include <span>
 #include <string>
+
 namespace akkaradb::engine::cluster {
     /**
      * ReplicationClient - Replica-side connection to the current primary.
@@ -31,12 +32,12 @@ namespace akkaradb::engine::cluster {
     class AKKARADB_CLUSTER_RUNTIME_API ReplicationClient {
         public:
             using ApplyCallback = std::function<void(
-                uint64_t seq,
-                ReplOpType op,
-                std::span<const uint8_t> key,
-                std::span<const uint8_t> value,
-                uint8_t recordFlags,
-                uint64_t sourceNodeId
+uint64_t seq,
+ ReplOpType op,
+ std::span<const uint8_t> key,
+ std::span<const uint8_t> value,
+ uint8_t recordFlags,
+ uint64_t sourceNodeId
             )>;
             using BlobCallback = std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)>;
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
@@ -56,6 +57,7 @@ namespace akkaradb::engine::cluster {
             void start();
             void close();
             [[nodiscard]] bool connected() const noexcept;
+
         private:
             class Impl;
             explicit ReplicationClient(std::unique_ptr<Impl> impl);

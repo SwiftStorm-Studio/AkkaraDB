@@ -47,10 +47,7 @@ class QuerySource {
         friend class PackedTable;
 
         QuerySource(const PackedTable* table, QueryPlan plan)
-            : table_{table},
-              kind_{plan.kind},
-              ranges_{std::move(plan.ranges)},
-              scanArena_{std::make_unique<core::BufferArena>()} {
+            : table_{table}, kind_{plan.kind}, ranges_{std::move(plan.ranges)}, scanArena_{std::make_unique<core::BufferArena>()} {
             openNextRange();
             advance();
         }
@@ -84,10 +81,7 @@ class QuerySource {
                             table_->pkPrefix_.size()
                         ) != 0) { return; }
 
-                        std::span<const uint8_t> pkBytes{
-                            key.data() + table_->pkPrefix_.size(),
-                            key.size() - table_->pkPrefix_.size()
-                        };
+                        std::span<const uint8_t> pkBytes{key.data() + table_->pkPrefix_.size(), key.size() - table_->pkPrefix_.size()};
                         entry = Entry{table_->decodePrimaryKeyBytes(pkBytes), binpack::BinPack::decode<Entity>(raw.value)};
                         table_->attachRefBindings(entry.value);
                         table_->sealImmutableFields(entry.value);

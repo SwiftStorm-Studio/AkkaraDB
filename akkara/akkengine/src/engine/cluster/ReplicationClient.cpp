@@ -418,14 +418,16 @@ namespace akkaradb::engine::cluster {
                         ReplEntry entry;
                         if (!decodeEntry(frame.payload, entry)) { return; }
                         ApplyCallback applyCallback;
-                        std::function<void()> forceDurableCallback;
+                        std::function < void() > forceDurableCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
                             applyCallback = applyCallback_;
                             forceDurableCallback = forceDurableCallback_;
                         }
                         if (!sendAck(socket, secure, entry.seq, AckStage::RECEIVED)) { return; }
-                        if (applyCallback) { applyCallback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId); }
+                        if (applyCallback) {
+                            applyCallback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId);
+                        }
                         if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
                         if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
                             if (forceDurableCallback) { forceDurableCallback(); }
