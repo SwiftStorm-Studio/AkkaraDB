@@ -243,6 +243,31 @@ namespace akkaradb {
         return *this;
     }
 
+    template <auto FieldPtr>
+    PackedTable& prefixIndexed() {
+        static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
+        Entity >, "prefix index field must belong to the table entity"
+        )
+        ;
+        using Field = binpack::detail::memberOf<FieldPtr>;
+        static_assert(query::isStringLikeV<Field>, "prefix indexes require string-like fields");
+
+        const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
+        for (const auto& idx : prefixIndexes_) { if (idx.fieldName == fieldName) { return *this; } }
+
+        prefixIndexes_.push_back(
+            PrefixIndexDef{
+                makePrefixIndexPrefix(tableName_, fieldName),
+                std::string(fieldName),
+                [](const Entity& entity, ArenaByteBuffer& out) {
+                    out.clear();
+                    encodePrefixIndexStringSegment(std::string_view{entity.*FieldPtr}, out, true);
+                }
+            }
+        );
+        return *this;
+    }
+
     template <auto FieldPtr, typename Handler>
     PackedTable& onUpdate(Handler&& handler) {
         static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
@@ -303,6 +328,7 @@ namespace akkaradb {
     std::array<uint8_t, 8> rowIdToPkPrefix_{};
     std::array<uint8_t, 8> nextRowIdKey_{};
     std::vector<IndexDef> indexes_;
+    std::vector<PrefixIndexDef> prefixIndexes_;
     std::vector<RefFieldDef> refFields_;
     std::vector<ForeignKeyDef> foreignKeys_;
     std::vector<CascadeDeleteDef> cascadeDeletes_;

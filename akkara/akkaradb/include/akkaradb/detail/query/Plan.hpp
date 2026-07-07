@@ -19,12 +19,14 @@ struct QueryRange {
     std::vector<uint8_t> endKey;
     size_t indexSearchPrefixSize = 0;
     bool dynamicIndexPkOffset = false;
+    bool prefixIndexPkOffset = false;
     bool dedupeIndexPks = false;
 };
 
 struct QueryPlan {
     QuerySourceKind kind = QuerySourceKind::TABLE;
     std::vector<QueryRange> ranges;
+    int score = 0;
 };
 
 class QuerySource {
@@ -57,6 +59,7 @@ class QuerySource {
                 const auto& range = ranges_[rangeIndex_++];
                 indexSearchPrefixSize_ = range.indexSearchPrefixSize;
                 dynamicIndexPkOffset_ = range.dynamicIndexPkOffset;
+                prefixIndexPkOffset_ = range.prefixIndexPkOffset;
                 dedupeIndexPks_ = range.dedupeIndexPks;
                 it_ = {};
                 rows_ = {};
@@ -89,7 +92,15 @@ class QuerySource {
                     else {
                         const auto key = raw.key;
                         size_t pkOffset = indexSearchPrefixSize_;
-                        if (dynamicIndexPkOffset_) {
+                        if (prefixIndexPkOffset_) {
+                            const auto offset = table_->prefixIndexPkOffset(key, 8);
+                            if (!offset.has_value()) {
+                                ++it_;
+                                continue;
+                            }
+                            pkOffset = *offset;
+                        }
+                        else if (dynamicIndexPkOffset_) {
                             if (key.size() <= 12) {
                                 ++it_;
                                 continue;
@@ -131,6 +142,7 @@ class QuerySource {
         QuerySourceKind kind_;
         size_t indexSearchPrefixSize_;
         bool dynamicIndexPkOffset_ = false;
+        bool prefixIndexPkOffset_ = false;
         bool dedupeIndexPks_ = false;
         std::unordered_set<std::string> seenIndexPks_;
         std::vector<QueryRange> ranges_;

@@ -16,6 +16,12 @@ struct IndexDef {
     void (*encodeField)(const Entity&, ArenaByteBuffer&);
 };
 
+struct PrefixIndexDef {
+    std::array<uint8_t, 8> prefix;
+    std::string fieldName;
+    void (*encodeField)(const Entity&, ArenaByteBuffer&);
+};
+
 struct RefFieldDef {
     std::string fieldName;
     void* binding;

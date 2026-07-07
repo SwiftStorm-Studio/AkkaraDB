@@ -18,7 +18,7 @@ void put(const Entity& entity) {
     makePkKey(pk, pkKeyBuffer_);
     std::optional<Entity> oldEntity;
 
-    if (!indexes_.empty() || !updateFieldHooks_.empty()) {
+    if (!indexes_.empty() || !prefixIndexes_.empty() || !updateFieldHooks_.empty()) {
         std::span<const uint8_t> oldBytes;
         if (engine_->getIntoArena(pkKeyBuffer_, *tempArena_, oldBytes)) {
             oldEntity = binpack::BinPack::decode<Entity>(oldBytes);
@@ -27,6 +27,7 @@ void put(const Entity& entity) {
             if (!updateFieldHooks_.empty()) { runUpdateFieldHooks(*oldEntity, workingEntity); }
             ensureImmutableFieldsUnchanged(*oldEntity, workingEntity);
             if (!indexes_.empty()) { removeIndexEntries(*oldEntity, pkKeyBuffer_); }
+            if (!prefixIndexes_.empty()) { removePrefixIndexEntries(*oldEntity, pkKeyBuffer_); }
         }
     }
     else if (existingRowId.has_value()) {
@@ -47,6 +48,7 @@ void put(const Entity& entity) {
     putHinted(pkKeyBuffer_, valueBuffer_);
     writeRowIdMapping(pk, existingRowId.value_or(allocateRowId()));
     if (!indexes_.empty()) { writeIndexEntries(workingEntity, pkKeyBuffer_); }
+    if (!prefixIndexes_.empty()) { writePrefixIndexEntries(workingEntity, pkKeyBuffer_); }
     sealImmutableFields(workingEntity);
 }
 
@@ -104,7 +106,7 @@ void remove(const PK& pk) {
     std::vector<uint8_t> pkKeyCopy{pkKeyBuffer_.begin(), pkKeyBuffer_.end()};
 
     std::optional<Entity> oldEntity;
-    if (!indexes_.empty() || !cascadeDeletes_.empty() || !restrictDeletes_.empty() || !setNullDeletes_.empty()) {
+    if (!indexes_.empty() || !prefixIndexes_.empty() || !cascadeDeletes_.empty() || !restrictDeletes_.empty() || !setNullDeletes_.empty()) {
         std::span<const uint8_t> oldBytes;
         if (engine_->getIntoArena(pkKeyCopy, *tempArena_, oldBytes)) { oldEntity = binpack::BinPack::decode<Entity>(oldBytes); }
     }
@@ -113,6 +115,7 @@ void remove(const PK& pk) {
     if (oldEntity) { runSetNullDeletes(*oldEntity); }
     if (oldEntity) { runCascadeDeletes(*oldEntity); }
     if (oldEntity && !indexes_.empty()) { removeIndexEntries(*oldEntity, pkKeyCopy); }
+    if (oldEntity && !prefixIndexes_.empty()) { removePrefixIndexEntries(*oldEntity, pkKeyCopy); }
     removeHinted(pkKeyCopy);
     if (stableRowId) { removeRowIdMapping(pk, *stableRowId); }
 }
@@ -163,6 +166,7 @@ void updatePrimaryKey(const PK& oldPk, const Entity& entity) {
     makePkKey(newPk, scanStartBuffer_);
     putHinted(scanStartBuffer_, valueBuffer_);
     if (!indexes_.empty()) { writeIndexEntries(workingEntity, scanStartBuffer_); }
+    if (!prefixIndexes_.empty()) { writePrefixIndexEntries(workingEntity, scanStartBuffer_); }
     rewriteRowIdMapping(oldPk, newPk, *stableRowId);
     if (updateActionsNeedTargetWrite_) {
         runSetNullUpdates(*oldEntity, workingEntity);
@@ -173,6 +177,7 @@ void updatePrimaryKey(const PK& oldPk, const Entity& entity) {
         runSetNullUpdates(*oldEntity, workingEntity);
     }
     if (!indexes_.empty()) { removeIndexEntries(*oldEntity, oldPkKeyCopy); }
+    if (!prefixIndexes_.empty()) { removePrefixIndexEntries(*oldEntity, oldPkKeyCopy); }
     removeHinted(oldPkKeyCopy);
     sealImmutableFields(workingEntity);
 }

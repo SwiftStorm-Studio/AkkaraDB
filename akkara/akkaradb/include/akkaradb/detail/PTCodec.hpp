@@ -151,6 +151,17 @@ static std::array<uint8_t, 8> makeIndexPrefix(std::string_view tableName, std::s
     return out;
 }
 
+static std::array<uint8_t, 8> makePrefixIndexPrefix(std::string_view tableName, std::string_view fieldName) {
+    std::string input;
+    input.reserve(tableName.size() + 5 + fieldName.size());
+    input.append(tableName);
+    input.append(":pfx:");
+    input.append(fieldName);
+    std::array<uint8_t, 8> out{};
+    detail::writeLe64(detail::fnv1a64(input), out.data());
+    return out;
+}
+
 void makePkToRowIdKey(const PK& pk, ArenaByteBuffer& out) const {
     out.clear();
     out.insert(out.end(), pkToRowIdPrefix_.begin(), pkToRowIdPrefix_.end());
@@ -209,6 +220,44 @@ void makeIndexSearchPrefix(const std::array<uint8_t, 8>& prefix, std::span<const
     if (!fieldBytes.empty()) { std::memcpy(out.data() + 12, fieldBytes.data(), fieldBytes.size()); }
 }
 
+template <typename Out>
+static void encodePrefixIndexStringSegment(std::string_view value, Out& out, bool terminate) {
+    for (const unsigned char ch : value) {
+        if (ch == 0) {
+            out.push_back(0);
+            out.push_back(0xFF);
+        }
+        else { out.push_back(ch); }
+    }
+    if (terminate) {
+        out.push_back(0);
+        out.push_back(0);
+    }
+}
+
+template <typename Out>
+void makePrefixIndexSearchPrefix(const std::array<uint8_t, 8>& prefix, std::span<const uint8_t> escapedPrefixBytes, Out& out) const {
+    out.clear();
+    out.insert(out.end(), prefix.begin(), prefix.end());
+    out.insert(out.end(), escapedPrefixBytes.begin(), escapedPrefixBytes.end());
+}
+
+[[nodiscard]] static std::optional<size_t> prefixIndexPkOffset(std::span<const uint8_t> key, size_t fieldOffset) {
+    for (size_t i = fieldOffset; i + 1 < key.size();) {
+        if (key[i] != 0) {
+            ++i;
+            continue;
+        }
+        if (key[i + 1] == 0) { return i + 2; }
+        if (key[i + 1] == 0xFF) {
+            i += 2;
+            continue;
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 void makeIndexKey(
     const std::array<uint8_t, 8>& prefix,
     std::span<const uint8_t> fieldBytes,
@@ -217,6 +266,19 @@ void makeIndexKey(
 ) const {
     if (pkKey.size() < pkPrefix_.size()) { throw std::invalid_argument("PackedTable: malformed primary key"); }
     makeIndexSearchPrefix(prefix, fieldBytes, out);
+    out.insert(out.end(), pkKey.begin() + static_cast<std::ptrdiff_t>(pkPrefix_.size()), pkKey.end());
+}
+
+void makePrefixIndexKey(
+    const std::array<uint8_t, 8>& prefix,
+    std::span<const uint8_t> escapedFieldBytes,
+    std::span<const uint8_t> pkKey,
+    ArenaByteBuffer& out
+) const {
+    if (pkKey.size() < pkPrefix_.size()) { throw std::invalid_argument("PackedTable: malformed primary key"); }
+    out.clear();
+    out.insert(out.end(), prefix.begin(), prefix.end());
+    out.insert(out.end(), escapedFieldBytes.begin(), escapedFieldBytes.end());
     out.insert(out.end(), pkKey.begin() + static_cast<std::ptrdiff_t>(pkPrefix_.size()), pkKey.end());
 }
 
@@ -229,10 +291,27 @@ void writeIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
     }
 }
 
+void writePrefixIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
+    constexpr std::span<const uint8_t> emptyValue{};
+    for (const auto& idx : prefixIndexes_) {
+        idx.encodeField(entity, fieldBuffer_);
+        makePrefixIndexKey(idx.prefix, fieldBuffer_, pkKey, indexKeyBuffer_);
+        putHinted(indexKeyBuffer_, emptyValue);
+    }
+}
+
 void removeIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
     for (const auto& idx : indexes_) {
         idx.encodeField(entity, fieldBuffer_);
         makeIndexKey(idx.prefix, fieldBuffer_, pkKey, indexKeyBuffer_);
+        removeHinted(indexKeyBuffer_);
+    }
+}
+
+void removePrefixIndexEntries(const Entity& entity, std::span<const uint8_t> pkKey) {
+    for (const auto& idx : prefixIndexes_) {
+        idx.encodeField(entity, fieldBuffer_);
+        makePrefixIndexKey(idx.prefix, fieldBuffer_, pkKey, indexKeyBuffer_);
         removeHinted(indexKeyBuffer_);
     }
 }

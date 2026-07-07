@@ -332,7 +332,7 @@ namespace {
         TempDir dir{"specv4Query"};
         auto db = AkkaraDB::open(dir.path, StartupMode::ULTRA_FAST);
         auto profiles = db->table<&Profile::id>("queryProfiles");
-        profiles.indexed<&Profile::email>().indexed<&Profile::age>().indexed<&Profile::name>();
+        profiles.indexed<&Profile::email>().indexed<&Profile::age>().indexed<&Profile::name>().prefixIndexed<&Profile::email>();
 
         profiles.put({1, "a@example.test", "Alice", 17});
         profiles.put({2, "b@example.test", "Bob", 30});
@@ -378,6 +378,16 @@ namespace {
         }).toVector();
         AKK_TEST_CHECK(fallbackOr.size() == 2);
 
+        auto indexedOr = profiles.query([](auto profile) {
+            return profile.email == "b@example.test" || profile.name == "Carol";
+        }).toVector();
+        AKK_TEST_CHECK(indexedOr.size() == 2);
+
+        auto overlappingOr = profiles.query([](auto profile) {
+            return profile.age >= 18 || profile.name == "Carol";
+        }).toVector();
+        AKK_TEST_CHECK(overlappingOr.size() == 2);
+
         auto selectedNames = profiles.query([](auto profile) {
             return profile.name.in({"Alice", "Carol"});
         }).toVector();
@@ -422,6 +432,17 @@ namespace {
         }).toVector();
         AKK_TEST_CHECK(excludedAges.size() == 1);
         AKK_TEST_CHECK(excludedAges[0].value.id == 2);
+
+        auto prefixOnlyProfiles = db->table<&Profile::id>("prefixOnlyProfiles");
+        prefixOnlyProfiles.prefixIndexed<&Profile::email>();
+        prefixOnlyProfiles.put({1, "alpha@example.test", "Alpha", 20});
+        prefixOnlyProfiles.put({2, "beta@example.test", "Beta", 21});
+        prefixOnlyProfiles.put({3, "alphabet@example.test", "Alphabet", 22});
+
+        auto alphaEmails = prefixOnlyProfiles.query([](auto profile) {
+            return profile.email.startsWith("alpha");
+        }).toVector();
+        AKK_TEST_CHECK(alphaEmails.size() == 2);
 
         size_t ranged = 0;
         auto range = profiles.scan(2ULL, 4ULL);

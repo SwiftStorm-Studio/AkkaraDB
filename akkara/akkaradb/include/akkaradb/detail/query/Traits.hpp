@@ -86,6 +86,15 @@ namespace akkaradb {
         template <typename T>
         inline constexpr bool isAnd = IsAnd<std::remove_cvref_t<T>>::value;
 
+        template <typename T>
+        struct IsOr : std::false_type {};
+
+        template <typename L, typename R>
+        struct IsOr<Logical<Op::OR, L, R>> : std::true_type {};
+
+        template <typename T>
+        inline constexpr bool isOr = IsOr<std::remove_cvref_t<T>>::value;
+
         template <Op Operator>
         inline constexpr Op swappedCompareOp = Operator;
 
