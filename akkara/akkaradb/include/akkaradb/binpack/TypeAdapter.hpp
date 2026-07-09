@@ -34,7 +34,18 @@ namespace akkaradb::binpack {
         inline constexpr bool alwaysFalse = false;
 
         template <typename T>
-        inline constexpr bool aggregateMemcpyFastPath = std::is_aggregate_v<T> && std::is_trivially_copyable_v<T> && !std::is_array_v<T>;
+        inline constexpr bool aggregateMemcpyFastPath = false;
+
+        inline constexpr uint32_t aggregateOffsetTableMagic = 0x314F4B41u; // AKO1
+
+        template <typename Out>
+        void writeU32At(Out& out, size_t offset, uint32_t value) {
+            if (offset + 4 > out.size()) { throw std::runtime_error("BinPack: internal offset patch out of range"); }
+            out[offset + 0] = static_cast<uint8_t>(value);
+            out[offset + 1] = static_cast<uint8_t>(value >> 8);
+            out[offset + 2] = static_cast<uint8_t>(value >> 16);
+            out[offset + 3] = static_cast<uint8_t>(value >> 24);
+        }
     } // namespace detail
 
     template <typename T>
@@ -49,10 +60,23 @@ namespace akkaradb::binpack {
                 out.insert(out.end(), p, p + sizeof(T));
             }
             else if constexpr (std::is_aggregate_v<T> && !std::is_array_v<T>) {
+                constexpr size_t fieldCount = boost::pfr::tuple_size_v<T>;
+                const size_t headerOffset = out.size();
+                detail::writeU32(detail::aggregateOffsetTableMagic, out);
+                detail::writeU32(0, out);
+                const size_t offsetsOffset = out.size();
+                for (size_t i = 0; i < fieldCount; ++i) { detail::writeU32(0, out); }
+                const size_t payloadOffset = out.size();
+                size_t fieldIndex = 0;
                 boost::pfr::for_each_field(
                     v,
-                    [&out](const auto& field) { TypeAdapter<std::remove_cvref_t<decltype(field)>>::write(field, out); }
+                    [&](const auto& field) {
+                        detail::writeU32At(out, offsetsOffset + fieldIndex * 4, static_cast<uint32_t>(out.size() - payloadOffset));
+                        TypeAdapter<std::remove_cvref_t<decltype(field)>>::write(field, out);
+                        ++fieldIndex;
+                    }
                 );
+                detail::writeU32At(out, headerOffset + 4, static_cast<uint32_t>(out.size() - payloadOffset));
             }
             else { static_assert(detail::alwaysFalse<T>, "BinPack: no TypeAdapter for this type"); }
         }
@@ -68,10 +92,29 @@ namespace akkaradb::binpack {
             }
             else if constexpr (std::is_aggregate_v<T> && !std::is_array_v<T>) {
                 static_assert(std::is_default_constructible_v<T>, "BinPack aggregate read requires default construction");
+                constexpr size_t fieldCount = boost::pfr::tuple_size_v<T>;
+                const uint32_t magic = detail::readU32(in);
+                if (magic != detail::aggregateOffsetTableMagic) { throw std::runtime_error("BinPack: invalid aggregate offset table magic"); }
+                const uint32_t payloadSize = detail::readU32(in);
+                std::array<uint32_t, fieldCount> offsets{};
+                for (size_t i = 0; i < fieldCount; ++i) { offsets[i] = detail::readU32(in); }
+                if (in.size() < payloadSize) { throw std::runtime_error("BinPack: buffer underflow (aggregate payload)"); }
+                const std::span<const uint8_t> payload{in.data(), payloadSize};
+                in = in.subspan(payloadSize);
+
                 T out{};
+                size_t fieldIndex = 0;
                 boost::pfr::for_each_field(
                     out,
-                    [&in](auto& field) { field = TypeAdapter<std::remove_cvref_t<decltype(field)>>::read(in); }
+                    [&](auto& field) {
+                        const uint32_t begin = offsets[fieldIndex];
+                        const uint32_t end = fieldIndex + 1 < fieldCount ? offsets[fieldIndex + 1] : payloadSize;
+                        if (begin > end || end > payloadSize) { throw std::runtime_error("BinPack: invalid aggregate field offset"); }
+                        std::span<const uint8_t> fieldBytes{payload.data() + begin, end - begin};
+                        field = TypeAdapter<std::remove_cvref_t<decltype(field)>>::read(fieldBytes);
+                        if (!fieldBytes.empty()) { throw std::runtime_error("BinPack: aggregate field decoder left trailing bytes"); }
+                        ++fieldIndex;
+                    }
                 );
                 return out;
             }
@@ -103,7 +146,7 @@ namespace akkaradb::binpack {
                     v,
                     [&total](const auto& field) { total += TypeAdapter<std::remove_cvref_t<decltype(field)>>::estimateSize(field); }
                 );
-                return total;
+                return 8 + boost::pfr::tuple_size_v<T> * 4 + total;
             }
             else { static_assert(detail::alwaysFalse<T>, "BinPack: no TypeAdapter for this type"); }
         }

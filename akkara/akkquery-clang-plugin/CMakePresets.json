@@ -1,0 +1,24 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-msys2-ucrt64-release",
+      "displayName": "Windows MSYS2 UCRT64 Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../../builds/akkquery-clang-plugin-ucrt64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/msys64/ucrt64/bin/clang.exe",
+        "CMAKE_CXX_COMPILER": "C:/msys64/ucrt64/bin/clang++.exe",
+        "LLVM_DIR": "C:/msys64/ucrt64/lib/cmake/llvm",
+        "Clang_DIR": "C:/msys64/ucrt64/lib/cmake/clang"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msys2-ucrt64-release",
+      "configurePreset": "windows-msys2-ucrt64-release"
+    }
+  ]
+}

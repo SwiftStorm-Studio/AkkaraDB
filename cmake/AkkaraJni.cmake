@@ -10,6 +10,7 @@ if(AKKARADB_BUILD_JNI)
     )
     target_compile_definitions(akkaradb_jni PRIVATE
             AKKARADB_JNI_COMPAT_LINE="${AKKARADB_COMPAT_LINE}"
+            AKKARADB_JNI_ABI="${AKKARADB_JNI_ABI}"
             AKKARADB_REQUIRED_NATIVE_GENERATION="${AKKARADB_NATIVE_GENERATION}"
     )
     set_target_properties(akkaradb_jni PROPERTIES

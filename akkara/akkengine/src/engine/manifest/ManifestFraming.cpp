@@ -68,15 +68,6 @@ namespace akkaradb::engine::manifest {
                 [off + 5]) << 40) | (static_cast<uint64_t>(buf[off + 6]) << 48) | (static_cast<uint64_t>(buf[off + 7]) << 56);
         }
 
-        // Append a string with a u16 length prefix.
-        void appendLengthPrefixed(std::vector<uint8_t>& buf, const std::string& s) {
-            const auto len = static_cast<uint16_t>(s.size());
-            const size_t off = buf.size();
-            buf.resize(off + 2 + len);
-            writeU16(buf.data(), off, len);
-            std::memcpy(buf.data() + off + 2, s.data(), len);
-        }
-
         // Read a length-prefixed string from payload at cursor; advances cursor.
         bool readLengthPrefixed(const uint8_t* payload, uint16_t payloadLen, size_t& cursor, std::string& out) {
             if (cursor + 2 > payloadLen) { return false; }

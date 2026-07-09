@@ -62,7 +62,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
-#include <malloc.h>
 #endif
 
 using Clock = std::chrono::steady_clock;
@@ -679,6 +678,7 @@ namespace {
         return value;
     }
 
+    #ifndef _WIN32
     [[nodiscard]] static std::string quoteCommandArg(const std::filesystem::path& path) {
         std::string text = path.string();
         size_t pos = 0;
@@ -688,6 +688,7 @@ namespace {
         }
         return '"' + text + '"';
     }
+    #endif
 
     [[nodiscard]] static std::vector<std::string> splitPipeColumns(const std::string& line) {
         std::vector<std::string> columns;
@@ -865,18 +866,18 @@ namespace {
         defaultProfile.key = "default";
         defaultProfile.label = "Default";
         defaultProfile.items = {
-            {.key = "seq1m_q8t1_read", .label = "SEQ1M Q8T1 Read"},
-            {.key = "seq1m_q8t1_write", .label = "SEQ1M Q8T1 Write"},
-            {.key = "seq1m_q8t1_mix", .label = "SEQ1M Q8T1 Mix R70/W30"},
-            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read"},
-            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write"},
-            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30"},
-            {.key = "rnd4k_q32t1_read", .label = "RND4K Q32T1 Read"},
-            {.key = "rnd4k_q32t1_write", .label = "RND4K Q32T1 Write"},
-            {.key = "rnd4k_q32t1_mix", .label = "RND4K Q32T1 Mix R70/W30"},
-            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read"},
-            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write"},
-            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30"}
+            {.key = "seq1m_q8t1_read", .label = "SEQ1M Q8T1 Read", .rawRuns = {}},
+            {.key = "seq1m_q8t1_write", .label = "SEQ1M Q8T1 Write", .rawRuns = {}},
+            {.key = "seq1m_q8t1_mix", .label = "SEQ1M Q8T1 Mix R70/W30", .rawRuns = {}},
+            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read", .rawRuns = {}},
+            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write", .rawRuns = {}},
+            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30", .rawRuns = {}},
+            {.key = "rnd4k_q32t1_read", .label = "RND4K Q32T1 Read", .rawRuns = {}},
+            {.key = "rnd4k_q32t1_write", .label = "RND4K Q32T1 Write", .rawRuns = {}},
+            {.key = "rnd4k_q32t1_mix", .label = "RND4K Q32T1 Mix R70/W30", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30", .rawRuns = {}}
         };
         profiles.push_back(std::move(defaultProfile));
 
@@ -884,12 +885,12 @@ namespace {
         realWorldProfile.key = "real_world";
         realWorldProfile.label = "Real World Performance";
         realWorldProfile.items = {
-            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read"},
-            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write"},
-            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30"},
-            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read"},
-            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write"},
-            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30"}
+            {.key = "seq1m_q1t1_read", .label = "SEQ1M Q1T1 Read", .rawRuns = {}},
+            {.key = "seq1m_q1t1_write", .label = "SEQ1M Q1T1 Write", .rawRuns = {}},
+            {.key = "seq1m_q1t1_mix", .label = "SEQ1M Q1T1 Mix R70/W30", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_read", .label = "RND4K Q1T1 Read", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_write", .label = "RND4K Q1T1 Write", .rawRuns = {}},
+            {.key = "rnd4k_q1t1_mix", .label = "RND4K Q1T1 Mix R70/W30", .rawRuns = {}}
         };
         profiles.push_back(std::move(realWorldProfile));
 
@@ -922,252 +923,6 @@ namespace {
         }
         return nullptr;
     }
-
-#ifdef _WIN32
-    struct AlignedBuffer {
-        void* ptr = nullptr;
-        size_t size = 0;
-
-        AlignedBuffer() = default;
-        explicit AlignedBuffer(size_t n) : ptr(_aligned_malloc(n, 4096)), size(n) {
-            if (ptr == nullptr) {
-                throw std::bad_alloc{};
-            }
-        }
-        AlignedBuffer(const AlignedBuffer&) = delete;
-        AlignedBuffer& operator=(const AlignedBuffer&) = delete;
-        AlignedBuffer(AlignedBuffer&& other) noexcept : ptr(other.ptr), size(other.size) {
-            other.ptr = nullptr;
-            other.size = 0;
-        }
-        AlignedBuffer& operator=(AlignedBuffer&& other) noexcept {
-            if (this != &other) {
-                if (ptr != nullptr) {
-                    _aligned_free(ptr);
-                }
-                ptr = other.ptr;
-                size = other.size;
-                other.ptr = nullptr;
-                other.size = 0;
-            }
-            return *this;
-        }
-        ~AlignedBuffer() {
-            if (ptr != nullptr) {
-                _aligned_free(ptr);
-            }
-        }
-    };
-
-    struct IoSlot {
-        OVERLAPPED overlapped{};
-        HANDLE eventHandle = nullptr;
-        AlignedBuffer buffer;
-        bool active = false;
-
-        explicit IoSlot(size_t blockSize) : eventHandle(CreateEventW(nullptr, TRUE, FALSE, nullptr)), buffer(blockSize) {
-            if (eventHandle == nullptr) {
-                throw std::runtime_error("CreateEventW failed for disk benchmark");
-            }
-            std::memset(&overlapped, 0, sizeof(overlapped));
-            overlapped.hEvent = eventHandle;
-            std::memset(buffer.ptr, 0xA5, blockSize);
-        }
-        IoSlot(const IoSlot&) = delete;
-        IoSlot& operator=(const IoSlot&) = delete;
-        IoSlot(IoSlot&& other) noexcept
-            : overlapped(other.overlapped),
-              eventHandle(other.eventHandle),
-              buffer(std::move(other.buffer)),
-              active(other.active) {
-            other.eventHandle = nullptr;
-            other.active = false;
-            std::memset(&other.overlapped, 0, sizeof(other.overlapped));
-        }
-        IoSlot& operator=(IoSlot&& other) noexcept {
-            if (this != &other) {
-                if (eventHandle != nullptr) {
-                    CloseHandle(eventHandle);
-                }
-                overlapped = other.overlapped;
-                eventHandle = other.eventHandle;
-                buffer = std::move(other.buffer);
-                active = other.active;
-                other.eventHandle = nullptr;
-                other.active = false;
-                std::memset(&other.overlapped, 0, sizeof(other.overlapped));
-            }
-            return *this;
-        }
-        ~IoSlot() {
-            if (eventHandle != nullptr) {
-                CloseHandle(eventHandle);
-            }
-        }
-    };
-
-    [[nodiscard]] static uint64_t xorshift64(uint64_t& state) noexcept {
-        state ^= (state << 13);
-        state ^= (state >> 7);
-        state ^= (state << 17);
-        return state;
-    }
-
-    static void assignOverlappedOffset(OVERLAPPED& overlapped, uint64_t offset) noexcept {
-        overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFULL);
-        overlapped.OffsetHigh = static_cast<DWORD>((offset >> 32) & 0xFFFFFFFFULL);
-    }
-
-    [[nodiscard]] static std::wstring widenPath(const std::filesystem::path& path) {
-        return path.wstring();
-    }
-
-    static void ensureBenchmarkFileSize(const std::filesystem::path& path, uint64_t fileSizeBytes) {
-        HANDLE handle = CreateFileW(
-            widenPath(path).c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            nullptr
-        );
-        if (handle == INVALID_HANDLE_VALUE) {
-            throw std::runtime_error("CreateFileW failed while preparing disk benchmark file");
-        }
-        LARGE_INTEGER size{};
-        size.QuadPart = static_cast<LONGLONG>(fileSizeBytes);
-        const BOOL seekOk = SetFilePointerEx(handle, size, nullptr, FILE_BEGIN);
-        const BOOL sizeOk = seekOk ? SetEndOfFile(handle) : FALSE;
-        CloseHandle(handle);
-        if (!seekOk || !sizeOk) {
-            throw std::runtime_error("Failed to size disk benchmark file");
-        }
-    }
-
-    [[nodiscard]] static DiskRunResult runWindowsDiskIoCase(
-        const std::filesystem::path& path,
-        bool writeMode,
-        bool randomAccess,
-        uint32_t queueDepth,
-        size_t blockSize,
-        uint64_t fileSizeBytes,
-        uint64_t seed
-    ) {
-        const DWORD desiredAccess = writeMode ? (GENERIC_READ | GENERIC_WRITE) : GENERIC_READ;
-        DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING;
-        flags |= randomAccess ? FILE_FLAG_RANDOM_ACCESS : FILE_FLAG_SEQUENTIAL_SCAN;
-        if (writeMode) {
-            flags |= FILE_FLAG_WRITE_THROUGH;
-        }
-
-        HANDLE handle = CreateFileW(
-            widenPath(path).c_str(),
-            desiredAccess,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr,
-            OPEN_EXISTING,
-            flags,
-            nullptr
-        );
-        if (handle == INVALID_HANDLE_VALUE) {
-            throw std::runtime_error("CreateFileW failed while opening disk benchmark file");
-        }
-
-        const uint64_t totalOps = fileSizeBytes / static_cast<uint64_t>(blockSize);
-        if (totalOps == 0) {
-            CloseHandle(handle);
-            throw std::runtime_error("Disk benchmark file size is smaller than block size");
-        }
-
-        std::vector<IoSlot> slots;
-        slots.reserve(queueDepth);
-        for (uint32_t i = 0; i < queueDepth; ++i) {
-            slots.emplace_back(blockSize);
-        }
-
-        std::vector<HANDLE> events;
-        events.reserve(queueDepth);
-        for (auto& slot : slots) {
-            events.push_back(slot.eventHandle);
-        }
-
-        uint64_t submitted = 0;
-        uint64_t completed = 0;
-        uint64_t state = seed ^ 0x9E3779B97F4A7C15ULL;
-
-        auto nextOffset = [&](uint64_t opIndex) mutable -> uint64_t {
-            if (!randomAccess) {
-                return (opIndex % totalOps) * static_cast<uint64_t>(blockSize);
-            }
-            const uint64_t blockIndex = xorshift64(state) % totalOps;
-            return blockIndex * static_cast<uint64_t>(blockSize);
-        };
-
-        const auto submitOp = [&](IoSlot& slot, uint64_t opIndex) {
-            slot.active = true;
-            ResetEvent(slot.eventHandle);
-            std::memset(&slot.overlapped, 0, sizeof(slot.overlapped));
-            slot.overlapped.hEvent = slot.eventHandle;
-            assignOverlappedOffset(slot.overlapped, nextOffset(opIndex));
-            DWORD transferred = 0;
-            const BOOL ok = writeMode
-                ? WriteFile(handle, slot.buffer.ptr, static_cast<DWORD>(blockSize), &transferred, &slot.overlapped)
-                : ReadFile(handle, slot.buffer.ptr, static_cast<DWORD>(blockSize), &transferred, &slot.overlapped);
-            if (!ok) {
-                const DWORD error = GetLastError();
-                if (error != ERROR_IO_PENDING) {
-                    throw std::runtime_error(std::format("Disk benchmark I/O submit failed (winerr={})", error));
-                }
-            }
-        };
-
-        const uint32_t initial = static_cast<uint32_t>(std::min<uint64_t>(queueDepth, totalOps));
-        for (uint32_t i = 0; i < initial; ++i) {
-            submitOp(slots[static_cast<size_t>(i)], submitted++);
-        }
-
-        const auto t0 = Clock::now();
-        while (completed < totalOps) {
-            const DWORD wait = WaitForMultipleObjects(static_cast<DWORD>(events.size()), events.data(), FALSE, INFINITE);
-            if (wait < WAIT_OBJECT_0 || wait >= WAIT_OBJECT_0 + events.size()) {
-                CloseHandle(handle);
-                throw std::runtime_error("WaitForMultipleObjects failed during disk benchmark");
-            }
-            const size_t index = static_cast<size_t>(wait - WAIT_OBJECT_0);
-            IoSlot& slot = slots[index];
-            DWORD transferred = 0;
-            if (!GetOverlappedResult(handle, &slot.overlapped, &transferred, FALSE)) {
-                const DWORD error = GetLastError();
-                CloseHandle(handle);
-                throw std::runtime_error(std::format("Disk benchmark I/O completion failed (winerr={})", error));
-            }
-            if (transferred != blockSize) {
-                CloseHandle(handle);
-                throw std::runtime_error("Disk benchmark transferred byte count mismatch");
-            }
-            ++completed;
-            slot.active = false;
-            if (submitted < totalOps) {
-                submitOp(slot, submitted++);
-            } else {
-                ResetEvent(slot.eventHandle);
-            }
-        }
-        if (writeMode) {
-            FlushFileBuffers(handle);
-        }
-        const double seconds = std::chrono::duration<double>(Clock::now() - t0).count();
-        CloseHandle(handle);
-
-        DiskRunResult out{};
-        if (seconds > 0.0) {
-            out.throughputMBPerSec = mibToMb((static_cast<double>(fileSizeBytes) / (1024.0 * 1024.0)) / seconds);
-            out.iops = static_cast<double>(totalOps) / seconds;
-        }
-        return out;
-    }
-#endif
 
     [[nodiscard]] static SystemProfile collectSystemProfile(
         const std::filesystem::path& diskTargetPath,
@@ -1492,6 +1247,8 @@ namespace {
             << ',' << stats.cov;
     }
 
+    [[nodiscard]] static double logicalPayloadMibPerSec(size_t bytesPerOp, int ops, double ms);
+    [[nodiscard]] static double residentMibPerSec(uint64_t residentBytes, double ms);
     [[nodiscard]] static double averageWallLatencyUs(int ops, double ms);
 
     [[nodiscard]] static const DiskBenchmarkProfileResult* findDiskProfileResult(

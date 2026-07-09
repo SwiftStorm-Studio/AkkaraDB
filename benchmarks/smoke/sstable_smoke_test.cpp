@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <stdexcept>
@@ -161,6 +162,8 @@ namespace {
         }
         AKK_TEST_CHECK(count == 5);
 
+        reader.reset();
+        in.close();
         fs::remove_all(dir);
     }
 

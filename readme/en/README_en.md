@@ -22,7 +22,7 @@
 | JVM bridge   | Kotlin/JVM wrapper over JNI using `ByteBufferL` at the public low-level API             |
 | Clustering   | Standalone, mirror, and stripe replication configuration primitives                     |
 | Erasure      | `XOR`, `DualXOR`, `RS`, and `ERS` low-level erasure/error-correcting codecs            |
-| Portability  | Windows/MSVC and Linux/GCC/Clang                                                        |
+| Portability  | clang-cl on Windows and LLVM clang++ on Linux/macOS                                     |
 
 ---
 
@@ -46,7 +46,11 @@ Common flags:
 
 TLS and SIMD are currently enabled by the native CMake configuration. The build links mbedTLS and adds SSE4.2/AVX2 compiler flags on supported compilers.
 
-On Windows, build from a Visual Studio/MSVC environment so the compiler, linker, and Windows SDK are initialized.
+Official native builds use LLVM Clang: `clang-cl` on Windows and `clang++` on Linux/macOS. On Windows, build from a Visual Studio developer environment so the MSVC linker and Windows SDK are initialized.
+
+```powershell
+cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake --preset windows-clang-cl-release && cmake --build --preset windows-clang-cl-release"
+```
 
 ### Install Target
 

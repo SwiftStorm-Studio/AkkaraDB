@@ -1,6 +1,8 @@
 # ==================== Dependencies ====================
 include(FetchContent)
 
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
         zstd
         GIT_REPOSITORY https://github.com/facebook/zstd.git

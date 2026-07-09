@@ -33,6 +33,12 @@
         TypePtr value;
     };
 
+    [[nodiscard]] TypeDesc makeStructType() {
+        TypeDesc out{};
+        out.kind = TypeDesc::STRUCT;
+        return out;
+    }
+
     [[nodiscard]] TypePtr parseType(BytesReader& in);
 
     void parseStructFields(BytesReader& in, TypeDesc& out) {
@@ -69,7 +75,7 @@
 
     [[nodiscard]] TypeDesc parseRootSchema(std::span<const uint8_t> schemaBytes) {
         BytesReader in(schemaBytes);
-        TypeDesc root{TypeDesc::STRUCT};
+        TypeDesc root = makeStructType();
         parseStructFields(in, root);
         if (!in.eof()) { throw std::runtime_error("Trailing bytes in AkkaraDB schema payload"); }
         return root;

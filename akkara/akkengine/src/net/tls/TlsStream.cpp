@@ -150,17 +150,15 @@ namespace akkaradb::net {
             setNativeSocketTimeout(socket, SO_SNDTIMEO, writeTimeoutMs);
         }
 
+        #ifndef _WIN32
         [[nodiscard]] int sendNoSigpipeFlags() noexcept {
-            #ifdef _WIN32
-            return 0;
-            #else
             #ifdef MSG_NOSIGNAL
             return MSG_NOSIGNAL;
             #else
             return 0;
             #endif
-            #endif
         }
+        #endif
 
         void ensureTlsSocketRuntime() {
             #ifdef _WIN32

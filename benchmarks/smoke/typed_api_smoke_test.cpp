@@ -12,11 +12,15 @@
 
 #include "akkaradb/AkkaraDB.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <map>
+#include <memory>
 #include <optional>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -174,6 +178,63 @@ namespace {
     };
 
     AKKARADB_QUERYABLE(WideQueryable, id, f01, f02, f03, f04, f05, f06, f07, f08, f09, f10, label)
+
+    bool profileIsBobbyWithOddAge(const Profile& profile, const void*) {
+        return profile.name == "Bobby" && (profile.age % 2U) == 1U;
+    }
+
+    struct ProfileMinAgeCapture {
+        uint32_t minAge;
+    };
+
+    struct ProfileNameCapture {
+        std::string name;
+    };
+
+    bool profileAgeAtLeastCapture(const Profile& profile, const void* raw) {
+        const auto* capture = static_cast<const ProfileMinAgeCapture*>(raw);
+        return capture != nullptr && profile.age >= capture->minAge;
+    }
+
+    bool profileNameEqualsCapture(const Profile& profile, const void* raw) {
+        const auto* capture = static_cast<const ProfileNameCapture*>(raw);
+        return capture != nullptr && profile.name == capture->name;
+    }
+
+    bool oddAgeOpcode(
+        std::span<const akkaradb::query::bytecode::Value> args,
+        akkaradb::query::bytecode::Value& out,
+        const void*
+    ) {
+        namespace bc = akkaradb::query::bytecode;
+        if (args.size() != 1 || !args[0].isNumeric()) { return false; }
+        const auto value = args[0].kind == bc::ValueKind::UInt
+                               ? args[0].u
+                               : static_cast<uint64_t>(bc::numericAsLongDouble(args[0]));
+        out = bc::Value::boolean((value % 2U) == 1U);
+        return true;
+    }
+
+    bool rejectingOpcode(
+        std::span<const akkaradb::query::bytecode::Value>,
+        akkaradb::query::bytecode::Value&,
+        const void*
+    ) {
+        return false;
+    }
+
+    bool customOddAge(uint32_t age) {
+        return (age % 2U) == 1U;
+    }
+
+    AKKARADB_QUERY_OPCODE(
+        customOddAge,
+        akkaradb::query::bytecode::customOpcodeUserMin + 1,
+        "custom_odd_age",
+        1,
+        akkaradb::query::bytecode::ValueKind::Bool,
+        &oddAgeOpcode
+    );
 
     void testTrivialCrud() {
         using namespace akkaradb;
@@ -427,6 +488,16 @@ namespace {
         AKK_TEST_CHECK(containedEmail.size() == 1);
         AKK_TEST_CHECK(containedEmail[0].value.id == 2);
 
+        auto suffixEmails = profiles.query([](auto profile) {
+            return profile.email.endsWith(".test");
+        }).toVector();
+        AKK_TEST_CHECK(suffixEmails.size() == 3);
+
+        auto suffixEmailsSnake = profiles.query([](auto profile) {
+            return profile.email.ends_with(".test");
+        }).toVector();
+        AKK_TEST_CHECK(suffixEmailsSnake.size() == 3);
+
         auto excludedAges = profiles.query([](auto profile) {
             return profile.age.notIn(std::vector<uint32_t>{17, 41});
         }).toVector();
@@ -443,6 +514,329 @@ namespace {
             return profile.email.startsWith("alpha");
         }).toVector();
         AKK_TEST_CHECK(alphaEmails.size() == 2);
+
+        namespace bc = akkaradb::query::bytecode;
+        static constexpr std::array<uint8_t, 16> bytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Ge),
+            static_cast<uint8_t>(bc::Opcode::LoadField), 1, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 1, 0,
+            static_cast<uint8_t>(bc::Opcode::Eq),
+            static_cast<uint8_t>(bc::Opcode::And),
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::Value, 2> constants{
+            bc::Value::uinteger(18),
+            bc::Value::string("Bobby")
+        };
+        static constexpr std::array<bc::FieldBinding<Profile>, 2> fields{
+            bc::makeTopLevelFieldBinding<&Profile::age, 3>("age"),
+            bc::makeTopLevelFieldBinding<&Profile::name, 2>("name")
+        };
+        static constexpr std::array<bc::PlanHint, 1> planHints{
+            bc::PlanHint{bc::PlanHintOp::Ge, 0, 0}
+        };
+        const auto encodedBobby = akkaradb::binpack::BinPack::encode(Profile{2, "b@example.test", "Bobby", 31});
+        AKK_TEST_CHECK(fields[0].rawRead(encodedBobby).u == 31U);
+        AKK_TEST_CHECK(fields[1].rawRead(encodedBobby).s == "Bobby");
+
+        auto compiledTableScan = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = bytecode,
+                .constants = constants,
+                .fields = fields,
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(compiledTableScan.size() == 1);
+        AKK_TEST_CHECK(compiledTableScan[0].value.id == 2);
+
+        auto compiled = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = bytecode,
+                .constants = constants,
+                .fields = fields,
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = planHints,
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(compiled.size() == 1);
+        AKK_TEST_CHECK(compiled[0].value.id == 2);
+
+        static constexpr std::array<uint8_t, 8> stringBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::EndsWith),
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::Value, 1> stringConstants{
+            bc::Value::string(".test")
+        };
+        static constexpr std::array<bc::FieldBinding<Profile>, 1> stringFields{
+            bc::makeTopLevelFieldBinding<&Profile::email, 1>("email")
+        };
+        auto stringFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = stringBytecode,
+                .constants = stringConstants,
+                .fields = stringFields,
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(stringFiltered.size() == 3);
+
+        struct BytecodeCaptureOwner {
+            uint32_t minAge;
+            std::array<bc::Value, 1> constants;
+
+            explicit BytecodeCaptureOwner(uint32_t value)
+                : minAge{value},
+                  constants{bc::valueFrom(minAge)} {}
+        };
+        auto captureOwner = std::make_shared<BytecodeCaptureOwner>(18U);
+        static constexpr std::array<uint8_t, 8> capturedBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Ge),
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        auto capturedFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = capturedBytecode,
+                .constants = captureOwner->constants,
+                .fields = std::span<const bc::FieldBinding<Profile>>{fields.data(), 1},
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = captureOwner.get(),
+                .capturesOwner = captureOwner
+            }
+        ).toVector();
+        AKK_TEST_CHECK(capturedFiltered.size() == 2);
+
+        static constexpr std::array<uint8_t, 8> whereNameBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Eq),
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::Value, 1> whereNameConstants{
+            bc::Value::string("Bobby")
+        };
+        static constexpr std::array<bc::FieldBinding<Profile>, 1> whereNameFields{
+            bc::makeTopLevelFieldBinding<&Profile::name, 2>("name")
+        };
+        auto composedWhereFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = capturedBytecode,
+                .constants = captureOwner->constants,
+                .fields = std::span<const bc::FieldBinding<Profile>>{fields.data(), 1},
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = captureOwner.get(),
+                .capturesOwner = captureOwner
+            }
+        ).where(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = whereNameBytecode,
+                .constants = whereNameConstants,
+                .fields = whereNameFields,
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(composedWhereFiltered.size() == 1);
+        AKK_TEST_CHECK(composedWhereFiltered[0].value.id == 2);
+
+        static constexpr std::array<uint8_t, 12> arithmeticBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Add),
+            static_cast<uint8_t>(bc::Opcode::PushConst), 1, 0,
+            static_cast<uint8_t>(bc::Opcode::Ge),
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::Value, 2> arithmeticConstants{
+            bc::Value::integer(1),
+            bc::Value::integer(42)
+        };
+        auto arithmeticFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = arithmeticBytecode,
+                .constants = arithmeticConstants,
+                .fields = std::span<const bc::FieldBinding<Profile>>{fields.data(), 1},
+                .hostCalls = {},
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(arithmeticFiltered.size() == 1);
+        AKK_TEST_CHECK(arithmeticFiltered[0].value.id == 3);
+
+        bc::CustomOpcodeRegistry customRegistry;
+        std::ostringstream customOpcodeLog;
+        AKK_TEST_CHECK(!customRegistry.registerOpcode(
+            bc::CustomOpcodeBinding{
+                .opcode = 1,
+                .name = "bad_user_range",
+                .arity = 1,
+                .resultKind = bc::ValueKind::Bool,
+                .thunk = &oddAgeOpcode
+            },
+            &customOpcodeLog
+        ));
+        AKK_TEST_CHECK(customOpcodeLog.str().find("rejected custom opcode") != std::string::npos);
+        AKK_TEST_CHECK(customRegistry.registerOpcode(
+            bc::CustomOpcodeBinding{
+                .opcode = bc::customOpcodeUserMin,
+                .name = "odd_age",
+                .arity = 1,
+                .resultKind = bc::ValueKind::Bool,
+                .thunk = &oddAgeOpcode
+            },
+            &customOpcodeLog
+        ));
+        AKK_TEST_CHECK(!customRegistry.registerOpcode(
+            bc::CustomOpcodeBinding{
+                .opcode = bc::customOpcodeUserMin,
+                .name = "odd_age_duplicate",
+                .arity = 1,
+                .resultKind = bc::ValueKind::Bool,
+                .thunk = &oddAgeOpcode
+            },
+            &customOpcodeLog
+        ));
+        static constexpr std::array<uint8_t, 7> customBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::CallCustom), 0, 0x80,
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        auto customFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = customBytecode,
+                .constants = {},
+                .fields = std::span<const bc::FieldBinding<Profile>>{fields.data(), 1},
+                .hostCalls = {},
+                .customOpcodes = customRegistry.bindings(),
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(customFiltered.size() == 3);
+
+        static constexpr std::array<uint8_t, 21> shortCircuitBytecode{
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::PushConst), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Gt),
+            static_cast<uint8_t>(bc::Opcode::JumpIfFalse), 17, 0,
+            static_cast<uint8_t>(bc::Opcode::LoadField), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::CallCustom), 1, 0x80,
+            static_cast<uint8_t>(bc::Opcode::Return),
+            static_cast<uint8_t>(bc::Opcode::PushConst), 1, 0,
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::Value, 2> shortCircuitConstants{
+            bc::Value::uinteger(100),
+            bc::Value::boolean(false)
+        };
+        static constexpr std::array<bc::CustomOpcodeBinding, 1> rejectingCustomOpcode{
+            bc::CustomOpcodeBinding{
+                .opcode = bc::customOpcodeUserMin + 1,
+                .name = "rejecting",
+                .arity = 1,
+                .resultKind = bc::ValueKind::Bool,
+                .thunk = &rejectingOpcode
+            }
+        };
+        auto shortCircuitFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = shortCircuitBytecode,
+                .constants = shortCircuitConstants,
+                .fields = std::span<const bc::FieldBinding<Profile>>{fields.data(), 1},
+                .hostCalls = {},
+                .customOpcodes = rejectingCustomOpcode,
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(shortCircuitFiltered.empty());
+
+        static constexpr std::array<uint8_t, 4> hostBytecode{
+            static_cast<uint8_t>(bc::Opcode::HostCallBool), 0, 0,
+            static_cast<uint8_t>(bc::Opcode::Return)
+        };
+        static constexpr std::array<bc::HostCallThunk<Profile>, 1> hostCalls{
+            &profileIsBobbyWithOddAge
+        };
+
+        auto hostFiltered = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = hostBytecode,
+                .constants = {},
+                .fields = {},
+                .hostCalls = hostCalls,
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nullptr,
+                .capturesOwner = {}
+            }
+        ).toVector();
+        AKK_TEST_CHECK(hostFiltered.size() == 1);
+        AKK_TEST_CHECK(hostFiltered[0].value.id == 2);
+
+        static constexpr std::array<bc::HostCallThunk<Profile>, 1> minAgeHostCalls{
+            &profileAgeAtLeastCapture
+        };
+        static constexpr std::array<bc::HostCallThunk<Profile>, 1> nameHostCalls{
+            &profileNameEqualsCapture
+        };
+        auto minAgeCapture = std::make_shared<ProfileMinAgeCapture>(ProfileMinAgeCapture{18});
+        auto nameCapture = std::make_shared<ProfileNameCapture>(ProfileNameCapture{"Bobby"});
+        auto composedIndependentHostCaptures = profiles.__query_compiled(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = hostBytecode,
+                .constants = {},
+                .fields = {},
+                .hostCalls = minAgeHostCalls,
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = minAgeCapture.get(),
+                .capturesOwner = minAgeCapture
+            }
+        ).where(
+            bc::CompiledQueryDescriptor<Profile>{
+                .code = hostBytecode,
+                .constants = {},
+                .fields = {},
+                .hostCalls = nameHostCalls,
+                .customOpcodes = {},
+                .planHints = {},
+                .captures = nameCapture.get(),
+                .capturesOwner = nameCapture
+            }
+        ).toVector();
+        AKK_TEST_CHECK(composedIndependentHostCaptures.size() == 1);
+        AKK_TEST_CHECK(composedIndependentHostCaptures[0].value.id == 2);
 
         size_t ranged = 0;
         auto range = profiles.scan(2ULL, 4ULL);

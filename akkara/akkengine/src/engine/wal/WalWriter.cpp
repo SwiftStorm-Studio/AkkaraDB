@@ -180,8 +180,6 @@ namespace akkaradb::engine::wal {
         }
     } // namespace
 
-    WalWriter::WalWriter() = default;
-
     class WalWriter::Impl {
         public:
             struct PendingEntry {
@@ -554,6 +552,8 @@ namespace akkaradb::engine::wal {
             std::vector<std::unique_ptr<ShardWriter>> shards_;
             bool closed_ = false;
     };
+
+    WalWriter::WalWriter() = default;
 
     std::unique_ptr<WalWriter> WalWriter::create(WalOptions options) {
         auto writer = std::unique_ptr < WalWriter > (new WalWriter{});

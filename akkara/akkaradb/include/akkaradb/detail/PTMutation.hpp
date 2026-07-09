@@ -16,6 +16,7 @@ void put(const Entity& entity) {
     const PK& pk = workingEntity.*PrimaryKeyPtr;
     const auto existingRowId = rowIdOf(pk);
     makePkKey(pk, pkKeyBuffer_);
+    std::vector<uint8_t> pkKeyCopy{pkKeyBuffer_.begin(), pkKeyBuffer_.end()};
     std::optional<Entity> oldEntity;
 
     if (!indexes_.empty() || !prefixIndexes_.empty() || !updateFieldHooks_.empty()) {
@@ -45,10 +46,10 @@ void put(const Entity& entity) {
     valueBuffer_.reserve(binpack::BinPack::estimateSize(workingEntity));
     binpack::BinPack::encodeInto(workingEntity, valueBuffer_);
 
-    putHinted(pkKeyBuffer_, valueBuffer_);
+    putHinted(pkKeyCopy, valueBuffer_);
     writeRowIdMapping(pk, existingRowId.value_or(allocateRowId()));
-    if (!indexes_.empty()) { writeIndexEntries(workingEntity, pkKeyBuffer_); }
-    if (!prefixIndexes_.empty()) { writePrefixIndexEntries(workingEntity, pkKeyBuffer_); }
+    if (!indexes_.empty()) { writeIndexEntries(workingEntity, pkKeyCopy); }
+    if (!prefixIndexes_.empty()) { writePrefixIndexEntries(workingEntity, pkKeyCopy); }
     sealImmutableFields(workingEntity);
 }
 

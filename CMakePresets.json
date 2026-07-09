@@ -21,6 +21,41 @@
       }
     },
     {
+      "name": "windows-clang-cl-debug",
+      "displayName": "Windows clang-cl Debug",
+      "generator": "NMake Makefiles",
+      "binaryDir": "${sourceDir}/builds/windows-clang-cl-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+        "AKKARADB_BUILD_SHARED_LIBS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clang-cl-release",
+      "displayName": "Windows clang-cl Release",
+      "generator": "NMake Makefiles",
+      "binaryDir": "${sourceDir}/builds/windows-clang-cl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/Program Files/LLVM/bin/clang-cl.exe",
+        "AKKARADB_BUILD_SHARED_LIBS": "ON",
+        "AKKARADB_BUILD_JNI": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
       "name": "release-linux",
       "displayName": "Release Linux",
       "inherits": "release",
@@ -92,6 +127,21 @@
       "name": "release",
       "configurePreset": "release",
       "configuration": "Release"
+    },
+    {
+      "name": "windows-clang-cl-debug",
+      "configurePreset": "windows-clang-cl-debug"
+    },
+    {
+      "name": "windows-clang-cl-release",
+      "configurePreset": "windows-clang-cl-release"
+    },
+    {
+      "name": "windows-clang-cl-query-rewrite-build",
+      "configurePreset": "windows-clang-cl-release",
+      "targets": [
+        "akkaradb_query_rewrite_build"
+      ]
     },
     {
       "name": "release-linux",

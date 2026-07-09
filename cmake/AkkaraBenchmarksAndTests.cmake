@@ -168,6 +168,7 @@ add_executable(akkaradb_crc32c_smoke_test
 if(MSVC)
     target_compile_options(akkaradb_crc32c_smoke_test PRIVATE /WX-)
 endif()
+target_compile_definitions(akkaradb_crc32c_smoke_test PRIVATE AKKARADB_STATIC)
 target_include_directories(akkaradb_crc32c_smoke_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}

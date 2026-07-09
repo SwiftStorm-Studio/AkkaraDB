@@ -37,6 +37,23 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
 ```
 
+Official native builds use LLVM Clang: `clang-cl` on Windows and `clang++` on Linux/macOS. On Windows, run from a Visual Studio developer environment so the MSVC linker and Windows SDK are initialized:
+
+```powershell
+cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake --preset windows-clang-cl-release && cmake --build --preset windows-clang-cl-release"
+```
+
+Experimental query-rewrite build on Windows:
+
+```powershell
+cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake --preset windows-clang-cl-release && cmake --build --preset windows-clang-cl-query-rewrite-build"
+```
+
+This target copies the source tree under `builds/akkara-query-rewrite/`, runs the
+Akkara query Clang plugin against copied `.cpp` translation units, replaces only
+the copied files with rewritten versions, and then builds the copied tree. The
+original source tree is not modified.
+
 Build the JNI bridge when you need the JVM wrapper:
 
 ```cmake

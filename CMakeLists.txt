@@ -8,6 +8,7 @@ foreach (AKKARADB_REQUIRED_VERSION_PROPERTY IN ITEMS
         AKKARADB_PROJECT_VERSION
         AKKARADB_DETAIL_VERSION_BASE
         AKKARADB_COMPAT_LINE
+        AKKARADB_JNI_ABI
         AKKARADB_REVISION_FILE
 )
     if (NOT DEFINED ${AKKARADB_REQUIRED_VERSION_PROPERTY} OR "${${AKKARADB_REQUIRED_VERSION_PROPERTY}}" STREQUAL "")
@@ -24,11 +25,13 @@ project(AkkaraDB
         LANGUAGES CXX
 )
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraCompilerPolicy.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/settings/CMakeLists.txt")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraDependencies.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraTargets.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraBenchmarksAndTests.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraJni.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraPackaging.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraQueryRewriteBuild.cmake")
 
 message(STATUS "AkkaraDB CMake configuration completed. TLS is enabled; SIMD paths are selected at runtime.")

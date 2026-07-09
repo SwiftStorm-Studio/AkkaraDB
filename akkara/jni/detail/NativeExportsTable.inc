@@ -2,6 +2,10 @@
     return env->NewStringUTF(AKKARADB_JNI_COMPAT_LINE);
 }
 
+    JNIEXPORT jstring JNICALL Java_dev_swiftstorm_akkaradb_engine_NativeLibrary_nativeJniAbi(JNIEnv* env, jclass) {
+    return env->NewStringUTF(AKKARADB_JNI_ABI);
+}
+
     JNIEXPORT jstring JNICALL Java_dev_swiftstorm_akkaradb_engine_NativeLibrary_nativeRequiredNativeGeneration(JNIEnv* env, jclass) {
     return env->NewStringUTF(AKKARADB_REQUIRED_NATIVE_GENERATION);
 }

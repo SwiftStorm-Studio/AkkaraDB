@@ -56,7 +56,7 @@ namespace akkaradb {
     #define AKKARADB_DETAIL_FOR_EACH_AGAIN() AKKARADB_DETAIL_FOR_EACH
 
     #define AKKARADB_QUERYABLE(Type, ...) \
-        [[nodiscard]] inline auto akkaradbQueryProxy(::akkaradb::query::ProxyTag<Type>) { \
+        [[nodiscard, maybe_unused]] inline auto akkaradbQueryProxy(::akkaradb::query::ProxyTag<Type>) { \
             struct Proxy { \
                 AKKARADB_DETAIL_EVAL(AKKARADB_DETAIL_FOR_EACH(AKKARADB_QUERYABLE_FIELD, Type, __VA_ARGS__)) \
             }; \
@@ -305,6 +305,7 @@ namespace akkaradb {
 
     #include "detail/PTScan.hpp"
     #include "detail/query/Plan.hpp"
+    #include "detail/query/BytecodeView.hpp"
     #include "detail/query/Join.hpp"
 
     [[nodiscard]] std::string_view tableName() const noexcept { return tableName_; }

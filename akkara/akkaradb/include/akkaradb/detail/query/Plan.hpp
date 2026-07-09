@@ -209,7 +209,18 @@ class QueryView {
 
         [[nodiscard]] typename Iterator::Sentinel end() const noexcept { return {}; }
 
-        template <typename Pred>
+        template <typename NextExpr> requires(query::isExpr<NextExpr>)
+        [[nodiscard]] auto where(NextExpr&& nextExpr) const {
+            using StoredNextExpr = std::remove_cvref_t<NextExpr>;
+            return QueryView<query::Logical<query::Op::AND, Expr, StoredNextExpr>>{
+                table_,
+                query::Logical<query::Op::AND, Expr, StoredNextExpr>{expr_, std::forward<NextExpr>(nextExpr)},
+                limit_
+            };
+        }
+
+        #ifndef AKKARADB_QUERY_REWRITE_PASS
+        template <typename Pred> requires(!query::isExpr<Pred>)
         [[nodiscard]] auto where(Pred&& predicate) const {
             auto next = std::forward<Pred>(predicate)(query::makeProxy<Entity>());
             using NextExpr = decltype(next);
@@ -219,6 +230,10 @@ class QueryView {
                 limit_
             };
         }
+        #else
+        template <typename Pred> requires(!query::isExpr<Pred>)
+        [[nodiscard]] QueryView where(Pred&&) const { return *this; }
+        #endif
 
         [[nodiscard]] QueryView limit(size_t n) const {
             QueryView out{*this};
@@ -263,5 +278,16 @@ class QueryView {
 
 [[nodiscard]] QueryView<query::AlwaysTrue> query() const { return QueryView<query::AlwaysTrue>{this, query::AlwaysTrue{}}; }
 
-template <typename Pred>
+template <typename Expr> requires(query::isExpr<Expr>)
+[[nodiscard]] auto query(Expr&& expr) const {
+    using StoredExpr = std::remove_cvref_t<Expr>;
+    return QueryView<StoredExpr>{this, std::forward<Expr>(expr)};
+}
+
+#ifndef AKKARADB_QUERY_REWRITE_PASS
+template <typename Pred> requires(!query::isExpr<Pred>)
 [[nodiscard]] auto query(Pred&& predicate) const { return query().where(std::forward<Pred>(predicate)); }
+#else
+template <typename Pred> requires(!query::isExpr<Pred>)
+[[nodiscard]] QueryView<query::AlwaysTrue> query(Pred&&) const { return query(); }
+#endif

@@ -349,7 +349,7 @@ template <query::Op Operator, auto FieldPtr, typename Lit>
         if constexpr (requires { std::begin(literal); std::end(literal); }) { return tryMakeFullFieldIndexPlan(idx->prefix, plan); }
         else { return false; }
     }
-    else if constexpr (Operator == query::Op::CONTAINS) {
+    else if constexpr (Operator == query::Op::CONTAINS || Operator == query::Op::ENDS_WITH) {
         if (idx == nullptr) { return false; }
         if constexpr (query::isStringLikeV<Field>&& query::isStringLikeV<Lit>) { return tryMakeFullFieldIndexPlan(idx->prefix, plan); }
         else { return false; }

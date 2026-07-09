@@ -88,8 +88,6 @@ namespace akkaradb::engine::vlog {
         }
     } // namespace
 
-    VersionLog::VersionLog() = default;
-
     class VersionLog::Impl {
         public:
             VersionLogOptions opts_;
@@ -388,6 +386,8 @@ namespace akkaradb::engine::vlog {
                 }
             }
     };
+
+    VersionLog::VersionLog() = default;
 
     std::unique_ptr<VersionLog> VersionLog::create(VersionLogOptions opts) {
         auto log = std::unique_ptr < VersionLog > (new VersionLog{});

@@ -97,7 +97,7 @@ void attachAutoRefs(const X& value) const {
         value.attach(static_cast<RefBinding<Target>*>(raw));
     }
     else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
-        boost::pfr::for_each_field(value, [this](const auto& field) { attachAutoRefs(field); });
+        boost::pfr::for_each_field(value, [this](const auto& field) { this->attachAutoRefs(field); });
     }
 }
 
@@ -120,7 +120,7 @@ void flushAutoRefs(const X& value) const {
         }
     }
     else if constexpr (std::is_aggregate_v<Field> && !std::is_array_v<Field>) {
-        boost::pfr::for_each_field(value, [this](const auto& field) { flushAutoRefs(field); });
+        boost::pfr::for_each_field(value, [this](const auto& field) { this->flushAutoRefs(field); });
     }
 }
 

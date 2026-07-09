@@ -22,7 +22,7 @@
 | JVM ブリッジ | public low-level API では `ByteBufferL` を使う Kotlin/JVM + JNI ラッパー |
 | クラスタリング | standalone、mirror、stripe の replication primitive |
 | 消失訂正 | low-level API に `XOR`、`DualXOR`、`RS`、`ERS` codec を同梱 |
-| 可搬性 | Windows/MSVC と Linux/GCC/Clang をサポート |
+| 可搬性 | Windows は clang-cl、Linux/macOS は LLVM clang++ をサポート |
 
 ---
 
@@ -46,7 +46,11 @@ cmake --build build --config Release
 
 現在の native CMake 設定では TLS と SIMD が有効です。ビルド時には mbedTLS をリンクし、対応するコンパイラでは SSE4.2 / AVX2 のフラグを追加します。
 
-Windows では、compiler、linker、Windows SDK が初期化された Visual Studio / MSVC 環境からビルドしてください。
+Native の公式ビルドは LLVM Clang を使います。Windows では `clang-cl`、Linux/macOS では `clang++` が前提です。Windows では linker と Windows SDK を使えるように、Visual Studio developer environment から実行してください。
+
+```powershell
+cmd /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"" >nul && cmake --preset windows-clang-cl-release && cmake --build --preset windows-clang-cl-release"
+```
 
 ### インストール済みターゲットの利用
 

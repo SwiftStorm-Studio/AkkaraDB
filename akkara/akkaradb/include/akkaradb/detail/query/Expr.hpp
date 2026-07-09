@@ -36,6 +36,7 @@ namespace akkaradb {
             IN_LIST,
             NOT_IN,
             STARTS_WITH,
+            ENDS_WITH,
             CONTAINS,
             LIKE,
             IS_NULL,
@@ -80,6 +81,12 @@ namespace akkaradb {
 
             template <typename R>
             [[nodiscard]] auto startsWith(R&& rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto endsWith(R&& rhs) const;
+
+            template <typename R>
+            [[nodiscard]] auto ends_with(R&& rhs) const;
 
             template <typename R>
             [[nodiscard]] auto contains(R&& rhs) const;
@@ -304,6 +311,17 @@ namespace akkaradb {
         }
 
         template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
+        [[nodiscard]] auto endsWith(L&& lhs, R&& rhs) {
+            return Compare<Op::ENDS_WITH, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
+                asExpr(std::forward<L>(lhs)),
+                asExpr(std::forward<R>(rhs))
+            };
+        }
+
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
+        [[nodiscard]] auto ends_with(L&& lhs, R&& rhs) { return endsWith(std::forward<L>(lhs), std::forward<R>(rhs)); }
+
+        template <typename L, typename R> requires(isExpr<L> || isExpr<R>)
         [[nodiscard]] auto contains(L&& lhs, R&& rhs) {
             return Compare<Op::CONTAINS, decltype(asExpr(std::forward<L>(lhs))), decltype(asExpr(std::forward<R>(rhs)))>{
                 asExpr(std::forward<L>(lhs)),
@@ -399,6 +417,14 @@ namespace akkaradb {
         template <auto FieldPtr>
         template <typename R>
         [[nodiscard]] auto Column<FieldPtr>::startsWith(R&& rhs) const { return query::startsWith(*this, std::forward<R>(rhs)); }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::endsWith(R&& rhs) const { return query::endsWith(*this, std::forward<R>(rhs)); }
+
+        template <auto FieldPtr>
+        template <typename R>
+        [[nodiscard]] auto Column<FieldPtr>::ends_with(R&& rhs) const { return query::endsWith(*this, std::forward<R>(rhs)); }
 
         template <auto FieldPtr>
         template <typename R>

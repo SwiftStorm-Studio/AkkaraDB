@@ -87,6 +87,10 @@ set(AKKARADB_CRC32C_AVX2_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.c
 set(AKKARADB_CRC32C_AVX512_SOURCE "${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp")
 if (AKKARADB_DIST_ARCH STREQUAL "x86_64")
     if (MSVC)
+        if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            set_source_files_properties(${AKKARADB_CRC32C_SSE42_SOURCE}
+                    PROPERTIES COMPILE_OPTIONS "/clang:-msse4.2")
+        endif ()
         set_source_files_properties(${AKKARADB_CRC32C_AVX2_SOURCE}
                 PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
         set_source_files_properties(${AKKARADB_CRC32C_AVX512_SOURCE}
@@ -314,7 +318,7 @@ if (TARGET akkaradb_api_grpc)
     find_package(gRPC CONFIG QUIET)
 
     set(AKKARADB_FETCHED_GRPC OFF)
-    if ((NOT Protobuf_FOUND OR NOT gRPC_FOUND) AND AKKARADB_FETCH_GRPC)
+    if (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
         message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; fetching gRPC")
         set(AKKARADB_FETCHED_GRPC ON)
         set(gRPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -340,7 +344,9 @@ if (TARGET akkaradb_api_grpc)
         set(utf8_range_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
         set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
         set(AKKARADB_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+        get_directory_property(AKKARADB_SAVED_COMPILE_OPTIONS COMPILE_OPTIONS)
         set(BUILD_SHARED_LIBS OFF)
+        set_directory_properties(PROPERTIES COMPILE_OPTIONS "")
         FetchContent_Declare(
                 grpc
                 GIT_REPOSITORY https://github.com/grpc/grpc.git
@@ -356,9 +362,24 @@ if (TARGET akkaradb_api_grpc)
                 GIT_SUBMODULES_RECURSE FALSE
         )
         FetchContent_MakeAvailable(grpc)
+        set_directory_properties(PROPERTIES COMPILE_OPTIONS "${AKKARADB_SAVED_COMPILE_OPTIONS}")
         set(BUILD_SHARED_LIBS ${AKKARADB_SAVED_BUILD_SHARED_LIBS})
-    elseif (NOT Protobuf_FOUND OR NOT gRPC_FOUND)
-        message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; using gRPC stub backend")
+        foreach (AKKARADB_GRPC_THIRD_PARTY_TARGET IN ITEMS
+                bssl
+                crypto
+                decrepit
+                fipsmodule
+                ssl
+        )
+            if (TARGET ${AKKARADB_GRPC_THIRD_PARTY_TARGET})
+                target_compile_options(${AKKARADB_GRPC_THIRD_PARTY_TARGET} PRIVATE
+                        $<$<COMPILE_LANG_AND_ID:C,Clang>:-Wno-unused-parameter>
+                        $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-Wno-unused-parameter>
+                        $<$<COMPILE_LANG_AND_ID:C,Clang>:-Wno-error=unused-parameter>
+                        $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-Wno-error=unused-parameter>
+                )
+            endif ()
+        endforeach ()
     endif ()
 
     set(AKKARADB_GRPCPP_TARGET "")
@@ -451,8 +472,9 @@ if (TARGET akkaradb_api_grpc)
         target_compile_definitions(akkaradb_api PRIVATE AKKARADB_API_HAS_GRPC_BACKEND)
         message(STATUS "AkkaraDB: gRPC backend enabled")
     else ()
-        target_sources(akkaradb_api_grpc PRIVATE "${AKKSERVER_SRC_DIR}/grpc/AkkaraGRPCServerStub.cpp")
-        message(STATUS "AkkaraDB: Protobuf/gRPC packages not found; gRPC backend disabled")
+        message(FATAL_ERROR
+                "AkkaraDB: gRPC API backend is enabled, but required gRPC/Protobuf targets "
+                "were not available after package lookup and FetchContent")
     endif ()
 endif ()
 

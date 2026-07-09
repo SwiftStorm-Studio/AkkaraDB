@@ -180,8 +180,6 @@ namespace akkaradb::engine::blob {
         }
     } // namespace
 
-    BlobManager::BlobManager() = default;
-
     class BlobManager::Impl {
         public:
             explicit Impl(Options optionsValue) : options(std::move(optionsValue)) {}
@@ -313,6 +311,8 @@ namespace akkaradb::engine::blob {
                 };
             }
     };
+
+    BlobManager::BlobManager() = default;
 
     std::unique_ptr<BlobManager> BlobManager::create(Options options) {
         if (options.blobDir.empty()) { throw std::invalid_argument("BlobManager: blobDir is required"); }

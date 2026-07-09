@@ -58,6 +58,13 @@ namespace akkaradb {
         }
 
         template <typename Value, typename Pattern>
+        [[nodiscard]] bool stringEndsWith(const Value& value, const Pattern& pattern) {
+            std::string_view haystack{value};
+            std::string_view needle{pattern};
+            return haystack.ends_with(needle);
+        }
+
+        template <typename Value, typename Pattern>
         [[nodiscard]] bool stringContains(const Value& value, const Pattern& pattern) {
             std::string_view haystack{value};
             std::string_view needle{pattern};
@@ -124,6 +131,7 @@ namespace akkaradb {
             else if constexpr (Operator == Op::IN_LIST) { return containsValue(rhs, lhs); }
             else if constexpr (Operator == Op::NOT_IN) { return !containsValue(rhs, lhs); }
             else if constexpr (Operator == Op::STARTS_WITH) { return stringStartsWith(lhs, rhs); }
+            else if constexpr (Operator == Op::ENDS_WITH) { return stringEndsWith(lhs, rhs); }
             else if constexpr (Operator == Op::CONTAINS) { return stringContains(lhs, rhs); }
             else if constexpr (Operator == Op::LIKE) { return stringLike(lhs, rhs); }
         }

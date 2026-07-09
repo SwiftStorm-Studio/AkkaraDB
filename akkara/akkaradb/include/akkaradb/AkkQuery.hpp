@@ -13,3 +13,4 @@
 #include "detail/query/Expr.hpp"
 #include "detail/query/Traits.hpp"
 #include "detail/query/Eval.hpp"
+#include "detail/query/Bytecode.hpp"

@@ -25,20 +25,6 @@
 
 namespace akkaradb::engine::sst {
     namespace {
-        void readAt(const std::filesystem::path& path, uint64_t offset, void* data, size_t size) {
-            std::ifstream in(path, std::ios::binary);
-            if (!in) { throw std::runtime_error("SSTReader: cannot open " + path.string()); }
-            in.seekg(static_cast<std::streamoff>(offset));
-            in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(size));
-            if (!in || in.gcount() != static_cast<std::streamsize>(size)) { throw std::runtime_error("SSTReader: short read"); }
-        }
-
-        [[nodiscard]] std::vector<uint8_t> readVecAt(const std::filesystem::path& path, uint64_t offset, size_t size) {
-            std::vector<uint8_t> out(size);
-            if (size > 0) { readAt(path, offset, out.data(), size); }
-            return out;
-        }
-
         [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> bytes) noexcept {
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         }

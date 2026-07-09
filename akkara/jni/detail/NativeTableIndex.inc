@@ -24,7 +24,7 @@
     struct NativeTable {
         AkkaraDB* db = nullptr;
         std::vector<uint8_t> tablePrefix;
-        TypeDesc schema{TypeDesc::STRUCT};
+        TypeDesc schema = makeStructType();
         std::vector<NativeIndexDef> indexes;
     };
 

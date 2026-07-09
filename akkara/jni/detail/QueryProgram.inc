@@ -14,7 +14,7 @@
 
     struct QueryProgram {
         std::vector<Value> captures;
-        TypeDesc schema{TypeDesc::STRUCT};
+        TypeDesc schema = makeStructType();
         Expr where;
     };
 

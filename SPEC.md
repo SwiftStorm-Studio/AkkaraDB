@@ -803,8 +803,9 @@ The gRPC module defines `akkaradb.grpcapi.v1.AkkaraDB` with unary RPCs for `Ping
 streaming RPCs emit item frames followed by an explicit terminal frame that carries `emitted_count` and `truncated`. The service can run with insecure
 credentials or TLS credentials depending on the configured certificate/key/CA paths.
 
-Availability is build-dependent. When Protobuf/gRPC packages are unavailable and `AKKARADB_FETCH_GRPC=OFF`, the build emits a stub backend instead: registration
-returns `false`, and attempting to start the gRPC server throws `std::runtime_error`.
+Availability is controlled by `AKKARADB_BUILD_API_GRPC`. When the gRPC backend is enabled and system Protobuf/gRPC packages are unavailable, the build fetches
+gRPC/Protobuf through `FetchContent`. If the fetched or system targets still cannot provide `grpc++`, `libprotobuf`, `protoc`, and `grpc_cpp_plugin`, configuration
+fails.
 
 ---
 
@@ -1099,6 +1100,28 @@ When a registered secondary index can provide a narrower source range, the query
 `in`, optional null checks, and arithmetic range predicates can use indexes. String prefix/contains/like predicates may use the field index as the source and
 still apply the full predicate in C++.
 
+Native C++ builds may run the `akkara-query` Clang plugin as a sidecar rewrite pass. Supported typed lambdas such as
+`[](const User& u) { return u.age >= 18 && u.name == "Alice"; }` are replaced at compile time with
+`akkaradb::query::bytecode::CompiledQueryDescriptor<User>` values. At runtime, `PackedTable::query(descriptor)` creates a `BytecodeQueryView`, evaluates the
+descriptor directly against row bytes when all referenced fields have raw readers, and otherwise decodes the entity and runs the same bytecode VM. The VM supports
+field loads, constants, comparisons, `!`, string predicates, custom opcode calls, host-call fallback, `+`, `-`, `*`, `/`, `%`, and short-circuit `&&` / `||`
+lowered with `JumpIfFalse` / `JumpIfTrue`.
+
+`BytecodeQueryView::where(descriptor)` composes the existing descriptor and the new `where` descriptor with logical `AND`, so the scan still has one prepared
+bytecode program. The plugin rewrites direct chains such as `table.query(lambda).where(lambda)` and variables that hold a rewritten query view, for example
+`auto view = table.query(lambda); view.where(lambda);`. A `where` lambda is rewritten only when it can be emitted as composable bytecode; unsupported `where`
+lambdas remain normal decoded predicate filters. Unsupported `query` lambdas can still become descriptors through a generated `HostCallBool` thunk that owns the
+original lambda.
+
+Composed bytecode descriptors keep host-call and custom-opcode capture pointers per call/binding. This permits independently captured descriptors to be combined
+without sharing a single descriptor-wide capture pointer. The legacy descriptor-wide `captures` pointer remains the fallback for descriptors that do not populate
+the per-call capture spans. Custom opcode metadata is still required to be non-conflicting after composition: the same opcode/name pair must have the same arity,
+result kind, thunk, and capture pointer.
+
+User bytecode opcodes are in the `0x8000..0xFFFF` range. `CustomOpcodeRegistry::registerOpcode(...)` rejects invalid or duplicate metadata, logs the rejection to
+the supplied stream, leaves the existing registry unchanged, and lets the process continue. Static lowering through `AKKARADB_QUERY_OPCODE(...)` is available when
+the registration is visible earlier in the translation unit.
+
 `PackedTable` is move-only and not documented as thread-safe. Use separate handles or external synchronization when sharing across threads.
 
 ### 15.4 Ref, Schema, and Joins
@@ -1171,6 +1194,12 @@ AKKARADB_QUERYABLE(PlainPost, id, authorId, body, likes)
 auto plainPosts = db->table<&PlainPost::id>("plain_posts");
 auto byField = plainPosts.join<&PlainPost::authorId, &Author::id>(authors);
 ```
+
+Query bytecode does not traverse `Ref<T>` as a local row field. A predicate such as `post.author->name == "Alice"` crosses a table boundary and therefore uses
+normal C++ `Ref<T>` lazy resolution rather than raw-row bytecode. In the Clang plugin rewrite path, `PackedTable::query(lambda)` with such a predicate is emitted
+as an owned `HostCallBool` descriptor; `BytecodeQueryView::where(lambda)` leaves the lambda as a decoded predicate filter because `where` descriptors must be
+bytecode-composable. Explicit `join(...).where([](const Left&, const Right&) { ... })` keeps the existing two-entity predicate semantics and is not currently
+lowered into local row bytecode.
 
 `PackedTable` also exposes stable row-identity helpers:
 
@@ -1555,8 +1584,9 @@ On `AkkEngine::open`:
 |-----------|-----------------------------------------------|
 | C++       | C++23                                         |
 | CMake     | 4.1 or newer                                  |
-| Windows   | MSVC with initialized Visual Studio toolchain |
-| Linux     | GCC/Clang with C++23 support                  |
+| Windows   | LLVM clang-cl with initialized Visual Studio toolchain |
+| Linux     | LLVM clang++ with C++23 support               |
+| macOS     | LLVM clang++ with C++23 support               |
 | Zstd      | Fetched by CMake, v1.5.6                      |
 | Boost.PFR | Fetched by CMake, boost-1.84.0                |
 | mbedTLS   | Fetched by CMake, v4.1.0                      |
@@ -1572,7 +1602,6 @@ On `AkkEngine::open`:
 | `AKKARADB_BUILD_API_HTTP`    | `ON`    | Build HTTP API transport backend                                      |
 | `AKKARADB_BUILD_API_TCP`     | `ON`    | Build TCP API transport backend                                       |
 | `AKKARADB_BUILD_API_GRPC`    | `ON`    | Build gRPC API transport backend target                               |
-| `AKKARADB_FETCH_GRPC`        | `OFF`   | Fetch gRPC/Protobuf when system packages are unavailable              |
 
 TLS support is compiled into the current native target set. SIMD dispatch is selected at runtime, while AVX2/AVX512 CRC32C translation units receive
 source-specific compile flags in `cmake/AkkaraTargets.cmake`.

@@ -248,7 +248,7 @@ namespace {
         std::atomic<int> applied{0};
         std::atomic<int> blobs{0};
 
-        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, plain);
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, all, plain);
         client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
             AKK_TEST_CHECK(seq == 1);
             AKK_TEST_CHECK(op == ReplOpType::PUT);
@@ -299,7 +299,7 @@ namespace {
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, options);
         std::atomic<int> applied{0};
 
-        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, options);
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, all, options);
         client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
             AKK_TEST_CHECK(seq == 2);
             AKK_TEST_CHECK(op == ReplOpType::PUT);
@@ -352,7 +352,7 @@ namespace {
         auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, serverOptions);
         std::atomic<int> applied{0};
 
-        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, clientOptions);
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, all, clientOptions);
         client->setApplyCallback([&](uint64_t seq, ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value, uint8_t flags, uint64_t source) {
             AKK_TEST_CHECK(seq == 3);
             AKK_TEST_CHECK(op == ReplOpType::PUT);
