@@ -41,7 +41,7 @@
             const auto schema = readDirectBuffer(env, schemaBytes);
 
             auto cursor = std::make_unique<ScanCursor>();
-            cursor->query = std::make_unique<QueryProgram>(parseQuery(query, schema));
+            cursor->query = std::make_unique<RuntimeBytecodeQuery>(parseQuery(query, schema));
             cursor->rows = db->engine().scan(cursor->arena, start, end);
             cursor->it = cursor->rows.begin();
             return toHandle(cursor.release());

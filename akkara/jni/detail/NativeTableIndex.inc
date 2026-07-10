@@ -2,7 +2,7 @@
         BufferArena arena;
         ArenaGenerator<AkkEngine::ScanRecordView> rows;
         ArenaGenerator<AkkEngine::ScanRecordView>::iterator it;
-        std::unique_ptr<QueryProgram> query;
+        std::unique_ptr<RuntimeBytecodeQuery> query;
         struct IndexLookup {
             AkkaraDB* db = nullptr;
             std::vector<uint8_t> tablePrefix;

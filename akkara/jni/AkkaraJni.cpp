@@ -50,7 +50,7 @@ namespace {
     #include "detail/BytesReader.inc"
     #include "detail/SchemaCodec.inc"
     #include "detail/RowValueCodec.inc"
-    #include "detail/QueryProgram.inc"
+    #include "detail/QueryBytecodeRuntime.inc"
     #include "detail/NativeTableIndex.inc"
     #include "detail/JavaObjects.inc"
     #include "detail/StatsObjects.inc"

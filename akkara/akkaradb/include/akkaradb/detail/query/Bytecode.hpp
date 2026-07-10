@@ -119,7 +119,10 @@ namespace akkaradb::query::bytecode {
         Sub = 0x18,
         Mul = 0x19,
         Div = 0x1A,
-        Mod = 0x1B
+        Mod = 0x1B,
+        In = 0x1C,
+        NotIn = 0x1D,
+        MapGet = 0x1E
     };
 
     inline constexpr uint16_t customOpcodeUserMin = 0x8000;

@@ -170,7 +170,7 @@
             cursor->indexLookup->db = table->db;
             cursor->indexLookup->tablePrefix = table->tablePrefix;
             cursor->indexLookup->searchPrefixSize = startKey.size();
-            cursor->query = std::make_unique<QueryProgram>(
+            cursor->query = std::make_unique<RuntimeBytecodeQuery>(
                 parseQuery(readDirectBuffer(env, queryBytes), readDirectBuffer(env, schemaBytes))
             );
             cursor->rows = table->db->engine().scan(cursor->arena, startKey, endKey);

@@ -2,13 +2,6 @@
 
 AkkaraDB is a low-latency embedded key-value database for C++ and Kotlin/JVM applications. It gives you a native storage engine with WAL-backed durability, LSM-based persistence, typed C++ tables, and optional server backends when you need HTTP, TCP, or gRPC access.
 
-## Read This In
-
-| Language | README |
-|---|---|
-| English | [readme/en/README_en.md](readme/en/README_en.md) |
-| Japanese | [readme/ja/README_ja.md](readme/ja/README_ja.md) |
-
 ## What You Can Use
 
 Choose the entry point that matches your application:
@@ -102,30 +95,13 @@ engine->put(bytes("user:1"), bytes("Alice"));
 
 ## Documentation
 
-Start here for the API surface:
-
-- [readme/en/API_USAGE_en.md](readme/en/API_USAGE_en.md)
-- [readme/ja/API_USAGE_ja.md](readme/ja/API_USAGE_ja.md)
-
-System and format details:
-
-- [readme/en/ARCHITECTURE_en.md](readme/en/ARCHITECTURE_en.md)
-- [readme/ja/ARCHITECTURE_ja.md](readme/ja/ARCHITECTURE_ja.md)
-- [SPEC.md](SPEC.md)
-
-Benchmark and validation documents:
-
-- [readme/en/BENCHMARK.md](readme/en/BENCHMARK.md)
-- `benchmarks/`
+Current documentation is published at [docs.swiftstorm.dev/akkaradb-native](https://docs.swiftstorm.dev/akkaradb-native/). The repository keeps implementation code, benchmarks, and concise build instructions only.
 
 ## Repository Map
 
 ```text
 akkara/              Native engine, typed API, JNI, and server backends
 benchmarks/          Smoke tests and throughput benchmarks
-readme/en/           English documentation
-readme/ja/           Japanese documentation
-SPEC.md              Native technical specification
 ```
 
 ## License
