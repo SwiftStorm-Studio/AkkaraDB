@@ -283,6 +283,13 @@ namespace akkaradb::engine::cluster {
                 forceDurableCallback_ = std::move(callback);
             }
 
+            void setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end) {
+                std::lock_guard lock{callbackMutex_};
+                snapshotBeginCallback_ = std::move(begin);
+                snapshotEntryCallback_ = std::move(entry);
+                snapshotEndCallback_ = std::move(end);
+            }
+
             void start() {
                 if (running_.exchange(true)) { return; }
                 worker_ = std::thread([this] { run(); });
@@ -410,6 +417,9 @@ namespace akkaradb::engine::cluster {
             }
 
             void receiveLoop(SocketHandle socket, crypto::SecureSession* secure) {
+                uint64_t expectedSeq = getLastSeq_ ? getLastSeq_() + 1 : 1;
+                bool receivingSnapshot = false;
+                uint64_t snapshotSeq = 0;
                 while (running_) {
                     DecodedFrame frame;
                     if (!recvFrameFrom(socket, secure, frame)) { return; }
@@ -417,6 +427,12 @@ namespace akkaradb::engine::cluster {
                     if (frame.type == ReplMsgType::ENTRY) {
                         ReplEntry entry;
                         if (!decodeEntry(frame.payload, entry)) { return; }
+                        if (receivingSnapshot) { return; }
+                        if (entry.seq < expectedSeq) {
+                            if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
+                            continue;
+                        }
+                        if (entry.seq != expectedSeq) { return; }
                         ApplyCallback applyCallback;
                         std::function < void() > forceDurableCallback;
                         {
@@ -428,6 +444,7 @@ namespace akkaradb::engine::cluster {
                         if (applyCallback) {
                             applyCallback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId);
                         }
+                        ++expectedSeq;
                         if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
                         if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
                             if (forceDurableCallback) { forceDurableCallback(); }
@@ -444,6 +461,35 @@ namespace akkaradb::engine::cluster {
                         }
                         if (callback) { callback(blob.seq, blob.blobId, blob.content); }
                     }
+                    else if (frame.type == ReplMsgType::SNAPSHOT_BEGIN) {
+                        ReplSnapshotBegin begin;
+                        if (receivingSnapshot || !decodeSnapshotBegin(frame.payload, begin)) { return; }
+                        SnapshotBeginCallback callback;
+                        { std::lock_guard lock{callbackMutex_}; callback = snapshotBeginCallback_; }
+                        if (!callback) { return; }
+                        callback(begin.snapshotSeq, begin.entryCount);
+                        receivingSnapshot = true;
+                        snapshotSeq = begin.snapshotSeq;
+                    }
+                    else if (frame.type == ReplMsgType::SNAPSHOT_ENTRY) {
+                        ReplSnapshotEntry entry;
+                        if (!receivingSnapshot || !decodeSnapshotEntry(frame.payload, entry)) { return; }
+                        SnapshotEntryCallback callback;
+                        { std::lock_guard lock{callbackMutex_}; callback = snapshotEntryCallback_; }
+                        if (!callback) { return; }
+                        callback(entry.key, entry.value);
+                    }
+                    else if (frame.type == ReplMsgType::SNAPSHOT_END) {
+                        uint64_t endSeq = 0;
+                        if (!receivingSnapshot || !decodeSnapshotEnd(frame.payload, endSeq) || endSeq != snapshotSeq) { return; }
+                        SnapshotEndCallback callback;
+                        { std::lock_guard lock{callbackMutex_}; callback = snapshotEndCallback_; }
+                        if (!callback) { return; }
+                        callback(endSeq);
+                        receivingSnapshot = false;
+                        expectedSeq = endSeq + 1;
+                    }
+                    else if (frame.type == ReplMsgType::RESYNC_REQUIRED) { return; }
                     else if (frame.type != ReplMsgType::READ_RESPONSE) { return; }
                 }
             }
@@ -467,6 +513,9 @@ namespace akkaradb::engine::cluster {
             ApplyCallback applyCallback_;
             BlobCallback blobCallback_;
             std::function<void()> forceDurableCallback_;
+            SnapshotBeginCallback snapshotBeginCallback_;
+            SnapshotEntryCallback snapshotEntryCallback_;
+            SnapshotEndCallback snapshotEndCallback_;
     };
 
     std::unique_ptr<ReplicationClient> ReplicationClient::create(
@@ -500,6 +549,9 @@ namespace akkaradb::engine::cluster {
     void ReplicationClient::setBlobCallback(BlobCallback callback) { impl_->setBlobCallback(std::move(callback)); }
 
     void ReplicationClient::setForceDurableCallback(std::function<void()> callback) { impl_->setForceDurableCallback(std::move(callback)); }
+    void ReplicationClient::setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end) {
+        impl_->setSnapshotCallbacks(std::move(begin), std::move(entry), std::move(end));
+    }
 
     void ReplicationClient::start() { impl_->start(); }
 

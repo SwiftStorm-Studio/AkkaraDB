@@ -42,6 +42,12 @@ namespace akkaradb::engine::cluster {
 
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
 
+            void addVotingNode(const NodeInfo& node);
+
+            void removeVotingNode(uint64_t nodeId);
+
+            void transferLeadership(uint64_t targetNodeId);
+
         private:
             class Impl;
             explicit RaftConsensusRuntime(std::unique_ptr<Impl> impl);

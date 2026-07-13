@@ -95,6 +95,12 @@ namespace akkaradb::engine::cluster {
              */
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) override;
 
+            void addRaftVotingNode(const NodeInfo& node) override;
+
+            void removeRaftVotingNode(uint64_t nodeId) override;
+
+            void transferRaftLeadership(uint64_t targetNodeId) override;
+
         private:
             class Impl;
             explicit ClusterRuntime(std::unique_ptr<Impl> impl);

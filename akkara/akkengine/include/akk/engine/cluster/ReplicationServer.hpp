@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace akkaradb::engine::cluster {
@@ -36,6 +37,12 @@ namespace akkaradb::engine::cluster {
      */
     class AKKARADB_CLUSTER_RUNTIME_API ReplicationServer {
         public:
+            using HistoryProvider = std::function<std::optional<std::vector<ReplEntry>>(uint64_t afterSeq, uint64_t throughSeq)>;
+            struct Snapshot {
+                uint64_t seq = 0;
+                std::vector<ReplSnapshotEntry> entries;
+            };
+            using SnapshotProvider = std::function<std::optional<Snapshot>()>;
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.
              *
@@ -50,7 +57,11 @@ namespace akkaradb::engine::cluster {
              * @param replPort       Local replication listener port.
              * @param selfNodeId    Primary node id advertised in ServerHello.
              * @param getCurrentSeq Returns current primary seq for ServerHello.
-             * @param ackPolicy      Entry acknowledgement policy.
+             * @param ackPolicy      Effective entry acknowledgement policy.
+             * @param consistency    Write completion and timeout policy.
+             * @param configuredReplicaCount Number of data-bearing replicas
+             *        configured for this primary.  ALL_CONFIGURED counts offline
+             *        replicas too; legacy ALL_TARGETS only counts live links.
              * @param runtimeOptions Transport options.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationServer> create(
@@ -58,7 +69,11 @@ namespace akkaradb::engine::cluster {
                 uint64_t selfNodeId,
                 std::function<uint64_t()> getCurrentSeq,
                 AckPolicy ackPolicy,
-                ClusterRuntimeOptions runtimeOptions = {}
+                ConsistencyOptions consistency = {},
+                uint16_t configuredReplicaCount = 0,
+                ClusterRuntimeOptions runtimeOptions = {},
+                HistoryProvider historyProvider = {},
+                SnapshotProvider snapshotProvider = {}
             );
 
             ~ReplicationServer();

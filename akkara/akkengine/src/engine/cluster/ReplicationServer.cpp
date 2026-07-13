@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -289,7 +290,11 @@ namespace akkaradb::engine::cluster {
             uint16_t replPort = 0;
             uint64_t selfNodeId = 0;
             std::function<uint64_t()> getCurrentSeq;
+            HistoryProvider historyProvider;
+            SnapshotProvider snapshotProvider;
             AckPolicy ackPolicy;
+            ConsistencyOptions consistency;
+            uint16_t configuredReplicaCount = 0;
             ClusterRuntimeOptions runtimeOptions;
             crypto::NodeIdentity localIdentity;
 
@@ -303,6 +308,7 @@ namespace akkaradb::engine::cluster {
 
             std::mutex ackMutex;
             std::condition_variable ackCv;
+            std::unordered_set<uint64_t> lagBlockedReplicas;
 
             void start() {
                 listenSock = listenOn(runtimeOptions.replBindHost, replPort);
@@ -377,16 +383,6 @@ namespace akkaradb::engine::cluster {
                         }
                     }
 
-                    ServerHello response{};
-                    response.nodeId = selfNodeId;
-                    response.currentSeq = getCurrentSeq ? getCurrentSeq() : 0;
-                    response.role = NodeRole::PRIMARY;
-                    auto helloWire = encodeServerHello(response);
-                    if (!sendTo(client, secure.get(), helloWire.data(), helloWire.size())) {
-                        closeSocket(client);
-                        continue;
-                    }
-
                     auto replica = std::make_shared<ReplicaState>();
                     replica->sock = client;
                     replica->secure = std::move(secure);
@@ -394,12 +390,58 @@ namespace akkaradb::engine::cluster {
                     replica->lastAckedSeq.store(hello.lastSeq);
                     replica->lastAckStage.store(static_cast<uint8_t>(AckStage::DURABLE));
 
+                    ServerHello response{};
+                    response.nodeId = selfNodeId;
+                    response.role = NodeRole::PRIMARY;
+                    bool resyncRequired = false;
                     {
                         std::lock_guard lock{replicasMutex};
-                        for (const auto& buffered : entryBuffer) {
-                            if (buffered.seq == 0 || buffered.seq > hello.lastSeq) { replica->queue.push_back(buffered.wire); }
+                        response.currentSeq = getCurrentSeq ? getCurrentSeq() : 0;
+                        if (historyProvider && hello.lastSeq < response.currentSeq) {
+                            const auto entries = historyProvider(hello.lastSeq, response.currentSeq);
+                            if (!entries && consistency.replicaLagAction == ReplicaLagAction::ASYNC_RESYNC && snapshotProvider) {
+                                const auto snapshot = snapshotProvider();
+                                if (!snapshot) { resyncRequired = true; }
+                                else {
+                                    response.currentSeq = snapshot->seq;
+                                    replica->queue.push_back(encodeSnapshotBegin(ReplSnapshotBegin{
+                                        .snapshotSeq = snapshot->seq,
+                                        .entryCount = snapshot->entries.size(),
+                                    }));
+                                    for (const auto& entry : snapshot->entries) { replica->queue.push_back(encodeSnapshotEntry(entry)); }
+                                    replica->queue.push_back(encodeSnapshotEnd(snapshot->seq));
+                                }
+                            }
+                            else if (!entries) { resyncRequired = true; }
+                            else {
+                                for (const auto& entry : *entries) { replica->queue.push_back(encodeEntry(entry)); }
+                            }
                         }
-                        replicas.push_back(replica);
+                        else if (!historyProvider) {
+                            for (const auto& buffered : entryBuffer) {
+                                if (buffered.seq == 0 || buffered.seq > hello.lastSeq) { replica->queue.push_back(buffered.wire); }
+                            }
+                        }
+                        if (resyncRequired && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES) {
+                            lagBlockedReplicas.insert(hello.nodeId);
+                        }
+                        if (!resyncRequired) {
+                            lagBlockedReplicas.erase(hello.nodeId);
+                            replicas.push_back(replica);
+                        }
+                    }
+                    const auto helloWire = encodeServerHello(response);
+                    if (!sendTo(client, replica->secure.get(), helloWire.data(), helloWire.size())) {
+                        replica->dead.store(true);
+                        closeReplica(replica);
+                        continue;
+                    }
+                    if (resyncRequired) {
+                        const auto resync = encodeFrame(ReplMsgType::RESYNC_REQUIRED, {});
+                        (void)sendTo(client, replica->secure.get(), resync.data(), resync.size());
+                        replica->dead.store(true);
+                        closeReplica(replica);
+                        continue;
                     }
                     replica->sendThread = std::thread([this, replica] { sendLoop(replica); });
                     replica->recvThread = std::thread([this, replica] { recvLoop(replica); });
@@ -463,6 +505,9 @@ namespace akkaradb::engine::cluster {
             void enqueueWire(uint64_t seq, std::vector<uint8_t> wire) {
                 {
                     std::lock_guard lock{replicasMutex};
+                    if (seq != 0 && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES && !lagBlockedReplicas.empty()) {
+                        throw std::runtime_error("ReplicationServer: write blocked by lagging replica");
+                    }
                     entryBuffer.push_back(BufferedWire{seq, wire});
                     while (entryBuffer.size() > ENTRY_BUFFER_SIZE) { entryBuffer.pop_front(); }
                     for (auto& replica : replicas) {
@@ -473,12 +518,14 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                 }
-                waitForAcks(seq);
+                if (!waitForAcks(seq) && consistency.ackTimeoutAction == AckTimeoutAction::FAIL_WRITE) {
+                    throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
+                }
             }
 
-            void waitForAcks(uint64_t seq) {
-                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return; }
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            bool waitForAcks(uint64_t seq) {
+                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return true; }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs);
                 while (std::chrono::steady_clock::now() < deadline) {
                     size_t live = 0;
                     size_t acked = 0;
@@ -494,12 +541,15 @@ namespace akkaradb::engine::cluster {
                         }
                     }
 
-                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS ? acked >= live : acked >= ackPolicy.quorum;
-                    if (ok) { return; }
+                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS
+                        ? acked >= (consistency.writeConsistency == WriteConsistency::ALL_CONFIGURED ? configuredReplicaCount : live)
+                        : acked >= ackPolicy.quorum;
+                    if (ok) { return true; }
 
                     std::unique_lock lock{ackMutex};
                     ackCv.wait_for(lock, std::chrono::milliseconds(50));
                 }
+                return false;
             }
     };
 
@@ -511,14 +561,22 @@ namespace akkaradb::engine::cluster {
         uint64_t selfNodeId,
         std::function<uint64_t()> getCurrentSeq,
         AckPolicy ackPolicy,
-        ClusterRuntimeOptions runtimeOptions
+        ConsistencyOptions consistency,
+        uint16_t configuredReplicaCount,
+        ClusterRuntimeOptions runtimeOptions,
+        HistoryProvider historyProvider,
+        SnapshotProvider snapshotProvider
     ) {
         auto impl = std::make_unique<Impl>();
         impl->replPort = replPort;
         impl->selfNodeId = selfNodeId;
         impl->getCurrentSeq = std::move(getCurrentSeq);
         impl->ackPolicy = ackPolicy;
+        impl->consistency = consistency;
+        impl->configuredReplicaCount = configuredReplicaCount;
         impl->runtimeOptions = std::move(runtimeOptions);
+        impl->historyProvider = std::move(historyProvider);
+        impl->snapshotProvider = std::move(snapshotProvider);
         if (impl->runtimeOptions.transportMode == TransportMode::SECURE) { impl->localIdentity = loadSecureIdentity(impl->runtimeOptions); }
         return std::unique_ptr < ReplicationServer > (new ReplicationServer(std::move(impl)));
     }

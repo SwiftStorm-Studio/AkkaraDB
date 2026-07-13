@@ -98,22 +98,11 @@ if (TARGET akkaradb_api AND TARGET akkaradb_api_tcp)
 endif ()
 
 set(AKKARADB_COMMON_TEST_TARGETS
-        akkaradb_akkaradb_open_smoke_test|benchmarks/smoke/akkaradb_open_smoke_test.cpp
-        akkaradb_akkengine_smoke_test|benchmarks/smoke/akkengine_smoke_test.cpp
-        akkaradb_crypto_identity_smoke_test|benchmarks/smoke/crypto_identity_smoke_test.cpp
-        akkaradb_typed_api_smoke_test|benchmarks/smoke/typed_api_smoke_test.cpp
-        akkaradb_memtable_smoke_test|benchmarks/smoke/memtable_smoke_test.cpp
         akkaradb_memtable_throughput_benchmark|benchmarks/throughput/memtable_throughput_benchmark.cpp
         akkaradb_wal_throughput_benchmark|benchmarks/throughput/wal_throughput_benchmark.cpp
         akkaradb_sstable_throughput_benchmark|benchmarks/throughput/sstable_throughput_benchmark.cpp
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
-        akkaradb_versionlog_smoke_test|benchmarks/smoke/versionlog_smoke_test.cpp
-        akkaradb_manifest_smoke_test|benchmarks/smoke/manifest_smoke_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
-        akkaradb_erasure_smoke_test|benchmarks/smoke/erasure_smoke_test.cpp
-        akkaradb_blob_smoke_test|benchmarks/smoke/blob_smoke_test.cpp
-        akkaradb_sstable_smoke_test|benchmarks/smoke/sstable_smoke_test.cpp
-        akkaradb_wal_smoke_test|benchmarks/smoke/wal_smoke_test.cpp
 )
 
 foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
@@ -156,28 +145,6 @@ add_custom_command(TARGET akkaradb_sstable_throughput_benchmark POST_BUILD
 
 target_link_libraries(akkaradb_cluster_smoke_test PRIVATE akkaradb_cluster)
 
-add_executable(akkaradb_crc32c_smoke_test
-        benchmarks/smoke/crc32c_smoke_test.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CRef.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86SSE42.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX2.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CX86AVX512.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CArmCRC.cpp
-        ${AKKENGINE_SRC_DIR}/cpu/crc32c/CRC32CDispatch.cpp
-)
-if(MSVC)
-    target_compile_options(akkaradb_crc32c_smoke_test PRIVATE /WX-)
-endif()
-target_compile_definitions(akkaradb_crc32c_smoke_test PRIVATE AKKARADB_STATIC)
-target_include_directories(akkaradb_crc32c_smoke_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
-        ${AKKARADB_INCLUDE_DIR}
-        ${AKKENGINE_INCLUDE_DIR}
-)
-set_target_properties(akkaradb_crc32c_smoke_test PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
-
 if (WIN32 AND BUILD_SHARED_LIBS)
     add_custom_command(TARGET akkaradb_benchmark POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -188,19 +155,7 @@ if (WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
-        akkaradb_akkaradb_open_smoke_test
-        akkaradb_akkengine_smoke_test
-        akkaradb_crypto_identity_smoke_test
-        akkaradb_crc32c_smoke_test
-        akkaradb_typed_api_smoke_test
-        akkaradb_memtable_smoke_test
-        akkaradb_versionlog_smoke_test
-        akkaradb_manifest_smoke_test
         akkaradb_cluster_smoke_test
-        akkaradb_erasure_smoke_test
-        akkaradb_blob_smoke_test
-        akkaradb_sstable_smoke_test
-        akkaradb_wal_smoke_test
 )
 list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 

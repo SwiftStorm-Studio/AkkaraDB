@@ -14,21 +14,30 @@
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/blob/BlobFraming.hpp"
 #include "akk/engine/cluster/ClusterRuntimeProvider.hpp"
+#include "akk/engine/generation/StorageGeneration.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/server/AkkApiServerProvider.hpp"
 #include "akk/engine/wal/WalRecovery.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace akkaradb::engine {
     namespace fs = std::filesystem;
@@ -53,6 +62,16 @@ namespace akkaradb::engine {
         }
 
         void ensureDir(const fs::path& path) { if (!path.empty()) { fs::create_directories(path); } }
+
+        void forceDurable(FILE* file) {
+            if (file == nullptr) { return; }
+            if (std::fflush(file) != 0) { throw std::runtime_error("AkkEngine: failed to flush Raft log"); }
+#ifdef _WIN32
+            if (_commit(_fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
+#else
+            if (::fsync(::fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
+#endif
+        }
 
         [[nodiscard]] uint64_t loadOrCreateNodeId(const fs::path& path) {
             if (path.empty()) { return 0; }
@@ -149,22 +168,61 @@ namespace akkaradb::engine {
 
     class AkkEngine::Impl {
         public:
-            explicit Impl(AkkEngineOptions optionsIn) : opts{std::move(optionsIn)} {}
+            template <typename T>
+            class StorageSlot {
+                public:
+                    explicit StorageSlot(std::unique_ptr<T>* slot) : slot_{slot} {}
+                    void bind(std::unique_ptr<T>* slot) noexcept { slot_ = slot; }
+                    [[nodiscard]] T* get() const noexcept { return slot_ ? slot_->get() : nullptr; }
+                    [[nodiscard]] explicit operator bool() const noexcept { return get() != nullptr; }
+                    [[nodiscard]] T* operator->() const noexcept { return get(); }
+                    [[nodiscard]] T& operator*() const noexcept { return *get(); }
+                    [[nodiscard]] bool operator==(std::nullptr_t) const noexcept { return get() == nullptr; }
+                    [[nodiscard]] bool operator!=(std::nullptr_t) const noexcept { return get() != nullptr; }
+                    void reset() noexcept { slot_->reset(); }
+                    StorageSlot& operator=(std::unique_ptr<T> value) noexcept { *slot_ = std::move(value); return *this; }
+                private:
+                    std::unique_ptr<T>* slot_;
+            };
+
+            struct StorageState {
+                std::unique_ptr<manifest::Manifest> manifest;
+                std::unique_ptr<sst::SSTManager> sstManager;
+                std::unique_ptr<memtable::MemTable> memtable;
+                std::unique_ptr<wal::WalWriter> walWriter;
+                std::unique_ptr<blob::BlobManager> blobManager;
+                std::unique_ptr<vlog::VersionLog> versionLog;
+            };
+
+            class RaftLog;
+
+            explicit Impl(AkkEngineOptions optionsIn)
+                : opts{std::move(optionsIn)},
+                  storage{std::make_shared<StorageState>()},
+                  manifest{&storage->manifest},
+                  sstManager{&storage->sstManager},
+                  memtable{&storage->memtable},
+                  walWriter{&storage->walWriter},
+                  blobManager{&storage->blobManager},
+                  versionLog{&storage->versionLog} {}
 
             AkkEngineOptions opts;
             std::atomic<bool> closed{false};
             uint64_t nodeId = 0;
 
-            std::unique_ptr<manifest::Manifest> manifest;
-            std::unique_ptr<sst::SSTManager> sstManager;
-            std::unique_ptr<memtable::MemTable> memtable;
-            std::unique_ptr<wal::WalWriter> walWriter;
-            std::unique_ptr<blob::BlobManager> blobManager;
-            std::unique_ptr<vlog::VersionLog> versionLog;
+            std::shared_ptr<StorageState> storage;
+            StorageSlot<manifest::Manifest> manifest;
+            StorageSlot<sst::SSTManager> sstManager;
+            StorageSlot<memtable::MemTable> memtable;
+            StorageSlot<wal::WalWriter> walWriter;
+            StorageSlot<blob::BlobManager> blobManager;
+            StorageSlot<vlog::VersionLog> versionLog;
             std::unique_ptr<cluster::IClusterRuntime> clusterRuntime;
             std::unique_ptr<server::IAkkApiServer> apiServer;
+            std::unique_ptr<RaftLog> raftLog;
 
             mutable std::mutex writeMu;
+            mutable std::shared_mutex storageMu;
             std::atomic<uint64_t> putsTotal{0};
             std::atomic<uint64_t> removesTotal{0};
             std::atomic<uint64_t> getsTotal{0};
@@ -175,7 +233,196 @@ namespace akkaradb::engine {
             std::atomic<uint64_t> scansTotal{0};
             std::atomic<uint64_t> blobPutsTotal{0};
 
+            bool snapshotInProgress = false;
+            uint64_t pendingSnapshotSeq = 0;
+            uint64_t pendingSnapshotEntryCount = 0;
+            std::vector<cluster::ClusterHistoryEntry> pendingSnapshotEntries;
+
+            struct AppliedWrite {
+                uint64_t seq = 0;
+                std::span<const uint8_t> key;
+                std::vector<uint8_t> stored;
+                uint8_t flags = MemHdr16::FLAG_NORMAL;
+                cluster::ReplOpType op = cluster::ReplOpType::PUT;
+                uint64_t sourceNodeId = 0;
+            };
+
+            struct RaftProposal {
+                uint64_t term = 1;
+                uint64_t index = 0;
+                std::vector<uint8_t> key;
+                std::vector<uint8_t> value;
+                uint8_t flags = MemHdr16::FLAG_NORMAL;
+                cluster::ReplOpType op = cluster::ReplOpType::PUT;
+                uint64_t sourceNodeId = 0;
+                uint64_t fp64 = 0;
+                uint64_t miniKey = 0;
+            };
+
+            class RaftLog {
+                public:
+                    enum class RecordType : uint8_t {
+                        PROPOSAL = 1,
+                        COMMIT = 2,
+                    };
+
+                    [[nodiscard]] static std::unique_ptr<RaftLog> open(const fs::path& path) {
+                        if (path.empty()) { throw std::invalid_argument("AkkEngine: Raft log path is required"); }
+                        ensureDir(path.parent_path());
+                        auto log = std::unique_ptr<RaftLog>{new RaftLog(path)};
+                        log->recover();
+                        log->file_ = std::fopen(path.string().c_str(), "ab");
+                        if (log->file_ == nullptr) { throw std::runtime_error("AkkEngine: failed to open Raft log: " + path.string()); }
+                        return log;
+                    }
+
+                    ~RaftLog() {
+                        if (file_ != nullptr) {
+                            try { forceDurable(file_); }
+                            catch (...) {}
+                            std::fclose(file_);
+                        }
+                    }
+
+                    RaftLog(const RaftLog&) = delete;
+                    RaftLog& operator=(const RaftLog&) = delete;
+
+                    [[nodiscard]] RaftProposal appendProposal(
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value,
+                        uint8_t flags,
+                        uint64_t sourceNodeId,
+                        uint64_t fp64 = 0,
+                        uint64_t miniKey = 0
+                    ) {
+                        std::lock_guard lock{mutex_};
+                        RaftProposal proposal;
+                        proposal.term = currentTerm_;
+                        proposal.index = ++lastIndex_;
+                        proposal.key.assign(key.begin(), key.end());
+                        proposal.value.assign(value.begin(), value.end());
+                        proposal.flags = flags;
+                        proposal.op = op;
+                        proposal.sourceNodeId = sourceNodeId;
+                        proposal.fp64 = fp64;
+                        proposal.miniKey = miniKey;
+                        appendRecord(RecordType::PROPOSAL, proposal);
+                        return proposal;
+                    }
+
+                    void markCommitted(uint64_t term, uint64_t index) {
+                        std::lock_guard lock{mutex_};
+                        RaftProposal marker;
+                        marker.term = term;
+                        marker.index = index;
+                        appendRecord(RecordType::COMMIT, marker);
+                        if (index > commitIndex_) { commitIndex_ = index; }
+                    }
+
+                    [[nodiscard]] uint64_t lastIndex() const noexcept { return lastIndex_; }
+                    [[nodiscard]] uint64_t commitIndex() const noexcept { return commitIndex_; }
+
+                private:
+                    explicit RaftLog(fs::path path) : path_{std::move(path)} {}
+
+                    static constexpr uint32_t MAGIC = 0x31465241; // "ARF1" little-endian.
+                    static constexpr uint8_t VERSION = 1;
+
+                    struct Header {
+                        uint32_t magic = MAGIC;
+                        uint8_t version = VERSION;
+                        uint8_t type = 0;
+                        uint16_t reserved = 0;
+                        uint64_t term = 0;
+                        uint64_t index = 0;
+                        uint64_t sourceNodeId = 0;
+                        uint8_t op = 0;
+                        uint8_t flags = 0;
+                        uint16_t reserved2 = 0;
+                        uint32_t keyLen = 0;
+                        uint32_t valueLen = 0;
+                    };
+
+                    static bool readExact(FILE* file, void* out, size_t bytes) {
+                        return std::fread(out, 1, bytes, file) == bytes;
+                    }
+
+                    static void writeExact(FILE* file, const void* data, size_t bytes) {
+                        if (bytes == 0) { return; }
+                        if (std::fwrite(data, 1, bytes, file) != bytes) {
+                            throw std::runtime_error("AkkEngine: failed to write Raft log");
+                        }
+                    }
+
+                    void recover() {
+                        FILE* rf = std::fopen(path_.string().c_str(), "rb");
+                        if (rf == nullptr) { return; }
+                        while (true) {
+                            Header header{};
+                            if (!readExact(rf, &header, sizeof(header))) { break; }
+                            if (header.magic != MAGIC || header.version != VERSION) { break; }
+                            if (header.type != static_cast<uint8_t>(RecordType::PROPOSAL) &&
+                                header.type != static_cast<uint8_t>(RecordType::COMMIT)) {
+                                break;
+                            }
+                            if (header.keyLen > 0 && std::fseek(rf, static_cast<long>(header.keyLen), SEEK_CUR) != 0) { break; }
+                            if (header.valueLen > 0 && std::fseek(rf, static_cast<long>(header.valueLen), SEEK_CUR) != 0) { break; }
+                            if (header.index > lastIndex_) { lastIndex_ = header.index; }
+                            if (header.term > currentTerm_) { currentTerm_ = header.term; }
+                            if (header.type == static_cast<uint8_t>(RecordType::COMMIT) && header.index > commitIndex_) {
+                                commitIndex_ = header.index;
+                            }
+                        }
+                        std::fclose(rf);
+                    }
+
+                    void appendRecord(RecordType type, const RaftProposal& proposal) {
+                        if (file_ == nullptr) { throw std::runtime_error("AkkEngine: Raft log is closed"); }
+                        if (proposal.key.size() > UINT32_MAX || proposal.value.size() > UINT32_MAX) {
+                            throw std::invalid_argument("AkkEngine: Raft log entry is too large");
+                        }
+                        Header header;
+                        header.type = static_cast<uint8_t>(type);
+                        header.term = proposal.term;
+                        header.index = proposal.index;
+                        header.sourceNodeId = proposal.sourceNodeId;
+                        header.op = static_cast<uint8_t>(proposal.op);
+                        header.flags = proposal.flags;
+                        header.keyLen = static_cast<uint32_t>(proposal.key.size());
+                        header.valueLen = static_cast<uint32_t>(proposal.value.size());
+                        writeExact(file_, &header, sizeof(header));
+                        writeExact(file_, proposal.key.data(), proposal.key.size());
+                        writeExact(file_, proposal.value.data(), proposal.value.size());
+                        forceDurable(file_);
+                    }
+
+                    fs::path path_;
+                    FILE* file_ = nullptr;
+                    mutable std::mutex mutex_;
+                    uint64_t currentTerm_ = 1;
+                    uint64_t lastIndex_ = 0;
+                    uint64_t commitIndex_ = 0;
+            };
+
             [[nodiscard]] uint64_t snapshotSeq() const noexcept { return memtable ? memtable->lastSeq() : 0; }
+
+            [[nodiscard]] std::shared_ptr<StorageState> pinStorage() const {
+                std::shared_lock lock{storageMu};
+                return storage;
+            }
+
+            void replaceStorage(std::shared_ptr<StorageState> replacement) {
+                if (!replacement) { throw std::invalid_argument("AkkEngine: replacement storage is required"); }
+                std::unique_lock lock{storageMu};
+                storage = std::move(replacement);
+                manifest.bind(&storage->manifest);
+                sstManager.bind(&storage->sstManager);
+                memtable.bind(&storage->memtable);
+                walWriter.bind(&storage->walWriter);
+                blobManager.bind(&storage->blobManager);
+                versionLog.bind(&storage->versionLog);
+            }
 
             [[nodiscard]] bool persistent() const noexcept {
                 return opts.components.walEnabled || opts.components.sstEnabled || opts.components.manifestEnabled;
@@ -269,6 +516,104 @@ namespace akkaradb::engine {
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
             }
 
+            [[nodiscard]] AppliedWrite applyLocalPut(
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t fp64 = 0,
+                uint64_t miniKey = 0,
+                uint64_t sourceNodeId = 0
+            ) {
+                AppliedWrite write;
+                write.key = key;
+                write.op = cluster::ReplOpType::PUT;
+                write.sourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                {
+                    std::lock_guard lock(writeMu);
+                    write.seq = memtable->reserveSeq(1);
+                    write.stored = maybeExternalize(write.seq, value, write.flags);
+                    putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    if ((write.flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                    appendAll(write.seq, key, write.stored, write.flags, write.sourceNodeId, fp64, miniKey);
+                }
+                return write;
+            }
+
+            [[nodiscard]] std::vector<AppliedWrite> applyLocalPutBatch(std::span<const BatchPutEntry> entries) {
+                std::vector<AppliedWrite> writes;
+                writes.reserve(entries.size());
+
+                std::lock_guard lock(writeMu);
+                const uint64_t baseSeq = memtable->reserveSeq(entries.size());
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    const auto& [key, value] = entries[i];
+                    AppliedWrite write;
+                    write.seq = baseSeq + i;
+                    write.key = key;
+                    write.op = cluster::ReplOpType::PUT;
+                    write.sourceNodeId = nodeId;
+                    write.stored = maybeExternalize(write.seq, value, write.flags);
+                    putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    if ((write.flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                    appendAll(write.seq, write.key, write.stored, write.flags, nodeId);
+                    writes.push_back(std::move(write));
+                }
+                return writes;
+            }
+
+            [[nodiscard]] AppliedWrite applyLocalRemove(
+                std::span<const uint8_t> key,
+                uint64_t fp64 = 0,
+                uint64_t miniKey = 0,
+                uint64_t sourceNodeId = 0
+            ) {
+                AppliedWrite write;
+                write.key = key;
+                write.op = cluster::ReplOpType::REMOVE;
+                write.flags = MemHdr16::FLAG_TOMBSTONE;
+                write.sourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                {
+                    std::lock_guard lock(writeMu);
+                    write.seq = memtable->reserveSeq(1);
+                    removesTotal.fetch_add(1, std::memory_order_relaxed);
+                    appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey);
+                }
+                return write;
+            }
+
+            void replicateCommitted(const AppliedWrite& write) {
+                if (clusterRuntime) {
+                    clusterRuntime->shipEntry(write.seq, write.op, write.key, write.stored, write.flags, write.sourceNodeId);
+                }
+            }
+
+            void applyCommittedRaftProposal(const RaftProposal& proposal) {
+                std::lock_guard lock(writeMu);
+                const uint8_t flags = proposal.op == cluster::ReplOpType::REMOVE
+                                          ? static_cast<uint8_t>(proposal.flags | MemHdr16::FLAG_TOMBSTONE)
+                                          : proposal.flags;
+                if (proposal.op == cluster::ReplOpType::REMOVE) {
+                    removesTotal.fetch_add(1, std::memory_order_relaxed);
+                    appendAll(proposal.index, proposal.key, {}, flags, proposal.sourceNodeId, proposal.fp64, proposal.miniKey);
+                }
+                else {
+                    putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    appendAll(proposal.index, proposal.key, proposal.value, flags, proposal.sourceNodeId, proposal.fp64, proposal.miniKey);
+                }
+            }
+
+            void replicateRaftProposal(const RaftProposal& proposal) {
+                if (clusterRuntime) {
+                    clusterRuntime->shipEntry(
+                        proposal.index,
+                        proposal.op,
+                        proposal.key,
+                        proposal.value,
+                        proposal.flags,
+                        proposal.sourceNodeId
+                    );
+                }
+            }
+
             void applyReplicaRecord(
                 uint64_t seq,
                 cluster::ReplOpType op,
@@ -286,12 +631,173 @@ namespace akkaradb::engine {
                 appendAll(seq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
                 memtable->advanceSeq(seq);
             }
+
+            void beginReplicaSnapshot(uint64_t seq, uint64_t entryCount) {
+                std::lock_guard lock(writeMu);
+                if (snapshotInProgress) { throw std::runtime_error("AkkEngine: received nested replication snapshot"); }
+                snapshotInProgress = true;
+                pendingSnapshotSeq = seq;
+                pendingSnapshotEntryCount = entryCount;
+                pendingSnapshotEntries.clear();
+                pendingSnapshotEntries.reserve(static_cast<size_t>(std::min<uint64_t>(entryCount, SIZE_MAX)));
+            }
+
+            void stageReplicaSnapshotEntry(std::span<const uint8_t> key, std::span<const uint8_t> value) {
+                std::lock_guard lock(writeMu);
+                if (!snapshotInProgress) { throw std::runtime_error("AkkEngine: received replication snapshot entry without begin"); }
+                if (pendingSnapshotEntries.size() >= pendingSnapshotEntryCount) {
+                    throw std::runtime_error("AkkEngine: replication snapshot has too many entries");
+                }
+                pendingSnapshotEntries.push_back(cluster::ClusterHistoryEntry{
+                    .key = {key.begin(), key.end()},
+                    .value = {value.begin(), value.end()},
+                });
+            }
+
+            void finishReplicaSnapshot(uint64_t seq) {
+                std::lock_guard lock(writeMu);
+                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotEntries.size() != pendingSnapshotEntryCount) {
+                    throw std::runtime_error("AkkEngine: invalid replication snapshot completion");
+                }
+
+                std::unordered_set<std::string> incomingKeys;
+                incomingKeys.reserve(pendingSnapshotEntries.size());
+                for (const auto& entry : pendingSnapshotEntries) {
+                    const auto [_, inserted] = incomingKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
+                    if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate keys"); }
+                }
+
+                core::BufferArena arena;
+                memtable::MemTable::KeyRange range;
+                auto mt = memtable->iterator(range, snapshotSeq());
+                sst::SSTManager::Iterator sst;
+                if (sstManager) { sst = sstManager->scanIter({}, {}); }
+                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                    const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
+                    if (incomingKeys.find(key) == incomingKeys.end()) {
+                        appendAll(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0);
+                    }
+                }
+                for (const auto& entry : pendingSnapshotEntries) {
+                    appendAll(seq, entry.key, entry.value, MemHdr16::FLAG_NORMAL, 0);
+                }
+                memtable->advanceSeq(seq);
+                pendingSnapshotEntries.clear();
+                snapshotInProgress = false;
+                pendingSnapshotSeq = 0;
+                pendingSnapshotEntryCount = 0;
+            }
+
+            class WriteCoordinator {
+                public:
+                    explicit WriteCoordinator(Impl& engine) : engine_{engine} {}
+                    virtual ~WriteCoordinator() = default;
+                    WriteCoordinator(const WriteCoordinator&) = delete;
+                    WriteCoordinator& operator=(const WriteCoordinator&) = delete;
+
+                    virtual void put(std::span<const uint8_t> key, std::span<const uint8_t> value) = 0;
+                    virtual void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) = 0;
+                    virtual void putBatch(std::span<const BatchPutEntry> entries) = 0;
+                    virtual void remove(std::span<const uint8_t> key) = 0;
+                    virtual void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) = 0;
+
+                protected:
+                    Impl& engine_;
+            };
+
+            class LocalReplicationWriteCoordinator final : public WriteCoordinator {
+                public:
+                    using WriteCoordinator::WriteCoordinator;
+
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        const auto write = engine_.applyLocalPut(key, value);
+                        engine_.replicateCommitted(write);
+                    }
+
+                    void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
+                        const auto write = engine_.applyLocalPut(key, value, fp64, miniKey);
+                        engine_.replicateCommitted(write);
+                    }
+
+                    void putBatch(std::span<const BatchPutEntry> entries) override {
+                        const auto writes = engine_.applyLocalPutBatch(entries);
+                        for (const auto& write : writes) { engine_.replicateCommitted(write); }
+                    }
+
+                    void remove(std::span<const uint8_t> key) override {
+                        const auto write = engine_.applyLocalRemove(key);
+                        engine_.replicateCommitted(write);
+                    }
+
+                    void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
+                        const auto write = engine_.applyLocalRemove(key, fp64, miniKey);
+                        engine_.replicateCommitted(write);
+                    }
+            };
+
+            class RaftQuorumWriteCoordinator final : public WriteCoordinator {
+                public:
+                    using WriteCoordinator::WriteCoordinator;
+
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        commitLocalProposal(propose(cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL));
+                    }
+
+                    void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
+                        commitLocalProposal(propose(cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL, fp64, miniKey));
+                    }
+
+                    void putBatch(std::span<const BatchPutEntry> entries) override {
+                        for (const auto& [key, value] : entries) {
+                            commitLocalProposal(propose(cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL));
+                        }
+                    }
+
+                    void remove(std::span<const uint8_t> key) override {
+                        commitLocalProposal(propose(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE));
+                    }
+
+                    void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
+                        commitLocalProposal(propose(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE, fp64, miniKey));
+                    }
+
+                private:
+                    [[nodiscard]] RaftProposal propose(
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value,
+                        uint8_t flags,
+                        uint64_t fp64 = 0,
+                        uint64_t miniKey = 0
+                    ) {
+                        if (!engine_.raftLog) { throw std::runtime_error("AkkEngine: RAFT_QUORUM requires a Raft log"); }
+                        return engine_.raftLog->appendProposal(op, key, value, flags, engine_.nodeId, fp64, miniKey);
+                    }
+
+                    void commitLocalProposal(const RaftProposal& proposal) {
+                        engine_.replicateRaftProposal(proposal);
+                        engine_.raftLog->markCommitted(proposal.term, proposal.index);
+                        engine_.applyCommittedRaftProposal(proposal);
+                    }
+            };
+
+            [[nodiscard]] std::unique_ptr<WriteCoordinator> createWriteCoordinator(cluster::ConsistencyMode mode) {
+                if (mode == cluster::ConsistencyMode::RAFT_QUORUM) {
+                    return std::make_unique<RaftQuorumWriteCoordinator>(*this);
+                }
+                return std::make_unique<LocalReplicationWriteCoordinator>(*this);
+            }
+
+            std::unique_ptr<WriteCoordinator> writeCoordinator;
     };
 
     AkkEngine::AkkEngine() = default;
     AkkEngine::~AkkEngine() { close(); }
 
     std::unique_ptr<AkkEngine> AkkEngine::open(AkkEngineOptions options) {
+        if (options.runtime.generationLayoutEnabled && !options.paths.dataDir.empty()) {
+            options.paths.dataDir = generation::StorageGeneration::openOrCreate(options.paths.dataDir).activePath();
+        }
         auto fillPath = [&](fs::path& target, const char* fallback) {
             if (target.empty() && !options.paths.dataDir.empty()) { target = options.paths.dataDir / fallback; }
         };
@@ -335,6 +841,7 @@ namespace akkaradb::engine {
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
+        cluster::ConsistencyMode writeCoordinatorMode = cluster::ConsistencyMode::PRIMARY_ACK;
         if (impl.opts.components.manifestEnabled && !impl.opts.paths.manifestPath.empty()) {
             impl.manifest = manifest::Manifest::create(impl.opts.paths.manifestPath, impl.opts.manifest.fastMode);
             impl.manifest->start();
@@ -371,9 +878,64 @@ namespace akkaradb::engine {
             cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
                                              ? *impl.opts.cluster.config
                                              : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
+            writeCoordinatorMode = cfg.consistency().mode;
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
             callbacks.getLastSeq = [&impl] { return impl.snapshotSeq(); };
+            callbacks.getEntries = [&impl](uint64_t afterSeq, uint64_t throughSeq) -> std::optional<std::vector<cluster::ClusterHistoryEntry>> {
+                if (!impl.walWriter || throughSeq < afterSeq) { return std::nullopt; }
+                std::vector<cluster::ClusterHistoryEntry> entries;
+                bool hasExternalBlob = false;
+                const auto recovery = wal::WalRecovery::recover(
+                    wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir},
+                    [&](const wal::WalRecoveredEntry& item) {
+                        if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
+                        const uint8_t flags = static_cast<uint8_t>(item.flags);
+                        if ((flags & MemHdr16::FLAG_BLOB) != 0) { hasExternalBlob = true; return; }
+                        entries.push_back(cluster::ClusterHistoryEntry{
+                            .seq = item.seq,
+                            .sourceNodeId = impl.nodeId,
+                            .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0 ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT),
+                            .recordFlags = flags,
+                            .key = item.key,
+                            .value = item.value,
+                        });
+                    }
+                );
+                (void)recovery;
+                if (hasExternalBlob) { return std::nullopt; }
+                std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.seq < right.seq; });
+                uint64_t expected = afterSeq;
+                for (const auto& entry : entries) {
+                    if (expected == UINT64_MAX || entry.seq != expected + 1) { return std::nullopt; }
+                    expected = entry.seq;
+                }
+                if (expected != throughSeq) { return std::nullopt; }
+                return entries;
+            };
+            callbacks.exportSnapshot = [&impl]() -> std::optional<cluster::ClusterSnapshot> {
+                std::lock_guard lock{impl.writeMu};
+                if (!impl.memtable) { return std::nullopt; }
+                cluster::ClusterSnapshot snapshot;
+                snapshot.seq = impl.snapshotSeq();
+                core::BufferArena arena;
+                memtable::MemTable::KeyRange range;
+                auto mt = impl.memtable->iterator(range, snapshot.seq);
+                sst::SSTManager::Iterator sst;
+                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}); }
+                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), impl.blobManager.get())) {
+                    snapshot.entries.push_back(cluster::ClusterHistoryEntry{
+                        .key = {record.key.begin(), record.key.end()},
+                        .value = {record.value.begin(), record.value.end()},
+                    });
+                }
+                return snapshot;
+            };
+            callbacks.beginSnapshot = [&impl](uint64_t seq, uint64_t entryCount) { impl.beginReplicaSnapshot(seq, entryCount); };
+            callbacks.applySnapshotEntry = [&impl](std::span<const uint8_t> key, std::span<const uint8_t> value) {
+                impl.stageReplicaSnapshotEntry(key, value);
+            };
+            callbacks.finishSnapshot = [&impl](uint64_t seq) { impl.finishReplicaSnapshot(seq); };
             callbacks.forceDurable = [&impl] {
                 if (impl.walWriter) { impl.walWriter->forceSync(); }
                 if (impl.versionLog) { impl.versionLog->forceSync(); }
@@ -410,6 +972,15 @@ namespace akkaradb::engine {
             impl.clusterRuntime->start();
         }
 
+        if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
+            const fs::path raftLogPath = impl.opts.paths.dataDir.empty()
+                                             ? fs::path{"raft.log"}
+                                             : impl.opts.paths.dataDir / "raft.log";
+            impl.raftLog = Impl::RaftLog::open(raftLogPath);
+        }
+
+        impl.writeCoordinator = impl.createWriteCoordinator(writeCoordinatorMode);
+
         if (impl.opts.components.apiEnabled) {
             if (!server::akkApiServerFactoryAvailable() && !server::loadAkkApiServerBackend(impl.opts.api.serverBackendPath)) {
                 const auto detail = server::lastAkkApiServerBackendLoadError();
@@ -428,101 +999,28 @@ namespace akkaradb::engine {
 
     void AkkEngine::put(std::span<const uint8_t> key, std::span<const uint8_t> value) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-
-        uint64_t seq = 0;
-        uint8_t flags = MemHdr16::FLAG_NORMAL;
-        std::vector<uint8_t> stored;
-        {
-            std::lock_guard lock(impl_->writeMu);
-            seq = impl_->memtable->reserveSeq(1);
-            stored = impl_->maybeExternalize(seq, value, flags);
-            impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-            if ((flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
-            impl_->appendAll(seq, key, stored, flags, impl_->nodeId);
-        }
-        if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::PUT, key, stored, flags, impl_->nodeId); }
+        impl_->writeCoordinator->put(key, value);
     }
 
     void AkkEngine::putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-
-        uint64_t seq = 0;
-        uint8_t flags = MemHdr16::FLAG_NORMAL;
-        std::vector<uint8_t> stored;
-        {
-            std::lock_guard lock(impl_->writeMu);
-            seq = impl_->memtable->reserveSeq(1);
-            stored = impl_->maybeExternalize(seq, value, flags);
-            impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-            if ((flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
-            impl_->appendAll(seq, key, stored, flags, impl_->nodeId, fp64, miniKey);
-        }
-        if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::PUT, key, stored, flags, impl_->nodeId); }
+        impl_->writeCoordinator->putHinted(key, value, fp64, miniKey);
     }
 
     void AkkEngine::putBatch(std::span<const BatchPutEntry> entries) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
         if (entries.empty()) { return; }
-
-        struct PendingShip {
-            uint64_t seq = 0;
-            std::span<const uint8_t> key;
-            std::vector<uint8_t> stored;
-            uint8_t flags = core::MemHdr16::FLAG_NORMAL;
-        };
-
-        std::vector<PendingShip> pending;
-        pending.reserve(entries.size());
-
-        {
-            std::lock_guard lock(impl_->writeMu);
-            const uint64_t baseSeq = impl_->memtable->reserveSeq(entries.size());
-            for (size_t i = 0; i < entries.size(); ++i) {
-                const auto& [key, value] = entries[i];
-                PendingShip item;
-                item.seq = baseSeq + i;
-                item.key = key;
-                item.stored = impl_->maybeExternalize(item.seq, value, item.flags);
-                impl_->putsTotal.fetch_add(1, std::memory_order_relaxed);
-                if ((item.flags & MemHdr16::FLAG_BLOB) != 0) { impl_->blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
-                impl_->appendAll(item.seq, item.key, item.stored, item.flags, impl_->nodeId);
-                pending.push_back(std::move(item));
-            }
-        }
-
-        if (impl_->clusterRuntime) {
-            for (const PendingShip& item : pending) {
-                impl_->clusterRuntime->shipEntry(item.seq, cluster::ReplOpType::PUT, item.key, item.stored, item.flags, impl_->nodeId);
-            }
-        }
+        impl_->writeCoordinator->putBatch(entries);
     }
 
     void AkkEngine::remove(std::span<const uint8_t> key) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-
-        uint64_t seq = 0;
-        constexpr uint8_t flags = MemHdr16::FLAG_TOMBSTONE;
-        {
-            std::lock_guard lock(impl_->writeMu);
-            seq = impl_->memtable->reserveSeq(1);
-            impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-            impl_->appendAll(seq, key, {}, flags, impl_->nodeId);
-        }
-        if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::REMOVE, key, {}, flags, impl_->nodeId); }
+        impl_->writeCoordinator->remove(key);
     }
 
     void AkkEngine::removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) {
         if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-
-        uint64_t seq = 0;
-        constexpr uint8_t flags = MemHdr16::FLAG_TOMBSTONE;
-        {
-            std::lock_guard lock(impl_->writeMu);
-            seq = impl_->memtable->reserveSeq(1);
-            impl_->removesTotal.fetch_add(1, std::memory_order_relaxed);
-            impl_->appendAll(seq, key, {}, flags, impl_->nodeId, fp64, miniKey);
-        }
-        if (impl_->clusterRuntime) { impl_->clusterRuntime->shipEntry(seq, cluster::ReplOpType::REMOVE, key, {}, flags, impl_->nodeId); }
+        impl_->writeCoordinator->removeHinted(key, fp64, miniKey);
     }
 
     std::optional<std::vector<uint8_t>> AkkEngine::get(std::span<const uint8_t> key) const {

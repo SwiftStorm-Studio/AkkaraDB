@@ -121,6 +121,28 @@ namespace akkaradb::engine::cluster {
         return encodeFrame(ReplMsgType::ACK, p);
     }
 
+    std::vector<uint8_t> encodeSnapshotBegin(const ReplSnapshotBegin& begin) {
+        std::vector<uint8_t> p;
+        writeU64(p, begin.snapshotSeq);
+        writeU64(p, begin.entryCount);
+        return encodeFrame(ReplMsgType::SNAPSHOT_BEGIN, p);
+    }
+
+    std::vector<uint8_t> encodeSnapshotEntry(const ReplSnapshotEntry& entry) {
+        std::vector<uint8_t> p;
+        writeU32(p, static_cast<uint32_t>(entry.key.size()));
+        writeU32(p, static_cast<uint32_t>(entry.value.size()));
+        p.insert(p.end(), entry.key.begin(), entry.key.end());
+        p.insert(p.end(), entry.value.begin(), entry.value.end());
+        return encodeFrame(ReplMsgType::SNAPSHOT_ENTRY, p);
+    }
+
+    std::vector<uint8_t> encodeSnapshotEnd(uint64_t snapshotSeq) {
+        std::vector<uint8_t> p;
+        writeU64(p, snapshotSeq);
+        return encodeFrame(ReplMsgType::SNAPSHOT_END, p);
+    }
+
     std::vector<uint8_t> encodeReadRequest(const ReadRequest& request) {
         std::vector<uint8_t> p;
         writeU64(p, request.requestId);
@@ -184,6 +206,27 @@ namespace akkaradb::engine::cluster {
         out.seq = readU64(payload, 0);
         out.stage = static_cast<AckStage>(payload[8]);
         return out.stage == AckStage::RECEIVED || out.stage == AckStage::APPLIED || out.stage == AckStage::DURABLE;
+    }
+
+    bool decodeSnapshotBegin(std::span<const uint8_t> payload, ReplSnapshotBegin& out) {
+        if (payload.size() != 16) { return false; }
+        out.snapshotSeq = readU64(payload, 0);
+        out.entryCount = readU64(payload, 8);
+        return true;
+    }
+
+    bool decodeSnapshotEntry(std::span<const uint8_t> payload, ReplSnapshotEntry& out) {
+        if (payload.size() < 8) { return false; }
+        const uint32_t keyLen = readU32(payload, 0);
+        const uint32_t valueLen = readU32(payload, 4);
+        size_t cursor = 8;
+        return readBytes(payload, cursor, keyLen, out.key) && readBytes(payload, cursor, valueLen, out.value) && cursor == payload.size();
+    }
+
+    bool decodeSnapshotEnd(std::span<const uint8_t> payload, uint64_t& snapshotSeq) {
+        if (payload.size() != 8) { return false; }
+        snapshotSeq = readU64(payload, 0);
+        return true;
     }
 
     bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out) {

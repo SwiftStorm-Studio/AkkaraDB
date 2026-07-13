@@ -19,13 +19,38 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace akkaradb::engine::cluster {
+    /** Core-to-runtime representation of a retained mutation. */
+    struct ClusterHistoryEntry {
+        uint64_t seq = 0;
+        uint64_t sourceNodeId = 0;
+        uint8_t op = 0;
+        uint8_t recordFlags = 0;
+        std::vector<uint8_t> key;
+        std::vector<uint8_t> value;
+    };
+
+    struct ClusterSnapshot {
+        uint64_t seq = 0;
+        std::vector<ClusterHistoryEntry> entries;
+    };
+
     struct AKDB_API ClusterEngineCallbacks {
         std::function<uint64_t()> getCurrentSeq;
         std::function<uint64_t()> getLastSeq;
+        // Returns a complete, contiguous (afterSeq, throughSeq] mutation range,
+        // or nullopt when the retained WAL cannot satisfy the request.
+        std::function<std::optional<std::vector<ClusterHistoryEntry>>(uint64_t afterSeq, uint64_t throughSeq)> getEntries;
+        std::function<std::optional<ClusterSnapshot>()> exportSnapshot;
+        std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> beginSnapshot;
+        std::function<void(std::span<const uint8_t> key, std::span<const uint8_t> value)> applySnapshotEntry;
+        std::function<void(uint64_t snapshotSeq)> finishSnapshot;
         std::function<void(
 uint64_t seq,
  ReplOpType op,
@@ -57,6 +82,18 @@ uint64_t seq,
                 uint64_t sourceNodeId
             ) = 0;
             virtual void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) = 0;
+
+            virtual void addRaftVotingNode(const NodeInfo&) {
+                throw std::runtime_error("IClusterRuntime: online Raft membership change is not supported");
+            }
+
+            virtual void removeRaftVotingNode(uint64_t) {
+                throw std::runtime_error("IClusterRuntime: online Raft membership change is not supported");
+            }
+
+            virtual void transferRaftLeadership(uint64_t) {
+                throw std::runtime_error("IClusterRuntime: Raft leader transfer is not supported");
+            }
 
         protected:
             IClusterRuntime() = default;

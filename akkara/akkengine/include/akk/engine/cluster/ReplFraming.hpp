@@ -49,6 +49,14 @@ namespace akkaradb::engine::cluster {
         ///< Raft AppendEntries RPC, including heartbeats.
         RAFT_APPEND_ENTRIES_RESPONSE = 0x33,
         ///< Raft AppendEntries RPC response.
+        RAFT_INSTALL_SNAPSHOT = 0x34,
+        ///< Raft InstallSnapshot RPC.
+        RAFT_INSTALL_SNAPSHOT_RESPONSE = 0x35,
+        ///< Raft InstallSnapshot RPC response.
+        RAFT_TIMEOUT_NOW = 0x36,
+        ///< Raft leadership transfer election trigger.
+        RAFT_TIMEOUT_NOW_RESPONSE = 0x37,
+        ///< Raft leadership transfer election trigger response.
     };
 
     /**

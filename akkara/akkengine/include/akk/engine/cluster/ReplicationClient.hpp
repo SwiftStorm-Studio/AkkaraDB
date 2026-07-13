@@ -40,6 +40,9 @@ uint64_t seq,
  uint64_t sourceNodeId
             )>;
             using BlobCallback = std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)>;
+            using SnapshotBeginCallback = std::function<void(uint64_t snapshotSeq, uint64_t entryCount)>;
+            using SnapshotEntryCallback = std::function<void(std::span<const uint8_t> key, std::span<const uint8_t> value)>;
+            using SnapshotEndCallback = std::function<void(uint64_t snapshotSeq)>;
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
                 std::string primaryHost,
                 uint16_t primaryReplPort,
@@ -54,6 +57,7 @@ uint64_t seq,
             void setApplyCallback(ApplyCallback callback);
             void setBlobCallback(BlobCallback callback);
             void setForceDurableCallback(std::function<void()> callback);
+            void setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end);
             void start();
             void close();
             [[nodiscard]] bool connected() const noexcept;

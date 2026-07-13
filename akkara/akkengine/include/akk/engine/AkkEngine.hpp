@@ -140,6 +140,9 @@ namespace akkaradb::engine {
             bool forceFlushOnClose = true;
             bool forceSyncOnClose = true;
             bool sstPromoteReads = false;
+            // Store mutable engine files under an active generation directory.
+            // Disabled by default so existing data directories retain their layout.
+            bool generationLayoutEnabled = false;
         } runtime;
 
         memtable::MemTable::Options memtable;

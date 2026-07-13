@@ -238,6 +238,21 @@ namespace akkaradb::engine::cluster {
                 if (server_) { server_->shipBlob(seq, blobId, content); }
             }
 
+            void addRaftVotingNode(const NodeInfo& node) {
+                if (!raftRuntime_) { throw std::runtime_error("ClusterRuntime: online Raft membership change requires RAFT_QUORUM"); }
+                raftRuntime_->addVotingNode(node);
+            }
+
+            void removeRaftVotingNode(uint64_t nodeId) {
+                if (!raftRuntime_) { throw std::runtime_error("ClusterRuntime: online Raft membership change requires RAFT_QUORUM"); }
+                raftRuntime_->removeVotingNode(nodeId);
+            }
+
+            void transferRaftLeadership(uint64_t targetNodeId) {
+                if (!raftRuntime_) { throw std::runtime_error("ClusterRuntime: Raft leader transfer requires RAFT_QUORUM"); }
+                raftRuntime_->transferLeadership(targetNodeId);
+            }
+
         private:
             void installRole(NodeRole role) {
                 std::lock_guard lock{mutex_};
@@ -380,6 +395,12 @@ namespace akkaradb::engine::cluster {
     void ClusterRuntime::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
         impl_->shipBlob(seq, blobId, content);
     }
+
+    void ClusterRuntime::addRaftVotingNode(const NodeInfo& node) { impl_->addRaftVotingNode(node); }
+
+    void ClusterRuntime::removeRaftVotingNode(uint64_t nodeId) { impl_->removeRaftVotingNode(nodeId); }
+
+    void ClusterRuntime::transferRaftLeadership(uint64_t targetNodeId) { impl_->transferRaftLeadership(targetNodeId); }
 } // namespace akkaradb::engine::cluster
 
 extern "C" AKKARADB_CLUSTER_RUNTIME_API bool akkaradb_cluster_register() noexcept {

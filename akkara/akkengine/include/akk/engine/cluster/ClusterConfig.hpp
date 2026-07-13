@@ -96,6 +96,79 @@ namespace akkaradb::engine::cluster {
         uint16_t quorum = 0; ///< Required replica count when mode == AckPolicyMode::QUORUM.
     };
 
+    /** Write completion rule requested by the cluster configuration. */
+    enum class WriteConsistency : uint8_t {
+        LEGACY_ACK_POLICY = 0, ///< Use AckPolicy; preserves the v1 runtime behaviour.
+        LOCAL = 1,
+        ONE_REPLICA = 2,
+        QUORUM = 3,
+        ALL_CONFIGURED = 4,
+    };
+
+    /** Replication algorithm selected for this cluster. */
+    enum class ConsistencyMode : uint8_t {
+        /** Existing primary-to-replica protocol; WriteConsistency selects its ACK rule. */
+        PRIMARY_ACK = 0,
+        /** Fire-and-forget primary-to-replica shipping with local completion. */
+        ASYNC = 1,
+        /** Raft-style quorum commit over the native cluster replication transport. */
+        RAFT_QUORUM = 2,
+    };
+
+    /** Behaviour when the requested write acknowledgement does not arrive in time. */
+    enum class AckTimeoutAction : uint8_t {
+        ACCEPT_LOCAL = 0,
+        FAIL_WRITE = 1,
+    };
+
+    /** Policy for replicas which cannot remain within the retained replication history. */
+    enum class ReplicaLagAction : uint8_t {
+        ASYNC_RESYNC = 0,
+        REJECT_REPLICA = 1,
+        BLOCK_WRITES = 2,
+    };
+
+    /** Preferred source for client reads. */
+    enum class ReadConsistency : uint8_t {
+        PRIMARY = 0,
+        REPLICA_ANY = 1,
+        REPLICA_AT_LEAST = 2,
+        QUORUM = 3,
+    };
+
+    enum class RaftMembershipMode : uint8_t {
+        STATIC = 0,
+        JOINT_CONSENSUS = 1,
+    };
+
+    struct AKDB_API RaftMembershipOptions {
+        RaftMembershipMode mode = RaftMembershipMode::STATIC;
+        bool allowOnlineVoterChanges = false;
+        bool allowLearners = false;
+    };
+
+    struct AKDB_API RaftOptions {
+        RaftMembershipOptions membership;
+    };
+
+    /**
+     * Consistency controls persisted with the cluster configuration.
+     *
+     * The defaults deliberately retain the existing AckPolicy-based runtime
+     * behaviour.  The additional modes are configuration contracts for the
+     * stricter runtime paths; they are not silently mapped to a weaker policy.
+     * RAFT_QUORUM derives its write quorum from data-bearing membership and
+     * forces failed writes on acknowledgement timeout.
+     */
+    struct AKDB_API ConsistencyOptions {
+        ConsistencyMode mode = ConsistencyMode::PRIMARY_ACK;
+        WriteConsistency writeConsistency = WriteConsistency::LEGACY_ACK_POLICY;
+        AckTimeoutAction ackTimeoutAction = AckTimeoutAction::ACCEPT_LOCAL;
+        ReplicaLagAction replicaLagAction = ReplicaLagAction::ASYNC_RESYNC;
+        ReadConsistency readConsistency = ReadConsistency::PRIMARY;
+        uint32_t ackTimeoutMs = 5000;
+    };
+
     /**
      * NodeInfo - Persistent identity and connection endpoints for one node.
      */
@@ -151,7 +224,7 @@ namespace akkaradb::engine::cluster {
     class AKDB_API ClusterConfig {
         public:
             static constexpr uint32_t MAGIC = 0x35434B41; // "AKC5"
-            static constexpr uint16_t VERSION = 1;
+            static constexpr uint16_t VERSION = 3;
 
             ClusterConfig() = default;
 
@@ -161,7 +234,13 @@ namespace akkaradb::engine::cluster {
              * @throws std::invalid_argument if node ids, capabilities, mode, or
              *         acknowledgement policy are invalid.
              */
-            ClusterConfig(std::vector<NodeInfo> nodes, ReplicationMode mode, AckPolicy ackPolicy);
+            ClusterConfig(
+                std::vector<NodeInfo> nodes,
+                ReplicationMode mode,
+                AckPolicy ackPolicy,
+                ConsistencyOptions consistency = {},
+                RaftOptions raft = {}
+            );
 
             /**
              * Loads and validates a cluster config file.
@@ -188,6 +267,12 @@ namespace akkaradb::engine::cluster {
 
             /** Returns the configured replica acknowledgement policy. */
             [[nodiscard]] AckPolicy ackPolicy() const noexcept { return ackPolicy_; }
+
+            /** Returns the configured write, lag, and read consistency controls. */
+            [[nodiscard]] ConsistencyOptions consistency() const noexcept { return consistency_; }
+
+            /** Returns RAFT-specific configuration. */
+            [[nodiscard]] RaftOptions raft() const noexcept { return raft_; }
 
             /** Returns reserved config flags from the file header. */
             [[nodiscard]] uint16_t flags() const noexcept { return flags_; }
@@ -217,6 +302,8 @@ namespace akkaradb::engine::cluster {
             std::vector<NodeInfo> nodes_;
             ReplicationMode mode_ = ReplicationMode::STANDALONE;
             AckPolicy ackPolicy_{};
+            ConsistencyOptions consistency_{};
+            RaftOptions raft_{};
             uint16_t flags_ = 0;
     };
 } // namespace akkaradb::engine::cluster
