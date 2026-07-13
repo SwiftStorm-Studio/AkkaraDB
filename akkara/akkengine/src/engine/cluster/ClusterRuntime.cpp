@@ -9,6 +9,7 @@
 
 // akkengine/src/engine/cluster/ClusterRuntime.cpp
 #include "akk/engine/cluster/ClusterRuntime.hpp"
+#include "RaftConsensusRuntime.hpp"
 
 #include <array>
 #include <charconv>
@@ -83,6 +84,66 @@ namespace akkaradb::engine::cluster {
                 }
             }
         }
+
+        uint16_t configuredReplicaCount(const ClusterConfig& config, uint64_t selfNodeId) {
+            size_t count = 0;
+            for (const auto& node : config.nodes()) {
+                if (node.nodeId != selfNodeId && node.dataBearing()) { ++count; }
+            }
+            if (count > UINT16_MAX) { throw std::invalid_argument("ClusterRuntime: too many configured replicas"); }
+            return static_cast<uint16_t>(count);
+        }
+
+        uint16_t raftReplicaQuorum(const ClusterConfig& config, uint64_t selfNodeId) {
+            const auto* self = config.findById(selfNodeId);
+            if (self == nullptr || !self->dataBearing()) {
+                throw std::invalid_argument("ClusterRuntime: RAFT_QUORUM requires the primary node to be data-bearing");
+            }
+
+            size_t dataNodes = 0;
+            for (const auto& node : config.nodes()) {
+                if (node.dataBearing()) { ++dataNodes; }
+            }
+            if (dataNodes == 0) { throw std::invalid_argument("ClusterRuntime: RAFT_QUORUM requires data-bearing nodes"); }
+
+            const size_t majority = (dataNodes / 2) + 1;
+            const size_t replicaAcks = majority > 0 ? majority - 1 : 0;
+            if (replicaAcks > UINT16_MAX) { throw std::invalid_argument("ClusterRuntime: RAFT_QUORUM replica quorum is too large"); }
+            return static_cast<uint16_t>(replicaAcks);
+        }
+
+        AckPolicy effectiveAckPolicy(const ClusterConfig& config, uint64_t selfNodeId) {
+            const auto consistency = config.consistency();
+            const auto legacy = config.ackPolicy();
+            if (consistency.mode == ConsistencyMode::ASYNC) {
+                return AckPolicy{.mode = AckPolicyMode::NONE, .stage = legacy.stage};
+            }
+            if (consistency.mode == ConsistencyMode::RAFT_QUORUM) {
+                const uint16_t quorum = raftReplicaQuorum(config, selfNodeId);
+                if (quorum == 0) { return AckPolicy{.mode = AckPolicyMode::NONE, .stage = AckStage::DURABLE}; }
+                return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = AckStage::DURABLE, .quorum = quorum};
+            }
+            switch (consistency.writeConsistency) {
+                case WriteConsistency::LEGACY_ACK_POLICY: return legacy;
+                case WriteConsistency::LOCAL: return AckPolicy{.mode = AckPolicyMode::NONE, .stage = legacy.stage};
+                case WriteConsistency::ONE_REPLICA:
+                    return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = legacy.stage, .quorum = 1};
+                case WriteConsistency::QUORUM:
+                    return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = legacy.stage, .quorum = legacy.quorum};
+                case WriteConsistency::ALL_CONFIGURED:
+                    return AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = legacy.stage};
+            }
+            throw std::invalid_argument("ClusterRuntime: invalid write consistency");
+        }
+
+        ConsistencyOptions effectiveConsistency(const ClusterConfig& config) {
+            auto consistency = config.consistency();
+            if (consistency.mode == ConsistencyMode::RAFT_QUORUM) {
+                consistency.ackTimeoutAction = AckTimeoutAction::FAIL_WRITE;
+                consistency.readConsistency = ReadConsistency::QUORUM;
+            }
+            return consistency;
+        }
     } // namespace
 
     class ClusterRuntime::Impl {
@@ -96,13 +157,23 @@ namespace akkaradb::engine::cluster {
             )
                 : config_{std::move(config)},
                   router_{config_},
-                  manager_{ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions)},
                   selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
                   runtimeOptions_{std::move(runtimeOptions)} {
                 if (runtimeOptions_.transportMode == TransportMode::SECURE && runtimeOptions_.secure.identitySeedPath.empty() && !dbDir.
                     empty()) { runtimeOptions_.secure.identitySeedPath = dbDir / "cluster.identity"; }
                 validateTransportScope(config_, runtimeOptions_);
+                if (config_.consistency().mode == ConsistencyMode::RAFT_QUORUM) {
+                    raftRuntime_ = RaftConsensusRuntime::create(dbDir, config_, selfNodeId_, callbacks_, runtimeOptions_);
+                    return;
+                }
+                manager_ = ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions);
+                effectiveAckPolicy_ = effectiveAckPolicy(config_, selfNodeId_);
+                effectiveConsistency_ = effectiveConsistency(config_);
+                configuredReplicaCount_ = configuredReplicaCount(config_, selfNodeId_);
+                if (effectiveAckPolicy_.mode == AckPolicyMode::QUORUM && effectiveAckPolicy_.quorum > configuredReplicaCount_) {
+                    throw std::invalid_argument("ClusterRuntime: write quorum exceeds configured replica count");
+                }
                 manager_->setRoleChangeCallback(
                     [this](NodeRole role) {
                         installRole(role);
@@ -114,6 +185,10 @@ namespace akkaradb::engine::cluster {
             ~Impl() { close(); }
 
             void start() {
+                if (raftRuntime_) {
+                    raftRuntime_->start();
+                    return;
+                }
                 {
                     std::lock_guard lock{mutex_};
                     if (started_) { return; }
@@ -124,15 +199,19 @@ namespace akkaradb::engine::cluster {
             }
 
             void close() {
+                if (raftRuntime_) {
+                    raftRuntime_->close();
+                    return;
+                }
                 std::lock_guard lock{mutex_};
                 stopReplication();
                 manager_->close();
                 started_ = false;
             }
 
-            NodeRole role() const noexcept { return manager_->role(); }
+            NodeRole role() const noexcept { return raftRuntime_ ? raftRuntime_->role() : manager_->role(); }
 
-            const ClusterRouter& router() const noexcept { return router_; }
+            const ClusterRouter& router() const noexcept { return raftRuntime_ ? raftRuntime_->router() : router_; }
 
             void shipEntry(
                 uint64_t seq,
@@ -142,11 +221,19 @@ namespace akkaradb::engine::cluster {
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
             ) {
+                if (raftRuntime_) {
+                    raftRuntime_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId);
+                    return;
+                }
                 std::lock_guard lock{mutex_};
                 if (server_) { server_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
             }
 
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+                if (raftRuntime_) {
+                    raftRuntime_->shipBlob(seq, blobId, content);
+                    return;
+                }
                 std::lock_guard lock{mutex_};
                 if (server_) { server_->shipBlob(seq, blobId, content); }
             }
@@ -160,12 +247,51 @@ namespace akkaradb::engine::cluster {
                     const auto* self = config_.findById(selfNodeId_);
                     if (!self && !config_.isStandalone()) { throw std::runtime_error("ClusterRuntime: self node is missing from config"); }
                     const uint16_t replPort = self ? self->replPort : 0;
+                    ReplicationServer::HistoryProvider historyProvider;
+                    if (callbacks_.getEntries) {
+                        historyProvider = [getEntries = callbacks_.getEntries](uint64_t afterSeq, uint64_t throughSeq)
+                            -> std::optional<std::vector<ReplEntry>> {
+                                const auto history = getEntries(afterSeq, throughSeq);
+                                if (!history) { return std::nullopt; }
+                                std::vector<ReplEntry> entries;
+                                entries.reserve(history->size());
+                                for (const auto& entry : *history) {
+                                    entries.push_back(ReplEntry{
+                                        .seq = entry.seq,
+                                        .sourceNodeId = entry.sourceNodeId,
+                                        .op = static_cast<ReplOpType>(entry.op),
+                                        .recordFlags = entry.recordFlags,
+                                        .key = entry.key,
+                                        .value = entry.value,
+                                    });
+                                }
+                                return entries;
+                            };
+                    }
+                    ReplicationServer::SnapshotProvider snapshotProvider;
+                    if (callbacks_.exportSnapshot) {
+                        snapshotProvider = [exportSnapshot = callbacks_.exportSnapshot]() -> std::optional<ReplicationServer::Snapshot> {
+                            const auto source = exportSnapshot();
+                            if (!source) { return std::nullopt; }
+                            ReplicationServer::Snapshot snapshot;
+                            snapshot.seq = source->seq;
+                            snapshot.entries.reserve(source->entries.size());
+                            for (const auto& entry : source->entries) {
+                                snapshot.entries.push_back(ReplSnapshotEntry{.key = entry.key, .value = entry.value});
+                            }
+                            return snapshot;
+                        };
+                    }
                     server_ = ReplicationServer::create(
                         replPort,
                         selfNodeId_,
                         callbacks_.getCurrentSeq,
-                        config_.ackPolicy(),
-                        runtimeOptions_
+                        effectiveAckPolicy_,
+                        effectiveConsistency_,
+                        configuredReplicaCount_,
+                        runtimeOptions_,
+                        std::move(historyProvider),
+                        std::move(snapshotProvider)
                     );
                     server_->start();
                 }
@@ -177,10 +303,11 @@ namespace akkaradb::engine::cluster {
                         manager_->primaryReplPort(),
                         selfNodeId_,
                         callbacks_.getLastSeq,
-                        config_.ackPolicy(),
+                        effectiveAckPolicy_,
                         std::move(clientOptions)
                     );
                     client_->setApplyCallback(callbacks_.apply);
+                    client_->setSnapshotCallbacks(callbacks_.beginSnapshot, callbacks_.applySnapshotEntry, callbacks_.finishSnapshot);
                     client_->setForceDurableCallback(callbacks_.forceDurable);
                     client_->setBlobCallback(callbacks_.applyBlob);
                     client_->start();
@@ -201,9 +328,13 @@ namespace akkaradb::engine::cluster {
             ClusterConfig config_;
             ClusterRouter router_;
             std::unique_ptr<ClusterManager> manager_;
+            std::unique_ptr<RaftConsensusRuntime> raftRuntime_;
             uint64_t selfNodeId_;
             ClusterEngineCallbacks callbacks_;
             ClusterRuntimeOptions runtimeOptions_;
+            AckPolicy effectiveAckPolicy_;
+            ConsistencyOptions effectiveConsistency_;
+            uint16_t configuredReplicaCount_ = 0;
 
             mutable std::mutex mutex_;
             bool started_ = false;

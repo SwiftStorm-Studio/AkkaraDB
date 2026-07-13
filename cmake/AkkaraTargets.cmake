@@ -59,6 +59,7 @@ set(AKKENGINE_CLUSTER_RUNTIME_SOURCES
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRuntime.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterManager.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRouter.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/RaftConsensusRuntime.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ReplicationClient.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ReplicationServer.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ReplFraming.cpp"

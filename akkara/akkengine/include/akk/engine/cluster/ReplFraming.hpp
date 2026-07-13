@@ -32,10 +32,23 @@ namespace akkaradb::engine::cluster {
         ///< Replicated external blob payload.
         ACK = 0x12,
         ///< Replica acknowledgement for an Entry seq.
+        RESYNC_REQUIRED = 0x13,
+        ///< Primary cannot provide a contiguous retained history for this replica.
+        SNAPSHOT_BEGIN = 0x14,
+        SNAPSHOT_ENTRY = 0x15,
+        SNAPSHOT_END = 0x16,
         READ_REQUEST = 0x20,
         ///< Reserved point-in-time read request.
         READ_RESPONSE = 0x21,
         ///< Reserved point-in-time read response.
+        RAFT_REQUEST_VOTE = 0x30,
+        ///< Raft RequestVote RPC.
+        RAFT_REQUEST_VOTE_RESPONSE = 0x31,
+        ///< Raft RequestVote RPC response.
+        RAFT_APPEND_ENTRIES = 0x32,
+        ///< Raft AppendEntries RPC, including heartbeats.
+        RAFT_APPEND_ENTRIES_RESPONSE = 0x33,
+        ///< Raft AppendEntries RPC response.
     };
 
     /**
@@ -117,6 +130,16 @@ namespace akkaradb::engine::cluster {
         AckStage stage = AckStage::APPLIED; ///< Replication lifecycle stage reached for seq.
     };
 
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplSnapshotBegin {
+        uint64_t snapshotSeq = 0;
+        uint64_t entryCount = 0;
+    };
+
+    struct AKKARADB_CLUSTER_RUNTIME_API ReplSnapshotEntry {
+        std::vector<uint8_t> key;
+        std::vector<uint8_t> value;
+    };
+
     /** Reserved point-in-time read request payload. */
     struct AKKARADB_CLUSTER_RUNTIME_API ReadRequest {
         uint64_t requestId = 0;
@@ -163,6 +186,9 @@ namespace akkaradb::engine::cluster {
 
     /** Encodes a ReplAck frame. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeAck(const ReplAck& ack);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeSnapshotBegin(const ReplSnapshotBegin& begin);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeSnapshotEntry(const ReplSnapshotEntry& entry);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeSnapshotEnd(uint64_t snapshotSeq);
 
     /** Encodes a ReadRequest frame. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeReadRequest(const ReadRequest& request);
@@ -184,6 +210,9 @@ namespace akkaradb::engine::cluster {
 
     /** Decodes a ReplAck payload. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeAck(std::span<const uint8_t> payload, ReplAck& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeSnapshotBegin(std::span<const uint8_t> payload, ReplSnapshotBegin& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeSnapshotEntry(std::span<const uint8_t> payload, ReplSnapshotEntry& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeSnapshotEnd(std::span<const uint8_t> payload, uint64_t& snapshotSeq);
 
     /** Decodes a ReadRequest payload. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out);

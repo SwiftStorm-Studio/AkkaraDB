@@ -845,7 +845,7 @@ runtime responsibility inside non-standalone topologies. `Standalone` mode does 
 
 ### 12.4 Cluster Config
 
-Cluster config is stored as `{dataDir}/cluster.akcc` by default and uses magic `0x35434B41` ("AKC5"), version 1. It stores:
+Cluster config is stored as `{dataDir}/cluster.akcc` by default and uses magic `0x35434B41` ("AKC5"), version 2. Version 1 files remain readable and receive legacy consistency defaults. It stores:
 
 - node ids
 - host names advertised to peer nodes
@@ -854,6 +854,13 @@ Cluster config is stored as `{dataDir}/cluster.akcc` by default and uses magic `
 - node capabilities
 - replication mode
 - acknowledgement policy
+- consistency mode: `PRIMARY_ACK`, `ASYNC`, or `RAFT_QUORUM`. `PRIMARY_ACK` uses the primary-to-replica protocol below; `ASYNC` completes locally without waiting for replica ACKs; `RAFT_QUORUM` uses the dedicated Raft consensus runtime and requires a committed majority of data-bearing voters before the leader applies a write.
+- write consistency (`LEGACY_ACK_POLICY`, `LOCAL`, `ONE_REPLICA`, `QUORUM`, or `ALL_CONFIGURED`) applies only to `PRIMARY_ACK`. `ONE_REPLICA` and `QUORUM` derive an effective replica ACK rule; `QUORUM` uses `ackPolicy.quorum`. `ALL_CONFIGURED` counts configured data-bearing replicas even while disconnected. `RAFT_QUORUM` derives its quorum from data-bearing membership and forces `FAIL_WRITE` on acknowledgement timeout.
+- acknowledgement timeout action (`ACCEPT_LOCAL` or `FAIL_WRITE`) and timeout
+- replica-lag action (`ASYNC_RESYNC`, `REJECT_REPLICA`, or `BLOCK_WRITES`)
+- read consistency preference (`PRIMARY`, `REPLICA_ANY`, `REPLICA_AT_LEAST`, or `QUORUM`)
+
+Write acknowledgements are evaluated at the configured `AckStage`. `ackTimeoutMs` bounds the wait; `ACCEPT_LOCAL` completes after the timeout, while `FAIL_WRITE` reports the timeout to the caller. In `PRIMARY_ACK`, the storage engine appends locally before shipping, so `FAIL_WRITE` does not roll back that already durable local mutation; it means that the requested replica acknowledgement was not achieved. In `RAFT_QUORUM`, `ClusterRuntime` does not use the primary-to-replica acknowledgement server. It starts a Raft node, persists `currentTerm`, `votedFor`, log entries, and the commit index in `{dataDir}/cluster-raft.state` and `{dataDir}/cluster-raft.log`, elects a leader with RequestVote, replicates entries with AppendEntries, and only returns the write to the engine after a majority has accepted the entry and the leader has advanced commit. Followers apply committed entries through the same engine apply callback used by replication catch-up.
 
 Runtime-only TLS/transport paths and the local replication bind host are not serialized in the config file. They live in `ClusterRuntimeOptions`.
 The advertised `NodeInfo.host` is the address peers dial; `ClusterRuntimeOptions::replBindHost` is the local address the primary listener binds to, defaulting to `0.0.0.0`.
@@ -861,7 +868,9 @@ Replication links run over TCP. `TransportMode::SECURE` wraps the TCP stream wit
 
 ### 12.5 Startup Role Resolution
 
-There is no automatic primary election in the current runtime. For `Mirror` and `Stripe`, the process must start explicitly as either `PRIMARY` or `REPLICA`.
+For `PRIMARY_ACK` and `ASYNC`, there is no automatic primary election in the current runtime. For `Mirror` and `Stripe`, the process must start explicitly as either `PRIMARY` or `REPLICA`.
+
+For `RAFT_QUORUM`, `ClusterRuntimeOptions::startupRole`, `primaryNodeId`, `primaryHost`, and `primaryReplPort` are ignored. Each data-bearing node starts a Raft listener on its configured replication port. Coordinator-eligible data-bearing nodes may become candidates; all data-bearing nodes vote. The elected leader reports `NodeRole::PRIMARY`, followers and candidates report `NodeRole::REPLICA`, and writes submitted to a non-leader fail instead of being applied locally.
 
 `PRIMARY` startup requirements:
 
@@ -877,8 +886,7 @@ There is no automatic primary election in the current runtime. For `Mirror` and 
 - if `primaryNodeId` exists in the cluster config, missing `primaryHost` and `primaryReplPort` are filled from that config entry
 - if the configured primary node is found in the config, it must be `coordinatorEligible()`
 
-Runtime startup fails fast with `std::runtime_error` when these requirements are not met. This is intentional: split-brain-safe failover, quorum leader election,
-and automatic primary re-selection are out of scope for the current cluster layer.
+Runtime startup fails fast with `std::runtime_error` when these requirements are not met.
 
 Changing the primary for non-mirrored ownership still requires an explicit migration plan. The new primary must not retain unrelated user data, and owned data must
 be moved back to the node selected by the placement policy before traffic is accepted.
