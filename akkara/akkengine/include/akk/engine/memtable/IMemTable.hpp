@@ -23,6 +23,19 @@
 using namespace akkaradb::core;
 
 namespace akkaradb::engine::memtable {
+    enum class MutableScanMode : uint8_t {
+        // Reconcile a mutable backend's scan before exposing records.
+        RECONCILE = 0,
+        // Stream ordered records while restarting structural traversal as needed.
+        STREAMING_RESTART = 1,
+    };
+
+    struct MemTableBackendOptions {
+        // BPTree uses this to select mutable scan behavior. SkipList and ART
+        // already provide stable ordered traversal, so it is intentionally a no-op there.
+        MutableScanMode mutableScanMode = MutableScanMode::RECONCILE;
+    };
+
     /**
      * @brief Abstract interface for pluggable MemTable implementations.
      *

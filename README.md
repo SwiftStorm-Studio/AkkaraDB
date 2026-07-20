@@ -2,6 +2,10 @@
 
 AkkaraDB is a low-latency embedded key-value database for C++ and Kotlin/JVM applications. It gives you a native storage engine with WAL-backed durability, LSM-based persistence, typed C++ tables, and optional server backends when you need HTTP, TCP, or gRPC access.
 
+## Documentation(ドキュメントはこちら)
+
+Current documentation is published at [docs.swiftstorm.dev/akkaradb-native](https://docs.swiftstorm.dev/akkaradb-native/). The repository keeps implementation code, benchmarks, and concise build instructions only.
+
 ## What You Can Use
 
 Choose the entry point that matches your application:
@@ -92,10 +96,6 @@ opts.paths.dataDir = "data";
 auto engine = akkaradb::engine::AkkEngine::open(std::move(opts));
 engine->put(bytes("user:1"), bytes("Alice"));
 ```
-
-## Documentation
-
-Current documentation is published at [docs.swiftstorm.dev/akkaradb-native](https://docs.swiftstorm.dev/akkaradb-native/). The repository keeps implementation code, benchmarks, and concise build instructions only.
 
 ## Repository Map
 

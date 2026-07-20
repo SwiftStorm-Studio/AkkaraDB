@@ -12,16 +12,21 @@
 
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterRuntime.hpp"
+#include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include "akk/engine/cluster/ReplicationServer.hpp"
+#include "akk/engine/erasure/ErasureCodec.hpp"
+#include "akk/engine/erasure/ErasureCodecExt.hpp"
 
 #include <array>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -31,6 +36,7 @@
 #include <vector>
 
 using namespace akkaradb::engine::cluster;
+namespace erasure = akkaradb::engine::erasure;
 
 extern "C" bool akkaradb_cluster_register() noexcept;
 
@@ -78,6 +84,39 @@ namespace {
 
     std::string textOf(std::span<const uint8_t> value) {
         return {reinterpret_cast<const char*>(value.data()), value.size()};
+    }
+
+    uint64_t nextPrng(uint64_t& state) noexcept {
+        state = state * 6364136223846793005ull + 1442695040888963407ull;
+        return state;
+    }
+
+    std::vector<uint8_t> deterministicBytes(size_t size, uint64_t seed) {
+        std::vector<uint8_t> out(size);
+        uint64_t state = seed;
+        for (auto& byte : out) { byte = static_cast<uint8_t>(nextPrng(state) >> 56u); }
+        return out;
+    }
+
+    std::vector<erasure::ErasureShard> selectShards(
+        const std::vector<erasure::ErasureShard>& shards,
+        erasure::ErasureLayout layout,
+        uint64_t seed
+    ) {
+        std::vector<uint16_t> indices;
+        indices.reserve(shards.size());
+        for (uint16_t i = 0; i < layout.totalShards(); ++i) { indices.push_back(i); }
+
+        uint64_t state = seed;
+        for (size_t i = indices.size(); i > 1; --i) {
+            const size_t j = static_cast<size_t>(nextPrng(state) % i);
+            std::swap(indices[i - 1], indices[j]);
+        }
+
+        std::vector<erasure::ErasureShard> selected;
+        selected.reserve(layout.dataShards);
+        for (uint16_t i = 0; i < layout.dataShards; ++i) { selected.push_back(shards[indices[i]]); }
+        return selected;
     }
 
     template <typename Predicate>
@@ -220,6 +259,321 @@ namespace {
             rejected = true;
         }
         AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testPartitionedAndStripeRouting() {
+        const ClusterConfig partitioned{
+            {
+                node(1, 20301, 20401),
+                node(2, 20302, 20402),
+                node(3, 20303, 20403),
+            },
+            ReplicationMode::PARTITIONED,
+            AckPolicy{},
+        };
+        ClusterRouter partitionedRouter{partitioned};
+        const auto partitionedTargets = partitionedRouter.writeTargets(bytesOf("partitioned-key"));
+        AKK_CLUSTER_CHECK(partitionedTargets.size() == 1);
+
+        StripeOptions stripeOptions;
+        stripeOptions.dataShards = 3;
+        stripeOptions.parityShards = 2;
+        const ClusterConfig stripe{
+            {
+                node(1, 20311, 20411),
+                node(2, 20312, 20412),
+                node(3, 20313, 20413),
+                node(4, 20314, 20414),
+                node(5, 20315, 20415),
+            },
+            ReplicationMode::STRIPE,
+            AckPolicy{},
+            {},
+            {},
+            stripeOptions,
+        };
+        ClusterRouter stripeRouter{stripe};
+        const auto shardTargets = stripeRouter.stripeShardTargets(bytesOf("stripe-key"));
+        AKK_CLUSTER_CHECK(shardTargets.size() == 5);
+        std::vector<uint64_t> nodeIds;
+        for (size_t i = 0; i < shardTargets.size(); ++i) {
+            AKK_CLUSTER_CHECK(shardTargets[i].shardIndex == i);
+            nodeIds.push_back(shardTargets[i].node.nodeId);
+        }
+        std::sort(nodeIds.begin(), nodeIds.end());
+        AKK_CLUSTER_CHECK(std::adjacent_find(nodeIds.begin(), nodeIds.end()) == nodeIds.end());
+
+        const auto dir = makeTempDir("stripe-config");
+        const auto path = dir / "cluster.cfg";
+        ClusterConfig::save(path, stripe);
+        const auto loaded = ClusterConfig::load(path);
+        AKK_CLUSTER_CHECK(loaded.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 3);
+        AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
+    }
+
+    void testStripeErasureCodecRecovery() {
+        const std::string value = "AkkaraDB parity stripe recovery across missing shards";
+        const erasure::ErasureLayout layout{.dataShards = 4, .parityShards = 2};
+        auto shards = erasure::RsErasureCodec::encode(bytesOf(value), layout);
+        AKK_CLUSTER_CHECK(shards.size() == 6);
+
+        for (size_t a = 0; a < shards.size(); ++a) {
+            for (size_t b = a + 1; b < shards.size(); ++b) {
+                for (size_t c = b + 1; c < shards.size(); ++c) {
+                    for (size_t d = c + 1; d < shards.size(); ++d) {
+                        std::vector<erasure::ErasureShard> available{shards[a], shards[b], shards[c], shards[d]};
+                        const auto recovered = erasure::RsErasureCodec::decode(available, layout);
+                        AKK_CLUSTER_CHECK(textOf(recovered) == value);
+                    }
+                }
+            }
+        }
+
+        for (uint16_t missingIndex = 0; missingIndex < layout.totalShards(); ++missingIndex) {
+            std::vector<erasure::ErasureShard> availableForRepair;
+            availableForRepair.reserve(shards.size() - 1);
+            for (const auto& shard : shards) {
+                if (shard.index != missingIndex) { availableForRepair.push_back(shard); }
+            }
+            const auto repairedShard = erasure::RsErasureCodec::repairOne(missingIndex, availableForRepair, layout);
+            AKK_CLUSTER_CHECK(repairedShard.index == missingIndex);
+            AKK_CLUSTER_CHECK(repairedShard.originalSize == shards[missingIndex].originalSize);
+            AKK_CLUSTER_CHECK(repairedShard.payload == shards[missingIndex].payload);
+            AKK_CLUSTER_CHECK(repairedShard.crc32c == shards[missingIndex].crc32c);
+        }
+        const auto repairedParityWithMissingData =
+            erasure::RsErasureCodec::repairOne(4, std::vector<erasure::ErasureShard>{shards[0], shards[2], shards[3], shards[5]}, layout);
+        AKK_CLUSTER_CHECK(repairedParityWithMissingData.index == 4);
+        AKK_CLUSTER_CHECK(repairedParityWithMissingData.payload == shards[4].payload);
+        AKK_CLUSTER_CHECK(repairedParityWithMissingData.crc32c == shards[4].crc32c);
+
+        const std::string cauchyValue = "AkkaraDB Cauchy RS matrix regression";
+        const erasure::ErasureLayout cauchyLayout{.dataShards = 3, .parityShards = 4};
+        const auto cauchyShards = erasure::RsErasureCodec::encode(bytesOf(cauchyValue), cauchyLayout);
+        for (size_t a = 0; a < cauchyShards.size(); ++a) {
+            for (size_t b = a + 1; b < cauchyShards.size(); ++b) {
+                for (size_t c = b + 1; c < cauchyShards.size(); ++c) {
+                    std::vector<erasure::ErasureShard> available{cauchyShards[a], cauchyShards[b], cauchyShards[c]};
+                    const auto recovered = erasure::RsErasureCodec::decode(available, cauchyLayout);
+                    AKK_CLUSTER_CHECK(textOf(recovered) == cauchyValue);
+                }
+            }
+        }
+
+        const auto assertBoundaryRoundTrip = [](const std::vector<uint8_t>& payload) {
+            const erasure::ErasureLayout boundaryLayout{.dataShards = 4, .parityShards = 2};
+            const auto encoded = erasure::RsErasureCodec::encode(std::span<const uint8_t>{payload.data(), payload.size()}, boundaryLayout);
+            AKK_CLUSTER_CHECK(encoded.size() == boundaryLayout.totalShards());
+            const auto decoded = erasure::RsErasureCodec::decode(
+                std::vector<erasure::ErasureShard>{encoded[0], encoded[2], encoded[3], encoded[5]},
+                boundaryLayout
+            );
+            AKK_CLUSTER_CHECK(decoded == payload);
+        };
+        assertBoundaryRoundTrip({});
+        assertBoundaryRoundTrip({0xA5});
+        assertBoundaryRoundTrip({0, 1, 2, 3, 4, 5, 6, 7});
+        assertBoundaryRoundTrip({0, 1, 2, 3, 4, 5, 6, 7, 8});
+        AKK_CLUSTER_CHECK(erasure::RsErasureCodec::shardPayloadSize(std::numeric_limits<uint64_t>::max(), 2) ==
+                          (std::numeric_limits<uint64_t>::max() / 2u) + 1u);
+
+        const auto repaired = erasure::RsErasureCodec::repairOne(1, std::vector<erasure::ErasureShard>{shards[0], shards[2], shards[3], shards[4]}, layout);
+        AKK_CLUSTER_CHECK(repaired.index == 1);
+        AKK_CLUSTER_CHECK(repaired.payload == shards[1].payload);
+        AKK_CLUSTER_CHECK(repaired.crc32c == shards[1].crc32c);
+
+        auto corrupted = shards;
+        corrupted[0].payload[0] ^= 0x7Fu;
+        bool crcRejected = false;
+        try {
+            (void)erasure::RsErasureCodec::decode(std::vector<erasure::ErasureShard>{corrupted[0], corrupted[1], corrupted[2], corrupted[3]}, layout);
+        }
+        catch (const std::runtime_error&) {
+            crcRejected = true;
+        }
+        AKK_CLUSTER_CHECK(crcRejected);
+
+        std::vector<erasure::ErasureShard> available{shards[0], shards[2], shards[4]};
+        bool rejected = false;
+        try {
+            (void)erasure::RsErasureCodec::decode(available, layout);
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testRsErasureCodecProperties() {
+        const auto runDecodeSample = [](erasure::ErasureLayout layout, size_t payloadSize, uint64_t seed) {
+            const auto payload = deterministicBytes(payloadSize, seed);
+            const auto shards = erasure::RsErasureCodec::encode(std::span<const uint8_t>{payload.data(), payload.size()}, layout);
+            const auto selected = selectShards(shards, layout, seed ^ 0x9E3779B97F4A7C15ull);
+            const auto decoded = erasure::RsErasureCodec::decode(selected, layout);
+            AKK_CLUSTER_CHECK(decoded == payload);
+        };
+
+        const auto runFullCombinationDecode = [](erasure::ErasureLayout layout, size_t payloadSize, uint64_t seed) {
+            const auto payload = deterministicBytes(payloadSize, seed);
+            const auto shards = erasure::RsErasureCodec::encode(std::span<const uint8_t>{payload.data(), payload.size()}, layout);
+
+            std::vector<uint16_t> picked;
+            picked.reserve(layout.dataShards);
+            const auto walk = [&](auto&& self, uint16_t offset) -> void {
+                if (picked.size() == layout.dataShards) {
+                    std::vector<erasure::ErasureShard> selected;
+                    selected.reserve(layout.dataShards);
+                    for (const auto index : picked) { selected.push_back(shards[index]); }
+                    const auto decoded = erasure::RsErasureCodec::decode(selected, layout);
+                    AKK_CLUSTER_CHECK(decoded == payload);
+                    return;
+                }
+
+                const auto remaining = static_cast<uint16_t>(layout.dataShards - picked.size());
+                for (uint16_t i = offset; i + remaining <= layout.totalShards(); ++i) {
+                    picked.push_back(i);
+                    self(self, static_cast<uint16_t>(i + 1u));
+                    picked.pop_back();
+                }
+            };
+            walk(walk, 0);
+        };
+
+        runFullCombinationDecode({.dataShards = 2, .parityShards = 1}, 17, 0x2001);
+        runFullCombinationDecode({.dataShards = 2, .parityShards = 3}, 31, 0x2002);
+        runFullCombinationDecode({.dataShards = 3, .parityShards = 4}, 43, 0x2003);
+        runFullCombinationDecode({.dataShards = 4, .parityShards = 4}, 71, 0x2004);
+        runFullCombinationDecode({.dataShards = 6, .parityShards = 3}, 97, 0x2005);
+
+        const std::array sampledLayouts{
+            erasure::ErasureLayout{.dataShards = 8, .parityShards = 4},
+            erasure::ErasureLayout{.dataShards = 10, .parityShards = 6},
+            erasure::ErasureLayout{.dataShards = 16, .parityShards = 8},
+            erasure::ErasureLayout{.dataShards = 32, .parityShards = 8},
+            erasure::ErasureLayout{.dataShards = 64, .parityShards = 16},
+        };
+
+        for (size_t layoutIndex = 0; layoutIndex < sampledLayouts.size(); ++layoutIndex) {
+            const auto sampledLayout = sampledLayouts[layoutIndex];
+            for (uint64_t sample = 0; sample < 32; ++sample) {
+                runDecodeSample(sampledLayout, 128 + layoutIndex * 31 + static_cast<size_t>(sample * 7), 0x5000 + layoutIndex * 257 + sample);
+            }
+
+            const auto payload = deterministicBytes(256 + layoutIndex * 17, 0x7000 + layoutIndex);
+            const auto shards = erasure::RsErasureCodec::encode(std::span<const uint8_t>{payload.data(), payload.size()}, sampledLayout);
+            for (const uint16_t missingIndex : {
+                     uint16_t{0},
+                     static_cast<uint16_t>(sampledLayout.dataShards - 1u),
+                     sampledLayout.dataShards,
+                     static_cast<uint16_t>(sampledLayout.totalShards() - 1u),
+                 }) {
+                std::vector<erasure::ErasureShard> available;
+                available.reserve(shards.size() - 1);
+                for (const auto& shard : shards) {
+                    if (shard.index != missingIndex) { available.push_back(shard); }
+                }
+                const auto repaired = erasure::RsErasureCodec::repairOne(missingIndex, available, sampledLayout);
+                AKK_CLUSTER_CHECK(repaired.index == missingIndex);
+                AKK_CLUSTER_CHECK(repaired.payload == shards[missingIndex].payload);
+                AKK_CLUSTER_CHECK(repaired.crc32c == shards[missingIndex].crc32c);
+            }
+        }
+    }
+
+    void testErsCodecRecovery() {
+        const auto containsIndex = [](const std::vector<uint16_t>& indices, uint16_t expected) {
+            return std::find(indices.begin(), indices.end(), expected) != indices.end();
+        };
+        const auto containsShard = [](const std::vector<erasure::ErasureShard>& shards, const erasure::ErasureShard& expected) {
+            return std::find_if(
+                       shards.begin(),
+                       shards.end(),
+                       [&expected](const erasure::ErasureShard& shard) {
+                           return shard.index == expected.index &&
+                                  shard.originalSize == expected.originalSize &&
+                                  shard.payload == expected.payload &&
+                                  shard.crc32c == expected.crc32c;
+                       }
+                   ) != shards.end();
+        };
+
+        const std::string value = "AkkaraDB ERS corruption and erasure recovery";
+        const erasure::ErasureLayout layout{.dataShards = 4, .parityShards = 3};
+        const auto shards = erasure::ErsCodec::encode(bytesOf(value), layout);
+
+        {
+            std::vector<erasure::ErasureShard> missing{shards[0], shards[1], shards[3], shards[4], shards[6]};
+            const auto recovered = erasure::ErsCodec::recover(missing, layout);
+            AKK_CLUSTER_CHECK(textOf(recovered.value) == value);
+            AKK_CLUSTER_CHECK(recovered.missingIndices.size() == 2);
+            AKK_CLUSTER_CHECK(containsIndex(recovered.missingIndices, 2));
+            AKK_CLUSTER_CHECK(containsIndex(recovered.missingIndices, 5));
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices.empty());
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[2]));
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[5]));
+        }
+
+        {
+            auto corrupted = shards;
+            corrupted[1].payload[0] ^= 0x33u;
+            const auto recovered = erasure::ErsCodec::recover(corrupted, layout);
+            AKK_CLUSTER_CHECK(textOf(recovered.value) == value);
+            AKK_CLUSTER_CHECK(recovered.missingIndices.empty());
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices.size() == 1);
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices[0] == 1);
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[1]));
+        }
+
+        {
+            auto suspicious = shards;
+            suspicious[4].payload[0] ^= 0x55u;
+            const std::array<uint16_t, 1> knownBad{4};
+            const auto recovered = erasure::ErsCodec::recover(suspicious, layout, knownBad);
+            AKK_CLUSTER_CHECK(textOf(recovered.value) == value);
+            AKK_CLUSTER_CHECK(recovered.missingIndices.empty());
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices.size() == 1);
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices[0] == 4);
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[4]));
+        }
+
+        {
+            auto corrupted = shards;
+            corrupted[0].payload[0] ^= 0x11u;
+            corrupted[5].payload[0] ^= 0x22u;
+            const auto recovered = erasure::ErsCodec::recover(corrupted, layout);
+            AKK_CLUSTER_CHECK(textOf(recovered.value) == value);
+            AKK_CLUSTER_CHECK(recovered.detectedErrorIndices.size() == 2);
+            AKK_CLUSTER_CHECK(containsIndex(recovered.detectedErrorIndices, 0));
+            AKK_CLUSTER_CHECK(containsIndex(recovered.detectedErrorIndices, 5));
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[0]));
+            AKK_CLUSTER_CHECK(containsShard(recovered.repairedShards, shards[5]));
+        }
+
+        {
+            std::vector<erasure::ErasureShard> insufficient{shards[0], shards[2], shards[4], shards[6]};
+            bool rejected = false;
+            try {
+                const std::array<uint16_t, 1> knownBad{0};
+                (void)erasure::ErsCodec::recover(insufficient, layout, knownBad);
+            }
+            catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            AKK_CLUSTER_CHECK(rejected);
+        }
+
+        {
+            bool rejected = false;
+            try {
+                const std::array<uint16_t, 1> knownBad{layout.totalShards()};
+                (void)erasure::ErsCodec::recover(shards, layout, knownBad);
+            }
+            catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            AKK_CLUSTER_CHECK(rejected);
+        }
     }
 
     void testRaftElectionAndLoopbackReplication() {
@@ -583,6 +937,10 @@ int main() {
         akkaradb::test::installMsvcTestErrorHandlers();
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
         testRaftOptionsRoundtripAndValidation();
+        testPartitionedAndStripeRouting();
+        testStripeErasureCodecRecovery();
+        testRsErasureCodecProperties();
+        testErsCodecRecovery();
         testRaftElectionAndLoopbackReplication();
         testRaftSnapshotInstallForCompactedFollower();
         testRaftLeaderTransfer();

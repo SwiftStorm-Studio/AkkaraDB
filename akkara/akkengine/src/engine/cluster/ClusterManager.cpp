@@ -115,7 +115,7 @@ namespace akkaradb::engine::cluster {
                         setRole(NodeRole::REPLICA);
                         return;
                     case NodeStartupRole::AUTO: default: throw std::runtime_error(
-                            "ClusterManager: explicit startup role is required for MIRROR/STRIPE modes (PRIMARY or REPLICA)"
+                            "ClusterManager: explicit startup role is required for non-standalone modes (PRIMARY or REPLICA)"
                         );
                 }
             }

@@ -26,11 +26,17 @@ namespace akkaradb::engine::cluster {
      *
      * The router is a pure, in-memory view over ClusterConfig.  It does not
      * perform I/O and does not observe runtime health.  Mirror mode returns all
-     * data-bearing nodes; Stripe mode returns the deterministic rendezvous-hash
-     * owner for the key.
+     * data-bearing nodes; Partitioned mode returns the deterministic
+     * rendezvous-hash owner for the key.  Stripe mode returns the nodes that
+     * hold erasure-coded data and parity shards for the key.
      */
     class AKKARADB_CLUSTER_RUNTIME_API ClusterRouter {
         public:
+            struct StripeShardTarget {
+                uint16_t shardIndex = 0;
+                NodeInfo node;
+            };
+
             /**
              * Builds a router from a validated cluster config.
              *
@@ -57,9 +63,17 @@ namespace akkaradb::engine::cluster {
              */
             [[nodiscard]] std::vector<NodeInfo> readCandidates(std::span<const uint8_t> key) const;
 
+            /**
+             * Returns the ordered data/parity shard placement for Stripe mode.
+             *
+             * Shard indexes [0, dataShards) are data shards; the following
+             * parityShards indexes are parity shards.
+             */
+            [[nodiscard]] std::vector<StripeShardTarget> stripeShardTargets(std::span<const uint8_t> key) const;
+
         private:
-            /** Returns the rendezvous-hash owner for key in Stripe mode. */
-            [[nodiscard]] NodeInfo stripeTarget(std::span<const uint8_t> key) const;
+            /** Returns the rendezvous-hash owner for key in Partitioned mode. */
+            [[nodiscard]] NodeInfo partitionTarget(std::span<const uint8_t> key) const;
 
             ClusterConfig config_;
             std::vector<NodeInfo> dataNodes_;

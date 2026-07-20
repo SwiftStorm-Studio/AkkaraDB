@@ -31,6 +31,9 @@ add_custom_target(akkaradb_prepare_diskspd
 add_executable(akkaradb_benchmark
         benchmarks/suite/benchmark.cpp
 )
+add_executable(akkaradb_parallel_memtable_visibility_rate_benchmark
+        benchmarks/throughput/parallel_memtable_visibility_rate_benchmark.cpp
+)
 if (MSVC)
     target_compile_options(akkaradb_benchmark PRIVATE /WX-)
 else ()
@@ -41,12 +44,21 @@ else ()
     endif ()
 endif ()
 target_link_libraries(akkaradb_benchmark PRIVATE akkaradb)
+target_link_libraries(akkaradb_parallel_memtable_visibility_rate_benchmark PRIVATE akkaradb)
 target_include_directories(akkaradb_benchmark PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
         ${AKKENGINE_INCLUDE_DIR}
 )
+target_include_directories(akkaradb_parallel_memtable_visibility_rate_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
 set_target_properties(akkaradb_benchmark PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+set_target_properties(akkaradb_parallel_memtable_visibility_rate_benchmark PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -99,10 +111,16 @@ endif ()
 
 set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_memtable_throughput_benchmark|benchmarks/throughput/memtable_throughput_benchmark.cpp
+        akkaradb_akkengine_bptree_put_benchmark|benchmarks/throughput/akkengine_bptree_put_benchmark.cpp
         akkaradb_wal_throughput_benchmark|benchmarks/throughput/wal_throughput_benchmark.cpp
         akkaradb_sstable_throughput_benchmark|benchmarks/throughput/sstable_throughput_benchmark.cpp
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
+        akkaradb_memtable_lifecycle_smoke_test|benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
+        akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
+        akkaradb_engine_recovery_smoke_test|benchmarks/smoke/engine_recovery_smoke_test.cpp
+        akkaradb_wal_async_failure_smoke_test|benchmarks/smoke/wal_async_failure_smoke_test.cpp
+        akkaradb_sst_snapshot_visibility_smoke_test|benchmarks/smoke/sst_snapshot_visibility_smoke_test.cpp
 )
 
 foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
@@ -156,6 +174,11 @@ endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_cluster_smoke_test
+        akkaradb_memtable_lifecycle_smoke_test
+        akkaradb_parallel_memtable_visibility_smoke_test
+        akkaradb_engine_recovery_smoke_test
+        akkaradb_wal_async_failure_smoke_test
+        akkaradb_sst_snapshot_visibility_smoke_test
 )
 list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 

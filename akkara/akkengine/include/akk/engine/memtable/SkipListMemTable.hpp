@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <new>
 #include <span>
 #include <vector>
 
@@ -30,11 +31,15 @@ namespace akkaradb::engine::memtable {
             static constexpr uint8_t MAX_LEVEL = 12;
             static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;
 
+            // The enclosing MemTable serializes put() and freeze() per shard.
+            // get() and iterator() are safe concurrently with that single writer.
+
             explicit SkipListMemTable(
                 size_t dataArenaInitialBlockSize = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
                 size_t dataArenaMaxBlockSize = core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
                 size_t generatorArenaInitialBlockSize = 64 * 1024,
-                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024
+                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024,
+                MemTableBackendOptions backendOptions = {}
             );
 
             [[nodiscard]] Status put(
@@ -53,19 +58,34 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] size_t entryCount() const override;
 
         private:
-            struct VersionSlot {
-                std::atomic<const core::OwnedRecord*> record{nullptr};
-            };
-
-            struct Node {
+            struct VersionChain {
                 std::atomic<uint64_t> version{0};
                 std::atomic<uint8_t> head{0};
                 std::atomic<uint8_t> count{0};
+                std::array<std::atomic<const core::OwnedRecord*>, MAX_VERSIONS_PER_KEY> ring{};
+            };
+
+            struct Node {
                 uint8_t level{1};
                 const core::OwnedRecord* keyRecord{nullptr};
-                std::array<std::atomic<Node*>, MAX_LEVEL> next{};
-                std::array<VersionSlot, MAX_VERSIONS_PER_KEY> ring{};
+                VersionChain* versions{nullptr};
+
+                Node(uint8_t nodeLevel, const core::OwnedRecord* key, VersionChain* chain) noexcept
+                    : level{nodeLevel}, keyRecord{key}, versions{chain} {}
+
+                [[nodiscard]] std::atomic<Node*>* nextSlots() noexcept {
+                    return std::launder(reinterpret_cast<std::atomic<Node*>*>(this + 1));
+                }
+
+                [[nodiscard]] const std::atomic<Node*>* nextSlots() const noexcept {
+                    return std::launder(reinterpret_cast<const std::atomic<Node*>*>(this + 1));
+                }
+
+                [[nodiscard]] std::atomic<Node*>& nextAt(uint8_t index) noexcept { return nextSlots()[index]; }
+                [[nodiscard]] const std::atomic<Node*>& nextAt(uint8_t index) const noexcept { return nextSlots()[index]; }
             };
+
+            static_assert(alignof(Node) >= alignof(std::atomic<Node*>));
 
             core::BufferArena dataArena_;
             mutable core::BufferArena generatorArena_;
@@ -82,6 +102,7 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] uint8_t randomLevel() noexcept;
 
             [[nodiscard]] Node* newNode(const core::OwnedRecord* initialRecord, uint8_t level);
+            [[nodiscard]] VersionChain* makeChain(const core::OwnedRecord* initialRecord);
             [[nodiscard]] core::OwnedRecord* makeRecord(
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
@@ -92,20 +113,25 @@ namespace akkaradb::engine::memtable {
             );
 
             [[nodiscard]] static int compareNodeKey(const Node* node, std::span<const uint8_t> key) noexcept;
-            [[nodiscard]] Node* findNode(
+            [[nodiscard]] Node* findNodeForWrite(
                 std::span<const uint8_t> key,
-                std::array<Node*, MAX_LEVEL>* update,
-                bool writerFastPath
+                std::array<Node*, MAX_LEVEL>& update
+            ) noexcept;
+            [[nodiscard]] Node* findNodeForRead(
+                std::span<const uint8_t> key
             ) const noexcept;
 
-            [[nodiscard]] bool visibleRecord(const Node* node, uint64_t snapshotSeq, RecordView* out) const noexcept;
+            static void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
+            [[nodiscard]] static bool visibleRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;
+            [[nodiscard]] static bool visibleFrozenRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;
             [[nodiscard]] static RecordView toView(const core::OwnedRecord& record) noexcept;
 
-            [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshot(uint64_t snapshotSeq) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshot(uint64_t snapshotSeq, bool frozen) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshotRange(
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,
-                std::vector<uint8_t> endKey
+                std::vector<uint8_t> endKey,
+                bool frozen
             ) const;
     };
 } // namespace akkaradb::engine::memtable

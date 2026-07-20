@@ -25,18 +25,35 @@
 #include "akk/engine/memtable/IMemTable.hpp"
 
 namespace akkaradb::engine::memtable {
+    enum class MemTableFlushMode : uint8_t {
+        AUTO = 0,
+        BYTES_PER_SHARD = 1,
+        MANUAL_ONLY = 2,
+    };
+
     class AKDB_API MemTable {
         public:
             using RecordView = core::RecordView;
             using FlushCallback = std::function<void(std::span<const RecordView>)>;
             using MemTableFactory = std::function<std::unique_ptr<IMemTable>()>;
+            using ConfiguredMemTableFactory = std::function<std::unique_ptr<IMemTable>(const MemTableBackendOptions&)>;
 
             struct Options {
+                // Physical write/read partitioning. 0 selects a writer-count based shard count.
                 size_t shardCount = 0;
                 size_t expectedConcurrentWriters = 0;
                 size_t autoShardCountCap = 128;
+                // Controls active MemTable rotation into immutable tables.
+                // AUTO maps to BYTES_PER_SHARD when thresholdBytesPerShard > 0, otherwise MANUAL_ONLY.
+                MemTableFlushMode flushMode = MemTableFlushMode::AUTO;
                 size_t thresholdBytesPerShard = 64ULL * 1024 * 1024;
+                // Backend construction policy. BPTree uses mutableScanMode;
+                // SkipList and ART accept it as a no-op.
+                MemTableBackendOptions backendOptions{};
+                // Physical in-memory index implementation and optional immutable flush sink.
+                // backendFactoryWithOptions takes precedence when supplied.
                 MemTableFactory backendFactory = nullptr;
+                ConfiguredMemTableFactory backendFactoryWithOptions = nullptr;
                 FlushCallback onFlush = nullptr;
             };
 
@@ -52,6 +69,7 @@ namespace akkaradb::engine::memtable {
                 uint64_t putsApplied = 0;
                 uint64_t removesApplied = 0;
                 uint64_t flushesCompleted = 0;
+                uint64_t immutableTables = 0;
             };
 
             class AKDB_API RangeIterator {
@@ -65,6 +83,7 @@ namespace akkaradb::engine::memtable {
 
                     [[nodiscard]] bool hasNext() const noexcept;
                     [[nodiscard]] std::optional<RecordView> next() noexcept;
+                    [[nodiscard]] uint64_t snapshotSeq() const noexcept;
 
                 private:
                     friend class MemTable;
@@ -104,6 +123,12 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const;
 
             [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshotSeq) const;
+            // Acquires all shard read locks before invoking snapshotSeqProvider.
+            // The returned iterator retains those locks until it is destroyed.
+            [[nodiscard]] RangeIterator pinnedIterator(
+                const KeyRange& range,
+                const std::function<uint64_t()>& snapshotSeqProvider
+            ) const;
 
             [[nodiscard]] uint64_t nextSeq() noexcept;
             [[nodiscard]] uint64_t reserveSeq(uint64_t count);
@@ -111,6 +136,8 @@ namespace akkaradb::engine::memtable {
 
             void flushHint();
             void forceFlush();
+            // Rethrows the first asynchronous immutable-flush failure, if any.
+            void throwIfFlushFailed() const;
             void setFlushCallback(const FlushCallback& cb);
 
             [[nodiscard]] size_t approxSize() const noexcept;

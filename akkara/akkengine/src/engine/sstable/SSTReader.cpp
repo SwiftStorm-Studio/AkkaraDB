@@ -182,7 +182,7 @@ namespace akkaradb::engine::sst {
                 return compareBytes(firstKey_, key) <= 0 && compareBytes(key, lastKey_) <= 0;
             }
 
-            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const {
+            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
                 if (!keyInRange(key)) { return std::nullopt; }
                 const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
                 const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
@@ -191,10 +191,12 @@ namespace akkaradb::engine::sst {
                 if (!blockIndex.has_value()) { return std::nullopt; }
                 const auto block = loadBlock(*blockIndex);
                 if (!block) { return std::nullopt; }
-                return findInBlock(*block, key, fp, mini, true);
+                auto rec = findInBlock(*block, key, fp, mini, true);
+                if (!rec || rec->seq > snapshotSeq) { return std::nullopt; }
+                return rec;
             }
 
-            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key) const {
+            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
                 if (!keyInRange(key)) { return std::nullopt; }
                 const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
                 const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
@@ -205,10 +207,11 @@ namespace akkaradb::engine::sst {
                 if (!block) { return std::nullopt; }
                 const auto rec = findInBlock(*block, key, fp, mini, false);
                 if (!rec) { return std::nullopt; }
+                if (rec->seq > snapshotSeq) { return std::nullopt; }
                 return !rec->isTombstone();
             }
 
-            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
+            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
                 if (!keyInRange(key)) { return std::nullopt; }
                 const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
                 const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
@@ -217,10 +220,14 @@ namespace akkaradb::engine::sst {
                 if (!blockIndex.has_value()) { return std::nullopt; }
                 const auto block = loadBlock(*blockIndex);
                 if (!block) { return std::nullopt; }
-                return findValueInBlock(*block, key, fp, mini, out);
+                return findValueInBlock(*block, key, fp, mini, out, snapshotSeq);
             }
 
-            [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(std::vector<uint8_t> startKey, std::vector<uint8_t> endKey) const {
+            [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey,
+                uint64_t snapshotSeq
+            ) const {
                 for (size_t i = 0; i < index_.size(); ++i) {
                     const auto first = arenaKey(keyArena_, index_[i].firstKeyOffset, index_[i].firstKeyLen);
                     const auto last = arenaKey(keyArena_, index_[i].lastKeyOffset, index_[i].lastKeyLen);
@@ -238,6 +245,7 @@ namespace akkaradb::engine::sst {
                         std::span<const uint8_t> key{keyPtr, hdr->kLen};
                         if (!startKey.empty() && compareBytes(key, startKey) < 0) { continue; }
                         if (!endKey.empty() && compareBytes(key, endKey) >= 0) { co_return; }
+                        if (hdr->seq > snapshotSeq) { continue; }
                         co_yield SSTRecord{
                             .key = std::vector<uint8_t>(key.begin(), key.end()),
                             .value = std::vector<uint8_t>(valPtr, valPtr + hdr->vLen),
@@ -407,7 +415,8 @@ namespace akkaradb::engine::sst {
                 std::span<const uint8_t> key,
                 uint64_t fp,
                 uint64_t mini,
-                std::vector<uint8_t>& out
+                std::vector<uint8_t>& out,
+                uint64_t snapshotSeq
             ) const {
                 size_t lo = 0;
                 size_t hi = block.offsets.size();
@@ -428,6 +437,7 @@ namespace akkaradb::engine::sst {
                 const uint8_t* valPtr = keyPtr + hdr->kLen;
                 if (valPtr + hdr->vLen > block.data.data() + block.data.size()) { return std::nullopt; }
                 if (!keyEquals(*hdr, keyPtr, key, fp, mini)) { return std::nullopt; }
+                if (hdr->seq > snapshotSeq) { return std::nullopt; }
                 if ((hdr->flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0) { return false; }
                 out.assign(valPtr, valPtr + hdr->vLen);
                 return true;
@@ -466,15 +476,28 @@ namespace akkaradb::engine::sst {
     SSTReader::SSTReader(SSTReader&&) noexcept = default;
     SSTReader& SSTReader::operator=(SSTReader&&) noexcept = default;
 
-    std::optional<SSTRecord> SSTReader::get(std::span<const uint8_t> key) const { return impl_->get(key); }
-    std::optional<bool> SSTReader::contains(std::span<const uint8_t> key) const { return impl_->contains(key); }
-
-    std::optional<bool> SSTReader::getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
-        return impl_->getInto(key, out);
+    std::optional<SSTRecord> SSTReader::get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+        return impl_->get(key, snapshotSeq);
     }
 
-    core::ArenaGenerator<SSTRecord> SSTReader::scan(std::span<const uint8_t> startKey, std::span<const uint8_t> endKey) const {
-        return impl_->scan(std::vector<uint8_t>(startKey.begin(), startKey.end()), std::vector<uint8_t>(endKey.begin(), endKey.end()));
+    std::optional<bool> SSTReader::contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+        return impl_->contains(key, snapshotSeq);
+    }
+
+    std::optional<bool> SSTReader::getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
+        return impl_->getInto(key, out, snapshotSeq);
+    }
+
+    core::ArenaGenerator<SSTRecord> SSTReader::scan(
+        std::span<const uint8_t> startKey,
+        std::span<const uint8_t> endKey,
+        uint64_t snapshotSeq
+    ) const {
+        return impl_->scan(
+            std::vector<uint8_t>(startKey.begin(), startKey.end()),
+            std::vector<uint8_t>(endKey.begin(), endKey.end()),
+            snapshotSeq
+        );
     }
 
     bool SSTReader::keyInRange(std::span<const uint8_t> key) const noexcept { return impl_->keyInRange(key); }

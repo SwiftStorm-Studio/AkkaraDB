@@ -34,7 +34,8 @@ namespace akkaradb::engine::memtable {
                 size_t dataArenaInitialBlockSize = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
                 size_t dataArenaMaxBlockSize = core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
                 size_t generatorArenaInitialBlockSize = 64 * 1024,
-                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024
+                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024,
+                MemTableBackendOptions backendOptions = {}
             );
 
             [[nodiscard]] Status put(

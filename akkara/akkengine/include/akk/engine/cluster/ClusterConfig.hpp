@@ -25,11 +25,12 @@ namespace akkaradb::engine::cluster {
      * ReplicationMode - Placement strategy for write/read routing.
      *
      * Standalone keeps all traffic local.  Mirror sends writes to every
-     * data-bearing node.  Stripe assigns each key to one data-bearing node
-     * using rendezvous hashing.
+     * data-bearing node.  Partitioned assigns each key to one owner node
+     * using rendezvous hashing.  Stripe splits values into data and parity
+     * shards placed across distinct data-bearing nodes.
      */
     enum class ReplicationMode : uint8_t {
-        STANDALONE = 0, MIRROR = 1, STRIPE = 2,
+        STANDALONE = 0, MIRROR = 1, PARTITIONED = 2, STRIPE = 3,
     };
 
     /**
@@ -128,14 +129,6 @@ namespace akkaradb::engine::cluster {
         BLOCK_WRITES = 2,
     };
 
-    /** Preferred source for client reads. */
-    enum class ReadConsistency : uint8_t {
-        PRIMARY = 0,
-        REPLICA_ANY = 1,
-        REPLICA_AT_LEAST = 2,
-        QUORUM = 3,
-    };
-
     enum class RaftMembershipMode : uint8_t {
         STATIC = 0,
         JOINT_CONSENSUS = 1,
@@ -149,6 +142,15 @@ namespace akkaradb::engine::cluster {
 
     struct AKDB_API RaftOptions {
         RaftMembershipOptions membership;
+    };
+
+    struct AKDB_API StripeOptions {
+        uint8_t dataShards = 4;
+        uint8_t parityShards = 2;
+
+        [[nodiscard]] uint16_t totalShards() const noexcept {
+            return static_cast<uint16_t>(dataShards) + static_cast<uint16_t>(parityShards);
+        }
     };
 
     /**
@@ -165,7 +167,6 @@ namespace akkaradb::engine::cluster {
         WriteConsistency writeConsistency = WriteConsistency::LEGACY_ACK_POLICY;
         AckTimeoutAction ackTimeoutAction = AckTimeoutAction::ACCEPT_LOCAL;
         ReplicaLagAction replicaLagAction = ReplicaLagAction::ASYNC_RESYNC;
-        ReadConsistency readConsistency = ReadConsistency::PRIMARY;
         uint32_t ackTimeoutMs = 5000;
     };
 
@@ -206,7 +207,7 @@ namespace akkaradb::engine::cluster {
     struct AKDB_API ClusterRuntimeOptions {
         TransportMode transportMode = TransportMode::SECURE;
         std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
-        NodeStartupRole startupRole = NodeStartupRole::AUTO; ///< Explicit startup role used for MIRROR/STRIPE modes.
+        NodeStartupRole startupRole = NodeStartupRole::AUTO; ///< Explicit startup role used for non-standalone modes.
         std::string primaryHost; ///< Replica-side configured primary host override.
         uint16_t primaryReplPort = 0; ///< Replica-side configured primary replication port override.
         uint64_t primaryNodeId = 0; ///< Replica-side configured primary node id override.
@@ -239,7 +240,8 @@ namespace akkaradb::engine::cluster {
                 ReplicationMode mode,
                 AckPolicy ackPolicy,
                 ConsistencyOptions consistency = {},
-                RaftOptions raft = {}
+                RaftOptions raft = {},
+                StripeOptions stripe = {}
             );
 
             /**
@@ -268,11 +270,14 @@ namespace akkaradb::engine::cluster {
             /** Returns the configured replica acknowledgement policy. */
             [[nodiscard]] AckPolicy ackPolicy() const noexcept { return ackPolicy_; }
 
-            /** Returns the configured write, lag, and read consistency controls. */
+            /** Returns the configured write and replica-lag consistency controls. */
             [[nodiscard]] ConsistencyOptions consistency() const noexcept { return consistency_; }
 
             /** Returns RAFT-specific configuration. */
             [[nodiscard]] RaftOptions raft() const noexcept { return raft_; }
+
+            /** Returns erasure-stripe layout options. */
+            [[nodiscard]] StripeOptions stripe() const noexcept { return stripe_; }
 
             /** Returns reserved config flags from the file header. */
             [[nodiscard]] uint16_t flags() const noexcept { return flags_; }
@@ -304,6 +309,7 @@ namespace akkaradb::engine::cluster {
             AckPolicy ackPolicy_{};
             ConsistencyOptions consistency_{};
             RaftOptions raft_{};
+            StripeOptions stripe_{};
             uint16_t flags_ = 0;
     };
 } // namespace akkaradb::engine::cluster

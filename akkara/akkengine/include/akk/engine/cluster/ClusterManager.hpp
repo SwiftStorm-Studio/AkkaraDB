@@ -24,7 +24,7 @@ namespace akkaradb::engine::cluster {
      *
      * ClusterManager owns local cluster role selection.
      *
-     * Standalone mode comes from ClusterConfig::mode(). For MIRROR/STRIPE
+     * Standalone mode comes from ClusterConfig::mode(). For non-standalone
      * modes the runtime startup role is explicit: each node starts either as
      * PRIMARY or as a REPLICA attached to a configured primary endpoint.
      *
@@ -70,7 +70,7 @@ namespace akkaradb::engine::cluster {
              * Starts role selection.
              *
              * Standalone configs immediately move to NodeRole::STANDALONE.
-             * MIRROR/STRIPE configs require an explicit startup role.
+             * Non-standalone configs require an explicit startup role.
              */
             void start();
 

@@ -41,6 +41,37 @@ namespace akkaradb::engine {
         uint64_t scansTotal = 0;
         uint64_t blobPutsTotal = 0;
 
+        struct ConfigStats {
+            uint32_t writeAdmission = 0;
+            uint32_t writeDurability = 0;
+            uint32_t writeVisibility = 0;
+            uint32_t readVisibility = 0;
+            uint32_t sequenceAllocation = 0;
+            uint32_t sequenceThreadLocalRangeSize = 0;
+            uint32_t commitWindowSize = 0;
+            uint32_t memtableBackpressureMode = 0;
+            uint32_t maxMemtableImmutableTables = 0;
+            uint32_t sstBackpressureMode = 0;
+            uint32_t maxSstL0Files = 0;
+            uint32_t backpressureWaitMicros = 0;
+            uint32_t backpressureTimeoutMs = 0;
+            uint32_t memtableFlushMode = 0;
+            uint32_t walExecution = 0;
+            uint32_t walSyncPolicy = 0;
+            uint32_t walBackpressure = 0;
+            uint32_t sstCompactionMode = 0;
+        } config;
+
+        struct BackpressureStats {
+            uint64_t blockedWrites = 0;
+            uint64_t rejectedWrites = 0;
+            uint64_t timedOutWrites = 0;
+            uint64_t memtableStalls = 0;
+            uint64_t sstStalls = 0;
+            uint64_t waitMicrosTotal = 0;
+            uint64_t waitMicrosMax = 0;
+        } backpressure;
+
         struct ApiStats {
             bool enabled = false;
             bool httpEnabled = false;
@@ -115,6 +146,7 @@ namespace akkaradb::engine {
             uint64_t putsApplied = 0;
             uint64_t removesApplied = 0;
             uint64_t flushesCompleted = 0;
+            uint64_t immutableTables = 0;
             uint64_t bytesFlushed = 0;
         } memtable;
 
@@ -126,6 +158,11 @@ namespace akkaradb::engine {
             uint64_t batchesFlushed = 0;
             uint64_t syncsExecuted = 0;
             uint64_t segmentRotations = 0;
+            uint64_t asyncFailures = 0;
+            uint64_t pendingEntries = 0;
+            uint64_t pendingBytes = 0;
+            uint64_t inFlightBytes = 0;
+            bool healthy = true;
         } wal;
 
         struct BlobStats {
@@ -149,6 +186,7 @@ namespace akkaradb::engine {
             uint64_t filesCompacted = 0;
             uint64_t bytesCompactedIn = 0;
             uint64_t bytesCompactedOut = 0;
+            uint64_t compactionFailures = 0;
             uint64_t l0Stalls = 0;
         } sst;
 

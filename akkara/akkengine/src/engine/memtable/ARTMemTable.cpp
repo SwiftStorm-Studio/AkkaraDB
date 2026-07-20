@@ -49,10 +49,13 @@ namespace akkaradb::engine::memtable {
         size_t dataArenaInitialBlockSize,
         size_t dataArenaMaxBlockSize,
         size_t generatorArenaInitialBlockSize,
-        size_t generatorArenaMaxBlockSize
+        size_t generatorArenaMaxBlockSize,
+        MemTableBackendOptions backendOptions
     )
         : dataArena_{dataArenaInitialBlockSize, dataArenaMaxBlockSize},
-          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize} {}
+          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize} {
+        (void)backendOptions;
+    }
 
     std::span<const uint8_t> ARTMemTable::asU8(ByteView view) noexcept {
         return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};

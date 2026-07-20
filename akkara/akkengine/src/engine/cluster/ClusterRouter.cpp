@@ -10,6 +10,7 @@
 // akkengine/src/engine/cluster/ClusterRouter.cpp
 #include "akk/engine/cluster/ClusterRouter.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -39,7 +40,14 @@ namespace akkaradb::engine::cluster {
                                                          ? std::vector<NodeInfo>{}
                                                          : std::vector<NodeInfo>{dataNodes_.front()};
             case ReplicationMode::MIRROR: return dataNodes_;
-            case ReplicationMode::STRIPE: return {stripeTarget(key)};
+            case ReplicationMode::PARTITIONED: return {partitionTarget(key)};
+            case ReplicationMode::STRIPE: {
+                std::vector<NodeInfo> out;
+                const auto targets = stripeShardTargets(key);
+                out.reserve(targets.size());
+                for (const auto& target : targets) { out.push_back(target.node); }
+                return out;
+            }
         }
         throw std::logic_error("ClusterRouter: invalid replication mode");
     }
@@ -50,12 +58,38 @@ namespace akkaradb::engine::cluster {
                                                          ? std::vector<NodeInfo>{}
                                                          : std::vector<NodeInfo>{dataNodes_.front()};
             case ReplicationMode::MIRROR: return dataNodes_;
-            case ReplicationMode::STRIPE: return {stripeTarget(key)};
+            case ReplicationMode::PARTITIONED: return {partitionTarget(key)};
+            case ReplicationMode::STRIPE: {
+                std::vector<NodeInfo> out;
+                const auto targets = stripeShardTargets(key);
+                out.reserve(targets.size());
+                for (const auto& target : targets) { out.push_back(target.node); }
+                return out;
+            }
         }
         throw std::logic_error("ClusterRouter: invalid replication mode");
     }
 
-    NodeInfo ClusterRouter::stripeTarget(std::span<const uint8_t> key) const {
+    std::vector<ClusterRouter::StripeShardTarget> ClusterRouter::stripeShardTargets(std::span<const uint8_t> key) const {
+        const uint16_t totalShards = config_.stripe().totalShards();
+        if (totalShards == 0) { throw std::runtime_error("ClusterRouter: invalid stripe shard count"); }
+        if (dataNodes_.size() < totalShards) { throw std::runtime_error("ClusterRouter: not enough data-bearing nodes for stripe"); }
+
+        std::vector<std::pair<uint64_t, NodeInfo>> scored;
+        scored.reserve(dataNodes_.size());
+        for (const auto& node : dataNodes_) { scored.emplace_back(rendezvousScore(key, node.nodeId), node); }
+        std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
+            if (left.first != right.first) { return left.first > right.first; }
+            return left.second.nodeId < right.second.nodeId;
+        });
+
+        std::vector<StripeShardTarget> out;
+        out.reserve(totalShards);
+        for (uint16_t i = 0; i < totalShards; ++i) { out.push_back(StripeShardTarget{.shardIndex = i, .node = scored[i].second}); }
+        return out;
+    }
+
+    NodeInfo ClusterRouter::partitionTarget(std::span<const uint8_t> key) const {
         if (dataNodes_.empty()) { throw std::runtime_error("ClusterRouter: no data-bearing nodes"); }
 
         const NodeInfo* best = nullptr;

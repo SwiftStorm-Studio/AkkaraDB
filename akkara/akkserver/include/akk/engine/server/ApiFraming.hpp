@@ -44,7 +44,8 @@ namespace akkaradb::engine::server {
         FORCE_FLUSH = 0x0F,
         STATS = 0x10,
         SCAN_STREAM = 0x11,
-        HISTORY_STREAM = 0x12, };
+        HISTORY_STREAM = 0x12,
+        RUN_BLOB_GC = 0x13, };
 
     enum class ApiStatus : uint8_t {
         OK = 0x00, NOT_FOUND = 0x01, ERROR_STATUS = 0xFF,

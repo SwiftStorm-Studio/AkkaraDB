@@ -37,10 +37,12 @@ namespace akkaradb::engine::memtable {
         size_t dataArenaInitialBlockSize,
         size_t dataArenaMaxBlockSize,
         size_t generatorArenaInitialBlockSize,
-        size_t generatorArenaMaxBlockSize
+        size_t generatorArenaMaxBlockSize,
+        MemTableBackendOptions backendOptions
     )
         : dataArena_{dataArenaInitialBlockSize, dataArenaMaxBlockSize},
-          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize} {
+          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize},
+          mutableScanMode_{backendOptions.mutableScanMode} {
         Node* initialRoot = makeNode(true);
         root_.store(initialRoot, std::memory_order_release);
     }
@@ -680,6 +682,77 @@ namespace akkaradb::engine::memtable {
         }
     }
 
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateStreamingSnapshot(uint64_t snapshotSeq) const {
+        std::vector<uint8_t> empty;
+        for (const RecordView& record : iterateStreamingSnapshotRange(snapshotSeq, std::move(empty), {})) { co_yield record; }
+    }
+
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateStreamingSnapshotRange(
+        uint64_t snapshotSeq,
+        std::vector<uint8_t> startKey,
+        std::vector<uint8_t> endKey
+    ) const {
+        const std::span<const uint8_t> start{startKey.data(), startKey.size()};
+        const std::span<const uint8_t> end{endKey.data(), endKey.size()};
+        if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
+
+        std::vector<uint8_t> resumeKey;
+        bool hasResumeKey = false;
+
+        while (true) {
+            const std::span<const uint8_t> lowerBound = hasResumeKey
+                                                             ? std::span<const uint8_t>{resumeKey.data(), resumeKey.size()}
+                                                             : start;
+            Node* node = lowerBound.empty()
+                             ? root_.load(std::memory_order_acquire)
+                             : descendToCandidateLeaf(lowerBound);
+            if (!hasResumeKey) {
+                while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
+            }
+
+            bool advanced = false;
+            while (node != nullptr && !advanced) {
+                std::array<const core::OwnedRecord*, MAX_KEYS> keys{};
+                std::array<VersionChain*, MAX_KEYS> chains{};
+                Node* nextLeaf = nullptr;
+                uint16_t keyCount = 0;
+                for (;;) {
+                    const uint64_t begin = node->version.load(std::memory_order_acquire);
+                    if ((begin & 1ULL) != 0ULL) { continue; }
+                    keyCount = node->keyCount.load(std::memory_order_acquire);
+                    for (uint16_t i = 0; i < keyCount; ++i) {
+                        keys[i] = node->keys[i].load(std::memory_order_acquire);
+                        chains[i] = node->chains[i].load(std::memory_order_acquire);
+                    }
+                    nextLeaf = node->nextLeaf.load(std::memory_order_acquire);
+                    const uint64_t endVersion = node->version.load(std::memory_order_acquire);
+                    if (begin == endVersion && (endVersion & 1ULL) == 0ULL) { break; }
+                }
+
+                for (uint16_t i = 0; i < keyCount; ++i) {
+                    const core::OwnedRecord* keyRecord = keys[i];
+                    if (keyRecord == nullptr) { continue; }
+                    const std::span<const uint8_t> key = keyRecord->key();
+                    if (!lowerBound.empty()) {
+                        const int cmp = compareRecordKey(keyRecord, lowerBound);
+                        if (cmp < 0 || (hasResumeKey && cmp == 0)) { continue; }
+                    }
+                    if (!end.empty() && compareRecordKey(keyRecord, end) >= 0) { co_return; }
+
+                    resumeKey.assign(key.begin(), key.end());
+                    hasResumeKey = true;
+                    advanced = true;
+
+                    RecordView visible;
+                    if (visibleRecord(chains[i], snapshotSeq, &visible)) { co_yield visible; }
+                }
+
+                if (!advanced) { node = nextLeaf; }
+            }
+            if (!advanced) { co_return; }
+        }
+    }
+
     ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const {
         const std::span<const uint8_t> start = asU8(startKey);
         const std::span<const uint8_t> end = asU8(endKey);
@@ -689,7 +762,12 @@ namespace akkaradb::engine::memtable {
         if (start.empty() && end.empty()) {
             return ArenaGenerator<RecordView>::withArena(
                 generatorArena_,
-                [this, snapshotSeq, frozen]() { return frozen ? iterateFrozenSnapshot(snapshotSeq) : iterateSnapshot(snapshotSeq); }
+                [this, snapshotSeq, frozen]() {
+                    if (frozen) { return iterateFrozenSnapshot(snapshotSeq); }
+                    return mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                               ? iterateStreamingSnapshot(snapshotSeq)
+                               : iterateSnapshot(snapshotSeq);
+                }
             );
         }
 
@@ -698,8 +776,9 @@ namespace akkaradb::engine::memtable {
         return ArenaGenerator<RecordView>::withArena(
             generatorArena_,
             [this, snapshotSeq, frozen, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
-                return frozen
-                           ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                if (frozen) { return iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)); }
+                return mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                           ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
                            : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }
         );

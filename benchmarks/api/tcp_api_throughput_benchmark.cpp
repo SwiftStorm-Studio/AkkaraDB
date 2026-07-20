@@ -233,12 +233,13 @@ int main(int argc, char** argv) {
 
     const size_t operations = sizeArg(argc, argv, "--ops", 100000);
     const size_t clients = std::max<size_t>(1, sizeArg(argc, argv, "--clients", std::thread::hardware_concurrency()));
+    const size_t workers = std::max<size_t>(1, sizeArg(argc, argv, "--workers", clients));
     const size_t payloadSize = sizeArg(argc, argv, "--payload", 128);
     const size_t keyspace = std::max<size_t>(1, sizeArg(argc, argv, "--keyspace", 65536));
     const uint16_t port = portArg(argc, argv, "--port", defaultPort());
     const std::string mode = stringArg(argc, argv, "--mode", "mixed");
-    if (mode != "get" && mode != "put" && mode != "mixed") {
-        std::cerr << "invalid --mode: expected get, put, or mixed\n";
+    if (mode != "get" && mode != "put" && mode != "mixed" && mode != "ping") {
+        std::cerr << "invalid --mode: expected get, put, mixed, or ping\n";
         return 2;
     }
 
@@ -261,7 +262,7 @@ int main(int argc, char** argv) {
     options.api.tcpPort = port;
     options.api.backends = {AkkEngineOptions::ApiBackend::TCP};
     options.api.transportMode = AkkEngineOptions::ApiTransportMode::PLAIN;
-    options.api.tcpWorkerThreads = static_cast<uint32_t>(clients);
+    options.api.tcpWorkerThreads = static_cast<uint32_t>(workers);
     options.runtime.writerThreads = static_cast<uint32_t>(clients);
 
     auto engine = AkkEngine::open(options);
@@ -275,6 +276,9 @@ int main(int argc, char** argv) {
     std::atomic<size_t> failures{0};
     std::vector<std::thread> threads;
     std::vector<std::vector<uint64_t>> samples(clients);
+    std::vector<std::vector<uint64_t>> makeSamples(clients);
+    std::vector<std::vector<uint64_t>> sendSamples(clients);
+    std::vector<std::vector<uint64_t>> recvSamples(clients);
 
     const size_t perClient = (operations + clients - 1) / clients;
     const auto benchStartConnect = std::chrono::steady_clock::now();
@@ -293,6 +297,12 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> request;
                 auto& localSamples = samples[clientId];
                 localSamples.reserve((perClient + 1023) / 1024);
+                auto& localMakeSamples = makeSamples[clientId];
+                auto& localSendSamples = sendSamples[clientId];
+                auto& localRecvSamples = recvSamples[clientId];
+                localMakeSamples.reserve((perClient + 1023) / 1024);
+                localSendSamples.reserve((perClient + 1023) / 1024);
+                localRecvSamples.reserve((perClient + 1023) / 1024);
 
                 ready.fetch_add(1, std::memory_order_release);
                 while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
@@ -305,22 +315,34 @@ int main(int argc, char** argv) {
                     const uint32_t requestId = static_cast<uint32_t>(i + 1);
 
                     const auto t0 = std::chrono::steady_clock::now();
-                    if (putOp) {
+                    if (mode == "ping") {
+                        request = makeRequest(requestId, ApiOp::PING, {});
+                    }
+                    else if (putOp) {
                         request = makeRequest(requestId, ApiOp::PUT, bytes(key), std::span<const uint8_t>{value.data(), value.size()});
                     }
                     else {
                         request = makeRequest(requestId, ApiOp::GET, bytes(key));
                     }
+                    const auto t1 = std::chrono::steady_clock::now();
 
-                    if (!sendAll(socket, request.data(), request.size()) || !readResponse(socket, requestId, responseValue)) {
+                    if (!sendAll(socket, request.data(), request.size())) {
                         failures.fetch_add(1, std::memory_order_relaxed);
                         break;
                     }
+                    const auto t2 = std::chrono::steady_clock::now();
+                    if (!readResponse(socket, requestId, responseValue)) {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    const auto t3 = std::chrono::steady_clock::now();
 
                     completed.fetch_add(1, std::memory_order_relaxed);
                     if ((i & 1023u) == 0) {
-                        const auto t1 = std::chrono::steady_clock::now();
-                        localSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                        localSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count()));
+                        localMakeSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+                        localSendSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+                        localRecvSamples.push_back(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
                     }
                 }
                 closeSocket(socket);
@@ -335,9 +357,15 @@ int main(int argc, char** argv) {
     const auto benchEnd = std::chrono::steady_clock::now();
 
     std::vector<uint64_t> allSamples;
+    std::vector<uint64_t> allMakeSamples;
+    std::vector<uint64_t> allSendSamples;
+    std::vector<uint64_t> allRecvSamples;
     for (auto& sampleSet : samples) {
         allSamples.insert(allSamples.end(), sampleSet.begin(), sampleSet.end());
     }
+    for (auto& sampleSet : makeSamples) { allMakeSamples.insert(allMakeSamples.end(), sampleSet.begin(), sampleSet.end()); }
+    for (auto& sampleSet : sendSamples) { allSendSamples.insert(allSendSamples.end(), sampleSet.begin(), sampleSet.end()); }
+    for (auto& sampleSet : recvSamples) { allRecvSamples.insert(allRecvSamples.end(), sampleSet.begin(), sampleSet.end()); }
 
     const double seconds = std::chrono::duration<double>(benchEnd - benchStart).count();
     const double connectSeconds = std::chrono::duration<double>(benchStart - benchStartConnect).count();
@@ -347,6 +375,7 @@ int main(int argc, char** argv) {
     std::cout << "mode = " << mode << '\n';
     std::cout << "operations = " << operations << '\n';
     std::cout << "clients = " << clients << '\n';
+    std::cout << "workers = " << workers << '\n';
     std::cout << "payloadBytes = " << payloadSize << '\n';
     std::cout << "keyspace = " << keyspace << '\n';
     std::cout << "connectSetupSeconds = " << connectSeconds << '\n';
@@ -357,6 +386,12 @@ int main(int argc, char** argv) {
     std::cout << "sampledLatencyUsP50 = " << percentile(allSamples, 0.50) << '\n';
     std::cout << "sampledLatencyUsP95 = " << percentile(allSamples, 0.95) << '\n';
     std::cout << "sampledLatencyUsP99 = " << percentile(allSamples, 0.99) << '\n';
+    std::cout << "sampledMakeRequestUsP50 = " << percentile(allMakeSamples, 0.50) << '\n';
+    std::cout << "sampledMakeRequestUsP95 = " << percentile(allMakeSamples, 0.95) << '\n';
+    std::cout << "sampledSendUsP50 = " << percentile(allSendSamples, 0.50) << '\n';
+    std::cout << "sampledSendUsP95 = " << percentile(allSendSamples, 0.95) << '\n';
+    std::cout << "sampledRecvUsP50 = " << percentile(allRecvSamples, 0.50) << '\n';
+    std::cout << "sampledRecvUsP95 = " << percentile(allRecvSamples, 0.95) << '\n';
 
     engine->close();
     return failed == 0 ? 0 : 1;

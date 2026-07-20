@@ -484,6 +484,10 @@ namespace {
         tlsSendAll(stream, forceSync.data(), forceSync.size());
         AKK_TEST_CHECK(readResponse(stream).status == ApiStatus::OK);
 
+        auto runBlobGc = makeRequest(39, ApiOp::RUN_BLOB_GC, {});
+        tlsSendAll(stream, runBlobGc.data(), runBlobGc.size());
+        AKK_TEST_CHECK(readResponse(stream).status == ApiStatus::OK);
+
         auto stats = makeRequest(40, ApiOp::STATS, {});
         tlsSendAll(stream, stats.data(), stats.size());
         auto statsResponse = readResponse(stream);

@@ -53,12 +53,17 @@ namespace akkaradb::engine::sst {
             SSTReader(SSTReader&&) noexcept;
             SSTReader& operator=(SSTReader&&) noexcept;
 
-            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
+            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
+            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
+            [[nodiscard]] std::optional<bool> getInto(
+                std::span<const uint8_t> key,
+                std::vector<uint8_t>& out,
+                uint64_t snapshotSeq = UINT64_MAX
+            ) const;
             [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(
                 std::span<const uint8_t> startKey = {},
-                std::span<const uint8_t> endKey = {}
+                std::span<const uint8_t> endKey = {},
+                uint64_t snapshotSeq = UINT64_MAX
             ) const;
 
             [[nodiscard]] bool keyInRange(std::span<const uint8_t> key) const noexcept;

@@ -20,9 +20,7 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        constexpr size_t HEADER_SIZE_V1 = 32;
-        constexpr size_t HEADER_SIZE_V2 = 40;
-        constexpr size_t HEADER_SIZE_V3 = 40;
+        constexpr size_t HEADER_SIZE = 48;
 
         uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -72,52 +70,51 @@ namespace akkaradb::engine::cluster {
         ReplicationMode mode,
         AckPolicy ackPolicy,
         ConsistencyOptions consistency,
-        RaftOptions raft
+        RaftOptions raft,
+        StripeOptions stripe
     )
-        : nodes_{std::move(nodes)}, mode_{mode}, ackPolicy_{ackPolicy}, consistency_{consistency}, raft_{raft} { validate(); }
+        : nodes_{std::move(nodes)}, mode_{mode}, ackPolicy_{ackPolicy}, consistency_{consistency}, raft_{raft}, stripe_{stripe} {
+        validate();
+    }
 
     ClusterConfig ClusterConfig::load(const std::filesystem::path& path) {
         std::ifstream file(path, std::ios::binary);
         if (!file) { throw std::runtime_error("ClusterConfig: cannot open " + path.string()); }
 
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        if (bytes.size() < HEADER_SIZE_V1) { throw std::runtime_error("ClusterConfig: file too short"); }
+        if (bytes.size() < HEADER_SIZE) { throw std::runtime_error("ClusterConfig: file too short"); }
 
         const uint32_t magic = readU32(bytes.data(), 0);
         const uint16_t version = readU16(bytes.data(), 4);
         if (magic != MAGIC) { throw std::runtime_error("ClusterConfig: bad magic"); }
-        if (version != 1 && version != 2 && version != VERSION) { throw std::runtime_error("ClusterConfig: unsupported version"); }
-        const size_t headerSize = version == 1 ? HEADER_SIZE_V1 : (version == 2 ? HEADER_SIZE_V2 : HEADER_SIZE_V3);
-        if (bytes.size() < headerSize) { throw std::runtime_error("ClusterConfig: file too short"); }
+        if (version != VERSION) { throw std::runtime_error("ClusterConfig: unsupported version"); }
 
         const uint32_t storedCrc = readU32(bytes.data(), 24);
         if (storedCrc != crcFileImage(bytes)) { throw std::runtime_error("ClusterConfig: CRC mismatch"); }
 
         const uint16_t flags = readU16(bytes.data(), 6);
         const uint16_t nodeCount = readU16(bytes.data(), 8);
-        const auto mode = static_cast<ReplicationMode>(bytes[10]);
+        auto mode = static_cast<ReplicationMode>(bytes[10]);
         AckPolicy ack{};
         ack.mode = static_cast<AckPolicyMode>(bytes[11]);
         ack.stage = static_cast<AckStage>(bytes[12]);
         ack.quorum = readU16(bytes.data(), 14);
 
         ConsistencyOptions consistency{};
-        if (version >= 2) {
-            consistency.writeConsistency = static_cast<WriteConsistency>(bytes[28]);
-            consistency.ackTimeoutAction = static_cast<AckTimeoutAction>(bytes[29]);
-            consistency.replicaLagAction = static_cast<ReplicaLagAction>(bytes[30]);
-            consistency.readConsistency = static_cast<ReadConsistency>(bytes[31]);
-            consistency.ackTimeoutMs = readU32(bytes.data(), 32);
-        }
-        if (version >= 3) { consistency.mode = static_cast<ConsistencyMode>(bytes[36]); }
+        consistency.writeConsistency = static_cast<WriteConsistency>(bytes[28]);
+        consistency.ackTimeoutAction = static_cast<AckTimeoutAction>(bytes[29]);
+        consistency.replicaLagAction = static_cast<ReplicaLagAction>(bytes[30]);
+        consistency.ackTimeoutMs = readU32(bytes.data(), 32);
+        consistency.mode = static_cast<ConsistencyMode>(bytes[36]);
         RaftOptions raft{};
-        if (version >= 3) {
-            raft.membership.mode = static_cast<RaftMembershipMode>(bytes[37]);
-            raft.membership.allowOnlineVoterChanges = bytes[38] != 0;
-            raft.membership.allowLearners = bytes[39] != 0;
-        }
+        raft.membership.mode = static_cast<RaftMembershipMode>(bytes[37]);
+        raft.membership.allowOnlineVoterChanges = bytes[38] != 0;
+        raft.membership.allowLearners = bytes[39] != 0;
+        StripeOptions stripe{};
+        stripe.dataShards = bytes[40];
+        stripe.parityShards = bytes[41];
 
-        size_t cursor = headerSize;
+        size_t cursor = HEADER_SIZE;
         std::vector<NodeInfo> nodes;
         nodes.reserve(nodeCount);
         for (uint16_t i = 0; i < nodeCount; ++i) {
@@ -135,7 +132,7 @@ namespace akkaradb::engine::cluster {
             nodes.push_back(std::move(node));
         }
 
-        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft};
+        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe};
         cfg.flags_ = flags;
         cfg.validate();
         return cfg;
@@ -145,7 +142,7 @@ namespace akkaradb::engine::cluster {
         config.validate();
         if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
 
-        std::vector<uint8_t> bytes(HEADER_SIZE_V3);
+        std::vector<uint8_t> bytes(HEADER_SIZE);
         writeU32(bytes.data(), 0, MAGIC);
         writeU16(bytes.data(), 4, VERSION);
         writeU16(bytes.data(), 6, config.flags_);
@@ -160,12 +157,14 @@ namespace akkaradb::engine::cluster {
         bytes[28] = static_cast<uint8_t>(config.consistency_.writeConsistency);
         bytes[29] = static_cast<uint8_t>(config.consistency_.ackTimeoutAction);
         bytes[30] = static_cast<uint8_t>(config.consistency_.replicaLagAction);
-        bytes[31] = static_cast<uint8_t>(config.consistency_.readConsistency);
+        bytes[31] = 0;
         writeU32(bytes.data(), 32, config.consistency_.ackTimeoutMs);
         bytes[36] = static_cast<uint8_t>(config.consistency_.mode);
         bytes[37] = static_cast<uint8_t>(config.raft_.membership.mode);
         bytes[38] = config.raft_.membership.allowOnlineVoterChanges ? 1 : 0;
         bytes[39] = config.raft_.membership.allowLearners ? 1 : 0;
+        bytes[40] = config.stripe_.dataShards;
+        bytes[41] = config.stripe_.parityShards;
 
         for (const auto& node : config.nodes_) {
             const auto hostLen = static_cast<uint16_t>(node.host.size());
@@ -212,7 +211,8 @@ namespace akkaradb::engine::cluster {
 
     void ClusterConfig::validate() const {
         if (nodes_.size() > UINT16_MAX) { throw std::invalid_argument("ClusterConfig: too many nodes"); }
-        if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::STRIPE) {
+        if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::PARTITIONED &&
+            mode_ != ReplicationMode::STRIPE) {
             throw std::invalid_argument("ClusterConfig: invalid replication mode");
         }
         if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.mode != AckPolicyMode::ALL_TARGETS && ackPolicy_.mode !=
@@ -246,12 +246,6 @@ namespace akkaradb::engine::cluster {
             consistency_.replicaLagAction != ReplicaLagAction::BLOCK_WRITES) {
             throw std::invalid_argument("ClusterConfig: invalid replica lag action");
         }
-        if (consistency_.readConsistency != ReadConsistency::PRIMARY &&
-            consistency_.readConsistency != ReadConsistency::REPLICA_ANY &&
-            consistency_.readConsistency != ReadConsistency::REPLICA_AT_LEAST &&
-            consistency_.readConsistency != ReadConsistency::QUORUM) {
-            throw std::invalid_argument("ClusterConfig: invalid read consistency");
-        }
         if (consistency_.ackTimeoutMs == 0) { throw std::invalid_argument("ClusterConfig: acknowledgement timeout must be > 0"); }
         if (raft_.membership.mode != RaftMembershipMode::STATIC && raft_.membership.mode != RaftMembershipMode::JOINT_CONSENSUS) {
             throw std::invalid_argument("ClusterConfig: invalid Raft membership mode");
@@ -264,10 +258,10 @@ namespace akkaradb::engine::cluster {
             consistency_.mode != ConsistencyMode::RAFT_QUORUM) {
             throw std::invalid_argument("ClusterConfig: Raft membership options require RAFT_QUORUM consistency");
         }
-
         std::unordered_set<uint64_t> ids;
         bool hasDataNode = false;
         bool hasCoordinator = false;
+        size_t dataNodeCount = 0;
         for (const auto& node : nodes_) {
             if (node.nodeId == 0) { throw std::invalid_argument("ClusterConfig: nodeId 0 is reserved"); }
             if (!ids.insert(node.nodeId).second) { throw std::invalid_argument("ClusterConfig: duplicate nodeId"); }
@@ -275,6 +269,7 @@ namespace akkaradb::engine::cluster {
             if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING)) != 0) {
                 throw std::invalid_argument("ClusterConfig: unknown node capability");
             }
+            if (node.dataBearing()) { ++dataNodeCount; }
             hasDataNode = hasDataNode || node.dataBearing();
             hasCoordinator = hasCoordinator || node.coordinatorEligible();
         }
@@ -283,6 +278,14 @@ namespace akkaradb::engine::cluster {
         }
         if (mode_ != ReplicationMode::STANDALONE && !hasCoordinator) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a coordinator-eligible node");
+        }
+        if (mode_ == ReplicationMode::STRIPE) {
+            if (stripe_.dataShards == 0) { throw std::invalid_argument("ClusterConfig: stripe dataShards must be > 0"); }
+            if (stripe_.parityShards == 0) { throw std::invalid_argument("ClusterConfig: stripe parityShards must be > 0"); }
+            if (stripe_.totalShards() > 255) { throw std::invalid_argument("ClusterConfig: stripe total shard count must be <= 255"); }
+            if (dataNodeCount < stripe_.totalShards()) {
+                throw std::invalid_argument("ClusterConfig: stripe mode requires at least dataShards + parityShards data-bearing nodes");
+            }
         }
     }
 } // namespace akkaradb::engine::cluster

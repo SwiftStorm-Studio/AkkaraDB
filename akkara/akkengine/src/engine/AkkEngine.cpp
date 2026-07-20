@@ -20,7 +20,11 @@
 #include "akk/engine/wal/WalRecovery.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -31,6 +35,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #ifdef _WIN32
@@ -49,6 +54,14 @@ namespace akkaradb::engine {
             return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
         }
 
+        // Test-only fault injection used by the recovery smoke test. The process
+        // terminates without unwinding, matching the storage guarantees required
+        // at each persistence boundary.
+        void crashAtTestPoint(const char* point) noexcept {
+            const char* requested = std::getenv("AKKARADB_TEST_CRASH_POINT");
+            if (requested != nullptr && std::strcmp(requested, point) == 0) { std::quick_exit(86); }
+        }
+
         [[nodiscard]] uint32_t nextPow2(uint32_t value) noexcept {
             uint32_t out = 1;
             while (out < value) { out <<= 1; }
@@ -59,6 +72,136 @@ namespace akkaradb::engine {
             if (writers <= 1) { return 1; }
             const uint32_t target = std::max(writers * 4u, 2u);
             return std::min(nextPow2(target), cap);
+        }
+
+        [[nodiscard]] bool supportsParallelWriteAdmission(const AkkEngineOptions& options) noexcept {
+            return !options.components.blobEnabled
+                   && !options.components.versionLogEnabled
+                   && !options.components.clusterEnabled;
+        }
+
+        static constexpr size_t COMMIT_COMPLETION_RING_SIZE = 1u << 16u;
+
+        [[nodiscard]] uint32_t resolveCommitWindowSize(uint32_t requested) noexcept {
+            if (requested == 0) { return static_cast<uint32_t>(COMMIT_COMPLETION_RING_SIZE); }
+            return nextPow2(std::clamp<uint32_t>(requested, 64u, 1u << 24u));
+        }
+
+        [[nodiscard]] wal::WalExecutionMode resolveWalExecutionMode(const wal::WalOptions& options) noexcept {
+            if (options.execution != wal::WalExecutionMode::AUTO) { return options.execution; }
+            return options.syncMode == wal::WalSyncMode::ASYNC ? wal::WalExecutionMode::ASYNC : wal::WalExecutionMode::INLINE;
+        }
+
+        [[nodiscard]] wal::WalSyncPolicy resolveWalSyncPolicy(const wal::WalOptions& options) noexcept {
+            if (options.syncPolicy != wal::WalSyncPolicy::AUTO) { return options.syncPolicy; }
+            switch (options.syncMode) {
+                case wal::WalSyncMode::OFF:
+                    return wal::WalSyncPolicy::NEVER;
+                case wal::WalSyncMode::ASYNC:
+                    return wal::WalSyncPolicy::ON_SYNC_ACK;
+                case wal::WalSyncMode::SYNC:
+                    return wal::WalSyncPolicy::ALWAYS;
+            }
+            return wal::WalSyncPolicy::ALWAYS;
+        }
+
+        void normalizeWalOptions(wal::WalOptions& options) noexcept {
+            options.execution = resolveWalExecutionMode(options);
+            options.syncPolicy = resolveWalSyncPolicy(options);
+            if (options.syncPolicy == wal::WalSyncPolicy::NEVER && options.syncMode == wal::WalSyncMode::SYNC) {
+                options.syncMode = wal::WalSyncMode::OFF;
+            }
+            else if (options.execution == wal::WalExecutionMode::ASYNC) { options.syncMode = wal::WalSyncMode::ASYNC; }
+            else if (options.syncPolicy == wal::WalSyncPolicy::NEVER) { options.syncMode = wal::WalSyncMode::OFF; }
+            else { options.syncMode = wal::WalSyncMode::SYNC; }
+        }
+
+        void normalizeMemTableOptions(memtable::MemTable::Options& options) noexcept {
+            if (options.flushMode == memtable::MemTableFlushMode::AUTO) {
+                options.flushMode = options.thresholdBytesPerShard > 0
+                                        ? memtable::MemTableFlushMode::BYTES_PER_SHARD
+                                        : memtable::MemTableFlushMode::MANUAL_ONLY;
+            }
+        }
+
+        void normalizeSstOptions(sst::SSTManager::Options& options) noexcept {
+            if (options.compactionMode == sst::SSTCompactionMode::AUTO) {
+                options.compactionMode = options.compactThreads == 0 ? sst::SSTCompactionMode::DISABLED : sst::SSTCompactionMode::BACKGROUND;
+            }
+        }
+
+        [[nodiscard]] AkkEngineOptions::WriteVisibilityMode resolveReadVisibility(const AkkEngineOptions& options) noexcept {
+            switch (options.runtime.visibility.readVisibility) {
+                case AkkEngineOptions::ReadVisibilityMode::AUTO:
+                    return options.runtime.writeVisibility;
+                case AkkEngineOptions::ReadVisibilityMode::COMMIT_ORDER:
+                    return AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
+                case AkkEngineOptions::ReadVisibilityMode::APPLIED:
+                    return AkkEngineOptions::WriteVisibilityMode::APPLIED;
+            }
+            return options.runtime.writeVisibility;
+        }
+
+        void normalizeVisibilityOptions(AkkEngineOptions& options) noexcept {
+            const auto effective = resolveReadVisibility(options);
+            options.runtime.writeVisibility = effective;
+            options.runtime.visibility.readVisibility = effective == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER
+                                                            ? AkkEngineOptions::ReadVisibilityMode::COMMIT_ORDER
+                                                            : AkkEngineOptions::ReadVisibilityMode::APPLIED;
+        }
+
+        void resolveWritePolicy(AkkEngineOptions& options) {
+            switch (options.runtime.writePolicy) {
+                case AkkEngineOptions::WritePolicyPreset::CUSTOM:
+                    break;
+                case AkkEngineOptions::WritePolicyPreset::SAFE:
+                    options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::SYNCED;
+                    options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
+                    break;
+                case AkkEngineOptions::WritePolicyPreset::BALANCED:
+                    options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::WRITTEN;
+                    options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
+                    break;
+                case AkkEngineOptions::WritePolicyPreset::FAST:
+                    options.runtime.writeDurability = options.components.walEnabled
+                                                          ? AkkEngineOptions::WriteDurabilityMode::ENQUEUED
+                                                          : AkkEngineOptions::WriteDurabilityMode::MEMORY;
+                    options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::APPLIED;
+                    break;
+            }
+
+            if (options.runtime.writeDurability == AkkEngineOptions::WriteDurabilityMode::MEMORY && options.components.walEnabled) {
+                throw std::invalid_argument("AkkEngine: writeDurability=MEMORY requires WAL to be disabled");
+            }
+        }
+
+        void validateRuntimeOptions(const AkkEngineOptions& options) {
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
+                options.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires readVisibility=APPLIED");
+            }
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
+                (options.components.clusterEnabled || options.components.versionLogEnabled)) {
+                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires cluster and version log to be disabled");
+            }
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
+                options.runtime.sequence.threadLocalRangeSize <= 1) {
+                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES requires sequence.threadLocalRangeSize > 1");
+            }
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE &&
+                options.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
+                throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires sequence.allocation=GLOBAL_ATOMIC");
+            }
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE &&
+                options.runtime.writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+                throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires readVisibility=COMMIT_ORDER");
+            }
+            if (options.components.sstEnabled &&
+                options.runtime.backpressure.maxSstL0Files > 0 &&
+                options.runtime.backpressure.sstCompactionBacklog == AkkEngineOptions::BackpressureMode::BLOCK &&
+                options.sst.compactionMode == sst::SSTCompactionMode::DISABLED) {
+                throw std::invalid_argument("AkkEngine: blocking SST backpressure requires background compaction or fail-fast mode");
+            }
         }
 
         void ensureDir(const fs::path& path) { if (!path.empty()) { fs::create_directories(path); } }
@@ -132,8 +275,11 @@ namespace akkaradb::engine {
         core::BufferArena& arena,
         memtable::MemTable::RangeIterator memtableIter,
         sst::SSTManager::Iterator sstIter,
-        blob::BlobManager* blobManager
+        blob::BlobManager* blobManager,
+        std::shared_ptr<void> operationLifetime = {}
     ) {
+        // Retains a public operation guard for the lifetime of a returned scan.
+        (void)operationLifetime;
         auto memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
         auto sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{};
 
@@ -196,17 +342,56 @@ namespace akkaradb::engine {
 
             class RaftLog;
 
+            class OperationGuard {
+                public:
+                    explicit OperationGuard(Impl& owner, bool rejectClosed = true) : owner_{&owner} {
+                        if (!owner_->tryBeginOperation()) {
+                            if (rejectClosed) { throw std::runtime_error("AkkEngine: engine is closed"); }
+                            return;
+                        }
+                        active_ = true;
+                    }
+
+                    ~OperationGuard() {
+                        if (!active_) { return; }
+                        owner_->endOperation();
+                    }
+
+                    OperationGuard(const OperationGuard&) = delete;
+                    OperationGuard& operator=(const OperationGuard&) = delete;
+
+                    [[nodiscard]] explicit operator bool() const noexcept { return active_; }
+
+                private:
+                    Impl* owner_;
+                    bool active_{false};
+            };
+
             explicit Impl(AkkEngineOptions optionsIn)
                 : opts{std::move(optionsIn)},
+                  writeBackpressureEnabled{
+                      opts.runtime.backpressure.maxMemtableImmutableTables != 0 ||
+                      opts.runtime.backpressure.maxSstL0Files != 0
+                  },
+                  commitWindowSize{resolveCommitWindowSize(opts.runtime.sequence.commitWindowSize)},
                   storage{std::make_shared<StorageState>()},
                   manifest{&storage->manifest},
                   sstManager{&storage->sstManager},
                   memtable{&storage->memtable},
                   walWriter{&storage->walWriter},
                   blobManager{&storage->blobManager},
-                  versionLog{&storage->versionLog} {}
+                  versionLog{&storage->versionLog},
+                  keySequenceOrderMu{
+                      opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE
+                          ? std::make_unique<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>>()
+                          : nullptr
+                  } {}
+
+            static constexpr size_t KEY_SEQUENCE_ORDER_STRIPES = 256;
 
             AkkEngineOptions opts;
+            const bool writeBackpressureEnabled;
+            const uint32_t commitWindowSize;
             std::atomic<bool> closed{false};
             uint64_t nodeId = 0;
 
@@ -222,7 +407,14 @@ namespace akkaradb::engine {
             std::unique_ptr<RaftLog> raftLog;
 
             mutable std::mutex writeMu;
+            std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
             mutable std::shared_mutex storageMu;
+            mutable std::mutex lifecycleMu;
+            std::condition_variable lifecycleCv;
+            static constexpr uint64_t LIFECYCLE_CLOSED = 1ULL << 63u;
+            static constexpr uint64_t LIFECYCLE_OPERATION_MASK = ~LIFECYCLE_CLOSED;
+            std::atomic<uint64_t> lifecycleState{0};
+            bool closing{false};
             std::atomic<uint64_t> putsTotal{0};
             std::atomic<uint64_t> removesTotal{0};
             std::atomic<uint64_t> getsTotal{0};
@@ -232,6 +424,22 @@ namespace akkaradb::engine {
             std::atomic<uint64_t> existsTotal{0};
             std::atomic<uint64_t> scansTotal{0};
             std::atomic<uint64_t> blobPutsTotal{0};
+            mutable std::atomic<uint64_t> backpressureBlockedWrites{0};
+            mutable std::atomic<uint64_t> backpressureRejectedWrites{0};
+            mutable std::atomic<uint64_t> backpressureTimedOutWrites{0};
+            mutable std::atomic<uint64_t> backpressureMemtableStalls{0};
+            mutable std::atomic<uint64_t> backpressureSstStalls{0};
+            mutable std::atomic<uint64_t> backpressureWaitMicrosTotal{0};
+            mutable std::atomic<uint64_t> backpressureWaitMicrosMax{0};
+            std::atomic<uint64_t> committedSeq{0};
+            mutable std::mutex commitMu;
+            mutable std::condition_variable commitCv;
+            // A failed write after it reserved a sequence leaves a permanent
+            // prefix gap. KEY_SEQUENCE reads must fail instead of waiting for
+            // that gap forever.
+            std::exception_ptr keySequenceFailure;
+            std::vector<uint64_t> completedSeqRing;
+            std::unordered_set<uint64_t> completedSeqOverflow;
 
             bool snapshotInProgress = false;
             uint64_t pendingSnapshotSeq = 0;
@@ -405,11 +613,207 @@ namespace akkaradb::engine {
                     uint64_t commitIndex_ = 0;
             };
 
-            [[nodiscard]] uint64_t snapshotSeq() const noexcept { return memtable ? memtable->lastSeq() : 0; }
+            [[nodiscard]] uint64_t snapshotSeq() const noexcept {
+                if (opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+                    return committedSeq.load(std::memory_order_acquire);
+                }
+                const uint64_t nextSeq = memtable ? memtable->lastSeq() : 0;
+                return nextSeq > 0 ? nextSeq - 1 : 0;
+            }
+
+            void markWriteCommitted(uint64_t seq, bool knownContiguous = false) {
+                if (opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::APPLIED) { return; }
+                if (knownContiguous && seq == committedSeq.load(std::memory_order_acquire) + 1u) {
+                    committedSeq.store(seq, std::memory_order_release);
+                    if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) {
+                        commitCv.notify_all();
+                    }
+                    return;
+                }
+                bool advanced = false;
+                {
+                    std::lock_guard lock{commitMu};
+                    uint64_t current = committedSeq.load(std::memory_order_relaxed);
+                    if (seq <= current) { return; }
+
+                    ensureCompletedSeqRing();
+                    const size_t mask = completedSeqRing.size() - 1u;
+                    const uint64_t distance = seq - current;
+                    if (distance <= completedSeqRing.size()) {
+                        const size_t slot = static_cast<size_t>(seq) & mask;
+                        if (completedSeqRing[slot] == 0 || completedSeqRing[slot] <= current) {
+                            completedSeqRing[slot] = seq;
+                        }
+                        else if (completedSeqRing[slot] != seq) {
+                            completedSeqOverflow.insert(seq);
+                        }
+                    }
+                    else {
+                        completedSeqOverflow.insert(seq);
+                    }
+
+                    while (true) {
+                        const uint64_t next = current + 1u;
+                        const size_t slot = static_cast<size_t>(next) & mask;
+                        if (completedSeqRing[slot] == next) {
+                            completedSeqRing[slot] = 0;
+                            current = next;
+                            advanced = true;
+                            continue;
+                        }
+                        if (completedSeqOverflow.erase(next) != 0) {
+                            current = next;
+                            advanced = true;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (advanced) { committedSeq.store(current, std::memory_order_release); }
+                }
+                if (advanced) { commitCv.notify_all(); }
+            }
+
+            void waitForKeySequenceReadVisibility() const {
+                if (opts.runtime.parallelWriteOrder != AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE ||
+                    opts.runtime.writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER ||
+                    !memtable) {
+                    return;
+                }
+                const uint64_t nextSeq = memtable->lastSeq();
+                const uint64_t target = nextSeq > 0 ? nextSeq - 1 : 0;
+                if (committedSeq.load(std::memory_order_acquire) >= target) { return; }
+
+                std::unique_lock lock{commitMu};
+                commitCv.wait(lock, [this, target] {
+                    return committedSeq.load(std::memory_order_acquire) >= target ||
+                           keySequenceFailure ||
+                           closed.load(std::memory_order_acquire);
+                });
+                const std::exception_ptr failure = keySequenceFailure;
+                lock.unlock();
+                if (failure) { std::rethrow_exception(failure); }
+            }
+
+            void markKeySequenceFailure(std::exception_ptr failure) {
+                {
+                    std::lock_guard lock{commitMu};
+                    if (!keySequenceFailure) { keySequenceFailure = std::move(failure); }
+                }
+                commitCv.notify_all();
+            }
+
+            void resetCommittedSeq(uint64_t seq) {
+                std::lock_guard lock{commitMu};
+                committedSeq.store(seq, std::memory_order_release);
+                std::ranges::fill(completedSeqRing, 0);
+                completedSeqOverflow.clear();
+            }
+
+            void ensureCompletedSeqRing() {
+                if (completedSeqRing.empty()) { completedSeqRing.resize(commitWindowSize); }
+            }
+
+            void throwIfBackgroundFailed() const {
+                if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) {
+                    std::exception_ptr failure;
+                    {
+                        std::lock_guard lock{commitMu};
+                        failure = keySequenceFailure;
+                    }
+                    if (failure) { std::rethrow_exception(failure); }
+                }
+                if (walWriter) { walWriter->throwIfFailed(); }
+                if (sstManager) { sstManager->throwIfBackgroundFailed(); }
+            }
+
+            [[nodiscard]] wal::WalAppendAck walAckForWriteDurability() const noexcept {
+                switch (opts.runtime.writeDurability) {
+                    case AkkEngineOptions::WriteDurabilityMode::MEMORY:
+                    case AkkEngineOptions::WriteDurabilityMode::ENQUEUED:
+                        return wal::WalAppendAck::ENQUEUED;
+                    case AkkEngineOptions::WriteDurabilityMode::WRITTEN:
+                        return wal::WalAppendAck::WRITTEN;
+                    case AkkEngineOptions::WriteDurabilityMode::SYNCED:
+                        return wal::WalAppendAck::SYNCED;
+                }
+                return wal::WalAppendAck::WRITTEN;
+            }
+
+            [[nodiscard]] uint64_t reserveWriteSeq(uint64_t count) {
+                if (count != 1 || opts.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES) {
+                    return memtable->reserveSeq(count);
+                }
+
+                struct SeqRangeCache {
+                    const Impl* owner = nullptr;
+                    uint64_t next = 0;
+                    uint64_t end = 0;
+                };
+                static thread_local SeqRangeCache cache;
+
+                if (cache.owner != this || cache.next >= cache.end) {
+                    const uint32_t rangeSize = std::max<uint32_t>(2, opts.runtime.sequence.threadLocalRangeSize);
+                    const uint64_t base = memtable->reserveSeq(rangeSize);
+                    cache.owner = this;
+                    cache.next = base;
+                    cache.end = base + rangeSize;
+                }
+                return cache.next++;
+            }
 
             [[nodiscard]] std::shared_ptr<StorageState> pinStorage() const {
                 std::shared_lock lock{storageMu};
                 return storage;
+            }
+
+            [[nodiscard]] bool tryBeginOperation() {
+                uint64_t state = lifecycleState.load(std::memory_order_acquire);
+                while ((state & LIFECYCLE_CLOSED) == 0) {
+                    if ((state & LIFECYCLE_OPERATION_MASK) == LIFECYCLE_OPERATION_MASK) {
+                        throw std::runtime_error("AkkEngine: too many in-flight operations");
+                    }
+                    if (lifecycleState.compare_exchange_weak(
+                        state,
+                        state + 1u,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire
+                    )) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            void endOperation() noexcept {
+                const uint64_t previous = lifecycleState.fetch_sub(1u, std::memory_order_acq_rel);
+                if ((previous & LIFECYCLE_OPERATION_MASK) == 1u) { lifecycleCv.notify_all(); }
+            }
+
+            [[nodiscard]] bool beginClose() {
+                std::unique_lock lock{lifecycleMu};
+                if (closed.load(std::memory_order_acquire)) {
+                    lifecycleCv.wait(lock, [this]() { return !closing; });
+                    return false;
+                }
+                lifecycleState.fetch_or(LIFECYCLE_CLOSED, std::memory_order_acq_rel);
+                closed.store(true, std::memory_order_release);
+                closing = true;
+                lock.unlock();
+                commitCv.notify_all();
+                if (walWriter) { walWriter->requestClose(); }
+                lock.lock();
+                lifecycleCv.wait(lock, [this]() {
+                    return (lifecycleState.load(std::memory_order_acquire) & LIFECYCLE_OPERATION_MASK) == 0;
+                });
+                return true;
+            }
+
+            void finishClose() noexcept {
+                {
+                    std::lock_guard lock{lifecycleMu};
+                    closing = false;
+                }
+                lifecycleCv.notify_all();
             }
 
             void replaceStorage(std::shared_ptr<StorageState> replacement) {
@@ -448,7 +852,286 @@ namespace akkaradb::engine {
                 return out;
             }
 
+            [[nodiscard]] std::optional<std::vector<uint8_t>> getValueInternal(
+                std::span<const uint8_t> key,
+                bool countStats,
+                std::optional<uint64_t> requestedSnapshot = std::nullopt
+            ) {
+                throwIfBackgroundFailed();
+                if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
+                if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
+                const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
+
+                RecordView view;
+                if (memtable->get(key, seq, &view)) {
+                    if (view.isTombstone()) {
+                        getsMiss.fetch_add(1, std::memory_order_relaxed);
+                        return std::nullopt;
+                    }
+                    auto value = resolveValue(view.flags(), view.value());
+                    if (value) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
+                    else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                    return value;
+                }
+
+                if (sstManager) {
+                    auto record = sstManager->get(key, seq);
+                    if (record) {
+                        if (record->isTombstone()) {
+                            getsMiss.fetch_add(1, std::memory_order_relaxed);
+                            return std::nullopt;
+                        }
+                        if (opts.runtime.sstPromoteReads && memtable) {
+                            memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
+                        }
+                        auto value = resolveValue(record->flags, record->value);
+                        if (value) { getsSstHit.fetch_add(1, std::memory_order_relaxed); }
+                        else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                        return value;
+                    }
+                }
+                getsMiss.fetch_add(1, std::memory_order_relaxed);
+                return std::nullopt;
+            }
+
+            [[nodiscard]] bool getIntoInternal(
+                std::span<const uint8_t> key,
+                std::vector<uint8_t>& out,
+                bool countStats,
+                std::optional<uint64_t> requestedSnapshot = std::nullopt
+            ) {
+                throwIfBackgroundFailed();
+                if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
+                if (blobManager) {
+                    auto value = getValueInternal(key, countStats, requestedSnapshot);
+                    if (!value) { return false; }
+                    out = std::move(*value);
+                    return true;
+                }
+
+                if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
+                const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
+                if (const auto mt = memtable->getInto(key, seq, out); mt.has_value()) {
+                    if (*mt) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
+                    else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                    return *mt;
+                }
+                if (sstManager) {
+                    if (const auto sst = sstManager->getInto(key, out, seq); sst.has_value()) {
+                        if (*sst) {
+                            if (opts.runtime.sstPromoteReads) {
+                                if (auto record = sstManager->get(key, seq); record && !record->isTombstone()) {
+                                    memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
+                                }
+                            }
+                            getsSstHit.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                        return *sst;
+                    }
+                }
+                getsMiss.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            [[nodiscard]] bool getIntoArenaInternal(
+                std::span<const uint8_t> key,
+                core::BufferArena& arena,
+                std::span<const uint8_t>& out,
+                bool countStats
+            ) {
+                throwIfBackgroundFailed();
+                waitForKeySequenceReadVisibility();
+                out = {};
+                if (blobManager) {
+                    auto value = getValueInternal(key, countStats);
+                    if (!value) { return false; }
+                    out = copySpanToArena(*value, arena);
+                    return true;
+                }
+
+                if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
+                const uint64_t seq = snapshotSeq();
+                RecordView view;
+                if (memtable->get(key, seq, &view)) {
+                    if (view.isTombstone()) {
+                        getsMiss.fetch_add(1, std::memory_order_relaxed);
+                        return false;
+                    }
+                    out = copySpanToArena(view.value(), arena);
+                    getsMemtableHit.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+
+                if (sstManager) {
+                    auto record = sstManager->get(key, seq);
+                    if (record) {
+                        if (record->isTombstone()) {
+                            getsMiss.fetch_add(1, std::memory_order_relaxed);
+                            return false;
+                        }
+                        if (opts.runtime.sstPromoteReads && memtable) {
+                            memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
+                        }
+                        out = copySpanToArena(record->value, arena);
+                        getsSstHit.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    }
+                }
+                getsMiss.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
             [[nodiscard]] bool canRunBlobGc() const noexcept { return blobManager != nullptr && versionLog == nullptr; }
+
+            [[nodiscard]] bool canUseParallelWriteAdmission() const noexcept {
+                const bool supported = !walWriter && !versionLog && !blobManager && !clusterRuntime;
+                const bool explicitSupported = !versionLog && !blobManager && !clusterRuntime;
+                switch (opts.runtime.writeAdmission) {
+                    case AkkEngineOptions::WriteAdmissionMode::SERIAL:
+                        return false;
+                    case AkkEngineOptions::WriteAdmissionMode::PARALLEL:
+                        return explicitSupported;
+                    case AkkEngineOptions::WriteAdmissionMode::AUTO:
+                        return opts.runtime.relaxedConcurrentWrites && supported;
+                }
+                return false;
+            }
+
+            [[nodiscard]] bool usesKeySequenceOrder() const noexcept {
+                return canUseParallelWriteAdmission() &&
+                       opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE;
+            }
+
+            [[nodiscard]] std::mutex& keySequenceOrderMutex(uint64_t fp64, size_t keySize) noexcept {
+                const uint64_t route = fp64 ^ (static_cast<uint64_t>(keySize) * 0x9E3779B97F4A7C15ULL);
+                return (*keySequenceOrderMu)[static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u)];
+            }
+
+            [[nodiscard]] std::vector<std::unique_lock<std::mutex>> lockKeySequenceOrderStripes(
+                std::span<const BatchPutEntry> entries
+            ) {
+                std::vector<size_t> stripes;
+                stripes.reserve(entries.size());
+                for (const auto& entry : entries) {
+                    const uint64_t fp64 = entry.key.empty() ? 0 : core::computeKeyFp64(entry.key.data(), entry.key.size());
+                    const uint64_t route = fp64 ^ (static_cast<uint64_t>(entry.key.size()) * 0x9E3779B97F4A7C15ULL);
+                    stripes.push_back(static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u));
+                }
+                std::ranges::sort(stripes);
+                stripes.erase(std::unique(stripes.begin(), stripes.end()), stripes.end());
+
+                std::vector<std::unique_lock<std::mutex>> locks;
+                locks.reserve(stripes.size());
+                for (const size_t stripe : stripes) { locks.emplace_back((*keySequenceOrderMu)[stripe]); }
+                return locks;
+            }
+
+            [[nodiscard]] bool memtableBackpressureActive() const noexcept {
+                const uint32_t limit = opts.runtime.backpressure.maxMemtableImmutableTables;
+                if (limit == 0 || !memtable) { return false; }
+                return memtable->snapshot().immutableTables >= limit;
+            }
+
+            [[nodiscard]] bool sstBackpressureActive() const {
+                const uint32_t limit = opts.runtime.backpressure.maxSstL0Files;
+                if (limit == 0 || !sstManager) { return false; }
+                const auto levels = sstManager->levelStats();
+                for (const auto& level : levels) {
+                    if (level.level == 0) { return level.fileCount >= limit; }
+                }
+                return false;
+            }
+
+            void recordBackpressureWait(std::chrono::steady_clock::duration elapsed) const noexcept {
+                const uint64_t micros = static_cast<uint64_t>(std::max<int64_t>(
+                    0,
+                    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()
+                ));
+                backpressureWaitMicrosTotal.fetch_add(micros, std::memory_order_relaxed);
+                uint64_t observed = backpressureWaitMicrosMax.load(std::memory_order_relaxed);
+                while (observed < micros && !backpressureWaitMicrosMax.compare_exchange_weak(
+                    observed,
+                    micros,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed
+                )) {}
+            }
+
+            [[noreturn]] void rejectBackpressuredWrite(const char* reason, bool timedOut) const {
+                backpressureRejectedWrites.fetch_add(1, std::memory_order_relaxed);
+                if (timedOut) { backpressureTimedOutWrites.fetch_add(1, std::memory_order_relaxed); }
+                std::string message = "AkkEngine: write backpressure ";
+                message += timedOut ? "timed out: " : "rejected write: ";
+                message += reason;
+                throw std::runtime_error(message);
+            }
+
+            void applyWriteBackpressure() const {
+                if (!writeBackpressureEnabled) {
+                    if (closed.load(std::memory_order_acquire)) {
+                        throw std::runtime_error("AkkEngine: engine is closed");
+                    }
+                    throwIfBackgroundFailed();
+                    if (memtable) { memtable->throwIfFlushFailed(); }
+                    return;
+                }
+                const auto started = std::chrono::steady_clock::now();
+                const auto timeout = std::chrono::milliseconds{opts.runtime.backpressure.timeoutMs};
+                bool waited = false;
+                bool countedMemtable = false;
+                bool countedSst = false;
+                while (true) {
+                    if (closed.load(std::memory_order_acquire)) {
+                        if (waited) { recordBackpressureWait(std::chrono::steady_clock::now() - started); }
+                        throw std::runtime_error("AkkEngine: engine is closed");
+                    }
+                    throwIfBackgroundFailed();
+                    if (memtable) { memtable->throwIfFlushFailed(); }
+
+                    AkkEngineOptions::BackpressureMode mode;
+                    const char* reason = nullptr;
+                    if (memtableBackpressureActive()) {
+                        mode = opts.runtime.backpressure.memtableFlushBacklog;
+                        reason = "memtable immutable-table backlog";
+                        if (!countedMemtable) {
+                            backpressureMemtableStalls.fetch_add(1, std::memory_order_relaxed);
+                            countedMemtable = true;
+                        }
+                    }
+                    else if (sstBackpressureActive()) {
+                        mode = opts.runtime.backpressure.sstCompactionBacklog;
+                        reason = "sst L0 compaction backlog";
+                        if (!countedSst) {
+                            backpressureSstStalls.fetch_add(1, std::memory_order_relaxed);
+                            countedSst = true;
+                        }
+                    }
+                    else {
+                        if (waited) { recordBackpressureWait(std::chrono::steady_clock::now() - started); }
+                        return;
+                    }
+
+                    if (mode == AkkEngineOptions::BackpressureMode::FAIL_FAST) { rejectBackpressuredWrite(reason, false); }
+                    if (!waited) {
+                        backpressureBlockedWrites.fetch_add(1, std::memory_order_relaxed);
+                        waited = true;
+                    }
+
+                    const auto elapsed = std::chrono::steady_clock::now() - started;
+                    if (opts.runtime.backpressure.timeoutMs != 0 && elapsed >= timeout) {
+                        recordBackpressureWait(elapsed);
+                        rejectBackpressuredWrite(reason, true);
+                    }
+
+                    auto wait = std::chrono::microseconds{std::max<uint32_t>(1, opts.runtime.backpressure.waitMicros)};
+                    if (opts.runtime.backpressure.timeoutMs != 0) {
+                        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(timeout - elapsed);
+                        wait = std::min(wait, std::max(std::chrono::microseconds{1}, remaining));
+                    }
+                    std::this_thread::sleep_for(wait);
+                }
+            }
 
             [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
                 std::unordered_set<uint64_t> live;
@@ -458,7 +1141,7 @@ namespace akkaradb::engine {
                 memtable::MemTable::KeyRange range;
                 auto mt = memtable->iterator(range, snapshotSeq);
                 sst::SSTManager::Iterator sstIt;
-                if (sstManager) { sstIt = sstManager->scanIter({}, {}); }
+                if (sstManager) { sstIt = sstManager->scanIter({}, {}, snapshotSeq); }
 
                 auto mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
                 auto sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
@@ -502,11 +1185,14 @@ namespace akkaradb::engine {
                 uint64_t sourceNodeId,
                 uint64_t precomputedFp64 = 0,
                 uint64_t precomputedMiniKey = 0,
-                uint8_t versionLogFlags = 0xFF
+                uint8_t versionLogFlags = 0xFF,
+                bool knownContiguousCommit = false
             ) {
+                throwIfBackgroundFailed();
+                memtable->throwIfFlushFailed();
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
                 const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
-                if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64); }
+                if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64, walAckForWriteDurability()); }
                 if (versionLog) {
                     const uint8_t vlogFlags = versionLogFlags == 0xFF ? flags : versionLogFlags;
                     versionLog->append(key, seq, sourceNodeId, nowNs(), vlogFlags, storedValue);
@@ -514,6 +1200,7 @@ namespace akkaradb::engine {
 
                 if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
+                markWriteCommitted(seq, knownContiguousCommit);
             }
 
             [[nodiscard]] AppliedWrite applyLocalPut(
@@ -527,9 +1214,10 @@ namespace akkaradb::engine {
                 write.key = key;
                 write.op = cluster::ReplOpType::PUT;
                 write.sourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                applyWriteBackpressure();
                 {
                     std::lock_guard lock(writeMu);
-                    write.seq = memtable->reserveSeq(1);
+                    write.seq = reserveWriteSeq(1);
                     write.stored = maybeExternalize(write.seq, value, write.flags);
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
                     if ((write.flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
@@ -538,12 +1226,59 @@ namespace akkaradb::engine {
                 return write;
             }
 
+            void applyLocalPutUnreplicated(
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t fp64 = 0,
+                uint64_t miniKey = 0,
+                uint64_t sourceNodeId = 0
+            ) {
+                uint8_t flags = MemHdr16::FLAG_NORMAL;
+                const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                applyWriteBackpressure();
+                if (canUseParallelWriteAdmission()) {
+                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    if (usesKeySequenceOrder()) {
+                        std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
+                        const uint64_t seq = reserveWriteSeq(1);
+                        try {
+                            putsTotal.fetch_add(1, std::memory_order_relaxed);
+                            appendAll(seq, key, value, flags, writeSourceNodeId, resolvedFp64, resolvedMiniKey);
+                        }
+                        catch (...) {
+                            markKeySequenceFailure(std::current_exception());
+                            throw;
+                        }
+                        return;
+                    }
+                    const uint64_t seq = reserveWriteSeq(1);
+                    putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    appendAll(seq, key, value, flags, writeSourceNodeId, resolvedFp64, resolvedMiniKey);
+                    return;
+                }
+
+                std::lock_guard lock(writeMu);
+                const uint64_t seq = reserveWriteSeq(1);
+                putsTotal.fetch_add(1, std::memory_order_relaxed);
+
+                if (blobManager && value.size() >= blobManager->threshold()) {
+                    std::vector<uint8_t> stored = maybeExternalize(seq, value, flags);
+                    if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                    appendAll(seq, key, stored, flags, writeSourceNodeId, fp64, miniKey, 0xFF, true);
+                    return;
+                }
+
+                appendAll(seq, key, value, flags, writeSourceNodeId, fp64, miniKey, 0xFF, true);
+            }
+
             [[nodiscard]] std::vector<AppliedWrite> applyLocalPutBatch(std::span<const BatchPutEntry> entries) {
                 std::vector<AppliedWrite> writes;
                 writes.reserve(entries.size());
+                if (!entries.empty()) { applyWriteBackpressure(); }
 
                 std::lock_guard lock(writeMu);
-                const uint64_t baseSeq = memtable->reserveSeq(entries.size());
+                const uint64_t baseSeq = reserveWriteSeq(entries.size());
                 for (size_t i = 0; i < entries.size(); ++i) {
                     const auto& [key, value] = entries[i];
                     AppliedWrite write;
@@ -560,6 +1295,46 @@ namespace akkaradb::engine {
                 return writes;
             }
 
+            void applyLocalPutBatchUnreplicated(std::span<const BatchPutEntry> entries) {
+                if (!entries.empty()) { applyWriteBackpressure(); }
+                if (canUseParallelWriteAdmission()) {
+                    std::vector<std::unique_lock<std::mutex>> keyOrderLocks;
+                    const bool keySequenceOrder = usesKeySequenceOrder();
+                    if (keySequenceOrder) { keyOrderLocks = lockKeySequenceOrderStripes(entries); }
+                    const uint64_t baseSeq = reserveWriteSeq(entries.size());
+                    try {
+                        for (size_t i = 0; i < entries.size(); ++i) {
+                            const auto& [key, value] = entries[i];
+                            putsTotal.fetch_add(1, std::memory_order_relaxed);
+                            appendAll(baseSeq + i, key, value, MemHdr16::FLAG_NORMAL, nodeId);
+                        }
+                    }
+                    catch (...) {
+                        if (keySequenceOrder) { markKeySequenceFailure(std::current_exception()); }
+                        throw;
+                    }
+                    return;
+                }
+
+                std::lock_guard lock(writeMu);
+                const uint64_t baseSeq = reserveWriteSeq(entries.size());
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    const auto& [key, value] = entries[i];
+                    uint8_t flags = MemHdr16::FLAG_NORMAL;
+                    putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    const uint64_t seq = baseSeq + i;
+
+                    if (blobManager && value.size() >= blobManager->threshold()) {
+                        std::vector<uint8_t> stored = maybeExternalize(seq, value, flags);
+                        if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
+                        appendAll(seq, key, stored, flags, nodeId, 0, 0, 0xFF, true);
+                    }
+                    else {
+                        appendAll(seq, key, value, flags, nodeId, 0, 0, 0xFF, true);
+                    }
+                }
+            }
+
             [[nodiscard]] AppliedWrite applyLocalRemove(
                 std::span<const uint8_t> key,
                 uint64_t fp64 = 0,
@@ -571,13 +1346,45 @@ namespace akkaradb::engine {
                 write.op = cluster::ReplOpType::REMOVE;
                 write.flags = MemHdr16::FLAG_TOMBSTONE;
                 write.sourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                applyWriteBackpressure();
                 {
                     std::lock_guard lock(writeMu);
-                    write.seq = memtable->reserveSeq(1);
+                    write.seq = reserveWriteSeq(1);
                     removesTotal.fetch_add(1, std::memory_order_relaxed);
                     appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey);
                 }
                 return write;
+            }
+
+            void applyLocalRemoveUnreplicated(std::span<const uint8_t> key, uint64_t fp64 = 0, uint64_t miniKey = 0, uint64_t sourceNodeId = 0) {
+                const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
+                applyWriteBackpressure();
+                if (canUseParallelWriteAdmission()) {
+                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    if (usesKeySequenceOrder()) {
+                        std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
+                        const uint64_t seq = reserveWriteSeq(1);
+                        try {
+                            removesTotal.fetch_add(1, std::memory_order_relaxed);
+                            appendAll(seq, key, {}, MemHdr16::FLAG_TOMBSTONE, writeSourceNodeId, resolvedFp64, resolvedMiniKey);
+                        }
+                        catch (...) {
+                            markKeySequenceFailure(std::current_exception());
+                            throw;
+                        }
+                        return;
+                    }
+                    const uint64_t seq = reserveWriteSeq(1);
+                    removesTotal.fetch_add(1, std::memory_order_relaxed);
+                    appendAll(seq, key, {}, MemHdr16::FLAG_TOMBSTONE, writeSourceNodeId, resolvedFp64, resolvedMiniKey);
+                    return;
+                }
+
+                std::lock_guard lock(writeMu);
+                const uint64_t seq = reserveWriteSeq(1);
+                removesTotal.fetch_add(1, std::memory_order_relaxed);
+                appendAll(seq, key, {}, MemHdr16::FLAG_TOMBSTONE, writeSourceNodeId, fp64, miniKey, 0xFF, true);
             }
 
             void replicateCommitted(const AppliedWrite& write) {
@@ -669,9 +1476,10 @@ namespace akkaradb::engine {
 
                 core::BufferArena arena;
                 memtable::MemTable::KeyRange range;
-                auto mt = memtable->iterator(range, snapshotSeq());
+                const uint64_t visibleSeq = snapshotSeq();
+                auto mt = memtable->iterator(range, visibleSeq);
                 sst::SSTManager::Iterator sst;
-                if (sstManager) { sst = sstManager->scanIter({}, {}); }
+                if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
                     if (incomingKeys.find(key) == incomingKeys.end()) {
@@ -703,6 +1511,27 @@ namespace akkaradb::engine {
 
                 protected:
                     Impl& engine_;
+            };
+
+            class LocalUnreplicatedWriteCoordinator final : public WriteCoordinator {
+                public:
+                    using WriteCoordinator::WriteCoordinator;
+
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        engine_.applyLocalPutUnreplicated(key, value);
+                    }
+
+                    void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
+                        engine_.applyLocalPutUnreplicated(key, value, fp64, miniKey);
+                    }
+
+                    void putBatch(std::span<const BatchPutEntry> entries) override { engine_.applyLocalPutBatchUnreplicated(entries); }
+
+                    void remove(std::span<const uint8_t> key) override { engine_.applyLocalRemoveUnreplicated(key); }
+
+                    void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
+                        engine_.applyLocalRemoveUnreplicated(key, fp64, miniKey);
+                    }
             };
 
             class LocalReplicationWriteCoordinator final : public WriteCoordinator {
@@ -785,6 +1614,7 @@ namespace akkaradb::engine {
                 if (mode == cluster::ConsistencyMode::RAFT_QUORUM) {
                     return std::make_unique<RaftQuorumWriteCoordinator>(*this);
                 }
+                if (!clusterRuntime) { return std::make_unique<LocalUnreplicatedWriteCoordinator>(*this); }
                 return std::make_unique<LocalReplicationWriteCoordinator>(*this);
             }
 
@@ -792,9 +1622,14 @@ namespace akkaradb::engine {
     };
 
     AkkEngine::AkkEngine() = default;
-    AkkEngine::~AkkEngine() { close(); }
+    AkkEngine::~AkkEngine() {
+        try { close(); }
+        catch (...) {}
+    }
 
     std::unique_ptr<AkkEngine> AkkEngine::open(AkkEngineOptions options) {
+        resolveWritePolicy(options);
+        normalizeVisibilityOptions(options);
         if (options.runtime.generationLayoutEnabled && !options.paths.dataDir.empty()) {
             options.paths.dataDir = generation::StorageGeneration::openOrCreate(options.paths.dataDir).activePath();
         }
@@ -824,6 +1659,10 @@ namespace akkaradb::engine {
                 options.wal.shardCount = static_cast<uint16_t>(shardsForThreads(options.runtime.writerThreads, 64));
             }
         }
+        normalizeWalOptions(options.wal);
+        normalizeMemTableOptions(options.memtable);
+        normalizeSstOptions(options.sst);
+        validateRuntimeOptions(options);
 
         if (!options.paths.dataDir.empty()) { ensureDir(options.paths.dataDir); }
         if (options.components.walEnabled) { ensureDir(options.wal.walDir); }
@@ -836,6 +1675,11 @@ namespace akkaradb::engine {
         if (options.components.versionLogEnabled) { ensureDir(options.vlog.logPath.parent_path()); }
         if (options.components.apiEnabled && options.api.bindHost.empty()) {
             throw std::invalid_argument("AkkEngine: api.bindHost is required when components.apiEnabled is true");
+        }
+        if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
+            throw std::invalid_argument(
+                "AkkEngine: runtime.writeAdmission=PARALLEL currently requires blob, version log, and cluster to be disabled"
+            );
         }
         auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
         engine->impl_ = std::make_unique<Impl>(std::move(options));
@@ -852,18 +1696,34 @@ namespace akkaradb::engine {
             if (impl.opts.runtime.recoverSst) { impl.sstManager->recover(); }
         }
 
-        impl.opts.memtable.onFlush = [&impl](std::span<const core::RecordView> records) {
-            if (!impl.sstManager || records.empty()) { return; }
-            const uint64_t checkpointSeq = impl.sstManager->flush(records);
-            if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
-            if (impl.manifest) { impl.manifest->checkpoint(std::optional<std::string>{"flush"}, std::nullopt, checkpointSeq); }
-            if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
-        };
+        if (impl.sstManager) {
+            impl.opts.memtable.onFlush = [&impl](std::span<const core::RecordView> records) {
+                if (records.empty()) { return; }
+                const uint64_t checkpointSeq = impl.sstManager->flush(records);
+                crashAtTestPoint("engine.flush.after_sst_flush");
+                if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
+                crashAtTestPoint("engine.flush.after_wal_prune");
+                if (impl.manifest) { impl.manifest->checkpoint(std::optional<std::string>{"flush"}, std::nullopt, checkpointSeq); }
+                crashAtTestPoint("engine.flush.after_manifest_checkpoint");
+                if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
+            };
+        }
+        else {
+            impl.opts.memtable.onFlush = {};
+        }
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
         if (impl.opts.components.walEnabled && impl.opts.runtime.recoverWal) {
             const auto recovery = wal::WalRecovery::recoverInto(wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir}, *impl.memtable);
             (void)recovery;
         }
+        uint64_t recoveredSeq = 0;
+        if (impl.memtable) {
+            const uint64_t nextMemtableSeq = impl.memtable->lastSeq();
+            recoveredSeq = nextMemtableSeq > 0 ? nextMemtableSeq - 1 : 0;
+        }
+        if (impl.sstManager) { recoveredSeq = std::max(recoveredSeq, impl.sstManager->maxSequence()); }
+        if (impl.memtable && recoveredSeq > 0) { impl.memtable->advanceSeq(recoveredSeq); }
+        impl.resetCommittedSeq(recoveredSeq);
 
         if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
 
@@ -922,7 +1782,7 @@ namespace akkaradb::engine {
                 memtable::MemTable::KeyRange range;
                 auto mt = impl.memtable->iterator(range, snapshot.seq);
                 sst::SSTManager::Iterator sst;
-                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}); }
+                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, snapshot.seq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), impl.blobManager.get())) {
                     snapshot.entries.push_back(cluster::ClusterHistoryEntry{
                         .key = {record.key.begin(), record.key.end()},
@@ -998,77 +1858,64 @@ namespace akkaradb::engine {
     }
 
     void AkkEngine::put(std::span<const uint8_t> key, std::span<const uint8_t> value) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->writeCoordinator->put(key, value);
     }
 
     void AkkEngine::putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->writeCoordinator->putHinted(key, value, fp64, miniKey);
     }
 
     void AkkEngine::putBatch(std::span<const BatchPutEntry> entries) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        if (entries.empty()) { return; }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (entries.empty()) {
+            impl_->throwIfBackgroundFailed();
+            return;
+        }
+        if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->writeCoordinator->putBatch(entries);
     }
 
     void AkkEngine::remove(std::span<const uint8_t> key) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->writeCoordinator->remove(key);
     }
 
     void AkkEngine::removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->writeCoordinator->removeHinted(key, fp64, miniKey);
     }
 
     std::optional<std::vector<uint8_t>> AkkEngine::get(std::span<const uint8_t> key) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        impl_->getsTotal.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t seq = impl_->snapshotSeq();
-
-        RecordView view;
-        if (impl_->memtable->get(key, seq, &view)) {
-            if (view.isTombstone()) {
-                impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-                return std::nullopt;
-            }
-            auto value = impl_->resolveValue(view.flags(), view.value());
-            if (value) { impl_->getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
-            else { impl_->getsMiss.fetch_add(1, std::memory_order_relaxed); }
-            return value;
-        }
-
-        if (impl_->sstManager) {
-            auto record = impl_->sstManager->get(key);
-            if (record) {
-                if (record->isTombstone()) {
-                    impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-                    return std::nullopt;
-                }
-                if (impl_->opts.runtime.sstPromoteReads && impl_->memtable) {
-                    impl_->memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                }
-                auto value = impl_->resolveValue(record->flags, record->value);
-                if (value) { impl_->getsSstHit.fetch_add(1, std::memory_order_relaxed); }
-                else { impl_->getsMiss.fetch_add(1, std::memory_order_relaxed); }
-                return value;
-            }
-        }
-        impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-        return std::nullopt;
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        return impl_->getValueInternal(key, true);
     }
 
     std::vector<AkkEngine::BatchGetResult> AkkEngine::getBatch(std::span<const std::span<const uint8_t>> keys) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        impl_->waitForKeySequenceReadVisibility();
+        const uint64_t snapshot = impl_->snapshotSeq();
 
         std::vector<BatchGetResult> out;
         out.reserve(keys.size());
 
         for (const auto& key : keys) {
             BatchGetResult result;
-            result.found = getInto(key, result.value);
+            result.found = impl_->getIntoInternal(key, result.value, true, snapshot);
             out.push_back(std::move(result));
         }
 
@@ -1076,100 +1923,52 @@ namespace akkaradb::engine {
     }
 
     bool AkkEngine::exists(std::span<const uint8_t> key) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        impl_->waitForKeySequenceReadVisibility();
         impl_->existsTotal.fetch_add(1, std::memory_order_relaxed);
         const uint64_t seq = impl_->snapshotSeq();
         if (const auto mt = impl_->memtable->contains(key, seq); mt.has_value()) { return *mt; }
-        if (impl_->sstManager) { if (const auto sst = impl_->sstManager->contains(key); sst.has_value()) { return *sst; } }
+        if (impl_->sstManager) { if (const auto sst = impl_->sstManager->contains(key, seq); sst.has_value()) { return *sst; } }
         return false;
     }
 
     bool AkkEngine::getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        if (impl_->blobManager) {
-            auto value = get(key);
-            if (!value) { return false; }
-            out = std::move(*value);
-            return true;
-        }
-
-        impl_->getsTotal.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t seq = impl_->snapshotSeq();
-        if (const auto mt = impl_->memtable->getInto(key, seq, out); mt.has_value()) {
-            if (*mt) { impl_->getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
-            else { impl_->getsMiss.fetch_add(1, std::memory_order_relaxed); }
-            return *mt;
-        }
-        if (impl_->sstManager) {
-            if (const auto sst = impl_->sstManager->getInto(key, out); sst.has_value()) {
-                if (*sst) {
-                    if (impl_->opts.runtime.sstPromoteReads) {
-                        if (auto record = impl_->sstManager->get(key); record && !record->isTombstone()) {
-                            impl_->memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                        }
-                    }
-                    impl_->getsSstHit.fetch_add(1, std::memory_order_relaxed);
-                }
-                else { impl_->getsMiss.fetch_add(1, std::memory_order_relaxed); }
-                return *sst;
-            }
-        }
-        impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        return impl_->getIntoInternal(key, out, true);
     }
 
     bool AkkEngine::getIntoArena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
-        out = {};
-
-        if (impl_->blobManager) {
-            auto value = get(key);
-            if (!value) { return false; }
-            out = copySpanToArena(*value, arena);
-            return true;
-        }
-
-        impl_->getsTotal.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t seq = impl_->snapshotSeq();
-        RecordView view;
-        if (impl_->memtable->get(key, seq, &view)) {
-            if (view.isTombstone()) {
-                impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            out = copySpanToArena(view.value(), arena);
-            impl_->getsMemtableHit.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-
-        if (impl_->sstManager) {
-            auto record = impl_->sstManager->get(key);
-            if (record) {
-                if (record->isTombstone()) {
-                    impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-                if (impl_->opts.runtime.sstPromoteReads && impl_->memtable) {
-                    impl_->memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                }
-                out = copySpanToArena(record->value, arena);
-                impl_->getsSstHit.fetch_add(1, std::memory_order_relaxed);
-                return true;
-            }
-        }
-        impl_->getsMiss.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        return impl_->getIntoArenaInternal(key, arena, out, true);
     }
 
     size_t AkkEngine::count(std::span<const uint8_t> startKey, std::span<const uint8_t> endKey) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        impl_->waitForKeySequenceReadVisibility();
 
         memtable::MemTable::KeyRange range;
         range.start.assign(startKey.begin(), startKey.end());
         range.end.assign(endKey.begin(), endKey.end());
-        auto mt = impl_->memtable->iterator(range, impl_->snapshotSeq());
+        uint64_t seq = 0;
+        auto mt = [&]() {
+            if (impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT) {
+                auto pinned = impl_->memtable->pinnedIterator(range, [this] { return impl_->snapshotSeq(); });
+                seq = pinned.snapshotSeq();
+                return pinned;
+            }
+            seq = impl_->snapshotSeq();
+            return impl_->memtable->iterator(range, seq);
+        }();
         sst::SSTManager::Iterator sstIt;
-        if (impl_->sstManager) { sstIt = impl_->sstManager->scanIter(startKey, endKey); }
+        if (impl_->sstManager) { sstIt = impl_->sstManager->scanIter(startKey, endKey, seq); }
 
         auto mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
         auto sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
@@ -1204,25 +2003,39 @@ namespace akkaradb::engine {
         std::span<const uint8_t> startKey,
         std::span<const uint8_t> endKey
     ) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
+        impl_->throwIfBackgroundFailed();
+        impl_->waitForKeySequenceReadVisibility();
         impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
 
         memtable::MemTable::KeyRange range;
         range.start.assign(startKey.begin(), startKey.end());
         range.end.assign(endKey.begin(), endKey.end());
-        auto mt = impl_->memtable->iterator(range, impl_->snapshotSeq());
+        uint64_t seq = 0;
+        auto mt = [&]() {
+            if (impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT) {
+                auto pinned = impl_->memtable->pinnedIterator(range, [this] { return impl_->snapshotSeq(); });
+                seq = pinned.snapshotSeq();
+                return pinned;
+            }
+            seq = impl_->snapshotSeq();
+            return impl_->memtable->iterator(range, seq);
+        }();
         sst::SSTManager::Iterator st;
-        if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey); }
+        if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq); }
         return core::ArenaGenerator<ScanRecordView>::withArena(
             arena,
-            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get()]() mutable {
-                return scanGenerator(arena, std::move(mt), std::move(st), blobManager);
+            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation)]() mutable {
+                return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(operation));
             }
         );
     }
 
     std::optional<std::vector<uint8_t>> AkkEngine::getAt(std::span<const uint8_t> key, uint64_t atSeq) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
         if (!impl_->versionLog) { return std::nullopt; }
         auto entry = impl_->versionLog->getAt(key, atSeq);
         if (!entry || (entry->flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) { return std::nullopt; }
@@ -1230,12 +2043,16 @@ namespace akkaradb::engine {
     }
 
     std::vector<VersionEntry> AkkEngine::history(std::span<const uint8_t> key) const {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
         return impl_->versionLog ? impl_->versionLog->history(key) : std::vector<VersionEntry>{};
     }
 
     void AkkEngine::rollbackTo(uint64_t targetSeq) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
         for (const auto& [key, prev] : impl_->versionLog->collectRollbackTargets(targetSeq)) {
             uint64_t seq = 0;
@@ -1269,7 +2086,9 @@ namespace akkaradb::engine {
     }
 
     void AkkEngine::rollbackKey(std::span<const uint8_t> key, uint64_t targetSeq) {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
         const auto prev = impl_->versionLog->getAt(key, targetSeq);
         uint64_t seq = 0;
@@ -1303,7 +2122,9 @@ namespace akkaradb::engine {
 
     EngineStats AkkEngine::stats() const noexcept {
         EngineStats out;
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { return out; }
+        if (!impl_) { return out; }
+        Impl::OperationGuard operation{*impl_, false};
+        if (!operation) { return out; }
 
         out.currentSeq = impl_->snapshotSeq();
         out.nodeId = impl_->nodeId;
@@ -1317,6 +2138,31 @@ namespace akkaradb::engine {
         out.existsTotal = impl_->existsTotal.load(std::memory_order_relaxed);
         out.scansTotal = impl_->scansTotal.load(std::memory_order_relaxed);
         out.blobPutsTotal = impl_->blobPutsTotal.load(std::memory_order_relaxed);
+        out.config.writeAdmission = static_cast<uint32_t>(impl_->opts.runtime.writeAdmission);
+        out.config.writeDurability = static_cast<uint32_t>(impl_->opts.runtime.writeDurability);
+        out.config.writeVisibility = static_cast<uint32_t>(impl_->opts.runtime.writeVisibility);
+        out.config.readVisibility = static_cast<uint32_t>(impl_->opts.runtime.visibility.readVisibility);
+        out.config.sequenceAllocation = static_cast<uint32_t>(impl_->opts.runtime.sequence.allocation);
+        out.config.sequenceThreadLocalRangeSize = impl_->opts.runtime.sequence.threadLocalRangeSize;
+        out.config.commitWindowSize = impl_->commitWindowSize;
+        out.config.memtableBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.memtableFlushBacklog);
+        out.config.maxMemtableImmutableTables = impl_->opts.runtime.backpressure.maxMemtableImmutableTables;
+        out.config.sstBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.sstCompactionBacklog);
+        out.config.maxSstL0Files = impl_->opts.runtime.backpressure.maxSstL0Files;
+        out.config.backpressureWaitMicros = impl_->opts.runtime.backpressure.waitMicros;
+        out.config.backpressureTimeoutMs = impl_->opts.runtime.backpressure.timeoutMs;
+        out.config.memtableFlushMode = static_cast<uint32_t>(impl_->opts.memtable.flushMode);
+        out.config.walExecution = static_cast<uint32_t>(impl_->opts.wal.execution);
+        out.config.walSyncPolicy = static_cast<uint32_t>(impl_->opts.wal.syncPolicy);
+        out.config.walBackpressure = static_cast<uint32_t>(impl_->opts.wal.backpressure);
+        out.config.sstCompactionMode = static_cast<uint32_t>(impl_->opts.sst.compactionMode);
+        out.backpressure.blockedWrites = impl_->backpressureBlockedWrites.load(std::memory_order_relaxed);
+        out.backpressure.rejectedWrites = impl_->backpressureRejectedWrites.load(std::memory_order_relaxed);
+        out.backpressure.timedOutWrites = impl_->backpressureTimedOutWrites.load(std::memory_order_relaxed);
+        out.backpressure.memtableStalls = impl_->backpressureMemtableStalls.load(std::memory_order_relaxed);
+        out.backpressure.sstStalls = impl_->backpressureSstStalls.load(std::memory_order_relaxed);
+        out.backpressure.waitMicrosTotal = impl_->backpressureWaitMicrosTotal.load(std::memory_order_relaxed);
+        out.backpressure.waitMicrosMax = impl_->backpressureWaitMicrosMax.load(std::memory_order_relaxed);
         out.api.enabled = impl_->opts.components.apiEnabled;
         if (impl_->apiServer) { out.api = impl_->apiServer->stats(); }
 
@@ -1328,6 +2174,7 @@ namespace akkaradb::engine {
             out.memtable.putsApplied = snap.putsApplied;
             out.memtable.removesApplied = snap.removesApplied;
             out.memtable.flushesCompleted = snap.flushesCompleted;
+            out.memtable.immutableTables = snap.immutableTables;
         }
 
         out.wal.enabled = impl_->opts.components.walEnabled;
@@ -1339,6 +2186,11 @@ namespace akkaradb::engine {
             out.wal.batchesFlushed = snap.batchesFlushed;
             out.wal.syncsExecuted = snap.syncsExecuted;
             out.wal.segmentRotations = snap.segmentRotations;
+            out.wal.asyncFailures = snap.asyncFailures;
+            out.wal.pendingEntries = snap.pendingEntries;
+            out.wal.pendingBytes = snap.pendingBytes;
+            out.wal.inFlightBytes = snap.inFlightBytes;
+            out.wal.healthy = snap.healthy;
         }
 
         out.blob.enabled = impl_->opts.components.blobEnabled && impl_->blobManager != nullptr;
@@ -1368,6 +2220,7 @@ namespace akkaradb::engine {
             out.sst.filesCompacted = snap.filesCompacted;
             out.sst.bytesCompactedIn = snap.bytesCompactedIn;
             out.sst.bytesCompactedOut = snap.bytesCompactedOut;
+            out.sst.compactionFailures = snap.compactionFailures;
         }
 
         out.vlog.enabled = impl_->versionLog != nullptr;
@@ -1391,14 +2244,25 @@ namespace akkaradb::engine {
 
     void AkkEngine::forceSync() {
         if (!impl_) { return; }
+        Impl::OperationGuard operation{*impl_, false};
+        if (!operation) { return; }
         if (impl_->walWriter) { impl_->walWriter->forceSync(); }
         if (impl_->versionLog) { impl_->versionLog->forceSync(); }
     }
 
-    void AkkEngine::forceFlush() { if (impl_ && impl_->memtable) { impl_->memtable->forceFlush(); } }
+    void AkkEngine::forceFlush() {
+        if (!impl_) { return; }
+        Impl::OperationGuard operation{*impl_, false};
+        if (operation) {
+            impl_->throwIfBackgroundFailed();
+            if (impl_->memtable) { impl_->memtable->forceFlush(); }
+        }
+    }
 
     void AkkEngine::runBlobGc() {
-        if (!impl_ || impl_->closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
         if (!impl_->blobManager) { return; }
         if (impl_->versionLog) { throw std::runtime_error("AkkEngine: blob GC is disabled while version log is enabled"); }
         impl_->runBlobGcIfSafe();
@@ -1406,40 +2270,67 @@ namespace akkaradb::engine {
 
     void AkkEngine::close() {
         if (!impl_) { return; }
-        bool expected = false;
-        if (!impl_->closed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) { return; }
+        if (!impl_->beginClose()) { return; }
 
-        if (impl_->apiServer) {
-            impl_->apiServer->close();
-            impl_->apiServer.reset();
-        }
-        if (impl_->clusterRuntime) {
-            impl_->clusterRuntime->close();
-            impl_->clusterRuntime.reset();
-        }
-        if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); }
-        if (impl_->sstManager) {
-            impl_->sstManager->shutdown();
-            impl_->sstManager.reset();
-        }
-        if (impl_->walWriter) {
-            if (impl_->opts.runtime.forceSyncOnClose) { impl_->walWriter->forceSync(); }
-            impl_->walWriter->close();
-            impl_->walWriter.reset();
-        }
-        if (impl_->manifest) {
-            impl_->manifest->close();
-            impl_->manifest.reset();
-        }
-        if (impl_->blobManager) {
-            if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
-            impl_->blobManager->close();
-            impl_->blobManager.reset();
-        }
-        if (impl_->versionLog) {
-            impl_->versionLog->close();
-            impl_->versionLog.reset();
-        }
-        impl_->memtable.reset();
+        std::exception_ptr closeFailure;
+        const auto closeStep = [&closeFailure](const auto& operation) {
+            try { operation(); }
+            catch (...) {
+                if (!closeFailure) { closeFailure = std::current_exception(); }
+            }
+        };
+
+        closeStep([&] {
+            if (impl_->apiServer) {
+                impl_->apiServer->close();
+                impl_->apiServer.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->clusterRuntime) {
+                impl_->clusterRuntime->close();
+                impl_->clusterRuntime.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); }
+        });
+        closeStep([&] {
+            if (impl_->sstManager) {
+                impl_->sstManager->shutdown();
+                impl_->sstManager.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->walWriter && impl_->opts.runtime.forceSyncOnClose) { impl_->walWriter->forceSync(); }
+        });
+        closeStep([&] {
+            if (impl_->walWriter) {
+                impl_->walWriter->close();
+                impl_->walWriter.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->manifest) {
+                impl_->manifest->close();
+                impl_->manifest.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->blobManager) {
+                if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
+                impl_->blobManager->close();
+                impl_->blobManager.reset();
+            }
+        });
+        closeStep([&] {
+            if (impl_->versionLog) {
+                impl_->versionLog->close();
+                impl_->versionLog.reset();
+            }
+        });
+        closeStep([&] { impl_->memtable.reset(); });
+        impl_->finishClose();
+        if (closeFailure) { std::rethrow_exception(closeFailure); }
     }
 } // namespace akkaradb::engine

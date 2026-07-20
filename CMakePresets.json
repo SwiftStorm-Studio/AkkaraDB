@@ -71,6 +71,17 @@
       }
     },
     {
+      "name": "linux-clang-cl-release",
+      "displayName": "Linux Clang Release",
+      "inherits": "release-linux",
+      "binaryDir": "${sourceDir}/builds/linux-clang-cl-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
       "name": "release-jni",
       "displayName": "Release with JNI",
       "binaryDir": "${sourceDir}/builds/release-jni",
@@ -146,6 +157,11 @@
     {
       "name": "release-linux",
       "configurePreset": "release-linux",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-clang-cl-release",
+      "configurePreset": "linux-clang-cl-release",
       "configuration": "Release"
     },
     {

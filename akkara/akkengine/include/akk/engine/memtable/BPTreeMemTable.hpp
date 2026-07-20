@@ -36,7 +36,8 @@ namespace akkaradb::engine::memtable {
                 size_t dataArenaInitialBlockSize = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
                 size_t dataArenaMaxBlockSize = core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
                 size_t generatorArenaInitialBlockSize = 64 * 1024,
-                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024
+                size_t generatorArenaMaxBlockSize = 2 * 1024 * 1024,
+                MemTableBackendOptions backendOptions = {}
             );
 
             [[nodiscard]] Status put(
@@ -91,6 +92,7 @@ namespace akkaradb::engine::memtable {
             std::atomic<bool> frozen_{false};
             std::atomic<size_t> bytes_{0};
             std::atomic<size_t> entries_{0};
+            MutableScanMode mutableScanMode_;
 
             [[nodiscard]] static std::span<const uint8_t> asU8(ByteView view) noexcept;
 
@@ -134,6 +136,12 @@ namespace akkaradb::engine::memtable {
             ) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshot(uint64_t snapshotSeq) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshotRange(
+                uint64_t snapshotSeq,
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey
+            ) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateStreamingSnapshot(uint64_t snapshotSeq) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateStreamingSnapshotRange(
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,
                 std::vector<uint8_t> endKey

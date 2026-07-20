@@ -53,6 +53,9 @@ set(AKKENGINE_API_HTTP_SOURCES
 )
 set(AKKENGINE_API_TCP_SOURCES
         "${AKKSERVER_SRC_DIR}/tcp/TcpApiServer.cpp"
+        "${AKKSERVER_SRC_DIR}/tcp/TcpApiConnection.cpp"
+        "${AKKSERVER_SRC_DIR}/tcp/TcpApiFrameReader.cpp"
+        "${AKKSERVER_SRC_DIR}/tcp/TcpApiPayloadCodec.cpp"
         "${AKKSERVER_SRC_DIR}/tcp/ApiFraming.cpp"
 )
 set(AKKENGINE_CLUSTER_RUNTIME_SOURCES

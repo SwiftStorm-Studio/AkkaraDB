@@ -9,7 +9,7 @@
 
 // akkengine/src/engine/cluster/ClusterRuntime.cpp
 #include "akk/engine/cluster/ClusterRuntime.hpp"
-#include "RaftConsensusRuntime.hpp"
+#include "akk/engine/cluster/detail/RaftConsensusRuntime.hpp"
 
 #include <array>
 #include <charconv>
@@ -140,7 +140,6 @@ namespace akkaradb::engine::cluster {
             auto consistency = config.consistency();
             if (consistency.mode == ConsistencyMode::RAFT_QUORUM) {
                 consistency.ackTimeoutAction = AckTimeoutAction::FAIL_WRITE;
-                consistency.readConsistency = ReadConsistency::QUORUM;
             }
             return consistency;
         }

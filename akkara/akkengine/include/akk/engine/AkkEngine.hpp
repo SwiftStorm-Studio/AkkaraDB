@@ -81,6 +81,98 @@ namespace akkaradb::engine {
             TLS = 0, PLAIN = 1,
         };
 
+        enum class WriteAdmissionMode : uint8_t {
+            AUTO = 0,
+            SERIAL = 1,
+            PARALLEL = 2,
+        };
+
+        enum class ParallelWriteOrderMode : uint8_t {
+            // Preserve the current fast path: a read observes the last write
+            // applied to a key, even when parallel writers reserved sequences
+            // in a different order.
+            APPLY_ORDER = 0,
+            // Serialize writes that route to the same ordering stripe before
+            // sequence allocation. Different stripes still insert concurrently.
+            KEY_SEQUENCE = 1,
+        };
+
+        enum class WritePolicyPreset : uint8_t {
+            CUSTOM = 0,
+            SAFE = 1,
+            BALANCED = 2,
+            FAST = 3,
+        };
+
+        enum class WriteDurabilityMode : uint8_t {
+            // Valid only without WAL: the write is retained only by the current process.
+            MEMORY = 0,
+            // The WAL queue accepted the record and the MemTable was updated. The
+            // write is visible but not durable; a later async WAL failure poisons
+            // the engine and is rethrown by subsequent public operations.
+            ENQUEUED = 1,
+            // The WAL flusher wrote and flushed the record, but did not necessarily sync it to storage.
+            WRITTEN = 2,
+            // The WAL record completed fdatasync before the write returns.
+            SYNCED = 3,
+        };
+
+        enum class WriteVisibilityMode : uint8_t {
+            COMMIT_ORDER = 0,
+            APPLIED = 1,
+        };
+
+        enum class ReadVisibilityMode : uint8_t {
+            AUTO = 0,
+            COMMIT_ORDER = 1,
+            APPLIED = 2,
+        };
+
+        enum class ScanConsistencyMode : uint8_t {
+            // Ordered scan with no scan-lifetime write exclusion.
+            WEAK_ORDERED = 0,
+            // Hold every MemTable shard read lock for the scan lifetime and
+            // capture the sequence after those locks are acquired.
+            PINNED_SNAPSHOT = 1,
+        };
+
+        enum class SequenceAllocationMode : uint8_t {
+            GLOBAL_ATOMIC = 0,
+            THREAD_LOCAL_RANGES = 1,
+        };
+
+        enum class BackpressureMode : uint8_t {
+            BLOCK = 0,
+            FAIL_FAST = 1,
+        };
+
+        struct SequenceOptions {
+            // GLOBAL_ATOMIC preserves gap-free commit-order sequencing.
+            // THREAD_LOCAL_RANGES reduces seqGen contention but is only valid with APPLIED visibility.
+            SequenceAllocationMode allocation = SequenceAllocationMode::GLOBAL_ATOMIC;
+            uint32_t threadLocalRangeSize = 1;
+            // 0 selects the engine default. Rounded up to a power of two internally.
+            uint32_t commitWindowSize = 0;
+        };
+
+        struct VisibilityOptions {
+            // AUTO keeps the legacy runtime.writeVisibility value. Explicit values override writePolicy preset visibility.
+            ReadVisibilityMode readVisibility = ReadVisibilityMode::AUTO;
+        };
+
+        struct BackpressureOptions {
+            // 0 disables the corresponding admission throttle.
+            uint32_t maxMemtableImmutableTables = 0;
+            uint32_t maxSstL0Files = 0;
+            uint32_t waitMicros = 100;
+            // 0 explicitly permits waiting indefinitely. The default bounds write
+            // admission stalls so a failed or undersized compaction setup does not
+            // leave callers blocked forever.
+            uint32_t timeoutMs = 30'000;
+            BackpressureMode memtableFlushBacklog = BackpressureMode::BLOCK;
+            BackpressureMode sstCompactionBacklog = BackpressureMode::BLOCK;
+        };
+
         struct ApiTlsOptions {
             std::filesystem::path certPath;
             std::filesystem::path keyPath;
@@ -140,6 +232,19 @@ namespace akkaradb::engine {
             bool forceFlushOnClose = true;
             bool forceSyncOnClose = true;
             bool sstPromoteReads = false;
+            WritePolicyPreset writePolicy = WritePolicyPreset::CUSTOM;
+            WriteAdmissionMode writeAdmission = WriteAdmissionMode::AUTO;
+            ParallelWriteOrderMode parallelWriteOrder = ParallelWriteOrderMode::APPLY_ORDER;
+            WriteDurabilityMode writeDurability = WriteDurabilityMode::SYNCED;
+            // Legacy alias for visibility.readVisibility. Kept for source compatibility.
+            WriteVisibilityMode writeVisibility = WriteVisibilityMode::COMMIT_ORDER;
+            VisibilityOptions visibility;
+            ScanConsistencyMode scanConsistency = ScanConsistencyMode::WEAK_ORDERED;
+            SequenceOptions sequence;
+            BackpressureOptions backpressure;
+            // Enables a lock-free in-memory write fast path only when WAL, blob, version log, and cluster are disabled.
+            // Concurrent readers may observe relaxed cross-writer visibility while writes are in flight.
+            bool relaxedConcurrentWrites = false;
             // Store mutable engine files under an active generation directory.
             // Disabled by default so existing data directories retain their layout.
             bool generationLayoutEnabled = false;
@@ -184,6 +289,7 @@ namespace akkaradb::engine {
             void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey);
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> get(std::span<const uint8_t> key) const;
+            // Returns all results from one visibility snapshot captured when the call begins.
             [[nodiscard]] std::vector<BatchGetResult> getBatch(std::span<const std::span<const uint8_t>> keys) const;
             [[nodiscard]] bool exists(std::span<const uint8_t> key) const;
             [[nodiscard]] bool getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;

@@ -30,6 +30,12 @@
 #include "akk/engine/sstable/SSTWriter.hpp"
 
 namespace akkaradb::engine::sst {
+    enum class SSTCompactionMode : uint8_t {
+        AUTO = 0,
+        BACKGROUND = 1,
+        DISABLED = 2,
+    };
+
     class AKDB_API SSTManager {
         private:
             class Impl;
@@ -37,14 +43,18 @@ namespace akkaradb::engine::sst {
         public:
             struct Options {
                 std::filesystem::path sstDir;
+                // Sorted storage level layout and compaction trigger policy.
                 int maxLevels = 7;
                 int maxL0Files = 4;
                 uint64_t l1MaxBytes = 64ULL * 1024ULL * 1024ULL;
                 double levelSizeMultiplier = 10.0;
+                SSTCompactionMode compactionMode = SSTCompactionMode::AUTO;
+                // Flush/compaction output format and read amplification knobs.
                 uint64_t targetFileSize = SST_DEFAULT_TARGET_FILE_SIZE;
                 uint32_t blockSize = SST_DEFAULT_BLOCK_SIZE;
                 uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
                 uint64_t blockCacheBytes = 64ULL * 1024ULL * 1024ULL;
+                // AUTO compaction uses this worker count. 0 disables background compaction in AUTO mode.
                 int compactThreads = 2;
                 SSTWriter::Codec codec = SSTWriter::Codec::ZSTD;
             };
@@ -61,6 +71,7 @@ namespace akkaradb::engine::sst {
                 uint64_t filesCompacted = 0;
                 uint64_t bytesCompactedIn = 0;
                 uint64_t bytesCompactedOut = 0;
+                uint64_t compactionFailures = 0;
             };
 
             class AKDB_API Iterator {
@@ -91,13 +102,23 @@ namespace akkaradb::engine::sst {
             void recover();
             void shutdown();
             uint64_t flush(std::span<const core::RecordView> records);
+            void throwIfBackgroundFailed() const;
 
-            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key) const;
-            [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
-            [[nodiscard]] Iterator scanIter(std::span<const uint8_t> startKey = {}, std::span<const uint8_t> endKey = {}) const;
+            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
+            [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
+            [[nodiscard]] std::optional<bool> getInto(
+                std::span<const uint8_t> key,
+                std::vector<uint8_t>& out,
+                uint64_t snapshotSeq = UINT64_MAX
+            ) const;
+            [[nodiscard]] Iterator scanIter(
+                std::span<const uint8_t> startKey = {},
+                std::span<const uint8_t> endKey = {},
+                uint64_t snapshotSeq = UINT64_MAX
+            ) const;
 
             [[nodiscard]] std::vector<LevelStats> levelStats() const;
+            [[nodiscard]] uint64_t maxSequence() const noexcept;
             [[nodiscard]] bool compactionPending() const noexcept;
             [[nodiscard]] CompactionSnapshot compactionSnapshot() const noexcept;
 
