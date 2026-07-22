@@ -242,7 +242,7 @@ namespace akkaradb::engine {
             ScanConsistencyMode scanConsistency = ScanConsistencyMode::WEAK_ORDERED;
             SequenceOptions sequence;
             BackpressureOptions backpressure;
-            // Enables a lock-free in-memory write fast path only when WAL, blob, version log, and cluster are disabled.
+            // Enables the concurrent write path when WAL, blob, and cluster are disabled. VersionLog chooses its own admission mode.
             // Concurrent readers may observe relaxed cross-writer visibility while writes are in flight.
             bool relaxedConcurrentWrites = false;
             // Store mutable engine files under an active generation directory.

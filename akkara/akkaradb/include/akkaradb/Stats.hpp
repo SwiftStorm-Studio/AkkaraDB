@@ -190,6 +190,31 @@ namespace akkaradb::engine {
             uint64_t l0Stalls = 0;
         } sst;
 
+        struct ManifestStats {
+            bool enabled = false;
+            bool hasCheckpoint = false;
+            bool sstBlobRefsComplete = false;
+            uint64_t lastCheckpointSeq = 0;
+            uint64_t lastCheckpointStripe = 0;
+            uint64_t liveSstCount = 0;
+            uint64_t deletedSstCount = 0;
+            uint64_t sstSealCount = 0;
+            uint64_t sstReferencedBlobCount = 0;
+            uint64_t liveBlobCount = 0;
+            uint64_t deletedBlobCount = 0;
+            uint64_t blobPutCount = 0;
+            uint64_t blobDeleteCount = 0;
+            uint64_t lastPrimaryLeaseNodeId = 0;
+            uint64_t lastPrimaryLeaseUntilUs = 0;
+        } manifest;
+
+        struct ClusterStats {
+            bool enabled = false;
+            uint32_t role = 0;
+            uint64_t configuredNodeCount = 0;
+            uint64_t activeNodeCount = 0;
+        } cluster;
+
         struct VLogStats {
             bool enabled = false;
             uint32_t syncMode = 0;

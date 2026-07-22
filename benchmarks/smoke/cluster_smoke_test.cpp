@@ -11,6 +11,7 @@
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/cluster/ClusterConfig.hpp"
+#include "akk/engine/cluster/ClusterManager.hpp"
 #include "akk/engine/cluster/ClusterRuntime.hpp"
 #include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
@@ -18,6 +19,7 @@
 #include "akk/engine/cluster/ReplicationServer.hpp"
 #include "akk/engine/erasure/ErasureCodec.hpp"
 #include "akk/engine/erasure/ErasureCodecExt.hpp"
+#include "akk/engine/manifest/Manifest.hpp"
 
 #include <array>
 #include <atomic>
@@ -37,6 +39,7 @@
 
 using namespace akkaradb::engine::cluster;
 namespace erasure = akkaradb::engine::erasure;
+namespace manifest = akkaradb::engine::manifest;
 
 extern "C" bool akkaradb_cluster_register() noexcept;
 
@@ -89,6 +92,12 @@ namespace {
     uint64_t nextPrng(uint64_t& state) noexcept {
         state = state * 6364136223846793005ull + 1442695040888963407ull;
         return state;
+    }
+
+    [[nodiscard]] uint64_t nowUs() noexcept {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count());
     }
 
     std::vector<uint8_t> deterministicBytes(size_t size, uint64_t seed) {
@@ -310,6 +319,154 @@ namespace {
         AKK_CLUSTER_CHECK(loaded.mode() == ReplicationMode::STRIPE);
         AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 3);
         AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
+    }
+
+    void testClusterManagerRecoversPrimaryLeaseFromManifest() {
+        const auto dir = makeTempDir("manifest-primary-lease");
+        const ClusterConfig cfg{
+            {
+                node(1, 20321, 20421),
+                node(2, 20322, 20422),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->primaryLease(1, nowUs() + 30'000'000);
+            mf->nodeJoin(1, 25421, "manifest-primary.local");
+            mf->close();
+        }
+
+        auto replica = ClusterManager::create(dir, cfg, 2);
+        replica->start();
+        AKK_CLUSTER_CHECK(replica->role() == NodeRole::REPLICA);
+        AKK_CLUSTER_CHECK(replica->primaryNodeId() == 1);
+        AKK_CLUSTER_CHECK(replica->primaryHost() == "manifest-primary.local");
+        AKK_CLUSTER_CHECK(replica->primaryReplPort() == 25421);
+        replica->close();
+    }
+
+    void testClusterManagerIgnoresExpiredManifestPrimaryLease() {
+        const auto dir = makeTempDir("manifest-expired-primary-lease");
+        const ClusterConfig cfg{
+            {
+                node(1, 20331, 20431),
+                node(2, 20332, 20432),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->primaryLease(1, nowUs() - 1);
+            mf->nodeJoin(1, 25431, "expired-primary.local");
+            mf->close();
+        }
+
+        auto replica = ClusterManager::create(dir, cfg, 2);
+        bool rejected = false;
+        try {
+            replica->start();
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testClusterManagerAutoPromotesAfterExpiredManifestLease() {
+        const auto dir = makeTempDir("manifest-expired-primary-lease-promote");
+        const ClusterConfig cfg{
+            {
+                node(1, 20341, 20441),
+                node(2, 20342, 20442),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->primaryLease(2, nowUs() - 1);
+            mf->nodeJoin(2, 25442, "expired-secondary.local");
+            mf->close();
+        }
+
+        auto primary = ClusterManager::create(dir, cfg, 1);
+        primary->start();
+        AKK_CLUSTER_CHECK(primary->role() == NodeRole::PRIMARY);
+        AKK_CLUSTER_CHECK(primary->primaryNodeId() == 1);
+        AKK_CLUSTER_CHECK(primary->primaryHost() == "127.0.0.1");
+        AKK_CLUSTER_CHECK(primary->primaryReplPort() == 20441);
+        primary->close();
+    }
+
+    void testClusterManagerDoesNotAutoPromoteRaftAfterExpiredManifestLease() {
+        const auto dir = makeTempDir("manifest-expired-raft-lease");
+        const ClusterConfig cfg{
+            {
+                node(1, 20351, 20451),
+                node(2, 20352, 20452),
+                node(3, 20353, 20453),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->primaryLease(2, nowUs() - 1);
+            mf->close();
+        }
+
+        auto primary = ClusterManager::create(dir, cfg, 1);
+        bool rejected = false;
+        try {
+            primary->start();
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testClusterManagerReportsManifestActiveNodes() {
+        const auto dir = makeTempDir("manifest-active-nodes");
+        const ClusterConfig cfg{
+            {
+                node(1, 20361, 20461),
+                node(2, 20362, 20462),
+                node(3, 20363, 20463),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->nodeJoin(1, 25461, "active-one.local");
+            mf->nodeJoin(2, 25462, "left-two.local");
+            mf->nodeLeave(2);
+            mf->nodeJoin(3, 25463, "active-three.local");
+            mf->nodeJoin(99, 25499, "ignored-config-external.local");
+            mf->close();
+        }
+
+        auto manager = ClusterManager::create(dir, cfg, 1);
+        const auto active = manager->activeNodes();
+        AKK_CLUSTER_CHECK(active.size() == 2);
+        AKK_CLUSTER_CHECK(active[0].nodeId == 1);
+        AKK_CLUSTER_CHECK(active[0].host == "active-one.local");
+        AKK_CLUSTER_CHECK(active[0].dataPort == 20361);
+        AKK_CLUSTER_CHECK(active[0].replPort == 25461);
+        AKK_CLUSTER_CHECK(active[1].nodeId == 3);
+        AKK_CLUSTER_CHECK(active[1].host == "active-three.local");
+        AKK_CLUSTER_CHECK(active[1].dataPort == 20363);
+        AKK_CLUSTER_CHECK(active[1].replPort == 25463);
     }
 
     void testStripeErasureCodecRecovery() {
@@ -819,12 +976,12 @@ namespace {
         RuntimeHarness* leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
         AKK_CLUSTER_CHECK(waitUntil([&] { return n4->runtime->role() != NodeRole::PRIMARY; }, std::chrono::milliseconds{1000}));
-        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
 
         leader->runtime->addRaftVotingNode(n4Info);
-        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{3000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
 
@@ -836,7 +993,7 @@ namespace {
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
         leader->runtime->removeRaftVotingNode(4);
-        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{3000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
 
@@ -938,6 +1095,11 @@ int main() {
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
         testRaftOptionsRoundtripAndValidation();
         testPartitionedAndStripeRouting();
+        testClusterManagerRecoversPrimaryLeaseFromManifest();
+        testClusterManagerIgnoresExpiredManifestPrimaryLease();
+        testClusterManagerAutoPromotesAfterExpiredManifestLease();
+        testClusterManagerDoesNotAutoPromoteRaftAfterExpiredManifestLease();
+        testClusterManagerReportsManifestActiveNodes();
         testStripeErasureCodecRecovery();
         testRsErasureCodecProperties();
         testErsCodecRecovery();

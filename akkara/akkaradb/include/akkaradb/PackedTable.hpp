@@ -18,6 +18,7 @@
 #include "akk/core/buffer/BufferArena.hpp"
 #include "akk/core/record/KeyFingerprint.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <concepts>

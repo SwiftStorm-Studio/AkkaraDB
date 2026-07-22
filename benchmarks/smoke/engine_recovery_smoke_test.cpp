@@ -8,6 +8,8 @@
  */
 
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/manifest/Manifest.hpp"
+#include "akk/engine/wal/WalWriter.hpp"
 
 #include "TestErrorHandlers.hpp"
 
@@ -19,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -39,6 +42,16 @@ namespace {
 
     [[nodiscard]] std::span<const uint8_t> bytes(std::string_view value) noexcept {
         return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
+    }
+
+    template <typename Predicate>
+    [[nodiscard]] bool waitUntil(Predicate predicate, std::chrono::milliseconds timeout = std::chrono::milliseconds{5000}) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) { return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        return predicate();
     }
 
     [[nodiscard]] akkaradb::engine::AkkEngineOptions persistentOptions(const fs::path& dir) {
@@ -410,6 +423,151 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    void runManifestCheckpointSkipsCoveredWalRecoveryTest() {
+        namespace wal = akkaradb::engine::wal;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_manifest_checkpoint_wal_skip_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create manifest checkpoint WAL skip test directory");
+
+        const std::vector<uint8_t> key{'m', 'a', 'n', 'i', 'f', 'e', 's', 't', '-', 'w', 'a', 'l', '-', 'k', 'e', 'y'};
+        const std::vector<uint8_t> flushedValue{'f', 'l', 'u', 's', 'h', 'e', 'd'};
+        const std::vector<uint8_t> staleWalValue{'s', 't', 'a', 'l', 'e', '-', 'w', 'a', 'l'};
+
+        {
+            auto engine = akkaradb::engine::AkkEngine::open(persistentOptions(dir));
+            engine->put(bytes(key), bytes(flushedValue));
+            engine->forceFlush();
+            engine->close();
+        }
+
+        {
+            wal::WalOptions wopts;
+            wopts.walDir = dir / "wal";
+            wopts.shardCount = 1;
+            wopts.execution = wal::WalExecutionMode::INLINE;
+            wopts.syncPolicy = wal::WalSyncPolicy::ALWAYS;
+            auto writer = wal::WalWriter::create(wopts);
+            writer->append(bytes(key), bytes(staleWalValue), 1, 0, 0, wal::WalAppendAck::SYNCED);
+            writer->close();
+        }
+
+        {
+            auto options = persistentOptions(dir);
+            options.runtime.pruneWalOnFlush = false;
+            auto engine = akkaradb::engine::AkkEngine::open(std::move(options));
+            const auto recovered = engine->get(bytes(key));
+            require(recovered.has_value() && *recovered == flushedValue, "manifest checkpoint did not suppress covered WAL replay");
+            require(engine->stats().currentSeq == 1, "manifest checkpoint WAL skip restored the wrong sequence");
+            engine->close();
+        }
+
+        fs::remove_all(dir, ec);
+    }
+
+    void runManifestCheckpointIntegrityRejectsMissingSstTest() {
+        namespace manifest = akkaradb::engine::manifest;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_manifest_checkpoint_integrity_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create manifest checkpoint integrity test directory");
+
+        {
+            auto mf = manifest::Manifest::create(dir / "manifest.akmf", false);
+            mf->checkpoint(std::optional<std::string>{"corrupt"}, std::nullopt, 10);
+            mf->close();
+        }
+
+        bool rejected = false;
+        try {
+            (void)akkaradb::engine::AkkEngine::open(persistentOptions(dir));
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "engine accepted a manifest checkpoint beyond recovered SST state");
+
+        fs::remove_all(dir, ec);
+    }
+
+    void runManifestStatsExposeRecoveryMetadataTest() {
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_manifest_stats_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create manifest stats test directory");
+
+        const std::vector<uint8_t> key{'m', 'a', 'n', 'i', 'f', 'e', 's', 't', '-', 's', 't', 'a', 't', 's'};
+        const std::vector<uint8_t> value{'v', 'a', 'l', 'u', 'e'};
+        {
+            auto engine = akkaradb::engine::AkkEngine::open(persistentOptions(dir));
+            engine->put(bytes(key), bytes(value));
+            engine->forceFlush();
+            const auto stats = engine->stats();
+            require(stats.manifest.enabled, "manifest stats did not report enabled manifest");
+            require(stats.manifest.hasCheckpoint, "manifest stats did not expose checkpoint presence");
+            require(stats.manifest.lastCheckpointSeq == 1, "manifest stats exposed the wrong checkpoint sequence");
+            require(stats.manifest.liveSstCount == 1, "manifest stats exposed the wrong live SST count");
+            require(stats.manifest.sstSealCount == 1, "manifest stats exposed the wrong SST seal count");
+            engine->close();
+        }
+
+        fs::remove_all(dir, ec);
+    }
+
+    void runManifestStatsExposeBlobLifecycleTest() {
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_manifest_blob_lifecycle_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create manifest blob lifecycle test directory");
+
+        auto options = persistentOptions(dir);
+        options.components.blobEnabled = true;
+        options.blob.thresholdBytes = 8;
+
+        const std::string key = "blob-manifest-key";
+        const std::vector<uint8_t> value(64, 'b');
+
+        auto engine = akkaradb::engine::AkkEngine::open(options);
+        engine->put(bytes(key), bytes(value));
+        engine->forceFlush();
+        auto stats = engine->stats();
+        require(stats.manifest.blobPutCount == 1, "manifest stats must count blob put records");
+        require(stats.manifest.liveBlobCount == 1, "manifest stats must expose live blob count");
+        require(stats.manifest.deletedBlobCount == 0, "manifest stats must not mark live blob as deleted");
+        require(stats.manifest.sstBlobRefsComplete, "manifest stats must mark flushed SST blob refs complete");
+        require(stats.manifest.sstReferencedBlobCount == 1, "manifest stats must expose SST-referenced blob count");
+
+        engine->remove(bytes(key));
+        engine->runBlobGc();
+        require(
+            waitUntil([&] {
+                const auto current = engine->stats();
+                return current.blob.blobsDeleted == 1 && current.manifest.blobDeleteCount == 1 &&
+                    current.manifest.liveBlobCount == 0 && current.manifest.deletedBlobCount == 1;
+            }),
+            "manifest stats must reflect blob GC delete records"
+        );
+        engine->close();
+
+        auto reopened = akkaradb::engine::AkkEngine::open(options);
+        stats = reopened->stats();
+        require(stats.manifest.blobPutCount == 1, "manifest replay must retain blob put records");
+        require(stats.manifest.blobDeleteCount == 1, "manifest replay must retain blob delete records");
+        require(stats.manifest.liveBlobCount == 0, "manifest replay must retain live blob count");
+        require(stats.manifest.deletedBlobCount == 1, "manifest replay must retain deleted blob count");
+        require(stats.manifest.sstBlobRefsComplete, "manifest replay must retain SST blob ref completeness");
+        require(stats.manifest.sstReferencedBlobCount == 0, "manifest replay must account for tombstones in SST blob refs");
+        reopened->close();
+
+        fs::remove_all(dir, ec);
+    }
+
     void runParallelWalMatrixRecoveryTest(const fs::path& executable) {
         const fs::path dir = fs::temp_directory_path() / "akkaradb_parallel_wal_matrix_recovery_smoke";
         std::error_code ec;
@@ -624,6 +782,10 @@ int main(int argc, char** argv) {
         if (argc == 4 && std::string{argv[1]} == "--compaction-crash-writer") { return runCompactionCrashWriter(argv[2], fs::path{argv[3]}); }
         if (argc != 1) { throw std::invalid_argument("unexpected command line"); }
         runRecoveryTest(fs::absolute(fs::path{argv[0]}));
+        runManifestCheckpointSkipsCoveredWalRecoveryTest();
+        runManifestCheckpointIntegrityRejectsMissingSstTest();
+        runManifestStatsExposeRecoveryMetadataTest();
+        runManifestStatsExposeBlobLifecycleTest();
         runParallelWalMatrixRecoveryTest(fs::absolute(fs::path{argv[0]}));
         runParallelWalSstCorrectnessTest();
         runFlushBoundaryCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));

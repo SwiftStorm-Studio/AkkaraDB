@@ -23,6 +23,7 @@ namespace akkaradb::engine::sst {
     inline constexpr uint64_t SST_DEFAULT_TARGET_FILE_SIZE = 64ULL * 1024ULL * 1024ULL;
 
     inline constexpr uint32_t SST_FILE_FLAG_BLOCK_ZSTD = 0x00000001u;
+    inline constexpr uint32_t SST_FILE_FLAG_METADATA_CRC = 0x00000002u;
 
     inline constexpr uint32_t SST_BLOCK_FLAG_COMPRESSED = 0x00000001u;
     inline constexpr uint32_t SST_BLOCK_FLAG_RAW = 0x00000002u;
@@ -103,6 +104,12 @@ namespace akkaradb::engine::sst {
         uint32_t reserved;
     };
 
+    struct SSTMetadataCrcV2 {
+        uint32_t indexCrc32c;
+        uint32_t keyArenaCrc32c;
+        uint32_t bloomCrc32c;
+    };
+
     struct SSTFooterV2 {
         uint64_t file_size;
         uint64_t indexOffset;
@@ -119,10 +126,12 @@ namespace akkaradb::engine::sst {
     static_assert(sizeof(SSTBlockHeaderV2) == 64, "SSTBlockHeaderV2 must be 64 bytes");
     static_assert(sizeof(SSTBlockIndexEntryV2) == 72, "SSTBlockIndexEntryV2 must be 72 bytes");
     static_assert(sizeof(SSTBloomHeaderV2) == 16, "SSTBloomHeaderV2 must be 16 bytes");
+    static_assert(sizeof(SSTMetadataCrcV2) == 12, "SSTMetadataCrcV2 must be 12 bytes");
     static_assert(sizeof(SSTFooterV2) == 48, "SSTFooterV2 must be 48 bytes");
     static_assert(std::is_trivially_copyable_v<SSTFileHeaderV2>);
     static_assert(std::is_trivially_copyable_v<SSTBlockHeaderV2>);
     static_assert(std::is_trivially_copyable_v<SSTBlockIndexEntryV2>);
     static_assert(std::is_trivially_copyable_v<SSTBloomHeaderV2>);
+    static_assert(std::is_trivially_copyable_v<SSTMetadataCrcV2>);
     static_assert(std::is_trivially_copyable_v<SSTFooterV2>);
 } // namespace akkaradb::engine::sst

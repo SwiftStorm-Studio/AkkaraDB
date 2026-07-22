@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace akkaradb::engine::cluster {
     /**
@@ -69,7 +70,10 @@ namespace akkaradb::engine::cluster {
             void close() override;
 
             /** Returns the current local cluster role. */
-            [[nodiscard]] NodeRole role() const noexcept;
+            [[nodiscard]] NodeRole role() const noexcept override;
+
+            /** Returns Manifest-derived active nodes for non-Raft runtimes. */
+            [[nodiscard]] std::vector<NodeInfo> activeNodes() const override;
 
             /** Returns the immutable key router for this config. */
             [[nodiscard]] const ClusterRouter& router() const noexcept;

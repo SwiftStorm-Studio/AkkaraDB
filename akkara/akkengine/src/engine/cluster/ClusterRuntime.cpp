@@ -210,6 +210,8 @@ namespace akkaradb::engine::cluster {
 
             NodeRole role() const noexcept { return raftRuntime_ ? raftRuntime_->role() : manager_->role(); }
 
+            std::vector<NodeInfo> activeNodes() const { return raftRuntime_ ? std::vector<NodeInfo>{} : manager_->activeNodes(); }
+
             const ClusterRouter& router() const noexcept { return raftRuntime_ ? raftRuntime_->router() : router_; }
 
             void shipEntry(
@@ -379,6 +381,8 @@ namespace akkaradb::engine::cluster {
     void ClusterRuntime::close() { impl_->close(); }
 
     NodeRole ClusterRuntime::role() const noexcept { return impl_->role(); }
+
+    std::vector<NodeInfo> ClusterRuntime::activeNodes() const { return impl_->activeNodes(); }
 
     const ClusterRouter& ClusterRuntime::router() const noexcept { return impl_->router(); }
 

@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace akkaradb::engine::cluster {
     /**
@@ -94,6 +95,13 @@ namespace akkaradb::engine::cluster {
 
             /** Returns true when the cluster config resolves to standalone mode. */
             [[nodiscard]] bool isStandalone() const noexcept;
+
+            /**
+             * Returns config-known nodes whose latest Manifest membership event is
+             * a join not followed by a leave. Manifest-advertised host/replPort
+             * are reflected in the returned NodeInfo values.
+             */
+            [[nodiscard]] std::vector<NodeInfo> activeNodes() const;
 
         private:
             class Impl;

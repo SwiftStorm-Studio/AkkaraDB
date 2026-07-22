@@ -83,6 +83,41 @@
                 {"flushThreadRunning", stats.vlog.flushThreadRunning}
             }
         );
+        jobject manifest = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/ManifestStats",
+            stats.manifest,
+            {
+                {"lastCheckpointSeq", static_cast<jlong>(stats.manifest.lastCheckpointSeq)},
+                {"lastCheckpointStripe", static_cast<jlong>(stats.manifest.lastCheckpointStripe)},
+                {"liveSstCount", static_cast<jlong>(stats.manifest.liveSstCount)},
+                {"deletedSstCount", static_cast<jlong>(stats.manifest.deletedSstCount)},
+                {"sstSealCount", static_cast<jlong>(stats.manifest.sstSealCount)},
+                {"sstReferencedBlobCount", static_cast<jlong>(stats.manifest.sstReferencedBlobCount)},
+                {"liveBlobCount", static_cast<jlong>(stats.manifest.liveBlobCount)},
+                {"deletedBlobCount", static_cast<jlong>(stats.manifest.deletedBlobCount)},
+                {"blobPutCount", static_cast<jlong>(stats.manifest.blobPutCount)},
+                {"blobDeleteCount", static_cast<jlong>(stats.manifest.blobDeleteCount)},
+                {"lastPrimaryLeaseNodeId", static_cast<jlong>(stats.manifest.lastPrimaryLeaseNodeId)},
+                {"lastPrimaryLeaseUntilUs", static_cast<jlong>(stats.manifest.lastPrimaryLeaseUntilUs)}
+            },
+            {
+                {"enabled", stats.manifest.enabled},
+                {"hasCheckpoint", stats.manifest.hasCheckpoint},
+                {"sstBlobRefsComplete", stats.manifest.sstBlobRefsComplete}
+            }
+        );
+        jobject cluster = makePlainStats(
+            env,
+            "dev/swiftstorm/akkaradb/engine/ClusterStats",
+            stats.cluster,
+            {
+                {"role", static_cast<jlong>(stats.cluster.role)},
+                {"configuredNodeCount", static_cast<jlong>(stats.cluster.configuredNodeCount)},
+                {"activeNodeCount", static_cast<jlong>(stats.cluster.activeNodeCount)}
+            },
+            {{"enabled", stats.cluster.enabled}}
+        );
 
         jclass sstCls = env->FindClass("dev/swiftstorm/akkaradb/engine/SstStats");
         if (sstCls == nullptr) { return nullptr; }
@@ -129,6 +164,8 @@
         setObjectField(env, out, cls, "wal", "Ldev/swiftstorm/akkaradb/engine/WalStats;", wal);
         setObjectField(env, out, cls, "blob", "Ldev/swiftstorm/akkaradb/engine/BlobStats;", blob);
         setObjectField(env, out, cls, "sst", "Ldev/swiftstorm/akkaradb/engine/SstStats;", sst);
+        setObjectField(env, out, cls, "manifest", "Ldev/swiftstorm/akkaradb/engine/ManifestStats;", manifest);
+        setObjectField(env, out, cls, "cluster", "Ldev/swiftstorm/akkaradb/engine/ClusterStats;", cluster);
         setObjectField(env, out, cls, "vlog", "Ldev/swiftstorm/akkaradb/engine/VLogStats;", vlog);
         return out;
     }

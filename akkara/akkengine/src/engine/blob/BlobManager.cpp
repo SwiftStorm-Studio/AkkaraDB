@@ -251,6 +251,15 @@ namespace akkaradb::engine::blob {
                 uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
                 serializeBlobHeader(header, headerBuf);
                 writeAtomicSplit(path, headerBuf, sizeof(headerBuf), payload, payloadSize);
+                if (options.onBlobPut) {
+                    options.onBlobPut(
+                        blobId,
+                        static_cast<uint64_t>(content.size()),
+                        static_cast<uint64_t>(payloadSize),
+                        contentCrc,
+                        static_cast<uint32_t>(actualCodec)
+                    );
+                }
                 blobsWritten.fetch_add(1, std::memory_order_relaxed);
                 bytesUncompressed.fetch_add(static_cast<uint64_t>(content.size()), std::memory_order_relaxed);
                 bytesOnDisk.fetch_add(
@@ -279,6 +288,7 @@ namespace akkaradb::engine::blob {
                         dst += ".del";
                         if (renameQuiet(src, dst)) {
                             (void)removeQuiet(dst);
+                            if (options.onBlobDelete) { options.onBlobDelete(id); }
                             blobsDeleted.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
@@ -296,6 +306,7 @@ namespace akkaradb::engine::blob {
                     dst += ".del";
                     if (renameQuiet(src, dst)) {
                         (void)removeQuiet(dst);
+                        if (options.onBlobDelete) { options.onBlobDelete(id); }
                         blobsDeleted.fetch_add(1, std::memory_order_relaxed);
                     }
                 }

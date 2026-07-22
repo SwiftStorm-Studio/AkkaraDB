@@ -72,6 +72,7 @@ class QuerySource {
 
         void advance() {
             pending_.reset();
+            if (ranges_.empty()) { return; }
             while (rangeIndex_ <= ranges_.size()) {
                 while (!(it_ == rows_.end())) {
                     const auto& raw = *it_;
@@ -140,7 +141,7 @@ class QuerySource {
 
         const PackedTable* table_;
         QuerySourceKind kind_;
-        size_t indexSearchPrefixSize_;
+        size_t indexSearchPrefixSize_ = 0;
         bool dynamicIndexPkOffset_ = false;
         bool prefixIndexPkOffset_ = false;
         bool dedupeIndexPks_ = false;

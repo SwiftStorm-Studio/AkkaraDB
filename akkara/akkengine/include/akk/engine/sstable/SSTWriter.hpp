@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -36,9 +37,17 @@ namespace akkaradb::engine::sst {
                 uint64_t targetFileSize = SST_DEFAULT_TARGET_FILE_SIZE;
                 uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
                 Codec codec = Codec::ZSTD;
+                int zstdCompressionLevel = 1;
             };
 
             struct Result {
+                struct BlobRefEntry {
+                    std::vector<uint8_t> key;
+                    uint64_t seq = 0;
+                    uint8_t flags = 0;
+                    std::optional<uint64_t> blobId;
+                };
+
                 std::filesystem::path path;
                 uint64_t entryCount = 0;
                 uint64_t fileSizeBytes = 0;
@@ -46,6 +55,7 @@ namespace akkaradb::engine::sst {
                 uint64_t maxSeq = 0;
                 std::vector<uint8_t> firstKey;
                 std::vector<uint8_t> lastKey;
+                std::vector<BlobRefEntry> blobRefs;
             };
 
             [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records);

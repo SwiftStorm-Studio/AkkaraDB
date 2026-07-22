@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -21,11 +22,32 @@
 
 #include "akk/core/record/SSTHdr32.hpp"
 #include "akk/cpu/CRC32C.hpp"
+#include "akk/engine/blob/BlobFraming.hpp"
 
 namespace akkaradb::engine::sst {
     namespace {
         [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> bytes) noexcept {
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+
+        [[nodiscard]] SSTWriter::Result::BlobRefEntry blobRefEntryFromRecord(const core::RecordView& rec) {
+            SSTWriter::Result::BlobRefEntry entry;
+            const auto key = rec.key();
+            entry.key.assign(key.begin(), key.end());
+            entry.seq = rec.seq();
+            entry.flags = rec.flags();
+            if ((rec.flags() & SST_RECORD_FLAG_BLOB) != 0 && rec.valueSize() >= blob::BLOB_REF_SIZE) {
+                entry.blobId = blob::decodeBlobRef(rec.value().data()).blobId;
+            }
+            return entry;
+        }
+
+        template <typename T>
+        [[nodiscard]] uint32_t crc32cPodVector(const std::vector<T>& values) noexcept {
+            return cpu::CRC32C(
+                reinterpret_cast<const std::byte*>(values.data()),
+                values.size() * sizeof(T)
+            );
         }
 
         template <typename T>
@@ -136,14 +158,19 @@ namespace akkaradb::engine::sst {
             block.lastMini = hdr.miniKey;
         }
 
-        [[nodiscard]] std::vector<uint8_t> compressOrRaw(const std::vector<uint8_t>& raw, SSTWriter::Codec codec, uint32_t& flags) {
+        [[nodiscard]] std::vector<uint8_t> compressOrRaw(
+            const std::vector<uint8_t>& raw,
+            SSTWriter::Codec codec,
+            int zstdCompressionLevel,
+            uint32_t& flags
+        ) {
             const uint32_t extraFlags = flags & ~SST_BLOCK_FLAG_RAW;
             flags = extraFlags | SST_BLOCK_FLAG_RAW;
             if (codec != SSTWriter::Codec::ZSTD || raw.empty()) { return raw; }
 
             const size_t bound = ZSTD_compressBound(raw.size());
             std::vector<uint8_t> compressed(bound);
-            const size_t n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), 1);
+            const size_t n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), zstdCompressionLevel);
             if (ZSTD_isError(n) || n >= raw.size()) { return raw; }
             compressed.resize(n);
             flags = extraFlags | SST_BLOCK_FLAG_COMPRESSED;
@@ -209,6 +236,10 @@ namespace akkaradb::engine::sst {
         if (options.blockSize < 4096 || (options.blockSize & 7u) != 0) {
             throw std::invalid_argument("SSTWriter::write: blockSize must be >=4096 and 8-byte aligned");
         }
+        if (options.codec == Codec::ZSTD &&
+            (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel > ZSTD_maxCLevel())) {
+            throw std::invalid_argument("SSTWriter::write: zstdCompressionLevel is outside the supported Zstd range");
+        }
 
         for (size_t i = 1; i < records.size(); ++i) {
             if (records[i - 1].compareKey(records[i]) > 0) {
@@ -234,6 +265,7 @@ namespace akkaradb::engine::sst {
             bloom.add(rec.keyFp64());
             result.minSeq = std::min(result.minSeq, rec.seq());
             result.maxSeq = std::max(result.maxSeq, rec.seq());
+            result.blobRefs.push_back(blobRefEntryFromRecord(rec));
         }
 
         std::vector<SSTBlockIndexEntryV2> index;
@@ -249,7 +281,7 @@ namespace akkaradb::engine::sst {
             const std::vector<uint32_t>& rawOffsets = usePrefixCompressed ? encoded.offsets : block.offsets;
 
             uint32_t blockFlags = usePrefixCompressed ? SST_BLOCK_FLAG_PREFIX_COMPRESSED : 0;
-            std::vector<uint8_t> payload = compressOrRaw(rawPayload, options.codec, blockFlags);
+            std::vector<uint8_t> payload = compressOrRaw(rawPayload, options.codec, options.zstdCompressionLevel, blockFlags);
             std::vector<uint8_t> offsetsBytes;
             offsetsBytes.reserve(rawOffsets.size() * sizeof(uint32_t));
             for (const uint32_t off : rawOffsets) { appendPod(offsetsBytes, off); }
@@ -336,7 +368,8 @@ namespace akkaradb::engine::sst {
         header.magic = SST_MAGIC_V2;
         header.version = SST_VERSION_V2;
         header.headerSize = sizeof(SSTFileHeaderV2);
-        header.flags = options.codec == Codec::ZSTD ? SST_FILE_FLAG_BLOCK_ZSTD : 0;
+        header.flags = SST_FILE_FLAG_METADATA_CRC;
+        if (options.codec == Codec::ZSTD) { header.flags |= SST_FILE_FLAG_BLOCK_ZSTD; }
         header.level = static_cast<uint32_t>(options.level);
         header.file_size = footer.file_size;
         header.entryCount = records.size();
@@ -352,6 +385,16 @@ namespace akkaradb::engine::sst {
         header.minSeq = result.minSeq;
         header.maxSeq = result.maxSeq;
         header.blockSize = options.blockSize;
+        std::vector<uint8_t> bloomData;
+        bloomData.reserve(sizeof(bloom.header) + bloom.bits.size());
+        appendPod(bloomData, bloom.header);
+        bloomData.insert(bloomData.end(), bloom.bits.begin(), bloom.bits.end());
+        const SSTMetadataCrcV2 metadataCrc{
+            .indexCrc32c = crc32cPodVector(index),
+            .keyArenaCrc32c = crc32c(keyArena),
+            .bloomCrc32c = crc32c(bloomData)
+        };
+        std::memcpy(header.reserved, &metadataCrc, sizeof(metadataCrc));
         header.crc32c = 0;
         header.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(&header), sizeof(header));
 

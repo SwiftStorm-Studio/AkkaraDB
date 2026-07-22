@@ -120,6 +120,15 @@ namespace akkaradb {
                     std::optional<bool> sstPromoteReads;
                     std::optional<size_t> sstBloomBitsPerKey;
                     std::optional<size_t> maxL0SstFiles;
+                    std::optional<int> sstZstdCompressionLevel;
+                    std::optional<engine::Codec> versionLogCodec;
+                    std::optional<int> versionLogZstdCompressionLevel;
+                    std::optional<engine::vlog::VLogWriteAdmissionMode> versionLogWriteAdmission;
+                    std::optional<engine::vlog::VLogSerialAppendMode> versionLogSerialAppendMode;
+                    std::optional<uint32_t> versionLogParallelWriteLanes;
+                    std::optional<engine::vlog::VLogParallelPendingLimitScope> versionLogParallelPendingLimitScope;
+                    std::optional<uint32_t> versionLogRetentionDays;
+                    std::optional<uint64_t> versionLogRetentionMinCommitSeq;
                 } overrides;
 
                 struct ApiTlsOptions {

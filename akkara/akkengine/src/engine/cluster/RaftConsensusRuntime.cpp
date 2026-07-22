@@ -983,8 +983,16 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
-            void ensurePeerReplicationTargetsLocked() {
-                refreshPeersFromMembershipLocked();
+            void ensurePeerReplicationTargetsLocked(const std::vector<NodeInfo>* targetsOverride = nullptr) {
+                if (targetsOverride != nullptr) {
+                    peers_.clear();
+                    for (const auto& node : *targetsOverride) {
+                        if (node.nodeId != selfNodeId_) { peers_.push_back(node); }
+                    }
+                }
+                else {
+                    refreshPeersFromMembershipLocked();
+                }
                 for (const auto& peer : peers_) {
                     if (peerState(peer.nodeId) == nullptr) {
                         peerReplication_.push_back(PeerReplicationState{.node = peer, .nextIndex = 1, .matchIndex = 0});
@@ -1024,6 +1032,22 @@ namespace akkaradb::engine::cluster {
                     return replicatedByMajorityLocked(*jointOldVoters_, index) && replicatedByMajorityLocked(*jointNewVoters_, index);
                 }
                 return replicatedByMajorityLocked(committedVoters_, index);
+            }
+
+            std::optional<std::vector<NodeInfo>> replicationTargetsForEntry(const RaftLogEntry& entry) const {
+                if (entry.kind == RaftEntryKind::CONFIG_JOINT) {
+                    std::vector<NodeInfo> oldVoters;
+                    std::vector<NodeInfo> newVoters;
+                    if (!decodeNodeSet(entry.key, oldVoters) || !decodeNodeSet(entry.value, newVoters)) { return std::nullopt; }
+                    oldVoters.insert(oldVoters.end(), newVoters.begin(), newVoters.end());
+                    return sortedUniqueVoters(std::move(oldVoters));
+                }
+                if (entry.kind == RaftEntryKind::CONFIG_FINAL) {
+                    std::vector<NodeInfo> newVoters;
+                    if (!decodeNodeSet(entry.value, newVoters)) { return std::nullopt; }
+                    return sortedUniqueVoters(std::move(newVoters));
+                }
+                return std::nullopt;
             }
 
             bool isVotingMemberLocked(uint64_t nodeId) const {
@@ -1504,7 +1528,7 @@ namespace akkaradb::engine::cluster {
                     }
                     persistLog();
                 }
-                if (!replicateEntryToMajority(entry)) {
+                if (!replicateEntryToMajority(entry, std::chrono::milliseconds{5000})) {
                     throw std::runtime_error("RaftConsensusRuntime: failed to replicate membership change to Raft quorum");
                 }
                 {
@@ -1549,26 +1573,35 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
-            bool replicateEntryToMajority(const RaftLogEntry& entry) {
+            bool replicateEntryToMajority(const RaftLogEntry& entry, std::chrono::milliseconds retryWindow = std::chrono::milliseconds{0}) {
                 if (quorum() == 1) { return true; }
-                std::vector<std::thread> workers;
-                std::vector<uint64_t> peerIds;
-                {
-                    std::lock_guard lock{mutex_};
-                    if (peerReplication_.empty()) { resetLeaderReplicationState(); }
-                    ensurePeerReplicationTargetsLocked();
-                    for (const auto& state : peerReplication_) { peerIds.push_back(state.node.nodeId); }
-                }
-                for (const auto peerId : peerIds) {
-                    workers.emplace_back(
-                        [this, peerId, targetIndex = entry.index] { (void)replicatePeerTo(peerId, targetIndex); }
-                    );
-                }
-                for (auto& worker : workers) {
-                    if (worker.joinable()) { worker.join(); }
-                }
-                std::lock_guard lock{mutex_};
-                return hasCommitQuorumLocked(entry.index, &entry);
+                const auto deadline = Clock::now() + retryWindow;
+                const auto entryTargets = replicationTargetsForEntry(entry);
+                do {
+                    std::vector<std::thread> workers;
+                    std::vector<uint64_t> peerIds;
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (!running_ || role_.load() != RaftRole::LEADER) { return false; }
+                        if (peerReplication_.empty()) { resetLeaderReplicationState(); }
+                        ensurePeerReplicationTargetsLocked(entryTargets ? &*entryTargets : nullptr);
+                        for (const auto& state : peerReplication_) { peerIds.push_back(state.node.nodeId); }
+                    }
+                    for (const auto peerId : peerIds) {
+                        workers.emplace_back(
+                            [this, peerId, targetIndex = entry.index] { (void)replicatePeerTo(peerId, targetIndex); }
+                        );
+                    }
+                    for (auto& worker : workers) {
+                        if (worker.joinable()) { worker.join(); }
+                    }
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (hasCommitQuorumLocked(entry.index, &entry)) { return true; }
+                    }
+                    if (retryWindow.count() == 0 || Clock::now() >= deadline) { return false; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                } while (true);
             }
 
             bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat = false) {

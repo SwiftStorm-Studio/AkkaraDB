@@ -57,6 +57,7 @@ namespace akkaradb::engine::sst {
                 // AUTO compaction uses this worker count. 0 disables background compaction in AUTO mode.
                 int compactThreads = 2;
                 SSTWriter::Codec codec = SSTWriter::Codec::ZSTD;
+                int zstdCompressionLevel = 1;
             };
 
             struct LevelStats {

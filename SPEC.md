@@ -450,8 +450,8 @@ upper bound; it is not a count of completed writes.
 | Mode | Behavior |
 |---|---|
 | `SERIAL` | Use the engine write mutex |
-| `PARALLEL` | Permit concurrent local writes only when Blob, VersionLog, and cluster components are disabled; WAL may remain enabled |
-| `AUTO` | Use the concurrent in-memory fast path only when `relaxedConcurrentWrites` is true and WAL, Blob, VersionLog, and cluster are disabled; otherwise serialize |
+| `PARALLEL` | Permit concurrent local writes when Blob and cluster are disabled; WAL may remain enabled. VersionLog admission is configured independently. |
+| `AUTO` | Use the concurrent in-memory fast path only when `relaxedConcurrentWrites` is true and WAL, Blob, and cluster are disabled; otherwise serialize |
 
 Invalid component combinations fail during `open`.
 
@@ -716,6 +716,7 @@ The SST manager stores immutable sorted files under `sstDir`.
 | `blockCacheBytes` | 64 MiB | Block cache budget |
 | `compactThreads` | 2 | Background compaction worker count |
 | `codec` | `ZSTD` | SST block codec |
+| `zstdCompressionLevel` | 1 | Zstd level for newly written SST blocks; must be within the linked Zstd range |
 
 In `AUTO`, zero `compactThreads` disables background compaction; otherwise it
 selects background compaction.
@@ -769,10 +770,22 @@ VersionLog is opt-in. It backs:
 |---|---:|---|
 | `logPath` | derived from data dir | Version log file |
 | `syncMode` | `ASYNC` | `SYNC`, `ASYNC`, or `BATCHED_SYNC` |
+| `writeAdmission` | `SERIAL` | `SERIAL`, `PREPARE_PARALLEL`, or `PARALLEL` (described below) |
+| `serialAppendMode` | `PIPELINED` | `SERIAL` admission only: `PIPELINED` or `WAIT_PREVIOUS_APPEND` |
+| `readVisibility` | `COMMIT_ORDER` | `COMMIT_ORDER` exposes only entries whose matching MemTable mutation committed; `APPLIED` exposes an appended entry immediately |
+| `recoveryMode` | `EAGER` | `EAGER` validates and rebuilds indexes during open; `BACKGROUND` returns after opening the active file, then VersionLog and AkkEngine data operations wait for validation/index reconstruction |
+| `codec` | `NONE` | `NONE` or opt-in `ZSTD` value compression |
+| `zstdCompressionLevel` | 1 | Zstd level for newly written VLog records; validated against the linked Zstd range when `codec = ZSTD` |
 | `groupN` | 128 | Async/batched entry grouping |
 | `groupMicros` | 500 | Async/batched delay threshold |
 | `groupBytes` | 1 MiB | Async/batched byte threshold |
 | `asyncMaxPendingBytes` | 64 MiB | Pending byte limit |
+| `parallelPendingLimitScope` | `PER_LANE` | `PARALLEL` only: apply `asyncMaxPendingBytes` to every lane independently, or once across all lane queues with `GLOBAL` |
+| `parallelWriteLanes` | 0 | `PARALLEL` lane-worker count; `0` selects a hardware-derived value clamped to 2 through 8, explicit values support 1 through 64 |
+| `segmentBytes` | 64 MiB | Rotate an active stream/lane into numbered sibling segment files at this size; `0` disables rotation |
+| `retentionDays` | 0 | Delete closed segments whose last modification is older than this many days; `0` disables the age boundary |
+| `retentionMinCommitSeq` | 0 | Delete closed segments whose largest sequence is lower than this sequence; `0` disables the sequence boundary |
+| `initialCommittedSeq` | 0 | Initial `COMMIT_ORDER` frontier; `AkkEngine` seeds this from WAL/SST recovery |
 
 ### 13.2 Version Entries
 
@@ -782,9 +795,56 @@ Each public `VersionEntry` contains:
 - `sourceNodeId`,
 - `timestampNs`,
 - `flags`,
-- stored value bytes.
+- value bytes (always decompressed when VLog compression is enabled).
 
 `ROLLBACK_NODE` is `UINT64_MAX`. `VLOG_FLAG_ROLLBACK` is `0x04`.
+`VLOG_FLAG_RETENTION_BASE` is `0x08` and identifies a synthetic state entry
+emitted by retention compaction. The internal `VLOG_FLAG_ZSTD` bit (`0x01`)
+prefixes the stored compressed payload with its four-byte uncompressed size; it
+is stripped before a `VersionEntry` is exposed.
+
+VLog compression is disabled by default. With `codec = ZSTD`, a record is only
+stored compressed when the result including its original-size prefix is smaller
+than the raw value; reads always return decompressed value bytes. Configure it
+directly through `AkkEngineOptions::vlog.codec` and
+`AkkEngineOptions::vlog.zstdCompressionLevel`, or at the high-level startup
+surface through `AkkaraDB::Options::overrides.versionLogCodec` and
+`versionLogZstdCompressionLevel`.
+
+Retention is disabled by default. Set `retentionDays`,
+`retentionMinCommitSeq`, or both. The enabled conditions are ORed: a closed
+segment is deleted when its file age reaches `retentionDays` or its highest
+sequence is lower than `retentionMinCommitSeq`. Retention runs after recovery,
+after segment rotation, and on close; it never deletes the active segment.
+It also leaves any segment that reaches beyond the current commit frontier in
+place until those writes commit.
+It is segment-granular, so history can remain slightly longer than the boundary
+but is never partially rewritten. Before deleting an expired segment, VersionLog
+scans the retained set and writes one `VLOG_FLAG_RETENTION_BASE` record for each
+key whose most recent value at the boundary would otherwise disappear. The base
+record is durable before deletion, so `getAt`, `history`, and rollback preserve
+the state from the effective retained boundary onward without retaining all
+older versions. The boundary is the later of `retentionMinCommitSeq` and the
+sequence immediately after the highest removed version. VersionLog keeps
+expired segments until that boundary is committed, so a base is never invisible
+under `COMMIT_ORDER` and never stands before a removed version.
+
+Queries before the base boundary remain unavailable, and `history` reports the
+synthetic base as its first retained version with the retention-base flag. This
+is an intentional history rebase, not a preservation of the original mutation
+sequence.
+
+Retention compaction snapshots the closed-segment set, commit frontier, and a
+persisted-generation counter, then reconstructs its base state under a shared
+scan lock. Regular reads and writes continue during that scan. It commits only
+when the persisted-generation counter is unchanged, taking the exclusive scan
+lock only to append durable bases and unlink expired files. A concurrent
+persisted write causes a retry; after two unstable attempts, pruning remains
+pending for a later append or close rather than deleting from an unsafe snapshot.
+
+The same settings are exposed at the high-level startup surface as
+`AkkaraDB::Options::overrides.versionLogRetentionDays` and
+`versionLogRetentionMinCommitSeq`.
 
 ### 13.3 Disabled Behavior
 
@@ -794,8 +854,84 @@ When VersionLog is disabled:
 - `history` returns an empty vector,
 - `rollbackTo` and `rollbackKey` throw.
 
-VersionLog is incompatible with `THREAD_LOCAL_RANGES` and parallel write
-admission.
+VersionLog is incompatible with `THREAD_LOCAL_RANGES`. Its write admission is
+independent from MemTable admission: a parallel MemTable may funnel VersionLog
+records through its serial entry, or both components may use parallel entry.
+
+`SERIAL` uses one admission mutex. `PREPARE_PARALLEL` retains the former
+parallel behavior: entry serialization and compression occur concurrently, but
+one append stream persists records and updates its active index in order.
+
+`serialAppendMode` applies only to `SERIAL`. `PIPELINED` submits VLog work and
+lets the same put continue to its MemTable and commit steps. With
+`WAIT_PREVIOUS_APPEND`, that put still continues immediately, but the next
+serial put waits until the preceding VLog append reaches the log file before it
+submits its own VLog record. This is an admission gate between puts; it does not
+make the preceding put wait before its MemTable step.
+
+`PARALLEL` is physical write parallelism and requires `syncMode = ASYNC`. Put
+calls enqueue a record to a lane worker rather than issuing VLog I/O themselves.
+Each worker owns an active segment, selected from the stable key fingerprint,
+and serializes that lane's append, active-index update, and rotation. Different
+lanes therefore persist and index concurrently, while writes for the same key
+remain ordered. `segmentBytes` bounds each lane independently, so the aggregate
+active VLog/index budget is approximately the lane count times that threshold.
+`parallelPendingLimitScope = PER_LANE` permits up to `asyncMaxPendingBytes` in
+each lane. `GLOBAL` applies that value once across all lane queues. Queues reject
+a write when their applicable pending-byte limit is reached; they do not turn
+ordinary puts into synchronous disk I/O. The durable tail
+advances at `forceSync`, lane rotation, or close. Entries that remain queued or
+unsynced at a crash are discarded rather than extending recovery beyond a
+durable prefix.
+
+VersionLog does not retain persisted historical values in RAM. Each segment has
+a derived `*.akvidx` sidecar containing a Bloom filter and a sorted mapping
+from key fingerprint to `(commitSeq, VLog byte offset)` records. `history` uses
+the Bloom filter to reject segments that cannot contain its key, then reads only
+that key's offsets; `getAt` binary-searches those per-key sequences and reads the
+selected record directly. With segmentation enabled, the active segment keeps
+only key-to-`(commitSeq, VLog byte offset)` metadata in RAM, bounded by
+`segmentBytes`; historical values remain on disk. Setting `segmentBytes = 0` also disables that active
+metadata, so reads of a newly appended single-file log safely fall back to a
+file scan rather than accumulating unbounded history in RAM. Reads run
+concurrently and retain only the async records that have not reached the file as
+a small value overlay. Rollback-target collection intentionally builds a
+temporary full-history view for the duration of that rollback only.
+
+The VLog segment is authoritative. Index-sidecar regeneration is attempted at
+segment rotation, clean close, and recovery. A missing, stale, malformed, or
+unwritable sidecar causes a safe scan of just that segment and never makes
+valid VLog data unreadable.
+
+Each sidecar has independent header and payload CRC32C validation. A corrupted
+Bloom filter or offset directory is therefore rejected before it can produce a
+false negative; the VLog segment remains the fallback source of truth.
+
+The base `logPath` is segment `0`; later segments insert `-seg-N` before the
+extension (for example, `vlog.akvlog`, `vlog-seg-1.akvlog`). Their derived
+indexes replace the VLog extension with `.akvidx` (for example, `vlog.akvidx`
+and `vlog-seg-1.akvidx`).
+`PARALLEL` also writes an `.akvtail` sibling for every active lane. It records
+the byte length of the durable contiguous VLog prefix. Recovery reads no bytes
+beyond that prefix, so a crash cannot turn an interrupted lane append into a
+corrupt VLog tail. The tail is a recovery boundary, not a historical index.
+A compact in-memory segment directory records each file's id, minimum sequence,
+maximum sequence, and byte size. `getAt` uses those ranges to skip segments
+that begin after its requested sequence. The directory is rebuilt during
+VersionLog recovery, so no separate manifest can become a source of truth.
+
+With `recoveryMode = BACKGROUND`, `open` returns after the active log file is
+opened and validation/index reconstruction continues in a worker. VersionLog
+append, visibility, history/rollback, sync, and close operations—and AkkEngine
+read or mutation paths—wait for that worker before continuing, so an application
+cannot observe or mutate engine state before the recovery boundary completes. A
+recovery error (including VLog corruption) is rethrown by that waiting operation;
+`EAGER` instead reports it from `open`.
+
+`AkkEngine` appends VersionLog records before applying their MemTable mutation,
+then publishes the VersionLog commit after that mutation. Consequently,
+`COMMIT_ORDER` history and `getAt` never expose a record ahead of the engine's
+VersionLog commit frontier; `APPLIED` is the opt-in lower-latency alternative.
 
 ### 13.4 Rollback
 
@@ -804,7 +940,9 @@ mutation that represents the rolled-back state. Rollback mutations are marked
 with the rollback source node id and rollback flag, then follow normal local and
 cluster shipment paths.
 
-Corrupt VersionLog data fails open rather than being silently accepted.
+VLog entry corruption is never accepted. `EAGER` recovery fails `open`; in
+`BACKGROUND` mode the first operation that crosses the recovery barrier throws
+the stored recovery error.
 
 ## 14. Generation Layout
 
@@ -1041,8 +1179,10 @@ delegates to engine shutdown.
 | `NORMAL` | WAL async |
 | `DURABLE` | WAL sync and VersionLog enabled |
 
-High-level overrides can set MemTable threshold, VersionLog enablement, SST/Blob
-codec, Blob threshold, SST read promotion, Bloom density, and L0 SST trigger.
+High-level overrides can set MemTable threshold; VersionLog enablement, codec,
+Zstd level, write admission, serial append mode, parallel lane count, parallel
+pending-limit scope, and retention boundaries; SST/Blob codec; SST Zstd compression level; Blob threshold;
+SST read promotion; Bloom density; and the L0 SST trigger.
 
 ### 17.3 Table Handles
 
@@ -1299,7 +1439,9 @@ own synchronization appropriate to their role:
 - WAL append/sync/close paths are synchronized and may use async workers.
 - Manifest public methods are thread-safe.
 - SST background compaction reports stored failures.
-- VersionLog async/batched writers serialize persistence.
+- VersionLog async/batched writers serialize persistence. `PARALLEL` instead
+  persists directly through independently locked lanes; `BACKGROUND` recovery
+  uses a separate validation/index-rebuild worker.
 - API servers own transport-specific accept/worker state.
 - Cluster runtime serializes endpoint start/close/shipping as required.
 
@@ -1314,7 +1456,8 @@ Depending on configuration, background work can include:
 - MemTable immutable flush workers,
 - SST compaction workers,
 - Manifest fast-mode flusher,
-- VersionLog async/batched flusher,
+- VersionLog async/batched flusher, `PARALLEL` lane writers, and optional
+  `BACKGROUND` recovery worker,
 - Blob GC,
 - API accept/connection workers,
 - cluster replication manager and endpoints.
@@ -1420,11 +1563,13 @@ dispatch where available.
 | Artifact | Magic | Version | Integrity boundary |
 |---|---|---:|---|
 | WAL segment | `AKWA` | 1 | Header CRC and entry CRC |
-| SST file | `AKS2` | 2 | Header, footer, block CRCs |
+| SST file | `AKS2` | 2 | Header, metadata, footer, and block CRCs |
 | SST footer | `A2SF` | 2 | Footer CRC |
 | Blob file | `AKB5` | 1 | Header CRC and original-content CRC |
 | Manifest | `AMV5` | 1 | Header CRC and per-record payload CRC |
-| VersionLog | `AKV5` | 1 | Header and entry CRCs |
+| VersionLog segment | `AKV5` | 1 | File-header and entry CRCs |
+| VersionLog sidecar index | `AKVI` | 2 | Header CRC and payload CRC |
+| VersionLog durable tail | `AKVT` | 1 | Tail-header CRC |
 | Cluster config | `AKC5` | 3 | Config CRC |
 | TCP API request | `AK5Q` | protocol 2 | Transport framing and payload validation |
 | TCP API response | `AK5S` | protocol 2 | Transport framing and payload validation |
@@ -1510,8 +1655,10 @@ Fixed structures:
 | `SSTBloomHeaderV2` | 16 |
 | `SSTFooterV2` | 48 |
 
-Per-file flags include block Zstd. Per-block flags include compressed, raw, and
-prefix-compressed. Record flags mirror tombstone and Blob status.
+Per-file flags include block Zstd and metadata CRCs. All SST files must checksum
+the block index, key arena, and Bloom filter; files without metadata checksums
+are rejected. Per-block flags include compressed, raw, and prefix-compressed.
+Record flags mirror tombstone and Blob status.
 
 ### 24.6 Manifest
 
@@ -1527,9 +1674,51 @@ cluster lifecycle events.
 
 ### 24.7 VersionLog
 
-VersionLog starts with an `AKV5` v1 header and then CRC-protected entries. Each
-entry stores key, sequence, source node id, timestamp, flags, and stored value.
-Corrupt VersionLog content is fatal at open.
+Each `.akvlog` segment starts with this 32-byte `AKV5` v1 header:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | `magic` (`AKV5`) |
+| 4 | 2 | `version` (`1`) |
+| 6 | 1 | `syncModeHint` |
+| 7 | 1 | reserved |
+| 8 | 8 | `createdNs` |
+| 16 | 8 | reserved |
+| 24 | 4 | header `crc32c` |
+| 28 | 4 | reserved |
+
+It is followed by variable-sized entries:
+
+```text
+[AkvlogV5EntryHeader:43][key:keyLen][stored value:valueLen][entry CRC32C:u32]
+```
+
+The packed entry header contains `entryLen`, `seq`, `sourceNodeId`,
+`timestampNs`, `flags`, `keyFp64`, `keyLen`, and `valueLen`. `entryLen` covers
+the complete entry, including its trailing CRC. With `VLOG_FLAG_ZSTD`, the
+stored value begins with a four-byte uncompressed size followed by the Zstd
+payload. Public `VersionEntry` values are decompressed and do not expose that
+internal flag.
+
+Each VLog segment may have a derived sibling `.akvidx` file. It begins with a
+44-byte `AKVI` v2 header containing the Bloom hash count, authoritative VLog
+byte length, key/version counts, Bloom bit count, payload CRC32C, and header
+CRC32C. Its payload is `[Bloom bytes][24-byte fingerprint directory
+records][16-byte (seq, VLog-offset) records]`. The directory is ordered by key
+fingerprint; a lookup verifies the referenced VLog key before trusting a
+fingerprint match. A missing, stale, or invalid sidecar is ignored for that
+query; recovery, segment rotation, and clean close attempt to regenerate it
+from the authoritative segment.
+
+`PARALLEL` mode additionally maintains a 24-byte `.akvtail` (`AKVT` v1)
+record beside each active lane segment. It contains the committed byte length
+and a CRC32C. Recovery validates that length against the physical file and
+scans only the recorded prefix; bytes after it are interrupted, unpublished
+tail data and are ignored.
+
+VLog corruption is never accepted. `EAGER` recovery reports it from `open`;
+with `BACKGROUND` recovery the first operation waiting on recovery receives the
+stored error instead.
 
 ### 24.8 Cluster Config
 

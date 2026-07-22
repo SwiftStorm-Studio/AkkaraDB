@@ -30,6 +30,94 @@ void makeQueryPlan(const Expr& expr, QueryPlan& plan) const {
     addQueryRange(plan, scanStartBuffer_, scanEndBuffer_, 0);
 }
 
+[[nodiscard]] static int compareRangeKey(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
+    return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end()) ? -1 :
+        (std::lexicographical_compare(rhs.begin(), rhs.end(), lhs.begin(), lhs.end()) ? 1 : 0);
+}
+
+[[nodiscard]] static int compareRangeStart(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
+    if (lhs.empty()) { return rhs.empty() ? 0 : -1; }
+    if (rhs.empty()) { return 1; }
+    return compareRangeKey(lhs, rhs);
+}
+
+[[nodiscard]] static int compareRangeEnd(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
+    if (lhs.empty()) { return rhs.empty() ? 0 : 1; }
+    if (rhs.empty()) { return -1; }
+    return compareRangeKey(lhs, rhs);
+}
+
+[[nodiscard]] static bool rangeMetadataCompatible(const QueryRange& lhs, const QueryRange& rhs) noexcept {
+    return lhs.indexSearchPrefixSize == rhs.indexSearchPrefixSize
+        && lhs.dynamicIndexPkOffset == rhs.dynamicIndexPkOffset
+        && lhs.prefixIndexPkOffset == rhs.prefixIndexPkOffset;
+}
+
+[[nodiscard]] static bool rangesHaveSameNamespace(const QueryRange& lhs, const QueryRange& rhs) {
+    constexpr size_t namespaceBytes = 8;
+    if (lhs.startKey.size() < namespaceBytes || rhs.startKey.size() < namespaceBytes) { return false; }
+    return std::equal(lhs.startKey.begin(), lhs.startKey.begin() + namespaceBytes, rhs.startKey.begin());
+}
+
+[[nodiscard]] static bool rangesCanIntersect(const QueryRange& lhs, const QueryRange& rhs) {
+    return rangeMetadataCompatible(lhs, rhs) && rangesHaveSameNamespace(lhs, rhs);
+}
+
+[[nodiscard]] static bool intersectRange(const QueryRange& lhs, const QueryRange& rhs, QueryRange& out) {
+    out = lhs;
+    if (compareRangeStart(rhs.startKey, out.startKey) > 0) { out.startKey = rhs.startKey; }
+    if (compareRangeEnd(rhs.endKey, out.endKey) < 0) { out.endKey = rhs.endKey; }
+    out.dedupeIndexPks = lhs.dedupeIndexPks || rhs.dedupeIndexPks;
+    return out.endKey.empty() || compareRangeKey(out.startKey, out.endKey) < 0;
+}
+
+[[nodiscard]] static bool tryIntersectIndexPlans(const QueryPlan& lhs, const QueryPlan& rhs, QueryPlan& out) {
+    if (lhs.kind != QuerySourceKind::INDEX || rhs.kind != QuerySourceKind::INDEX) { return false; }
+
+    std::vector<QueryRange> ranges;
+    ranges.reserve(lhs.ranges.size() * rhs.ranges.size());
+    for (const auto& lhsRange : lhs.ranges) {
+        for (const auto& rhsRange : rhs.ranges) {
+            if (!rangesCanIntersect(lhsRange, rhsRange)) { return false; }
+            QueryRange intersection;
+            if (intersectRange(lhsRange, rhsRange, intersection)) { ranges.push_back(std::move(intersection)); }
+        }
+    }
+    out.kind = QuerySourceKind::INDEX;
+    out.ranges = std::move(ranges);
+    out.score = lhs.score < rhs.score ? lhs.score : rhs.score;
+    return true;
+}
+
+[[nodiscard]] static bool rangesCanMerge(const QueryRange& lhs, const QueryRange& rhs) {
+    return rangeMetadataCompatible(lhs, rhs) && rangesHaveSameNamespace(lhs, rhs)
+        && (lhs.endKey.empty() || compareRangeStart(rhs.startKey, lhs.endKey) <= 0);
+}
+
+static void mergeIndexPlanRanges(QueryPlan& plan) {
+    if (plan.kind != QuerySourceKind::INDEX || plan.ranges.size() < 2) { return; }
+
+    std::sort(plan.ranges.begin(), plan.ranges.end(), [](const QueryRange& lhs, const QueryRange& rhs) {
+        const int start = compareRangeStart(lhs.startKey, rhs.startKey);
+        if (start != 0) { return start < 0; }
+        return compareRangeEnd(lhs.endKey, rhs.endKey) < 0;
+    });
+
+    std::vector<QueryRange> merged;
+    merged.reserve(plan.ranges.size());
+    for (auto& range : plan.ranges) {
+        if (merged.empty() || !rangesCanMerge(merged.back(), range)) {
+            merged.push_back(std::move(range));
+            continue;
+        }
+
+        auto& current = merged.back();
+        if (compareRangeEnd(range.endKey, current.endKey) > 0) { current.endKey = std::move(range.endKey); }
+        current.dedupeIndexPks = current.dedupeIndexPks || range.dedupeIndexPks;
+    }
+    plan.ranges = std::move(merged);
+}
+
 void addQueryRange(
     QueryPlan& plan,
     std::span<const uint8_t> startKey,
@@ -58,6 +146,7 @@ template <typename Expr>
         const bool lhsUsable = tryMakeIndexPlan(expr.lhs, lhsPlan);
         const bool rhsUsable = tryMakeIndexPlan(expr.rhs, rhsPlan);
         if (!lhsUsable && !rhsUsable) { return false; }
+        if (lhsUsable && rhsUsable && tryIntersectIndexPlans(lhsPlan, rhsPlan, plan)) { return true; }
         if (!rhsUsable || (lhsUsable && lhsPlan.score >= rhsPlan.score)) { plan = std::move(lhsPlan); }
         else { plan = std::move(rhsPlan); }
         return true;
@@ -77,6 +166,7 @@ template <typename Expr>
             std::make_move_iterator(rhsPlan.ranges.end())
         );
         for (auto& range : plan.ranges) { range.dedupeIndexPks = true; }
+        mergeIndexPlanRanges(plan);
 
         const int lowerScore = lhsPlan.score < rhsPlan.score ? lhsPlan.score : rhsPlan.score;
         plan.score = lowerScore < queryPlanScoreOrUnion ? lowerScore : queryPlanScoreOrUnion;

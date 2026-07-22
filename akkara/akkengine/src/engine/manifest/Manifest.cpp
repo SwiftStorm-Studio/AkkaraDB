@@ -19,6 +19,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include "akk/engine/manifest/ManifestFraming.hpp"
@@ -214,6 +215,7 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             void advance(uint64_t newCount) {
+                std::lock_guard apiLock{apiMutex_};
                 {
                     std::lock_guard lock{advanceMutex_};
                     if (newCount < stripesWritten_.load(std::memory_order_relaxed)) {
@@ -231,6 +233,7 @@ namespace akkaradb::engine::manifest {
                 const std::optional<std::string>& firstKeyHex,
                 const std::optional<std::string>& lastKeyHex
             ) {
+                std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::SST_SEAL, encodeSstSeal(ts, level, file, entries, firstKeyHex, lastKeyHex));
 
@@ -240,11 +243,23 @@ namespace akkaradb::engine::manifest {
                 deletedSst_.erase(file);
             }
 
+            void sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) {
+                std::lock_guard apiLock{apiMutex_};
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::SST_BLOB_REFS, encodeSstBlobRefs(ts, file, toFramingEntries(entries)));
+
+                std::lock_guard lock{mutex_};
+                auto stored = sortedUniqueEntries(entries);
+                sstBlobRefs_.push_back(SSTBlobRefsEvent{file, stored, ts});
+                sstBlobRefsByFile_[file] = std::move(stored);
+            }
+
             void checkpoint(
                 const std::optional<std::string>& name,
                 const std::optional<uint64_t>& stripe,
                 const std::optional<uint64_t>& lastSeq
             ) {
+                std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::CHECKPOINT, encodeCheckpoint(ts, name, stripe, lastSeq));
 
@@ -257,6 +272,7 @@ namespace akkaradb::engine::manifest {
             }
 
             void compactionStart(int level, const std::vector<std::string>& inputs) {
+                std::lock_guard apiLock{apiMutex_};
                 append(ManifestRecordType::COMPACTION_START, encodeCompactionStart(nowUs(), level, inputs));
             }
 
@@ -268,6 +284,7 @@ namespace akkaradb::engine::manifest {
                 const std::optional<std::string>& firstKeyHex,
                 const std::optional<std::string>& lastKeyHex
             ) {
+                std::lock_guard apiLock{apiMutex_};
                 append(
                     ManifestRecordType::COMPACTION_END,
                     encodeCompactionEnd(nowUs(), level, output, inputs, entries, firstKeyHex, lastKeyHex)
@@ -282,14 +299,17 @@ namespace akkaradb::engine::manifest {
             }
 
             void sstDelete(const std::string& file) {
+                std::lock_guard apiLock{apiMutex_};
                 append(ManifestRecordType::SST_DELETE, encodeSstDelete(nowUs(), file));
 
                 std::lock_guard lock{mutex_};
                 liveSst_.erase(file);
                 deletedSst_.insert(file);
+                sstBlobRefsByFile_.erase(file);
             }
 
             void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles) {
+                std::lock_guard apiLock{apiMutex_};
                 // Single append call -> single CRC-protected record.
                 // Either fully applied on replay or entirely absent (CRC mismatch).
                 append(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), outputFiles, inputFiles));
@@ -302,14 +322,17 @@ namespace akkaradb::engine::manifest {
                 for (const auto& f : inputFiles) {
                     liveSst_.erase(f);
                     deletedSst_.insert(f);
+                    sstBlobRefsByFile_.erase(f);
                 }
             }
 
             void truncate(const std::optional<std::string>& reason) {
+                std::lock_guard apiLock{apiMutex_};
                 append(ManifestRecordType::TRUNCATE, encodeTruncate(nowUs(), reason));
             }
 
             void nodeJoin(uint64_t nodeId, uint16_t replPort, const std::string& host) {
+                std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::NODE_JOIN, encodeNodeJoin(ts, nodeId, replPort, host));
 
@@ -318,6 +341,7 @@ namespace akkaradb::engine::manifest {
             }
 
             void nodeLeave(uint64_t nodeId) {
+                std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::NODE_LEAVE, encodeNodeLeave(ts, nodeId));
 
@@ -326,6 +350,7 @@ namespace akkaradb::engine::manifest {
             }
 
             void primaryLease(uint64_t nodeId, uint64_t leaseUntilUs) {
+                std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::PRIMARY_LEASE, encodePrimaryLease(ts, nodeId, leaseUntilUs));
 
@@ -333,11 +358,145 @@ namespace akkaradb::engine::manifest {
                 lastPrimaryLease_ = PrimaryLeaseEvent{nodeId, leaseUntilUs, ts};
             }
 
+            void blobPut(uint64_t blobId, uint64_t totalSize, uint64_t storedSize, uint32_t contentCrc32c, uint32_t codec) {
+                std::lock_guard apiLock{apiMutex_};
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::BLOB_PUT, encodeBlobPut(ts, blobId, totalSize, storedSize, contentCrc32c, codec));
+
+                std::lock_guard lock{mutex_};
+                blobPuts_.push_back(BlobPutEvent{blobId, totalSize, storedSize, contentCrc32c, codec, ts});
+                liveBlobs_.insert(blobId);
+                deletedBlobs_.erase(blobId);
+            }
+
+            void blobDelete(uint64_t blobId) {
+                std::lock_guard apiLock{apiMutex_};
+                const uint64_t ts = nowUs();
+                append(ManifestRecordType::BLOB_DELETE, encodeBlobDelete(ts, blobId));
+
+                std::lock_guard lock{mutex_};
+                blobDeletes_.push_back(BlobDeleteEvent{blobId, ts});
+                liveBlobs_.erase(blobId);
+                deletedBlobs_.insert(blobId);
+            }
+
             // ----------------------------------------------------------------
             // Replay
             // ----------------------------------------------------------------
 
             void replay() { replayInternal(); }
+
+            void compact() {
+                std::lock_guard apiLock{apiMutex_};
+                flushPendingForCompact();
+
+                uint64_t stripes = 0;
+                std::vector<SSTSealEvent> seals;
+                std::vector<std::string> live;
+                std::vector<std::string> deleted;
+                std::optional<CheckpointEvent> checkpoint;
+                std::vector<NodeJoinEvent> joins;
+                std::vector<NodeLeaveEvent> leaves;
+                std::optional<PrimaryLeaseEvent> lease;
+                std::vector<BlobPutEvent> blobPuts;
+                std::vector<uint64_t> liveBlobs;
+                std::vector<uint64_t> deletedBlobs;
+                std::vector<SSTBlobRefsEvent> sstBlobRefs;
+                {
+                    std::lock_guard lock{mutex_};
+                    stripes = stripesWritten_.load(std::memory_order_relaxed);
+                    seals = sstSeals_;
+                    live.assign(liveSst_.begin(), liveSst_.end());
+                    deleted.assign(deletedSst_.begin(), deletedSst_.end());
+                    checkpoint = lastCheckpoint_;
+                    joins = nodeJoins_;
+                    leaves = nodeLeaves_;
+                    lease = lastPrimaryLease_;
+                    blobPuts = blobPuts_;
+                    liveBlobs.assign(liveBlobs_.begin(), liveBlobs_.end());
+                    deletedBlobs.assign(deletedBlobs_.begin(), deletedBlobs_.end());
+                    for (const auto& file : liveSst_) {
+                        if (const auto it = sstBlobRefsByFile_.find(file); it != sstBlobRefsByFile_.end()) {
+                            sstBlobRefs.push_back(SSTBlobRefsEvent{file, it->second, nowUs()});
+                        }
+                    }
+                }
+
+                std::sort(live.begin(), live.end());
+                std::sort(deleted.begin(), deleted.end());
+                std::sort(liveBlobs.begin(), liveBlobs.end());
+                std::sort(deletedBlobs.begin(), deletedBlobs.end());
+
+                const auto tmpPath = path_.parent_path() / (path_.filename().string() + ".compact.tmp");
+                std::filesystem::remove(tmpPath);
+                FileHandle compactFile = FileHandle::open(tmpPath);
+                uint64_t compactSize = 0;
+                {
+                    const ManifestFileHeader fhdr = ManifestFileHeader::build(0);
+                    uint8_t buf[ManifestFileHeader::SIZE];
+                    fhdr.serialize(buf);
+                    compactFile.write(buf, ManifestFileHeader::SIZE);
+                    compactSize += ManifestFileHeader::SIZE;
+                }
+
+                auto writeRecord = [&](ManifestRecordType type, std::vector<uint8_t> payload) {
+                    auto record = buildRecord(type, std::move(payload));
+                    compactFile.write(record.data(), record.size());
+                    compactSize += record.size();
+                };
+
+                if (stripes > 0) { writeRecord(ManifestRecordType::STRIPE_COMMIT, encodeStripeCommit(nowUs(), stripes)); }
+                for (const auto& seal : seals) {
+                    writeRecord(
+                        ManifestRecordType::SST_SEAL,
+                        encodeSstSeal(seal.tsUs, seal.level, seal.file, seal.entries, seal.firstKeyHex, seal.lastKeyHex)
+                    );
+                }
+                if (!live.empty()) { writeRecord(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), live, {})); }
+                for (const auto& refs : sstBlobRefs) {
+                    writeRecord(ManifestRecordType::SST_BLOB_REFS, encodeSstBlobRefs(refs.tsUs, refs.file, toFramingEntries(refs.entries)));
+                }
+                if (checkpoint.has_value()) {
+                    writeRecord(
+                        ManifestRecordType::CHECKPOINT,
+                        encodeCheckpoint(checkpoint->tsUs, checkpoint->name, checkpoint->stripe, checkpoint->lastSeq)
+                    );
+                }
+                for (const auto& file : deleted) { writeRecord(ManifestRecordType::SST_DELETE, encodeSstDelete(nowUs(), file)); }
+                for (const auto& join : joins) {
+                    writeRecord(ManifestRecordType::NODE_JOIN, encodeNodeJoin(join.tsUs, join.nodeId, join.replPort, join.host));
+                }
+                for (const auto& leave : leaves) { writeRecord(ManifestRecordType::NODE_LEAVE, encodeNodeLeave(leave.tsUs, leave.nodeId)); }
+                if (lease.has_value()) {
+                    writeRecord(ManifestRecordType::PRIMARY_LEASE, encodePrimaryLease(lease->tsUs, lease->nodeId, lease->leaseUntilUs));
+                }
+                for (const auto& put : blobPuts) {
+                    if (std::binary_search(liveBlobs.begin(), liveBlobs.end(), put.blobId)) {
+                        writeRecord(
+                            ManifestRecordType::BLOB_PUT,
+                            encodeBlobPut(put.tsUs, put.blobId, put.totalSize, put.storedSize, put.contentCrc32c, put.codec)
+                        );
+                    }
+                }
+                for (const auto blobId : deletedBlobs) { writeRecord(ManifestRecordType::BLOB_DELETE, encodeBlobDelete(nowUs(), blobId)); }
+
+                compactFile.fsyncFull();
+                compactFile.close();
+
+                std::lock_guard rotationLock{rotationMutex_};
+                fileHandle_.close();
+                std::filesystem::remove(path_);
+                std::filesystem::rename(tmpPath, path_);
+                for (size_t i = 1; i < 10000; ++i) {
+                    const auto p = existingManifestPath(i);
+                    if (p.empty()) { break; }
+                    std::filesystem::remove(p);
+                }
+                rotationCounter_ = 0;
+                currentPath_ = path_;
+                currentFileSize_ = compactSize;
+                fileHandle_ = FileHandle::open(currentPath_);
+            }
 
             // ----------------------------------------------------------------
             // Queries
@@ -380,8 +539,103 @@ namespace akkaradb::engine::manifest {
                 return lastPrimaryLease_;
             }
 
+            std::vector<uint64_t> liveBlobs() const {
+                std::lock_guard lock{mutex_};
+                return {liveBlobs_.begin(), liveBlobs_.end()};
+            }
+
+            std::vector<uint64_t> deletedBlobs() const {
+                std::lock_guard lock{mutex_};
+                return {deletedBlobs_.begin(), deletedBlobs_.end()};
+            }
+
+            std::vector<BlobPutEvent> blobPuts() const {
+                std::lock_guard lock{mutex_};
+                return blobPuts_;
+            }
+
+            std::vector<BlobDeleteEvent> blobDeletes() const {
+                std::lock_guard lock{mutex_};
+                return blobDeletes_;
+            }
+
+            std::vector<SSTBlobRefsEvent> sstBlobRefs() const {
+                std::lock_guard lock{mutex_};
+                return sstBlobRefs_;
+            }
+
+            std::vector<uint64_t> sstReferencedBlobs() const {
+                std::lock_guard lock{mutex_};
+                struct LatestEntry {
+                    uint64_t seq = 0;
+                    std::optional<uint64_t> blobId;
+                };
+                std::unordered_map<std::string, LatestEntry> latestByKey;
+                for (const auto& file : liveSst_) {
+                    const auto it = sstBlobRefsByFile_.find(file);
+                    if (it == sstBlobRefsByFile_.end()) { continue; }
+                    for (const auto& entry : it->second) {
+                        const std::string key{reinterpret_cast<const char*>(entry.key.data()), entry.key.size()};
+                        auto& latest = latestByKey[key];
+                        if (entry.seq >= latest.seq) { latest = LatestEntry{entry.seq, entry.blobId}; }
+                    }
+                }
+                std::vector<uint64_t> out;
+                for (const auto& [_, latest] : latestByKey) {
+                    if (latest.blobId.has_value()) { out.push_back(*latest.blobId); }
+                }
+                return sortedUniqueBlobIds(out);
+            }
+
+            bool sstBlobRefsComplete() const {
+                std::lock_guard lock{mutex_};
+                for (const auto& file : liveSst_) {
+                    if (sstBlobRefsByFile_.find(file) == sstBlobRefsByFile_.end()) { return false; }
+                }
+                return true;
+            }
+
         private:
             static constexpr size_t ROTATION_THRESHOLD = 32 * 1024 * 1024; // 32 MiB
+
+            static std::vector<uint64_t> sortedUniqueBlobIds(std::vector<uint64_t> blobIds) {
+                std::sort(blobIds.begin(), blobIds.end());
+                blobIds.erase(std::unique(blobIds.begin(), blobIds.end()), blobIds.end());
+                return blobIds;
+            }
+
+            static std::vector<SSTBlobRefEntry> toFramingEntries(const std::vector<SSTBlobRefsEvent::Entry>& entries) {
+                std::vector<SSTBlobRefEntry> out;
+                out.reserve(entries.size());
+                for (const auto& entry : entries) {
+                    out.push_back(SSTBlobRefEntry{entry.key, entry.seq, entry.flags, entry.blobId});
+                }
+                return out;
+            }
+
+            static std::vector<SSTBlobRefsEvent::Entry> toManifestEntries(std::vector<SSTBlobRefEntry> entries) {
+                std::vector<SSTBlobRefsEvent::Entry> out;
+                out.reserve(entries.size());
+                for (auto& entry : entries) {
+                    out.push_back(SSTBlobRefsEvent::Entry{std::move(entry.key), entry.seq, entry.flags, entry.blobId});
+                }
+                return out;
+            }
+
+            static std::vector<SSTBlobRefsEvent::Entry> sortedUniqueEntries(std::vector<SSTBlobRefsEvent::Entry> entries) {
+                std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+                    if (lhs.key != rhs.key) { return lhs.key < rhs.key; }
+                    if (lhs.seq != rhs.seq) { return lhs.seq < rhs.seq; }
+                    return lhs.blobId.value_or(0) < rhs.blobId.value_or(0);
+                });
+                entries.erase(
+                    std::unique(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+                        return lhs.key == rhs.key && lhs.seq == rhs.seq && lhs.flags == rhs.flags && lhs.blobId == rhs.blobId;
+                    }),
+                    entries.end()
+                );
+                return entries;
+            }
 
             // ----------------------------------------------------------------
             // Path helpers
@@ -468,13 +722,17 @@ namespace akkaradb::engine::manifest {
             // Append
             // ----------------------------------------------------------------
 
-            void append(ManifestRecordType type, std::vector<uint8_t> payload) {
+            [[nodiscard]] static std::vector<uint8_t> buildRecord(ManifestRecordType type, std::vector<uint8_t> payload) {
                 const auto plen = static_cast<uint16_t>(payload.size());
                 const ManifestRecordHeader rhdr = ManifestRecordHeader::build(type, payload.data(), plen);
                 payload.resize(ManifestRecordHeader::SIZE + plen);
                 std::memmove(payload.data() + ManifestRecordHeader::SIZE, payload.data(), plen);
                 rhdr.serialize(payload.data());
+                return payload;
+            }
 
+            void append(ManifestRecordType type, std::vector<uint8_t> payload) {
+                payload = buildRecord(type, std::move(payload));
                 if (fastMode_) {
                     bool wasEmpty;
                     {
@@ -491,6 +749,23 @@ namespace akkaradb::engine::manifest {
                     fileHandle_.fsyncData();
                     currentFileSize_ += payload.size();
                 }
+            }
+
+            void flushPendingForCompact() {
+                if (!fastMode_) { return; }
+                std::vector<std::vector<uint8_t>> batch;
+                {
+                    std::lock_guard lock{queueMutex_};
+                    std::swap(batch, queue_);
+                }
+                if (batch.empty()) { return; }
+                std::lock_guard rotationLock{rotationMutex_};
+                for (const auto& record : batch) {
+                    checkRotation();
+                    fileHandle_.write(record.data(), record.size());
+                    currentFileSize_ += record.size();
+                }
+                fileHandle_.fsyncData();
             }
 
             // ----------------------------------------------------------------
@@ -549,6 +824,12 @@ namespace akkaradb::engine::manifest {
                     nodeJoins_.clear();
                     nodeLeaves_.clear();
                     lastPrimaryLease_.reset();
+                    blobPuts_.clear();
+                    blobDeletes_.clear();
+                    liveBlobs_.clear();
+                    deletedBlobs_.clear();
+                    sstBlobRefs_.clear();
+                    sstBlobRefsByFile_.clear();
                 }
                 stripesWritten_.store(0, std::memory_order_relaxed);
 
@@ -656,6 +937,7 @@ namespace akkaradb::engine::manifest {
                         std::lock_guard lock{mutex_};
                         liveSst_.erase(d.name);
                         deletedSst_.insert(d.name);
+                        sstBlobRefsByFile_.erase(d.name);
                         break;
                     }
                     case ManifestRecordType::COMPACTION_END: {
@@ -666,6 +948,7 @@ namespace akkaradb::engine::manifest {
                         for (const auto& inp : d.inputs) {
                             liveSst_.erase(inp);
                             deletedSst_.insert(inp);
+                            sstBlobRefsByFile_.erase(inp);
                         }
                         break;
                     }
@@ -691,13 +974,59 @@ namespace akkaradb::engine::manifest {
                         for (const auto& f : d.inputFiles) {
                             liveSst_.erase(f);
                             deletedSst_.insert(f);
+                            sstBlobRefsByFile_.erase(f);
                         }
                         break;
                     }
+                    case ManifestRecordType::SST_BLOB_REFS: {
+                        DecodedSSTBlobRefs d;
+                        if (!decodeSstBlobRefs(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        auto entries = sortedUniqueEntries(toManifestEntries(std::move(d.entries)));
+                        sstBlobRefs_.push_back(SSTBlobRefsEvent{d.name, entries, d.tsUs});
+                        sstBlobRefsByFile_[d.name] = std::move(entries);
+                        break;
+                    }
+                    case ManifestRecordType::NODE_JOIN: {
+                        DecodedNodeJoin d;
+                        if (!decodeNodeJoin(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        nodeJoins_.push_back(NodeJoinEvent{d.nodeId, d.replPort, d.host, d.tsUs});
+                        break;
+                    }
+                    case ManifestRecordType::NODE_LEAVE: {
+                        DecodedNodeLeave d;
+                        if (!decodeNodeLeave(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        nodeLeaves_.push_back(NodeLeaveEvent{d.nodeId, d.tsUs});
+                        break;
+                    }
+                    case ManifestRecordType::PRIMARY_LEASE: {
+                        DecodedPrimaryLease d;
+                        if (!decodePrimaryLease(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        lastPrimaryLease_ = PrimaryLeaseEvent{d.nodeId, d.leaseUntilUs, d.tsUs};
+                        break;
+                    }
+                    case ManifestRecordType::BLOB_PUT: {
+                        DecodedBlobPut d;
+                        if (!decodeBlobPut(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        blobPuts_.push_back(BlobPutEvent{d.blobId, d.totalSize, d.storedSize, d.contentCrc32c, d.codec, d.tsUs});
+                        liveBlobs_.insert(d.blobId);
+                        deletedBlobs_.erase(d.blobId);
+                        break;
+                    }
+                    case ManifestRecordType::BLOB_DELETE: {
+                        DecodedBlobDelete d;
+                        if (!decodeBlobDelete(payload, len, d)) { return; }
+                        std::lock_guard lock{mutex_};
+                        blobDeletes_.push_back(BlobDeleteEvent{d.blobId, d.tsUs});
+                        liveBlobs_.erase(d.blobId);
+                        deletedBlobs_.insert(d.blobId);
+                        break;
+                    }
                     case ManifestRecordType::COMPACTION_START:
-                    case ManifestRecordType::NODE_JOIN:
-                    case ManifestRecordType::NODE_LEAVE:
-                    case ManifestRecordType::PRIMARY_LEASE:
                     case ManifestRecordType::TRUNCATE:
                         // Informational only - no state change
                         break;
@@ -712,6 +1041,7 @@ namespace akkaradb::engine::manifest {
             bool fastMode_;
             std::atomic<bool> running_;
             FileHandle fileHandle_;
+            std::mutex apiMutex_;
 
             // Durable state
             std::atomic<uint64_t> stripesWritten_;
@@ -724,6 +1054,12 @@ namespace akkaradb::engine::manifest {
             std::vector<NodeJoinEvent> nodeJoins_;
             std::vector<NodeLeaveEvent> nodeLeaves_;
             std::optional<PrimaryLeaseEvent> lastPrimaryLease_;
+            std::vector<BlobPutEvent> blobPuts_;
+            std::vector<BlobDeleteEvent> blobDeletes_;
+            std::unordered_set<uint64_t> liveBlobs_;
+            std::unordered_set<uint64_t> deletedBlobs_;
+            std::vector<SSTBlobRefsEvent> sstBlobRefs_;
+            std::unordered_map<std::string, std::vector<SSTBlobRefsEvent::Entry>> sstBlobRefsByFile_;
 
             // Fast-mode flusher
             std::thread flusherThread_;
@@ -787,6 +1123,8 @@ namespace akkaradb::engine::manifest {
         impl_->compactionCommit(outputFiles, inputFiles);
     }
 
+    void Manifest::sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) { impl_->sstBlobRefs(file, entries); }
+
     void Manifest::truncate(const std::optional<std::string>& reason) { impl_->truncate(reason); }
 
     void Manifest::nodeJoin(uint64_t nodeId, uint16_t replPort, const std::string& host) { impl_->nodeJoin(nodeId, replPort, host); }
@@ -795,7 +1133,14 @@ namespace akkaradb::engine::manifest {
 
     void Manifest::primaryLease(uint64_t nodeId, uint64_t leaseUntilUs) { impl_->primaryLease(nodeId, leaseUntilUs); }
 
+    void Manifest::blobPut(uint64_t blobId, uint64_t totalSize, uint64_t storedSize, uint32_t contentCrc32c, uint32_t codec) {
+        impl_->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec);
+    }
+
+    void Manifest::blobDelete(uint64_t blobId) { impl_->blobDelete(blobId); }
+
     void Manifest::replay() { impl_->replay(); }
+    void Manifest::compact() { impl_->compact(); }
 
     uint64_t Manifest::stripesWritten() const noexcept { return impl_->stripesWritten(); }
 
@@ -807,6 +1152,13 @@ namespace akkaradb::engine::manifest {
     std::vector<Manifest::NodeJoinEvent> Manifest::nodeJoins() const { return impl_->nodeJoins(); }
     std::vector<Manifest::NodeLeaveEvent> Manifest::nodeLeaves() const { return impl_->nodeLeaves(); }
     std::optional<Manifest::PrimaryLeaseEvent> Manifest::lastPrimaryLease() const noexcept { return impl_->lastPrimaryLease(); }
+    std::vector<uint64_t> Manifest::liveBlobs() const { return impl_->liveBlobs(); }
+    std::vector<uint64_t> Manifest::deletedBlobs() const { return impl_->deletedBlobs(); }
+    std::vector<Manifest::BlobPutEvent> Manifest::blobPuts() const { return impl_->blobPuts(); }
+    std::vector<Manifest::BlobDeleteEvent> Manifest::blobDeletes() const { return impl_->blobDeletes(); }
+    std::vector<Manifest::SSTBlobRefsEvent> Manifest::sstBlobRefs() const { return impl_->sstBlobRefs(); }
+    std::vector<uint64_t> Manifest::sstReferencedBlobs() const { return impl_->sstReferencedBlobs(); }
+    bool Manifest::sstBlobRefsComplete() const { return impl_->sstBlobRefsComplete(); }
 
     void Manifest::close() { impl_->close(); }
 } // namespace akkaradb::engine::manifest

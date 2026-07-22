@@ -9,6 +9,7 @@
 
 #include "TestErrorHandlers.hpp"
 
+#include "akk/cpu/CRC32C.hpp"
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/core/record/RecordView.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
@@ -16,11 +17,16 @@
 #include "akk/engine/sstable/SSTWriter.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -139,6 +145,282 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    void testManifestCompactPreservesReplayState() {
+        namespace fs = std::filesystem;
+        namespace manifest = akkaradb::engine::manifest;
+        using BlobRefEntry = manifest::Manifest::SSTBlobRefsEvent::Entry;
+
+        const fs::path dir = fs::current_path() / ".bench-tmp" / "manifest_compact_replay_state_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir);
+        const fs::path manifestPath = dir / "manifest.akmf";
+
+        {
+            auto mf = manifest::Manifest::create(manifestPath);
+            mf->advance(7);
+            mf->sstSeal(0, "L0_1.aksst", 1, std::optional<std::string>{"61"}, std::optional<std::string>{"61"});
+            mf->sstSeal(0, "L0_2.aksst", 1, std::optional<std::string>{"62"}, std::optional<std::string>{"62"});
+            mf->sstBlobRefs(
+                "L0_1.aksst",
+                {
+                    BlobRefEntry{{'a'}, 1, akkaradb::engine::sst::SST_RECORD_FLAG_BLOB, 101},
+                    BlobRefEntry{{'a'}, 2, 0, std::nullopt},
+                    BlobRefEntry{{'b'}, 3, akkaradb::engine::sst::SST_RECORD_FLAG_BLOB, 102},
+                }
+            );
+            mf->sstBlobRefs("L0_2.aksst", {BlobRefEntry{{'c'}, 4, akkaradb::core::RecordView::FLAG_TOMBSTONE, std::nullopt}});
+            mf->compactionCommit({"L1_3.aksst"}, {"L0_1.aksst", "L0_2.aksst"});
+            mf->sstBlobRefs(
+                "L1_3.aksst",
+                {
+                    BlobRefEntry{{'a'}, 2, 0, std::nullopt},
+                    BlobRefEntry{{'b'}, 3, akkaradb::engine::sst::SST_RECORD_FLAG_BLOB, 102},
+                    BlobRefEntry{{'c'}, 4, akkaradb::core::RecordView::FLAG_TOMBSTONE, std::nullopt},
+                }
+            );
+            mf->checkpoint(std::optional<std::string>{"compact-source"}, std::nullopt, 9);
+            mf->sstDelete("L9_deleted.aksst");
+            mf->nodeJoin(1, 20401, "node-one.local");
+            mf->nodeJoin(2, 20402, "node-two.local");
+            mf->nodeLeave(2);
+            mf->primaryLease(1, 123456789);
+            mf->blobPut(101, 4096, 1024, 0x12345678u, 1);
+            mf->blobPut(102, 2048, 2048, 0x87654321u, 0);
+            mf->blobDelete(101);
+            mf->compact();
+            mf->close();
+        }
+
+        {
+            auto recovered = manifest::Manifest::create(manifestPath);
+            const auto live = recovered->liveSst();
+            require(live.size() == 1 && live[0] == "L1_3.aksst", "compacted manifest did not preserve live SST set");
+            const auto deleted = recovered->deletedSst();
+            require(deleted.size() == 1 && deleted[0] == "L9_deleted.aksst", "compacted manifest did not preserve deleted SST set");
+            const auto checkpoint = recovered->lastCheckpoint();
+            require(
+                checkpoint.has_value() && checkpoint->lastSeq.has_value() && *checkpoint->lastSeq == 9,
+                "compacted manifest did not preserve checkpoint"
+            );
+            require(recovered->stripesWritten() == 7, "compacted manifest did not preserve stripe counter");
+            require(recovered->nodeJoins().size() == 2, "compacted manifest did not preserve node joins");
+            require(recovered->nodeLeaves().size() == 1, "compacted manifest did not preserve node leaves");
+            const auto lease = recovered->lastPrimaryLease();
+            require(
+                lease.has_value() && lease->nodeId == 1 && lease->leaseUntilUs == 123456789,
+                "compacted manifest did not preserve primary lease"
+            );
+            auto liveBlobs = recovered->liveBlobs();
+            std::sort(liveBlobs.begin(), liveBlobs.end());
+            require(liveBlobs.size() == 1 && liveBlobs[0] == 102, "compacted manifest did not preserve live blob set");
+            auto deletedBlobs = recovered->deletedBlobs();
+            std::sort(deletedBlobs.begin(), deletedBlobs.end());
+            require(deletedBlobs.size() == 1 && deletedBlobs[0] == 101, "compacted manifest did not preserve deleted blob set");
+            const auto blobPuts = recovered->blobPuts();
+            require(
+                blobPuts.size() == 1 && blobPuts[0].blobId == 102 && blobPuts[0].totalSize == 2048 &&
+                    blobPuts[0].storedSize == 2048 && blobPuts[0].contentCrc32c == 0x87654321u && blobPuts[0].codec == 0,
+                "compacted manifest did not preserve live blob metadata"
+            );
+            require(recovered->sstBlobRefsComplete(), "compacted manifest did not preserve complete SST blob refs");
+            const auto sstBlobRefs = recovered->sstReferencedBlobs();
+            require(sstBlobRefs.size() == 1 && sstBlobRefs[0] == 102, "compacted manifest did not preserve live SST blob refs");
+            recovered->close();
+        }
+
+        fs::remove_all(dir, ec);
+    }
+
+    void testZstdCompressionLevel() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+
+        const fs::path dir = fs::current_path() / ".bench-tmp" / "sst_zstd_compression_level_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir);
+
+        const std::vector<uint8_t> key{'k'};
+        const std::vector<uint8_t> value(4096, 'v');
+        const std::vector<akkaradb::core::RecordView> records{record(key, value, 1)};
+
+        sst::SSTWriter::Options writerOptions;
+        writerOptions.zstdCompressionLevel = 3;
+        const auto path = dir / "configured.aksst";
+        (void)sst::SSTWriter::write(path, records, writerOptions);
+        auto reader = sst::SSTReader::open(path);
+        require(reader != nullptr, "configured Zstd level must produce a readable SST");
+        std::vector<uint8_t> out;
+        const auto hit = reader->getInto(bytes(key), out);
+        require(hit.has_value() && *hit && out == value, "configured Zstd level must preserve values");
+
+        sst::SSTManager::Options managerOptions;
+        managerOptions.sstDir = dir;
+        managerOptions.compactionMode = sst::SSTCompactionMode::DISABLED;
+        managerOptions.compactThreads = 0;
+        managerOptions.zstdCompressionLevel = std::numeric_limits<int>::max();
+        bool rejected = false;
+        try {
+            (void)sst::SSTManager::create(managerOptions);
+        }
+        catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        require(rejected, "invalid Zstd level must be rejected when SST manager starts");
+
+        reader.reset();
+        fs::remove_all(dir, ec);
+    }
+
+    void testL0RecoveryUsesNumericFileOrder() {
+        namespace fs = std::filesystem;
+        namespace manifest = akkaradb::engine::manifest;
+        namespace sst = akkaradb::engine::sst;
+
+        const fs::path dir = fs::current_path() / ".bench-tmp" / "sst_l0_numeric_recovery_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir);
+
+        auto mf = manifest::Manifest::create(dir / "manifest.akmf");
+        sst::SSTManager::Options options;
+        options.sstDir = dir;
+        options.compactionMode = sst::SSTCompactionMode::DISABLED;
+        options.compactThreads = 0;
+
+        const std::vector<uint8_t> key{'k'};
+        {
+            auto manager = sst::SSTManager::create(options, mf.get());
+            for (uint64_t seq = 1; seq <= 10; ++seq) {
+                const std::vector<uint8_t> value{'v', static_cast<uint8_t>(seq)};
+                const std::vector<akkaradb::core::RecordView> records{record(key, value, seq)};
+                manager->flush(records);
+            }
+            manager->shutdown();
+        }
+
+        {
+            auto recovered = sst::SSTManager::create(options, mf.get());
+            recovered->recover();
+            std::vector<uint8_t> out;
+            const auto hit = recovered->getInto(bytes(key), out);
+            require(
+                hit.has_value() && *hit && out == std::vector<uint8_t>({'v', 10}),
+                "recovered L0 lookup must prefer the largest numeric file id"
+            );
+            recovered->shutdown();
+        }
+
+        mf->close();
+        fs::remove_all(dir, ec);
+    }
+
+    [[nodiscard]] akkaradb::engine::sst::SSTFileHeaderV2 readSstHeader(const std::filesystem::path& path) {
+        akkaradb::engine::sst::SSTFileHeaderV2 header{};
+        std::ifstream in(path, std::ios::binary);
+        require(static_cast<bool>(in), "failed to open SST for header read");
+        in.read(reinterpret_cast<char*>(&header), sizeof(header));
+        require(static_cast<bool>(in), "failed to read SST header");
+        return header;
+    }
+
+    void flipFileByte(const std::filesystem::path& path, uint64_t offset) {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        require(static_cast<bool>(file), "failed to open SST for corruption test");
+        char value = 0;
+        file.seekg(static_cast<std::streamoff>(offset));
+        file.read(&value, 1);
+        require(static_cast<bool>(file), "failed to read SST corruption target");
+        value = static_cast<char>(static_cast<unsigned char>(value) ^ 0x5au);
+        file.seekp(static_cast<std::streamoff>(offset));
+        file.write(&value, 1);
+        file.flush();
+        require(static_cast<bool>(file), "failed to write SST corruption target");
+    }
+
+    void removeSstMetadataChecksums(const std::filesystem::path& path) {
+        namespace sst = akkaradb::engine::sst;
+
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        require(static_cast<bool>(file), "failed to open SST for legacy-format test");
+        sst::SSTFileHeaderV2 header{};
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+        require(static_cast<bool>(file), "failed to read SST header for legacy-format test");
+
+        sst::SSTFooterV2 footer{};
+        file.seekg(static_cast<std::streamoff>(header.footerOffset));
+        file.read(reinterpret_cast<char*>(&footer), sizeof(footer));
+        require(static_cast<bool>(file), "failed to read SST footer for legacy-format test");
+
+        header.flags &= ~sst::SST_FILE_FLAG_METADATA_CRC;
+        std::memset(header.reserved, 0, sizeof(header.reserved));
+        header.crc32c = 0;
+        header.crc32c = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(&header), sizeof(header));
+        footer.headerCrc32c = header.crc32c;
+        footer.footerCrc32c = 0;
+        footer.footerCrc32c = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(&footer), sizeof(footer));
+
+        file.seekp(0);
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.seekp(static_cast<std::streamoff>(header.footerOffset));
+        file.write(reinterpret_cast<const char*>(&footer), sizeof(footer));
+        file.flush();
+        require(static_cast<bool>(file), "failed to write SST legacy-format test fixture");
+    }
+
+    void testSstCorruptionDetection() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+
+        const fs::path dir = fs::current_path() / ".bench-tmp" / "sst_corruption_detection_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir);
+
+        const std::vector<uint8_t> key{'k', 'e', 'y'};
+        const std::vector<uint8_t> value(4096, 'v');
+        const std::vector<akkaradb::core::RecordView> records{record(key, value, 1)};
+        const fs::path source = dir / "source.aksst";
+        (void)sst::SSTWriter::write(source, records);
+        const auto header = readSstHeader(source);
+
+        const fs::path legacy = dir / "legacy.aksst";
+        fs::copy_file(source, legacy, fs::copy_options::overwrite_existing);
+        removeSstMetadataChecksums(legacy);
+        require(sst::SSTReader::open(legacy) == nullptr, "SST without metadata checksums must be rejected");
+
+        const std::pair<const char*, uint64_t> metadataTargets[] = {
+            {"index", header.indexOffset},
+            {"key-arena", header.keyArenaOffset},
+            {"bloom", header.bloomOffset},
+        };
+        for (const auto& [name, offset] : metadataTargets) {
+            const fs::path corrupt = dir / (std::string{name} + ".aksst");
+            fs::copy_file(source, corrupt, fs::copy_options::overwrite_existing);
+            flipFileByte(corrupt, offset);
+            require(sst::SSTReader::open(corrupt) == nullptr, "metadata corruption must reject SST open");
+        }
+
+        const fs::path corruptBlock = dir / "block.aksst";
+        fs::copy_file(source, corruptBlock, fs::copy_options::overwrite_existing);
+        flipFileByte(corruptBlock, header.dataOffset + sizeof(sst::SSTBlockHeaderV2));
+        auto reader = sst::SSTReader::open(corruptBlock);
+        require(reader != nullptr, "block corruption must be detected on block access");
+        std::vector<uint8_t> out;
+        bool rejected = false;
+        try {
+            (void)reader->getInto(bytes(key), out);
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        require(rejected, "block corruption must throw instead of reporting a miss");
+
+        reader.reset();
+        fs::remove_all(dir, ec);
+    }
+
 }
 
 int main() {
@@ -210,6 +492,10 @@ int main() {
         manager->shutdown();
         fs::remove_all(dir, ec);
         testManifestRecoveryPrunesCompactionArtifacts();
+        testManifestCompactPreservesReplayState();
+        testZstdCompressionLevel();
+        testL0RecoveryUsesNumericFileOrder();
+        testSstCorruptionDetection();
         return 0;
     }
     catch (const std::exception& ex) {

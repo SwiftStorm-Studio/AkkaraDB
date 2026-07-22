@@ -51,6 +51,8 @@ namespace akkaradb::engine::manifest {
          * the old input files as still live and discards the orphan output files.
          */
         COMPACTION_COMMIT = 0x08,
+        SST_BLOB_REFS = 0x09,
+        ///< Blob ids referenced by one SST file
 
         // Cluster events (v4)
         NODE_JOIN = 0x10,
@@ -59,6 +61,12 @@ namespace akkaradb::engine::manifest {
         ///< A node left the cluster
         PRIMARY_LEASE = 0x12,
         ///< Primary lease record (nodeId + expiry)
+
+        // Blob lifecycle events (v5)
+        BLOB_PUT = 0x20,
+        ///< Blob file was durably written
+        BLOB_DELETE = 0x21,
+        ///< Blob file was deleted by GC
     };
 
     // ============================================================================
@@ -276,6 +284,28 @@ namespace akkaradb::engine::manifest {
         const std::vector<std::string>& inputFiles
     );
 
+    /**
+     * Encodes an SSTBlobRefs payload.
+     * Payload fixed (12 bytes): [tsUs:u64][nameLen:u16][entryCount:u16]
+     * Variable:
+     *   name bytes
+     *   entryCount x [seq:u64][blobId:u64][keyLen:u16][flags:u8][reserved:u8][key bytes]
+     *
+     * blobId uses MANIFEST_ABSENT_U64 for records whose current value is not an external blob ref.
+     */
+    struct AKDB_API SSTBlobRefEntry {
+        std::vector<uint8_t> key;
+        uint64_t seq;
+        uint8_t flags;
+        std::optional<uint64_t> blobId;
+    };
+
+    [[nodiscard]] AKDB_API std::vector<uint8_t> encodeSstBlobRefs(
+        uint64_t tsUs,
+        const std::string& name,
+        const std::vector<SSTBlobRefEntry>& entries
+    );
+
     // ============================================================================
     // Decode helpers - parse payload bytes into structured fields
     // ============================================================================
@@ -333,6 +363,12 @@ namespace akkaradb::engine::manifest {
         std::vector<std::string> inputFiles;
     };
 
+    struct AKDB_API DecodedSSTBlobRefs {
+        uint64_t tsUs;
+        std::string name;
+        std::vector<SSTBlobRefEntry> entries;
+    };
+
     /**
      * Decode functions.  Return false if payload is malformed / too short.
      */
@@ -344,6 +380,47 @@ namespace akkaradb::engine::manifest {
     [[nodiscard]] AKDB_API bool decodeCheckpoint(const uint8_t* payload, uint16_t len, DecodedCheckpoint& out);
     [[nodiscard]] AKDB_API bool decodeTruncate(const uint8_t* payload, uint16_t len, DecodedTruncate& out);
     [[nodiscard]] AKDB_API bool decodeCompactionCommit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out);
+    [[nodiscard]] AKDB_API bool decodeSstBlobRefs(const uint8_t* payload, uint16_t len, DecodedSSTBlobRefs& out);
+
+    // ========================================================================
+    // Blob lifecycle encode / decode (v5)
+    // ========================================================================
+
+    /**
+     * Encodes a BlobPut payload.
+     * Payload (40 bytes): [tsUs:u64][blobId:u64][totalSize:u64][storedSize:u64][contentCrc32c:u32][codec:u32]
+     */
+    [[nodiscard]] AKDB_API std::vector<uint8_t> encodeBlobPut(
+        uint64_t tsUs,
+        uint64_t blobId,
+        uint64_t totalSize,
+        uint64_t storedSize,
+        uint32_t contentCrc32c,
+        uint32_t codec
+    );
+
+    /**
+     * Encodes a BlobDelete payload.
+     * Payload (16 bytes): [tsUs:u64][blobId:u64]
+     */
+    [[nodiscard]] AKDB_API std::vector<uint8_t> encodeBlobDelete(uint64_t tsUs, uint64_t blobId);
+
+    struct AKDB_API DecodedBlobPut {
+        uint64_t tsUs;
+        uint64_t blobId;
+        uint64_t totalSize;
+        uint64_t storedSize;
+        uint32_t contentCrc32c;
+        uint32_t codec;
+    };
+
+    struct AKDB_API DecodedBlobDelete {
+        uint64_t tsUs;
+        uint64_t blobId;
+    };
+
+    [[nodiscard]] AKDB_API bool decodeBlobPut(const uint8_t* payload, uint16_t len, DecodedBlobPut& out);
+    [[nodiscard]] AKDB_API bool decodeBlobDelete(const uint8_t* payload, uint16_t len, DecodedBlobDelete& out);
 
     // ========================================================================
     // Cluster event encode / decode (v4)

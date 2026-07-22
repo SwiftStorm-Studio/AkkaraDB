@@ -481,6 +481,38 @@ namespace akkaradb::engine::manifest {
         return p;
     }
 
+    std::vector<uint8_t> encodeSstBlobRefs(uint64_t tsUs, const std::string& name, const std::vector<SSTBlobRefEntry>& entries) {
+        if (name.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref filename is too long"); }
+        if (entries.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref list is too large"); }
+        const auto nameLen = static_cast<uint16_t>(name.size());
+        const auto entryCount = static_cast<uint16_t>(entries.size());
+        size_t total = 12 + name.size();
+        for (const auto& entry : entries) {
+            if (entry.key.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref key is too large"); }
+            total += 20 + entry.key.size();
+        }
+        if (total > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref payload is too large"); }
+        std::vector<uint8_t> p(total);
+        writeU64(p.data(), 0, tsUs);
+        writeU16(p.data(), 8, nameLen);
+        writeU16(p.data(), 10, entryCount);
+        std::memcpy(p.data() + 12, name.data(), name.size());
+        size_t off = 12 + name.size();
+        for (const auto& entry : entries) {
+            writeU64(p.data(), off, entry.seq);
+            off += sizeof(uint64_t);
+            writeU64(p.data(), off, entry.blobId.value_or(MANIFEST_ABSENT_U64));
+            off += sizeof(uint64_t);
+            writeU16(p.data(), off, static_cast<uint16_t>(entry.key.size()));
+            off += sizeof(uint16_t);
+            p[off++] = entry.flags;
+            p[off++] = 0;
+            std::memcpy(p.data() + off, entry.key.data(), entry.key.size());
+            off += entry.key.size();
+        }
+        return p;
+    }
+
     bool decodeCompactionCommit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out) {
         if (len < 12) { return false; }
         out.tsUs = readU64(payload, 0);
@@ -502,6 +534,83 @@ namespace akkaradb::engine::manifest {
             if (!readLengthPrefixed(payload, len, cursor, s)) { return false; }
             out.inputFiles.push_back(std::move(s));
         }
+        return true;
+    }
+
+    bool decodeSstBlobRefs(const uint8_t* payload, uint16_t len, DecodedSSTBlobRefs& out) {
+        if (len < 12) { return false; }
+        out.tsUs = readU64(payload, 0);
+        const uint16_t nameLen = readU16(payload, 8);
+        const uint16_t entryCount = readU16(payload, 10);
+        if (len < 12u + nameLen) { return false; }
+        out.name.assign(reinterpret_cast<const char*>(payload + 12), nameLen);
+        out.entries.clear();
+        out.entries.reserve(entryCount);
+        size_t off = 12u + nameLen;
+        for (uint16_t i = 0; i < entryCount; ++i) {
+            if (off + 20 > len) { return false; }
+            SSTBlobRefEntry entry;
+            entry.seq = readU64(payload, off);
+            off += sizeof(uint64_t);
+            const uint64_t blobId = readU64(payload, off);
+            off += sizeof(uint64_t);
+            if (blobId != MANIFEST_ABSENT_U64) { entry.blobId = blobId; }
+            const uint16_t keyLen = readU16(payload, off);
+            off += sizeof(uint16_t);
+            entry.flags = payload[off++];
+            ++off;
+            if (off + keyLen > len) { return false; }
+            entry.key.assign(payload + off, payload + off + keyLen);
+            off += keyLen;
+            out.entries.push_back(std::move(entry));
+        }
+        return true;
+    }
+
+    // ============================================================================
+    // Blob lifecycle encode / decode (v5)
+    // ============================================================================
+
+    std::vector<uint8_t> encodeBlobPut(
+        uint64_t tsUs,
+        uint64_t blobId,
+        uint64_t totalSize,
+        uint64_t storedSize,
+        uint32_t contentCrc32c,
+        uint32_t codec
+    ) {
+        std::vector<uint8_t> p(40);
+        writeU64(p.data(), 0, tsUs);
+        writeU64(p.data(), 8, blobId);
+        writeU64(p.data(), 16, totalSize);
+        writeU64(p.data(), 24, storedSize);
+        writeU32(p.data(), 32, contentCrc32c);
+        writeU32(p.data(), 36, codec);
+        return p;
+    }
+
+    std::vector<uint8_t> encodeBlobDelete(uint64_t tsUs, uint64_t blobId) {
+        std::vector<uint8_t> p(16);
+        writeU64(p.data(), 0, tsUs);
+        writeU64(p.data(), 8, blobId);
+        return p;
+    }
+
+    bool decodeBlobPut(const uint8_t* payload, uint16_t len, DecodedBlobPut& out) {
+        if (len < 40) { return false; }
+        out.tsUs = readU64(payload, 0);
+        out.blobId = readU64(payload, 8);
+        out.totalSize = readU64(payload, 16);
+        out.storedSize = readU64(payload, 24);
+        out.contentCrc32c = readU32(payload, 32);
+        out.codec = readU32(payload, 36);
+        return true;
+    }
+
+    bool decodeBlobDelete(const uint8_t* payload, uint16_t len, DecodedBlobDelete& out) {
+        if (len < 16) { return false; }
+        out.tsUs = readU64(payload, 0);
+        out.blobId = readU64(payload, 8);
         return true;
     }
 

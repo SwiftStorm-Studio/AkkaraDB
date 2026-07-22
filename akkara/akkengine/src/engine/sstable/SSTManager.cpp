@@ -26,6 +26,8 @@
 #include <thread>
 #include <unordered_set>
 
+#include <zstd.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -86,6 +88,24 @@ namespace akkaradb::engine::sst {
                     return false;
             }
             return true;
+        }
+
+        void validateZstdCompressionLevel(const SSTManager::Options& options) {
+            if (options.codec == SSTWriter::Codec::ZSTD &&
+                (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel > ZSTD_maxCLevel())) {
+                throw std::invalid_argument("SSTManager: zstdCompressionLevel is outside the supported Zstd range");
+            }
+        }
+
+        std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> toManifestBlobRefs(
+            const std::vector<SSTWriter::Result::BlobRefEntry>& refs
+        ) {
+            std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> out;
+            out.reserve(refs.size());
+            for (const auto& ref : refs) {
+                out.push_back(manifest::Manifest::SSTBlobRefsEvent::Entry{ref.key, ref.seq, ref.flags, ref.blobId});
+            }
+            return out;
         }
 
         void syncFile(const std::filesystem::path& path) {
@@ -276,6 +296,7 @@ namespace akkaradb::engine::sst {
                 : options_{std::move(options)}, manifest_{manifest} {
                 if (options_.maxLevels < 2) { options_.maxLevels = 2; }
                 if (options_.sstDir.empty()) { throw std::invalid_argument("SSTManager: sstDir is required"); }
+                validateZstdCompressionLevel(options_);
                 std::filesystem::create_directories(options_.sstDir);
                 levels_.resize(static_cast<size_t>(options_.maxLevels));
                 publishLocked();
@@ -357,6 +378,7 @@ namespace akkaradb::engine::sst {
                 wopts.targetFileSize = options_.targetFileSize;
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
+                wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
 
                 const auto result = SSTWriter::write(tmp, records, wopts);
                 crashAtTestPoint("sst.flush.after_tmp_write");
@@ -366,7 +388,10 @@ namespace akkaradb::engine::sst {
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
                 Meta meta = makeMeta(path, path.filename().string(), std::move(reader));
 
-                if (manifest_) { manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey)); }
+                if (manifest_) {
+                    manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
+                    manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
+                }
                 crashAtTestPoint("sst.flush.after_manifest_seal");
 
                 {
@@ -576,7 +601,12 @@ namespace akkaradb::engine::sst {
 
             void sortAllLevelsLocked() {
                 if (!levels_.empty()) {
-                    std::sort(levels_[0].begin(), levels_[0].end(), [](const Meta& a, const Meta& b) { return a.filename > b.filename; });
+                    std::sort(levels_[0].begin(), levels_[0].end(), [](const Meta& a, const Meta& b) {
+                        const uint64_t aId = parseFileId(a.filename);
+                        const uint64_t bId = parseFileId(b.filename);
+                        if (aId != bId) { return aId > bId; }
+                        return a.filename > b.filename;
+                    });
                 }
                 for (size_t i = 1; i < levels_.size(); ++i) {
                     std::sort(
@@ -664,12 +694,15 @@ namespace akkaradb::engine::sst {
                 wopts.targetFileSize = options_.targetFileSize;
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
-                (void)SSTWriter::write(tmp, views, wopts);
+                wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
+                const auto result = SSTWriter::write(tmp, views, wopts);
                 crashAtTestPoint("sst.compaction.after_output_tmp_write");
                 durableRename(tmp, path);
                 crashAtTestPoint("sst.compaction.after_output_rename");
                 auto reader = SSTReader::open(path, readerOptions());
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen compacted SST"); }
+
+                if (manifest_) { manifest_->sstBlobRefs(path.filename().string(), toManifestBlobRefs(result.blobRefs)); }
 
                 std::vector<Meta> outputs;
                 outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));

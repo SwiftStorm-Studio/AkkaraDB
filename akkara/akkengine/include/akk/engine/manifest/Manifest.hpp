@@ -78,6 +78,33 @@ namespace akkaradb::engine::manifest {
                 uint64_t tsUs;
             };
 
+            struct BlobPutEvent {
+                uint64_t blobId;
+                uint64_t totalSize;
+                uint64_t storedSize;
+                uint32_t contentCrc32c;
+                uint32_t codec;
+                uint64_t tsUs;
+            };
+
+            struct BlobDeleteEvent {
+                uint64_t blobId;
+                uint64_t tsUs;
+            };
+
+            struct SSTBlobRefsEvent {
+                struct Entry {
+                    std::vector<uint8_t> key;
+                    uint64_t seq;
+                    uint8_t flags;
+                    std::optional<uint64_t> blobId;
+                };
+
+                std::string file;
+                std::vector<Entry> entries;
+                uint64_t tsUs;
+            };
+
             // ================================================================
             // Factory / lifecycle
             // ================================================================
@@ -170,6 +197,9 @@ namespace akkaradb::engine::manifest {
              */
             void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles);
 
+            /** Records the complete key/version/blob-reference set contained in one SST file. */
+            void sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries);
+
             /**
              * Records a truncation marker (informational).
              */
@@ -184,6 +214,12 @@ namespace akkaradb::engine::manifest {
             /** Records the last advertised primary lease window. */
             void primaryLease(uint64_t nodeId, uint64_t leaseUntilUs);
 
+            /** Records that a blob file was durably written. */
+            void blobPut(uint64_t blobId, uint64_t totalSize, uint64_t storedSize, uint32_t contentCrc32c, uint32_t codec);
+
+            /** Records that a blob file was deleted by GC. */
+            void blobDelete(uint64_t blobId);
+
             // ================================================================
             // Replay
             // ================================================================
@@ -194,6 +230,16 @@ namespace akkaradb::engine::manifest {
              * explicit replay after external changes.
              */
             void replay();
+
+            /**
+             * Rewrites the current replay state into a fresh base manifest file
+             * and removes rotated manifest history.
+             *
+             * The compacted file is encoded as ordinary manifest records, so no
+             * separate snapshot record format is required. Public write methods
+             * are serialized with compaction.
+             */
+            void compact();
 
             // ================================================================
             // State queries
@@ -220,6 +266,27 @@ namespace akkaradb::engine::manifest {
 
             /** Returns the most recently replayed primary-lease event, if any. */
             [[nodiscard]] std::optional<PrimaryLeaseEvent> lastPrimaryLease() const noexcept;
+
+            /** Returns all currently live blob ids known to the manifest. */
+            [[nodiscard]] std::vector<uint64_t> liveBlobs() const;
+
+            /** Returns all blob ids deleted by GC known to the manifest. */
+            [[nodiscard]] std::vector<uint64_t> deletedBlobs() const;
+
+            /** Returns all blob-put events in replay order. */
+            [[nodiscard]] std::vector<BlobPutEvent> blobPuts() const;
+
+            /** Returns all blob-delete events in replay order. */
+            [[nodiscard]] std::vector<BlobDeleteEvent> blobDeletes() const;
+
+            /** Returns all SST blob-reference events in replay order. */
+            [[nodiscard]] std::vector<SSTBlobRefsEvent> sstBlobRefs() const;
+
+            /** Returns unique blob ids referenced by latest versions in currently live SST files. */
+            [[nodiscard]] std::vector<uint64_t> sstReferencedBlobs() const;
+
+            /** True when every currently live SST has an explicit blob-reference record. */
+            [[nodiscard]] bool sstBlobRefsComplete() const;
 
             // ================================================================
             // Shutdown

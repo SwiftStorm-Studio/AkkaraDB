@@ -1,7 +1,9 @@
     [[nodiscard]] AkkaraDB::Options readOptions(JNIEnv* env, jobject optionsBuffer) {
         BytesReader in(readDirectBuffer(env, optionsBuffer));
         const auto version = in.u8();
-        if (version != 1 && version != 2 && version != 3 && version != 4) { throw std::runtime_error("Unsupported AkkaraDB options payload version"); }
+        if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5) {
+            throw std::runtime_error("Unsupported AkkaraDB options payload version");
+        }
 
         AkkaraDB::Options options;
         options.mode = startupModeFromOrdinal(static_cast<jint>(in.i32()));
@@ -30,6 +32,13 @@
         const auto sstBloomBitsPerKey = static_cast<jlong>(in.i64());
         if (sstBloomBitsPerKey >= 0) {
             options.overrides.sstBloomBitsPerKey = checkedCast<size_t>(sstBloomBitsPerKey, "sstBloomBitsPerKey");
+        }
+
+        if (version >= 5) {
+            const auto sstZstdCompressionLevel = static_cast<jint>(in.i32());
+            if (sstZstdCompressionLevel != std::numeric_limits<jint>::min()) {
+                options.overrides.sstZstdCompressionLevel = sstZstdCompressionLevel;
+            }
         }
 
         const auto maxL0SstFiles = static_cast<jlong>(in.i64());

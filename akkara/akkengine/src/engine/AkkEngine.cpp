@@ -76,7 +76,6 @@ namespace akkaradb::engine {
 
         [[nodiscard]] bool supportsParallelWriteAdmission(const AkkEngineOptions& options) noexcept {
             return !options.components.blobEnabled
-                   && !options.components.versionLogEnabled
                    && !options.components.clusterEnabled;
         }
 
@@ -405,6 +404,7 @@ namespace akkaradb::engine {
             std::unique_ptr<cluster::IClusterRuntime> clusterRuntime;
             std::unique_ptr<server::IAkkApiServer> apiServer;
             std::unique_ptr<RaftLog> raftLog;
+            uint64_t clusterConfiguredNodeCount = 0;
 
             mutable std::mutex writeMu;
             std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
@@ -984,9 +984,13 @@ namespace akkaradb::engine {
 
             [[nodiscard]] bool canRunBlobGc() const noexcept { return blobManager != nullptr && versionLog == nullptr; }
 
+            void waitForVersionLogRecovery() const {
+                if (versionLog) { versionLog->waitUntilReady(); }
+            }
+
             [[nodiscard]] bool canUseParallelWriteAdmission() const noexcept {
-                const bool supported = !walWriter && !versionLog && !blobManager && !clusterRuntime;
-                const bool explicitSupported = !versionLog && !blobManager && !clusterRuntime;
+                const bool supported = !walWriter && !blobManager && !clusterRuntime;
+                const bool explicitSupported = !blobManager && !clusterRuntime;
                 switch (opts.runtime.writeAdmission) {
                     case AkkEngineOptions::WriteAdmissionMode::SERIAL:
                         return false;
@@ -1189,18 +1193,20 @@ namespace akkaradb::engine {
                 bool knownContiguousCommit = false
             ) {
                 throwIfBackgroundFailed();
+                waitForVersionLogRecovery();
                 memtable->throwIfFlushFailed();
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
                 const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
                 if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64, walAckForWriteDurability()); }
                 if (versionLog) {
                     const uint8_t vlogFlags = versionLogFlags == 0xFF ? flags : versionLogFlags;
-                    versionLog->append(key, seq, sourceNodeId, nowNs(), vlogFlags, storedValue);
+                    versionLog->appendDeferred(key, seq, sourceNodeId, nowNs(), vlogFlags, storedValue);
                 }
 
                 if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
                 markWriteCommitted(seq, knownContiguousCommit);
+                if (versionLog) { versionLog->markCommitted(seq); }
             }
 
             [[nodiscard]] AppliedWrite applyLocalPut(
@@ -1678,7 +1684,7 @@ namespace akkaradb::engine {
         }
         if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
             throw std::invalid_argument(
-                "AkkEngine: runtime.writeAdmission=PARALLEL currently requires blob, version log, and cluster to be disabled"
+                "AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled"
             );
         }
         auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
@@ -1712,8 +1718,27 @@ namespace akkaradb::engine {
             impl.opts.memtable.onFlush = {};
         }
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
+        uint64_t manifestCheckpointSeq = 0;
+        if (impl.manifest) {
+            const auto checkpoint = impl.manifest->lastCheckpoint();
+            if (checkpoint.has_value() && checkpoint->lastSeq.has_value()) { manifestCheckpointSeq = *checkpoint->lastSeq; }
+        }
+        uint64_t walRecoveryCheckpointSeq = 0;
+        if (manifestCheckpointSeq > 0 && impl.sstManager && impl.opts.runtime.recoverSst) {
+            const uint64_t sstMaxSeq = impl.sstManager->maxSequence();
+            if (manifestCheckpointSeq > sstMaxSeq) {
+                throw std::runtime_error(
+                    "AkkEngine: manifest checkpoint sequence exceeds recovered SST sequence (checkpoint=" +
+                    std::to_string(manifestCheckpointSeq) + ", sstMaxSeq=" + std::to_string(sstMaxSeq) + ")"
+                );
+            }
+            walRecoveryCheckpointSeq = manifestCheckpointSeq;
+        }
         if (impl.opts.components.walEnabled && impl.opts.runtime.recoverWal) {
-            const auto recovery = wal::WalRecovery::recoverInto(wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir}, *impl.memtable);
+            const auto recovery = wal::WalRecovery::recoverInto(
+                wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir, .checkpointSeq = walRecoveryCheckpointSeq},
+                *impl.memtable
+            );
             (void)recovery;
         }
         uint64_t recoveredSeq = 0;
@@ -1726,18 +1751,37 @@ namespace akkaradb::engine {
         impl.resetCommittedSeq(recoveredSeq);
 
         if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
+        if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) { impl.walWriter->pruneUntil(walRecoveryCheckpointSeq); }
 
         if (impl.opts.components.blobEnabled) {
+            impl.opts.blob.onBlobPut = [&impl](
+                uint64_t blobId,
+                uint64_t totalSize,
+                uint64_t storedSize,
+                uint32_t contentCrc32c,
+                uint32_t codec
+            ) {
+                if (impl.manifest) { impl.manifest->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec); }
+            };
+            impl.opts.blob.onBlobDelete = [&impl](uint64_t blobId) {
+                if (!impl.manifest) { return; }
+                try { impl.manifest->blobDelete(blobId); }
+                catch (...) {}
+            };
             impl.blobManager = blob::BlobManager::create(impl.opts.blob);
             impl.blobManager->start();
         }
 
-        if (impl.opts.components.versionLogEnabled) { impl.versionLog = vlog::VersionLog::create(impl.opts.vlog); }
+        if (impl.opts.components.versionLogEnabled) {
+            impl.opts.vlog.initialCommittedSeq = std::max(impl.opts.vlog.initialCommittedSeq, recoveredSeq);
+            impl.versionLog = vlog::VersionLog::create(impl.opts.vlog);
+        }
 
         if (impl.opts.components.clusterEnabled) {
             cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
                                              ? *impl.opts.cluster.config
                                              : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
+            impl.clusterConfiguredNodeCount = cfg.nodes().size();
             writeCoordinatorMode = cfg.consistency().mode;
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
@@ -1861,6 +1905,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
+        impl_->waitForVersionLogRecovery();
         impl_->writeCoordinator->put(key, value);
     }
 
@@ -1868,6 +1913,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
+        impl_->waitForVersionLogRecovery();
         impl_->writeCoordinator->putHinted(key, value, fp64, miniKey);
     }
 
@@ -1879,6 +1925,7 @@ namespace akkaradb::engine {
             return;
         }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
+        impl_->waitForVersionLogRecovery();
         impl_->writeCoordinator->putBatch(entries);
     }
 
@@ -1886,6 +1933,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
+        impl_->waitForVersionLogRecovery();
         impl_->writeCoordinator->remove(key);
     }
 
@@ -1893,6 +1941,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
+        impl_->waitForVersionLogRecovery();
         impl_->writeCoordinator->removeHinted(key, fp64, miniKey);
     }
 
@@ -1900,6 +1949,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         return impl_->getValueInternal(key, true);
     }
 
@@ -1907,6 +1957,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         impl_->waitForKeySequenceReadVisibility();
         const uint64_t snapshot = impl_->snapshotSeq();
 
@@ -1926,6 +1977,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         impl_->waitForKeySequenceReadVisibility();
         impl_->existsTotal.fetch_add(1, std::memory_order_relaxed);
         const uint64_t seq = impl_->snapshotSeq();
@@ -1938,6 +1990,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         return impl_->getIntoInternal(key, out, true);
     }
 
@@ -1945,6 +1998,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         return impl_->getIntoArenaInternal(key, arena, out, true);
     }
 
@@ -1952,6 +2006,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         impl_->waitForKeySequenceReadVisibility();
 
         memtable::MemTable::KeyRange range;
@@ -2006,6 +2061,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
         impl_->throwIfBackgroundFailed();
+        impl_->waitForVersionLogRecovery();
         impl_->waitForKeySequenceReadVisibility();
         impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
 
@@ -2223,6 +2279,36 @@ namespace akkaradb::engine {
             out.sst.compactionFailures = snap.compactionFailures;
         }
 
+        out.manifest.enabled = impl_->manifest != nullptr;
+        if (impl_->manifest) {
+            const auto checkpoint = impl_->manifest->lastCheckpoint();
+            out.manifest.hasCheckpoint = checkpoint.has_value();
+            if (checkpoint.has_value()) {
+                out.manifest.lastCheckpointSeq = checkpoint->lastSeq.value_or(0);
+                out.manifest.lastCheckpointStripe = checkpoint->stripe.value_or(0);
+            }
+            out.manifest.liveSstCount = impl_->manifest->liveSst().size();
+            out.manifest.deletedSstCount = impl_->manifest->deletedSst().size();
+            out.manifest.sstSealCount = impl_->manifest->sstSeals().size();
+            out.manifest.sstReferencedBlobCount = impl_->manifest->sstReferencedBlobs().size();
+            out.manifest.sstBlobRefsComplete = impl_->manifest->sstBlobRefsComplete();
+            out.manifest.liveBlobCount = impl_->manifest->liveBlobs().size();
+            out.manifest.deletedBlobCount = impl_->manifest->deletedBlobs().size();
+            out.manifest.blobPutCount = impl_->manifest->blobPuts().size();
+            out.manifest.blobDeleteCount = impl_->manifest->blobDeletes().size();
+            if (const auto lease = impl_->manifest->lastPrimaryLease(); lease.has_value()) {
+                out.manifest.lastPrimaryLeaseNodeId = lease->nodeId;
+                out.manifest.lastPrimaryLeaseUntilUs = lease->leaseUntilUs;
+            }
+        }
+
+        out.cluster.enabled = impl_->opts.components.clusterEnabled && impl_->clusterRuntime != nullptr;
+        out.cluster.configuredNodeCount = impl_->clusterConfiguredNodeCount;
+        if (impl_->clusterRuntime) {
+            out.cluster.role = static_cast<uint32_t>(impl_->clusterRuntime->role());
+            out.cluster.activeNodeCount = impl_->clusterRuntime->activeNodes().size();
+        }
+
         out.vlog.enabled = impl_->versionLog != nullptr;
         if (impl_->versionLog) {
             const auto snap = impl_->versionLog->snapshot();
@@ -2296,6 +2382,13 @@ namespace akkaradb::engine {
             if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); }
         });
         closeStep([&] {
+            if (impl_->blobManager) {
+                if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
+                impl_->blobManager->close();
+                impl_->blobManager.reset();
+            }
+        });
+        closeStep([&] {
             if (impl_->sstManager) {
                 impl_->sstManager->shutdown();
                 impl_->sstManager.reset();
@@ -2303,6 +2396,9 @@ namespace akkaradb::engine {
         });
         closeStep([&] {
             if (impl_->walWriter && impl_->opts.runtime.forceSyncOnClose) { impl_->walWriter->forceSync(); }
+        });
+        closeStep([&] {
+            if (impl_->versionLog && impl_->opts.runtime.forceSyncOnClose) { impl_->versionLog->forceSync(); }
         });
         closeStep([&] {
             if (impl_->walWriter) {
@@ -2314,13 +2410,6 @@ namespace akkaradb::engine {
             if (impl_->manifest) {
                 impl_->manifest->close();
                 impl_->manifest.reset();
-            }
-        });
-        closeStep([&] {
-            if (impl_->blobManager) {
-                if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
-                impl_->blobManager->close();
-                impl_->blobManager.reset();
             }
         });
         closeStep([&] {

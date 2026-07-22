@@ -121,6 +121,7 @@ class BytecodeQueryView {
 
                 void advanceRaw() {
                     current_.reset();
+                    if (plan_.ranges.empty()) { return; }
                     while (rangeIndex_ <= plan_.ranges.size()) {
                         while (!(rawIt_ == rawRows_.end())) {
                             if (limit_ && matched_ >= *limit_) { return; }
@@ -358,8 +359,24 @@ class BytecodeQueryView {
 void makeBytecodeQueryPlan(const query::bytecode::PreparedQuery<Entity>& query, QueryPlan& plan) const {
     resetTempBuffers();
     const auto& descriptor = query.descriptor();
+    QueryPlan bestPlan;
+    bool hasBestPlan = false;
     for (const auto& hint : descriptor.planHints) {
-        if (tryMakeBytecodeQueryPlanHint(descriptor, hint, plan)) { return; }
+        QueryPlan hintPlan;
+        if (!tryMakeBytecodeQueryPlanHint(descriptor, hint, hintPlan)) { continue; }
+        if (!hasBestPlan) {
+            bestPlan = std::move(hintPlan);
+            hasBestPlan = true;
+            continue;
+        }
+
+        QueryPlan intersection;
+        if (tryIntersectIndexPlans(bestPlan, hintPlan, intersection)) { bestPlan = std::move(intersection); }
+        else if (hintPlan.score > bestPlan.score) { bestPlan = std::move(hintPlan); }
+    }
+    if (hasBestPlan) {
+        plan = std::move(bestPlan);
+        return;
     }
 
     plan.kind = QuerySourceKind::TABLE;

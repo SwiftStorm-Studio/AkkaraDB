@@ -73,6 +73,8 @@ uint64_t seq,
 
             virtual void start() = 0;
             virtual void close() = 0;
+            [[nodiscard]] virtual NodeRole role() const noexcept { return NodeRole::STANDALONE; }
+            [[nodiscard]] virtual std::vector<NodeInfo> activeNodes() const { return {}; }
             virtual void shipEntry(
                 uint64_t seq,
                 ReplOpType op,

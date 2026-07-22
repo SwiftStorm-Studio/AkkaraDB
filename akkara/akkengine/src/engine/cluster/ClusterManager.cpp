@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -64,6 +65,14 @@ namespace akkaradb::engine::cluster {
                         setRole(NodeRole::STANDALONE);
                         return;
                     }
+                    if (configureFromManifestLease()) {
+                        recordSelfJoin();
+                        return;
+                    }
+                    if (configureFromExpiredManifestLease()) {
+                        recordSelfJoin();
+                        return;
+                    }
                     selectRole();
                     recordSelfJoin();
                 }
@@ -94,6 +103,23 @@ namespace akkaradb::engine::cluster {
                 return primaryReplPort_;
             }
 
+            std::vector<NodeInfo> activeNodes() const {
+                std::vector<NodeInfo> out;
+                if (!clusterManifest_) { return out; }
+
+                for (const auto& configured : config_.nodes()) {
+                    const auto join = latestManifestJoinFor(configured.nodeId);
+                    if (!join.has_value()) { continue; }
+                    if (manifestNodeLeftAfter(configured.nodeId, join->tsUs)) { continue; }
+
+                    NodeInfo active = configured;
+                    if (!join->host.empty()) { active.host = join->host; }
+                    if (join->replPort != 0) { active.replPort = join->replPort; }
+                    out.push_back(std::move(active));
+                }
+                return out;
+            }
+
         private:
             void setRole(NodeRole role) {
                 const NodeRole old = role_.exchange(role);
@@ -118,6 +144,109 @@ namespace akkaradb::engine::cluster {
                             "ClusterManager: explicit startup role is required for non-standalone modes (PRIMARY or REPLICA)"
                         );
                 }
+            }
+
+            bool configureFromManifestLease() {
+                if (!clusterManifest_) { return false; }
+                const auto lease = clusterManifest_->lastPrimaryLease();
+                if (!lease.has_value() || lease->leaseUntilUs <= nowUs()) { return false; }
+                if (manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) { return false; }
+
+                const auto* primary = config_.findById(lease->nodeId);
+                if (primary == nullptr || !primary->coordinatorEligible()) { return false; }
+
+                if (runtimeOptions_.startupRole == NodeStartupRole::PRIMARY && lease->nodeId != selfNodeId_) { return false; }
+                if (runtimeOptions_.startupRole == NodeStartupRole::REPLICA && lease->nodeId == selfNodeId_) { return false; }
+
+                if (lease->nodeId == selfNodeId_) {
+                    configurePrimarySelf();
+                    setRole(NodeRole::PRIMARY);
+                    return true;
+                }
+
+                std::string host = runtimeOptions_.primaryHost;
+                uint16_t replPort = runtimeOptions_.primaryReplPort;
+                uint64_t primaryNodeId = runtimeOptions_.primaryNodeId;
+
+                if (primaryNodeId != 0 && primaryNodeId != lease->nodeId) { return false; }
+                if (primaryNodeId == 0) { primaryNodeId = runtimeOptions_.secure.expectedPrimaryNodeId; }
+                if (primaryNodeId != 0 && primaryNodeId != lease->nodeId) { return false; }
+                primaryNodeId = lease->nodeId;
+
+                if (host.empty() || replPort == 0) {
+                    if (const auto advertised = manifestJoinFor(lease->nodeId, lease->tsUs); advertised.has_value()) {
+                        if (host.empty()) { host = advertised->host; }
+                        if (replPort == 0) { replPort = advertised->replPort; }
+                    }
+                }
+                if (host.empty()) { host = primary->host; }
+                if (replPort == 0) { replPort = primary->replPort; }
+                if (host.empty() || replPort == 0) { return false; }
+
+                {
+                    std::lock_guard lock{primaryMutex_};
+                    primaryNodeId_.store(primaryNodeId, std::memory_order_release);
+                    primaryHost_ = std::move(host);
+                    primaryReplPort_ = replPort;
+                }
+                setRole(NodeRole::REPLICA);
+                return true;
+            }
+
+            bool configureFromExpiredManifestLease() {
+                if (!clusterManifest_ || runtimeOptions_.startupRole != NodeStartupRole::AUTO) { return false; }
+                if (config_.consistency().mode == ConsistencyMode::RAFT_QUORUM) { return false; }
+
+                const auto lease = clusterManifest_->lastPrimaryLease();
+                if (!lease.has_value()) { return false; }
+                const bool expired = lease->leaseUntilUs <= nowUs();
+                const bool left = manifestNodeLeftAfter(lease->nodeId, lease->tsUs);
+                if (!expired && !left) { return false; }
+                if (!isDeterministicPrimaryCandidate()) { return false; }
+
+                configurePrimarySelf();
+                setRole(NodeRole::PRIMARY);
+                return true;
+            }
+
+            bool isDeterministicPrimaryCandidate() const noexcept {
+                const auto* self = config_.findById(selfNodeId_);
+                if (self == nullptr || !self->coordinatorEligible()) { return false; }
+
+                uint64_t selectedNodeId = 0;
+                for (const auto& node : config_.nodes()) {
+                    if (!node.coordinatorEligible()) { continue; }
+                    if (selectedNodeId == 0 || node.nodeId < selectedNodeId) { selectedNodeId = node.nodeId; }
+                }
+                return selectedNodeId == selfNodeId_;
+            }
+
+            bool manifestNodeLeftAfter(uint64_t nodeId, uint64_t tsUs) const {
+                if (!clusterManifest_) { return false; }
+                for (const auto& leave : clusterManifest_->nodeLeaves()) {
+                    if (leave.nodeId == nodeId && leave.tsUs > tsUs) { return true; }
+                }
+                return false;
+            }
+
+            std::optional<manifest::Manifest::NodeJoinEvent> manifestJoinFor(uint64_t nodeId, uint64_t afterTsUs) const {
+                if (!clusterManifest_) { return std::nullopt; }
+                std::optional<manifest::Manifest::NodeJoinEvent> latest;
+                for (const auto& join : clusterManifest_->nodeJoins()) {
+                    if (join.nodeId != nodeId || join.tsUs < afterTsUs) { continue; }
+                    if (!latest.has_value() || join.tsUs >= latest->tsUs) { latest = join; }
+                }
+                return latest;
+            }
+
+            std::optional<manifest::Manifest::NodeJoinEvent> latestManifestJoinFor(uint64_t nodeId) const {
+                if (!clusterManifest_) { return std::nullopt; }
+                std::optional<manifest::Manifest::NodeJoinEvent> latest;
+                for (const auto& join : clusterManifest_->nodeJoins()) {
+                    if (join.nodeId != nodeId) { continue; }
+                    if (!latest.has_value() || join.tsUs >= latest->tsUs) { latest = join; }
+                }
+                return latest;
             }
 
             void configurePrimarySelf() {
@@ -219,4 +348,5 @@ namespace akkaradb::engine::cluster {
     uint64_t ClusterManager::primaryNodeId() const noexcept { return impl_->primaryNodeId(); }
     uint16_t ClusterManager::primaryReplPort() const { return impl_->primaryReplPort(); }
     bool ClusterManager::isStandalone() const noexcept { return impl_->isStandalone(); }
+    std::vector<NodeInfo> ClusterManager::activeNodes() const { return impl_->activeNodes(); }
 } // namespace akkaradb::engine::cluster
