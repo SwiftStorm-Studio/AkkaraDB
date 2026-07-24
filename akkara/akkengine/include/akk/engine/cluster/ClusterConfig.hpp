@@ -99,7 +99,8 @@ namespace akkaradb::engine::cluster {
 
     /** Write completion rule requested by the cluster configuration. */
     enum class WriteConsistency : uint8_t {
-        LEGACY_ACK_POLICY = 0, ///< Use AckPolicy; preserves the v1 runtime behaviour.
+        LEGACY_ACK_POLICY = 0,
+        ///< Use AckPolicy; preserves the v1 runtime behaviour.
         LOCAL = 1,
         ONE_REPLICA = 2,
         QUORUM = 3,
@@ -119,19 +120,17 @@ namespace akkaradb::engine::cluster {
     /** Behaviour when the requested write acknowledgement does not arrive in time. */
     enum class AckTimeoutAction : uint8_t {
         ACCEPT_LOCAL = 0,
-        FAIL_WRITE = 1,
+        FAIL_ACK = 1,
+        FAIL_WRITE = 2,
     };
 
     /** Policy for replicas which cannot remain within the retained replication history. */
     enum class ReplicaLagAction : uint8_t {
-        ASYNC_RESYNC = 0,
-        REJECT_REPLICA = 1,
-        BLOCK_WRITES = 2,
+        ASYNC_RESYNC = 0, REJECT_REPLICA = 1, BLOCK_WRITES = 2,
     };
 
     enum class RaftMembershipMode : uint8_t {
-        STATIC = 0,
-        JOINT_CONSENSUS = 1,
+        STATIC = 0, JOINT_CONSENSUS = 1,
     };
 
     struct AKDB_API RaftMembershipOptions {
@@ -225,7 +224,7 @@ namespace akkaradb::engine::cluster {
     class AKDB_API ClusterConfig {
         public:
             static constexpr uint32_t MAGIC = 0x35434B41; // "AKC5"
-            static constexpr uint16_t VERSION = 3;
+            static constexpr uint16_t VERSION = 4;
 
             ClusterConfig() = default;
 

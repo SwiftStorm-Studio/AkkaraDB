@@ -101,6 +101,7 @@ namespace akkaradb::engine::cluster {
 
             const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(
                 header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
+            if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
 
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
@@ -117,7 +118,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = 128u * 1024u * 1024u;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::MAX_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -465,7 +466,10 @@ namespace akkaradb::engine::cluster {
                         ReplSnapshotBegin begin;
                         if (receivingSnapshot || !decodeSnapshotBegin(frame.payload, begin)) { return; }
                         SnapshotBeginCallback callback;
-                        { std::lock_guard lock{callbackMutex_}; callback = snapshotBeginCallback_; }
+                        {
+                            std::lock_guard lock{callbackMutex_};
+                            callback = snapshotBeginCallback_;
+                        }
                         if (!callback) { return; }
                         callback(begin.snapshotSeq, begin.entryCount);
                         receivingSnapshot = true;
@@ -475,7 +479,10 @@ namespace akkaradb::engine::cluster {
                         ReplSnapshotEntry entry;
                         if (!receivingSnapshot || !decodeSnapshotEntry(frame.payload, entry)) { return; }
                         SnapshotEntryCallback callback;
-                        { std::lock_guard lock{callbackMutex_}; callback = snapshotEntryCallback_; }
+                        {
+                            std::lock_guard lock{callbackMutex_};
+                            callback = snapshotEntryCallback_;
+                        }
                         if (!callback) { return; }
                         callback(entry.key, entry.value);
                     }
@@ -483,7 +490,10 @@ namespace akkaradb::engine::cluster {
                         uint64_t endSeq = 0;
                         if (!receivingSnapshot || !decodeSnapshotEnd(frame.payload, endSeq) || endSeq != snapshotSeq) { return; }
                         SnapshotEndCallback callback;
-                        { std::lock_guard lock{callbackMutex_}; callback = snapshotEndCallback_; }
+                        {
+                            std::lock_guard lock{callbackMutex_};
+                            callback = snapshotEndCallback_;
+                        }
                         if (!callback) { return; }
                         callback(endSeq);
                         receivingSnapshot = false;
@@ -549,6 +559,7 @@ namespace akkaradb::engine::cluster {
     void ReplicationClient::setBlobCallback(BlobCallback callback) { impl_->setBlobCallback(std::move(callback)); }
 
     void ReplicationClient::setForceDurableCallback(std::function<void()> callback) { impl_->setForceDurableCallback(std::move(callback)); }
+
     void ReplicationClient::setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end) {
         impl_->setSnapshotCallbacks(std::move(begin), std::move(entry), std::move(end));
     }

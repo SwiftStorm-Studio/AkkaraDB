@@ -82,9 +82,7 @@ namespace akkaradb::engine {
         };
 
         enum class WriteAdmissionMode : uint8_t {
-            AUTO = 0,
-            SERIAL = 1,
-            PARALLEL = 2,
+            AUTO = 0, SERIAL = 1, PARALLEL = 2,
         };
 
         enum class ParallelWriteOrderMode : uint8_t {
@@ -98,10 +96,7 @@ namespace akkaradb::engine {
         };
 
         enum class WritePolicyPreset : uint8_t {
-            CUSTOM = 0,
-            SAFE = 1,
-            BALANCED = 2,
-            FAST = 3,
+            CUSTOM = 0, SAFE = 1, BALANCED = 2, FAST = 3,
         };
 
         enum class WriteDurabilityMode : uint8_t {
@@ -118,14 +113,11 @@ namespace akkaradb::engine {
         };
 
         enum class WriteVisibilityMode : uint8_t {
-            COMMIT_ORDER = 0,
-            APPLIED = 1,
+            COMMIT_ORDER = 0, APPLIED = 1,
         };
 
         enum class ReadVisibilityMode : uint8_t {
-            AUTO = 0,
-            COMMIT_ORDER = 1,
-            APPLIED = 2,
+            AUTO = 0, COMMIT_ORDER = 1, APPLIED = 2,
         };
 
         enum class ScanConsistencyMode : uint8_t {
@@ -137,13 +129,11 @@ namespace akkaradb::engine {
         };
 
         enum class SequenceAllocationMode : uint8_t {
-            GLOBAL_ATOMIC = 0,
-            THREAD_LOCAL_RANGES = 1,
+            GLOBAL_ATOMIC = 0, THREAD_LOCAL_RANGES = 1,
         };
 
         enum class BackpressureMode : uint8_t {
-            BLOCK = 0,
-            FAIL_FAST = 1,
+            BLOCK = 0, FAIL_FAST = 1,
         };
 
         struct SequenceOptions {

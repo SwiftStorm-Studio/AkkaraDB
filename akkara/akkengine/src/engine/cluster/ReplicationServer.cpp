@@ -104,6 +104,7 @@ namespace akkaradb::engine::cluster {
             uint8_t header[ReplFrameHeader::SIZE];
             if (!recvAll(s, header, sizeof(header))) { return false; }
             const uint32_t payloadLen = readU32(header + 6);
+            if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
             if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen)) { return false; }
@@ -119,7 +120,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = 128u * 1024u * 1024u;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::MAX_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -404,18 +405,17 @@ namespace akkaradb::engine::cluster {
                                 if (!snapshot) { resyncRequired = true; }
                                 else {
                                     response.currentSeq = snapshot->seq;
-                                    replica->queue.push_back(encodeSnapshotBegin(ReplSnapshotBegin{
-                                        .snapshotSeq = snapshot->seq,
-                                        .entryCount = snapshot->entries.size(),
-                                    }));
+                                    replica->queue.push_back(
+                                        encodeSnapshotBegin(
+                                            ReplSnapshotBegin{.snapshotSeq = snapshot->seq, .entryCount = snapshot->entries.size(),}
+                                        )
+                                    );
                                     for (const auto& entry : snapshot->entries) { replica->queue.push_back(encodeSnapshotEntry(entry)); }
                                     replica->queue.push_back(encodeSnapshotEnd(snapshot->seq));
                                 }
                             }
                             else if (!entries) { resyncRequired = true; }
-                            else {
-                                for (const auto& entry : *entries) { replica->queue.push_back(encodeEntry(entry)); }
-                            }
+                            else { for (const auto& entry : *entries) { replica->queue.push_back(encodeEntry(entry)); } }
                         }
                         else if (!historyProvider) {
                             for (const auto& buffered : entryBuffer) {
@@ -518,7 +518,8 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                 }
-                if (!waitForAcks(seq) && consistency.ackTimeoutAction == AckTimeoutAction::FAIL_WRITE) {
+                if (!waitForAcks(seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.ackTimeoutAction ==
+                    AckTimeoutAction::FAIL_WRITE)) {
                     throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
                 }
             }
@@ -542,8 +543,10 @@ namespace akkaradb::engine::cluster {
                     }
 
                     const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS
-                        ? acked >= (consistency.writeConsistency == WriteConsistency::ALL_CONFIGURED ? configuredReplicaCount : live)
-                        : acked >= ackPolicy.quorum;
+                                        ? (consistency.writeConsistency == WriteConsistency::ALL_CONFIGURED
+                                               ? acked >= configuredReplicaCount
+                                               : live > 0 && acked >= live)
+                                        : acked >= ackPolicy.quorum;
                     if (ok) { return true; }
 
                     std::unique_lock lock{ackMutex};

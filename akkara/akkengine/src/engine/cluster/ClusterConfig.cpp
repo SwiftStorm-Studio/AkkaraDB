@@ -211,10 +211,8 @@ namespace akkaradb::engine::cluster {
 
     void ClusterConfig::validate() const {
         if (nodes_.size() > UINT16_MAX) { throw std::invalid_argument("ClusterConfig: too many nodes"); }
-        if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::PARTITIONED &&
-            mode_ != ReplicationMode::STRIPE) {
-            throw std::invalid_argument("ClusterConfig: invalid replication mode");
-        }
+        if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::PARTITIONED && mode_ !=
+            ReplicationMode::STRIPE) { throw std::invalid_argument("ClusterConfig: invalid replication mode"); }
         if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.mode != AckPolicyMode::ALL_TARGETS && ackPolicy_.mode !=
             AckPolicyMode::QUORUM) { throw std::invalid_argument("ClusterConfig: invalid ack policy"); }
         if (ackPolicy_.stage != AckStage::RECEIVED && ackPolicy_.stage != AckStage::APPLIED && ackPolicy_.stage != AckStage::DURABLE) {
@@ -223,27 +221,22 @@ namespace akkaradb::engine::cluster {
         if (ackPolicy_.mode == AckPolicyMode::QUORUM && ackPolicy_.quorum == 0) {
             throw std::invalid_argument("ClusterConfig: quorum policy requires quorum > 0");
         }
-        if (consistency_.mode != ConsistencyMode::PRIMARY_ACK && consistency_.mode != ConsistencyMode::ASYNC &&
-            consistency_.mode != ConsistencyMode::RAFT_QUORUM) {
-            throw std::invalid_argument("ClusterConfig: invalid consistency mode");
-        }
-        if (consistency_.writeConsistency != WriteConsistency::LEGACY_ACK_POLICY &&
-            consistency_.writeConsistency != WriteConsistency::LOCAL &&
-            consistency_.writeConsistency != WriteConsistency::ONE_REPLICA &&
-            consistency_.writeConsistency != WriteConsistency::QUORUM &&
-            consistency_.writeConsistency != WriteConsistency::ALL_CONFIGURED) {
+        if (consistency_.mode != ConsistencyMode::PRIMARY_ACK && consistency_.mode != ConsistencyMode::ASYNC && consistency_.mode !=
+            ConsistencyMode::RAFT_QUORUM) { throw std::invalid_argument("ClusterConfig: invalid consistency mode"); }
+        if (consistency_.writeConsistency != WriteConsistency::LEGACY_ACK_POLICY && consistency_.writeConsistency != WriteConsistency::LOCAL
+            && consistency_.writeConsistency != WriteConsistency::ONE_REPLICA && consistency_.writeConsistency != WriteConsistency::QUORUM
+            && consistency_.writeConsistency != WriteConsistency::ALL_CONFIGURED) {
             throw std::invalid_argument("ClusterConfig: invalid write consistency");
         }
         if (consistency_.writeConsistency == WriteConsistency::QUORUM && ackPolicy_.quorum == 0) {
             throw std::invalid_argument("ClusterConfig: QUORUM write consistency requires ackPolicy.quorum > 0");
         }
-        if (consistency_.ackTimeoutAction != AckTimeoutAction::ACCEPT_LOCAL &&
-            consistency_.ackTimeoutAction != AckTimeoutAction::FAIL_WRITE) {
+        if (consistency_.ackTimeoutAction != AckTimeoutAction::ACCEPT_LOCAL && consistency_.ackTimeoutAction != AckTimeoutAction::FAIL_ACK
+            && consistency_.ackTimeoutAction != AckTimeoutAction::FAIL_WRITE) {
             throw std::invalid_argument("ClusterConfig: invalid acknowledgement timeout action");
         }
-        if (consistency_.replicaLagAction != ReplicaLagAction::ASYNC_RESYNC &&
-            consistency_.replicaLagAction != ReplicaLagAction::REJECT_REPLICA &&
-            consistency_.replicaLagAction != ReplicaLagAction::BLOCK_WRITES) {
+        if (consistency_.replicaLagAction != ReplicaLagAction::ASYNC_RESYNC && consistency_.replicaLagAction !=
+            ReplicaLagAction::REJECT_REPLICA && consistency_.replicaLagAction != ReplicaLagAction::BLOCK_WRITES) {
             throw std::invalid_argument("ClusterConfig: invalid replica lag action");
         }
         if (consistency_.ackTimeoutMs == 0) { throw std::invalid_argument("ClusterConfig: acknowledgement timeout must be > 0"); }
@@ -253,9 +246,8 @@ namespace akkaradb::engine::cluster {
         if (raft_.membership.allowOnlineVoterChanges && raft_.membership.mode != RaftMembershipMode::JOINT_CONSENSUS) {
             throw std::invalid_argument("ClusterConfig: online Raft voter changes require joint consensus membership mode");
         }
-        if ((raft_.membership.allowOnlineVoterChanges || raft_.membership.allowLearners ||
-                raft_.membership.mode == RaftMembershipMode::JOINT_CONSENSUS) &&
-            consistency_.mode != ConsistencyMode::RAFT_QUORUM) {
+        if ((raft_.membership.allowOnlineVoterChanges || raft_.membership.allowLearners || raft_.membership.mode ==
+            RaftMembershipMode::JOINT_CONSENSUS) && consistency_.mode != ConsistencyMode::RAFT_QUORUM) {
             throw std::invalid_argument("ClusterConfig: Raft membership options require RAFT_QUORUM consistency");
         }
         std::unordered_set<uint64_t> ids;

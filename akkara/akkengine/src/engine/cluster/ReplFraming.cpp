@@ -48,6 +48,7 @@ namespace akkaradb::engine::cluster {
     } // namespace
 
     std::vector<uint8_t> encodeFrame(ReplMsgType type, std::span<const uint8_t> payload, uint8_t flags) {
+        if (payload.size() > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return {}; }
         std::vector<uint8_t> wire(ReplFrameHeader::SIZE + payload.size());
         writeU32At(wire.data(), 0, ReplFrameHeader::MAGIC);
         wire[4] = static_cast<uint8_t>(type);
@@ -63,6 +64,7 @@ namespace akkaradb::engine::cluster {
         if (wire.size() < ReplFrameHeader::SIZE) { return false; }
         if (readU32(wire, 0) != ReplFrameHeader::MAGIC) { return false; }
         const auto payloadLen = readU32(wire, 6);
+        if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
         if (wire.size() != ReplFrameHeader::SIZE + payloadLen) { return false; }
         const auto payload = wire.subspan(ReplFrameHeader::SIZE, payloadLen);
         const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());

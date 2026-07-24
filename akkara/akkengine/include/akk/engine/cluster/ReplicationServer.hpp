@@ -38,10 +38,12 @@ namespace akkaradb::engine::cluster {
     class AKKARADB_CLUSTER_RUNTIME_API ReplicationServer {
         public:
             using HistoryProvider = std::function<std::optional<std::vector<ReplEntry>>(uint64_t afterSeq, uint64_t throughSeq)>;
+
             struct Snapshot {
                 uint64_t seq = 0;
                 std::vector<ReplSnapshotEntry> entries;
             };
+
             using SnapshotProvider = std::function<std::optional<Snapshot>()>;
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.

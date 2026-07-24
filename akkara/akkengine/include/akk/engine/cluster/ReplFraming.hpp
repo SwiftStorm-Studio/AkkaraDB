@@ -85,6 +85,7 @@ namespace akkaradb::engine::cluster {
     struct AKKARADB_CLUSTER_RUNTIME_API ReplFrameHeader {
         static constexpr uint32_t MAGIC = 0x35524B41; // "AKR5"
         static constexpr size_t SIZE = 14;
+        static constexpr uint32_t MAX_PAYLOAD_SIZE = 128u * 1024u * 1024u;
 
         ReplMsgType type{}; ///< Message discriminator.
         uint8_t flags = 0; ///< Reserved per-frame flags.

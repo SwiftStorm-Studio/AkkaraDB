@@ -87,9 +87,7 @@ namespace akkaradb::engine::cluster {
 
         uint16_t configuredReplicaCount(const ClusterConfig& config, uint64_t selfNodeId) {
             size_t count = 0;
-            for (const auto& node : config.nodes()) {
-                if (node.nodeId != selfNodeId && node.dataBearing()) { ++count; }
-            }
+            for (const auto& node : config.nodes()) { if (node.nodeId != selfNodeId && node.dataBearing()) { ++count; } }
             if (count > UINT16_MAX) { throw std::invalid_argument("ClusterRuntime: too many configured replicas"); }
             return static_cast<uint16_t>(count);
         }
@@ -101,9 +99,7 @@ namespace akkaradb::engine::cluster {
             }
 
             size_t dataNodes = 0;
-            for (const auto& node : config.nodes()) {
-                if (node.dataBearing()) { ++dataNodes; }
-            }
+            for (const auto& node : config.nodes()) { if (node.dataBearing()) { ++dataNodes; } }
             if (dataNodes == 0) { throw std::invalid_argument("ClusterRuntime: RAFT_QUORUM requires data-bearing nodes"); }
 
             const size_t majority = (dataNodes / 2) + 1;
@@ -115,9 +111,7 @@ namespace akkaradb::engine::cluster {
         AckPolicy effectiveAckPolicy(const ClusterConfig& config, uint64_t selfNodeId) {
             const auto consistency = config.consistency();
             const auto legacy = config.ackPolicy();
-            if (consistency.mode == ConsistencyMode::ASYNC) {
-                return AckPolicy{.mode = AckPolicyMode::NONE, .stage = legacy.stage};
-            }
+            if (consistency.mode == ConsistencyMode::ASYNC) { return AckPolicy{.mode = AckPolicyMode::NONE, .stage = legacy.stage}; }
             if (consistency.mode == ConsistencyMode::RAFT_QUORUM) {
                 const uint16_t quorum = raftReplicaQuorum(config, selfNodeId);
                 if (quorum == 0) { return AckPolicy{.mode = AckPolicyMode::NONE, .stage = AckStage::DURABLE}; }
@@ -126,21 +120,20 @@ namespace akkaradb::engine::cluster {
             switch (consistency.writeConsistency) {
                 case WriteConsistency::LEGACY_ACK_POLICY: return legacy;
                 case WriteConsistency::LOCAL: return AckPolicy{.mode = AckPolicyMode::NONE, .stage = legacy.stage};
-                case WriteConsistency::ONE_REPLICA:
-                    return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = legacy.stage, .quorum = 1};
-                case WriteConsistency::QUORUM:
-                    return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = legacy.stage, .quorum = legacy.quorum};
-                case WriteConsistency::ALL_CONFIGURED:
-                    return AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = legacy.stage};
+                case WriteConsistency::ONE_REPLICA: return AckPolicy{.mode = AckPolicyMode::QUORUM, .stage = legacy.stage, .quorum = 1};
+                case WriteConsistency::QUORUM: return AckPolicy{
+                        .mode = AckPolicyMode::QUORUM,
+                        .stage = legacy.stage,
+                        .quorum = legacy.quorum
+                    };
+                case WriteConsistency::ALL_CONFIGURED: return AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = legacy.stage};
             }
             throw std::invalid_argument("ClusterRuntime: invalid write consistency");
         }
 
         ConsistencyOptions effectiveConsistency(const ClusterConfig& config) {
             auto consistency = config.consistency();
-            if (consistency.mode == ConsistencyMode::RAFT_QUORUM) {
-                consistency.ackTimeoutAction = AckTimeoutAction::FAIL_WRITE;
-            }
+            if (consistency.mode == ConsistencyMode::RAFT_QUORUM) { consistency.ackTimeoutAction = AckTimeoutAction::FAIL_WRITE; }
             return consistency;
         }
     } // namespace
@@ -265,21 +258,25 @@ namespace akkaradb::engine::cluster {
                     const uint16_t replPort = self ? self->replPort : 0;
                     ReplicationServer::HistoryProvider historyProvider;
                     if (callbacks_.getEntries) {
-                        historyProvider = [getEntries = callbacks_.getEntries](uint64_t afterSeq, uint64_t throughSeq)
-                            -> std::optional<std::vector<ReplEntry>> {
+                        historyProvider = [getEntries = callbacks_.getEntries](
+                            uint64_t afterSeq,
+                            uint64_t throughSeq
+                        ) -> std::optional<std::vector<ReplEntry>> {
                                 const auto history = getEntries(afterSeq, throughSeq);
                                 if (!history) { return std::nullopt; }
                                 std::vector<ReplEntry> entries;
                                 entries.reserve(history->size());
                                 for (const auto& entry : *history) {
-                                    entries.push_back(ReplEntry{
-                                        .seq = entry.seq,
-                                        .sourceNodeId = entry.sourceNodeId,
-                                        .op = static_cast<ReplOpType>(entry.op),
-                                        .recordFlags = entry.recordFlags,
-                                        .key = entry.key,
-                                        .value = entry.value,
-                                    });
+                                    entries.push_back(
+                                        ReplEntry{
+                                            .seq = entry.seq,
+                                            .sourceNodeId = entry.sourceNodeId,
+                                            .op = static_cast<ReplOpType>(entry.op),
+                                            .recordFlags = entry.recordFlags,
+                                            .key = entry.key,
+                                            .value = entry.value,
+                                        }
+                                    );
                                 }
                                 return entries;
                             };

@@ -36,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #ifdef _WIN32
@@ -75,8 +76,7 @@ namespace akkaradb::engine {
         }
 
         [[nodiscard]] bool supportsParallelWriteAdmission(const AkkEngineOptions& options) noexcept {
-            return !options.components.blobEnabled
-                   && !options.components.clusterEnabled;
+            return !options.components.blobEnabled && !options.components.clusterEnabled;
         }
 
         static constexpr size_t COMMIT_COMPLETION_RING_SIZE = 1u << 16u;
@@ -94,12 +94,9 @@ namespace akkaradb::engine {
         [[nodiscard]] wal::WalSyncPolicy resolveWalSyncPolicy(const wal::WalOptions& options) noexcept {
             if (options.syncPolicy != wal::WalSyncPolicy::AUTO) { return options.syncPolicy; }
             switch (options.syncMode) {
-                case wal::WalSyncMode::OFF:
-                    return wal::WalSyncPolicy::NEVER;
-                case wal::WalSyncMode::ASYNC:
-                    return wal::WalSyncPolicy::ON_SYNC_ACK;
-                case wal::WalSyncMode::SYNC:
-                    return wal::WalSyncPolicy::ALWAYS;
+                case wal::WalSyncMode::OFF: return wal::WalSyncPolicy::NEVER;
+                case wal::WalSyncMode::ASYNC: return wal::WalSyncPolicy::ON_SYNC_ACK;
+                case wal::WalSyncMode::SYNC: return wal::WalSyncPolicy::ALWAYS;
             }
             return wal::WalSyncPolicy::ALWAYS;
         }
@@ -125,18 +122,17 @@ namespace akkaradb::engine {
 
         void normalizeSstOptions(sst::SSTManager::Options& options) noexcept {
             if (options.compactionMode == sst::SSTCompactionMode::AUTO) {
-                options.compactionMode = options.compactThreads == 0 ? sst::SSTCompactionMode::DISABLED : sst::SSTCompactionMode::BACKGROUND;
+                options.compactionMode = options.compactThreads == 0
+                                             ? sst::SSTCompactionMode::DISABLED
+                                             : sst::SSTCompactionMode::BACKGROUND;
             }
         }
 
         [[nodiscard]] AkkEngineOptions::WriteVisibilityMode resolveReadVisibility(const AkkEngineOptions& options) noexcept {
             switch (options.runtime.visibility.readVisibility) {
-                case AkkEngineOptions::ReadVisibilityMode::AUTO:
-                    return options.runtime.writeVisibility;
-                case AkkEngineOptions::ReadVisibilityMode::COMMIT_ORDER:
-                    return AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
-                case AkkEngineOptions::ReadVisibilityMode::APPLIED:
-                    return AkkEngineOptions::WriteVisibilityMode::APPLIED;
+                case AkkEngineOptions::ReadVisibilityMode::AUTO: return options.runtime.writeVisibility;
+                case AkkEngineOptions::ReadVisibilityMode::COMMIT_ORDER: return AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
+                case AkkEngineOptions::ReadVisibilityMode::APPLIED: return AkkEngineOptions::WriteVisibilityMode::APPLIED;
             }
             return options.runtime.writeVisibility;
         }
@@ -151,20 +147,18 @@ namespace akkaradb::engine {
 
         void resolveWritePolicy(AkkEngineOptions& options) {
             switch (options.runtime.writePolicy) {
-                case AkkEngineOptions::WritePolicyPreset::CUSTOM:
-                    break;
-                case AkkEngineOptions::WritePolicyPreset::SAFE:
-                    options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::SYNCED;
+                case AkkEngineOptions::WritePolicyPreset::CUSTOM: break;
+                case AkkEngineOptions::WritePolicyPreset::SAFE: options.runtime.writeDurability =
+                        AkkEngineOptions::WriteDurabilityMode::SYNCED;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
                     break;
-                case AkkEngineOptions::WritePolicyPreset::BALANCED:
-                    options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::WRITTEN;
+                case AkkEngineOptions::WritePolicyPreset::BALANCED: options.runtime.writeDurability =
+                        AkkEngineOptions::WriteDurabilityMode::WRITTEN;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
                     break;
-                case AkkEngineOptions::WritePolicyPreset::FAST:
-                    options.runtime.writeDurability = options.components.walEnabled
-                                                          ? AkkEngineOptions::WriteDurabilityMode::ENQUEUED
-                                                          : AkkEngineOptions::WriteDurabilityMode::MEMORY;
+                case AkkEngineOptions::WritePolicyPreset::FAST: options.runtime.writeDurability = options.components.walEnabled
+                        ? AkkEngineOptions::WriteDurabilityMode::ENQUEUED
+                        : AkkEngineOptions::WriteDurabilityMode::MEMORY;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::APPLIED;
                     break;
             }
@@ -175,30 +169,31 @@ namespace akkaradb::engine {
         }
 
         void validateRuntimeOptions(const AkkEngineOptions& options) {
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
-                options.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.
+                writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
                 throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires readVisibility=APPLIED");
             }
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
-                (options.components.clusterEnabled || options.components.versionLogEnabled)) {
-                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires cluster and version log to be disabled");
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && (options.components.
+                clusterEnabled || options.components.versionLogEnabled)) {
+                throw std::invalid_argument(
+                    "AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires cluster and version log to be disabled"
+                );
             }
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES &&
-                options.runtime.sequence.threadLocalRangeSize <= 1) {
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.
+                sequence.threadLocalRangeSize <= 1) {
                 throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES requires sequence.threadLocalRangeSize > 1");
             }
-            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE &&
-                options.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.sequence.
+                allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
                 throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires sequence.allocation=GLOBAL_ATOMIC");
             }
-            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE &&
-                options.runtime.writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.
+                writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
                 throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires readVisibility=COMMIT_ORDER");
             }
-            if (options.components.sstEnabled &&
-                options.runtime.backpressure.maxSstL0Files > 0 &&
-                options.runtime.backpressure.sstCompactionBacklog == AkkEngineOptions::BackpressureMode::BLOCK &&
-                options.sst.compactionMode == sst::SSTCompactionMode::DISABLED) {
+            if (options.components.sstEnabled && options.runtime.backpressure.maxSstL0Files > 0 && options.runtime.backpressure.
+                sstCompactionBacklog == AkkEngineOptions::BackpressureMode::BLOCK && options.sst.compactionMode ==
+                sst::SSTCompactionMode::DISABLED) {
                 throw std::invalid_argument("AkkEngine: blocking SST backpressure requires background compaction or fail-fast mode");
             }
         }
@@ -208,11 +203,11 @@ namespace akkaradb::engine {
         void forceDurable(FILE* file) {
             if (file == nullptr) { return; }
             if (std::fflush(file) != 0) { throw std::runtime_error("AkkEngine: failed to flush Raft log"); }
-#ifdef _WIN32
+            #ifdef _WIN32
             if (_commit(_fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
-#else
+            #else
             if (::fsync(::fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
-#endif
+            #endif
         }
 
         [[nodiscard]] uint64_t loadOrCreateNodeId(const fs::path& path) {
@@ -325,7 +320,12 @@ namespace akkaradb::engine {
                     [[nodiscard]] bool operator==(std::nullptr_t) const noexcept { return get() == nullptr; }
                     [[nodiscard]] bool operator!=(std::nullptr_t) const noexcept { return get() != nullptr; }
                     void reset() noexcept { slot_->reset(); }
-                    StorageSlot& operator=(std::unique_ptr<T> value) noexcept { *slot_ = std::move(value); return *this; }
+
+                    StorageSlot& operator=(std::unique_ptr<T> value) noexcept {
+                        *slot_ = std::move(value);
+                        return *this;
+                    }
+
                 private:
                     std::unique_ptr<T>* slot_;
             };
@@ -343,7 +343,8 @@ namespace akkaradb::engine {
 
             class OperationGuard {
                 public:
-                    explicit OperationGuard(Impl& owner, bool rejectClosed = true) : owner_{&owner} {
+                    explicit OperationGuard(Impl& owner, bool rejectClosed = true)
+                        : owner_{&owner} {
                         if (!owner_->tryBeginOperation()) {
                             if (rejectClosed) { throw std::runtime_error("AkkEngine: engine is closed"); }
                             return;
@@ -368,10 +369,8 @@ namespace akkaradb::engine {
 
             explicit Impl(AkkEngineOptions optionsIn)
                 : opts{std::move(optionsIn)},
-                  writeBackpressureEnabled{
-                      opts.runtime.backpressure.maxMemtableImmutableTables != 0 ||
-                      opts.runtime.backpressure.maxSstL0Files != 0
-                  },
+                  writeBackpressureEnabled
+                  {opts.runtime.backpressure.maxMemtableImmutableTables != 0 || opts.runtime.backpressure.maxSstL0Files != 0},
                   commitWindowSize{resolveCommitWindowSize(opts.runtime.sequence.commitWindowSize)},
                   storage{std::make_shared<StorageState>()},
                   manifest{&storage->manifest},
@@ -405,6 +404,7 @@ namespace akkaradb::engine {
             std::unique_ptr<server::IAkkApiServer> apiServer;
             std::unique_ptr<RaftLog> raftLog;
             uint64_t clusterConfiguredNodeCount = 0;
+            cluster::AckTimeoutAction primaryAckTimeoutAction = cluster::AckTimeoutAction::ACCEPT_LOCAL;
 
             mutable std::mutex writeMu;
             std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
@@ -470,8 +470,7 @@ namespace akkaradb::engine {
             class RaftLog {
                 public:
                     enum class RecordType : uint8_t {
-                        PROPOSAL = 1,
-                        COMMIT = 2,
+                        PROPOSAL = 1, COMMIT = 2,
                     };
 
                     [[nodiscard]] static std::unique_ptr<RaftLog> open(const fs::path& path) {
@@ -552,15 +551,11 @@ namespace akkaradb::engine {
                         uint32_t valueLen = 0;
                     };
 
-                    static bool readExact(FILE* file, void* out, size_t bytes) {
-                        return std::fread(out, 1, bytes, file) == bytes;
-                    }
+                    static bool readExact(FILE* file, void* out, size_t bytes) { return std::fread(out, 1, bytes, file) == bytes; }
 
                     static void writeExact(FILE* file, const void* data, size_t bytes) {
                         if (bytes == 0) { return; }
-                        if (std::fwrite(data, 1, bytes, file) != bytes) {
-                            throw std::runtime_error("AkkEngine: failed to write Raft log");
-                        }
+                        if (std::fwrite(data, 1, bytes, file) != bytes) { throw std::runtime_error("AkkEngine: failed to write Raft log"); }
                     }
 
                     void recover() {
@@ -570,10 +565,8 @@ namespace akkaradb::engine {
                             Header header{};
                             if (!readExact(rf, &header, sizeof(header))) { break; }
                             if (header.magic != MAGIC || header.version != VERSION) { break; }
-                            if (header.type != static_cast<uint8_t>(RecordType::PROPOSAL) &&
-                                header.type != static_cast<uint8_t>(RecordType::COMMIT)) {
-                                break;
-                            }
+                            if (header.type != static_cast<uint8_t>(RecordType::PROPOSAL) && header.type != static_cast<uint8_t>(
+                                RecordType::COMMIT)) { break; }
                             if (header.keyLen > 0 && std::fseek(rf, static_cast<long>(header.keyLen), SEEK_CUR) != 0) { break; }
                             if (header.valueLen > 0 && std::fseek(rf, static_cast<long>(header.valueLen), SEEK_CUR) != 0) { break; }
                             if (header.index > lastIndex_) { lastIndex_ = header.index; }
@@ -641,16 +634,10 @@ namespace akkaradb::engine {
                     const uint64_t distance = seq - current;
                     if (distance <= completedSeqRing.size()) {
                         const size_t slot = static_cast<size_t>(seq) & mask;
-                        if (completedSeqRing[slot] == 0 || completedSeqRing[slot] <= current) {
-                            completedSeqRing[slot] = seq;
-                        }
-                        else if (completedSeqRing[slot] != seq) {
-                            completedSeqOverflow.insert(seq);
-                        }
+                        if (completedSeqRing[slot] == 0 || completedSeqRing[slot] <= current) { completedSeqRing[slot] = seq; }
+                        else if (completedSeqRing[slot] != seq) { completedSeqOverflow.insert(seq); }
                     }
-                    else {
-                        completedSeqOverflow.insert(seq);
-                    }
+                    else { completedSeqOverflow.insert(seq); }
 
                     while (true) {
                         const uint64_t next = current + 1u;
@@ -674,21 +661,21 @@ namespace akkaradb::engine {
             }
 
             void waitForKeySequenceReadVisibility() const {
-                if (opts.runtime.parallelWriteOrder != AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE ||
-                    opts.runtime.writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER ||
-                    !memtable) {
-                    return;
-                }
+                if (opts.runtime.parallelWriteOrder != AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE || opts.runtime.
+                    writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER || !memtable) { return; }
                 const uint64_t nextSeq = memtable->lastSeq();
                 const uint64_t target = nextSeq > 0 ? nextSeq - 1 : 0;
                 if (committedSeq.load(std::memory_order_acquire) >= target) { return; }
 
                 std::unique_lock lock{commitMu};
-                commitCv.wait(lock, [this, target] {
-                    return committedSeq.load(std::memory_order_acquire) >= target ||
-                           keySequenceFailure ||
-                           closed.load(std::memory_order_acquire);
-                });
+                commitCv.wait(
+                    lock,
+                    [this, target] {
+                        return committedSeq.load(std::memory_order_acquire) >= target || keySequenceFailure || closed.load(
+                            std::memory_order_acquire
+                        );
+                    }
+                );
                 const std::exception_ptr failure = keySequenceFailure;
                 lock.unlock();
                 if (failure) { std::rethrow_exception(failure); }
@@ -709,9 +696,7 @@ namespace akkaradb::engine {
                 completedSeqOverflow.clear();
             }
 
-            void ensureCompletedSeqRing() {
-                if (completedSeqRing.empty()) { completedSeqRing.resize(commitWindowSize); }
-            }
+            void ensureCompletedSeqRing() { if (completedSeqRing.empty()) { completedSeqRing.resize(commitWindowSize); } }
 
             void throwIfBackgroundFailed() const {
                 if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) {
@@ -729,12 +714,9 @@ namespace akkaradb::engine {
             [[nodiscard]] wal::WalAppendAck walAckForWriteDurability() const noexcept {
                 switch (opts.runtime.writeDurability) {
                     case AkkEngineOptions::WriteDurabilityMode::MEMORY:
-                    case AkkEngineOptions::WriteDurabilityMode::ENQUEUED:
-                        return wal::WalAppendAck::ENQUEUED;
-                    case AkkEngineOptions::WriteDurabilityMode::WRITTEN:
-                        return wal::WalAppendAck::WRITTEN;
-                    case AkkEngineOptions::WriteDurabilityMode::SYNCED:
-                        return wal::WalAppendAck::SYNCED;
+                    case AkkEngineOptions::WriteDurabilityMode::ENQUEUED: return wal::WalAppendAck::ENQUEUED;
+                    case AkkEngineOptions::WriteDurabilityMode::WRITTEN: return wal::WalAppendAck::WRITTEN;
+                    case AkkEngineOptions::WriteDurabilityMode::SYNCED: return wal::WalAppendAck::SYNCED;
                 }
                 return wal::WalAppendAck::WRITTEN;
             }
@@ -772,12 +754,7 @@ namespace akkaradb::engine {
                     if ((state & LIFECYCLE_OPERATION_MASK) == LIFECYCLE_OPERATION_MASK) {
                         throw std::runtime_error("AkkEngine: too many in-flight operations");
                     }
-                    if (lifecycleState.compare_exchange_weak(
-                        state,
-                        state + 1u,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire
-                    )) {
+                    if (lifecycleState.compare_exchange_weak(state, state + 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
                         return true;
                     }
                 }
@@ -802,9 +779,10 @@ namespace akkaradb::engine {
                 commitCv.notify_all();
                 if (walWriter) { walWriter->requestClose(); }
                 lock.lock();
-                lifecycleCv.wait(lock, [this]() {
-                    return (lifecycleState.load(std::memory_order_acquire) & LIFECYCLE_OPERATION_MASK) == 0;
-                });
+                lifecycleCv.wait(
+                    lock,
+                    [this]() { return (lifecycleState.load(std::memory_order_acquire) & LIFECYCLE_OPERATION_MASK) == 0; }
+                );
                 return true;
             }
 
@@ -984,27 +962,22 @@ namespace akkaradb::engine {
 
             [[nodiscard]] bool canRunBlobGc() const noexcept { return blobManager != nullptr && versionLog == nullptr; }
 
-            void waitForVersionLogRecovery() const {
-                if (versionLog) { versionLog->waitUntilReady(); }
-            }
+            void waitForVersionLogRecovery() const { if (versionLog) { versionLog->waitUntilReady(); } }
 
             [[nodiscard]] bool canUseParallelWriteAdmission() const noexcept {
                 const bool supported = !walWriter && !blobManager && !clusterRuntime;
                 const bool explicitSupported = !blobManager && !clusterRuntime;
                 switch (opts.runtime.writeAdmission) {
-                    case AkkEngineOptions::WriteAdmissionMode::SERIAL:
-                        return false;
-                    case AkkEngineOptions::WriteAdmissionMode::PARALLEL:
-                        return explicitSupported;
-                    case AkkEngineOptions::WriteAdmissionMode::AUTO:
-                        return opts.runtime.relaxedConcurrentWrites && supported;
+                    case AkkEngineOptions::WriteAdmissionMode::SERIAL: return false;
+                    case AkkEngineOptions::WriteAdmissionMode::PARALLEL: return explicitSupported;
+                    case AkkEngineOptions::WriteAdmissionMode::AUTO: return opts.runtime.relaxedConcurrentWrites && supported;
                 }
                 return false;
             }
 
             [[nodiscard]] bool usesKeySequenceOrder() const noexcept {
-                return canUseParallelWriteAdmission() &&
-                       opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE;
+                return canUseParallelWriteAdmission() && opts.runtime.parallelWriteOrder ==
+                    AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE;
             }
 
             [[nodiscard]] std::mutex& keySequenceOrderMutex(uint64_t fp64, size_t keySize) noexcept {
@@ -1012,9 +985,7 @@ namespace akkaradb::engine {
                 return (*keySequenceOrderMu)[static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u)];
             }
 
-            [[nodiscard]] std::vector<std::unique_lock<std::mutex>> lockKeySequenceOrderStripes(
-                std::span<const BatchPutEntry> entries
-            ) {
+            [[nodiscard]] std::vector<std::unique_lock<std::mutex>> lockKeySequenceOrderStripes(std::span<const BatchPutEntry> entries) {
                 std::vector<size_t> stripes;
                 stripes.reserve(entries.size());
                 for (const auto& entry : entries) {
@@ -1041,9 +1012,7 @@ namespace akkaradb::engine {
                 const uint32_t limit = opts.runtime.backpressure.maxSstL0Files;
                 if (limit == 0 || !sstManager) { return false; }
                 const auto levels = sstManager->levelStats();
-                for (const auto& level : levels) {
-                    if (level.level == 0) { return level.fileCount >= limit; }
-                }
+                for (const auto& level : levels) { if (level.level == 0) { return level.fileCount >= limit; } }
                 return false;
             }
 
@@ -1073,9 +1042,7 @@ namespace akkaradb::engine {
 
             void applyWriteBackpressure() const {
                 if (!writeBackpressureEnabled) {
-                    if (closed.load(std::memory_order_acquire)) {
-                        throw std::runtime_error("AkkEngine: engine is closed");
-                    }
+                    if (closed.load(std::memory_order_acquire)) { throw std::runtime_error("AkkEngine: engine is closed"); }
                     throwIfBackgroundFailed();
                     if (memtable) { memtable->throwIfFlushFailed(); }
                     return;
@@ -1137,7 +1104,23 @@ namespace akkaradb::engine {
                 }
             }
 
-            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
+            struct LatestBlobReference {
+                uint64_t seq = 0;
+                std::optional<uint64_t> blobId;
+            };
+
+            static void recordLatestBlobReference(
+                std::unordered_map<std::string, LatestBlobReference>& latestByKey,
+                std::span<const uint8_t> key,
+                uint64_t seq,
+                std::optional<uint64_t> blobId
+            ) {
+                const std::string keyBytes{reinterpret_cast<const char*>(key.data()), key.size()};
+                auto& latest = latestByKey[keyBytes];
+                if (seq >= latest.seq) { latest = LatestBlobReference{seq, blobId}; }
+            }
+
+            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIdsByScan() const {
                 std::unordered_set<uint64_t> live;
                 if (!blobManager || !memtable) { return live; }
 
@@ -1173,6 +1156,39 @@ namespace akkaradb::engine {
                 }
 
                 return live;
+            }
+
+            [[nodiscard]] std::optional<std::unordered_set<uint64_t>> collectReferencedBlobIdsFromManifest() const {
+                if (!blobManager || !memtable || !manifest || !manifest->sstBlobRefsComplete()) { return std::nullopt; }
+
+                std::unordered_set<std::string> liveSstFiles;
+                for (const auto& file : manifest->liveSst()) { liveSstFiles.insert(file); }
+
+                std::unordered_map<std::string, LatestBlobReference> latestByKey;
+                for (const auto& refs : manifest->sstBlobRefs()) {
+                    if (liveSstFiles.find(refs.file) == liveSstFiles.end()) { continue; }
+                    for (const auto& entry : refs.entries) { recordLatestBlobReference(latestByKey, entry.key, entry.seq, entry.blobId); }
+                }
+
+                const uint64_t snapshotSeq = this->snapshotSeq();
+                memtable::MemTable::KeyRange range;
+                auto mt = memtable->iterator(range, snapshotSeq);
+                while (mt.hasNext()) {
+                    const auto record = mt.next();
+                    if (!record.has_value()) { continue; }
+                    std::optional<uint64_t> blobId;
+                    if (!record->isTombstone()) { blobId = decodeBlobIdIfReference(record->flags(), record->value()); }
+                    recordLatestBlobReference(latestByKey, record->key(), record->seq(), blobId);
+                }
+
+                std::unordered_set<uint64_t> live;
+                for (const auto& [_, latest] : latestByKey) { if (latest.blobId.has_value()) { live.insert(*latest.blobId); } }
+                return live;
+            }
+
+            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
+                if (const auto manifestLive = collectReferencedBlobIdsFromManifest(); manifestLive.has_value()) { return *manifestLive; }
+                return collectReferencedBlobIdsByScan();
             }
 
             void runBlobGcIfSafe() {
@@ -1244,7 +1260,8 @@ namespace akkaradb::engine {
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
                     const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey =
+                        miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -1335,9 +1352,7 @@ namespace akkaradb::engine {
                         if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                         appendAll(seq, key, stored, flags, nodeId, 0, 0, 0xFF, true);
                     }
-                    else {
-                        appendAll(seq, key, value, flags, nodeId, 0, 0, 0xFF, true);
-                    }
+                    else { appendAll(seq, key, value, flags, nodeId, 0, 0, 0xFF, true); }
                 }
             }
 
@@ -1362,12 +1377,18 @@ namespace akkaradb::engine {
                 return write;
             }
 
-            void applyLocalRemoveUnreplicated(std::span<const uint8_t> key, uint64_t fp64 = 0, uint64_t miniKey = 0, uint64_t sourceNodeId = 0) {
+            void applyLocalRemoveUnreplicated(
+                std::span<const uint8_t> key,
+                uint64_t fp64 = 0,
+                uint64_t miniKey = 0,
+                uint64_t sourceNodeId = 0
+            ) {
                 const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
                     const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey =
+                        miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -1397,6 +1418,10 @@ namespace akkaradb::engine {
                 if (clusterRuntime) {
                     clusterRuntime->shipEntry(write.seq, write.op, write.key, write.stored, write.flags, write.sourceNodeId);
                 }
+            }
+
+            [[nodiscard]] bool strictPrimaryAckFailWrite() const noexcept {
+                return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE;
             }
 
             void applyCommittedRaftProposal(const RaftProposal& proposal) {
@@ -1461,10 +1486,9 @@ namespace akkaradb::engine {
                 if (pendingSnapshotEntries.size() >= pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: replication snapshot has too many entries");
                 }
-                pendingSnapshotEntries.push_back(cluster::ClusterHistoryEntry{
-                    .key = {key.begin(), key.end()},
-                    .value = {value.begin(), value.end()},
-                });
+                pendingSnapshotEntries.push_back(
+                    cluster::ClusterHistoryEntry{.key = {key.begin(), key.end()}, .value = {value.begin(), value.end()},}
+                );
             }
 
             void finishReplicaSnapshot(uint64_t seq) {
@@ -1488,13 +1512,9 @@ namespace akkaradb::engine {
                 if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
-                    if (incomingKeys.find(key) == incomingKeys.end()) {
-                        appendAll(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0);
-                    }
+                    if (incomingKeys.find(key) == incomingKeys.end()) { appendAll(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0); }
                 }
-                for (const auto& entry : pendingSnapshotEntries) {
-                    appendAll(seq, entry.key, entry.value, MemHdr16::FLAG_NORMAL, 0);
-                }
+                for (const auto& entry : pendingSnapshotEntries) { appendAll(seq, entry.key, entry.value, MemHdr16::FLAG_NORMAL, 0); }
                 memtable->advanceSeq(seq);
                 pendingSnapshotEntries.clear();
                 snapshotInProgress = false;
@@ -1510,7 +1530,12 @@ namespace akkaradb::engine {
                     WriteCoordinator& operator=(const WriteCoordinator&) = delete;
 
                     virtual void put(std::span<const uint8_t> key, std::span<const uint8_t> value) = 0;
-                    virtual void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) = 0;
+                    virtual void putHinted(
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value,
+                        uint64_t fp64,
+                        uint64_t miniKey
+                    ) = 0;
                     virtual void putBatch(std::span<const BatchPutEntry> entries) = 0;
                     virtual void remove(std::span<const uint8_t> key) = 0;
                     virtual void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) = 0;
@@ -1545,28 +1570,122 @@ namespace akkaradb::engine {
                     using WriteCoordinator::WriteCoordinator;
 
                     void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        if (engine_.strictPrimaryAckFailWrite()) {
+                            strictPut(key, value);
+                            return;
+                        }
                         const auto write = engine_.applyLocalPut(key, value);
                         engine_.replicateCommitted(write);
                     }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
+                        if (engine_.strictPrimaryAckFailWrite()) {
+                            strictPut(key, value, fp64, miniKey);
+                            return;
+                        }
                         const auto write = engine_.applyLocalPut(key, value, fp64, miniKey);
                         engine_.replicateCommitted(write);
                     }
 
                     void putBatch(std::span<const BatchPutEntry> entries) override {
+                        if (engine_.strictPrimaryAckFailWrite()) {
+                            strictPutBatch(entries);
+                            return;
+                        }
                         const auto writes = engine_.applyLocalPutBatch(entries);
                         for (const auto& write : writes) { engine_.replicateCommitted(write); }
                     }
 
                     void remove(std::span<const uint8_t> key) override {
+                        if (engine_.strictPrimaryAckFailWrite()) {
+                            strictRemove(key);
+                            return;
+                        }
                         const auto write = engine_.applyLocalRemove(key);
                         engine_.replicateCommitted(write);
                     }
 
                     void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
+                        if (engine_.strictPrimaryAckFailWrite()) {
+                            strictRemove(key, fp64, miniKey);
+                            return;
+                        }
                         const auto write = engine_.applyLocalRemove(key, fp64, miniKey);
                         engine_.replicateCommitted(write);
+                    }
+
+                private:
+                    void strictPut(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64 = 0, uint64_t miniKey = 0) {
+                        engine_.applyWriteBackpressure();
+                        std::lock_guard lock{engine_.writeMu};
+                        AppliedWrite write;
+                        write.seq = engine_.reserveWriteSeq(1);
+                        write.key = key;
+                        write.stored.assign(value.begin(), value.end());
+                        write.op = cluster::ReplOpType::PUT;
+                        write.flags = MemHdr16::FLAG_NORMAL;
+                        write.sourceNodeId = engine_.nodeId;
+                        try {
+                            engine_.replicateCommitted(write);
+                        }
+                        catch (...) {
+                            engine_.markWriteCommitted(write.seq, true);
+                            throw;
+                        }
+                        engine_.putsTotal.fetch_add(1, std::memory_order_relaxed);
+                        engine_.appendAll(write.seq, key, write.stored, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, true);
+                    }
+
+                    void strictPutBatch(std::span<const BatchPutEntry> entries) {
+                        if (entries.empty()) { return; }
+                        engine_.applyWriteBackpressure();
+                        std::lock_guard lock{engine_.writeMu};
+                        const uint64_t baseSeq = engine_.reserveWriteSeq(entries.size());
+                        std::vector<AppliedWrite> writes;
+                        writes.reserve(entries.size());
+                        for (size_t i = 0; i < entries.size(); ++i) {
+                            const auto& [key, value] = entries[i];
+                            AppliedWrite write;
+                            write.seq = baseSeq + i;
+                            write.key = key;
+                            write.stored.assign(value.begin(), value.end());
+                            write.op = cluster::ReplOpType::PUT;
+                            write.flags = MemHdr16::FLAG_NORMAL;
+                            write.sourceNodeId = engine_.nodeId;
+                            writes.push_back(std::move(write));
+                        }
+                        size_t replicated = 0;
+                        try {
+                            for (; replicated < writes.size(); ++replicated) { engine_.replicateCommitted(writes[replicated]); }
+                        }
+                        catch (...) {
+                            for (const auto& write : writes) { engine_.markWriteCommitted(write.seq, true); }
+                            throw;
+                        }
+                        for (const auto& write : writes) {
+                            engine_.putsTotal.fetch_add(1, std::memory_order_relaxed);
+                            engine_.appendAll(write.seq, write.key, write.stored, write.flags, write.sourceNodeId);
+                        }
+                    }
+
+                    void strictRemove(std::span<const uint8_t> key, uint64_t fp64 = 0, uint64_t miniKey = 0) {
+                        engine_.applyWriteBackpressure();
+                        std::lock_guard lock{engine_.writeMu};
+                        AppliedWrite write;
+                        write.seq = engine_.reserveWriteSeq(1);
+                        write.key = key;
+                        write.op = cluster::ReplOpType::REMOVE;
+                        write.flags = MemHdr16::FLAG_TOMBSTONE;
+                        write.sourceNodeId = engine_.nodeId;
+                        try {
+                            engine_.replicateCommitted(write);
+                        }
+                        catch (...) {
+                            engine_.markWriteCommitted(write.seq, true);
+                            throw;
+                        }
+                        engine_.removesTotal.fetch_add(1, std::memory_order_relaxed);
+                        engine_.appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, true);
                     }
             };
 
@@ -1617,9 +1736,7 @@ namespace akkaradb::engine {
             };
 
             [[nodiscard]] std::unique_ptr<WriteCoordinator> createWriteCoordinator(cluster::ConsistencyMode mode) {
-                if (mode == cluster::ConsistencyMode::RAFT_QUORUM) {
-                    return std::make_unique<RaftQuorumWriteCoordinator>(*this);
-                }
+                if (mode == cluster::ConsistencyMode::RAFT_QUORUM) { return std::make_unique<RaftQuorumWriteCoordinator>(*this); }
                 if (!clusterRuntime) { return std::make_unique<LocalUnreplicatedWriteCoordinator>(*this); }
                 return std::make_unique<LocalReplicationWriteCoordinator>(*this);
             }
@@ -1628,6 +1745,7 @@ namespace akkaradb::engine {
     };
 
     AkkEngine::AkkEngine() = default;
+
     AkkEngine::~AkkEngine() {
         try { close(); }
         catch (...) {}
@@ -1683,11 +1801,12 @@ namespace akkaradb::engine {
             throw std::invalid_argument("AkkEngine: api.bindHost is required when components.apiEnabled is true");
         }
         if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
-            throw std::invalid_argument(
-                "AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled"
-            );
+            throw std::invalid_argument("AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled");
         }
-        auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
+        auto engine = std::unique_ptr < AkkEngine >
+        {
+            new AkkEngine()
+        };
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
@@ -1714,9 +1833,7 @@ namespace akkaradb::engine {
                 if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
             };
         }
-        else {
-            impl.opts.memtable.onFlush = {};
-        }
+        else { impl.opts.memtable.onFlush = {}; }
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
         uint64_t manifestCheckpointSeq = 0;
         if (impl.manifest) {
@@ -1728,8 +1845,9 @@ namespace akkaradb::engine {
             const uint64_t sstMaxSeq = impl.sstManager->maxSequence();
             if (manifestCheckpointSeq > sstMaxSeq) {
                 throw std::runtime_error(
-                    "AkkEngine: manifest checkpoint sequence exceeds recovered SST sequence (checkpoint=" +
-                    std::to_string(manifestCheckpointSeq) + ", sstMaxSeq=" + std::to_string(sstMaxSeq) + ")"
+                    "AkkEngine: manifest checkpoint sequence exceeds recovered SST sequence (checkpoint=" + std::to_string(
+                        manifestCheckpointSeq
+                    ) + ", sstMaxSeq=" + std::to_string(sstMaxSeq) + ")"
                 );
             }
             walRecoveryCheckpointSeq = manifestCheckpointSeq;
@@ -1751,7 +1869,9 @@ namespace akkaradb::engine {
         impl.resetCommittedSeq(recoveredSeq);
 
         if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
-        if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) { impl.walWriter->pruneUntil(walRecoveryCheckpointSeq); }
+        if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) {
+            impl.walWriter->pruneUntil(walRecoveryCheckpointSeq);
+        }
 
         if (impl.opts.components.blobEnabled) {
             impl.opts.blob.onBlobPut = [&impl](
@@ -1761,8 +1881,8 @@ namespace akkaradb::engine {
                 uint32_t contentCrc32c,
                 uint32_t codec
             ) {
-                if (impl.manifest) { impl.manifest->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec); }
-            };
+                    if (impl.manifest) { impl.manifest->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec); }
+                };
             impl.opts.blob.onBlobDelete = [&impl](uint64_t blobId) {
                 if (!impl.manifest) { return; }
                 try { impl.manifest->blobDelete(blobId); }
@@ -1783,40 +1903,51 @@ namespace akkaradb::engine {
                                              : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
             writeCoordinatorMode = cfg.consistency().mode;
+            impl.primaryAckTimeoutAction = cfg.consistency().ackTimeoutAction;
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
             callbacks.getLastSeq = [&impl] { return impl.snapshotSeq(); };
-            callbacks.getEntries = [&impl](uint64_t afterSeq, uint64_t throughSeq) -> std::optional<std::vector<cluster::ClusterHistoryEntry>> {
-                if (!impl.walWriter || throughSeq < afterSeq) { return std::nullopt; }
-                std::vector<cluster::ClusterHistoryEntry> entries;
-                bool hasExternalBlob = false;
-                const auto recovery = wal::WalRecovery::recover(
-                    wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir},
-                    [&](const wal::WalRecoveredEntry& item) {
-                        if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
-                        const uint8_t flags = static_cast<uint8_t>(item.flags);
-                        if ((flags & MemHdr16::FLAG_BLOB) != 0) { hasExternalBlob = true; return; }
-                        entries.push_back(cluster::ClusterHistoryEntry{
-                            .seq = item.seq,
-                            .sourceNodeId = impl.nodeId,
-                            .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0 ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT),
-                            .recordFlags = flags,
-                            .key = item.key,
-                            .value = item.value,
-                        });
+            callbacks.getEntries = [&impl](
+                uint64_t afterSeq,
+                uint64_t throughSeq
+            ) -> std::optional<std::vector<cluster::ClusterHistoryEntry>> {
+                    if (!impl.walWriter || throughSeq < afterSeq) { return std::nullopt; }
+                    std::vector<cluster::ClusterHistoryEntry> entries;
+                    bool hasExternalBlob = false;
+                    const auto recovery = wal::WalRecovery::recover(
+                        wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir},
+                        [&](const wal::WalRecoveredEntry& item) {
+                            if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
+                            const uint8_t flags = static_cast<uint8_t>(item.flags);
+                            if ((flags & MemHdr16::FLAG_BLOB) != 0) {
+                                hasExternalBlob = true;
+                                return;
+                            }
+                            entries.push_back(
+                                cluster::ClusterHistoryEntry{
+                                    .seq = item.seq,
+                                    .sourceNodeId = impl.nodeId,
+                                    .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0
+                                                                   ? cluster::ReplOpType::REMOVE
+                                                                   : cluster::ReplOpType::PUT),
+                                    .recordFlags = flags,
+                                    .key = item.key,
+                                    .value = item.value,
+                                }
+                            );
+                        }
+                    );
+                    (void)recovery;
+                    if (hasExternalBlob) { return std::nullopt; }
+                    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.seq < right.seq; });
+                    uint64_t expected = afterSeq;
+                    for (const auto& entry : entries) {
+                        if (expected == UINT64_MAX || entry.seq != expected + 1) { return std::nullopt; }
+                        expected = entry.seq;
                     }
-                );
-                (void)recovery;
-                if (hasExternalBlob) { return std::nullopt; }
-                std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.seq < right.seq; });
-                uint64_t expected = afterSeq;
-                for (const auto& entry : entries) {
-                    if (expected == UINT64_MAX || entry.seq != expected + 1) { return std::nullopt; }
-                    expected = entry.seq;
-                }
-                if (expected != throughSeq) { return std::nullopt; }
-                return entries;
-            };
+                    if (expected != throughSeq) { return std::nullopt; }
+                    return entries;
+                };
             callbacks.exportSnapshot = [&impl]() -> std::optional<cluster::ClusterSnapshot> {
                 std::lock_guard lock{impl.writeMu};
                 if (!impl.memtable) { return std::nullopt; }
@@ -1828,10 +1959,12 @@ namespace akkaradb::engine {
                 sst::SSTManager::Iterator sst;
                 if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, snapshot.seq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), impl.blobManager.get())) {
-                    snapshot.entries.push_back(cluster::ClusterHistoryEntry{
-                        .key = {record.key.begin(), record.key.end()},
-                        .value = {record.value.begin(), record.value.end()},
-                    });
+                    snapshot.entries.push_back(
+                        cluster::ClusterHistoryEntry{
+                            .key = {record.key.begin(), record.key.end()},
+                            .value = {record.value.begin(), record.value.end()},
+                        }
+                    );
                 }
                 return snapshot;
             };
@@ -1877,9 +2010,7 @@ namespace akkaradb::engine {
         }
 
         if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
-            const fs::path raftLogPath = impl.opts.paths.dataDir.empty()
-                                             ? fs::path{"raft.log"}
-                                             : impl.opts.paths.dataDir / "raft.log";
+            const fs::path raftLogPath = impl.opts.paths.dataDir.empty() ? fs::path{"raft.log"} : impl.opts.paths.dataDir / "raft.log";
             impl.raftLog = Impl::RaftLog::open(raftLogPath);
         }
 
@@ -2082,7 +2213,8 @@ namespace akkaradb::engine {
         if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq); }
         return core::ArenaGenerator<ScanRecordView>::withArena(
             arena,
-            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation)]() mutable {
+            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation)
+            ]() mutable {
                 return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(operation));
             }
         );
@@ -2323,6 +2455,19 @@ namespace akkaradb::engine {
             out.vlog.pendingWrites = snap.pendingWrites;
             out.vlog.pendingBytes = snap.pendingBytes;
             out.vlog.durableBytes = snap.durableBytes;
+            out.vlog.segmentCount = snap.segmentCount;
+            out.vlog.activeSegmentBytes = snap.activeSegmentBytes;
+            out.vlog.recoveryDurationMicros = snap.recoveryDurationMicros;
+            out.vlog.recoveredSegmentCount = snap.recoveredSegmentCount;
+            out.vlog.recoveredEntryCount = snap.recoveredEntryCount;
+            out.vlog.sidecarFallbackCount = snap.sidecarFallbackCount;
+            out.vlog.sidecarRebuildFailures = snap.sidecarRebuildFailures;
+            out.vlog.retentionPrunedSegments = snap.retentionPrunedSegments;
+            out.vlog.retentionBaseEntriesWritten = snap.retentionBaseEntriesWritten;
+            out.vlog.parallelQueueRejects = snap.parallelQueueRejects;
+            out.vlog.parallelLaneCount = snap.parallelLaneCount;
+            out.vlog.parallelPendingWrites = snap.parallelPendingWrites;
+            out.vlog.parallelPendingBytes = snap.parallelPendingBytes;
             out.vlog.flushThreadRunning = snap.flushThreadRunning;
         }
         return out;
@@ -2361,63 +2506,69 @@ namespace akkaradb::engine {
         std::exception_ptr closeFailure;
         const auto closeStep = [&closeFailure](const auto& operation) {
             try { operation(); }
-            catch (...) {
-                if (!closeFailure) { closeFailure = std::current_exception(); }
-            }
+            catch (...) { if (!closeFailure) { closeFailure = std::current_exception(); } }
         };
 
-        closeStep([&] {
-            if (impl_->apiServer) {
-                impl_->apiServer->close();
-                impl_->apiServer.reset();
+        closeStep(
+            [&] {
+                if (impl_->apiServer) {
+                    impl_->apiServer->close();
+                    impl_->apiServer.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->clusterRuntime) {
-                impl_->clusterRuntime->close();
-                impl_->clusterRuntime.reset();
+        );
+        closeStep(
+            [&] {
+                if (impl_->clusterRuntime) {
+                    impl_->clusterRuntime->close();
+                    impl_->clusterRuntime.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); }
-        });
-        closeStep([&] {
-            if (impl_->blobManager) {
-                if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
-                impl_->blobManager->close();
-                impl_->blobManager.reset();
+        );
+        closeStep([&] { if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); } });
+        closeStep(
+            [&] {
+                if (impl_->blobManager) {
+                    if (impl_->opts.blob.gcOnClose) { impl_->runBlobGcIfSafe(); }
+                    impl_->blobManager->close();
+                    impl_->blobManager.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->sstManager) {
-                impl_->sstManager->shutdown();
-                impl_->sstManager.reset();
+        );
+        closeStep(
+            [&] {
+                if (impl_->sstManager) {
+                    impl_->sstManager->shutdown();
+                    impl_->sstManager.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->walWriter && impl_->opts.runtime.forceSyncOnClose) { impl_->walWriter->forceSync(); }
-        });
-        closeStep([&] {
-            if (impl_->versionLog && impl_->opts.runtime.forceSyncOnClose) { impl_->versionLog->forceSync(); }
-        });
-        closeStep([&] {
-            if (impl_->walWriter) {
-                impl_->walWriter->close();
-                impl_->walWriter.reset();
+        );
+        closeStep([&] { if (impl_->walWriter && impl_->opts.runtime.forceSyncOnClose) { impl_->walWriter->forceSync(); } });
+        closeStep([&] { if (impl_->versionLog && impl_->opts.runtime.forceSyncOnClose) { impl_->versionLog->forceSync(); } });
+        closeStep(
+            [&] {
+                if (impl_->walWriter) {
+                    impl_->walWriter->close();
+                    impl_->walWriter.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->manifest) {
-                impl_->manifest->close();
-                impl_->manifest.reset();
+        );
+        closeStep(
+            [&] {
+                if (impl_->manifest) {
+                    impl_->manifest->close();
+                    impl_->manifest.reset();
+                }
             }
-        });
-        closeStep([&] {
-            if (impl_->versionLog) {
-                impl_->versionLog->close();
-                impl_->versionLog.reset();
+        );
+        closeStep(
+            [&] {
+                if (impl_->versionLog) {
+                    impl_->versionLog->close();
+                    impl_->versionLog.reset();
+                }
             }
-        });
+        );
         closeStep([&] { impl_->memtable.reset(); });
         impl_->finishClose();
         if (closeFailure) { std::rethrow_exception(closeFailure); }

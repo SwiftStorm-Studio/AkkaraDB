@@ -186,6 +186,8 @@ native build produces:
 - `akkaradb_api_http`, `akkaradb_api_tcp`, `akkaradb_api_grpc` optional backends.
 - `akkaradb_cluster` cluster runtime backend.
 - `akkaradb_jni` JNI library when JNI is enabled.
+- `akkaradb_vlog_tool` maintenance executable for offline VersionLog validation
+  and sidecar-index rebuilds.
 - SDK/native distribution archives through the packaging CMake scripts.
 
 Consumers should link the exported CMake targets instead of relying on private
@@ -944,6 +946,61 @@ VLog entry corruption is never accepted. `EAGER` recovery fails `open`; in
 `BACKGROUND` mode the first operation that crosses the recovery barrier throws
 the stored recovery error.
 
+### 13.5 Operational Runbook
+
+VersionLog health is primarily observed through `AkkEngine::stats().vlog`.
+Operators should treat the following counters as signals rather than as exact
+transactional measurements:
+
+| Signal | Meaning | Operational response |
+|---|---|---|
+| `recoveryDurationMicros` | Time spent in the latest VersionLog recovery pass | Track startup regression and compare with segment count and entry count |
+| `recoveredSegmentCount` / `recoveredEntryCount` | Number of segments and entries accepted by recovery | Unexpected drops indicate retention, truncation by durable tail, or failed recovery |
+| `segmentCount` / `activeSegmentBytes` | Current segment fan-out and active segment size | Tune `segmentBytes` and retention when history storage grows too quickly |
+| `sidecarFallbackCount` | Queries that could not use a derived `.akvidx` and scanned the authoritative segment | Investigate repeated growth; missing or corrupt sidecars are safe but slower |
+| `sidecarRebuildFailures` | Best-effort sidecar writes that failed at rotation, recovery, close, or retention-base creation | Check filesystem errors, permissions, full disks, and antivirus/file-lock interference |
+| `retentionPrunedSegments` | Closed segments successfully deleted by retention | Confirms retention is making progress |
+| `retentionBaseEntriesWritten` | Synthetic base records written before segment deletion | Should move with pruning; very high values mean many live keys cross the retention boundary |
+| `parallelLaneCount` | Active `PARALLEL` lane workers | Confirms the resolved lane count after hardware/default normalization |
+| `parallelPendingWrites` / `parallelPendingBytes` | Queued lane work not yet persisted | Sustained growth means storage cannot keep up or `asyncMaxPendingBytes` is too small |
+| `parallelQueueRejects` | Writes rejected because the parallel pending-byte limit was reached | Alert on any sustained non-zero increase in production workloads |
+
+For recovery failures, the thrown `VersionLog:` error includes path context and,
+when available, the byte offset and sequence number. The segment file remains
+the source of truth; deleting or rewriting `.akvidx` sidecars is safe because
+they are derived. Do not delete `.akvlog` or `.akvtail` files unless the data
+set is intentionally being discarded or restored from a backup.
+
+Recommended operating checks:
+
+- Record the VersionLog stats snapshot at process start after recovery
+  completes.
+- Alert when `sidecarFallbackCount` or `sidecarRebuildFailures` increases
+  repeatedly, because reads remain correct but may degrade to scans.
+- Alert when `parallelQueueRejects` increases; this means the configured
+  admission limit is actively shedding writes.
+- Watch `parallelPendingBytes` against `asyncMaxPendingBytes` for backpressure
+  headroom.
+- Watch `segmentCount`, `durableBytes`, and `retentionPrunedSegments` together
+  to verify that history retention is reducing closed-segment storage.
+- Preserve `.akvlog`, `.akvtail`, and engine WAL/SST/manifest files together
+  when taking filesystem-level backups.
+
+The `akkaradb_vlog_tool` maintenance executable can validate a VersionLog path
+and rebuild derived sidecar indexes:
+
+```text
+akkaradb_vlog_tool validate --log <path> [--json]
+akkaradb_vlog_tool rebuild-indexes --log <path> [--json]
+```
+
+Both commands open the log through normal eager recovery, so they validate
+authoritative segments and may rewrite `.akvidx` sidecars. The tool refuses to
+create a new empty log when neither the base path nor a sibling segment exists.
+Exit code `0` means recovery completed; exit code `1` means validation/open
+failed; `rebuild-indexes` returns `2` when recovery completed but sidecar
+regeneration reported failures.
+
 ## 14. Generation Layout
 
 Generation layout isolates mutable engine state under an active generation
@@ -964,7 +1021,7 @@ migration from legacy flat directories.
 ## 15. Cluster and Replication
 
 Cluster configuration is persisted separately from runtime transport options.
-The config file uses `AKC5` magic and version 3.
+The config file uses `AKC5` magic and version 4.
 
 ### 15.1 Persistent Cluster Config
 
@@ -1035,8 +1092,12 @@ Consistency mode:
 `RAFT_QUORUM` derives quorum from data-bearing voters and forces failed writes
 on acknowledgement timeout.
 
-Timeout action is `ACCEPT_LOCAL` or `FAIL_WRITE`. Replica lag action is
-`ASYNC_RESYNC`, `REJECT_REPLICA`, or `BLOCK_WRITES`.
+Timeout action is `ACCEPT_LOCAL`, `FAIL_ACK`, or `FAIL_WRITE`. `FAIL_ACK`
+reports acknowledgement failure after local commit in local-first primary-ack
+paths. `FAIL_WRITE` is the strict primary-ack path: the primary reserves a
+sequence and requires the configured acknowledgement before publishing the
+local WAL/MemTable record. Replica lag action is `ASYNC_RESYNC`,
+`REJECT_REPLICA`, or `BLOCK_WRITES`.
 
 ### 15.5 Secure Transport
 
@@ -1428,6 +1489,28 @@ Stats remain intentionally available after certain background failures so
 operators can inspect unhealthy WAL, pending queues, compaction failures, and
 API counters.
 
+The VersionLog portion exposes both configuration echoes and operational
+counters:
+
+| Field | Meaning |
+|---|---|
+| `enabled` | VersionLog component is active |
+| `syncMode`, `groupN`, `groupMicros`, `groupBytes`, `asyncMaxPendingBytes` | Resolved write/sync configuration |
+| `indexedKeys`, `indexedEntries`, `rollbackEntries` | Resident and persisted historical-entry index counters |
+| `pendingWrites`, `pendingBytes` | Serial async/batched queue depth |
+| `durableBytes` | Bytes in durable VersionLog segments after known pruning |
+| `segmentCount`, `activeSegmentBytes` | Current segment directory size and active segment byte count |
+| `flushThreadRunning` | Serial async/batched flush worker is alive |
+| `recoveryDurationMicros`, `recoveredSegmentCount`, `recoveredEntryCount` | Latest recovery pass duration and accepted segment/entry counts |
+| `sidecarFallbackCount`, `sidecarRebuildFailures` | Derived sidecar read fallback and regeneration failure counters |
+| `retentionPrunedSegments`, `retentionBaseEntriesWritten` | Retention progress counters |
+| `parallelQueueRejects`, `parallelLaneCount`, `parallelPendingWrites`, `parallelPendingBytes` | `PARALLEL` admission and lane queue diagnostics |
+
+HTTP and TCP stats encode new VersionLog fields after the existing
+`flushThreadRunning` byte. gRPC exposes the same fields as appended protobuf
+fields. Consumers should ignore fields they do not understand when they are on
+an older compatibility line.
+
 ## 22. Threading and Lifecycle
 
 ### 22.1 Thread Safety
@@ -1570,7 +1653,7 @@ dispatch where available.
 | VersionLog segment | `AKV5` | 1 | File-header and entry CRCs |
 | VersionLog sidecar index | `AKVI` | 2 | Header CRC and payload CRC |
 | VersionLog durable tail | `AKVT` | 1 | Tail-header CRC |
-| Cluster config | `AKC5` | 3 | Config CRC |
+| Cluster config | `AKC5` | 4 | Config CRC |
 | TCP API request | `AK5Q` | protocol 2 | Transport framing and payload validation |
 | TCP API response | `AK5S` | protocol 2 | Transport framing and payload validation |
 
@@ -1722,7 +1805,7 @@ stored error instead.
 
 ### 24.8 Cluster Config
 
-Cluster config is a CRC-protected `AKC5` v3 binary file. It stores persistent
+Cluster config is a CRC-protected `AKC5` v4 binary file. It stores persistent
 membership, placement, acknowledgement, consistency, Raft, and stripe settings.
 Runtime transport settings remain out-of-band.
 
@@ -1746,6 +1829,9 @@ targets including:
 - SSTable Bloom negative lookup benchmark,
 - cluster smoke test,
 - MemTable lifecycle smoke test,
+- VersionLog admission/visibility smoke test,
+- VersionLog recovery/concurrency smoke test,
+- VersionLog maintenance-tool smoke test,
 - engine recovery smoke test,
 - WAL async failure smoke test,
 - SST snapshot visibility smoke test.
