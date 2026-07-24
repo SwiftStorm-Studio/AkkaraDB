@@ -447,6 +447,11 @@ allocator. With thread-local ranges, that upper bound may contain holes while
 writers are in flight. `EngineStats::currentSeq` reports the same read-snapshot
 upper bound; it is not a count of completed writes.
 
+The visibility snapshot is an upper bound for the current read operation. It is
+not a durable historical-read contract for the MemTable or SST layers. Those
+layers only apply the bound to records they currently retain; persistent
+historical reads are provided by VersionLog.
+
 ### 6.5 Write Admission
 
 | Mode | Behavior |
@@ -525,7 +530,8 @@ Point reads search newest visible MemTable state first, then SST state:
 2. Search MemTable by key and snapshot.
 3. If MemTable returns a visible tombstone, report missing.
 4. If MemTable returns a normal or Blob record, materialize the public value.
-5. If MemTable misses, search SST files with the same snapshot.
+5. If MemTable misses, search retained SST records with the same snapshot upper
+   bound.
 6. If SST returns a tombstone, report missing.
 7. If SST returns a normal or Blob record, materialize the public value.
 8. If `runtime.sstPromoteReads` is enabled, copy the SST hit back into the
@@ -724,15 +730,20 @@ In `AUTO`, zero `compactThreads` disables background compaction; otherwise it
 selects background compaction.
 
 Reads search L0 newest first because L0 files may overlap. Higher levels are
-kept as ordered ranges by compaction policy. SST lookup and scan honor the
-caller-provided snapshot sequence.
+kept as ordered ranges by compaction policy. SST lookup and scan apply the
+caller-provided snapshot sequence as a visibility upper bound over records that
+remain in the current SST set.
 
 ### 12.2 Flush and Compaction
 
 MemTable flush writes sorted records to an L0 SST. Compaction replaces one or
-more input files with output files. The Manifest's atomic `COMPACTION_COMMIT`
-record names all outputs and all inputs, so recovery either installs the whole
-replacement or preserves the old inputs and discards orphan outputs.
+more input files with output files and may collapse multiple records for the
+same key to the newest retained record. SST compaction is not required to
+preserve compacted-away historical versions for arbitrary older snapshot
+sequences; `getAt`, `history`, and rollback use VersionLog for persistent
+history. The Manifest's atomic `COMPACTION_COMMIT` record names all outputs and
+all inputs, so recovery either installs the whole replacement or preserves the
+old inputs and discards orphan outputs.
 
 Blocking L0 backpressure with compaction disabled is rejected at open.
 
