@@ -125,6 +125,17 @@ namespace akkaradb::engine::vlog {
         uint64_t activeSegmentBytes = 0;
         uint32_t retentionDays = 0;
         uint64_t retentionMinCommitSeq = 0;
+        uint64_t recoveryDurationMicros = 0;
+        uint64_t recoveredSegmentCount = 0;
+        uint64_t recoveredEntryCount = 0;
+        uint64_t sidecarFallbackCount = 0;
+        uint64_t sidecarRebuildFailures = 0;
+        uint64_t retentionPrunedSegments = 0;
+        uint64_t retentionBaseEntriesWritten = 0;
+        uint64_t parallelQueueRejects = 0;
+        uint64_t parallelLaneCount = 0;
+        uint64_t parallelPendingWrites = 0;
+        uint64_t parallelPendingBytes = 0;
         bool flushThreadRunning = false;
     };
 

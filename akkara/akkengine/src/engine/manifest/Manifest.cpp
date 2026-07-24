@@ -581,17 +581,13 @@ namespace akkaradb::engine::manifest {
                     }
                 }
                 std::vector<uint64_t> out;
-                for (const auto& [_, latest] : latestByKey) {
-                    if (latest.blobId.has_value()) { out.push_back(*latest.blobId); }
-                }
+                for (const auto& [_, latest] : latestByKey) { if (latest.blobId.has_value()) { out.push_back(*latest.blobId); } }
                 return sortedUniqueBlobIds(out);
             }
 
             bool sstBlobRefsComplete() const {
                 std::lock_guard lock{mutex_};
-                for (const auto& file : liveSst_) {
-                    if (sstBlobRefsByFile_.find(file) == sstBlobRefsByFile_.end()) { return false; }
-                }
+                for (const auto& file : liveSst_) { if (sstBlobRefsByFile_.find(file) == sstBlobRefsByFile_.end()) { return false; } }
                 return true;
             }
 
@@ -607,9 +603,7 @@ namespace akkaradb::engine::manifest {
             static std::vector<SSTBlobRefEntry> toFramingEntries(const std::vector<SSTBlobRefsEvent::Entry>& entries) {
                 std::vector<SSTBlobRefEntry> out;
                 out.reserve(entries.size());
-                for (const auto& entry : entries) {
-                    out.push_back(SSTBlobRefEntry{entry.key, entry.seq, entry.flags, entry.blobId});
-                }
+                for (const auto& entry : entries) { out.push_back(SSTBlobRefEntry{entry.key, entry.seq, entry.flags, entry.blobId}); }
                 return out;
             }
 
@@ -623,15 +617,23 @@ namespace akkaradb::engine::manifest {
             }
 
             static std::vector<SSTBlobRefsEvent::Entry> sortedUniqueEntries(std::vector<SSTBlobRefsEvent::Entry> entries) {
-                std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
-                    if (lhs.key != rhs.key) { return lhs.key < rhs.key; }
-                    if (lhs.seq != rhs.seq) { return lhs.seq < rhs.seq; }
-                    return lhs.blobId.value_or(0) < rhs.blobId.value_or(0);
-                });
+                std::sort(
+                    entries.begin(),
+                    entries.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                        if (lhs.key != rhs.key) { return lhs.key < rhs.key; }
+                        if (lhs.seq != rhs.seq) { return lhs.seq < rhs.seq; }
+                        return lhs.blobId.value_or(0) < rhs.blobId.value_or(0);
+                    }
+                );
                 entries.erase(
-                    std::unique(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
-                        return lhs.key == rhs.key && lhs.seq == rhs.seq && lhs.flags == rhs.flags && lhs.blobId == rhs.blobId;
-                    }),
+                    std::unique(
+                        entries.begin(),
+                        entries.end(),
+                        [](const auto& lhs, const auto& rhs) {
+                            return lhs.key == rhs.key && lhs.seq == rhs.seq && lhs.flags == rhs.flags && lhs.blobId == rhs.blobId;
+                        }
+                    ),
                     entries.end()
                 );
                 return entries;
@@ -1123,7 +1125,9 @@ namespace akkaradb::engine::manifest {
         impl_->compactionCommit(outputFiles, inputFiles);
     }
 
-    void Manifest::sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) { impl_->sstBlobRefs(file, entries); }
+    void Manifest::sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) {
+        impl_->sstBlobRefs(file, entries);
+    }
 
     void Manifest::truncate(const std::optional<std::string>& reason) { impl_->truncate(reason); }
 

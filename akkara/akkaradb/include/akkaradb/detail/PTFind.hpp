@@ -13,9 +13,7 @@
 template <auto FieldPtr>
 [[nodiscard]] std::optional<Entity> findBy(const binpack::detail::memberOf<FieldPtr>& value) const {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "findBy field must belong to the table entity"
-    )
-    ;
+    Entity >, "findBy field must belong to the table entity" ) ;
     const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
     const auto prefix = makeIndexPrefix(tableName_, fieldName);
 

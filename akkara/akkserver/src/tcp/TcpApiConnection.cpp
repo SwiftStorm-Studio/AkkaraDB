@@ -147,8 +147,11 @@ namespace akkaradb::engine::server::tcp {
                     case ApiOp::BATCH_PUT: {
                         uint32_t count = 0;
                         const uint32_t maxBatch = maxBatchItems();
-                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch ||
-                            !decodeBatchPut(frame.value, maxBatch, batchPutItems)) {
+                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch || !decodeBatchPut(
+                            frame.value,
+                            maxBatch,
+                            batchPutItems
+                        )) {
                             counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);
                             encodeError(frame.header.requestId, responseBuffer);
                             return false;
@@ -165,19 +168,27 @@ namespace akkaradb::engine::server::tcp {
                     case ApiOp::BATCH_GET: {
                         uint32_t count = 0;
                         const uint32_t maxBatch = maxBatchItems();
-                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch ||
-                            !decodeBatchGet(frame.value, maxBatch, batchGetKeys)) {
+                        if (frame.header.keyLen != 0 || !readBatchCount(frame.value, count) || count > maxBatch || !decodeBatchGet(
+                            frame.value,
+                            maxBatch,
+                            batchGetKeys
+                        )) {
                             counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);
                             encodeError(frame.header.requestId, responseBuffer);
                             return false;
                         }
 
-                        engineGetResults = engine_.getBatch(std::span<const std::span<const uint8_t>>{batchGetKeys.data(), batchGetKeys.size()});
+                        engineGetResults = engine_.getBatch(
+                            std::span<const std::span<const uint8_t>>{batchGetKeys.data(), batchGetKeys.size()}
+                        );
                         wireGetResults.clear();
                         wireGetResults.reserve(engineGetResults.size());
                         for (const auto& result : engineGetResults) {
                             wireGetResults.push_back(
-                                ApiBatchGetResult{result.found ? ApiStatus::OK : ApiStatus::NOT_FOUND, {result.value.data(), result.value.size()}}
+                                ApiBatchGetResult{
+                                    result.found ? ApiStatus::OK : ApiStatus::NOT_FOUND,
+                                    {result.value.data(), result.value.size()}
+                                }
                             );
                         }
                         counters_.batchGetItemsTotal.fetch_add(batchGetKeys.size(), std::memory_order_relaxed);
@@ -186,15 +197,18 @@ namespace akkaradb::engine::server::tcp {
                     }
                     case ApiOp::PING: {
                         static constexpr std::string_view pong = "pong";
-                        encodeResponse(ApiStatus::OK, frame.header.requestId, {reinterpret_cast<const uint8_t*>(pong.data()), pong.size()}, responseBuffer);
+                        encodeResponse(
+                            ApiStatus::OK,
+                            frame.header.requestId,
+                            {reinterpret_cast<const uint8_t*>(pong.data()), pong.size()},
+                            responseBuffer
+                        );
                         break;
                     }
-                    case ApiOp::EXISTS:
-                        encodeBoolPayload(engine_.exists(frame.key), outputBuffer);
+                    case ApiOp::EXISTS: encodeBoolPayload(engine_.exists(frame.key), outputBuffer);
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {outputBuffer.data(), outputBuffer.size()}, responseBuffer);
                         break;
-                    case ApiOp::COUNT:
-                        encodeU64Payload(static_cast<uint64_t>(engine_.count(frame.key, frame.value)), outputBuffer);
+                    case ApiOp::COUNT: encodeU64Payload(static_cast<uint64_t>(engine_.count(frame.key, frame.value)), outputBuffer);
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {outputBuffer.data(), outputBuffer.size()}, responseBuffer);
                         break;
                     case ApiOp::SCAN: {
@@ -320,8 +334,7 @@ namespace akkaradb::engine::server::tcp {
                     case ApiOp::FORCE_FLUSH: engine_.forceFlush();
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
-                    case ApiOp::RUN_BLOB_GC:
-                        if (frame.header.keyLen != 0 || frame.header.valLen != 0) {
+                    case ApiOp::RUN_BLOB_GC: if (frame.header.keyLen != 0 || frame.header.valLen != 0) {
                             counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);
                             encodeError(frame.header.requestId, responseBuffer);
                             return false;
@@ -329,12 +342,10 @@ namespace akkaradb::engine::server::tcp {
                         engine_.runBlobGc();
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
-                    case ApiOp::STATS:
-                        encodeStatsPayload(engine_.stats(), outputBuffer);
+                    case ApiOp::STATS: encodeStatsPayload(engine_.stats(), outputBuffer);
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {outputBuffer.data(), outputBuffer.size()}, responseBuffer);
                         break;
-                    default:
-                        counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);
+                    default: counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);
                         encodeError(frame.header.requestId, responseBuffer);
                         return false;
                 }

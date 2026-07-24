@@ -162,9 +162,29 @@ namespace akkaradb::engine::vlog {
             if (_fseeki64(file, static_cast<__int64>(offset), SEEK_SET) != 0) {
             #else
             if (fseeko(file, static_cast<off_t>(offset), SEEK_SET) != 0) {
-            #endif
+                #endif
                 throw std::runtime_error("VersionLog: failed to seek file");
             }
+        }
+
+        [[nodiscard]] static std::string fileContext(
+            const fs::path& path,
+            std::optional<uint64_t> offset = std::nullopt,
+            std::optional<uint64_t> seq = std::nullopt
+        ) {
+            std::string out = " path=" + path.string();
+            if (offset.has_value()) { out += " offset=" + std::to_string(*offset); }
+            if (seq.has_value()) { out += " seq=" + std::to_string(*seq); }
+            return out;
+        }
+
+        [[noreturn]] static void throwVLogError(
+            const std::string& message,
+            const fs::path& path,
+            std::optional<uint64_t> offset = std::nullopt,
+            std::optional<uint64_t> seq = std::nullopt
+        ) {
+            throw std::runtime_error("VersionLog: " + message + fileContext(path, offset, seq));
         }
 
         [[nodiscard]] static uint64_t mixIndexHash(uint64_t value) noexcept {
@@ -286,6 +306,14 @@ namespace akkaradb::engine::vlog {
             std::atomic<bool> asyncFailed_{false};
             std::atomic<bool> retentionPrunePending_{false};
             std::atomic<uint64_t> persistedGeneration_{0};
+            std::atomic<uint64_t> recoveryDurationMicros_{0};
+            std::atomic<uint64_t> recoveredSegmentCount_{0};
+            std::atomic<uint64_t> recoveredEntryCount_{0};
+            mutable std::atomic<uint64_t> sidecarFallbackCount_{0};
+            mutable std::atomic<uint64_t> sidecarRebuildFailures_{0};
+            std::atomic<uint64_t> retentionPrunedSegments_{0};
+            std::atomic<uint64_t> retentionBaseEntriesWritten_{0};
+            std::atomic<uint64_t> parallelQueueRejects_{0};
             bool closing_ = false;
             bool retentionCompacting_ = false;
             bool recoveryComplete_ = false;
@@ -308,22 +336,19 @@ namespace akkaradb::engine::vlog {
             }
 
             [[nodiscard]] bool usesZstd() const noexcept { return opts_.codec == VLogCodec::ZSTD; }
-            [[nodiscard]] bool usesTrueParallelWrites() const noexcept {
-                return opts_.writeAdmission == VLogWriteAdmissionMode::PARALLEL;
-            }
+            [[nodiscard]] bool usesTrueParallelWrites() const noexcept { return opts_.writeAdmission == VLogWriteAdmissionMode::PARALLEL; }
 
             void validateOptions() const {
-                if (opts_.writeAdmission != VLogWriteAdmissionMode::SERIAL &&
-                    opts_.writeAdmission != VLogWriteAdmissionMode::PREPARE_PARALLEL &&
-                    opts_.writeAdmission != VLogWriteAdmissionMode::PARALLEL) {
+                if (opts_.writeAdmission != VLogWriteAdmissionMode::SERIAL && opts_.writeAdmission !=
+                    VLogWriteAdmissionMode::PREPARE_PARALLEL && opts_.writeAdmission != VLogWriteAdmissionMode::PARALLEL) {
                     throw std::invalid_argument("VersionLog: unsupported write admission mode");
                 }
-                if (opts_.serialAppendMode != VLogSerialAppendMode::PIPELINED &&
-                    opts_.serialAppendMode != VLogSerialAppendMode::WAIT_PREVIOUS_APPEND) {
+                if (opts_.serialAppendMode != VLogSerialAppendMode::PIPELINED && opts_.serialAppendMode !=
+                    VLogSerialAppendMode::WAIT_PREVIOUS_APPEND) {
                     throw std::invalid_argument("VersionLog: unsupported serial append mode");
                 }
-                if (opts_.parallelPendingLimitScope != VLogParallelPendingLimitScope::PER_LANE &&
-                    opts_.parallelPendingLimitScope != VLogParallelPendingLimitScope::GLOBAL) {
+                if (opts_.parallelPendingLimitScope != VLogParallelPendingLimitScope::PER_LANE && opts_.parallelPendingLimitScope !=
+                    VLogParallelPendingLimitScope::GLOBAL) {
                     throw std::invalid_argument("VersionLog: unsupported parallel pending limit scope");
                 }
                 if (opts_.parallelWriteLanes > 64) {
@@ -335,8 +360,7 @@ namespace akkaradb::engine::vlog {
                 if (opts_.codec != VLogCodec::NONE && opts_.codec != VLogCodec::ZSTD) {
                     throw std::invalid_argument("VersionLog: unsupported value codec");
                 }
-                if (usesZstd() &&
-                    (opts_.zstdCompressionLevel < ZSTD_minCLevel() || opts_.zstdCompressionLevel > ZSTD_maxCLevel())) {
+                if (usesZstd() && (opts_.zstdCompressionLevel < ZSTD_minCLevel() || opts_.zstdCompressionLevel > ZSTD_maxCLevel())) {
                     throw std::invalid_argument("VersionLog: zstdCompressionLevel is outside the supported Zstd range");
                 }
             }
@@ -434,9 +458,7 @@ namespace akkaradb::engine::vlog {
                 if (fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size()) { throw std::runtime_error("VersionLog: fwrite failed"); }
             }
 
-            void checkAsyncError() const {
-                if (asyncFailed_.load(std::memory_order_acquire)) { std::rethrow_exception(asyncError_); }
-            }
+            void checkAsyncError() const { if (asyncFailed_.load(std::memory_order_acquire)) { std::rethrow_exception(asyncError_); } }
 
             void recordAsyncError(std::exception_ptr error) noexcept {
                 if (asyncFailed_.load(std::memory_order_relaxed)) { return; }
@@ -462,9 +484,7 @@ namespace akkaradb::engine::vlog {
                 if (seq <= current) { return; }
 
                 completedSeqs_.insert(seq);
-                while (current != std::numeric_limits<uint64_t>::max() && completedSeqs_.erase(current + 1u) != 0) {
-                    ++current;
-                }
+                while (current != std::numeric_limits<uint64_t>::max() && completedSeqs_.erase(current + 1u) != 0) { ++current; }
                 committedSeq_.store(current, std::memory_order_release);
             }
 
@@ -608,8 +628,8 @@ namespace akkaradb::engine::vlog {
                 queueSpaceCv_.wait(
                     lock,
                     [&] {
-                        return asyncFailed_.load(std::memory_order_acquire) || closing_ || pendingBytes_ + entryBytes <= opts_.asyncMaxPendingBytes
-                               || pendingWrites_.empty();
+                        return asyncFailed_.load(std::memory_order_acquire) || closing_ || pendingBytes_ + entryBytes <= opts_.
+                            asyncMaxPendingBytes || pendingWrites_.empty();
                     }
                 );
                 checkAsyncError();
@@ -678,9 +698,7 @@ namespace akkaradb::engine::vlog {
                     #else
                     file = fopen(temporary.string().c_str(), "wb");
                     #endif
-                    if (!file || fwrite(&tail, sizeof(tail), 1, file) != 1) {
-                        throw std::runtime_error("VersionLog: failed to write durable tail");
-                    }
+                    if (!file || fwrite(&tail, sizeof(tail), 1, file) != 1) { throwVLogError("failed to write durable tail", temporary); }
                     fflush(file);
                     if (sync) { doFdatasync(file); }
                     fclose(file);
@@ -689,7 +707,7 @@ namespace akkaradb::engine::vlog {
                     fs::remove(path, error);
                     error.clear();
                     fs::rename(temporary, path, error);
-                    if (error) { throw std::runtime_error("VersionLog: failed to publish durable tail: " + error.message()); }
+                    if (error) { throwVLogError("failed to publish durable tail: " + error.message(), path); }
                 }
                 catch (...) {
                     if (file) { fclose(file); }
@@ -703,28 +721,27 @@ namespace akkaradb::engine::vlog {
                 const auto path = segmentTailPath(segmentPath);
                 std::error_code sizeError;
                 const bool exists = fs::exists(path, sizeError);
-                if (sizeError) { throw std::runtime_error("VersionLog: cannot inspect durable tail"); }
+                if (sizeError) { throwVLogError("cannot inspect durable tail: " + sizeError.message(), path); }
                 if (!exists) { return std::nullopt; }
                 const uint64_t bytes = fs::file_size(path, sizeError);
-                if (sizeError || bytes != sizeof(AkvlogTailFile)) {
-                    throw std::runtime_error("VersionLog: invalid durable tail size");
-                }
+                if (sizeError) { throwVLogError("cannot stat durable tail: " + sizeError.message(), path); }
+                if (bytes != sizeof(AkvlogTailFile)) { throwVLogError("invalid durable tail size", path, bytes); }
                 #ifdef _WIN32
                 FILE* file = _wfopen(path.wstring().c_str(), L"rb");
                 #else
                 FILE* file = fopen(path.string().c_str(), "rb");
                 #endif
-                if (!file) { throw std::runtime_error("VersionLog: cannot open durable tail"); }
+                if (!file) { throwVLogError("cannot open durable tail", path); }
                 AkvlogTailFile tail{};
                 const bool valid = fread(&tail, sizeof(tail), 1, file) == 1;
                 fclose(file);
-                if (!valid) { throw std::runtime_error("VersionLog: truncated durable tail"); }
+                if (!valid) { throwVLogError("truncated durable tail", path); }
                 const uint32_t stored = tail.crc32c;
                 tail.crc32c = 0;
-                if (tail.magic != AKVLOG_TAIL_MAGIC || tail.version != AKVLOG_TAIL_VERSION ||
-                    stored != cpu::CRC32C(reinterpret_cast<const std::byte*>(&tail), sizeof(tail))) {
-                    throw std::runtime_error("VersionLog: corrupt durable tail");
-                }
+                if (tail.magic != AKVLOG_TAIL_MAGIC || tail.version != AKVLOG_TAIL_VERSION || stored != cpu::CRC32C(
+                    reinterpret_cast<const std::byte*>(&tail),
+                    sizeof(tail)
+                )) { throwVLogError("corrupt durable tail", path, tail.committedBytes); }
                 return tail.committedBytes;
             }
 
@@ -743,32 +760,26 @@ namespace akkaradb::engine::vlog {
                 validatedIndexPayloads_.erase(path.string());
             }
 
-            [[nodiscard]] bool verifyIndexPayload(
-                FILE* file,
-                const fs::path& path,
-                const AkvlogIndexFileHeader& header
-            ) const {
+            [[nodiscard]] bool verifyIndexPayload(FILE* file, const fs::path& path, const AkvlogIndexFileHeader& header) const {
                 std::error_code error;
                 const uint64_t totalBytes = fs::file_size(path, error);
-                if (error || totalBytes < sizeof(AkvlogIndexFileHeader) ||
-                    totalBytes - sizeof(AkvlogIndexFileHeader) > std::numeric_limits<size_t>::max()) {
-                    return false;
-                }
+                if (error || totalBytes < sizeof(AkvlogIndexFileHeader) || totalBytes - sizeof(AkvlogIndexFileHeader) > std::numeric_limits<
+                    size_t>::max()) { return false; }
                 const auto modified = fs::last_write_time(path, error);
                 if (error) { return false; }
                 {
                     std::lock_guard lock{indexValidationMu_};
                     const auto it = validatedIndexPayloads_.find(path.string());
-                    if (it != validatedIndexPayloads_.end() && it->second.crc32c == header.payloadCrc32c &&
-                        it->second.bytes == totalBytes && it->second.modified == modified) {
-                        return true;
-                    }
+                    if (it != validatedIndexPayloads_.end() && it->second.crc32c == header.payloadCrc32c && it->second.bytes == totalBytes
+                        && it->second.modified == modified) { return true; }
                 }
 
                 std::vector<uint8_t> payload(static_cast<size_t>(totalBytes - sizeof(AkvlogIndexFileHeader)));
                 seekFile(file, sizeof(AkvlogIndexFileHeader));
                 if (!payload.empty() && fread(payload.data(), 1, payload.size(), file) != payload.size()) { return false; }
-                if (cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size()) != header.payloadCrc32c) { return false; }
+                if (cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size()) != header.payloadCrc32c) {
+                    return false;
+                }
                 markIndexPayloadValidated(path, header.payloadCrc32c);
                 return true;
             }
@@ -812,19 +823,21 @@ namespace akkaradb::engine::vlog {
                 uint64_t versionCount = 0;
                 for (const auto& [key, versions] : index) {
                     if (versions.empty()) { continue; }
-                    if (versions.size() > std::numeric_limits<uint32_t>::max() ||
-                        versionCount > std::numeric_limits<uint64_t>::max() - versions.size()) {
-                        throw std::runtime_error("VersionLog: segment index is too large");
-                    }
+                    if (versions.size() > std::numeric_limits<uint32_t>::max() || versionCount > std::numeric_limits<uint64_t>::max() -
+                        versions.size()) { throw std::runtime_error("VersionLog: segment index is too large"); }
                     const uint64_t fingerprint = key.empty()
                                                      ? 0ULL
                                                      : core::computeKeyFp64(reinterpret_cast<const uint8_t*>(key.data()), key.size());
                     keys.push_back(PreparedKey{fingerprint, &key, &versions});
                     versionCount += static_cast<uint64_t>(versions.size());
                 }
-                std::sort(keys.begin(), keys.end(), [](const PreparedKey& left, const PreparedKey& right) {
-                    return left.fingerprint == right.fingerprint ? *left.key < *right.key : left.fingerprint < right.fingerprint;
-                });
+                std::sort(
+                    keys.begin(),
+                    keys.end(),
+                    [](const PreparedKey& left, const PreparedKey& right) {
+                        return left.fingerprint == right.fingerprint ? *left.key < *right.key : left.fingerprint < right.fingerprint;
+                    }
+                );
 
                 const uint64_t requestedBloomBits = std::max<uint64_t>(64, static_cast<uint64_t>(keys.size()) * INDEX_BLOOM_BITS_PER_KEY);
                 if (requestedBloomBits > std::numeric_limits<uint32_t>::max()) {
@@ -840,20 +853,26 @@ namespace akkaradb::engine::vlog {
                 versions.reserve(static_cast<size_t>(versionCount));
                 for (const auto& key : keys) {
                     auto ordered = *key.versions;
-                    std::sort(ordered.begin(), ordered.end(), [](const IndexVersion& left, const IndexVersion& right) {
-                        return left.seq == right.seq ? left.offset < right.offset : left.seq < right.seq;
-                    });
-                    directories.push_back(AkvlogIndexKeyRecord{
-                        key.fingerprint,
-                        static_cast<uint64_t>(versions.size()),
-                        static_cast<uint32_t>(ordered.size()),
-                        0,
-                    });
+                    std::sort(
+                        ordered.begin(),
+                        ordered.end(),
+                        [](const IndexVersion& left, const IndexVersion& right) {
+                            return left.seq == right.seq ? left.offset < right.offset : left.seq < right.seq;
+                        }
+                    );
+                    directories.push_back(
+                        AkvlogIndexKeyRecord{
+                            key.fingerprint,
+                            static_cast<uint64_t>(versions.size()),
+                            static_cast<uint32_t>(ordered.size()),
+                            0,
+                        }
+                    );
                     for (const auto& version : ordered) { versions.push_back(AkvlogIndexVersionRecord{version.seq, version.offset}); }
                 }
 
-                const size_t payloadBytes = bloom.size() + directories.size() * sizeof(AkvlogIndexKeyRecord) +
-                                            versions.size() * sizeof(AkvlogIndexVersionRecord);
+                const size_t payloadBytes = bloom.size() + directories.size() * sizeof(AkvlogIndexKeyRecord) + versions.size() * sizeof(
+                    AkvlogIndexVersionRecord);
                 std::vector<uint8_t> payload(payloadBytes);
                 uint8_t* payloadCursor = payload.data();
                 if (!bloom.empty()) {
@@ -893,7 +912,7 @@ namespace akkaradb::engine::vlog {
                     #else
                     file = fopen(temporary.string().c_str(), "wb");
                     #endif
-                    if (!file) { throw std::runtime_error("VersionLog: cannot create segment index: " + temporary.string()); }
+                    if (!file) { throwVLogError("cannot create segment index", temporary); }
                     writeAll(file, &header, sizeof(header));
                     writeAll(file, payload.data(), payload.size());
                     fflush(file);
@@ -905,7 +924,7 @@ namespace akkaradb::engine::vlog {
                     fs::remove(path, error);
                     error.clear();
                     fs::rename(temporary, path, error);
-                    if (error) { throw std::runtime_error("VersionLog: cannot publish segment index: " + error.message()); }
+                    if (error) { throwVLogError("cannot publish segment index: " + error.message(), path); }
                     markIndexPayloadValidated(path, header.payloadCrc32c);
                 }
                 catch (...) {
@@ -918,7 +937,7 @@ namespace akkaradb::engine::vlog {
 
             void tryWriteSegmentIndex(const fs::path& segmentPath, uint64_t logBytes, const SegmentKeyIndex& index) const noexcept {
                 try { writeSegmentIndex(segmentPath, logBytes, index); }
-                catch (...) {}
+                catch (...) { sidecarRebuildFailures_.fetch_add(1, std::memory_order_relaxed); }
             }
 
             void recordActiveIndex(const std::string& key, uint64_t seq, uint64_t offset) {
@@ -926,7 +945,9 @@ namespace akkaradb::engine::vlog {
                 std::unique_lock lock{activeIndexMu_};
                 auto& versions = activeSegmentIndex_[key];
                 const auto pos = std::upper_bound(
-                    versions.begin(), versions.end(), IndexVersion{seq, offset},
+                    versions.begin(),
+                    versions.end(),
+                    IndexVersion{seq, offset},
                     [](const IndexVersion& left, const IndexVersion& right) {
                         return left.seq == right.seq ? left.offset < right.offset : left.seq < right.seq;
                     }
@@ -945,11 +966,7 @@ namespace akkaradb::engine::vlog {
                 activeSegmentIndex_ = std::move(index);
             }
 
-            [[nodiscard]] bool activeIndexVersions(
-                uint64_t segmentId,
-                std::string_view key,
-                std::vector<IndexVersion>& out
-            ) const {
+            [[nodiscard]] bool activeIndexVersions(uint64_t segmentId, std::string_view key, std::vector<IndexVersion>& out) const {
                 if (usesTrueParallelWrites()) {
                     for (const auto& lane : parallelLanes_) {
                         std::lock_guard laneLock{lane->mutex};
@@ -977,16 +994,24 @@ namespace akkaradb::engine::vlog {
                 for (const auto& entry : fs::directory_iterator(parent)) {
                     if (!entry.is_regular_file()) { continue; }
                     const std::string name = entry.path().filename().string();
-                    if (!name.starts_with(prefix) || !name.ends_with(extension) || name.size() <= prefix.size() + extension.size()) { continue; }
+                    if (!name.starts_with(prefix) || !name.ends_with(extension) || name.size() <= prefix.size() + extension.size()) {
+                        continue;
+                    }
                     const std::string_view suffix{name.data() + prefix.size(), name.size() - prefix.size() - extension.size()};
-                    if (suffix.empty() || !std::ranges::all_of(suffix, [](unsigned char ch) { return ch >= '0' && ch <= '9'; })) { continue; }
+                    if (suffix.empty() || !std::ranges::all_of(suffix, [](unsigned char ch) { return ch >= '0' && ch <= '9'; })) {
+                        continue;
+                    }
                     try {
                         const uint64_t id = std::stoull(std::string{suffix});
                         if (id != 0) { discovered.push_back(SegmentInfo{id, entry.path()}); }
                     }
                     catch (const std::exception&) {}
                 }
-                std::sort(discovered.begin(), discovered.end(), [](const SegmentInfo& left, const SegmentInfo& right) { return left.id < right.id; });
+                std::sort(
+                    discovered.begin(),
+                    discovered.end(),
+                    [](const SegmentInfo& left, const SegmentInfo& right) { return left.id < right.id; }
+                );
                 return discovered;
             }
 
@@ -995,14 +1020,9 @@ namespace akkaradb::engine::vlog {
                 return segments_;
             }
 
-            [[nodiscard]] bool retentionEnabled() const noexcept {
-                return opts_.retentionDays != 0 || opts_.retentionMinCommitSeq != 0;
-            }
+            [[nodiscard]] bool retentionEnabled() const noexcept { return opts_.retentionDays != 0 || opts_.retentionMinCommitSeq != 0; }
 
-            [[nodiscard]] bool segmentReachedRetentionBoundary(
-                const SegmentInfo& segment,
-                fs::file_time_type now
-            ) const {
+            [[nodiscard]] bool segmentReachedRetentionBoundary(const SegmentInfo& segment, fs::file_time_type now) const {
                 if (opts_.retentionMinCommitSeq != 0 && segment.hasEntries && segment.lastSeq < opts_.retentionMinCommitSeq) {
                     return true;
                 }
@@ -1031,11 +1051,9 @@ namespace akkaradb::engine::vlog {
                         segments = segmentSnapshot();
                         expired.reserve(segments.size());
                         for (const auto& segment : segments) {
-                            if ((usesTrueParallelWrites() ? parallelActiveSegmentIds_.contains(segment.id) : segment.id == activeSegmentId_) ||
-                                (segment.hasEntries && segment.lastSeq > committedSeq) ||
-                                !segmentReachedRetentionBoundary(segment, now)) {
-                                continue;
-                            }
+                            if ((usesTrueParallelWrites() ? parallelActiveSegmentIds_.contains(segment.id) : segment.id == activeSegmentId_)
+                                || (segment.hasEntries && segment.lastSeq > committedSeq) || !
+                                segmentReachedRetentionBoundary(segment, now)) { continue; }
                             expired.push_back(segment);
                         }
                         if (expired.empty()) { return; }
@@ -1085,9 +1103,11 @@ namespace akkaradb::engine::vlog {
                 activeSegmentBytes_ += static_cast<uint64_t>(write.bytes.size());
                 {
                     std::unique_lock lock{segmentMu_};
-                    const auto it = std::find_if(segments_.begin(), segments_.end(), [this](const SegmentInfo& segment) {
-                        return segment.id == activeSegmentId_;
-                    });
+                    const auto it = std::find_if(
+                        segments_.begin(),
+                        segments_.end(),
+                        [this](const SegmentInfo& segment) { return segment.id == activeSegmentId_; }
+                    );
                     if (it == segments_.end()) { throw std::runtime_error("VersionLog: active segment is missing from the segment index"); }
                     if (!it->hasEntries) {
                         it->firstSeq = write.seq;
@@ -1100,9 +1120,7 @@ namespace akkaradb::engine::vlog {
                     }
                     it->bytes = activeSegmentBytes_;
                     ++it->entryCount;
-                    if ((write.flags & VLOG_FLAG_ROLLBACK) != 0) {
-                        ++it->rollbackCount;
-                    }
+                    if ((write.flags & VLOG_FLAG_ROLLBACK) != 0) { ++it->rollbackCount; }
                 }
                 recordActiveIndex(write.key, write.seq, write.offset);
                 persistedGeneration_.fetch_add(1, std::memory_order_release);
@@ -1119,12 +1137,9 @@ namespace akkaradb::engine::vlog {
                         const auto summary = scanSegment(
                             segmentPath(activeSegmentId_),
                             false,
-                            [&rebuilt](
-                                std::string_view key,
-                                const AkvlogV5EntryHeader& header,
-                                std::span<const uint8_t>,
-                                uint64_t offset
-                            ) { rebuilt[std::string{key}].push_back(IndexVersion{header.seq, offset}); }
+                            [&rebuilt](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t>, uint64_t offset) {
+                                rebuilt[std::string{key}].push_back(IndexVersion{header.seq, offset});
+                            }
                         );
                         tryWriteSegmentIndex(segmentPath(activeSegmentId_), summary.durableBytes, rebuilt);
                     }
@@ -1170,9 +1185,7 @@ namespace akkaradb::engine::vlog {
                     segments_.push_back(SegmentInfo{nextId, path, 0, 0, activeSegmentBytes_});
                 }
                 resetActiveIndex(nextId, {});
-                if (!retentionCompacting_ && retentionEnabled()) {
-                    retentionPrunePending_.store(true, std::memory_order_release);
-                }
+                if (!retentionCompacting_ && retentionEnabled()) { retentionPrunePending_.store(true, std::memory_order_release); }
             }
 
             [[nodiscard]] uint32_t parallelLaneCount() const noexcept {
@@ -1269,9 +1282,7 @@ namespace akkaradb::engine::vlog {
                 std::lock_guard writeLock{writeMu_};
                 parallelActiveSegmentIds_.erase(oldId);
                 addParallelLaneSegmentLocked(lane);
-                if (!retentionCompacting_ && retentionEnabled()) {
-                    retentionPrunePending_.store(true, std::memory_order_release);
-                }
+                if (!retentionCompacting_ && retentionEnabled()) { retentionPrunePending_.store(true, std::memory_order_release); }
             }
 
             void persistParallelLocked(ParallelLane& lane, PendingWrite write) {
@@ -1284,7 +1295,9 @@ namespace akkaradb::engine::vlog {
                 lane.bytes += static_cast<uint64_t>(write.bytes.size());
                 auto& versions = lane.index[write.key];
                 const auto pos = std::upper_bound(
-                    versions.begin(), versions.end(), IndexVersion{write.seq, write.offset},
+                    versions.begin(),
+                    versions.end(),
+                    IndexVersion{write.seq, write.offset},
                     [](const IndexVersion& left, const IndexVersion& right) {
                         return left.seq == right.seq ? left.offset < right.offset : left.seq < right.seq;
                     }
@@ -1298,9 +1311,11 @@ namespace akkaradb::engine::vlog {
                 {
                     std::lock_guard writeLock{writeMu_};
                     std::unique_lock segmentLock{segmentMu_};
-                    const auto it = std::find_if(segments_.begin(), segments_.end(), [&](const SegmentInfo& segment) {
-                        return segment.id == lane.segmentId;
-                    });
+                    const auto it = std::find_if(
+                        segments_.begin(),
+                        segments_.end(),
+                        [&](const SegmentInfo& segment) { return segment.id == lane.segmentId; }
+                    );
                     if (it == segments_.end()) { throw std::runtime_error("VersionLog: parallel active segment is missing"); }
                     if (!it->hasEntries) {
                         it->firstSeq = write.seq;
@@ -1390,9 +1405,7 @@ namespace akkaradb::engine::vlog {
                     }
                     lane->queueCv.notify_all();
                 }
-                for (const auto& lane : parallelLanes_) {
-                    if (lane->worker.joinable()) { lane->worker.join(); }
-                }
+                for (const auto& lane : parallelLanes_) { if (lane->worker.joinable()) { lane->worker.join(); } }
             }
 
             void appendParallel(PendingWrite write) {
@@ -1400,7 +1413,10 @@ namespace akkaradb::engine::vlog {
                 checkAsyncError();
                 const uint64_t fingerprint = write.key.empty()
                                                  ? 0ULL
-                                                 : core::computeKeyFp64(reinterpret_cast<const uint8_t*>(write.key.data()), write.key.size());
+                                                 : core::computeKeyFp64(
+                                                     reinterpret_cast<const uint8_t*>(write.key.data()),
+                                                     write.key.size()
+                                                 );
                 auto& lane = *parallelLanes_[fingerprint % parallelLanes_.size()];
                 const uint64_t writeBytes = static_cast<uint64_t>(write.bytes.size());
                 std::lock_guard laneLock{lane.mutex};
@@ -1408,6 +1424,7 @@ namespace akkaradb::engine::vlog {
                 if (opts_.parallelPendingLimitScope == VLogParallelPendingLimitScope::GLOBAL) {
                     std::lock_guard pendingLock{parallelQueueMu_};
                     if (parallelPendingBytes_ != 0 && parallelPendingBytes_ + writeBytes > opts_.asyncMaxPendingBytes) {
+                        parallelQueueRejects_.fetch_add(1, std::memory_order_relaxed);
                         throw std::runtime_error("VersionLog: global parallel queue is full");
                     }
                     lane.pendingWrites.push_back(std::move(write));
@@ -1416,6 +1433,7 @@ namespace akkaradb::engine::vlog {
                 }
                 else {
                     if (!lane.pendingWrites.empty() && lane.pendingBytes + writeBytes > opts_.asyncMaxPendingBytes) {
+                        parallelQueueRejects_.fetch_add(1, std::memory_order_relaxed);
                         throw std::runtime_error("VersionLog: parallel lane queue is full");
                     }
                     lane.pendingWrites.push_back(std::move(write));
@@ -1486,22 +1504,23 @@ namespace akkaradb::engine::vlog {
             template <typename Visitor>
             [[nodiscard]] ScanSummary scanFile(
                 FILE* rf,
+                const fs::path& path,
                 bool allowTrailingEntry,
                 Visitor&& visitor,
                 uint64_t maxBytes = std::numeric_limits<uint64_t>::max()
             ) const {
                 ScanSummary summary;
-                if (maxBytes < sizeof(AkvlogV5FileHeader)) { throw std::runtime_error("VersionLog: durable tail precedes file header"); }
+                if (maxBytes < sizeof(AkvlogV5FileHeader)) { throwVLogError("durable tail precedes file header", path, maxBytes); }
                 AkvlogV5FileHeader fileHdr{};
                 const size_t headerRead = fread(&fileHdr, 1, sizeof(fileHdr), rf);
                 if (headerRead == 0 && feof(rf)) { return summary; }
-                if (headerRead != sizeof(fileHdr)) { throw std::runtime_error("VersionLog: truncated file header"); }
+                if (headerRead != sizeof(fileHdr)) { throwVLogError("truncated file header", path, 0); }
 
                 const uint32_t storedHeaderCrc = fileHdr.crc32c;
                 fileHdr.crc32c = 0;
                 const uint32_t computedHeaderCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(&fileHdr), sizeof(fileHdr));
                 if (fileHdr.magic != AKVLOG_V5_MAGIC || fileHdr.version != AKVLOG_V5_VERSION || storedHeaderCrc != computedHeaderCrc) {
-                    throw std::runtime_error("VersionLog: corrupt file header");
+                    throwVLogError("corrupt file header", path, 0);
                 }
                 summary.durableBytes += sizeof(fileHdr);
 
@@ -1511,21 +1530,21 @@ namespace akkaradb::engine::vlog {
                     if (entryOffset == maxBytes) { break; }
                     if (entryOffset > maxBytes || maxBytes - entryOffset < sizeof(uint32_t)) {
                         if (allowTrailingEntry) { break; }
-                        throw std::runtime_error("VersionLog: durable tail splits entry length");
+                        throwVLogError("durable tail splits entry length", path, entryOffset);
                     }
                     uint32_t entryLen = 0;
                     const size_t prefixRead = fread(&entryLen, 1, sizeof(entryLen), rf);
                     if (prefixRead == 0 && feof(rf)) { break; }
                     if (prefixRead != sizeof(entryLen)) {
                         if (allowTrailingEntry && feof(rf)) { break; }
-                        throw std::runtime_error("VersionLog: truncated entry length");
+                        throwVLogError("truncated entry length", path, entryOffset);
                     }
                     if (entryLen < MIN_ENTRY_SIZE || entryLen > MAX_ENTRY_SIZE) {
-                        throw std::runtime_error("VersionLog: corrupt entry length");
+                        throwVLogError("corrupt entry length", path, entryOffset);
                     }
                     if (static_cast<uint64_t>(entryLen) > maxBytes - entryOffset) {
                         if (allowTrailingEntry) { break; }
-                        throw std::runtime_error("VersionLog: durable tail splits entry");
+                        throwVLogError("durable tail splits entry", path, entryOffset);
                     }
 
                     buf.resize(entryLen);
@@ -1534,19 +1553,19 @@ namespace akkaradb::engine::vlog {
                     const size_t rest = entryLen - sizeof(entryLen);
                     if (fread(buf.data() + sizeof(entryLen), 1, rest, rf) != rest) {
                         if (allowTrailingEntry && feof(rf)) { break; }
-                        throw std::runtime_error("VersionLog: truncated entry");
+                        throwVLogError("truncated entry", path, entryOffset);
                     }
 
                     uint32_t storedEntryCrc = 0;
                     std::memcpy(&storedEntryCrc, buf.data() + entryLen - CRC_SIZE, CRC_SIZE);
                     std::memset(buf.data() + entryLen - CRC_SIZE, 0, CRC_SIZE);
                     const uint32_t computedEntryCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(buf.data()), entryLen - CRC_SIZE);
-                    if (storedEntryCrc != computedEntryCrc) { throw std::runtime_error("VersionLog: entry CRC mismatch"); }
-
-                    if (buf.size() < ENTRY_HDR_SIZE) { throw std::runtime_error("VersionLog: corrupt entry header"); }
                     const auto& ehdr = *reinterpret_cast<const AkvlogV5EntryHeader*>(buf.data());
+                    if (storedEntryCrc != computedEntryCrc) { throwVLogError("entry CRC mismatch", path, entryOffset, ehdr.seq); }
+
+                    if (buf.size() < ENTRY_HDR_SIZE) { throwVLogError("corrupt entry header", path, entryOffset); }
                     const size_t expectedSize = ENTRY_HDR_SIZE + ehdr.keyLen + ehdr.valueLen + CRC_SIZE;
-                    if (expectedSize != entryLen) { throw std::runtime_error("VersionLog: corrupt entry payload"); }
+                    if (expectedSize != entryLen) { throwVLogError("corrupt entry payload", path, entryOffset, ehdr.seq); }
 
                     const uint8_t* p = buf.data() + ENTRY_HDR_SIZE;
                     const std::string_view key(reinterpret_cast<const char*>(p), ehdr.keyLen);
@@ -1556,12 +1575,12 @@ namespace akkaradb::engine::vlog {
                     std::span<const uint8_t> value = storedValue;
                     if ((ehdr.flags & VLOG_FLAG_ZSTD) != 0) {
                         if (storedValue.size() <= ZSTD_VALUE_PREFIX_SIZE) {
-                            throw std::runtime_error("VersionLog: invalid compressed value record");
+                            throwVLogError("invalid compressed value record", path, entryOffset, ehdr.seq);
                         }
                         uint32_t rawSize = 0;
                         std::memcpy(&rawSize, storedValue.data(), sizeof(rawSize));
                         if (rawSize == 0 || rawSize > MAX_ENTRY_SIZE) {
-                            throw std::runtime_error("VersionLog: invalid compressed value size");
+                            throwVLogError("invalid compressed value size", path, entryOffset, ehdr.seq);
                         }
                         decodedValue.resize(rawSize);
                         const size_t decodedSize = ZSTD_decompress(
@@ -1571,18 +1590,15 @@ namespace akkaradb::engine::vlog {
                             storedValue.size() - ZSTD_VALUE_PREFIX_SIZE
                         );
                         if (ZSTD_isError(decodedSize) || decodedSize != rawSize) {
-                            throw std::runtime_error("VersionLog: corrupt Zstd value payload");
+                            throwVLogError("corrupt Zstd value payload", path, entryOffset, ehdr.seq);
                         }
                         value = std::span<const uint8_t>{decodedValue};
                     }
                     auto logicalHeader = ehdr;
                     logicalHeader.flags &= static_cast<uint8_t>(~VLOG_FLAG_ZSTD);
-                    if constexpr (std::is_invocable_v<Visitor&, std::string_view, const AkvlogV5EntryHeader&, std::span<const uint8_t>, uint64_t>) {
-                        visitor(key, logicalHeader, value, entryOffset);
-                    }
-                    else {
-                        visitor(key, logicalHeader, value);
-                    }
+                    if constexpr (std::is_invocable_v<Visitor&, std::string_view, const AkvlogV5EntryHeader&, std::span<const uint8_t>,
+                        uint64_t>) { visitor(key, logicalHeader, value, entryOffset); }
+                    else { visitor(key, logicalHeader, value); }
                     if (!summary.hasEntries) {
                         summary.firstSeq = ehdr.seq;
                         summary.maxSeq = ehdr.seq;
@@ -1625,10 +1641,11 @@ namespace akkaradb::engine::vlog {
                     if (const auto tail = readTailFile(path); tail.has_value()) {
                         std::error_code error;
                         const uint64_t actualBytes = fs::file_size(path, error);
-                        if (error || *tail > actualBytes) { throw std::runtime_error("VersionLog: invalid durable tail length"); }
+                        if (error) { throwVLogError("cannot stat segment for durable tail validation: " + error.message(), path); }
+                        if (*tail > actualBytes) { throwVLogError("invalid durable tail length", path, *tail); }
                         maxBytes = *tail;
                     }
-                    auto summary = scanFile(rf, allowTrailingEntry, std::forward<Visitor>(visitor), maxBytes);
+                    auto summary = scanFile(rf, path, allowTrailingEntry, std::forward<Visitor>(visitor), maxBytes);
                     fclose(rf);
                     return summary;
                 }
@@ -1650,29 +1667,26 @@ namespace akkaradb::engine::vlog {
             // scanMu_ must be held shared by the caller. The generation check at
             // commit guarantees no persisted entry was added while this snapshot
             // was being built.
-            [[nodiscard]] RetentionStateMap buildRetentionBaseStates(
-                const std::vector<SegmentInfo>& segments,
-                uint64_t baseSeq
-            ) const {
+            [[nodiscard]] RetentionStateMap buildRetentionBaseStates(const std::vector<SegmentInfo>& segments, uint64_t baseSeq) const {
                 RetentionStateMap states;
                 for (const auto& segment : segments) {
                     if (segment.hasEntries && segment.firstSeq > baseSeq) { continue; }
-                    (void)scanSegment(segment.path, true, [&](
-                        std::string_view key,
-                        const AkvlogV5EntryHeader& header,
-                        std::span<const uint8_t> value
-                    ) {
-                        if (header.seq > baseSeq) { return; }
-                        const auto it = states.find(key);
-                        if (it != states.end() && it->second.entry.seq >= header.seq) { return; }
-                        VersionEntry entry;
-                        entry.seq = header.seq;
-                        entry.sourceNodeId = header.sourceNodeId;
-                        entry.timestampNs = header.timestampNs;
-                        entry.flags = header.flags;
-                        entry.value.assign(value.begin(), value.end());
-                        states[std::string{key}] = RetentionBaseState{std::move(entry), segment.id};
-                    });
+                    (void)scanSegment(
+                        segment.path,
+                        true,
+                        [&](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t> value) {
+                            if (header.seq > baseSeq) { return; }
+                            const auto it = states.find(key);
+                            if (it != states.end() && it->second.entry.seq >= header.seq) { return; }
+                            VersionEntry entry;
+                            entry.seq = header.seq;
+                            entry.sourceNodeId = header.sourceNodeId;
+                            entry.timestampNs = header.timestampNs;
+                            entry.flags = header.flags;
+                            entry.value.assign(value.begin(), value.end());
+                            states[std::string{key}] = RetentionBaseState{std::move(entry), segment.id};
+                        }
+                    );
                 }
                 return states;
             }
@@ -1684,6 +1698,7 @@ namespace akkaradb::engine::vlog {
                 uint64_t baseSeq
             ) {
                 retentionCompacting_ = true;
+                uint64_t baseEntriesWritten = 0;
                 try {
                     if (usesTrueParallelWrites()) {
                         ParallelLane base;
@@ -1693,9 +1708,14 @@ namespace akkaradb::engine::vlog {
                             const uint8_t flags = static_cast<uint8_t>(state.entry.flags | VLOG_FLAG_RETENTION_BASE);
                             PendingWrite write;
                             write.bytes = serializeEntry(
-                                reinterpret_cast<const uint8_t*>(key.data()), key.size(), baseSeq,
-                                state.entry.sourceNodeId, state.entry.timestampNs, flags,
-                                state.entry.value.data(), state.entry.value.size()
+                                reinterpret_cast<const uint8_t*>(key.data()),
+                                key.size(),
+                                baseSeq,
+                                state.entry.sourceNodeId,
+                                state.entry.timestampNs,
+                                flags,
+                                state.entry.value.data(),
+                                state.entry.value.size()
                             );
                             write.key = key;
                             write.seq = baseSeq;
@@ -1709,15 +1729,22 @@ namespace akkaradb::engine::vlog {
                             if ((flags & VLOG_FLAG_ROLLBACK) != 0) { rollbackEntries_.fetch_add(1, std::memory_order_relaxed); }
                             {
                                 std::unique_lock segmentLock{segmentMu_};
-                                const auto it = std::find_if(segments_.begin(), segments_.end(), [&](const SegmentInfo& segment) {
-                                    return segment.id == base.segmentId;
-                                });
+                                const auto it = std::find_if(
+                                    segments_.begin(),
+                                    segments_.end(),
+                                    [&](const SegmentInfo& segment) { return segment.id == base.segmentId; }
+                                );
                                 if (it == segments_.end()) { throw std::runtime_error("VersionLog: retention base segment is missing"); }
-                                if (!it->hasEntries) { it->firstSeq = baseSeq; it->lastSeq = baseSeq; it->hasEntries = true; }
+                                if (!it->hasEntries) {
+                                    it->firstSeq = baseSeq;
+                                    it->lastSeq = baseSeq;
+                                    it->hasEntries = true;
+                                }
                                 it->bytes = base.bytes;
                                 ++it->entryCount;
                                 if ((flags & VLOG_FLAG_ROLLBACK) != 0) { ++it->rollbackCount; }
                             }
+                            ++baseEntriesWritten;
                         }
                         fflush(base.file);
                         doFdatasync(base.file);
@@ -1727,6 +1754,7 @@ namespace akkaradb::engine::vlog {
                         fclose(base.file);
                         parallelActiveSegmentIds_.erase(base.segmentId);
                         persistedGeneration_.fetch_add(1, std::memory_order_release);
+                        retentionBaseEntriesWritten_.fetch_add(baseEntriesWritten, std::memory_order_relaxed);
                         retentionCompacting_ = false;
                         return;
                     }
@@ -1755,11 +1783,13 @@ namespace akkaradb::engine::vlog {
                         notePersistedLocked(write);
                         trackEntryStats(flags);
                         rotateSegmentIfNeededLocked();
+                        ++baseEntriesWritten;
                     }
                     if (file_) {
                         fflush(file_);
                         doFdatasync(file_);
                     }
+                    retentionBaseEntriesWritten_.fetch_add(baseEntriesWritten, std::memory_order_relaxed);
                     retentionCompacting_ = false;
                 }
                 catch (...) {
@@ -1773,6 +1803,7 @@ namespace akkaradb::engine::vlog {
                 std::unique_lock segmentLock{segmentMu_};
                 std::vector<SegmentInfo> retained;
                 retained.reserve(segments_.size());
+                uint64_t prunedSegments = 0;
                 for (const auto& segment : segments_) {
                     if (!expiredIds.contains(segment.id)) {
                         retained.push_back(segment);
@@ -1790,8 +1821,10 @@ namespace akkaradb::engine::vlog {
                     durableBytes_ = segment.bytes > durableBytes_ ? 0 : durableBytes_ - segment.bytes;
                     indexedEntries_.fetch_sub(segment.entryCount, std::memory_order_relaxed);
                     rollbackEntries_.fetch_sub(segment.rollbackCount, std::memory_order_relaxed);
+                    ++prunedSegments;
                 }
                 segments_.swap(retained);
+                retentionPrunedSegments_.fetch_add(prunedSegments, std::memory_order_relaxed);
             }
 
             class IndexUnavailable final : public std::runtime_error {
@@ -1804,32 +1837,32 @@ namespace akkaradb::engine::vlog {
                 VersionEntry entry;
             };
 
-            [[nodiscard]] ParsedEntry readEntryAt(FILE* file, uint64_t offset) const {
+            [[nodiscard]] ParsedEntry readEntryAt(FILE* file, const fs::path& path, uint64_t offset) const {
                 seekFile(file, offset);
                 uint32_t entryLen = 0;
                 if (fread(&entryLen, sizeof(entryLen), 1, file) != 1) {
-                    throw std::runtime_error("VersionLog: truncated indexed entry length");
+                    throwVLogError("truncated indexed entry length", path, offset);
                 }
                 if (entryLen < MIN_ENTRY_SIZE || entryLen > MAX_ENTRY_SIZE) {
-                    throw std::runtime_error("VersionLog: corrupt indexed entry length");
+                    throwVLogError("corrupt indexed entry length", path, offset);
                 }
 
                 std::vector<uint8_t> buffer(entryLen);
                 std::memcpy(buffer.data(), &entryLen, sizeof(entryLen));
                 const size_t remaining = entryLen - sizeof(entryLen);
                 if (fread(buffer.data() + sizeof(entryLen), 1, remaining, file) != remaining) {
-                    throw std::runtime_error("VersionLog: truncated indexed entry");
+                    throwVLogError("truncated indexed entry", path, offset);
                 }
 
                 uint32_t storedCrc = 0;
                 std::memcpy(&storedCrc, buffer.data() + entryLen - CRC_SIZE, CRC_SIZE);
                 std::memset(buffer.data() + entryLen - CRC_SIZE, 0, CRC_SIZE);
                 const uint32_t computedCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(buffer.data()), entryLen - CRC_SIZE);
-                if (storedCrc != computedCrc) { throw std::runtime_error("VersionLog: indexed entry CRC mismatch"); }
-
                 const auto& header = *reinterpret_cast<const AkvlogV5EntryHeader*>(buffer.data());
+                if (storedCrc != computedCrc) { throwVLogError("indexed entry CRC mismatch", path, offset, header.seq); }
+
                 const size_t expectedSize = ENTRY_HDR_SIZE + header.keyLen + header.valueLen + CRC_SIZE;
-                if (expectedSize != entryLen) { throw std::runtime_error("VersionLog: corrupt indexed entry payload"); }
+                if (expectedSize != entryLen) { throwVLogError("corrupt indexed entry payload", path, offset, header.seq); }
 
                 const uint8_t* data = buffer.data() + ENTRY_HDR_SIZE;
                 ParsedEntry parsed;
@@ -1869,20 +1902,16 @@ namespace akkaradb::engine::vlog {
             }
 
             [[nodiscard]] static bool indexLayoutIsValid(const fs::path& path, const AkvlogIndexFileHeader& header) {
-                if (header.magic != AKVLOG_INDEX_MAGIC || header.version != AKVLOG_INDEX_VERSION ||
-                    header.bloomHashCount != INDEX_BLOOM_HASHES || header.bloomBitCount == 0) {
-                    return false;
-                }
+                if (header.magic != AKVLOG_INDEX_MAGIC || header.version != AKVLOG_INDEX_VERSION || header.bloomHashCount !=
+                    INDEX_BLOOM_HASHES || header.bloomBitCount == 0) { return false; }
                 AkvlogIndexFileHeader checksum = header;
                 const uint32_t storedCrc = checksum.crc32c;
                 checksum.crc32c = 0;
                 if (storedCrc != cpu::CRC32C(reinterpret_cast<const std::byte*>(&checksum), sizeof(checksum))) { return false; }
 
                 const uint64_t bloomBytes = (static_cast<uint64_t>(header.bloomBitCount) + 7u) / 8u;
-                if (header.keyCount > (std::numeric_limits<uint64_t>::max() - sizeof(AkvlogIndexFileHeader) - bloomBytes) /
-                                          sizeof(AkvlogIndexKeyRecord)) {
-                    return false;
-                }
+                if (header.keyCount > (std::numeric_limits<uint64_t>::max() - sizeof(AkvlogIndexFileHeader) - bloomBytes) / sizeof(
+                    AkvlogIndexKeyRecord)) { return false; }
                 uint64_t expectedBytes = sizeof(AkvlogIndexFileHeader) + bloomBytes + header.keyCount * sizeof(AkvlogIndexKeyRecord);
                 if (header.versionCount > (std::numeric_limits<uint64_t>::max() - expectedBytes) / sizeof(AkvlogIndexVersionRecord)) {
                     return false;
@@ -1900,12 +1929,18 @@ namespace akkaradb::engine::vlog {
             ) const {
                 const fs::path path = segmentIndexPath(segment.path);
                 FILE* indexFile = openReadFile(path);
-                if (!indexFile) { return false; }
+                if (!indexFile) {
+                    sidecarFallbackCount_.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
                 try {
                     AkvlogIndexFileHeader header{};
-                    if (fread(&header, sizeof(header), 1, indexFile) != 1 || header.logBytes != segment.bytes ||
-                        !indexLayoutIsValid(path, header) || !verifyIndexPayload(indexFile, path, header)) {
+                    if (fread(&header, sizeof(header), 1, indexFile) != 1 || header.logBytes != segment.bytes || !indexLayoutIsValid(
+                        path,
+                        header
+                    ) || !verifyIndexPayload(indexFile, path, header)) {
                         fclose(indexFile);
+                        sidecarFallbackCount_.fetch_add(1, std::memory_order_relaxed);
                         return false;
                     }
                     const uint64_t fingerprint = key.empty()
@@ -1944,8 +1979,8 @@ namespace akkaradb::engine::vlog {
                             AkvlogIndexKeyRecord candidate{};
                             seekFile(indexFile, directoryOffset + directory * sizeof(candidate));
                             if (fread(&candidate, sizeof(candidate), 1, indexFile) != 1 || candidate.keyFp64 != fingerprint) { break; }
-                            if (candidate.versionCount == 0 || candidate.firstVersion > header.versionCount ||
-                                candidate.versionCount > header.versionCount - candidate.firstVersion) {
+                            if (candidate.versionCount == 0 || candidate.firstVersion > header.versionCount || candidate.versionCount >
+                                header.versionCount - candidate.firstVersion) {
                                 throw IndexUnavailable("VersionLog: invalid segment index version range");
                             }
                             AkvlogIndexVersionRecord firstVersion{};
@@ -1953,13 +1988,12 @@ namespace akkaradb::engine::vlog {
                             if (fread(&firstVersion, sizeof(firstVersion), 1, indexFile) != 1) {
                                 throw IndexUnavailable("VersionLog: truncated segment index version record");
                             }
-                            if (readEntryAt(logFile, firstVersion.offset).key != key) { continue; }
+                            if (readEntryAt(logFile, segment.path, firstVersion.offset).key != key) { continue; }
 
                             std::vector<AkvlogIndexVersionRecord> storedVersions(candidate.versionCount);
                             seekFile(indexFile, versionOffset + candidate.firstVersion * sizeof(AkvlogIndexVersionRecord));
-                            if (fread(storedVersions.data(), sizeof(AkvlogIndexVersionRecord), storedVersions.size(), indexFile) != storedVersions.size()) {
-                                throw IndexUnavailable("VersionLog: truncated segment index versions");
-                            }
+                            if (fread(storedVersions.data(), sizeof(AkvlogIndexVersionRecord), storedVersions.size(), indexFile) !=
+                                storedVersions.size()) { throw IndexUnavailable("VersionLog: truncated segment index versions"); }
                             out.reserve(out.size() + storedVersions.size());
                             for (const auto& version : storedVersions) { out.push_back(IndexVersion{version.seq, version.offset}); }
                             fclose(logFile);
@@ -1977,10 +2011,12 @@ namespace akkaradb::engine::vlog {
                 }
                 catch (const IndexUnavailable&) {
                     fclose(indexFile);
+                    sidecarFallbackCount_.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
                 catch (...) {
                     fclose(indexFile);
+                    sidecarFallbackCount_.fetch_add(1, std::memory_order_relaxed);
                     return false;
                 }
             }
@@ -1989,9 +2025,7 @@ namespace akkaradb::engine::vlog {
                 const SegmentInfo& segment,
                 std::string_view key,
                 std::vector<IndexVersion>& out
-            ) const {
-                return activeIndexVersions(segment.id, key, out) || sidecarIndexVersions(segment, key, out);
-            }
+            ) const { return activeIndexVersions(segment.id, key, out) || sidecarIndexVersions(segment, key, out); }
 
             [[nodiscard]] std::vector<VersionEntry> readIndexedEntries(
                 const SegmentInfo& segment,
@@ -2007,7 +2041,7 @@ namespace akkaradb::engine::vlog {
                     entries.reserve(versions.size());
                     for (const auto& version : versions) {
                         if (version.seq > visibleSeq) { continue; }
-                        auto parsed = readEntryAt(file, version.offset);
+                        auto parsed = readEntryAt(file, segment.path, version.offset);
                         if (parsed.key != key || parsed.entry.seq != version.seq) {
                             throw IndexUnavailable("VersionLog: stale segment index entry");
                         }
@@ -2050,7 +2084,10 @@ namespace akkaradb::engine::vlog {
             }
 
             void runRecovery() noexcept {
+                const auto started = std::chrono::steady_clock::now();
                 std::exception_ptr error;
+                uint64_t recoveredSegments = 0;
+                uint64_t recoveredEntries = 0;
                 try {
                     auto segments = discoverSegments();
                     ScanSummary total;
@@ -2062,11 +2099,11 @@ namespace akkaradb::engine::vlog {
                             segment.path,
                             false,
                             [&segmentIndex](
-                                std::string_view key,
-                                const AkvlogV5EntryHeader& header,
-                                std::span<const uint8_t>,
-                                uint64_t offset
-                            ) {
+                            std::string_view key,
+                            const AkvlogV5EntryHeader& header,
+                            std::span<const uint8_t>,
+                            uint64_t offset
+                        ) {
                                 auto& versions = segmentIndex[std::string{key}];
                                 versions.push_back(IndexVersion{header.seq, offset});
                             }
@@ -2082,6 +2119,8 @@ namespace akkaradb::engine::vlog {
                         recoveredActiveSegmentId = segment.id;
                         activeIndex = std::move(segmentIndex);
                     }
+                    recoveredSegments = static_cast<uint64_t>(segments.size());
+                    recoveredEntries = total.entryCount;
                     applyRecoverySummary(total, std::move(segments));
                     resetActiveIndex(recoveredActiveSegmentId, std::move(activeIndex));
                     pruneClosedSegments();
@@ -2090,6 +2129,12 @@ namespace akkaradb::engine::vlog {
                 }
                 catch (...) { error = std::current_exception(); }
 
+                const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started
+                ).count();
+                recoveryDurationMicros_.store(static_cast<uint64_t>(std::max<int64_t>(0, elapsed)), std::memory_order_relaxed);
+                recoveredSegmentCount_.store(recoveredSegments, std::memory_order_relaxed);
+                recoveredEntryCount_.store(recoveredEntries, std::memory_order_relaxed);
                 {
                     std::lock_guard lock{recoveryMu_};
                     recoveryError_ = std::move(error);
@@ -2115,9 +2160,7 @@ namespace akkaradb::engine::vlog {
                 if (error) { std::rethrow_exception(error); }
             }
 
-            void joinRecoveryWorker() {
-                if (recoveryThread_.joinable()) { recoveryThread_.join(); }
-            }
+            void joinRecoveryWorker() { if (recoveryThread_.joinable()) { recoveryThread_.join(); } }
 
             void openOrCreate() {
                 const auto& path = opts_.logPath;
@@ -2208,13 +2251,20 @@ namespace akkaradb::engine::vlog {
             ve.value.assign(value.begin(), value.end());
             return ve;
         };
-        const auto persistAndPublish = [&](std::vector<uint8_t> bytes, VersionEntry entry, std::shared_ptr<Impl::AppendCompletion> completion = {}) {
+        const auto persistAndPublish = [&](
+            std::vector<uint8_t> bytes,
+            VersionEntry entry,
+            std::shared_ptr<Impl::AppendCompletion> completion = {}
+        ) {
             std::unique_lock lock{impl_->writeMu_};
             if (!impl_->file_) {
                 Impl::completeAppend(completion, std::make_exception_ptr(std::runtime_error("VersionLog: append rejected after close")));
                 return;
             }
-            const bool remainsResident = impl_->persistSerialized(lock, Impl::PendingWrite{std::move(bytes), keyStr, seq, flags, 0, std::move(completion)});
+            const bool remainsResident = impl_->persistSerialized(
+                lock,
+                Impl::PendingWrite{std::move(bytes), keyStr, seq, flags, 0, std::move(completion)}
+            );
             impl_->trackEntryStats(flags);
             if (remainsResident) { impl_->publishResident(keyStr, std::move(entry)); }
         };
@@ -2257,9 +2307,7 @@ namespace akkaradb::engine::vlog {
         }
     }
 
-    void VersionLog::waitUntilReady() const {
-        if (impl_) { impl_->waitForRecovery(); }
-    }
+    void VersionLog::waitUntilReady() const { if (impl_) { impl_->waitForRecovery(); } }
 
     std::optional<VersionEntry> VersionLog::getAt(std::span<const uint8_t> key, uint64_t atSeq) const {
         if (!impl_) { return std::nullopt; }
@@ -2282,37 +2330,39 @@ namespace akkaradb::engine::vlog {
             if (usedIndex) {
                 try {
                     const auto after = std::upper_bound(
-                        versions.begin(), versions.end(), visibleSeq,
+                        versions.begin(),
+                        versions.end(),
+                        visibleSeq,
                         [](uint64_t sequence, const Impl::IndexVersion& version) { return sequence < version.seq; }
                     );
                     if (after != versions.begin()) {
                         auto selected = std::prev(after);
                         while (selected != versions.begin() && std::prev(selected)->seq == selected->seq) { --selected; }
                         for (auto& entry : impl_->readIndexedEntries(
-                            segment,
-                            keySv,
-                            std::span<const Impl::IndexVersion>{&*selected, 1},
-                            visibleSeq
-                        )) { consider(std::move(entry)); }
+                                 segment,
+                                 keySv,
+                                 std::span<const Impl::IndexVersion>{&*selected, 1},
+                                 visibleSeq
+                             )) { consider(std::move(entry)); }
                     }
                 }
                 catch (const Impl::IndexUnavailable&) { usedIndex = false; }
             }
             if (usedIndex) { continue; }
-            (void)impl_->scanSegment(segment.path, true, [&](
-                std::string_view entryKey,
-                const AkvlogV5EntryHeader& header,
-                std::span<const uint8_t> entryValue
-            ) {
-                if (entryKey != keySv || header.seq > visibleSeq) { return; }
-                VersionEntry entry;
-                entry.seq = header.seq;
-                entry.sourceNodeId = header.sourceNodeId;
-                entry.timestampNs = header.timestampNs;
-                entry.flags = header.flags;
-                entry.value.assign(entryValue.begin(), entryValue.end());
-                consider(std::move(entry));
-            });
+            (void)impl_->scanSegment(
+                segment.path,
+                true,
+                [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
+                    if (entryKey != keySv || header.seq > visibleSeq) { return; }
+                    VersionEntry entry;
+                    entry.seq = header.seq;
+                    entry.sourceNodeId = header.sourceNodeId;
+                    entry.timestampNs = header.timestampNs;
+                    entry.flags = header.flags;
+                    entry.value.assign(entryValue.begin(), entryValue.end());
+                    consider(std::move(entry));
+                }
+            );
         }
         for (auto& entry : resident) { consider(std::move(entry)); }
         return result;
@@ -2336,39 +2386,37 @@ namespace akkaradb::engine::vlog {
             if (usedIndex) {
                 try {
                     auto indexed = impl_->readIndexedEntries(segment, keySv, versions, visibleSeq);
-                    entries.insert(
-                        entries.end(),
-                        std::make_move_iterator(indexed.begin()),
-                        std::make_move_iterator(indexed.end())
-                    );
+                    entries.insert(entries.end(), std::make_move_iterator(indexed.begin()), std::make_move_iterator(indexed.end()));
                 }
                 catch (const Impl::IndexUnavailable&) { usedIndex = false; }
             }
             if (usedIndex) { continue; }
-            (void)impl_->scanSegment(segment.path, true, [&](
-                std::string_view entryKey,
-                const AkvlogV5EntryHeader& header,
-                std::span<const uint8_t> entryValue
-            ) {
-                if (entryKey != keySv || header.seq > visibleSeq) { return; }
-                VersionEntry entry;
-                entry.seq = header.seq;
-                entry.sourceNodeId = header.sourceNodeId;
-                entry.timestampNs = header.timestampNs;
-                entry.flags = header.flags;
-                entry.value.assign(entryValue.begin(), entryValue.end());
-                entries.push_back(std::move(entry));
-            });
+            (void)impl_->scanSegment(
+                segment.path,
+                true,
+                [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
+                    if (entryKey != keySv || header.seq > visibleSeq) { return; }
+                    VersionEntry entry;
+                    entry.seq = header.seq;
+                    entry.sourceNodeId = header.sourceNodeId;
+                    entry.timestampNs = header.timestampNs;
+                    entry.flags = header.flags;
+                    entry.value.assign(entryValue.begin(), entryValue.end());
+                    entries.push_back(std::move(entry));
+                }
+            );
         }
-        for (auto& entry : resident) {
-            if (entry.seq <= visibleSeq) { entries.push_back(std::move(entry)); }
-        }
+        for (auto& entry : resident) { if (entry.seq <= visibleSeq) { entries.push_back(std::move(entry)); } }
         std::sort(entries.begin(), entries.end(), [](const VersionEntry& left, const VersionEntry& right) { return left.seq < right.seq; });
         entries.erase(
-            std::unique(entries.begin(), entries.end(), [](const VersionEntry& left, const VersionEntry& right) {
-                return left.seq == right.seq && left.sourceNodeId == right.sourceNodeId && left.timestampNs == right.timestampNs &&
-                       left.flags == right.flags && left.value == right.value;
-            }),
+            std::unique(
+                entries.begin(),
+                entries.end(),
+                [](const VersionEntry& left, const VersionEntry& right) {
+                    return left.seq == right.seq && left.sourceNodeId == right.sourceNodeId && left.timestampNs == right.timestampNs && left
+                       .flags == right.flags && left.value == right.value;
+                }
+            ),
             entries.end()
         );
         return entries;
@@ -2383,30 +2431,40 @@ namespace akkaradb::engine::vlog {
         const uint64_t effectiveTargetSeq = std::min(targetSeq, visibleSeq);
         std::unordered_map<std::string, std::vector<VersionEntry>> entriesByKey;
         auto resident = impl_->residentSnapshot();
-        (void)impl_->scanLog(true, visibleSeq, [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
-            if (header.seq > visibleSeq) { return; }
-            VersionEntry entry;
-            entry.seq = header.seq;
-            entry.sourceNodeId = header.sourceNodeId;
-            entry.timestampNs = header.timestampNs;
-            entry.flags = header.flags;
-            entry.value.assign(entryValue.begin(), entryValue.end());
-            entriesByKey[std::string{entryKey}].push_back(std::move(entry));
-        });
+        (void)impl_->scanLog(
+            true,
+            visibleSeq,
+            [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
+                if (header.seq > visibleSeq) { return; }
+                VersionEntry entry;
+                entry.seq = header.seq;
+                entry.sourceNodeId = header.sourceNodeId;
+                entry.timestampNs = header.timestampNs;
+                entry.flags = header.flags;
+                entry.value.assign(entryValue.begin(), entryValue.end());
+                entriesByKey[std::string{entryKey}].push_back(std::move(entry));
+            }
+        );
         for (auto& [key, entries] : resident) {
             auto& destination = entriesByKey[key];
-            for (auto& entry : entries) {
-                if (entry.seq <= visibleSeq) { destination.push_back(std::move(entry)); }
-            }
+            for (auto& entry : entries) { if (entry.seq <= visibleSeq) { destination.push_back(std::move(entry)); } }
         }
         std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> result;
         for (auto& [key, versions] : entriesByKey) {
-            std::sort(versions.begin(), versions.end(), [](const VersionEntry& left, const VersionEntry& right) { return left.seq < right.seq; });
+            std::sort(
+                versions.begin(),
+                versions.end(),
+                [](const VersionEntry& left, const VersionEntry& right) { return left.seq < right.seq; }
+            );
             versions.erase(
-                std::unique(versions.begin(), versions.end(), [](const VersionEntry& left, const VersionEntry& right) {
-                    return left.seq == right.seq && left.sourceNodeId == right.sourceNodeId && left.timestampNs == right.timestampNs &&
-                           left.flags == right.flags && left.value == right.value;
-                }),
+                std::unique(
+                    versions.begin(),
+                    versions.end(),
+                    [](const VersionEntry& left, const VersionEntry& right) {
+                        return left.seq == right.seq && left.sourceNodeId == right.sourceNodeId && left.timestampNs == right.timestampNs &&
+                            left.flags == right.flags && left.value == right.value;
+                    }
+                ),
                 versions.end()
             );
             if (versions.empty() || versions.back().seq <= effectiveTargetSeq) { continue; }
@@ -2431,27 +2489,52 @@ namespace akkaradb::engine::vlog {
         VersionLogSnapshot out;
         if (!impl_) { return out; }
 
-        std::lock_guard writeLock{impl_->writeMu_};
-        std::shared_lock residentLock{impl_->residentMu_};
-        std::shared_lock segmentLock{impl_->segmentMu_};
-        out.syncMode = static_cast<uint8_t>(impl_->opts_.syncMode);
-        out.codec = static_cast<uint8_t>(impl_->opts_.codec);
-        out.zstdCompressionLevel = impl_->opts_.zstdCompressionLevel;
-        out.groupN = impl_->opts_.groupN;
-        out.groupMicros = impl_->opts_.groupMicros;
-        out.groupBytes = impl_->opts_.groupBytes;
-        out.asyncMaxPendingBytes = impl_->opts_.asyncMaxPendingBytes;
-        out.indexedKeys = impl_->residentIndex_.size();
-        out.indexedEntries = impl_->indexedEntries_.load(std::memory_order_relaxed);
-        out.rollbackEntries = impl_->rollbackEntries_.load(std::memory_order_relaxed);
-        out.pendingWrites = impl_->pendingWrites_.size();
-        out.pendingBytes = impl_->pendingBytes_;
-        out.durableBytes = impl_->durableBytes_;
-        out.segmentCount = impl_->segments_.size();
-        out.activeSegmentBytes = impl_->activeSegmentBytes_;
-        out.retentionDays = impl_->opts_.retentionDays;
-        out.retentionMinCommitSeq = impl_->opts_.retentionMinCommitSeq;
-        out.flushThreadRunning = impl_->flushThread_.joinable();
+        std::vector<VersionLog::Impl::ParallelLane*> lanes;
+        {
+            std::lock_guard writeLock{impl_->writeMu_};
+            std::shared_lock residentLock{impl_->residentMu_};
+            std::shared_lock segmentLock{impl_->segmentMu_};
+            out.syncMode = static_cast<uint8_t>(impl_->opts_.syncMode);
+            out.codec = static_cast<uint8_t>(impl_->opts_.codec);
+            out.zstdCompressionLevel = impl_->opts_.zstdCompressionLevel;
+            out.groupN = impl_->opts_.groupN;
+            out.groupMicros = impl_->opts_.groupMicros;
+            out.groupBytes = impl_->opts_.groupBytes;
+            out.asyncMaxPendingBytes = impl_->opts_.asyncMaxPendingBytes;
+            out.indexedKeys = impl_->residentIndex_.size();
+            out.indexedEntries = impl_->indexedEntries_.load(std::memory_order_relaxed);
+            out.rollbackEntries = impl_->rollbackEntries_.load(std::memory_order_relaxed);
+            out.pendingWrites = impl_->pendingWrites_.size();
+            out.pendingBytes = impl_->pendingBytes_;
+            out.durableBytes = impl_->durableBytes_;
+            out.segmentCount = impl_->segments_.size();
+            out.activeSegmentBytes = impl_->activeSegmentBytes_;
+            out.retentionDays = impl_->opts_.retentionDays;
+            out.retentionMinCommitSeq = impl_->opts_.retentionMinCommitSeq;
+            out.flushThreadRunning = impl_->flushThread_.joinable();
+            out.recoveryDurationMicros = impl_->recoveryDurationMicros_.load(std::memory_order_relaxed);
+            out.recoveredSegmentCount = impl_->recoveredSegmentCount_.load(std::memory_order_relaxed);
+            out.recoveredEntryCount = impl_->recoveredEntryCount_.load(std::memory_order_relaxed);
+            out.sidecarFallbackCount = impl_->sidecarFallbackCount_.load(std::memory_order_relaxed);
+            out.sidecarRebuildFailures = impl_->sidecarRebuildFailures_.load(std::memory_order_relaxed);
+            out.retentionPrunedSegments = impl_->retentionPrunedSegments_.load(std::memory_order_relaxed);
+            out.retentionBaseEntriesWritten = impl_->retentionBaseEntriesWritten_.load(std::memory_order_relaxed);
+            out.parallelQueueRejects = impl_->parallelQueueRejects_.load(std::memory_order_relaxed);
+            out.parallelLaneCount = impl_->parallelLanes_.size();
+            lanes.reserve(impl_->parallelLanes_.size());
+            for (const auto& lane : impl_->parallelLanes_) { lanes.push_back(lane.get()); }
+        }
+        for (const auto& lane : lanes) {
+            std::lock_guard laneLock{lane->mutex};
+            out.parallelPendingWrites += lane->pendingWrites.size();
+            if (impl_->opts_.parallelPendingLimitScope != VLogParallelPendingLimitScope::GLOBAL) {
+                out.parallelPendingBytes += lane->pendingBytes;
+            }
+        }
+        if (impl_->opts_.parallelPendingLimitScope == VLogParallelPendingLimitScope::GLOBAL) {
+            std::lock_guard pendingLock{impl_->parallelQueueMu_};
+            out.parallelPendingBytes = impl_->parallelPendingBytes_;
+        }
         return out;
     }
 
@@ -2512,15 +2595,15 @@ namespace akkaradb::engine::vlog {
         {
             std::lock_guard lock{impl_->writeMu_};
             asyncError = impl_->asyncError_;
-                if (!impl_->file_) {
+            if (!impl_->file_) {
                 if (recoveryError) { std::rethrow_exception(recoveryError); }
                 if (asyncError) { std::rethrow_exception(asyncError); }
-                    return;
-                }
-                fflush(impl_->file_);
-                doFdatasync(impl_->file_);
-                impl_->writeActiveSegmentIndexLocked();
-                fclose(impl_->file_);
+                return;
+            }
+            fflush(impl_->file_);
+            doFdatasync(impl_->file_);
+            impl_->writeActiveSegmentIndexLocked();
+            fclose(impl_->file_);
             impl_->file_ = nullptr;
         }
         if (recoveryError) { std::rethrow_exception(recoveryError); }

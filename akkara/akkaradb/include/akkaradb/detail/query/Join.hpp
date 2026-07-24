@@ -170,15 +170,11 @@ class JoinView {
 template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
 [[nodiscard]] JoinView<LeftFieldPtr, RightFieldPtr, TargetPrimaryKeyPtr> join(const PackedTable<TargetPrimaryKeyPtr>& target) const {
     static_assert(std::is_same_v < binpack::detail::classOf < LeftFieldPtr >,
-    Entity >, "join left field must belong to the left table entity"
-    )
-    ;
+    Entity >, "join left field must belong to the left table entity" ) ;
     using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
     using RightEntity = typename TargetTable::Entity;
     static_assert(std::is_same_v < binpack::detail::classOf < RightFieldPtr >,
-    RightEntity >, "join right field must belong to the right table entity"
-    )
-    ;
+    RightEntity >, "join right field must belong to the right table entity" ) ;
     using LeftField = binpack::detail::memberOf<LeftFieldPtr>;
     using RightField = binpack::detail::memberOf<RightFieldPtr>;
     static_assert(
@@ -196,9 +192,7 @@ template <auto LeftFieldPtr, auto RightFieldPtr, auto TargetPrimaryKeyPtr>
 template <auto RefFieldPtr, auto TargetPrimaryKeyPtr> requires(isRef<binpack::detail::memberOf<RefFieldPtr>>)
 [[nodiscard]] auto join(const PackedTable<TargetPrimaryKeyPtr>& target) const {
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    Entity >, "join ref field must belong to the table entity"
-    )
-    ;
+    Entity >, "join ref field must belong to the table entity" ) ;
     using Field = binpack::detail::memberOf<RefFieldPtr>;
     using Target = typename RefTarget<Field>::Type;
     using TargetTable = PackedTable<TargetPrimaryKeyPtr>;

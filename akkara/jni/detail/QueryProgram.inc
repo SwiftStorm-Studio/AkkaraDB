@@ -89,16 +89,17 @@
             case Value::INT: return lhs.i == rhs.i;
             case Value::DOUBLE: return lhs.d == rhs.d;
             case Value::STRING: return lhs.s == rhs.s;
-            case Value::LIST:
-                if (lhs.list.size() != rhs.list.size()) { return false; }
+            case Value::LIST: if (lhs.list.size() != rhs.list.size()) { return false; }
                 for (size_t i = 0; i < lhs.list.size(); ++i) { if (!valuesEqual(lhs.list[i], rhs.list[i])) { return false; } }
                 return true;
-            case Value::MAP:
-                if (lhs.map.size() != rhs.map.size()) { return false; }
+            case Value::MAP: if (lhs.map.size() != rhs.map.size()) { return false; }
                 for (const auto& [lhsKey, lhsValue] : lhs.map) {
                     bool found = false;
                     for (const auto& [rhsKey, rhsValue] : rhs.map) {
-                        if (valuesEqual(lhsKey, rhsKey) && valuesEqual(lhsValue, rhsValue)) { found = true; break; }
+                        if (valuesEqual(lhsKey, rhsKey) && valuesEqual(lhsValue, rhsValue)) {
+                            found = true;
+                            break;
+                        }
                     }
                     if (!found) { return false; }
                 }
@@ -158,8 +159,8 @@
         size_t pc = 0;
         auto readU16 = [&]() {
             if (pc + 2 > query.code.size()) { throw std::runtime_error("Truncated AkkaraDB portable query bytecode operand"); }
-            const uint16_t value = static_cast<uint16_t>(query.code[pc]) |
-                static_cast<uint16_t>(static_cast<uint16_t>(query.code[pc + 1]) << 8);
+            const uint16_t value = static_cast<uint16_t>(query.code[pc]) | static_cast<uint16_t>(static_cast<uint16_t>(query.code[pc + 1])
+                << 8);
             pc += 2;
             return value;
         };
@@ -174,7 +175,9 @@
             switch (query.code[pc++]) {
                 case 0x01: { // PushConst
                     const auto index = readU16();
-                    if (index >= query.constants.size()) { throw std::runtime_error("AkkaraDB portable query constant index out of range"); }
+                    if (index >= query.constants.size()) {
+                        throw std::runtime_error("AkkaraDB portable query constant index out of range");
+                    }
                     stack.push_back(query.constants[index]);
                     break;
                 }
@@ -184,28 +187,82 @@
                     stack.push_back(readColumn(rowValue, query.schema, query.fields[index]));
                     break;
                 }
-                case 0x03: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(valuesEqual(lhs, rhs))); break; }
-                case 0x04: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(!valuesEqual(lhs, rhs))); break; }
+                case 0x03: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(valuesEqual(lhs, rhs)));
+                    break;
+                }
+                case 0x04: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(!valuesEqual(lhs, rhs)));
+                    break;
+                }
                 case 0x05:
                 case 0x06:
                 case 0x07:
                 case 0x08: {
-                    const auto rhs = pop(); const auto lhs = pop(); const auto cmp = compareValues(lhs, rhs);
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    const auto cmp = compareValues(lhs, rhs);
                     const uint8_t op = query.code[pc - 1];
                     stack.push_back(Value::boolean(op == 0x05 ? cmp < 0 : op == 0x06 ? cmp <= 0 : op == 0x07 ? cmp > 0 : cmp >= 0));
                     break;
                 }
-                case 0x09: stack.push_back(Value::boolean(!valueIsTrue(pop()))); break;
-                case 0x0A: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(valueIsTrue(lhs) && valueIsTrue(rhs))); break; }
-                case 0x0B: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(valueIsTrue(lhs) || valueIsTrue(rhs))); break; }
-                case 0x12: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(stringStartsWith(lhs, rhs))); break; }
-                case 0x14: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(stringContains(lhs, rhs))); break; }
-                case 0x15: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(stringLike(lhs, rhs))); break; }
-                case 0x1C: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(valueInList(lhs, rhs))); break; }
-                case 0x1D: { const auto rhs = pop(); const auto lhs = pop(); stack.push_back(Value::boolean(!valueInList(lhs, rhs))); break; }
-                case 0x1E: { const auto key = pop(); const auto map = pop(); stack.push_back(mapGetValue(map, key)); break; }
-                case 0x10:
-                    if (pc != query.code.size() || stack.size() != 1) { throw std::runtime_error("Malformed AkkaraDB portable query bytecode return"); }
+                case 0x09: stack.push_back(Value::boolean(!valueIsTrue(pop())));
+                    break;
+                case 0x0A: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(valueIsTrue(lhs) && valueIsTrue(rhs)));
+                    break;
+                }
+                case 0x0B: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(valueIsTrue(lhs) || valueIsTrue(rhs)));
+                    break;
+                }
+                case 0x12: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(stringStartsWith(lhs, rhs)));
+                    break;
+                }
+                case 0x14: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(stringContains(lhs, rhs)));
+                    break;
+                }
+                case 0x15: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(stringLike(lhs, rhs)));
+                    break;
+                }
+                case 0x1C: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(valueInList(lhs, rhs)));
+                    break;
+                }
+                case 0x1D: {
+                    const auto rhs = pop();
+                    const auto lhs = pop();
+                    stack.push_back(Value::boolean(!valueInList(lhs, rhs)));
+                    break;
+                }
+                case 0x1E: {
+                    const auto key = pop();
+                    const auto map = pop();
+                    stack.push_back(mapGetValue(map, key));
+                    break;
+                }
+                case 0x10: if (pc != query.code.size() || stack.size() != 1) {
+                        throw std::runtime_error("Malformed AkkaraDB portable query bytecode return");
+                    }
                     return valueIsTrue(stack.back());
                 default: throw std::runtime_error("Unsupported AkkaraDB portable query opcode");
             }

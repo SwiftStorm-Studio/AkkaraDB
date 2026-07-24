@@ -83,7 +83,7 @@ namespace akkaradb::engine::memtable {
         VersionChain* chain = initialRecord != nullptr ? makeChain(initialRecord) : nullptr;
         Node* node = new(mem) Node{level, initialRecord, chain};
         auto* nextSlots = reinterpret_cast<std::atomic<Node*>*>(node + 1);
-        for (uint8_t i = 0; i < level; ++i) { new (&nextSlots[i]) std::atomic<Node*>{nullptr}; }
+        for (uint8_t i = 0; i < level; ++i) { new(&nextSlots[i]) std::atomic<Node*>{nullptr}; }
         bytes_.fetch_add(bytes, std::memory_order_relaxed);
         return node;
     }
@@ -203,7 +203,16 @@ namespace akkaradb::engine::memtable {
     RecordView SkipListMemTable::toView(const core::OwnedRecord& record) noexcept {
         const auto key = record.key();
         const auto value = record.value();
-        return {key.data(), record.hdr.kLen, value.data(), record.hdr.vLen, record.hdr.seq, record.hdr.flags, record.keyFp64, record.miniKey};
+        return {
+            key.data(),
+            record.hdr.kLen,
+            value.data(),
+            record.hdr.vLen,
+            record.hdr.seq,
+            record.hdr.flags,
+            record.keyFp64,
+            record.miniKey
+        };
     }
 
     Status SkipListMemTable::put(

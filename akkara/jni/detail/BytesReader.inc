@@ -4,6 +4,7 @@
 
             [[nodiscard]] bool eof() const noexcept { return pos_ == bytes_.size(); }
             [[nodiscard]] size_t position() const noexcept { return pos_; }
+
             [[nodiscard]] std::span<const uint8_t> slice(size_t start, size_t len) const {
                 if (start > bytes_.size() || len > bytes_.size() - start) {
                     throw std::runtime_error("AkkaraDB query payload slice is out of bounds");
@@ -32,9 +33,7 @@
                 return out;
             }
 
-            [[nodiscard]] int32_t i32() {
-                return static_cast<int32_t>(u32());
-            }
+            [[nodiscard]] int32_t i32() { return static_cast<int32_t>(u32()); }
 
             [[nodiscard]] uint64_t u64() {
                 const uint64_t lo = u32();
@@ -42,9 +41,7 @@
                 return lo | (hi << 32);
             }
 
-            [[nodiscard]] int64_t i64() {
-                return static_cast<int64_t>(u64());
-            }
+            [[nodiscard]] int64_t i64() { return static_cast<int64_t>(u64()); }
 
             [[nodiscard]] std::string strU16() {
                 const auto len = static_cast<size_t>(u16());

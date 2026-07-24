@@ -306,9 +306,7 @@ namespace akkaradb::engine::memtable {
                         if (!failure_) { failure_ = std::move(failure); }
                     }
 
-                    void rethrowFailureLocked() const {
-                        if (failure_) { std::rethrow_exception(failure_); }
-                    }
+                    void rethrowFailureLocked() const { if (failure_) { std::rethrow_exception(failure_); } }
 
                     void run() {
                         for (;;) {
@@ -495,13 +493,7 @@ namespace akkaradb::engine::memtable {
                 }
 
                 return RangeIterator{
-                    std::make_unique<RangeIterator::Impl>(
-                        std::move(scanLocks),
-                        std::move(sources),
-                        range.start,
-                        range.end,
-                        snapshotSeq
-                    )
+                    std::make_unique<RangeIterator::Impl>(std::move(scanLocks), std::move(sources), range.start, range.end, snapshotSeq)
                 };
             }
 
@@ -509,10 +501,7 @@ namespace akkaradb::engine::memtable {
                 return makeIterator(range, snapshotSeq);
             }
 
-            [[nodiscard]] RangeIterator pinnedIterator(
-                const KeyRange& range,
-                const std::function<uint64_t()>& snapshotSeqProvider
-            ) const {
+            [[nodiscard]] RangeIterator pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const {
                 std::vector<std::shared_lock<std::shared_mutex>> scanLocks;
                 scanLocks.reserve(shards_.size());
                 for (const auto& shard : shards_) { scanLocks.emplace_back(shard->mutex); }
@@ -556,9 +545,7 @@ namespace akkaradb::engine::memtable {
                 if (flushPool_) { flushPool_->drain(); }
             }
 
-            void throwIfFlushFailed() const {
-                if (flushPool_) { flushPool_->throwIfFailed(); }
-            }
+            void throwIfFlushFailed() const { if (flushPool_) { flushPool_->throwIfFailed(); } }
 
             void setFlushCallback(const FlushCallback& cb) {
                 rawActiveGetEnabled_.store(false, std::memory_order_release);
@@ -739,10 +726,7 @@ namespace akkaradb::engine::memtable {
         return impl_->iterator(range, snapshotSeq);
     }
 
-    MemTable::RangeIterator MemTable::pinnedIterator(
-        const KeyRange& range,
-        const std::function<uint64_t()>& snapshotSeqProvider
-    ) const {
+    MemTable::RangeIterator MemTable::pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const {
         return impl_->pinnedIterator(range, snapshotSeqProvider);
     }
 

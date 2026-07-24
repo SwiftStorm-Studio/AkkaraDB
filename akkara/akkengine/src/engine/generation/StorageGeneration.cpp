@@ -13,6 +13,7 @@
 
 namespace akkaradb::engine::generation {
     namespace fs = std::filesystem;
+
     namespace {
         constexpr const char* CURRENT_FILE = "current.akgen";
 

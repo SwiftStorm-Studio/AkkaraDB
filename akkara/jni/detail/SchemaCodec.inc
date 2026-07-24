@@ -39,7 +39,7 @@
         return out;
     }
 
-    [[nodiscard]] TypePtr parseType(BytesReader& in);
+    [[nodiscard]] TypePtr parseType(BytesReader & in);
 
     void parseStructFields(BytesReader& in, TypeDesc& out) {
         const auto count = in.u8();

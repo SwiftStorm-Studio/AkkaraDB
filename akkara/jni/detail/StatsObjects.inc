@@ -1,4 +1,10 @@
-    [[nodiscard]] jobject makePlainStats(JNIEnv* env, const char* className, const TStats& /*stats*/, std::initializer_list<std::pair<const char*, jlong>> longs, std::initializer_list<std::pair<const char*, bool>> bools = {}) {
+    [[nodiscard]] jobject makePlainStats(
+        JNIEnv* env,
+        const char* className,
+        const TStats& /*stats*/,
+        std::initializer_list<std::pair<const char*, jlong>> longs,
+        std::initializer_list<std::pair<const char*, bool>> bools = {}
+    ) {
         jclass cls = env->FindClass(className);
         if (cls == nullptr) { return nullptr; }
         jmethodID ctor = env->GetMethodID(cls, "<init>", "()V");
@@ -76,12 +82,22 @@
                 {"rollbackEntries", static_cast<jlong>(stats.vlog.rollbackEntries)},
                 {"pendingWrites", static_cast<jlong>(stats.vlog.pendingWrites)},
                 {"pendingBytes", static_cast<jlong>(stats.vlog.pendingBytes)},
-                {"durableBytes", static_cast<jlong>(stats.vlog.durableBytes)}
+                {"durableBytes", static_cast<jlong>(stats.vlog.durableBytes)},
+                {"segmentCount", static_cast<jlong>(stats.vlog.segmentCount)},
+                {"activeSegmentBytes", static_cast<jlong>(stats.vlog.activeSegmentBytes)},
+                {"recoveryDurationMicros", static_cast<jlong>(stats.vlog.recoveryDurationMicros)},
+                {"recoveredSegmentCount", static_cast<jlong>(stats.vlog.recoveredSegmentCount)},
+                {"recoveredEntryCount", static_cast<jlong>(stats.vlog.recoveredEntryCount)},
+                {"sidecarFallbackCount", static_cast<jlong>(stats.vlog.sidecarFallbackCount)},
+                {"sidecarRebuildFailures", static_cast<jlong>(stats.vlog.sidecarRebuildFailures)},
+                {"retentionPrunedSegments", static_cast<jlong>(stats.vlog.retentionPrunedSegments)},
+                {"retentionBaseEntriesWritten", static_cast<jlong>(stats.vlog.retentionBaseEntriesWritten)},
+                {"parallelQueueRejects", static_cast<jlong>(stats.vlog.parallelQueueRejects)},
+                {"parallelLaneCount", static_cast<jlong>(stats.vlog.parallelLaneCount)},
+                {"parallelPendingWrites", static_cast<jlong>(stats.vlog.parallelPendingWrites)},
+                {"parallelPendingBytes", static_cast<jlong>(stats.vlog.parallelPendingBytes)}
             },
-            {
-                {"enabled", stats.vlog.enabled},
-                {"flushThreadRunning", stats.vlog.flushThreadRunning}
-            }
+            {{"enabled", stats.vlog.enabled}, {"flushThreadRunning", stats.vlog.flushThreadRunning}}
         );
         jobject manifest = makePlainStats(
             env,

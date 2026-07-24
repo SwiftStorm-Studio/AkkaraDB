@@ -12,6 +12,7 @@
 
 namespace akkaradb::engine::erasure {
     uint16_t ErasureLayout::totalShards() const noexcept { return static_cast<uint16_t>(dataShards + parityShards); }
+
     bool ErasureShard::verifyCrc() const noexcept {
         return crc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
     }

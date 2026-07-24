@@ -32,10 +32,7 @@ namespace akkaradb::engine::sst {
 
         template <typename T>
         [[nodiscard]] uint32_t crc32cPodVector(const std::vector<T>& values) noexcept {
-            return cpu::CRC32C(
-                reinterpret_cast<const std::byte*>(values.data()),
-                values.size() * sizeof(T)
-            );
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(values.data()), values.size() * sizeof(T));
         }
 
         [[nodiscard]] bool rangeWithin(uint64_t offset, uint64_t size, uint64_t limit) noexcept {
@@ -162,20 +159,17 @@ namespace akkaradb::engine::sst {
                     if (actualFileSize != header_.file_size || header_.file_size < sizeof(SSTFileHeaderV2) + sizeof(SSTFooterV2)) {
                         return false;
                     }
-                    if (header_.dataOffset != sizeof(SSTFileHeaderV2) || header_.entryCount == 0 || header_.blockCount == 0 ||
-                        header_.footerOffset != header_.file_size - sizeof(SSTFooterV2) ||
-                        header_.blockCount > UINT64_MAX / sizeof(SSTBlockIndexEntryV2) ||
-                        header_.indexSize != header_.blockCount * sizeof(SSTBlockIndexEntryV2) ||
-                        header_.blockCount > std::numeric_limits<size_t>::max() ||
-                        header_.keyArenaSize > std::numeric_limits<size_t>::max() ||
-                        header_.bloomSize > std::numeric_limits<size_t>::max() ||
-                        header_.indexOffset <= header_.dataOffset || header_.keyArenaOffset < header_.indexOffset ||
-                        header_.bloomOffset < header_.keyArenaOffset || header_.footerOffset <= header_.bloomOffset ||
-                        !rangeWithin(header_.indexOffset, header_.indexSize, header_.keyArenaOffset) ||
-                        !rangeWithin(header_.keyArenaOffset, header_.keyArenaSize, header_.bloomOffset) ||
-                        !rangeWithin(header_.bloomOffset, header_.bloomSize, header_.footerOffset)) {
-                        return false;
-                    }
+                    if (header_.dataOffset != sizeof(SSTFileHeaderV2) || header_.entryCount == 0 || header_.blockCount == 0 || header_.
+                        footerOffset != header_.file_size - sizeof(SSTFooterV2) || header_.blockCount > UINT64_MAX / sizeof(
+                            SSTBlockIndexEntryV2) || header_.indexSize != header_.blockCount * sizeof(SSTBlockIndexEntryV2) || header_.
+                        blockCount > std::numeric_limits<size_t>::max() || header_.keyArenaSize > std::numeric_limits<size_t>::max() ||
+                        header_.bloomSize > std::numeric_limits<size_t>::max() || header_.indexOffset <= header_.dataOffset || header_.
+                        keyArenaOffset < header_.indexOffset || header_.bloomOffset < header_.keyArenaOffset || header_.footerOffset <=
+                        header_.bloomOffset || !rangeWithin(header_.indexOffset, header_.indexSize, header_.keyArenaOffset) || !rangeWithin(
+                            header_.keyArenaOffset,
+                            header_.keyArenaSize,
+                            header_.bloomOffset
+                        ) || !rangeWithin(header_.bloomOffset, header_.bloomSize, header_.footerOffset)) { return false; }
 
                     SSTFooterV2 footer{};
                     readAt(header_.footerOffset, &footer, sizeof(footer));
@@ -192,14 +186,14 @@ namespace akkaradb::engine::sst {
                     bloomData_ = readVecAt(header_.bloomOffset, static_cast<size_t>(header_.bloomSize));
                     SSTMetadataCrcV2 metadataCrc{};
                     std::memcpy(&metadataCrc, header_.reserved, sizeof(metadataCrc));
-                    if (crc32cPodVector(index_) != metadataCrc.indexCrc32c || crc32c(keyArena_) != metadataCrc.keyArenaCrc32c ||
-                        crc32c(bloomData_) != metadataCrc.bloomCrc32c) { return false; }
+                    if (crc32cPodVector(index_) != metadataCrc.indexCrc32c || crc32c(keyArena_) != metadataCrc.keyArenaCrc32c || crc32c(
+                        bloomData_
+                    ) != metadataCrc.bloomCrc32c) { return false; }
                     if (bloomData_.size() < sizeof(SSTBloomHeaderV2)) { return false; }
                     std::memcpy(&bloomHeader_, bloomData_.data(), sizeof(bloomHeader_));
-                    if (bloomHeader_.numBits == 0 || bloomHeader_.numHashes == 0 ||
-                        (bloomHeader_.numBits & (bloomHeader_.numBits - 1u)) != 0 ||
-                        bloomHeader_.bitsSize != bloomHeader_.numBits / 8u ||
-                        bloomHeader_.bitsSize + sizeof(SSTBloomHeaderV2) != bloomData_.size() || !validateIndexMetadata()) { return false; }
+                    if (bloomHeader_.numBits == 0 || bloomHeader_.numHashes == 0 || (bloomHeader_.numBits & (bloomHeader_.numBits - 1u)) !=
+                        0 || bloomHeader_.bitsSize != bloomHeader_.numBits / 8u || bloomHeader_.bitsSize + sizeof(SSTBloomHeaderV2) !=
+                        bloomData_.size() || !validateIndexMetadata()) { return false; }
                     const auto first = arenaKey(keyArena_, index_.front().firstKeyOffset, index_.front().firstKeyLen);
                     const auto last = arenaKey(keyArena_, index_.back().lastKeyOffset, index_.back().lastKeyLen);
                     firstKey_.assign(first.begin(), first.end());
@@ -305,18 +299,15 @@ namespace akkaradb::engine::sst {
                     const auto arenaRangeIsValid = [this](uint32_t offset, uint32_t length) noexcept {
                         return offset <= keyArena_.size() && length <= keyArena_.size() - offset;
                     };
-                    if (entry.blockOffset != expectedBlockOffset || entry.blockSize < sizeof(SSTBlockHeaderV2) ||
-                        entry.recordCount == 0 || entry.uncompressedSize == 0 ||
-                        !rangeWithin(entry.blockOffset, entry.blockSize, header_.indexOffset) ||
-                        !arenaRangeIsValid(entry.firstKeyOffset, entry.firstKeyLen) ||
-                        !arenaRangeIsValid(entry.lastKeyOffset, entry.lastKeyLen)) {
-                        return false;
-                    }
+                    if (entry.blockOffset != expectedBlockOffset || entry.blockSize < sizeof(SSTBlockHeaderV2) || entry.recordCount == 0 ||
+                        entry.uncompressedSize == 0 || !rangeWithin(entry.blockOffset, entry.blockSize, header_.indexOffset) || !
+                        arenaRangeIsValid(entry.firstKeyOffset, entry.firstKeyLen) || !arenaRangeIsValid(
+                            entry.lastKeyOffset,
+                            entry.lastKeyLen
+                        )) { return false; }
                     const auto first = arenaKey(keyArena_, entry.firstKeyOffset, entry.firstKeyLen);
                     const auto last = arenaKey(keyArena_, entry.lastKeyOffset, entry.lastKeyLen);
-                    if (compareBytes(first, last) > 0 || (havePrevious && compareBytes(previousLast, first) > 0)) {
-                        return false;
-                    }
+                    if (compareBytes(first, last) > 0 || (havePrevious && compareBytes(previousLast, first) > 0)) { return false; }
                     previousLast = last;
                     havePrevious = true;
                     expectedBlockOffset = entry.blockOffset + entry.blockSize;
@@ -368,9 +359,7 @@ namespace akkaradb::engine::sst {
             }
 
             void validateDecodedBlock(const Block& block, uint32_t recordCount) const {
-                if (block.offsets.size() != recordCount) {
-                    throw std::runtime_error("SSTReader: corrupt block offset count");
-                }
+                if (block.offsets.size() != recordCount) { throw std::runtime_error("SSTReader: corrupt block offset count"); }
                 for (size_t i = 0; i < block.offsets.size(); ++i) {
                     const size_t offset = block.offsets[i];
                     if (offset > block.data.size() || sizeof(core::SSTHdr32) > block.data.size() - offset) {
@@ -383,9 +372,8 @@ namespace akkaradb::engine::sst {
                         throw std::runtime_error("SSTReader: corrupt record payload");
                     }
                     const size_t nextOffset = static_cast<size_t>(alignUpU64(payloadOffset + payloadSize, 8));
-                    if (nextOffset > block.data.size() ||
-                        (i + 1 < block.offsets.size() && nextOffset != block.offsets[i + 1]) ||
-                        (i + 1 == block.offsets.size() && nextOffset != block.data.size())) {
+                    if (nextOffset > block.data.size() || (i + 1 < block.offsets.size() && nextOffset != block.offsets[i + 1]) || (i + 1 ==
+                        block.offsets.size() && nextOffset != block.data.size())) {
                         throw std::runtime_error("SSTReader: corrupt record layout");
                     }
                 }
@@ -411,9 +399,8 @@ namespace akkaradb::engine::sst {
                 constexpr uint32_t knownBlockFlags = SST_BLOCK_FLAG_COMPRESSED | SST_BLOCK_FLAG_RAW | SST_BLOCK_FLAG_PREFIX_COMPRESSED;
                 const bool compressed = (bh.flags & SST_BLOCK_FLAG_COMPRESSED) != 0;
                 const bool raw = (bh.flags & SST_BLOCK_FLAG_RAW) != 0;
-                if (bh.headerSize != sizeof(SSTBlockHeaderV2) || bh.recordCount != entry.recordCount || bh.flags != entry.flags ||
-                    (bh.flags & ~knownBlockFlags) != 0 || compressed == raw ||
-                    (compressed && (header_.flags & SST_FILE_FLAG_BLOCK_ZSTD) == 0)) {
+                if (bh.headerSize != sizeof(SSTBlockHeaderV2) || bh.recordCount != entry.recordCount || bh.flags != entry.flags || (bh.flags
+                    & ~knownBlockFlags) != 0 || compressed == raw || (compressed && (header_.flags & SST_FILE_FLAG_BLOCK_ZSTD) == 0)) {
                     throw std::runtime_error("SSTReader: corrupt block metadata");
                 }
 
@@ -421,8 +408,8 @@ namespace akkaradb::engine::sst {
                 const size_t offsetsOff = payloadOff + static_cast<size_t>(bh.compressedSize);
                 const size_t crcLen = static_cast<size_t>(bh.compressedSize) + static_cast<size_t>(bh.offsetsSize);
                 const size_t expectedBlockSize = static_cast<size_t>(alignUpU64(payloadOff + crcLen, 8));
-                if (offsetsOff > blockFile.size() || bh.offsetsSize > blockFile.size() - offsetsOff ||
-                    payloadOff > blockFile.size() || crcLen > blockFile.size() - payloadOff || expectedBlockSize != blockFile.size()) {
+                if (offsetsOff > blockFile.size() || bh.offsetsSize > blockFile.size() - offsetsOff || payloadOff > blockFile.size() ||
+                    crcLen > blockFile.size() - payloadOff || expectedBlockSize != blockFile.size()) {
                     throw std::runtime_error("SSTReader: corrupt block bounds");
                 }
 
@@ -436,15 +423,11 @@ namespace akkaradb::engine::sst {
                 if (compressed) {
                     block->data.resize(bh.uncompressedSize);
                     const size_t n = ZSTD_decompress(block->data.data(), block->data.size(), payload.data(), payload.size());
-                    if (ZSTD_isError(n) || n != bh.uncompressedSize) {
-                        throw std::runtime_error("SSTReader: corrupt Zstd block payload");
-                    }
+                    if (ZSTD_isError(n) || n != bh.uncompressedSize) { throw std::runtime_error("SSTReader: corrupt Zstd block payload"); }
                 }
                 else {
                     block->data.assign(payload.begin(), payload.end());
-                    if (block->data.size() != bh.uncompressedSize) {
-                        throw std::runtime_error("SSTReader: corrupt raw block size");
-                    }
+                    if (block->data.size() != bh.uncompressedSize) { throw std::runtime_error("SSTReader: corrupt raw block size"); }
                 }
                 if (offsetsBytes.size() % sizeof(uint32_t) != 0) { throw std::runtime_error("SSTReader: corrupt block offsets"); }
                 block->offsets.resize(offsetsBytes.size() / sizeof(uint32_t));
@@ -487,9 +470,7 @@ namespace akkaradb::engine::sst {
                 while (lo < hi) {
                     const size_t mid = lo + (hi - lo) / 2;
                     const uint32_t off = block.offsets[mid];
-                    if (off + sizeof(core::SSTHdr32) > block.data.size()) {
-                        throw std::runtime_error("SSTReader: corrupt record offset");
-                    }
+                    if (off + sizeof(core::SSTHdr32) > block.data.size()) { throw std::runtime_error("SSTReader: corrupt record offset"); }
                     const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
                     const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
                     const int cmp = compareRecordKey(*hdr, keyPtr, key);
@@ -528,9 +509,7 @@ namespace akkaradb::engine::sst {
                 while (lo < hi) {
                     const size_t mid = lo + (hi - lo) / 2;
                     const uint32_t off = block.offsets[mid];
-                    if (off + sizeof(core::SSTHdr32) > block.data.size()) {
-                        throw std::runtime_error("SSTReader: corrupt record offset");
-                    }
+                    if (off + sizeof(core::SSTHdr32) > block.data.size()) { throw std::runtime_error("SSTReader: corrupt record offset"); }
                     const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
                     const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
                     const int cmp = compareRecordKey(*hdr, keyPtr, key);

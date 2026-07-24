@@ -3,11 +3,13 @@
         ArenaGenerator<AkkEngine::ScanRecordView> rows;
         ArenaGenerator<AkkEngine::ScanRecordView>::iterator it;
         std::unique_ptr<RuntimeBytecodeQuery> query;
+
         struct IndexLookup {
             AkkaraDB* db = nullptr;
             std::vector<uint8_t> tablePrefix;
             size_t searchPrefixSize = 0;
         };
+
         std::unique_ptr<IndexLookup> indexLookup;
     };
 
@@ -77,9 +79,7 @@
     }
 
     [[nodiscard]] const NativeIndexDef& requireIndex(const NativeTable& table, std::string_view fieldName) {
-        for (const auto& index : table.indexes) {
-            if (index.fieldName == fieldName) { return index; }
-        }
+        for (const auto& index : table.indexes) { if (index.fieldName == fieldName) { return index; } }
         throw std::runtime_error("AkkaraDB secondary index is not registered for field: " + std::string(fieldName));
     }
 
@@ -95,9 +95,19 @@
         return *current;
     }
 
-    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part);
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(
+        BytesReader& in,
+        const TypeDesc& type,
+        const ColumnRef& column,
+        size_t part
+    );
 
-    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldNested(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldNested(
+        BytesReader& in,
+        const TypeDesc& type,
+        const ColumnRef& column,
+        size_t part
+    ) {
         if (type.kind == TypeDesc::NULLABLE) {
             const size_t start = in.position();
             if (in.u8() == 0) { return in.slice(start, in.position() - start); }
@@ -109,7 +119,12 @@
         return extractEncodedFieldFromStruct(in, type, column, part);
     }
 
-    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(BytesReader& in, const TypeDesc& type, const ColumnRef& column, size_t part) {
+    [[nodiscard]] std::span<const uint8_t> extractEncodedFieldFromStruct(
+        BytesReader& in,
+        const TypeDesc& type,
+        const ColumnRef& column,
+        size_t part
+    ) {
         if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB index root schema is not a struct"); }
         const size_t fieldIndex = column.fieldPath[part];
         if (fieldIndex >= type.fields.size()) {
@@ -130,7 +145,11 @@
         throw std::runtime_error("AkkaraDB index column not found in schema: " + column.name);
     }
 
-    [[nodiscard]] std::span<const uint8_t> readEncodedField(std::span<const uint8_t> rowValue, const TypeDesc& schema, const ColumnRef& column) {
+    [[nodiscard]] std::span<const uint8_t> readEncodedField(
+        std::span<const uint8_t> rowValue,
+        const TypeDesc& schema,
+        const ColumnRef& column
+    ) {
         BytesReader in(rowValue);
         return extractEncodedFieldFromStruct(in, schema, column, 0);
     }
@@ -140,22 +159,17 @@
     }
 
     [[nodiscard]] uint32_t readU32Le(std::span<const uint8_t> bytes) {
-        return static_cast<uint32_t>(bytes[0])
-            | (static_cast<uint32_t>(bytes[1]) << 8)
-            | (static_cast<uint32_t>(bytes[2]) << 16)
-            | (static_cast<uint32_t>(bytes[3]) << 24);
+        return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) | (static_cast<uint32_t>(bytes[2]) << 16) | (
+            static_cast<uint32_t>(bytes[3]) << 24);
     }
 
     [[nodiscard]] uint64_t readU64Le(std::span<const uint8_t> bytes) {
-        return static_cast<uint64_t>(readU32Le(bytes))
-            | (static_cast<uint64_t>(readU32Le(bytes.subspan(4, 4))) << 32);
+        return static_cast<uint64_t>(readU32Le(bytes)) | (static_cast<uint64_t>(readU32Le(bytes.subspan(4, 4))) << 32);
     }
 
     void appendSortableInt(std::vector<uint8_t>& out, uint64_t value, size_t size) {
         out.resize(size);
-        for (size_t i = 0; i < size; ++i) {
-            out[i] = static_cast<uint8_t>(value >> ((size - 1 - i) * 8));
-        }
+        for (size_t i = 0; i < size; ++i) { out[i] = static_cast<uint8_t>(value >> ((size - 1 - i) * 8)); }
     }
 
     void encodeIndexFieldFromRow(
@@ -168,8 +182,7 @@
         const TypeDesc& leafType = resolveColumnLeafType(schema, column);
         out.clear();
         switch (leafType.kind) {
-            case TypeDesc::INT8:
-                out.push_back(static_cast<uint8_t>(static_cast<int8_t>(encoded[0]) ^ static_cast<int8_t>(0x80)));
+            case TypeDesc::INT8: out.push_back(static_cast<uint8_t>(static_cast<int8_t>(encoded[0]) ^ static_cast<int8_t>(0x80)));
                 return;
             case TypeDesc::INT16: {
                 const auto value = static_cast<uint16_t>(static_cast<int16_t>(readU16Le(encoded)) ^ static_cast<int16_t>(0x8000));
@@ -198,18 +211,12 @@
                 appendSortableInt(out, sortable, 8);
                 return;
             }
-            default:
-                out.insert(out.end(), encoded.begin(), encoded.end());
+            default: out.insert(out.end(), encoded.begin(), encoded.end());
                 return;
         }
     }
 
-    void updateIndexEntries(
-        NativeTable& table,
-        std::span<const uint8_t> pkBytes,
-        std::span<const uint8_t> rowValue,
-        bool remove
-    ) {
+    void updateIndexEntries(NativeTable& table, std::span<const uint8_t> pkBytes, std::span<const uint8_t> rowValue, bool remove) {
         std::vector<uint8_t> fieldBytes;
         std::vector<uint8_t> key;
         for (const auto& index : table.indexes) {

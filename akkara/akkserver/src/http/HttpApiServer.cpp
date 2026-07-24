@@ -349,6 +349,19 @@ namespace akkaradb::engine::server {
             appendPlain(out, stats.vlog.pendingBytes);
             appendPlain(out, stats.vlog.durableBytes);
             appendPlain(out, static_cast<uint8_t>(stats.vlog.flushThreadRunning));
+            appendPlain(out, stats.vlog.segmentCount);
+            appendPlain(out, stats.vlog.activeSegmentBytes);
+            appendPlain(out, stats.vlog.recoveryDurationMicros);
+            appendPlain(out, stats.vlog.recoveredSegmentCount);
+            appendPlain(out, stats.vlog.recoveredEntryCount);
+            appendPlain(out, stats.vlog.sidecarFallbackCount);
+            appendPlain(out, stats.vlog.sidecarRebuildFailures);
+            appendPlain(out, stats.vlog.retentionPrunedSegments);
+            appendPlain(out, stats.vlog.retentionBaseEntriesWritten);
+            appendPlain(out, stats.vlog.parallelQueueRejects);
+            appendPlain(out, stats.vlog.parallelLaneCount);
+            appendPlain(out, stats.vlog.parallelPendingWrites);
+            appendPlain(out, stats.vlog.parallelPendingBytes);
         }
     }
 
@@ -666,9 +679,9 @@ namespace akkaradb::engine::server {
     bool HttpApiServer::route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer) {
         requestsTotal_.fetch_add(1, std::memory_order_relaxed);
 
-        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/putHinted" || request.path == "/v1/get" ||
-            request.path == "/v1/remove" || request.path == "/v1/removeHinted" || request.path == "/v1/getAt" || request.path ==
-            "/v1/exists" || request.path == "/v1/history" || request.path == "/v1/rollbackKey";
+        const bool needsKey = request.path == "/v1/put" || request.path == "/v1/putHinted" || request.path == "/v1/get" || request.path ==
+            "/v1/remove" || request.path == "/v1/removeHinted" || request.path == "/v1/getAt" || request.path == "/v1/exists" || request.
+            path == "/v1/history" || request.path == "/v1/rollbackKey";
         const std::string rawKey = queryParam(request.query, "key");
         if (needsKey && rawKey.empty()) {
             sendEmpty(connection, 400);

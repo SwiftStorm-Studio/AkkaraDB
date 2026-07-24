@@ -36,21 +36,15 @@ namespace akkaradb::engine::wal {
     };
 
     enum class WalExecutionMode : uint8_t {
-        AUTO = 0,
-        INLINE = 1,
-        ASYNC = 2,
+        AUTO = 0, INLINE = 1, ASYNC = 2,
     };
 
     enum class WalSyncPolicy : uint8_t {
-        AUTO = 0,
-        NEVER = 1,
-        ON_SYNC_ACK = 2,
-        ALWAYS = 3,
+        AUTO = 0, NEVER = 1, ON_SYNC_ACK = 2, ALWAYS = 3,
     };
 
     enum class WalBackpressureMode : uint8_t {
-        BLOCK = 0,
-        FAIL_FAST = 1,
+        BLOCK = 0, FAIL_FAST = 1,
     };
 
     struct AKDB_API WalOptions {

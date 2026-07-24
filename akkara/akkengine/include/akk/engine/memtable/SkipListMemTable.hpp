@@ -113,13 +113,8 @@ namespace akkaradb::engine::memtable {
             );
 
             [[nodiscard]] static int compareNodeKey(const Node* node, std::span<const uint8_t> key) noexcept;
-            [[nodiscard]] Node* findNodeForWrite(
-                std::span<const uint8_t> key,
-                std::array<Node*, MAX_LEVEL>& update
-            ) noexcept;
-            [[nodiscard]] Node* findNodeForRead(
-                std::span<const uint8_t> key
-            ) const noexcept;
+            [[nodiscard]] Node* findNodeForWrite(std::span<const uint8_t> key, std::array<Node*, MAX_LEVEL>& update) noexcept;
+            [[nodiscard]] Node* findNodeForRead(std::span<const uint8_t> key) const noexcept;
 
             static void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
             [[nodiscard]] static bool visibleRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;

@@ -197,6 +197,19 @@ namespace akkaradb::grpcapi {
             vlog->set_pending_writes(stats.vlog.pendingWrites);
             vlog->set_pending_bytes(stats.vlog.pendingBytes);
             vlog->set_durable_bytes(stats.vlog.durableBytes);
+            vlog->set_segment_count(stats.vlog.segmentCount);
+            vlog->set_active_segment_bytes(stats.vlog.activeSegmentBytes);
+            vlog->set_recovery_duration_micros(stats.vlog.recoveryDurationMicros);
+            vlog->set_recovered_segment_count(stats.vlog.recoveredSegmentCount);
+            vlog->set_recovered_entry_count(stats.vlog.recoveredEntryCount);
+            vlog->set_sidecar_fallback_count(stats.vlog.sidecarFallbackCount);
+            vlog->set_sidecar_rebuild_failures(stats.vlog.sidecarRebuildFailures);
+            vlog->set_retention_pruned_segments(stats.vlog.retentionPrunedSegments);
+            vlog->set_retention_base_entries_written(stats.vlog.retentionBaseEntriesWritten);
+            vlog->set_parallel_queue_rejects(stats.vlog.parallelQueueRejects);
+            vlog->set_parallel_lane_count(stats.vlog.parallelLaneCount);
+            vlog->set_parallel_pending_writes(stats.vlog.parallelPendingWrites);
+            vlog->set_parallel_pending_bytes(stats.vlog.parallelPendingBytes);
             vlog->set_flush_thread_running(stats.vlog.flushThreadRunning);
         }
 

@@ -207,9 +207,7 @@ namespace akkaradb {
     template <auto FieldPtr>
     [[nodiscard]] Index<FieldPtr> index() {
         static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-        Entity >, "index field must belong to the table entity"
-        )
-        ;
+        Entity >, "index field must belong to the table entity" ) ;
         const std::string_view fieldName = binpack::detail::memberName<FieldPtr>();
         const auto prefix = makeIndexPrefix(tableName_, fieldName);
 
@@ -247,9 +245,7 @@ namespace akkaradb {
     template <auto FieldPtr>
     PackedTable& prefixIndexed() {
         static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-        Entity >, "prefix index field must belong to the table entity"
-        )
-        ;
+        Entity >, "prefix index field must belong to the table entity" ) ;
         using Field = binpack::detail::memberOf<FieldPtr>;
         static_assert(query::isStringLikeV<Field>, "prefix indexes require string-like fields");
 
@@ -272,9 +268,7 @@ namespace akkaradb {
     template <auto FieldPtr, typename Handler>
     PackedTable& onUpdate(Handler&& handler) {
         static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-        Entity >, "update field must belong to the table entity"
-        )
-        ;
+        Entity >, "update field must belong to the table entity" ) ;
         using Field = binpack::detail::memberOf<FieldPtr>;
         static_assert(
             requires(const Field& lhs, const Field& rhs) {

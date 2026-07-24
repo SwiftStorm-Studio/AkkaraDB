@@ -13,9 +13,7 @@
 template <auto FieldPtr, auto TargetPrimaryKeyPtr>
 PackedTable& bindRef(PackedTable<TargetPrimaryKeyPtr>& target) {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "ref field must belong to the table entity"
-    )
-    ;
+    Entity >, "ref field must belong to the table entity" ) ;
     using Field = binpack::detail::memberOf<FieldPtr>;
     static_assert(isRef<Field>, "bindRef field must be akkaradb::Ref<T>");
     using Target = typename RefTarget<Field>::Type;

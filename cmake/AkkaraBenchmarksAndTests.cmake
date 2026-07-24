@@ -34,6 +34,9 @@ add_executable(akkaradb_benchmark
 add_executable(akkaradb_parallel_memtable_visibility_rate_benchmark
         benchmarks/throughput/parallel_memtable_visibility_rate_benchmark.cpp
 )
+add_executable(akkaradb_vlog_tool
+        benchmarks/tools/akkaradb_vlog_tool.cpp
+)
 if (MSVC)
     target_compile_options(akkaradb_benchmark PRIVATE /WX-)
 else ()
@@ -45,6 +48,7 @@ else ()
 endif ()
 target_link_libraries(akkaradb_benchmark PRIVATE akkaradb)
 target_link_libraries(akkaradb_parallel_memtable_visibility_rate_benchmark PRIVATE akkaradb)
+target_link_libraries(akkaradb_vlog_tool PRIVATE akkaradb)
 target_include_directories(akkaradb_benchmark PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
         ${AKKARADB_INCLUDE_DIR}
@@ -55,10 +59,18 @@ target_include_directories(akkaradb_parallel_memtable_visibility_rate_benchmark 
         ${AKKARADB_INCLUDE_DIR}
         ${AKKENGINE_INCLUDE_DIR}
 )
+target_include_directories(akkaradb_vlog_tool PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks
+        ${AKKARADB_INCLUDE_DIR}
+        ${AKKENGINE_INCLUDE_DIR}
+)
 set_target_properties(akkaradb_benchmark PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 set_target_properties(akkaradb_parallel_memtable_visibility_rate_benchmark PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+set_target_properties(akkaradb_vlog_tool PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -120,6 +132,8 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
         akkaradb_query_planner_smoke_test|benchmarks/smoke/query_planner_smoke_test.cpp
         akkaradb_version_log_admission_visibility_smoke_test|benchmarks/smoke/version_log_admission_visibility_smoke_test.cpp
+        akkaradb_version_log_recovery_concurrency_smoke_test|benchmarks/smoke/version_log_recovery_concurrency_smoke_test.cpp
+        akkaradb_version_log_tool_smoke_test|benchmarks/smoke/version_log_tool_smoke_test.cpp
         akkaradb_engine_recovery_smoke_test|benchmarks/smoke/engine_recovery_smoke_test.cpp
         akkaradb_wal_async_failure_smoke_test|benchmarks/smoke/wal_async_failure_smoke_test.cpp
         akkaradb_sst_snapshot_visibility_smoke_test|benchmarks/smoke/sst_snapshot_visibility_smoke_test.cpp
@@ -172,6 +186,12 @@ if (WIN32 AND BUILD_SHARED_LIBS)
             $<TARGET_FILE_DIR:akkaradb_benchmark>
             COMMENT "Copying akkaradb.dll to benchmark executable directory"
     )
+    add_custom_command(TARGET akkaradb_vlog_tool POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb>
+            $<TARGET_FILE_DIR:akkaradb_vlog_tool>
+            COMMENT "Copying akkaradb.dll to VLog tool executable directory"
+    )
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
@@ -180,6 +200,8 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_parallel_memtable_visibility_smoke_test
         akkaradb_query_planner_smoke_test
         akkaradb_version_log_admission_visibility_smoke_test
+        akkaradb_version_log_recovery_concurrency_smoke_test
+        akkaradb_version_log_tool_smoke_test
         akkaradb_engine_recovery_smoke_test
         akkaradb_wal_async_failure_smoke_test
         akkaradb_sst_snapshot_visibility_smoke_test

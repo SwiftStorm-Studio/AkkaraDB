@@ -700,15 +700,9 @@ namespace akkaradb::engine::memtable {
         bool hasResumeKey = false;
 
         while (true) {
-            const std::span<const uint8_t> lowerBound = hasResumeKey
-                                                             ? std::span<const uint8_t>{resumeKey.data(), resumeKey.size()}
-                                                             : start;
-            Node* node = lowerBound.empty()
-                             ? root_.load(std::memory_order_acquire)
-                             : descendToCandidateLeaf(lowerBound);
-            if (!hasResumeKey) {
-                while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
-            }
+            const std::span<const uint8_t> lowerBound = hasResumeKey ? std::span<const uint8_t>{resumeKey.data(), resumeKey.size()} : start;
+            Node* node = lowerBound.empty() ? root_.load(std::memory_order_acquire) : descendToCandidateLeaf(lowerBound);
+            if (!hasResumeKey) { while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); } }
 
             bool advanced = false;
             while (node != nullptr && !advanced) {

@@ -37,10 +37,7 @@ namespace akkaradb::engine::server::tcp {
     };
 
     enum class FrameReadStatus : uint8_t {
-        OK,
-        NEED_MORE,
-        CLOSED,
-        INVALID,
+        OK, NEED_MORE, CLOSED, INVALID,
     };
 
     class BufferedInput {

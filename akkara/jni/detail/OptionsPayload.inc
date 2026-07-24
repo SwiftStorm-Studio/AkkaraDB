@@ -42,9 +42,7 @@
         }
 
         const auto maxL0SstFiles = static_cast<jlong>(in.i64());
-        if (maxL0SstFiles >= 0) {
-            options.overrides.maxL0SstFiles = checkedCast<size_t>(maxL0SstFiles, "maxL0SstFiles");
-        }
+        if (maxL0SstFiles >= 0) { options.overrides.maxL0SstFiles = checkedCast<size_t>(maxL0SstFiles, "maxL0SstFiles"); }
 
         if (version >= 2) {
             const auto hasApi = static_cast<jint>(in.i32());
@@ -53,9 +51,7 @@
                 const auto backendCount = static_cast<jint>(in.i32());
                 if (backendCount < 0) { throw std::runtime_error("api.backends count must be >= 0"); }
                 api.backends.reserve(static_cast<size_t>(backendCount));
-                for (jint i = 0; i < backendCount; ++i) {
-                    api.backends.push_back(apiBackendFromOrdinal(static_cast<jint>(in.i32())));
-                }
+                for (jint i = 0; i < backendCount; ++i) { api.backends.push_back(apiBackendFromOrdinal(static_cast<jint>(in.i32()))); }
                 api.bindHost = readUtf8String(in);
                 api.httpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.httpPort");
                 api.tcpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.tcpPort");
@@ -97,9 +93,7 @@
                     if (const auto value = readOptionalUtf8String(in)) { api.tls.certPath = *value; }
                     if (const auto value = readOptionalUtf8String(in)) { api.tls.keyPath = *value; }
                     if (const auto value = readOptionalUtf8String(in)) { api.tls.caPath = *value; }
-                    if (version >= 4) {
-                        if (const auto value = readOptionalBytes(in)) { api.tls.psk = std::move(*value); }
-                    }
+                    if (version >= 4) { if (const auto value = readOptionalBytes(in)) { api.tls.psk = std::move(*value); } }
                     if (const auto value = readOptionalUtf8String(in)) { api.tls.pskIdentity = *value; }
                     api.tls.verifyPeer = boolFromInt(static_cast<jint>(in.i32()), "api.tls.verifyPeer");
                 }

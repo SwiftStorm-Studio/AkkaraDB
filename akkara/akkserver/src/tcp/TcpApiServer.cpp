@@ -36,7 +36,10 @@ namespace akkaradb::engine::server {
     TcpApiServer::TcpApiServer(AkkEngine& engine, AkkEngineOptions::ApiOptions options) : engine_{engine}, options_{std::move(options)} {}
 
     std::unique_ptr<TcpApiServer> TcpApiServer::create(AkkEngine& engine, AkkEngineOptions::ApiOptions options) {
-        return std::unique_ptr<TcpApiServer>{new TcpApiServer{engine, std::move(options)}};
+        return std::unique_ptr < TcpApiServer >
+        {
+            new TcpApiServer{engine, std::move(options)}
+        };
     }
 
     TcpApiServer::~TcpApiServer() { close(); }
@@ -58,9 +61,7 @@ namespace akkaradb::engine::server {
             listenSocket_ = detail::BAD_SOCKET_VALUE;
             queueCv_.notify_all();
             if (acceptThread_.joinable()) { acceptThread_.join(); }
-            for (auto& worker : workerThreads_) {
-                if (worker.joinable()) { worker.join(); }
-            }
+            for (auto& worker : workerThreads_) { if (worker.joinable()) { worker.join(); } }
             workerThreads_.clear();
             throw;
         }
@@ -82,9 +83,7 @@ namespace akkaradb::engine::server {
         }
         queueCv_.notify_all();
         if (acceptThread_.joinable()) { acceptThread_.join(); }
-        for (auto& worker : workerThreads_) {
-            if (worker.joinable()) { worker.join(); }
-        }
+        for (auto& worker : workerThreads_) { if (worker.joinable()) { worker.join(); } }
         workerThreads_.clear();
     }
 
@@ -281,9 +280,9 @@ namespace akkaradb::engine::server {
         return akkaradb::engine::server::registerAkkApiTransportFactory(
             akkaradb::engine::AkkEngineOptions::ApiBackend::TCP,
             [](
-                akkaradb::engine::AkkEngine& engine,
-                const akkaradb::engine::AkkEngineOptions::ApiOptions& options
-            ) -> std::unique_ptr<akkaradb::engine::server::IAkkApiTransport> {
+            akkaradb::engine::AkkEngine& engine,
+            const akkaradb::engine::AkkEngineOptions::ApiOptions& options
+        ) -> std::unique_ptr<akkaradb::engine::server::IAkkApiTransport> {
                 return akkaradb::engine::server::TcpApiServer::create(engine, options);
             }
         );

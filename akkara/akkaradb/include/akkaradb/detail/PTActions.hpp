@@ -19,13 +19,9 @@ PackedTable& cascadeDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "cascade ref field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "cascade ref field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "cascade target field must belong to the target entity"
-    )
-    ;
+    Entity >, "cascade target field must belong to the target entity" ) ;
     static_assert(
         !isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(),
         "Ref cascade delete currently requires target primary key"
@@ -82,13 +78,9 @@ PackedTable& restrictDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "restrict ref field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "restrict ref field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "restrict target field must belong to the target entity"
-    )
-    ;
+    Entity >, "restrict target field must belong to the target entity" ) ;
     static_assert(
         !isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(),
         "Ref restrict delete currently requires target primary key"
@@ -148,13 +140,9 @@ PackedTable& setNullDeleteFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "set null ref field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "set null ref field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "set null target field must belong to the target entity"
-    )
-    ;
+    Entity >, "set null target field must belong to the target entity" ) ;
     static_assert(
         !isRef<Field> || sameMemberPointer<TargetFieldPtr, PrimaryKeyPtr>(),
         "Ref set null delete currently requires target primary key"
@@ -221,13 +209,9 @@ PackedTable& cascadeUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "cascade update field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "cascade update field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "cascade update target field must belong to the target entity"
-    )
-    ;
+    Entity >, "cascade update target field must belong to the target entity" ) ;
     static_assert(
         requires(const ComparableField& field, const ComparableTargetField& targetField) {
             { field == targetField } -> std::convertible_to<bool>;
@@ -289,13 +273,9 @@ PackedTable& restrictUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "restrict update field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "restrict update field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "restrict update target field must belong to the target entity"
-    )
-    ;
+    Entity >, "restrict update target field must belong to the target entity" ) ;
     static_assert(
         requires(const ComparableField& field, const ComparableTargetField& targetField) {
             { field == targetField } -> std::convertible_to<bool>;
@@ -348,13 +328,9 @@ PackedTable& setNullUpdateFrom(PackedTable<SourcePrimaryKeyPtr>& source) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = std::conditional_t<isRef<Field>, RowId, ForeignKeyComparableType<TargetField>>;
     static_assert(std::is_same_v < binpack::detail::classOf < RefFieldPtr >,
-    SourceEntity >, "set null update field must belong to the source entity"
-    )
-    ;
+    SourceEntity >, "set null update field must belong to the source entity" ) ;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    Entity >, "set null update target field must belong to the target entity"
-    )
-    ;
+    Entity >, "set null update target field must belong to the target entity" ) ;
     static_assert(
         requires(const ComparableField& field, const ComparableTargetField& targetField) {
             { field == targetField } -> std::convertible_to<bool>;

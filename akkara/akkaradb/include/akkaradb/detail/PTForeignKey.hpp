@@ -13,9 +13,7 @@
 template <auto FieldPtr, auto TargetPrimaryKeyPtr, auto TargetFieldPtr = TargetPrimaryKeyPtr>
 PackedTable& foreignKey(PackedTable<TargetPrimaryKeyPtr>& target) {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "foreign key field must belong to the table entity"
-    )
-    ;
+    Entity >, "foreign key field must belong to the table entity" ) ;
     using Field = binpack::detail::memberOf<FieldPtr>;
     using TargetTable = PackedTable<TargetPrimaryKeyPtr>;
     using TargetEntity = typename TargetTable::Entity;
@@ -23,9 +21,7 @@ PackedTable& foreignKey(PackedTable<TargetPrimaryKeyPtr>& target) {
     using ComparableField = ForeignKeyComparableType<Field>;
     using ComparableTargetField = ForeignKeyComparableType<TargetField>;
     static_assert(std::is_same_v < binpack::detail::classOf < TargetFieldPtr >,
-    TargetEntity >, "foreign key target field must belong to the target table entity"
-    )
-    ;
+    TargetEntity >, "foreign key target field must belong to the target table entity" ) ;
     static_assert(
         requires(const ComparableField& field, const ComparableTargetField& targetField) {
             { field == targetField } -> std::convertible_to<bool>;
@@ -64,9 +60,7 @@ PackedTable& foreignKey(PackedTable<TargetPrimaryKeyPtr>& target) {
 template <auto FieldPtr>
 PackedTable& foreignKey() {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "foreign key field must belong to the table entity"
-    )
-    ;
+    Entity >, "foreign key field must belong to the table entity" ) ;
     using Field = binpack::detail::memberOf<FieldPtr>;
     static_assert(isRef<Field>, "foreignKey field must be akkaradb::Ref<T>");
 

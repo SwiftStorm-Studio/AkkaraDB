@@ -44,10 +44,7 @@ namespace akkaradb::engine::sst {
 
         template <typename T>
         [[nodiscard]] uint32_t crc32cPodVector(const std::vector<T>& values) noexcept {
-            return cpu::CRC32C(
-                reinterpret_cast<const std::byte*>(values.data()),
-                values.size() * sizeof(T)
-            );
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(values.data()), values.size() * sizeof(T));
         }
 
         template <typename T>
@@ -236,8 +233,8 @@ namespace akkaradb::engine::sst {
         if (options.blockSize < 4096 || (options.blockSize & 7u) != 0) {
             throw std::invalid_argument("SSTWriter::write: blockSize must be >=4096 and 8-byte aligned");
         }
-        if (options.codec == Codec::ZSTD &&
-            (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel > ZSTD_maxCLevel())) {
+        if (options.codec == Codec::ZSTD && (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel >
+            ZSTD_maxCLevel())) {
             throw std::invalid_argument("SSTWriter::write: zstdCompressionLevel is outside the supported Zstd range");
         }
 

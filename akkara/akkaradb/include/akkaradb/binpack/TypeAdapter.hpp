@@ -94,7 +94,9 @@ namespace akkaradb::binpack {
                 static_assert(std::is_default_constructible_v<T>, "BinPack aggregate read requires default construction");
                 constexpr size_t fieldCount = boost::pfr::tuple_size_v<T>;
                 const uint32_t magic = detail::readU32(in);
-                if (magic != detail::aggregateOffsetTableMagic) { throw std::runtime_error("BinPack: invalid aggregate offset table magic"); }
+                if (magic != detail::aggregateOffsetTableMagic) {
+                    throw std::runtime_error("BinPack: invalid aggregate offset table magic");
+                }
                 const uint32_t payloadSize = detail::readU32(in);
                 std::array<uint32_t, fieldCount> offsets{};
                 for (size_t i = 0; i < fieldCount; ++i) { offsets[i] = detail::readU32(in); }

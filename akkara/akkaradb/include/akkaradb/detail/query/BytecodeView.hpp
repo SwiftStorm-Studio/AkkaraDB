@@ -224,10 +224,11 @@ class BytecodeQueryView {
                     private:
                         friend class FilteredView;
 
-                        Iterator(typename BytecodeQueryView::Iterator inner, typename BytecodeQueryView::Iterator::Sentinel end, Pred predicate)
-                            : inner_{std::move(inner)}, end_{end}, predicate_{std::move(predicate)} {
-                            advance();
-                        }
+                        Iterator(
+                            typename BytecodeQueryView::Iterator inner,
+                            typename BytecodeQueryView::Iterator::Sentinel end,
+                            Pred predicate
+                        ) : inner_{std::move(inner)}, end_{end}, predicate_{std::move(predicate)} { advance(); }
 
                         void advance() {
                             current_.reset();
@@ -277,8 +278,7 @@ class BytecodeQueryView {
             private:
                 friend class BytecodeQueryView;
 
-                FilteredView(BytecodeQueryView base, Pred predicate)
-                    : base_{std::move(base)}, predicate_{std::move(predicate)} {}
+                FilteredView(BytecodeQueryView base, Pred predicate) : base_{std::move(base)}, predicate_{std::move(predicate)} {}
 
                 BytecodeQueryView base_;
                 Pred predicate_;
@@ -306,11 +306,7 @@ class BytecodeQueryView {
 
         [[nodiscard]] BytecodeQueryView where(query::bytecode::CompiledQueryDescriptor<Entity> descriptor) const {
             Prepared next{descriptor};
-            return BytecodeQueryView{
-                table_,
-                Prepared{query::bytecode::composeAnd(query_.descriptor(), next.descriptor())},
-                limit_
-            };
+            return BytecodeQueryView{table_, Prepared{query::bytecode::composeAnd(query_.descriptor(), next.descriptor())}, limit_};
         }
 
         [[nodiscard]] std::optional<Entry> first() const {

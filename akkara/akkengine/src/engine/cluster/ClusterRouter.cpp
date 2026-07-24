@@ -78,10 +78,14 @@ namespace akkaradb::engine::cluster {
         std::vector<std::pair<uint64_t, NodeInfo>> scored;
         scored.reserve(dataNodes_.size());
         for (const auto& node : dataNodes_) { scored.emplace_back(rendezvousScore(key, node.nodeId), node); }
-        std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
-            if (left.first != right.first) { return left.first > right.first; }
-            return left.second.nodeId < right.second.nodeId;
-        });
+        std::sort(
+            scored.begin(),
+            scored.end(),
+            [](const auto& left, const auto& right) {
+                if (left.first != right.first) { return left.first > right.first; }
+                return left.second.nodeId < right.second.nodeId;
+            }
+        );
 
         std::vector<StripeShardTarget> out;
         out.reserve(totalShards);

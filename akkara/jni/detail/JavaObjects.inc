@@ -14,12 +14,7 @@
         jbyteArray out = env->NewByteArray(static_cast<jsize>(bytes.size()));
         if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
         if (!bytes.empty()) {
-            env->SetByteArrayRegion(
-                out,
-                0,
-                static_cast<jsize>(bytes.size()),
-                reinterpret_cast<const jbyte*>(bytes.data())
-            );
+            env->SetByteArrayRegion(out, 0, static_cast<jsize>(bytes.size()), reinterpret_cast<const jbyte*>(bytes.data()));
             if (env->ExceptionCheck()) { return nullptr; }
         }
         return out;
@@ -42,9 +37,7 @@
 
     jfieldID requireField(JNIEnv* env, jclass cls, const char* name, const char* sig) {
         jfieldID field = env->GetFieldID(cls, name, sig);
-        if (field == nullptr || env->ExceptionCheck()) {
-            throw std::runtime_error(std::string("Failed to resolve field: ") + name);
-        }
+        if (field == nullptr || env->ExceptionCheck()) { throw std::runtime_error(std::string("Failed to resolve field: ") + name); }
         return field;
     }
 

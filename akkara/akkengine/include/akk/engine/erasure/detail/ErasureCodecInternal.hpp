@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+
 namespace akkaradb::engine::erasure {
     namespace detail {
         constexpr uint8_t GF256_POLY = 0x1Du;
@@ -119,7 +120,9 @@ namespace akkaradb::engine::erasure {
 
         [[nodiscard]] inline const uint8_t* gfMulRow(uint8_t coefficient) noexcept { return gf256Tables().mul[coefficient].data(); }
 
-        [[nodiscard]] inline uint8_t gfMulFast(uint8_t coefficient, uint8_t value) noexcept { return gf256Tables().mul[coefficient][value]; }
+        [[nodiscard]] inline uint8_t gfMulFast(uint8_t coefficient, uint8_t value) noexcept {
+            return gf256Tables().mul[coefficient][value];
+        }
 
         [[nodiscard]] inline uint8_t gfInvFast(uint8_t value) {
             if (value == 0) { throw std::runtime_error("RsErasureCodec: coefficient is not invertible"); }
@@ -332,7 +335,10 @@ namespace akkaradb::engine::erasure {
             return key;
         }
 
-        [[nodiscard]] inline std::vector<uint8_t> buildRsInverseMatrix(const std::vector<uint16_t>& available, const ErasureLayout& layout) {
+        [[nodiscard]] inline std::vector<uint8_t> buildRsInverseMatrix(
+            const std::vector<uint16_t>& available,
+            const ErasureLayout& layout
+        ) {
             std::vector<uint8_t> matrix(static_cast<size_t>(layout.dataShards) * layout.dataShards, 0);
             for (uint16_t row = 0; row < layout.dataShards; ++row) {
                 fillRsGeneratorRow(matrix.data() + static_cast<size_t>(row) * layout.dataShards, available[row], layout);
@@ -340,7 +346,10 @@ namespace akkaradb::engine::erasure {
             return invertGfMatrix(matrix, layout.dataShards);
         }
 
-        [[nodiscard]] inline std::vector<uint8_t> cachedRsInverseMatrix(const std::vector<uint16_t>& available, const ErasureLayout& layout) {
+        [[nodiscard]] inline std::vector<uint8_t> cachedRsInverseMatrix(
+            const std::vector<uint16_t>& available,
+            const ErasureLayout& layout
+        ) {
             static std::mutex mutex;
             static std::unordered_map<std::string, std::vector<uint8_t>> cache;
             constexpr size_t MAX_CACHE_ENTRIES = 256;
@@ -419,7 +428,8 @@ namespace akkaradb::engine::erasure {
             return data;
         }
 
-        [[nodiscard]] inline std::vector<ErasureShard> reconstructRsData(std::span<const ErasureShard> shards, const ErasureLayout& layout) {
+        [[nodiscard]] inline std::vector<ErasureShard>
+        reconstructRsData(std::span<const ErasureShard> shards, const ErasureLayout& layout) {
             return reconstructRsData(validateRsShards(shards, layout), layout);
         }
 
@@ -482,6 +492,5 @@ namespace akkaradb::engine::erasure {
             if (choose > values.size()) { return false; }
             return walk(walk, 0);
         }
-
     } // namespace detail
 } // namespace akkaradb::engine::erasure

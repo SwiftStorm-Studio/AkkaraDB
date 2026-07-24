@@ -157,6 +157,4 @@ namespace akkaradb::engine::erasure {
         ErasureLayout layout,
         std::span<const uint16_t> knownBadIndices
     ) { return recover(shards, layout, knownBadIndices).value; }
-
-
 } // namespace akkaradb::engine::erasure

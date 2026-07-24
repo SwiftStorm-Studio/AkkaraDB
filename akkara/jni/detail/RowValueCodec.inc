@@ -164,7 +164,9 @@
 
     [[nodiscard]] const TypeDesc& unwrapNullableStruct(const TypeDesc& type, const std::string& name) {
         if (type.kind == TypeDesc::NULLABLE) { return unwrapNullableStruct(*type.elem, name); }
-        if (type.kind != TypeDesc::STRUCT) { throw std::runtime_error("AkkaraDB query column path descends into a non-struct field: " + name); }
+        if (type.kind != TypeDesc::STRUCT) {
+            throw std::runtime_error("AkkaraDB query column path descends into a non-struct field: " + name);
+        }
         return type;
     }
 
@@ -172,9 +174,7 @@
         if (type.fields.size() > static_cast<size_t>(std::numeric_limits<uint8_t>::max())) {
             throw std::runtime_error("AkkaraDB schema has too many fields for JNI query resolution");
         }
-        for (size_t i = 0; i < type.fields.size(); ++i) {
-            if (type.fields[i].name == fieldName) { return static_cast<uint8_t>(i); }
-        }
+        for (size_t i = 0; i < type.fields.size(); ++i) { if (type.fields[i].name == fieldName) { return static_cast<uint8_t>(i); } }
         throw std::runtime_error("AkkaraDB query column not found in schema: " + name);
     }
 

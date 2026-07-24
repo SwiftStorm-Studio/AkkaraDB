@@ -316,6 +316,19 @@ message VLogStats {
   uint64 pending_bytes = 11;
   uint64 durable_bytes = 12;
   bool flush_thread_running = 13;
+  uint64 segment_count = 14;
+  uint64 active_segment_bytes = 15;
+  uint64 recovery_duration_micros = 16;
+  uint64 recovered_segment_count = 17;
+  uint64 recovered_entry_count = 18;
+  uint64 sidecar_fallback_count = 19;
+  uint64 sidecar_rebuild_failures = 20;
+  uint64 retention_pruned_segments = 21;
+  uint64 retention_base_entries_written = 22;
+  uint64 parallel_queue_rejects = 23;
+  uint64 parallel_lane_count = 24;
+  uint64 parallel_pending_writes = 25;
+  uint64 parallel_pending_bytes = 26;
 }
 
 message EngineStats {

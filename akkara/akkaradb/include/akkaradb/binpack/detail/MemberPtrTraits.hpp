@@ -32,24 +32,15 @@ namespace akkaradb::binpack::detail {
     template <auto MPtr>
     [[nodiscard]] inline std::string_view memberName() noexcept {
         #if defined(_MSC_VER)
-        const std::string_view sig = __FUNCSIG__;
-        auto end = std::string_view::npos;
-        auto cc = std::string_view::npos;
-
-        const auto ampLt = sig.rfind("<&");
-        if (ampLt != std::string_view::npos) {
+        const std::string_view sig = __FUNCSIG__; auto end = std::string_view::npos; auto cc = std::string_view::npos; const auto ampLt =
+            sig.rfind("<&"); if (ampLt != std::string_view::npos) {
             end = sig.find('>', ampLt);
             if (end == std::string_view::npos) { return {}; }
             cc = sig.rfind("::", end);
             if (cc == std::string_view::npos || cc < ampLt) { return {}; }
             return sig.substr(cc + 2, end - cc - 2);
-        }
-
-        end = sig.rfind(']');
-        if (end == std::string_view::npos) { return {}; }
-        cc = sig.rfind("::", end);
-        if (cc == std::string_view::npos) { return {}; }
-        return sig.substr(cc + 2, end - cc - 2);
+        } end = sig.rfind(']'); if (end == std::string_view::npos) { return {}; } cc = sig.rfind("::", end); if (cc ==
+            std::string_view::npos) { return {}; } return sig.substr(cc + 2, end - cc - 2);
         #elif defined(__clang__)
         const std::string_view sig = __PRETTY_FUNCTION__; const auto rb = sig.rfind(']'); if (rb == std::string_view::npos) { return {}; }
         const auto cc = sig.rfind("::", rb); if (cc == std::string_view::npos) { return {}; } return sig.substr(cc + 2, rb - cc - 2);

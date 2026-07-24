@@ -80,19 +80,16 @@ namespace akkaradb::engine::sst {
 
         [[nodiscard]] bool compactionEnabled(const SSTManager::Options& options) noexcept {
             switch (options.compactionMode) {
-                case SSTCompactionMode::AUTO:
-                    return options.compactThreads != 0;
-                case SSTCompactionMode::BACKGROUND:
-                    return true;
-                case SSTCompactionMode::DISABLED:
-                    return false;
+                case SSTCompactionMode::AUTO: return options.compactThreads != 0;
+                case SSTCompactionMode::BACKGROUND: return true;
+                case SSTCompactionMode::DISABLED: return false;
             }
             return true;
         }
 
         void validateZstdCompressionLevel(const SSTManager::Options& options) {
-            if (options.codec == SSTWriter::Codec::ZSTD &&
-                (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel > ZSTD_maxCLevel())) {
+            if (options.codec == SSTWriter::Codec::ZSTD && (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel
+                > ZSTD_maxCLevel())) {
                 throw std::invalid_argument("SSTManager: zstdCompressionLevel is outside the supported Zstd range");
             }
         }
@@ -109,7 +106,7 @@ namespace akkaradb::engine::sst {
         }
 
         void syncFile(const std::filesystem::path& path) {
-#ifdef _WIN32
+            #ifdef _WIN32
             HANDLE h = ::CreateFileW(
                 path.wstring().c_str(),
                 GENERIC_READ | GENERIC_WRITE,
@@ -118,25 +115,23 @@ namespace akkaradb::engine::sst {
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL,
                 nullptr
-            );
-            if (h == INVALID_HANDLE_VALUE) { throw std::runtime_error("SSTManager: failed to open file for sync: " + path.string()); }
-            const bool ok = ::FlushFileBuffers(h) != 0;
-            const DWORD err = ::GetLastError();
-            ::CloseHandle(h);
-            if (!ok) { throw std::runtime_error("SSTManager: file sync failed: " + path.string() + " error=" + std::to_string(err)); }
-#else
+            ); if (h == INVALID_HANDLE_VALUE) { throw std::runtime_error("SSTManager: failed to open file for sync: " + path.string()); }
+            const bool ok = ::FlushFileBuffers(h) != 0; const DWORD err = ::GetLastError(); ::CloseHandle(h); if (!ok) {
+                throw std::runtime_error("SSTManager: file sync failed: " + path.string() + " error=" + std::to_string(err));
+            }
+            #else
             const int fd = ::open(path.c_str(), O_RDONLY);
             if (fd < 0) { throw std::runtime_error("SSTManager: failed to open file for sync: " + path.string()); }
             const int rc = ::fsync(fd);
             const int saved = errno;
             ::close(fd);
             if (rc != 0) { throw std::runtime_error("SSTManager: file sync failed: " + path.string() + " errno=" + std::to_string(saved)); }
-#endif
+            #endif
         }
 
         void syncDirectoryBestEffort(const std::filesystem::path& dir) {
             if (dir.empty()) { return; }
-#ifdef _WIN32
+            #ifdef _WIN32
             HANDLE h = ::CreateFileW(
                 dir.wstring().c_str(),
                 GENERIC_READ,
@@ -145,16 +140,13 @@ namespace akkaradb::engine::sst {
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS,
                 nullptr
-            );
-            if (h == INVALID_HANDLE_VALUE) { return; }
-            (void)::FlushFileBuffers(h);
-            ::CloseHandle(h);
-#else
+            ); if (h == INVALID_HANDLE_VALUE) { return; } (void)::FlushFileBuffers(h); ::CloseHandle(h);
+            #else
             const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
             if (fd < 0) { return; }
             (void)::fsync(fd);
             ::close(fd);
-#endif
+            #endif
         }
 
         void durableRename(const std::filesystem::path& tmp, const std::filesystem::path& path) {
@@ -319,9 +311,7 @@ namespace akkaradb::engine::sst {
                 std::vector<std::string> allSstFiles;
                 for (const auto& entry : std::filesystem::directory_iterator(options_.sstDir)) {
                     const auto p = entry.path();
-                    if (p.extension() == ".tmp") {
-                        removeFileDurable(p);
-                    }
+                    if (p.extension() == ".tmp") { removeFileDurable(p); }
                     else if (p.extension() == ".aksst") {
                         const std::string filename = p.filename().string();
                         allSstFiles.push_back(filename);
@@ -334,7 +324,9 @@ namespace akkaradb::engine::sst {
                     files = manifest_->liveSst();
                     liveManifestFiles.insert(files.begin(), files.end());
                     for (const auto& filename : allSstFiles) {
-                        if (liveManifestFiles.find(filename) == liveManifestFiles.end()) { orphanSsts.push_back(options_.sstDir / filename); }
+                        if (liveManifestFiles.find(filename) == liveManifestFiles.end()) {
+                            orphanSsts.push_back(options_.sstDir / filename);
+                        }
                     }
                 }
                 else {
@@ -485,9 +477,7 @@ namespace akkaradb::engine::sst {
 
                 std::vector<std::shared_ptr<SSTReader>> readers;
                 for (const auto& level : *snap) {
-                    for (const auto& meta : level) {
-                        if (meta.reader && meta.minSeq <= snapshotSeq) { readers.push_back(meta.reader); }
-                    }
+                    for (const auto& meta : level) { if (meta.reader && meta.minSeq <= snapshotSeq) { readers.push_back(meta.reader); } }
                 }
                 return Iterator{std::make_unique<Iterator::Impl>(std::move(readers), startKey, endKey, snapshotSeq)};
             }
@@ -510,9 +500,7 @@ namespace akkaradb::engine::sst {
                 if (!snap) { return 0; }
 
                 uint64_t maxSeq = 0;
-                for (const auto& level : *snap) {
-                    for (const auto& meta : level) { maxSeq = std::max(maxSeq, meta.maxSeq); }
-                }
+                for (const auto& level : *snap) { for (const auto& meta : level) { maxSeq = std::max(maxSeq, meta.maxSeq); } }
                 return maxSeq;
             }
 
@@ -601,12 +589,16 @@ namespace akkaradb::engine::sst {
 
             void sortAllLevelsLocked() {
                 if (!levels_.empty()) {
-                    std::sort(levels_[0].begin(), levels_[0].end(), [](const Meta& a, const Meta& b) {
-                        const uint64_t aId = parseFileId(a.filename);
-                        const uint64_t bId = parseFileId(b.filename);
-                        if (aId != bId) { return aId > bId; }
-                        return a.filename > b.filename;
-                    });
+                    std::sort(
+                        levels_[0].begin(),
+                        levels_[0].end(),
+                        [](const Meta& a, const Meta& b) {
+                            const uint64_t aId = parseFileId(a.filename);
+                            const uint64_t bId = parseFileId(b.filename);
+                            if (aId != bId) { return aId > bId; }
+                            return a.filename > b.filename;
+                        }
+                    );
                 }
                 for (size_t i = 1; i < levels_.size(); ++i) {
                     std::sort(
@@ -898,6 +890,7 @@ namespace akkaradb::engine::sst {
     void SSTManager::shutdown() { impl_->shutdown(); }
     uint64_t SSTManager::flush(std::span<const core::RecordView> records) { return impl_->flush(records); }
     void SSTManager::throwIfBackgroundFailed() const { impl_->throwIfBackgroundFailed(); }
+
     std::optional<SSTRecord> SSTManager::get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
         return impl_->get(key, snapshotSeq);
     }
@@ -914,9 +907,7 @@ namespace akkaradb::engine::sst {
         std::span<const uint8_t> startKey,
         std::span<const uint8_t> endKey,
         uint64_t snapshotSeq
-    ) const {
-        return impl_->scanIter(startKey, endKey, snapshotSeq);
-    }
+    ) const { return impl_->scanIter(startKey, endKey, snapshotSeq); }
 
     std::vector<SSTManager::LevelStats> SSTManager::levelStats() const { return impl_->levelStats(); }
     uint64_t SSTManager::maxSequence() const noexcept { return impl_->maxSequence(); }

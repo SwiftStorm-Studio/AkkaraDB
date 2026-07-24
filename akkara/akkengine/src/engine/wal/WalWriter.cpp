@@ -67,12 +67,9 @@ namespace akkaradb::engine::wal {
         [[nodiscard]] WalSyncPolicy resolveSyncPolicy(const WalOptions& options) noexcept {
             if (options.syncPolicy != WalSyncPolicy::AUTO) { return options.syncPolicy; }
             switch (options.syncMode) {
-                case WalSyncMode::OFF:
-                    return WalSyncPolicy::NEVER;
-                case WalSyncMode::ASYNC:
-                    return WalSyncPolicy::ON_SYNC_ACK;
-                case WalSyncMode::SYNC:
-                    return WalSyncPolicy::ALWAYS;
+                case WalSyncMode::OFF: return WalSyncPolicy::NEVER;
+                case WalSyncMode::ASYNC: return WalSyncPolicy::ON_SYNC_ACK;
+                case WalSyncMode::SYNC: return WalSyncPolicy::ALWAYS;
             }
             return WalSyncPolicy::ALWAYS;
         }
@@ -80,7 +77,9 @@ namespace akkaradb::engine::wal {
         void normalizeOptions(WalOptions& options) {
             options.execution = resolveExecutionMode(options);
             options.syncPolicy = resolveSyncPolicy(options);
-            if (options.syncPolicy == WalSyncPolicy::NEVER && options.syncMode == WalSyncMode::SYNC) { options.syncMode = WalSyncMode::OFF; }
+            if (options.syncPolicy == WalSyncPolicy::NEVER && options.syncMode == WalSyncMode::SYNC) {
+                options.syncMode = WalSyncMode::OFF;
+            }
             else if (options.execution == WalExecutionMode::ASYNC) { options.syncMode = WalSyncMode::ASYNC; }
             else if (options.syncPolicy == WalSyncPolicy::NEVER) { options.syncMode = WalSyncMode::OFF; }
             else { options.syncMode = WalSyncMode::SYNC; }
@@ -274,7 +273,8 @@ namespace akkaradb::engine::wal {
                                 std::unique_lock lock{queueMutex_};
                                 const auto hasCapacity = [&] {
                                     const uint64_t pendingBytes = queueBytes_ + inFlightBytes_;
-                                    return pendingBytes + entryBytes <= options_.asyncMaxPendingBytes || (queue_.empty() && inFlightBytes_ == 0);
+                                    return pendingBytes + entryBytes <= options_.asyncMaxPendingBytes || (queue_.empty() && inFlightBytes_
+                                        == 0);
                                 };
                                 if (!hasCapacity() && options_.backpressure == WalBackpressureMode::FAIL_FAST) {
                                     throw std::runtime_error("WAL async queue is full");
@@ -294,8 +294,8 @@ namespace akkaradb::engine::wal {
                         writeOneLocked(entry);
                         std::fflush(file_);
                         batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
-                        if (options_.syncPolicy == WalSyncPolicy::ALWAYS ||
-                            (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && ack == WalAppendAck::SYNCED)) {
+                        if (options_.syncPolicy == WalSyncPolicy::ALWAYS || (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && ack ==
+                            WalAppendAck::SYNCED)) {
                             doFdatasync(file_);
                             syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                         }
@@ -469,10 +469,8 @@ namespace akkaradb::engine::wal {
                         if (entry.bytes.size() + WalSegmentHeader::SIZE > segmentBytes_) {
                             throw std::invalid_argument("WAL entry exceeds segment capacity");
                         }
-                        if (injectedWriteFailureAfterEntries_ != 0 &&
-                            entriesWritten_.load(std::memory_order_relaxed) >= injectedWriteFailureAfterEntries_) {
-                            throw std::runtime_error("WAL injected write failure");
-                        }
+                        if (injectedWriteFailureAfterEntries_ != 0 && entriesWritten_.load(std::memory_order_relaxed) >=
+                            injectedWriteFailureAfterEntries_) { throw std::runtime_error("WAL injected write failure"); }
                         if (currentSize_ + entry.bytes.size() > segmentBytes_ && currentSize_ > WalSegmentHeader::SIZE) { rotateLocked(); }
 
                         if (header_.firstSeq == 0 || entry.seq < header_.firstSeq) { header_.firstSeq = entry.seq; }
@@ -484,9 +482,7 @@ namespace akkaradb::engine::wal {
                     }
 
                     [[nodiscard]] bool queuedWrittenAckLocked() const noexcept {
-                        for (const PendingEntry& entry : queue_) {
-                            if (entry.ackMode == WalAppendAck::WRITTEN) { return true; }
-                        }
+                        for (const PendingEntry& entry : queue_) { if (entry.ackMode == WalAppendAck::WRITTEN) { return true; } }
                         return false;
                     }
 
@@ -500,8 +496,8 @@ namespace akkaradb::engine::wal {
                                     std::unique_lock lock{queueMutex_};
                                     queueCv_.wait(lock, [this] { return !queue_.empty() || !running_; });
                                     if (!running_ && queue_.empty()) { break; }
-                                    if (running_ && !queuedWrittenAckLocked() && queue_.size() < options_.groupN && queueBytes_ <
-                                        options_.groupBytes) {
+                                    if (running_ && !queuedWrittenAckLocked() && queue_.size() < options_.groupN && queueBytes_ < options_.
+                                        groupBytes) {
                                         queueCv_.wait_for(
                                             lock,
                                             std::chrono::microseconds(options_.groupMicros),
@@ -526,9 +522,8 @@ namespace akkaradb::engine::wal {
                                         std::fflush(file_);
                                         batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
                                         for (const PendingEntry& entry : batch) {
-                                            if (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && entry.ackMode == WalAppendAck::SYNCED) {
-                                                needsSync = true;
-                                            }
+                                            if (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && entry.ackMode ==
+                                                WalAppendAck::SYNCED) { needsSync = true; }
                                         }
                                         if (!forceSync) {
                                             for (const PendingEntry& entry : batch) {
@@ -672,13 +667,9 @@ namespace akkaradb::engine::wal {
 
             void pruneUntil(uint64_t checkpointSeq) { for (const auto& shard : shards_) { shard->pruneUntil(checkpointSeq); } }
 
-            void requestClose() noexcept {
-                for (const auto& shard : shards_) { shard->requestClose(); }
-            }
+            void requestClose() noexcept { for (const auto& shard : shards_) { shard->requestClose(); } }
 
-            void throwIfFailed() const {
-                for (const auto& shard : shards_) { shard->throwIfFailed(); }
-            }
+            void throwIfFailed() const { for (const auto& shard : shards_) { shard->throwIfFailed(); } }
 
             [[nodiscard]] WalWriterSnapshot snapshot() const noexcept {
                 WalWriterSnapshot out;

@@ -11,20 +11,15 @@ The goal is to bring the Kotlin compiler-plugin model to C++:
 
 This plugin can now do diagnostic lowering and sidecar source rewriting. With
 `-plugin-arg-akkara-query-dump`, it finds AkkaraDB `PackedTable::query(...)` and
-`QueryView::where(...)` calls that take a lambda, lowers the returned expression
-into a small diagnostic IR, and prints the index-source strategy it would choose
-for compound predicates. With `rewrite` plus `rewrite-output=<path>`, it writes
-a rewritten source file where supported `PackedTable::query(...)` lambdas are
-replaced by `akkaradb::query::bytecode::CompiledQueryDescriptor<T>` objects.
+`QueryView::where(...)` calls that take a lambda, lowers the returned expression into a small diagnostic IR, and prints the index-source strategy it would
+choose for compound predicates. With `rewrite` plus `rewrite-output=<path>`, it writes a rewritten source file where supported `PackedTable::query(...)` lambdas
+are replaced by `akkaradb::query::bytecode::CompiledQueryDescriptor<T>` objects.
 
 Current compound predicate strategy:
 
-- `A && B`: use the highest-scoring indexable side as the source scan, then keep
-  the whole predicate as a residual filter.
-- `A || B`: use an index union only when both sides are indexable; otherwise fall
-  back to a table scan.
-- Equality is scored above ordered ranges; prefix-like string operations are
-  scored above range scans; non-sargable string operations such as `contains` and
+- `A && B`: use the highest-scoring indexable side as the source scan, then keep the whole predicate as a residual filter.
+- `A || B`: use an index union only when both sides are indexable; otherwise fall back to a table scan.
+- Equality is scored above ordered ranges; prefix-like string operations are scored above range scans; non-sargable string operations such as `contains` and
   `ends_with` are treated as full-field-index candidates plus residual filtering.
 
 ## Build
@@ -32,8 +27,8 @@ Current compound predicate strategy:
 Configure this directory as a standalone CMake project with LLVM and Clang package paths available.
 
 On Windows, use an LLVM/Clang package that includes the development CMake files. The official LLVM installer provides
-`clang++`, but may not include `LLVMConfig.cmake`, `ClangConfig.cmake`, and the Clang development libraries required to
-build a plugin. The verified local setup is MSYS2 UCRT64:
+`clang++`, but may not include `LLVMConfig.cmake`, `ClangConfig.cmake`, and the Clang development libraries required to build a plugin. The verified local setup
+is MSYS2 UCRT64:
 
 - `C:/msys64/ucrt64/bin/clang++.exe`
 - `C:/msys64/ucrt64/lib/cmake/llvm/LLVMConfig.cmake`
@@ -78,8 +73,7 @@ clang++ -fsyntax-only \
 ```
 
 In copied work trees, `rewrite-in-place` can be used instead of
-`rewrite-output=<path>` to overwrite every edited file, including included
-project headers:
+`rewrite-output=<path>` to overwrite every edited file, including included project headers:
 
 ```bash
 clang++ -fsyntax-only \
@@ -93,8 +87,7 @@ clang++ -fsyntax-only \
 
 ## Rewrite Build Runner
 
-The repository also exposes a Windows build target that automates the sidecar
-workflow for the full tree:
+The repository also exposes a Windows build target that automates the sidecar workflow for the full tree:
 
 ```powershell
 cmake --preset windows-clang-cl-release
@@ -102,22 +95,17 @@ cmake --build --preset windows-clang-cl-query-rewrite-build
 ```
 
 `akkaradb_query_rewrite_build` copies the repository to
-`builds/akkara-query-rewrite/<preset>/source`, configures that copy, builds the
-query plugin, rewrites copied `.cpp` translation units and any edited project
-headers in place, and then builds the copied source tree. The original
-repository files are not overwritten.
+`builds/akkara-query-rewrite/<preset>/source`, configures that copy, builds the query plugin, rewrites copied `.cpp` translation units and any edited project
+headers in place, and then builds the copied source tree. The original repository files are not overwritten.
 
 The runner is intentionally conservative at this stage:
 
-- rewrite is driven from translation-unit source files (`.cpp`, `.cc`, `.cxx`);
-  included project headers are rewritten in place when their calls are
+- rewrite is driven from translation-unit source files (`.cpp`, `.cc`, `.cxx`); included project headers are rewritten in place when their calls are
   semantically resolvable in that translation unit,
 - the actual build still uses the selected CMake preset, normally
   `windows-clang-cl-release`,
-- the rewrite scan uses the standalone Clang plugin toolchain and includes from
-  the configured copied tree,
-- the rewrite scan defines `AKKARADB_QUERY_REWRITE_PASS` so typed entity lambdas
-  can be parsed without instantiating the normal runtime proxy-lambda path.
+- the rewrite scan uses the standalone Clang plugin toolchain and includes from the configured copied tree,
+- the rewrite scan defines `AKKARADB_QUERY_REWRITE_PASS` so typed entity lambdas can be parsed without instantiating the normal runtime proxy-lambda path.
 
 ## Rewrite Shape
 
@@ -158,12 +146,9 @@ auto result = profiles.query(
 );
 ```
 
-The bytecode rewrite currently requires a typed non-generic lambda parameter.
-Expressions rooted at the entity parameter become field loads and VM operations.
-Row-independent values become descriptor constants; when those constants need
-runtime storage, the generated descriptor owns a small capture block. Unsupported
-row-dependent predicates fall back to a generated `HostCallBool` thunk that owns
-the original lambda.
+The bytecode rewrite currently requires a typed non-generic lambda parameter. Expressions rooted at the entity parameter become field loads and VM operations.
+Row-independent values become descriptor constants; when those constants need runtime storage, the generated descriptor owns a small capture block. Unsupported
+row-dependent predicates fall back to a generated `HostCallBool` thunk that owns the original lambda.
 
 Example dump:
 
@@ -198,17 +183,12 @@ profiles.query(
 Current rewrite coverage:
 
 - `PackedTable::query(lambda)` is rewritten to a bytecode descriptor,
-- direct `PackedTable::query(lambda).where(lambda)` chains and variables that
-  hold a rewritten query view, for example `auto view = profiles.query(...);
-  view.where(...)`, are rewritten to descriptor calls and composed into one
-  bytecode program at runtime,
-- if a `where` lambda cannot be emitted as composable bytecode, it is left
-  unchanged and runs as a decoded predicate filter,
+- direct `PackedTable::query(lambda).where(lambda)` chains and variables that hold a rewritten query view, for example `auto view = profiles.query(...);
+  view.where(...)`, are rewritten to descriptor calls and composed into one bytecode program at runtime,
+- if a `where` lambda cannot be emitted as composable bytecode, it is left unchanged and runs as a decoded predicate filter,
 - typed lambda parameters such as `[](const Profile& profile)`,
-- top-level entity fields such as `profile.age` and `profile.email`, with raw
-  row evaluation when every field has a raw reader,
-- nested aggregate fields such as `profile.address.city`, evaluated after entity
-  decode,
+- top-level entity fields such as `profile.age` and `profile.email`, with raw row evaluation when every field has a raw reader,
+- nested aggregate fields such as `profile.address.city`, evaluated after entity decode,
 - `==`, `!=`, `<`, `<=`, `>`, `>=`,
 - `&&`, `||`, `!`; `&&` and `||` are lowered with `JumpIfFalse` /
   `JumpIfTrue` short-circuit control flow,
@@ -217,21 +197,18 @@ Current rewrite coverage:
   as bytecode string operations,
 - integer, floating, bool, character, and string literals,
 - row-independent capture expressions as owned constants,
-- whole-lambda host-call fallback for unsupported row-dependent expressions such
-  as custom function calls or `Ref<T>` resolution in `query(...)`,
+- whole-lambda host-call fallback for unsupported row-dependent expressions such as custom function calls or `Ref<T>` resolution in `query(...)`,
 - user-registered stack opcodes through
   `akkaradb::query::bytecode::CustomOpcodeRegistry`,
 - statically registered user opcode calls through `AKKARADB_QUERY_OPCODE(...)`
   are lowered to `CallCustom`,
-- plan hints are emitted for value-vs-field comparisons and string prefixes, and
-  sorted so equality/prefix hints are considered before ordered range hints.
+- plan hints are emitted for value-vs-field comparisons and string prefixes, and sorted so equality/prefix hints are considered before ordered range hints.
   Hints are emitted only where using one side as the scan source is safe; `||`
   and `!` subexpressions keep residual filtering without unsafe index narrowing.
 
 ## User Opcodes
 
-User opcodes are registered as stack functions. A custom opcode receives the
-already-evaluated stack values declared by its arity and returns one
+User opcodes are registered as stack functions. A custom opcode receives the already-evaluated stack values declared by its arity and returns one
 `akkaradb::query::bytecode::Value`.
 
 The runtime contract is:
@@ -242,14 +219,11 @@ The runtime contract is:
 - the thunk must be non-null,
 - the thunk must return the declared `resultKind`.
 
-`CustomOpcodeRegistry::registerOpcode(...)` rejects metadata that violates this
-contract, writes a diagnostic to the supplied stream, and leaves the registry
-unchanged so the process can continue. If a thunk later returns `false` or
-returns a value with the wrong `resultKind`, query execution treats that as an
+`CustomOpcodeRegistry::registerOpcode(...)` rejects metadata that violates this contract, writes a diagnostic to the supplied stream, and leaves the registry
+unchanged so the process can continue. If a thunk later returns `false` or returns a value with the wrong `resultKind`, query execution treats that as an
 implementation contract violation.
 
-For Clang Plugin lowering, declare a static opcode registration before the query
-that calls the function:
+For Clang Plugin lowering, declare a static opcode registration before the query that calls the function:
 
 Example:
 
@@ -274,8 +248,7 @@ registry.registerOpcode(
 );
 ```
 
-To make a normal C++ function lower to `CallCustom`, bind that function to the
-same stack opcode metadata:
+To make a normal C++ function lower to `CallCustom`, bind that function to the same stack opcode metadata:
 
 ```cpp
 bool customOddAge(uint32_t age) {
@@ -305,22 +278,17 @@ Return
 ```
 
 The plugin only lowers calls whose target function has a visible
-`AKKARADB_QUERY_OPCODE(...)` registration earlier in the translation unit. If no
-registration is visible, or if the call arity does not match the registration,
+`AKKARADB_QUERY_OPCODE(...)` registration earlier in the translation unit. If no registration is visible, or if the call arity does not match the registration,
 the expression keeps the existing whole-lambda `HostCallBool` fallback.
 
-`akkaradb::Ref<T>` is deliberately not traversed by the sidecar rewrite. A
-predicate such as `post.author->name == "Alice"` crosses a table boundary and
-needs join/resolve semantics instead of a local raw-row field path rewrite. For
+`akkaradb::Ref<T>` is deliberately not traversed by the sidecar rewrite. A predicate such as `post.author->name == "Alice"` crosses a table boundary and needs
+join/resolve semantics instead of a local raw-row field path rewrite. For
 `PackedTable::query(lambda)`, the plugin keeps the lambda as an owned
 `HostCallBool` descriptor so normal C++ `Ref<T>` lazy resolution still runs. For
-`where(lambda)`, a `Ref<T>` crossing is left as the existing decoded predicate
-filter because `where` descriptors must be bytecode-composable. Explicit
-`join(...).where([](const Left&, const Right&) { ... })` keeps the existing
-two-entity predicate semantics and is not rewritten into local row bytecode.
+`where(lambda)`, a `Ref<T>` crossing is left as the existing decoded predicate filter because `where` descriptors must be bytecode-composable. Explicit
+`join(...).where([](const Left&, const Right&) { ... })` keeps the existing two-entity predicate semantics and is not rewritten into local row bytecode.
 
 ## Next Steps
 
 1. Add integration tests using `clang -cc1 -load`.
-2. Add optional Ref-aware join bytecode only after the public join API exposes a
-   stable bytecode descriptor shape for two-table predicates.
+2. Add optional Ref-aware join bytecode only after the public join API exposes a stable bytecode descriptor shape for two-table predicates.

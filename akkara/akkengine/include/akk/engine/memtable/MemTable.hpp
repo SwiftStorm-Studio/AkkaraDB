@@ -26,9 +26,7 @@
 
 namespace akkaradb::engine::memtable {
     enum class MemTableFlushMode : uint8_t {
-        AUTO = 0,
-        BYTES_PER_SHARD = 1,
-        MANUAL_ONLY = 2,
+        AUTO = 0, BYTES_PER_SHARD = 1, MANUAL_ONLY = 2,
     };
 
     class AKDB_API MemTable {
@@ -36,7 +34,7 @@ namespace akkaradb::engine::memtable {
             using RecordView = core::RecordView;
             using FlushCallback = std::function<void(std::span<const RecordView>)>;
             using MemTableFactory = std::function<std::unique_ptr<IMemTable>()>;
-            using ConfiguredMemTableFactory = std::function<std::unique_ptr<IMemTable>(const MemTableBackendOptions&)>;
+            using ConfiguredMemTableFactory = std::function<std::unique_ptr<IMemTable>(const MemTableBackendOptions &)>;
 
             struct Options {
                 // Physical write/read partitioning. 0 selects a writer-count based shard count.
@@ -125,10 +123,7 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshotSeq) const;
             // Acquires all shard read locks before invoking snapshotSeqProvider.
             // The returned iterator retains those locks until it is destroyed.
-            [[nodiscard]] RangeIterator pinnedIterator(
-                const KeyRange& range,
-                const std::function<uint64_t()>& snapshotSeqProvider
-            ) const;
+            [[nodiscard]] RangeIterator pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const;
 
             [[nodiscard]] uint64_t nextSeq() noexcept;
             [[nodiscard]] uint64_t reserveSeq(uint64_t count);

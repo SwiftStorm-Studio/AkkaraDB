@@ -31,8 +31,9 @@ void makeQueryPlan(const Expr& expr, QueryPlan& plan) const {
 }
 
 [[nodiscard]] static int compareRangeKey(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
-    return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end()) ? -1 :
-        (std::lexicographical_compare(rhs.begin(), rhs.end(), lhs.begin(), lhs.end()) ? 1 : 0);
+    return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end())
+               ? -1
+               : (std::lexicographical_compare(rhs.begin(), rhs.end(), lhs.begin(), lhs.end()) ? 1 : 0);
 }
 
 [[nodiscard]] static int compareRangeStart(const std::vector<uint8_t>& lhs, const std::vector<uint8_t>& rhs) {
@@ -48,9 +49,8 @@ void makeQueryPlan(const Expr& expr, QueryPlan& plan) const {
 }
 
 [[nodiscard]] static bool rangeMetadataCompatible(const QueryRange& lhs, const QueryRange& rhs) noexcept {
-    return lhs.indexSearchPrefixSize == rhs.indexSearchPrefixSize
-        && lhs.dynamicIndexPkOffset == rhs.dynamicIndexPkOffset
-        && lhs.prefixIndexPkOffset == rhs.prefixIndexPkOffset;
+    return lhs.indexSearchPrefixSize == rhs.indexSearchPrefixSize && lhs.dynamicIndexPkOffset == rhs.dynamicIndexPkOffset && lhs.
+        prefixIndexPkOffset == rhs.prefixIndexPkOffset;
 }
 
 [[nodiscard]] static bool rangesHaveSameNamespace(const QueryRange& lhs, const QueryRange& rhs) {
@@ -90,18 +90,24 @@ void makeQueryPlan(const Expr& expr, QueryPlan& plan) const {
 }
 
 [[nodiscard]] static bool rangesCanMerge(const QueryRange& lhs, const QueryRange& rhs) {
-    return rangeMetadataCompatible(lhs, rhs) && rangesHaveSameNamespace(lhs, rhs)
-        && (lhs.endKey.empty() || compareRangeStart(rhs.startKey, lhs.endKey) <= 0);
+    return rangeMetadataCompatible(lhs, rhs) && rangesHaveSameNamespace(lhs, rhs) && (lhs.endKey.empty() || compareRangeStart(
+        rhs.startKey,
+        lhs.endKey
+    ) <= 0);
 }
 
 static void mergeIndexPlanRanges(QueryPlan& plan) {
     if (plan.kind != QuerySourceKind::INDEX || plan.ranges.size() < 2) { return; }
 
-    std::sort(plan.ranges.begin(), plan.ranges.end(), [](const QueryRange& lhs, const QueryRange& rhs) {
-        const int start = compareRangeStart(lhs.startKey, rhs.startKey);
-        if (start != 0) { return start < 0; }
-        return compareRangeEnd(lhs.endKey, rhs.endKey) < 0;
-    });
+    std::sort(
+        plan.ranges.begin(),
+        plan.ranges.end(),
+        [](const QueryRange& lhs, const QueryRange& rhs) {
+            const int start = compareRangeStart(lhs.startKey, rhs.startKey);
+            if (start != 0) { return start < 0; }
+            return compareRangeEnd(lhs.endKey, rhs.endKey) < 0;
+        }
+    );
 
     std::vector<QueryRange> merged;
     merged.reserve(plan.ranges.size());
@@ -397,9 +403,7 @@ template <query::Op Operator, auto FieldPtr, typename Lit>
             const std::string_view pattern{literal};
             if (pattern.find_first_of("%_") != std::string_view::npos) {
                 std::string_view prefix;
-                if (likePatternToPrefix(pattern, prefix)) {
-                    if (tryMakePrefixIndexPlan<FieldPtr>(prefix, plan)) { return true; }
-                }
+                if (likePatternToPrefix(pattern, prefix)) { if (tryMakePrefixIndexPlan<FieldPtr>(prefix, plan)) { return true; } }
                 return idx != nullptr && tryMakeFullFieldIndexPlan(idx->prefix, plan);
             }
             if (idx == nullptr) { return false; }

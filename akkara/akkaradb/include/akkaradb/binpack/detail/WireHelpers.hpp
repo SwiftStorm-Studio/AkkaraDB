@@ -58,8 +58,8 @@ namespace akkaradb::binpack::detail {
     }
 
     [[nodiscard]] inline uint32_t readU32At(const uint8_t* in) noexcept {
-        return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (
-            static_cast<uint32_t>(in[3]) << 24);
+        return static_cast<uint32_t>(in[0]) | (static_cast<uint32_t>(in[1]) << 8) | (static_cast<uint32_t>(in[2]) << 16) | (static_cast<
+            uint32_t>(in[3]) << 24);
     }
 
     [[nodiscard]] inline uint64_t readU64(std::span<const uint8_t>& in) {

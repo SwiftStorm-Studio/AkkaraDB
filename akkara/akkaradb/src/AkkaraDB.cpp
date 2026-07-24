@@ -77,28 +77,20 @@ namespace akkaradb {
             if (options.overrides.sstBloomBitsPerKey) {
                 out.sst.bloomBitsPerKey = static_cast<uint32_t>(*options.overrides.sstBloomBitsPerKey);
             }
-            if (options.overrides.sstZstdCompressionLevel) {
-                out.sst.zstdCompressionLevel = *options.overrides.sstZstdCompressionLevel;
-            }
+            if (options.overrides.sstZstdCompressionLevel) { out.sst.zstdCompressionLevel = *options.overrides.sstZstdCompressionLevel; }
             if (options.overrides.versionLogCodec) { out.vlog.codec = toVLogCodec(*options.overrides.versionLogCodec); }
             if (options.overrides.versionLogZstdCompressionLevel) {
                 out.vlog.zstdCompressionLevel = *options.overrides.versionLogZstdCompressionLevel;
             }
-            if (options.overrides.versionLogWriteAdmission) {
-                out.vlog.writeAdmission = *options.overrides.versionLogWriteAdmission;
-            }
-            if (options.overrides.versionLogSerialAppendMode) {
-                out.vlog.serialAppendMode = *options.overrides.versionLogSerialAppendMode;
-            }
+            if (options.overrides.versionLogWriteAdmission) { out.vlog.writeAdmission = *options.overrides.versionLogWriteAdmission; }
+            if (options.overrides.versionLogSerialAppendMode) { out.vlog.serialAppendMode = *options.overrides.versionLogSerialAppendMode; }
             if (options.overrides.versionLogParallelWriteLanes) {
                 out.vlog.parallelWriteLanes = *options.overrides.versionLogParallelWriteLanes;
             }
             if (options.overrides.versionLogParallelPendingLimitScope) {
                 out.vlog.parallelPendingLimitScope = *options.overrides.versionLogParallelPendingLimitScope;
             }
-            if (options.overrides.versionLogRetentionDays) {
-                out.vlog.retentionDays = *options.overrides.versionLogRetentionDays;
-            }
+            if (options.overrides.versionLogRetentionDays) { out.vlog.retentionDays = *options.overrides.versionLogRetentionDays; }
             if (options.overrides.versionLogRetentionMinCommitSeq) {
                 out.vlog.retentionMinCommitSeq = *options.overrides.versionLogRetentionMinCommitSeq;
             }

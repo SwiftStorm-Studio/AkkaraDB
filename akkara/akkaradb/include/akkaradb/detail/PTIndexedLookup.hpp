@@ -32,9 +32,7 @@ static void encodeIndexedSearchFieldValue(const Value& value, Out& out) {
 template <auto FieldPtr, typename Value>
 [[nodiscard]] bool hasAnyByIndexedFieldValue(const Value& value) const {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "indexed field lookup must belong to the table entity"
-    )
-    ;
+    Entity >, "indexed field lookup must belong to the table entity" ) ;
     using IndexedField = binpack::detail::memberOf<FieldPtr>;
     std::vector<uint8_t> fieldBytes;
     encodeIndexedSearchFieldValue<IndexedField>(value, fieldBytes);
@@ -51,9 +49,7 @@ template <auto FieldPtr, typename Value>
 template <auto FieldPtr, typename Value>
 void collectPrimaryKeysByIndexedFieldValue(const Value& value, std::vector<PK>& out) const {
     static_assert(std::is_same_v < binpack::detail::classOf < FieldPtr >,
-    Entity >, "indexed field lookup must belong to the table entity"
-    )
-    ;
+    Entity >, "indexed field lookup must belong to the table entity" ) ;
     using IndexedField = binpack::detail::memberOf<FieldPtr>;
     std::vector<uint8_t> fieldBytes;
     encodeIndexedSearchFieldValue<IndexedField>(value, fieldBytes);

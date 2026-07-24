@@ -34,12 +34,7 @@
 
 namespace akkaradb::query::bytecode {
     enum class ValueKind : uint8_t {
-        Null,
-        Bool,
-        Int,
-        UInt,
-        Double,
-        String
+        Null, Bool, Int, UInt, Double, String
     };
 
     struct Value {
@@ -130,12 +125,7 @@ namespace akkaradb::query::bytecode {
     inline constexpr uint8_t customOpcodeMaxArity = 16;
 
     enum class PlanHintOp : uint8_t {
-        Eq,
-        Lt,
-        Le,
-        Gt,
-        Ge,
-        StartsWith
+        Eq, Lt, Le, Gt, Ge, StartsWith
     };
 
     struct PlanHint {
@@ -160,13 +150,11 @@ namespace akkaradb::query::bytecode {
     [[nodiscard]] Value scalarValueFrom(const T& value) {
         using V = std::remove_cvref_t<T>;
         if constexpr (std::is_same_v<V, bool>) { return Value::boolean(value); }
-        else if constexpr (std::is_integral_v<V> && std::is_signed_v<V>) { return Value::integer(static_cast<int64_t>(value)); }
-        else if constexpr (std::is_integral_v<V> && std::is_unsigned_v<V>) { return Value::uinteger(static_cast<uint64_t>(value)); }
+        else if constexpr (std::is_integral_v<V>&& std::is_signed_v<V>) { return Value::integer(static_cast<int64_t>(value)); }
+        else if constexpr (std::is_integral_v<V>&& std::is_unsigned_v<V>) { return Value::uinteger(static_cast<uint64_t>(value)); }
         else if constexpr (std::is_floating_point_v<V>) { return Value::floating(static_cast<double>(value)); }
         else if constexpr (requires { std::string_view{value}; }) { return Value::string(std::string_view{value}); }
-        else {
-            static_assert(sizeof(V) == 0, "AkkaraDB bytecode field type is not supported yet");
-        }
+        else { static_assert(sizeof(V) == 0, "AkkaraDB bytecode field type is not supported yet"); }
     }
 
     template <typename T>
@@ -199,12 +187,7 @@ namespace akkaradb::query::bytecode {
         CustomOpcodeThunk thunk = nullptr;
     };
 
-    template <
-        auto Function,
-        uint16_t OpcodeValue,
-        uint8_t ArityValue,
-        ValueKind ResultKindValue,
-        CustomOpcodeThunk ThunkValue>
+    template <auto Function, uint16_t OpcodeValue, uint8_t ArityValue, ValueKind ResultKindValue, CustomOpcodeThunk ThunkValue>
     struct StaticCustomOpcodeRegistration {
         static constexpr auto function = Function;
         static constexpr uint16_t opcode = OpcodeValue;
@@ -214,8 +197,7 @@ namespace akkaradb::query::bytecode {
 
         std::string_view name;
 
-        constexpr explicit StaticCustomOpcodeRegistration(std::string_view nameValue) noexcept
-            : name{nameValue} {}
+        constexpr explicit StaticCustomOpcodeRegistration(std::string_view nameValue) noexcept : name{nameValue} {}
 
         [[nodiscard]] constexpr CustomOpcodeBinding binding() const noexcept {
             return CustomOpcodeBinding{opcode, name, arity, resultKind, thunk};
@@ -225,39 +207,39 @@ namespace akkaradb::query::bytecode {
     };
 
     class CustomOpcodeRegistry {
-    public:
-        bool registerOpcode(CustomOpcodeBinding binding, std::ostream* log = &std::clog) {
-            if (!validate(binding, log)) { return false; }
-            bindings_.push_back(binding);
-            return true;
-        }
-
-        [[nodiscard]] std::span<const CustomOpcodeBinding> bindings() const noexcept { return bindings_; }
-
-    private:
-        [[nodiscard]] bool validate(const CustomOpcodeBinding& binding, std::ostream* log) const {
-            auto reject = [&](std::string_view reason) {
-                if (log != nullptr) {
-                    *log << "[akkaradb::query::bytecode] rejected custom opcode";
-                    if (!binding.name.empty()) { *log << " `" << binding.name << '`'; }
-                    *log << " (" << binding.opcode << "): " << reason << '\n';
-                }
-                return false;
-            };
-
-            if (binding.opcode < customOpcodeUserMin) { return reject("opcode id must be in the user range 0x8000..0xFFFF"); }
-            if (binding.name.empty()) { return reject("name must not be empty"); }
-            if (binding.arity > customOpcodeMaxArity) { return reject("arity exceeds the documented maximum of 16"); }
-            if (binding.thunk == nullptr) { return reject("thunk must not be null"); }
-
-            for (const auto& existing : bindings_) {
-                if (existing.opcode == binding.opcode) { return reject("opcode id is already registered"); }
-                if (existing.name == binding.name) { return reject("name is already registered"); }
+        public:
+            bool registerOpcode(CustomOpcodeBinding binding, std::ostream* log = &std::clog) {
+                if (!validate(binding, log)) { return false; }
+                bindings_.push_back(binding);
+                return true;
             }
-            return true;
-        }
 
-        std::vector<CustomOpcodeBinding> bindings_;
+            [[nodiscard]] std::span<const CustomOpcodeBinding> bindings() const noexcept { return bindings_; }
+
+        private:
+            [[nodiscard]] bool validate(const CustomOpcodeBinding& binding, std::ostream* log) const {
+                auto reject = [&](std::string_view reason) {
+                    if (log != nullptr) {
+                        *log << "[akkaradb::query::bytecode] rejected custom opcode";
+                        if (!binding.name.empty()) { *log << " `" << binding.name << '`'; }
+                        *log << " (" << binding.opcode << "): " << reason << '\n';
+                    }
+                    return false;
+                };
+
+                if (binding.opcode < customOpcodeUserMin) { return reject("opcode id must be in the user range 0x8000..0xFFFF"); }
+                if (binding.name.empty()) { return reject("name must not be empty"); }
+                if (binding.arity > customOpcodeMaxArity) { return reject("arity exceeds the documented maximum of 16"); }
+                if (binding.thunk == nullptr) { return reject("thunk must not be null"); }
+
+                for (const auto& existing : bindings_) {
+                    if (existing.opcode == binding.opcode) { return reject("opcode id is already registered"); }
+                    if (existing.name == binding.name) { return reject("name is already registered"); }
+                }
+                return true;
+            }
+
+            std::vector<CustomOpcodeBinding> bindings_;
     };
 
     template <typename Entity>
@@ -270,23 +252,19 @@ namespace akkaradb::query::bytecode {
     };
 
     template <auto FieldPtr>
-    [[nodiscard]] Value readMemberField(const binpack::detail::classOf<FieldPtr>& entity) {
-        return valueFrom(entity.*FieldPtr);
-    }
+    [[nodiscard]] Value readMemberField(const binpack::detail::classOf<FieldPtr>& entity) { return valueFrom(entity.*FieldPtr); }
 
     template <auto FieldPtr>
-    [[nodiscard]] consteval FieldReader<binpack::detail::classOf<FieldPtr>> makeFieldReader() {
-        return &readMemberField<FieldPtr>;
-    }
+    [[nodiscard]] consteval FieldReader<binpack::detail::classOf<FieldPtr>> makeFieldReader() { return &readMemberField<FieldPtr>; }
 
     template <typename T>
-    void skipWireValue(std::span<const uint8_t>& in);
+    void skipWireValue(std::span<const uint8_t> & in);
 
     template <typename T, size_t... Is>
-    void skipWireAggregate(std::span<const uint8_t>& in, std::index_sequence<Is...>);
+    void skipWireAggregate(std::span<const uint8_t> & in, std::index_sequence < Is...>);
 
     template <typename T>
-    [[nodiscard]] Value readWireValue(std::span<const uint8_t>& in);
+    [[nodiscard]] Value readWireValue(std::span<const uint8_t> & in);
 
     inline void skipBytes(std::span<const uint8_t>& in, size_t size) {
         if (in.size() < size) { throw std::runtime_error("AkkaraDB bytecode raw row buffer underflow"); }
@@ -317,7 +295,8 @@ namespace akkaradb::query::bytecode {
                 skipWireValue<typename V::mapped_type>(in);
             }
         }
-        else if constexpr (requires { typename V::value_type; std::declval<V>().begin(); std::declval<V>().end(); } && !std::is_same_v<V, std::string>) {
+        else if constexpr (requires { typename V::value_type; std::declval<V>().begin(); std::declval<V>().end(); } && !std::is_same_v<V,
+            std::string>) {
             using Elem = typename V::value_type;
             const uint32_t count = binpack::detail::readU32(in);
             for (uint32_t i = 0; i < count; ++i) { skipWireValue<Elem>(in); }
@@ -336,7 +315,9 @@ namespace akkaradb::query::bytecode {
     void skipWireAggregate(std::span<const uint8_t>& in, std::index_sequence<Is...>) {
         (void)sizeof...(Is);
         const uint32_t magic = binpack::detail::readU32(in);
-        if (magic != binpack::detail::aggregateOffsetTableMagic) { throw std::runtime_error("AkkaraDB bytecode aggregate offset table magic mismatch"); }
+        if (magic != binpack::detail::aggregateOffsetTableMagic) {
+            throw std::runtime_error("AkkaraDB bytecode aggregate offset table magic mismatch");
+        }
         const uint32_t payloadSize = binpack::detail::readU32(in);
         skipBytes(in, boost::pfr::tuple_size_v<T> * 4 + payloadSize);
     }
@@ -377,9 +358,7 @@ namespace akkaradb::query::bytecode {
             if (present == 0) { return Value::null(); }
             return readWireValue<typename V::value_type>(in);
         }
-        else {
-            static_assert(sizeof(V) == 0, "AkkaraDB bytecode raw read does not support this field type yet");
-        }
+        else { static_assert(sizeof(V) == 0, "AkkaraDB bytecode raw read does not support this field type yet"); }
     }
 
     template <typename Entity, size_t FieldIndex>
@@ -387,9 +366,13 @@ namespace akkaradb::query::bytecode {
         static_assert(FieldIndex < boost::pfr::tuple_size_v<Entity>, "AkkaraDB bytecode raw field index is out of range");
         constexpr size_t fieldCount = boost::pfr::tuple_size_v<Entity>;
         const uint32_t magic = binpack::detail::readU32(rowBytes);
-        if (magic != binpack::detail::aggregateOffsetTableMagic) { throw std::runtime_error("AkkaraDB bytecode aggregate offset table magic mismatch"); }
+        if (magic != binpack::detail::aggregateOffsetTableMagic) {
+            throw std::runtime_error("AkkaraDB bytecode aggregate offset table magic mismatch");
+        }
         const uint32_t payloadSize = binpack::detail::readU32(rowBytes);
-        if (rowBytes.size() < fieldCount * 4 + payloadSize) { throw std::runtime_error("AkkaraDB bytecode aggregate offset table is truncated"); }
+        if (rowBytes.size() < fieldCount * 4 + payloadSize) {
+            throw std::runtime_error("AkkaraDB bytecode aggregate offset table is truncated");
+        }
 
         const size_t offsetTableBytes = fieldCount * 4;
         const auto* offsets = rowBytes.data();
@@ -406,9 +389,7 @@ namespace akkaradb::query::bytecode {
     }
 
     template <typename Entity, size_t FieldIndex>
-    [[nodiscard]] consteval RawFieldReader makeRawFieldReader() {
-        return &readTopLevelField<Entity, FieldIndex>;
-    }
+    [[nodiscard]] consteval RawFieldReader makeRawFieldReader() { return &readTopLevelField<Entity, FieldIndex>; }
 
     [[nodiscard]] inline long double numericAsLongDouble(const Value& value);
 
@@ -429,19 +410,18 @@ namespace akkaradb::query::bytecode {
             out = value.b;
             return true;
         }
-        else if constexpr (std::is_integral_v<F> && std::is_signed_v<F>) {
+        else if constexpr (std::is_integral_v<F>&& std::is_signed_v<F>) {
             long double number = 0;
             if (value.kind == ValueKind::Int) { number = static_cast<long double>(value.i); }
             else if (value.kind == ValueKind::UInt) { number = static_cast<long double>(value.u); }
             else if (value.kind == ValueKind::Double) { number = static_cast<long double>(value.d); }
             else { return false; }
-            if (number < static_cast<long double>(std::numeric_limits<F>::lowest()) || number > static_cast<long double>(std::numeric_limits<F>::max())) {
-                return false;
-            }
+            if (number < static_cast<long double>(std::numeric_limits<F>::lowest()) || number > static_cast<long double>(std::numeric_limits
+                <F>::max())) { return false; }
             out = static_cast<F>(number);
             return true;
         }
-        else if constexpr (std::is_integral_v<F> && std::is_unsigned_v<F>) {
+        else if constexpr (std::is_integral_v<F>&& std::is_unsigned_v<F>) {
             long double number = 0;
             if (value.kind == ValueKind::Int) {
                 if (value.i < 0) { return false; }
@@ -597,17 +577,14 @@ namespace akkaradb::query::bytecode {
                 case Opcode::PushConst:
                 case Opcode::LoadField:
                 case Opcode::HostCallBool:
-                case Opcode::CallCustom:
-                    if (op == Opcode::HostCallBool || op == Opcode::CallCustom) { return true; }
+                case Opcode::CallCustom: if (op == Opcode::HostCallBool || op == Opcode::CallCustom) { return true; }
                     pc += 2;
                     break;
                 case Opcode::Jump:
                 case Opcode::JumpIfFalse:
-                case Opcode::JumpIfTrue:
-                    pc += 2;
+                case Opcode::JumpIfTrue: pc += 2;
                     break;
-                default:
-                    break;
+                default: break;
             }
         }
         return false;
@@ -627,20 +604,34 @@ namespace akkaradb::query::bytecode {
             const auto op = static_cast<Opcode>(code[pc++]);
             out.push_back(static_cast<uint8_t>(op));
             switch (op) {
-                case Opcode::PushConst:
-                    appendCodeU16(out, checkedU16(static_cast<size_t>(readCodeU16(code, pc)) + constantOffset, "AkkaraDB bytecode constant index overflow during composition"));
+                case Opcode::PushConst: appendCodeU16(
+                        out,
+                        checkedU16(
+                            static_cast<size_t>(readCodeU16(code, pc)) + constantOffset,
+                            "AkkaraDB bytecode constant index overflow during composition"
+                        )
+                    );
                     pc += 2;
                     break;
-                case Opcode::LoadField:
-                    appendCodeU16(out, checkedU16(static_cast<size_t>(readCodeU16(code, pc)) + fieldOffset, "AkkaraDB bytecode field index overflow during composition"));
+                case Opcode::LoadField: appendCodeU16(
+                        out,
+                        checkedU16(
+                            static_cast<size_t>(readCodeU16(code, pc)) + fieldOffset,
+                            "AkkaraDB bytecode field index overflow during composition"
+                        )
+                    );
                     pc += 2;
                     break;
-                case Opcode::HostCallBool:
-                    appendCodeU16(out, checkedU16(static_cast<size_t>(readCodeU16(code, pc)) + hostCallOffset, "AkkaraDB bytecode host-call index overflow during composition"));
+                case Opcode::HostCallBool: appendCodeU16(
+                        out,
+                        checkedU16(
+                            static_cast<size_t>(readCodeU16(code, pc)) + hostCallOffset,
+                            "AkkaraDB bytecode host-call index overflow during composition"
+                        )
+                    );
                     pc += 2;
                     break;
-                case Opcode::CallCustom:
-                    appendCodeU16(out, readCodeU16(code, pc));
+                case Opcode::CallCustom: appendCodeU16(out, readCodeU16(code, pc));
                     pc += 2;
                     break;
                 case Opcode::Jump:
@@ -648,14 +639,14 @@ namespace akkaradb::query::bytecode {
                 case Opcode::JumpIfTrue: {
                     const uint16_t target = readCodeU16(code, pc);
                     pc += 2;
-                    if (target > returnOffset) { throw std::runtime_error("AkkaraDB bytecode query composition found a jump outside the composable body"); }
+                    if (target > returnOffset) {
+                        throw std::runtime_error("AkkaraDB bytecode query composition found a jump outside the composable body");
+                    }
                     appendCodeU16(out, checkedU16(outStart + target, "AkkaraDB bytecode jump target overflow during composition"));
                     break;
                 }
-                case Opcode::Return:
-                    throw std::runtime_error("AkkaraDB bytecode query composition found a non-final return");
-                default:
-                    break;
+                case Opcode::Return: throw std::runtime_error("AkkaraDB bytecode query composition found a non-final return");
+                default: break;
             }
         }
     }
@@ -684,17 +675,19 @@ namespace akkaradb::query::bytecode {
         const CustomOpcodeBinding& binding,
         const void* capture
     ) {
-        const auto existing = std::find_if(out.begin(), out.end(), [&](const CustomOpcodeBinding& current) {
-            return current.opcode == binding.opcode || current.name == binding.name;
-        });
+        const auto existing = std::find_if(
+            out.begin(),
+            out.end(),
+            [&](const CustomOpcodeBinding& current) { return current.opcode == binding.opcode || current.name == binding.name; }
+        );
         if (existing == out.end()) {
             out.push_back(binding);
             captures.push_back(capture);
             return;
         }
         const size_t index = static_cast<size_t>(std::distance(out.begin(), existing));
-        if (existing->opcode != binding.opcode || existing->name != binding.name || existing->arity != binding.arity
-            || existing->resultKind != binding.resultKind || existing->thunk != binding.thunk || captures[index] != capture) {
+        if (existing->opcode != binding.opcode || existing->name != binding.name || existing->arity != binding.arity || existing->resultKind
+            != binding.resultKind || existing->thunk != binding.thunk || captures[index] != capture) {
             throw std::runtime_error("AkkaraDB bytecode query composition found conflicting custom opcode bindings");
         }
     }
@@ -721,7 +714,12 @@ namespace akkaradb::query::bytecode {
             owner->hostCallCaptures.push_back(hostCallCaptureFor(lhs, i));
         }
         for (size_t i = 0; i < lhs.customOpcodes.size(); ++i) {
-            appendUniqueCustomOpcode(owner->customOpcodes, owner->customOpcodeCaptures, lhs.customOpcodes[i], customOpcodeCaptureFor(lhs, i));
+            appendUniqueCustomOpcode(
+                owner->customOpcodes,
+                owner->customOpcodeCaptures,
+                lhs.customOpcodes[i],
+                customOpcodeCaptureFor(lhs, i)
+            );
         }
 
         const size_t constantOffset = owner->constants.size();
@@ -735,20 +733,35 @@ namespace akkaradb::query::bytecode {
             owner->hostCallCaptures.push_back(hostCallCaptureFor(rhs, i));
         }
         for (size_t i = 0; i < rhs.customOpcodes.size(); ++i) {
-            appendUniqueCustomOpcode(owner->customOpcodes, owner->customOpcodeCaptures, rhs.customOpcodes[i], customOpcodeCaptureFor(rhs, i));
+            appendUniqueCustomOpcode(
+                owner->customOpcodes,
+                owner->customOpcodeCaptures,
+                rhs.customOpcodes[i],
+                customOpcodeCaptureFor(rhs, i)
+            );
         }
 
         owner->planHints.insert(owner->planHints.end(), lhs.planHints.begin(), lhs.planHints.end());
         for (const auto& hint : rhs.planHints) {
-            owner->planHints.push_back(PlanHint{
-                hint.op,
-                checkedU16(static_cast<size_t>(hint.field) + fieldOffset, "AkkaraDB bytecode plan hint field index overflow during composition"),
-                checkedU16(static_cast<size_t>(hint.constant) + constantOffset, "AkkaraDB bytecode plan hint constant index overflow during composition")
-            });
+            owner->planHints.push_back(
+                PlanHint{
+                    hint.op,
+                    checkedU16(
+                        static_cast<size_t>(hint.field) + fieldOffset,
+                        "AkkaraDB bytecode plan hint field index overflow during composition"
+                    ),
+                    checkedU16(
+                        static_cast<size_t>(hint.constant) + constantOffset,
+                        "AkkaraDB bytecode plan hint constant index overflow during composition"
+                    )
+                }
+            );
         }
-        std::stable_sort(owner->planHints.begin(), owner->planHints.end(), [](const PlanHint& a, const PlanHint& b) {
-            return planHintScore(a.op) > planHintScore(b.op);
-        });
+        std::stable_sort(
+            owner->planHints.begin(),
+            owner->planHints.end(),
+            [](const PlanHint& a, const PlanHint& b) { return planHintScore(a.op) > planHintScore(b.op); }
+        );
 
         appendComposableCode(owner->code, lhs.code, 0, 0, 0);
         appendComposableCode(owner->code, rhs.code, constantOffset, fieldOffset, hostCallOffset);
@@ -774,159 +787,158 @@ namespace akkaradb::query::bytecode {
 
     template <typename Entity>
     class PreparedQuery {
-    public:
-        explicit PreparedQuery(CompiledQueryDescriptor<Entity> descriptor)
-            : descriptor_{descriptor} {
-            validate();
-        }
+        public:
+            explicit PreparedQuery(CompiledQueryDescriptor<Entity> descriptor) : descriptor_{descriptor} { validate(); }
 
-        [[nodiscard]] const CompiledQueryDescriptor<Entity>& descriptor() const noexcept { return descriptor_; }
-        [[nodiscard]] bool usesHostCalls() const noexcept { return usesHostCalls_; }
+            [[nodiscard]] const CompiledQueryDescriptor<Entity>& descriptor() const noexcept { return descriptor_; }
+            [[nodiscard]] bool usesHostCalls() const noexcept { return usesHostCalls_; }
 
-        [[nodiscard]] bool canEvalRaw() const noexcept {
-            if (usesHostCalls_) { return false; }
-            for (const auto& field : descriptor_.fields) {
-                if (field.rawRead == nullptr) { return false; }
+            [[nodiscard]] bool canEvalRaw() const noexcept {
+                if (usesHostCalls_) { return false; }
+                for (const auto& field : descriptor_.fields) { if (field.rawRead == nullptr) { return false; } }
+                return true;
             }
-            return true;
-        }
 
-    private:
-        static uint16_t readU16At(std::span<const uint8_t> code, size_t offset) {
-            if (offset + 2 > code.size()) { throw std::runtime_error("AkkaraDB bytecode query is truncated"); }
-            return static_cast<uint16_t>(code[offset]) | static_cast<uint16_t>(static_cast<uint16_t>(code[offset + 1]) << 8);
-        }
-
-        [[nodiscard]] const CustomOpcodeBinding* findCustomOpcode(uint16_t opcode) const noexcept {
-            for (const auto& binding : descriptor_.customOpcodes) {
-                if (binding.opcode == opcode) { return &binding; }
+        private:
+            static uint16_t readU16At(std::span<const uint8_t> code, size_t offset) {
+                if (offset + 2 > code.size()) { throw std::runtime_error("AkkaraDB bytecode query is truncated"); }
+                return static_cast<uint16_t>(code[offset]) | static_cast<uint16_t>(static_cast<uint16_t>(code[offset + 1]) << 8);
             }
-            return nullptr;
-        }
 
-        void validateCustomOpcodeTable() const {
-            for (size_t i = 0; i < descriptor_.customOpcodes.size(); ++i) {
-                const auto& binding = descriptor_.customOpcodes[i];
-                if (binding.opcode < customOpcodeUserMin) { throw std::runtime_error("AkkaraDB bytecode custom opcode id is outside the user range"); }
-                if (binding.name.empty()) { throw std::runtime_error("AkkaraDB bytecode custom opcode name is empty"); }
-                if (binding.arity > customOpcodeMaxArity) { throw std::runtime_error("AkkaraDB bytecode custom opcode arity is too large"); }
-                if (binding.thunk == nullptr) { throw std::runtime_error("AkkaraDB bytecode custom opcode thunk is null"); }
-                for (size_t j = i + 1; j < descriptor_.customOpcodes.size(); ++j) {
-                    if (descriptor_.customOpcodes[j].opcode == binding.opcode) {
-                        throw std::runtime_error("AkkaraDB bytecode custom opcode id is duplicated");
-                    }
-                    if (descriptor_.customOpcodes[j].name == binding.name) {
-                        throw std::runtime_error("AkkaraDB bytecode custom opcode name is duplicated");
-                    }
-                }
+            [[nodiscard]] const CustomOpcodeBinding* findCustomOpcode(uint16_t opcode) const noexcept {
+                for (const auto& binding : descriptor_.customOpcodes) { if (binding.opcode == opcode) { return &binding; } }
+                return nullptr;
             }
-        }
 
-        void validate() {
-            if (descriptor_.code.empty()) { throw std::runtime_error("AkkaraDB bytecode query is empty"); }
-            if (!descriptor_.hostCallCaptures.empty() && descriptor_.hostCallCaptures.size() != descriptor_.hostCalls.size()) {
-                throw std::runtime_error("AkkaraDB bytecode host-call capture table size mismatch");
-            }
-            if (!descriptor_.customOpcodeCaptures.empty() && descriptor_.customOpcodeCaptures.size() != descriptor_.customOpcodes.size()) {
-                throw std::runtime_error("AkkaraDB bytecode custom opcode capture table size mismatch");
-            }
-            validateCustomOpcodeTable();
-
-            size_t pc = 0;
-            bool hasReturn = false;
-            int stackDepth = 0;
-            usesHostCalls_ = false;
-            while (pc < descriptor_.code.size()) {
-                const auto op = static_cast<Opcode>(descriptor_.code[pc++]);
-                switch (op) {
-                    case Opcode::PushConst: {
-                        const uint16_t index = readU16At(descriptor_.code, pc);
-                        pc += 2;
-                        if (index >= descriptor_.constants.size()) { throw std::runtime_error("AkkaraDB bytecode constant index out of range"); }
-                        ++stackDepth;
-                        break;
+            void validateCustomOpcodeTable() const {
+                for (size_t i = 0; i < descriptor_.customOpcodes.size(); ++i) {
+                    const auto& binding = descriptor_.customOpcodes[i];
+                    if (binding.opcode < customOpcodeUserMin) {
+                        throw std::runtime_error("AkkaraDB bytecode custom opcode id is outside the user range");
                     }
-                    case Opcode::LoadField: {
-                        const uint16_t index = readU16At(descriptor_.code, pc);
-                        pc += 2;
-                        if (index >= descriptor_.fields.size()) { throw std::runtime_error("AkkaraDB bytecode field index out of range"); }
-                        if (descriptor_.fields[index].read == nullptr) { throw std::runtime_error("AkkaraDB bytecode field reader is null"); }
-                        ++stackDepth;
-                        break;
+                    if (binding.name.empty()) { throw std::runtime_error("AkkaraDB bytecode custom opcode name is empty"); }
+                    if (binding.arity > customOpcodeMaxArity) {
+                        throw std::runtime_error("AkkaraDB bytecode custom opcode arity is too large");
                     }
-                    case Opcode::HostCallBool: {
-                        const uint16_t index = readU16At(descriptor_.code, pc);
-                        pc += 2;
-                        if (index >= descriptor_.hostCalls.size()) { throw std::runtime_error("AkkaraDB bytecode host-call index out of range"); }
-                        usesHostCalls_ = true;
-                        ++stackDepth;
-                        break;
-                    }
-                    case Opcode::CallCustom: {
-                        const uint16_t opcode = readU16At(descriptor_.code, pc);
-                        pc += 2;
-                        const CustomOpcodeBinding* binding = findCustomOpcode(opcode);
-                        if (binding == nullptr) { throw std::runtime_error("AkkaraDB bytecode custom opcode is not registered"); }
-                        if (stackDepth < binding->arity) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
-                        stackDepth = stackDepth - binding->arity + 1;
-                        break;
-                    }
-                    case Opcode::Eq:
-                    case Opcode::Ne:
-                    case Opcode::Lt:
-                    case Opcode::Le:
-                    case Opcode::Gt:
-                    case Opcode::Ge:
-                    case Opcode::And:
-                    case Opcode::Or:
-                    case Opcode::StartsWith:
-                    case Opcode::EndsWith:
-                    case Opcode::Contains:
-                    case Opcode::Like:
-                    case Opcode::Add:
-                    case Opcode::Sub:
-                    case Opcode::Mul:
-                    case Opcode::Div:
-                    case Opcode::Mod:
-                        if (stackDepth < 2) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
-                        --stackDepth;
-                        break;
-                    case Opcode::Not:
-                        if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
-                        break;
-                    case Opcode::Pop:
-                        if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
-                        --stackDepth;
-                        break;
-                    case Opcode::Jump:
-                    case Opcode::JumpIfFalse:
-                    case Opcode::JumpIfTrue: {
-                        const uint16_t target = readU16At(descriptor_.code, pc);
-                        pc += 2;
-                        if (target >= descriptor_.code.size()) { throw std::runtime_error("AkkaraDB bytecode jump target out of range"); }
-                        if ((op == Opcode::JumpIfFalse || op == Opcode::JumpIfTrue) && stackDepth < 1) {
-                            throw std::runtime_error("AkkaraDB bytecode stack underflow");
+                    if (binding.thunk == nullptr) { throw std::runtime_error("AkkaraDB bytecode custom opcode thunk is null"); }
+                    for (size_t j = i + 1; j < descriptor_.customOpcodes.size(); ++j) {
+                        if (descriptor_.customOpcodes[j].opcode == binding.opcode) {
+                            throw std::runtime_error("AkkaraDB bytecode custom opcode id is duplicated");
                         }
-                        break;
+                        if (descriptor_.customOpcodes[j].name == binding.name) {
+                            throw std::runtime_error("AkkaraDB bytecode custom opcode name is duplicated");
+                        }
                     }
-                    case Opcode::Return:
-                        if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode return without a value"); }
-                        hasReturn = true;
-                        break;
-                    default:
-                        throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
                 }
             }
-            if (!hasReturn) { throw std::runtime_error("AkkaraDB bytecode query has no return instruction"); }
-        }
 
-        CompiledQueryDescriptor<Entity> descriptor_;
-        bool usesHostCalls_ = false;
+            void validate() {
+                if (descriptor_.code.empty()) { throw std::runtime_error("AkkaraDB bytecode query is empty"); }
+                if (!descriptor_.hostCallCaptures.empty() && descriptor_.hostCallCaptures.size() != descriptor_.hostCalls.size()) {
+                    throw std::runtime_error("AkkaraDB bytecode host-call capture table size mismatch");
+                }
+                if (!descriptor_.customOpcodeCaptures.empty() && descriptor_.customOpcodeCaptures.size() != descriptor_.customOpcodes.
+                    size()) { throw std::runtime_error("AkkaraDB bytecode custom opcode capture table size mismatch"); }
+                validateCustomOpcodeTable();
+
+                size_t pc = 0;
+                bool hasReturn = false;
+                int stackDepth = 0;
+                usesHostCalls_ = false;
+                while (pc < descriptor_.code.size()) {
+                    const auto op = static_cast<Opcode>(descriptor_.code[pc++]);
+                    switch (op) {
+                        case Opcode::PushConst: {
+                            const uint16_t index = readU16At(descriptor_.code, pc);
+                            pc += 2;
+                            if (index >= descriptor_.constants.size()) {
+                                throw std::runtime_error("AkkaraDB bytecode constant index out of range");
+                            }
+                            ++stackDepth;
+                            break;
+                        }
+                        case Opcode::LoadField: {
+                            const uint16_t index = readU16At(descriptor_.code, pc);
+                            pc += 2;
+                            if (index >= descriptor_.fields.size()) {
+                                throw std::runtime_error("AkkaraDB bytecode field index out of range");
+                            }
+                            if (descriptor_.fields[index].read == nullptr) {
+                                throw std::runtime_error("AkkaraDB bytecode field reader is null");
+                            }
+                            ++stackDepth;
+                            break;
+                        }
+                        case Opcode::HostCallBool: {
+                            const uint16_t index = readU16At(descriptor_.code, pc);
+                            pc += 2;
+                            if (index >= descriptor_.hostCalls.size()) {
+                                throw std::runtime_error("AkkaraDB bytecode host-call index out of range");
+                            }
+                            usesHostCalls_ = true;
+                            ++stackDepth;
+                            break;
+                        }
+                        case Opcode::CallCustom: {
+                            const uint16_t opcode = readU16At(descriptor_.code, pc);
+                            pc += 2;
+                            const CustomOpcodeBinding* binding = findCustomOpcode(opcode);
+                            if (binding == nullptr) { throw std::runtime_error("AkkaraDB bytecode custom opcode is not registered"); }
+                            if (stackDepth < binding->arity) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
+                            stackDepth = stackDepth - binding->arity + 1;
+                            break;
+                        }
+                        case Opcode::Eq:
+                        case Opcode::Ne:
+                        case Opcode::Lt:
+                        case Opcode::Le:
+                        case Opcode::Gt:
+                        case Opcode::Ge:
+                        case Opcode::And:
+                        case Opcode::Or:
+                        case Opcode::StartsWith:
+                        case Opcode::EndsWith:
+                        case Opcode::Contains:
+                        case Opcode::Like:
+                        case Opcode::Add:
+                        case Opcode::Sub:
+                        case Opcode::Mul:
+                        case Opcode::Div:
+                        case Opcode::Mod: if (stackDepth < 2) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
+                            --stackDepth;
+                            break;
+                        case Opcode::Not: if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
+                            break;
+                        case Opcode::Pop: if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode stack underflow"); }
+                            --stackDepth;
+                            break;
+                        case Opcode::Jump:
+                        case Opcode::JumpIfFalse:
+                        case Opcode::JumpIfTrue: {
+                            const uint16_t target = readU16At(descriptor_.code, pc);
+                            pc += 2;
+                            if (target >= descriptor_.code.size()) {
+                                throw std::runtime_error("AkkaraDB bytecode jump target out of range");
+                            }
+                            if ((op == Opcode::JumpIfFalse || op == Opcode::JumpIfTrue) && stackDepth < 1) {
+                                throw std::runtime_error("AkkaraDB bytecode stack underflow");
+                            }
+                            break;
+                        }
+                        case Opcode::Return: if (stackDepth < 1) { throw std::runtime_error("AkkaraDB bytecode return without a value"); }
+                            hasReturn = true;
+                            break;
+                        default: throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
+                    }
+                }
+                if (!hasReturn) { throw std::runtime_error("AkkaraDB bytecode query has no return instruction"); }
+            }
+
+            CompiledQueryDescriptor<Entity> descriptor_;
+            bool usesHostCalls_ = false;
     };
 
-    [[nodiscard]] inline bool valueIsTrue(const Value& value) noexcept {
-        return value.kind == ValueKind::Bool && value.b;
-    }
+    [[nodiscard]] inline bool valueIsTrue(const Value& value) noexcept { return value.kind == ValueKind::Bool && value.b; }
 
     [[nodiscard]] inline long double numericAsLongDouble(const Value& value) {
         switch (value.kind) {
@@ -1075,10 +1087,11 @@ namespace akkaradb::query::bytecode {
         throw std::runtime_error("AkkaraDB bytecode unknown string operation");
     }
 
-    [[nodiscard]] inline const CustomOpcodeBinding* findCustomOpcode(std::span<const CustomOpcodeBinding> bindings, uint16_t opcode) noexcept {
-        for (const auto& binding : bindings) {
-            if (binding.opcode == opcode) { return &binding; }
-        }
+    [[nodiscard]] inline const CustomOpcodeBinding* findCustomOpcode(
+        std::span<const CustomOpcodeBinding> bindings,
+        uint16_t opcode
+    ) noexcept {
+        for (const auto& binding : bindings) { if (binding.opcode == opcode) { return &binding; } }
         return nullptr;
     }
 
@@ -1087,8 +1100,12 @@ namespace akkaradb::query::bytecode {
         const size_t firstArg = stack.size() - binding.arity;
         const std::span<const Value> args{stack.data() + firstArg, binding.arity};
         Value out;
-        if (!binding.thunk(args, out, captures)) { throw std::runtime_error("AkkaraDB bytecode custom opcode thunk rejected its arguments"); }
-        if (out.kind != binding.resultKind) { throw std::runtime_error("AkkaraDB bytecode custom opcode returned an unexpected value kind"); }
+        if (!binding.thunk(args, out, captures)) {
+            throw std::runtime_error("AkkaraDB bytecode custom opcode thunk rejected its arguments");
+        }
+        if (out.kind != binding.resultKind) {
+            throw std::runtime_error("AkkaraDB bytecode custom opcode returned an unexpected value kind");
+        }
         stack.resize(firstArg);
         stack.push_back(out);
     }
@@ -1108,9 +1125,8 @@ namespace akkaradb::query::bytecode {
 
         auto readU16 = [&](size_t& pc) {
             if (pc + 2 > descriptor.code.size()) { throw std::runtime_error("AkkaraDB bytecode query is truncated"); }
-            const uint16_t out = static_cast<uint16_t>(descriptor.code[pc]) | static_cast<uint16_t>(
-                static_cast<uint16_t>(descriptor.code[pc + 1]) << 8
-            );
+            const uint16_t out = static_cast<uint16_t>(descriptor.code[pc]) | static_cast<uint16_t>(static_cast<uint16_t>(descriptor.code[pc
+                + 1]) << 8);
             pc += 2;
             return out;
         };
@@ -1119,14 +1135,11 @@ namespace akkaradb::query::bytecode {
         while (pc < descriptor.code.size()) {
             const auto op = static_cast<Opcode>(descriptor.code[pc++]);
             switch (op) {
-                case Opcode::PushConst:
-                    stack.push_back(descriptor.constants[readU16(pc)]);
+                case Opcode::PushConst: stack.push_back(descriptor.constants[readU16(pc)]);
                     break;
-                case Opcode::LoadField:
-                    stack.push_back(descriptor.fields[readU16(pc)].read(entity));
+                case Opcode::LoadField: stack.push_back(descriptor.fields[readU16(pc)].read(entity));
                     break;
-                case Opcode::HostCallBool:
-                {
+                case Opcode::HostCallBool: {
                     const uint16_t index = readU16(pc);
                     stack.push_back(Value::boolean(descriptor.hostCalls[index](entity, hostCallCaptureFor(descriptor, index))));
                     break;
@@ -1197,14 +1210,11 @@ namespace akkaradb::query::bytecode {
                     stack.push_back(Value::boolean(evalStringOperation(op, lhs, rhs)));
                     break;
                 }
-                case Opcode::Not:
-                    stack.push_back(Value::boolean(!valueIsTrue(pop())));
+                case Opcode::Not: stack.push_back(Value::boolean(!valueIsTrue(pop())));
                     break;
-                case Opcode::Pop:
-                    (void)pop();
+                case Opcode::Pop: (void)pop();
                     break;
-                case Opcode::Jump:
-                    pc = readU16(pc);
+                case Opcode::Jump: pc = readU16(pc);
                     break;
                 case Opcode::JumpIfFalse: {
                     const uint16_t target = readU16(pc);
@@ -1216,10 +1226,8 @@ namespace akkaradb::query::bytecode {
                     if (valueIsTrue(pop())) { pc = target; }
                     break;
                 }
-                case Opcode::Return:
-                    return valueIsTrue(pop());
-                default:
-                    throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
+                case Opcode::Return: return valueIsTrue(pop());
+                default: throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
             }
         }
 
@@ -1241,9 +1249,8 @@ namespace akkaradb::query::bytecode {
 
         auto readU16 = [&](size_t& pc) {
             if (pc + 2 > descriptor.code.size()) { throw std::runtime_error("AkkaraDB bytecode query is truncated"); }
-            const uint16_t out = static_cast<uint16_t>(descriptor.code[pc]) | static_cast<uint16_t>(
-                static_cast<uint16_t>(descriptor.code[pc + 1]) << 8
-            );
+            const uint16_t out = static_cast<uint16_t>(descriptor.code[pc]) | static_cast<uint16_t>(static_cast<uint16_t>(descriptor.code[pc
+                + 1]) << 8);
             pc += 2;
             return out;
         };
@@ -1252,8 +1259,7 @@ namespace akkaradb::query::bytecode {
         while (pc < descriptor.code.size()) {
             const auto op = static_cast<Opcode>(descriptor.code[pc++]);
             switch (op) {
-                case Opcode::PushConst:
-                    stack.push_back(descriptor.constants[readU16(pc)]);
+                case Opcode::PushConst: stack.push_back(descriptor.constants[readU16(pc)]);
                     break;
                 case Opcode::LoadField: {
                     const auto& field = descriptor.fields[readU16(pc)];
@@ -1261,8 +1267,7 @@ namespace akkaradb::query::bytecode {
                     stack.push_back(field.rawRead(rowBytes));
                     break;
                 }
-                case Opcode::HostCallBool:
-                    throw std::runtime_error("AkkaraDB bytecode raw evaluation cannot execute host calls");
+                case Opcode::HostCallBool: throw std::runtime_error("AkkaraDB bytecode raw evaluation cannot execute host calls");
                 case Opcode::CallCustom: {
                     const uint16_t opcode = readU16(pc);
                     const CustomOpcodeBinding* binding = findCustomOpcode(descriptor.customOpcodes, opcode);
@@ -1329,14 +1334,11 @@ namespace akkaradb::query::bytecode {
                     stack.push_back(Value::boolean(evalStringOperation(op, lhs, rhs)));
                     break;
                 }
-                case Opcode::Not:
-                    stack.push_back(Value::boolean(!valueIsTrue(pop())));
+                case Opcode::Not: stack.push_back(Value::boolean(!valueIsTrue(pop())));
                     break;
-                case Opcode::Pop:
-                    (void)pop();
+                case Opcode::Pop: (void)pop();
                     break;
-                case Opcode::Jump:
-                    pc = readU16(pc);
+                case Opcode::Jump: pc = readU16(pc);
                     break;
                 case Opcode::JumpIfFalse: {
                     const uint16_t target = readU16(pc);
@@ -1348,10 +1350,8 @@ namespace akkaradb::query::bytecode {
                     if (valueIsTrue(pop())) { pc = target; }
                     break;
                 }
-                case Opcode::Return:
-                    return valueIsTrue(pop());
-                default:
-                    throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
+                case Opcode::Return: return valueIsTrue(pop());
+                default: throw std::runtime_error("AkkaraDB bytecode query contains an unknown opcode");
             }
         }
 

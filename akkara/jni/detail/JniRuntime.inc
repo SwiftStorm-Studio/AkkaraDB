@@ -36,11 +36,7 @@
                         "allocateDirect",
                         "(I)Ljava/nio/ByteBuffer;"
                     );
-                    cached.byteBufferAsReadOnly = env->GetMethodID(
-                        cached.byteBufferClass,
-                        "asReadOnlyBuffer",
-                        "()Ljava/nio/ByteBuffer;"
-                    );
+                    cached.byteBufferAsReadOnly = env->GetMethodID(cached.byteBufferClass, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;");
                     if (cached.byteBufferAllocateDirect == nullptr || cached.byteBufferAsReadOnly == nullptr) {
                         throw std::runtime_error("Failed to resolve ByteBuffer methods");
                     }
@@ -62,11 +58,7 @@
                     cached.versionEntryClass = static_cast<jclass>(env->NewGlobalRef(versionEntryLocal));
                     env->DeleteLocalRef(versionEntryLocal);
                     if (cached.versionEntryClass == nullptr) { throw std::runtime_error("Failed to cache VersionEntry class"); }
-                    cached.versionEntryCtor = env->GetMethodID(
-                        cached.versionEntryClass,
-                        "<init>",
-                        "(JJJB[B)V"
-                    );
+                    cached.versionEntryCtor = env->GetMethodID(cached.versionEntryClass, "<init>", "(JJJB[B)V");
                     if (cached.versionEntryCtor == nullptr) { throw std::runtime_error("Failed to resolve VersionEntry constructor"); }
 
                     jclass batchGetResultLocal = env->FindClass("dev/swiftstorm/akkaradb/engine/BatchGetResult");
@@ -74,11 +66,7 @@
                     cached.batchGetResultClass = static_cast<jclass>(env->NewGlobalRef(batchGetResultLocal));
                     env->DeleteLocalRef(batchGetResultLocal);
                     if (cached.batchGetResultClass == nullptr) { throw std::runtime_error("Failed to cache BatchGetResult class"); }
-                    cached.batchGetResultCtor = env->GetMethodID(
-                        cached.batchGetResultClass,
-                        "<init>",
-                        "()V"
-                    );
+                    cached.batchGetResultCtor = env->GetMethodID(cached.batchGetResultClass, "<init>", "()V");
                     if (cached.batchGetResultCtor == nullptr) { throw std::runtime_error("Failed to resolve BatchGetResult constructor"); }
                 }
                 catch (...) { initError = std::current_exception(); }
@@ -98,9 +86,7 @@
 
     [[nodiscard]] jlong toHandle(void* ptr) noexcept { return static_cast<jlong>(reinterpret_cast<std::uintptr_t>(ptr)); }
 
-    void throwRuntime(JNIEnv* env, const std::exception& ex) {
-        env->ThrowNew(bindings(env).runtimeExceptionClass, ex.what());
-    }
+    void throwRuntime(JNIEnv* env, const std::exception& ex) { env->ThrowNew(bindings(env).runtimeExceptionClass, ex.what()); }
 
     [[nodiscard]] std::span<const uint8_t> readDirectBuffer(JNIEnv* env, jobject buffer) {
         if (buffer == nullptr) { return {}; }
@@ -205,8 +191,6 @@
         using LimitT = std::numeric_limits<T>;
         using UnsignedWide = unsigned long long;
         const auto raw = static_cast<UnsignedWide>(value);
-        if (raw > static_cast<UnsignedWide>(LimitT::max())) {
-            throw std::runtime_error(std::string(name) + " is out of range");
-        }
+        if (raw > static_cast<UnsignedWide>(LimitT::max())) { throw std::runtime_error(std::string(name) + " is out of range"); }
         return static_cast<T>(value);
     }

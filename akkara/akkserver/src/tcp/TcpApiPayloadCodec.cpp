@@ -125,9 +125,8 @@ namespace akkaradb::engine::server::tcp {
     }
 
     void encodeHistoryStreamPayload(const VersionEntry& entry, std::vector<uint8_t>& out) {
-        const uint32_t payloadBytes = static_cast<uint32_t>(
-            sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) + sizeof(uint32_t) + sizeof(uint32_t) + entry.value.size()
-        );
+        const uint32_t payloadBytes = static_cast<uint32_t>(sizeof(entry.seq) + sizeof(entry.sourceNodeId) + sizeof(entry.timestampNs) +
+            sizeof(uint32_t) + sizeof(uint32_t) + entry.value.size());
         appendStreamFrameHeader(out, kStreamFrameItem, payloadBytes);
         appendPlain(out, entry.seq);
         appendPlain(out, entry.sourceNodeId);

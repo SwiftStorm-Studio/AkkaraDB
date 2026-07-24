@@ -31,9 +31,7 @@
 
 namespace akkaradb::engine::sst {
     enum class SSTCompactionMode : uint8_t {
-        AUTO = 0,
-        BACKGROUND = 1,
-        DISABLED = 2,
+        AUTO = 0, BACKGROUND = 1, DISABLED = 2,
     };
 
     class AKDB_API SSTManager {
