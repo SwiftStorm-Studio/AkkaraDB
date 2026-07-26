@@ -17,11 +17,12 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace akkaradb::engine::vlog {
     inline constexpr uint64_t ROLLBACK_NODE = UINT64_MAX;
-    inline constexpr uint8_t VLOG_FLAG_ZSTD = 0x01;
+    inline constexpr uint8_t VLOG_FLAG_ZSTD = 0x80;
     inline constexpr uint8_t VLOG_FLAG_ROLLBACK = 0x04;
     // Synthetic entry written by retention compaction to preserve the value at
     // the start of the retained history window.
@@ -69,7 +70,6 @@ namespace akkaradb::engine::vlog {
     };
 
     struct AKDB_API VersionLogOptions {
-        std::filesystem::path logPath;
         VLogSyncMode syncMode = VLogSyncMode::ASYNC;
         VLogWriteAdmissionMode writeAdmission = VLogWriteAdmissionMode::SERIAL;
         // Applies only to SERIAL admission. PARALLEL always submits to lane workers.
@@ -107,6 +107,11 @@ namespace akkaradb::engine::vlog {
         std::vector<uint8_t> value;
     };
 
+    struct AKDB_API VersionRecord {
+        std::vector<uint8_t> key;
+        VersionEntry entry;
+    };
+
     struct AKDB_API VersionLogSnapshot {
         uint8_t syncMode = static_cast<uint8_t>(VLogSyncMode::ASYNC);
         uint8_t codec = static_cast<uint8_t>(VLogCodec::NONE);
@@ -141,7 +146,7 @@ namespace akkaradb::engine::vlog {
 
     class AKDB_API VersionLog {
         public:
-            [[nodiscard]] static std::unique_ptr<VersionLog> create(VersionLogOptions opts);
+            [[nodiscard]] static std::unique_ptr<VersionLog> create(std::filesystem::path logPath, VersionLogOptions opts = {});
 
             ~VersionLog();
 
@@ -177,10 +182,13 @@ namespace akkaradb::engine::vlog {
 
             [[nodiscard]] std::optional<VersionEntry> getAt(std::span<const uint8_t> key, uint64_t atSeq) const;
             [[nodiscard]] std::vector<VersionEntry> history(std::span<const uint8_t> key) const;
+            [[nodiscard]] std::vector<VersionRecord> collectSince(uint64_t afterSeq) const;
 
             [[nodiscard]] std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> collectRollbackTargets(
                 uint64_t targetSeq
             ) const;
+
+            void seedCommittedSeq(uint64_t seq);
 
             [[nodiscard]] VersionLogSnapshot snapshot() const noexcept;
             void forceSync();

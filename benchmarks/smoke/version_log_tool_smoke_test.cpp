@@ -65,9 +65,8 @@ namespace {
 
     void createLog(const fs::path& path) {
         vlog::VersionLogOptions options;
-        options.logPath = path;
         options.syncMode = vlog::VLogSyncMode::SYNC;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         for (uint64_t seq = 1; seq <= 4; ++seq) {
             const auto value = "value-" + std::to_string(seq);
             log->append(bytes("tool-key"), seq, 0, 0, 0, bytes(value));

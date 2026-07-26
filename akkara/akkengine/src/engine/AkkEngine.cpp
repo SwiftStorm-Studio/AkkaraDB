@@ -1769,11 +1769,6 @@ namespace akkaradb::engine {
         fillPath(options.paths.clusterConfigPath, "cluster.akcc");
         fillPath(options.paths.nodeIdPath, "node.id");
 
-        if (options.wal.walDir.empty()) { options.wal.walDir = options.paths.walDir; }
-        if (options.blob.blobDir.empty()) { options.blob.blobDir = options.paths.blobDir; }
-        if (options.sst.sstDir.empty()) { options.sst.sstDir = options.paths.sstDir; }
-        if (options.vlog.logPath.empty()) { options.vlog.logPath = options.paths.versionLogPath; }
-
         if (options.runtime.writerThreads > 0) {
             if (options.memtable.expectedConcurrentWriters == 0) {
                 options.memtable.expectedConcurrentWriters = options.runtime.writerThreads;
@@ -1789,14 +1784,14 @@ namespace akkaradb::engine {
         validateRuntimeOptions(options);
 
         if (!options.paths.dataDir.empty()) { ensureDir(options.paths.dataDir); }
-        if (options.components.walEnabled) { ensureDir(options.wal.walDir); }
-        if (options.components.blobEnabled) { ensureDir(options.blob.blobDir); }
-        if (options.components.sstEnabled) { ensureDir(options.sst.sstDir); }
+        if (options.components.walEnabled) { ensureDir(options.paths.walDir); }
+        if (options.components.blobEnabled) { ensureDir(options.paths.blobDir); }
+        if (options.components.sstEnabled) { ensureDir(options.paths.sstDir); }
         if (options.components.manifestEnabled) { ensureDir(options.paths.manifestPath.parent_path()); }
-        if (options.components.versionLogEnabled && options.vlog.logPath.empty()) {
+        if (options.components.versionLogEnabled && options.paths.versionLogPath.empty()) {
             throw std::invalid_argument("AkkEngine: version log path is required when components.versionLogEnabled is true");
         }
-        if (options.components.versionLogEnabled) { ensureDir(options.vlog.logPath.parent_path()); }
+        if (options.components.versionLogEnabled) { ensureDir(options.paths.versionLogPath.parent_path()); }
         if (options.components.apiEnabled && options.api.bindHost.empty()) {
             throw std::invalid_argument("AkkEngine: api.bindHost is required when components.apiEnabled is true");
         }
@@ -1816,8 +1811,8 @@ namespace akkaradb::engine {
             impl.manifest->start();
         }
 
-        if (impl.opts.components.sstEnabled && !impl.opts.sst.sstDir.empty()) {
-            impl.sstManager = sst::SSTManager::create(impl.opts.sst, impl.manifest.get());
+        if (impl.opts.components.sstEnabled && !impl.opts.paths.sstDir.empty()) {
+            impl.sstManager = sst::SSTManager::create(impl.opts.paths.sstDir, impl.opts.sst, impl.manifest.get());
             if (impl.opts.runtime.recoverSst) { impl.sstManager->recover(); }
         }
 
@@ -1852,12 +1847,59 @@ namespace akkaradb::engine {
             }
             walRecoveryCheckpointSeq = manifestCheckpointSeq;
         }
+        uint64_t preWalRecoveredSeq = 0;
+        if (impl.sstManager) { preWalRecoveredSeq = std::max(preWalRecoveredSeq, impl.sstManager->maxSequence()); }
+        std::exception_ptr versionLogStartupError;
+        if (impl.opts.components.versionLogEnabled) {
+            impl.opts.vlog.initialCommittedSeq = std::max(impl.opts.vlog.initialCommittedSeq, preWalRecoveredSeq);
+            try { impl.versionLog = vlog::VersionLog::create(impl.opts.paths.versionLogPath, impl.opts.vlog); }
+            catch (...) { versionLogStartupError = std::current_exception(); }
+        }
+        bool walRecoveryHadCorruption = false;
         if (impl.opts.components.walEnabled && impl.opts.runtime.recoverWal) {
             const auto recovery = wal::WalRecovery::recoverInto(
-                wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir, .checkpointSeq = walRecoveryCheckpointSeq},
+                wal::WalRecoveryOptions{
+                    .walDir = impl.opts.paths.walDir,
+                    .checkpointSeq = walRecoveryCheckpointSeq,
+                    .truncateCorruptTail = impl.opts.runtime.truncateCorruptWalOnRecovery
+                },
                 *impl.memtable
             );
-            (void)recovery;
+            walRecoveryHadCorruption = recovery.corruptSegments > 0;
+            if (walRecoveryHadCorruption && impl.versionLog) {
+                try {
+                    const uint64_t versionLogSupplementAfterSeq = std::max(walRecoveryCheckpointSeq, recovery.maxSeq);
+                    const auto records = impl.versionLog->collectSince(versionLogSupplementAfterSeq);
+                    for (const auto& record : records) {
+                        const uint8_t flags = static_cast<uint8_t>(
+                            record.entry.flags & (MemHdr16::FLAG_TOMBSTONE | MemHdr16::FLAG_BLOB)
+                        );
+                        const std::span<const uint8_t> key{record.key.data(), record.key.size()};
+                        const uint64_t fp64 = core::computeKeyFp64(key);
+                        const uint64_t mini = core::buildMiniKey(key);
+                        if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { impl.memtable->remove(key, record.entry.seq, fp64, mini); }
+                        else {
+                            impl.memtable->put(
+                                key,
+                                std::span<const uint8_t>{record.entry.value.data(), record.entry.value.size()},
+                                record.entry.seq,
+                                flags,
+                                fp64,
+                                mini
+                            );
+                        }
+                    }
+                }
+                catch (...) {
+                    if (!impl.opts.runtime.ignoreVersionLogSupplementErrors) { throw; }
+                    impl.versionLog.reset();
+                }
+            }
+        }
+        if (versionLogStartupError) {
+            if (!walRecoveryHadCorruption || !impl.opts.runtime.ignoreVersionLogSupplementErrors) {
+                std::rethrow_exception(versionLogStartupError);
+            }
         }
         uint64_t recoveredSeq = 0;
         if (impl.memtable) {
@@ -1867,8 +1909,9 @@ namespace akkaradb::engine {
         if (impl.sstManager) { recoveredSeq = std::max(recoveredSeq, impl.sstManager->maxSequence()); }
         if (impl.memtable && recoveredSeq > 0) { impl.memtable->advanceSeq(recoveredSeq); }
         impl.resetCommittedSeq(recoveredSeq);
+        if (impl.versionLog) { impl.versionLog->seedCommittedSeq(recoveredSeq); }
 
-        if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.wal); }
+        if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.paths.walDir, impl.opts.wal); }
         if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) {
             impl.walWriter->pruneUntil(walRecoveryCheckpointSeq);
         }
@@ -1888,13 +1931,8 @@ namespace akkaradb::engine {
                 try { impl.manifest->blobDelete(blobId); }
                 catch (...) {}
             };
-            impl.blobManager = blob::BlobManager::create(impl.opts.blob);
+            impl.blobManager = blob::BlobManager::create(impl.opts.paths.blobDir, impl.opts.blob);
             impl.blobManager->start();
-        }
-
-        if (impl.opts.components.versionLogEnabled) {
-            impl.opts.vlog.initialCommittedSeq = std::max(impl.opts.vlog.initialCommittedSeq, recoveredSeq);
-            impl.versionLog = vlog::VersionLog::create(impl.opts.vlog);
         }
 
         if (impl.opts.components.clusterEnabled) {
@@ -1915,7 +1953,7 @@ namespace akkaradb::engine {
                     std::vector<cluster::ClusterHistoryEntry> entries;
                     bool hasExternalBlob = false;
                     const auto recovery = wal::WalRecovery::recover(
-                        wal::WalRecoveryOptions{.walDir = impl.opts.wal.walDir},
+                        wal::WalRecoveryOptions{.walDir = impl.opts.paths.walDir},
                         [&](const wal::WalRecoveredEntry& item) {
                             if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
                             const uint8_t flags = static_cast<uint8_t>(item.flags);

@@ -16,7 +16,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <new>
 #include <span>
 #include <vector>
@@ -29,7 +28,8 @@ namespace akkaradb::engine::memtable {
     class AKDB_API SkipListMemTable final : public IMemTable {
         public:
             static constexpr uint8_t MAX_LEVEL = 12;
-            static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;
+            static constexpr size_t DEFAULT_MAX_VERSIONS_PER_KEY = 4;
+            static constexpr size_t MAX_CONFIGURED_VERSIONS_PER_KEY = 65535;
 
             // The enclosing MemTable serializes put() and freeze() per shard.
             // get() and iterator() are safe concurrently with that single writer.
@@ -60,9 +60,17 @@ namespace akkaradb::engine::memtable {
         private:
             struct VersionChain {
                 std::atomic<uint64_t> version{0};
-                std::atomic<uint8_t> head{0};
-                std::atomic<uint8_t> count{0};
-                std::array<std::atomic<const core::OwnedRecord*>, MAX_VERSIONS_PER_KEY> ring{};
+                uint16_t capacity{0};
+                std::atomic<uint16_t> head{0};
+                std::atomic<uint16_t> count{0};
+
+                [[nodiscard]] std::atomic<const core::OwnedRecord*>* ring() noexcept {
+                    return std::launder(reinterpret_cast<std::atomic<const core::OwnedRecord*>*>(this + 1));
+                }
+
+                [[nodiscard]] const std::atomic<const core::OwnedRecord*>* ring() const noexcept {
+                    return std::launder(reinterpret_cast<const std::atomic<const core::OwnedRecord*>*>(this + 1));
+                }
             };
 
             struct Node {
@@ -88,14 +96,15 @@ namespace akkaradb::engine::memtable {
             static_assert(alignof(Node) >= alignof(std::atomic<Node*>));
 
             core::BufferArena dataArena_;
-            mutable core::BufferArena generatorArena_;
             Node* head_{nullptr};
             std::atomic<bool> frozen_{false};
             std::atomic<size_t> bytes_{0};
             std::atomic<size_t> entries_{0};
             std::atomic<uint8_t> currentMaxLevel_{1};
             uint64_t rngState_{0x9e3779b97f4a7c15ULL};
-            mutable std::mutex generatorArenaMutex_;
+            size_t generatorArenaInitialBlockSize_{64 * 1024};
+            size_t generatorArenaMaxBlockSize_{2 * 1024 * 1024};
+            uint16_t maxVersionsPerKey_{DEFAULT_MAX_VERSIONS_PER_KEY};
 
             [[nodiscard]] static std::span<const uint8_t> asU8(ByteView view) noexcept;
             [[nodiscard]] uint64_t nextRandom() noexcept;

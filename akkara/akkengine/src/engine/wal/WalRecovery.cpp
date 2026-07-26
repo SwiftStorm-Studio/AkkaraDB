@@ -28,6 +28,12 @@ namespace akkaradb::engine::wal {
             WalSegmentHeader header;
         };
 
+        struct SegmentRecoveryStatus {
+            bool clean = true;
+            bool replayedAny = false;
+            uint64_t validBytes = WalSegmentHeader::SIZE;
+        };
+
         [[nodiscard]] bool readExact(std::ifstream& file, uint8_t* out, size_t len) {
             if (len == 0) { return true; }
             file.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(len));
@@ -72,7 +78,7 @@ namespace akkaradb::engine::wal {
             return files;
         }
 
-        void recoverSegment(
+        [[nodiscard]] SegmentRecoveryStatus recoverSegment(
             const SegmentFile& segment,
             const WalRecoveryOptions& options,
             const WalRecovery::Callback& callback,
@@ -82,7 +88,7 @@ namespace akkaradb::engine::wal {
             if (!file) { throw std::runtime_error("WAL recovery failed to open segment: " + segment.path.string()); }
             file.seekg(WalSegmentHeader::SIZE, std::ios::beg);
 
-            bool replayedAny = false;
+            SegmentRecoveryStatus status;
             std::vector<uint8_t> key;
             std::vector<uint8_t> value;
 
@@ -91,27 +97,38 @@ namespace akkaradb::engine::wal {
                 file.read(reinterpret_cast<char*>(ehdrBuf), WalEntryHeader::SIZE);
                 const std::streamsize got = file.gcount();
                 if (got == 0) { break; }
-                if (got != static_cast<std::streamsize>(WalEntryHeader::SIZE)) { break; }
+                if (got != static_cast<std::streamsize>(WalEntryHeader::SIZE)) {
+                    ++result.corruptSegments;
+                    status.clean = false;
+                    break;
+                }
 
                 const WalEntryHeader ehdr = WalEntryHeader::deserialize(ehdrBuf);
                 if (!ehdr.verifyLengths(options.maxEntryBytes)) {
                     ++result.corruptSegments;
+                    status.clean = false;
                     break;
                 }
 
                 key.resize(ehdr.keyLen);
                 value.resize(ehdr.valueLen);
-                if (!readExact(file, key.data(), key.size()) || !readExact(file, value.data(), value.size())) { break; }
+                if (!readExact(file, key.data(), key.size()) || !readExact(file, value.data(), value.size())) {
+                    ++result.corruptSegments;
+                    status.clean = false;
+                    break;
+                }
 
                 const std::span<const uint8_t> keySpan{key.data(), key.size()};
                 const std::span<const uint8_t> valueSpan{value.data(), value.size()};
                 if (!ehdr.verifyChecksum(keySpan, valueSpan)) {
                     ++result.corruptSegments;
+                    status.clean = false;
                     break;
                 }
 
                 ++result.entriesSeen;
                 result.maxSeq = std::max(result.maxSeq, ehdr.seq);
+                status.validBytes += ehdr.entryLen;
 
                 if (ehdr.seq <= options.checkpointSeq) { continue; }
 
@@ -125,10 +142,19 @@ namespace akkaradb::engine::wal {
                 out.segmentId = segment.header.segmentId;
                 callback(out);
                 ++result.entriesReplayed;
-                replayedAny = true;
+                status.replayedAny = true;
             }
 
-            if (replayedAny) { ++result.segmentsReplayed; }
+            if (status.replayedAny) { ++result.segmentsReplayed; }
+            return status;
+        }
+
+        void truncateCorruptSegmentTail(const SegmentFile& segment, const SegmentRecoveryStatus& status, WalRecoveryResult& result) {
+            const uint64_t currentSize = fs::file_size(segment.path);
+            if (status.validBytes < currentSize) {
+                fs::resize_file(segment.path, status.validBytes);
+                ++result.segmentsTruncated;
+            }
         }
     } // namespace
 
@@ -136,7 +162,21 @@ namespace akkaradb::engine::wal {
         if (!callback) { throw std::invalid_argument("WAL recovery callback is empty"); }
         WalRecoveryResult result{};
         const std::vector<SegmentFile> files = listSegments(options.walDir, result);
-        for (const SegmentFile& segment : files) { recoverSegment(segment, options, callback, result); }
+        bool skipShard = false;
+        uint16_t skippedShard = 0;
+        for (const SegmentFile& segment : files) {
+            if (skipShard && segment.header.shardId == skippedShard) {
+                if (options.truncateCorruptTail && fs::remove(segment.path)) { ++result.segmentsRemoved; }
+                continue;
+            }
+            if (skipShard && segment.header.shardId != skippedShard) { skipShard = false; }
+            const SegmentRecoveryStatus status = recoverSegment(segment, options, callback, result);
+            if (!status.clean) {
+                if (options.truncateCorruptTail) { truncateCorruptSegmentTail(segment, status, result); }
+                skipShard = true;
+                skippedShard = segment.header.shardId;
+            }
+        }
         return result;
     }
 

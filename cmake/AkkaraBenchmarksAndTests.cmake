@@ -127,6 +127,7 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_wal_throughput_benchmark|benchmarks/throughput/wal_throughput_benchmark.cpp
         akkaradb_sstable_throughput_benchmark|benchmarks/throughput/sstable_throughput_benchmark.cpp
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
+        akkaradb_bptree_mutable_concurrency_stress_test|benchmarks/smoke/bptree_mutable_concurrency_stress_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
         akkaradb_memtable_lifecycle_smoke_test|benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
         akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
@@ -195,6 +196,7 @@ if (WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
+        akkaradb_bptree_mutable_concurrency_stress_test
         akkaradb_cluster_smoke_test
         akkaradb_memtable_lifecycle_smoke_test
         akkaradb_parallel_memtable_visibility_smoke_test

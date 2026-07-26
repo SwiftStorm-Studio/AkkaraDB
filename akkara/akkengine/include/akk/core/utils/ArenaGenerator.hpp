@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <exception>
 #include <iterator>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -127,11 +128,15 @@ namespace akkaradb::core {
             ArenaGenerator(const ArenaGenerator&) = delete;
             ArenaGenerator& operator=(const ArenaGenerator&) = delete;
 
-            ArenaGenerator(ArenaGenerator&& other) noexcept : handle_{std::exchange(other.handle_, {})} {}
+            ArenaGenerator(ArenaGenerator&& other) noexcept
+                : ownedArena_{std::move(other.ownedArena_)},
+                  handle_{std::exchange(other.handle_, {})} {}
 
             ArenaGenerator& operator=(ArenaGenerator&& other) noexcept {
                 if (this != &other) {
                     if (handle_) { handle_.destroy(); }
+                    ownedArena_.reset();
+                    ownedArena_ = std::move(other.ownedArena_);
                     handle_ = std::exchange(other.handle_, {});
                 }
                 return *this;
@@ -165,6 +170,14 @@ namespace akkaradb::core {
 
                 ScopedArena scoped{&arena};
                 return std::forward<Factory>(factory)();
+            }
+
+            template <typename Factory>
+            [[nodiscard]] static ArenaGenerator withOwnedArena(size_t initialBlockSize, size_t maxBlockSize, Factory&& factory) {
+                auto arena = std::make_unique<BufferArena>(initialBlockSize, maxBlockSize);
+                ArenaGenerator out = withArena(*arena, std::forward<Factory>(factory));
+                out.ownedArena_ = std::move(arena);
+                return out;
             }
 
             [[nodiscard]] static ArenaGenerator yieldAll(BufferArena& arena, ArenaGenerator first, ArenaGenerator second) {
@@ -213,6 +226,7 @@ namespace akkaradb::core {
                 for (auto& gen : tail) { for (auto&& value : gen) { co_yield value; } }
             }
 
+            std::unique_ptr<BufferArena> ownedArena_;
             HandleType handle_{};
     };
 

@@ -217,6 +217,8 @@ namespace akkaradb::engine {
         struct RuntimeOptions {
             uint32_t writerThreads = 0;
             bool recoverWal = true;
+            bool truncateCorruptWalOnRecovery = false;
+            bool ignoreVersionLogSupplementErrors = false;
             bool recoverSst = true;
             bool pruneWalOnFlush = true;
             bool forceFlushOnClose = true;

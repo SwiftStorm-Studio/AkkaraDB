@@ -24,7 +24,6 @@ namespace akkaradb::engine::blob {
     class AKDB_API BlobManager {
         public:
             struct Options {
-                std::filesystem::path blobDir;
                 uint64_t thresholdBytes = DEFAULT_THRESHOLD_BYTES;
                 BlobCodec codec = BlobCodec::NONE;
                 bool gcOnFlush = false;
@@ -47,7 +46,7 @@ namespace akkaradb::engine::blob {
                 uint64_t gcCycles = 0;
             };
 
-            [[nodiscard]] static std::unique_ptr<BlobManager> create(Options options);
+            [[nodiscard]] static std::unique_ptr<BlobManager> create(std::filesystem::path blobDir, Options options);
 
             ~BlobManager();
 

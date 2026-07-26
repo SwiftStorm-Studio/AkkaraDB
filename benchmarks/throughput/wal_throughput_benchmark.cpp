@@ -316,7 +316,6 @@ namespace {
     }
 
     [[nodiscard]] static WalOptions makeOptions(
-        const fs::path& walDir,
         WalSyncMode syncMode,
         uint32_t shardCount,
         uint32_t groupN,
@@ -325,7 +324,6 @@ namespace {
         uint64_t asyncMaxPendingBytes
     ) {
         WalOptions opts;
-        opts.walDir = walDir;
         opts.syncMode = syncMode;
         opts.shardCount = static_cast<uint16_t>(shardCount);
         opts.groupN = groupN;
@@ -384,8 +382,7 @@ namespace {
                 spec.valueSize,
                 syncModeName(syncMode)
             ));
-            auto warmup = WalWriter::create(makeOptions(
-                warmupDir,
+            auto warmup = WalWriter::create(warmupDir, makeOptions(
                 syncMode,
                 shardCount,
                 groupN,
@@ -408,8 +405,7 @@ namespace {
             shardCount
         ));
 
-        auto writer = WalWriter::create(makeOptions(
-            dir,
+        auto writer = WalWriter::create(dir, makeOptions(
             syncMode,
             shardCount,
             groupN,

@@ -31,6 +31,7 @@ namespace akkaradb::engine::wal {
         std::filesystem::path walDir;
         uint64_t checkpointSeq = 0;
         size_t maxEntryBytes = 64ULL * 1024ULL * 1024ULL;
+        bool truncateCorruptTail = false;
     };
 
     struct AKDB_API WalRecoveredEntry {
@@ -50,6 +51,8 @@ namespace akkaradb::engine::wal {
         uint64_t entriesSeen = 0;
         uint64_t entriesReplayed = 0;
         uint64_t maxSeq = 0;
+        uint64_t segmentsTruncated = 0;
+        uint64_t segmentsRemoved = 0;
     };
 
     class AKDB_API WalRecovery {

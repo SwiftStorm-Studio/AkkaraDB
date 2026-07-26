@@ -30,10 +30,25 @@ namespace akkaradb::engine::memtable {
         STREAMING_RESTART = 1,
     };
 
+    enum class BPTreeConcurrencyMode : uint8_t {
+        // Serialize BPTree structural writes against mutable readers.
+        LOCKED = 0,
+        // Preserve the old optimistic reader path. This is for experiments only;
+        // internal splits can expose transient unreachable paths to readers.
+        OPTIMISTIC_UNSAFE = 1,
+    };
+
     struct MemTableBackendOptions {
         // BPTree uses this to select mutable scan behavior. SkipList and ART
         // already provide stable ordered traversal, so it is intentionally a no-op there.
         MutableScanMode mutableScanMode = MutableScanMode::RECONCILE;
+        // BPTree structural concurrency policy. Keep LOCKED for correctness
+        // unless a caller is explicitly running unsafe experiments.
+        BPTreeConcurrencyMode bptreeConcurrencyMode = BPTreeConcurrencyMode::LOCKED;
+        // Number of recent same-key versions retained inside a mutable MemTable
+        // backend. SkipList and BPTree honor this option; ART currently keeps
+        // its backend-local default.
+        size_t maxVersionsPerKey = 4;
     };
 
     /**

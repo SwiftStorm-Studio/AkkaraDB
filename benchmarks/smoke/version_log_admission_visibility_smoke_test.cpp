@@ -58,9 +58,8 @@ namespace {
             fs::path path_;
     };
 
-    [[nodiscard]] vlog::VersionLogOptions logOptions(const fs::path& path, vlog::VLogReadVisibilityMode visibility) {
+    [[nodiscard]] vlog::VersionLogOptions logOptions(vlog::VLogReadVisibilityMode visibility) {
         vlog::VersionLogOptions options;
-        options.logPath = path;
         options.syncMode = vlog::VLogSyncMode::SYNC;
         options.readVisibility = visibility;
         return options;
@@ -71,7 +70,7 @@ namespace {
         constexpr std::string_view value{"value"};
 
         {
-            auto log = vlog::VersionLog::create(logOptions(dir / "commit.akvlog", vlog::VLogReadVisibilityMode::COMMIT_ORDER));
+            auto log = vlog::VersionLog::create(dir / "commit.akvlog", logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER));
             log->appendDeferred(bytes(key), 1, 0, 0, 0, bytes(value));
             require(!log->getAt(bytes(key), 1).has_value(), "COMMIT_ORDER must hide a deferred append");
             require(log->history(bytes(key)).empty(), "COMMIT_ORDER history must hide a deferred append");
@@ -82,7 +81,7 @@ namespace {
         }
 
         {
-            auto log = vlog::VersionLog::create(logOptions(dir / "applied.akvlog", vlog::VLogReadVisibilityMode::APPLIED));
+            auto log = vlog::VersionLog::create(dir / "applied.akvlog", logOptions(vlog::VLogReadVisibilityMode::APPLIED));
             log->appendDeferred(bytes(key), 1, 0, 0, 0, bytes(value));
             const auto observed = log->getAt(bytes(key), 1);
             require(observed.has_value() && observed->value == std::vector<uint8_t>{value.begin(), value.end()}, "APPLIED must reveal a deferred append");
@@ -97,18 +96,18 @@ namespace {
         const auto path = dir / "background.akvlog";
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.syncMode = vlog::VLogSyncMode::ASYNC;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             for (uint64_t seq = 1; seq <= entryCount; ++seq) {
                 log->append(bytes(key), seq, 0, 0, 0, bytes(value));
             }
             log->close();
         }
 
-        auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.recoveryMode = vlog::VLogRecoveryMode::BACKGROUND;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         // getAt waits for background validation and scans the persisted history on demand.
         const auto observed = log->getAt(bytes(key), entryCount);
         require(observed.has_value() && observed->seq == entryCount, "background recovery must expose persisted history after waiting");
@@ -123,18 +122,18 @@ namespace {
         const auto path = dir / "compression.akvlog";
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             require(options.codec == vlog::VLogCodec::NONE, "VersionLog compression must default to NONE");
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             log->append(bytes(key), 1, 0, 0, 0, bytes(plainValue));
             log->close();
         }
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.codec = vlog::VLogCodec::ZSTD;
             options.zstdCompressionLevel = 3;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             const auto snapshot = log->snapshot();
             require(snapshot.codec == static_cast<uint8_t>(vlog::VLogCodec::ZSTD) && snapshot.zstdCompressionLevel == 3,
                     "VersionLog must expose the configured Zstd codec and level");
@@ -146,10 +145,10 @@ namespace {
         require(fs::file_size(path) < repeatedValue.size(), "VersionLog must persist compressible values in Zstd form");
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.codec = vlog::VLogCodec::ZSTD;
             options.zstdCompressionLevel = 3;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             const auto original = log->getAt(bytes(key), 1);
             const auto compressed = log->getAt(bytes(key), 2);
             require(original.has_value() && original->value == std::vector<uint8_t>{plainValue.begin(), plainValue.end()},
@@ -160,11 +159,12 @@ namespace {
             log->close();
         }
 
-        auto invalid = logOptions(dir / "invalid-zstd-level.akvlog", vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        const auto invalidPath = dir / "invalid-zstd-level.akvlog";
+        auto invalid = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         invalid.codec = vlog::VLogCodec::ZSTD;
         invalid.zstdCompressionLevel = std::numeric_limits<int>::max();
         bool rejected = false;
-        try { (void)vlog::VersionLog::create(std::move(invalid)); }
+        try { (void)vlog::VersionLog::create(invalidPath, std::move(invalid)); }
         catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "VersionLog must reject an unsupported Zstd level at startup");
     }
@@ -176,9 +176,9 @@ namespace {
         const auto path = dir / "segments.akvlog";
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 256;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             log->append(bytes(key), 0, 0, 0, 0, bytes(value));
             for (uint64_t seq = 1; seq <= entryCount; ++seq) {
                 log->append(bytes(key), seq, 0, 0, 0, bytes(value));
@@ -191,10 +191,10 @@ namespace {
         require(fs::exists(dir / "segments-seg-1.akvlog"), "VersionLog must create numbered sibling segments without changing the extension");
         require(fs::exists(dir / "segments.akvidx"), "VersionLog must persist a sidecar index for segment zero");
         require(fs::exists(dir / "segments-seg-1.akvidx"), "VersionLog must persist a sidecar index for closed segments");
-        auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.segmentBytes = 256;
         options.recoveryMode = vlog::VLogRecoveryMode::BACKGROUND;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         const auto zero = log->getAt(bytes(key), 0);
         require(zero.has_value() && zero->seq == 0, "segment index must retain a zero-sequence version");
         const auto observed = log->getAt(bytes(key), 6);
@@ -225,9 +225,9 @@ namespace {
         const auto path = dir / "single-file.akvlog";
 
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 0;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             log->append(bytes(key), 1, 0, 0, 0, bytes(value));
             log->append(bytes(key), 2, 0, 0, 0, bytes(value));
             require(log->history(bytes(key)).size() == 2,
@@ -235,9 +235,9 @@ namespace {
             log->close();
         }
 
-        auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.segmentBytes = 0;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         require(log->history(bytes(key)).size() == 2, "recovery must regenerate the single-file index sidecar");
         log->append(bytes(key), 3, 0, 0, 0, bytes(value));
         require(log->history(bytes(key)).size() == 3,
@@ -251,9 +251,9 @@ namespace {
         const auto sequencePath = dir / "retention-sequence.akvlog";
 
         {
-            auto options = logOptions(sequencePath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(sequencePath, std::move(options));
             for (uint64_t seq = 1; seq <= 12; ++seq) {
                 log->append(bytes(key), seq, 0, 0, 0, bytes(value));
             }
@@ -261,10 +261,10 @@ namespace {
         }
 
         {
-            auto options = logOptions(sequencePath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
             options.retentionMinCommitSeq = 7;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(sequencePath, std::move(options));
             const auto snapshot = log->snapshot();
             require(snapshot.retentionMinCommitSeq == 7, "VersionLog must expose the configured commit-sequence retention boundary");
             require(!fs::exists(sequencePath) && !fs::exists(dir / "retention-sequence-seg-1.akvlog"),
@@ -283,9 +283,9 @@ namespace {
         constexpr std::string_view driverKey{"retention-driver"};
         constexpr std::string_view carriedValue{"carried-value"};
         {
-            auto options = logOptions(compactedPath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(compactedPath, std::move(options));
             log->append(bytes(carriedKey), 1, 0, 0, 0, bytes(carriedValue));
             for (uint64_t seq = 2; seq <= 10; ++seq) {
                 log->append(bytes(driverKey), seq, 0, 0, 0, bytes(value));
@@ -294,10 +294,10 @@ namespace {
         }
 
         {
-            auto options = logOptions(compactedPath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
             options.retentionMinCommitSeq = 7;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(compactedPath, std::move(options));
             require(!log->getAt(bytes(carriedKey), 6).has_value(),
                     "retention compaction must not recreate history before the configured sequence boundary");
             const auto carried = log->getAt(bytes(carriedKey), 7);
@@ -314,9 +314,9 @@ namespace {
 
         const auto agePath = dir / "retention-age.akvlog";
         {
-            auto options = logOptions(agePath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(agePath, std::move(options));
             for (uint64_t seq = 1; seq <= 4; ++seq) {
                 log->append(bytes(key), seq, 0, 0, 0, bytes(value));
             }
@@ -325,10 +325,10 @@ namespace {
         fs::last_write_time(agePath, fs::file_time_type::clock::now() - std::chrono::hours{48});
 
         {
-            auto options = logOptions(agePath, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.segmentBytes = 150;
             options.retentionDays = 1;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(agePath, std::move(options));
             require(!fs::exists(agePath), "age retention must remove a closed segment older than the configured number of days");
             require(fs::exists(dir / "retention-age-seg-1.akvlog"), "age retention must retain newer closed segments");
             require(log->history(bytes(key)).size() == 2, "age retention must retain only entries from non-expired segments");
@@ -342,10 +342,10 @@ namespace {
         constexpr std::string_view value{"value"};
         const auto path = dir / "retention-concurrent.akvlog";
 
-        auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.segmentBytes = 150;
         options.retentionDays = 1;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         log->append(bytes(carriedKey), 1, 0, 0, 0, bytes(value));
         for (uint64_t seq = 2; seq <= 16; ++seq) {
             log->append(bytes(driverKey), seq, 0, 0, 0, bytes(value));
@@ -388,11 +388,12 @@ namespace {
         constexpr uint64_t seedEntries = 256;
         constexpr uint32_t readerCount = 8;
         constexpr uint32_t readerIterations = 64;
+        const auto path = dir / "readers.akvlog";
 
-        auto options = logOptions(dir / "readers.akvlog", vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.syncMode = vlog::VLogSyncMode::ASYNC;
         options.writeAdmission = vlog::VLogWriteAdmissionMode::PARALLEL;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         for (uint64_t seq = 1; seq <= seedEntries; ++seq) {
             log->append(bytes(readKey), seq, 0, 0, 0, bytes(value));
         }
@@ -446,11 +447,12 @@ namespace {
     void verifySerialAppendGate(const fs::path& dir) {
         constexpr std::string_view key{"serial-append-gate"};
         constexpr std::string_view value{"value"};
-        auto options = logOptions(dir / "serial-append-gate.akvlog", vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        const auto path = dir / "serial-append-gate.akvlog";
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.syncMode = vlog::VLogSyncMode::ASYNC;
         options.serialAppendMode = vlog::VLogSerialAppendMode::WAIT_PREVIOUS_APPEND;
         options.asyncMaxPendingBytes = 1;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         log->append(bytes(key), 1, 0, 0, 0, bytes(value));
         log->append(bytes(key), 2, 0, 0, 0, bytes(value));
         const auto history = log->history(bytes(key));
@@ -464,12 +466,12 @@ namespace {
         constexpr uint32_t entriesPerWriter = 24;
         const auto path = dir / "true-parallel.akvlog";
         {
-            auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+            auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
             options.syncMode = vlog::VLogSyncMode::ASYNC;
             options.writeAdmission = vlog::VLogWriteAdmissionMode::PARALLEL;
             options.parallelWriteLanes = 4;
             options.parallelPendingLimitScope = vlog::VLogParallelPendingLimitScope::GLOBAL;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
 
             std::vector<std::thread> writers;
             writers.reserve(writerCount);
@@ -489,12 +491,12 @@ namespace {
 
         require(fs::exists(dir / "true-parallel-seg-1.akvtail"), "parallel VLog must persist a durable tail for each active lane");
         require(fs::exists(dir / "true-parallel-seg-1.akvidx"), "parallel VLog must publish a sidecar index when a lane closes");
-        auto options = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.syncMode = vlog::VLogSyncMode::ASYNC;
         options.writeAdmission = vlog::VLogWriteAdmissionMode::PARALLEL;
         options.parallelWriteLanes = 4;
         options.parallelPendingLimitScope = vlog::VLogParallelPendingLimitScope::GLOBAL;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         for (uint32_t writer = 0; writer < writerCount; ++writer) {
             const std::string key = "true-parallel-key-" + std::to_string(writer);
             const auto history = log->history(bytes(key));
@@ -504,13 +506,13 @@ namespace {
 
         constexpr std::string_view serialKey{"parallel-to-serial"};
         constexpr std::string_view serialValue{"serial-value"};
-        auto serialOptions = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
-        auto serialLog = vlog::VersionLog::create(std::move(serialOptions));
+        auto serialOptions = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto serialLog = vlog::VersionLog::create(path, std::move(serialOptions));
         serialLog->append(bytes(serialKey), writerCount * entriesPerWriter + 1u, 0, 0, 0, bytes(serialValue));
         serialLog->close();
 
-        auto verifySerialOptions = logOptions(path, vlog::VLogReadVisibilityMode::COMMIT_ORDER);
-        auto verifySerial = vlog::VersionLog::create(std::move(verifySerialOptions));
+        auto verifySerialOptions = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        auto verifySerial = vlog::VersionLog::create(path, std::move(verifySerialOptions));
         const auto serialEntry = verifySerial->getAt(bytes(serialKey), writerCount * entriesPerWriter + 1u);
         require(serialEntry.has_value() && serialEntry->value == std::vector<uint8_t>{serialValue.begin(), serialValue.end()},
                 "serial reopening must safely continue from a parallel durable tail");

@@ -16,7 +16,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -118,8 +117,8 @@ namespace akkaradb::engine::memtable {
             using ChildVec = std::vector<ChildEntry>;
 
             core::BufferArena dataArena_;
-            mutable core::BufferArena generatorArena_;
-            mutable std::mutex generatorArenaMutex_;
+            size_t generatorArenaInitialBlockSize_{64 * 1024};
+            size_t generatorArenaMaxBlockSize_{2 * 1024 * 1024};
 
             std::atomic<NodeBase*> root_{nullptr};
             std::atomic<bool> frozen_{false};

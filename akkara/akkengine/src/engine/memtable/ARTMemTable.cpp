@@ -53,7 +53,8 @@ namespace akkaradb::engine::memtable {
         MemTableBackendOptions backendOptions
     )
         : dataArena_{dataArenaInitialBlockSize, dataArenaMaxBlockSize},
-          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize} { (void)backendOptions; }
+          generatorArenaInitialBlockSize_{generatorArenaInitialBlockSize},
+          generatorArenaMaxBlockSize_{generatorArenaMaxBlockSize} { (void)backendOptions; }
 
     std::span<const uint8_t> ARTMemTable::asU8(ByteView view) noexcept {
         return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
@@ -591,9 +592,9 @@ namespace akkaradb::engine::memtable {
         std::vector<uint8_t> startOwned(start.begin(), start.end());
         std::vector<uint8_t> endOwned(end.begin(), end.end());
 
-        std::lock_guard<std::mutex> lock{generatorArenaMutex_};
-        return ArenaGenerator<RecordView>::withArena(
-            generatorArena_,
+        return ArenaGenerator<RecordView>::withOwnedArena(
+            generatorArenaInitialBlockSize_,
+            generatorArenaMaxBlockSize_,
             [this, snapshotSeq, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
                 return iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }

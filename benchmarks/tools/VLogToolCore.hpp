@@ -123,9 +123,8 @@ namespace akkaradb::tools::vlogtool {
             }
 
             vlog::VersionLogOptions options;
-            options.logPath = args.logPath;
             options.recoveryMode = vlog::VLogRecoveryMode::EAGER;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(args.logPath, std::move(options));
             log->forceSync();
             const auto snapshot = log->snapshot();
             log->close();

@@ -141,6 +141,7 @@ namespace {
 
     void verifyEnginePassesBackendOptionsAtInitialization() {
         using EngineOptions = akkaradb::engine::AkkEngineOptions;
+        using akkaradb::engine::memtable::BPTreeConcurrencyMode;
         using akkaradb::engine::memtable::BPTreeMemTable;
         using akkaradb::engine::memtable::MutableScanMode;
 
@@ -155,12 +156,17 @@ namespace {
         options.runtime.scanConsistency = EngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT;
         options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::MANUAL_ONLY;
         options.memtable.backendOptions.mutableScanMode = MutableScanMode::STREAMING_RESTART;
+        options.memtable.backendOptions.bptreeConcurrencyMode = BPTreeConcurrencyMode::LOCKED;
 
         bool configured = false;
         options.memtable.backendFactoryWithOptions = [&configured](const auto& backendOptions) {
             require(
                 backendOptions.mutableScanMode == MutableScanMode::STREAMING_RESTART,
                 "AkkEngine must pass MemTable backend options during initialization"
+            );
+            require(
+                backendOptions.bptreeConcurrencyMode == BPTreeConcurrencyMode::LOCKED,
+                "AkkEngine must pass BPTree concurrency mode during initialization"
             );
             configured = true;
             return std::make_unique<BPTreeMemTable>(
@@ -259,6 +265,88 @@ namespace {
         }
         require(expectedKey == 90, "SkipList range iteration must honor its upper bound");
     }
+
+    void verifyConfiguredVersionRetention(
+        std::string_view backendName,
+        MemTable::ConfiguredMemTableFactory backendFactory
+    ) {
+        MemTable::Options retainedOptions;
+        retainedOptions.shardCount = 1;
+        retainedOptions.flushMode = akkaradb::engine::memtable::MemTableFlushMode::MANUAL_ONLY;
+        retainedOptions.thresholdBytesPerShard = 0;
+        retainedOptions.backendOptions.maxVersionsPerKey = 8;
+        retainedOptions.backendFactoryWithOptions = backendFactory;
+        auto retained = MemTable::create(retainedOptions);
+
+        const std::vector<uint8_t> key{'v', 'e', 'r', 's', 'i', 'o', 'n', 'e', 'd'};
+        for (uint64_t seq = 1; seq <= 6; ++seq) {
+            const std::vector<uint8_t> value{static_cast<uint8_t>('0' + seq)};
+            retained->put(bytes(key), bytes(value), seq);
+        }
+
+        RecordView oldRecord;
+        require(
+            retained->get(bytes(key), 1, &oldRecord),
+            (std::string{"configured "} + std::string{backendName} + " retention must keep older same-key versions").c_str()
+        );
+        require(oldRecord.seq() == 1 && oldRecord.value().size() == 1 && oldRecord.value()[0] == '1', "configured old version mismatch");
+
+        MemTable::Options shortOptions = retainedOptions;
+        shortOptions.backendOptions.maxVersionsPerKey = 2;
+        auto shortRetained = MemTable::create(shortOptions);
+        for (uint64_t seq = 1; seq <= 3; ++seq) {
+            const std::vector<uint8_t> value{static_cast<uint8_t>('a' + seq)};
+            shortRetained->put(bytes(key), bytes(value), seq);
+        }
+        require(
+            !shortRetained->get(bytes(key), 1, &oldRecord),
+            (std::string{"small "} + std::string{backendName} + " retention must evict versions beyond its capacity").c_str()
+        );
+    }
+
+    [[nodiscard]] std::vector<uint8_t> fixedKey(size_t value) {
+        std::string text = "key-";
+        text += std::to_string(1'000'000 + value);
+        return {text.begin(), text.end()};
+    }
+
+    void verifyBPTreeDeepSplitPointAndRange() {
+        using akkaradb::engine::memtable::BPTreeMemTable;
+        BPTreeMemTable table;
+        constexpr size_t keyCount = 4096;
+        std::vector<std::vector<uint8_t>> keys;
+        keys.reserve(keyCount);
+        for (size_t i = 0; i < keyCount; ++i) { keys.push_back(fixedKey(i)); }
+
+        for (size_t i = 0; i < keyCount; ++i) {
+            const size_t keyIndex = (i * 997) % keyCount;
+            const std::vector<uint8_t> value{static_cast<uint8_t>(keyIndex & 0xff)};
+            require(
+                table.put(std::as_bytes(bytes(keys[keyIndex])), std::as_bytes(bytes(value)), i + 1, 0).ok(),
+                "BPTree deep split insert must succeed"
+            );
+        }
+
+        for (size_t i = 0; i < keyCount; ++i) {
+            RecordView found;
+            require(table.get(std::as_bytes(bytes(keys[i])), keyCount, &found), "BPTree deep split point lookup must find every key");
+            require(std::ranges::equal(found.key(), bytes(keys[i])), "BPTree deep split point lookup returned the wrong key");
+        }
+
+        size_t expected = 0;
+        for (const RecordView& current : table.iterator({}, {}, keyCount)) {
+            require(std::ranges::equal(current.key(), bytes(keys[expected])), "BPTree deep split full scan must stay ordered");
+            ++expected;
+        }
+        require(expected == keyCount, "BPTree deep split full scan must return every key");
+
+        expected = 1000;
+        for (const RecordView& current : table.iterator(std::as_bytes(bytes(keys[1000])), std::as_bytes(bytes(keys[1100])), keyCount)) {
+            require(std::ranges::equal(current.key(), bytes(keys[expected])), "BPTree deep split range scan must stay ordered");
+            ++expected;
+        }
+        require(expected == 1100, "BPTree deep split range scan must honor bounds");
+    }
 }
 
 int main() {
@@ -277,6 +365,25 @@ int main() {
         verifySstDisabledFlushRetainsMemtable();
         verifyEnginePassesBackendOptionsAtInitialization();
         verifySkipListSnapshotRangeAndFreeze();
+        verifyConfiguredVersionRetention("SkipList", [](const auto& backendOptions) {
+            return std::make_unique<akkaradb::engine::memtable::SkipListMemTable>(
+                akkaradb::core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
+                akkaradb::core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
+                64 * 1024,
+                2 * 1024 * 1024,
+                backendOptions
+            );
+        });
+        verifyConfiguredVersionRetention("BPTree", [](const auto& backendOptions) {
+            return std::make_unique<akkaradb::engine::memtable::BPTreeMemTable>(
+                akkaradb::core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
+                akkaradb::core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
+                64 * 1024,
+                2 * 1024 * 1024,
+                backendOptions
+            );
+        });
+        verifyBPTreeDeepSplitPointAndRange();
 
         if (!failures.empty()) {
             std::string message;

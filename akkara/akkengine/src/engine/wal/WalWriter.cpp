@@ -127,6 +127,22 @@ namespace akkaradb::engine::wal {
             if (std::fwrite(data, 1, size, f) != size) { throw std::runtime_error("WAL write failed"); }
         }
 
+        void truncateFile(FILE* f, uint64_t size) {
+            #ifdef _WIN32
+            if (_chsize_s(_fileno(f), size) != 0) { throw std::runtime_error("WAL truncate failed"); }
+            #else
+            if (::ftruncate(fileno(f), static_cast<off_t>(size)) != 0) { throw std::runtime_error("WAL truncate failed"); }
+            #endif
+        }
+
+        void seekFileOffset(FILE* f, uint64_t offset) {
+            #ifdef _WIN32
+            if (::_fseeki64(f, static_cast<__int64>(offset), SEEK_SET) != 0) { throw std::runtime_error("WAL seek failed"); }
+            #else
+            if (::fseeko(f, static_cast<off_t>(offset), SEEK_SET) != 0) { throw std::runtime_error("WAL seek failed"); }
+            #endif
+        }
+
         [[nodiscard]] bool readExact(std::ifstream& file, uint8_t* out, size_t len) {
             if (len == 0) { return true; }
             file.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(len));
@@ -146,6 +162,7 @@ namespace akkaradb::engine::wal {
 
         struct SegmentScanResult {
             bool validHeader = false;
+            uint64_t validBytes = 0;
             uint64_t firstSeq = 0;
             uint64_t lastSeq = 0;
         };
@@ -160,6 +177,7 @@ namespace akkaradb::engine::wal {
             const WalSegmentHeader shdr = WalSegmentHeader::deserialize(shdrBuf);
             if (!shdr.verifyMagic() || !shdr.verifyVersion() || !shdr.verifyChecksum()) { return result; }
             result.validHeader = true;
+            result.validBytes = WalSegmentHeader::SIZE;
 
             while (true) {
                 uint8_t ehdrBuf[WalEntryHeader::SIZE]{};
@@ -181,6 +199,7 @@ namespace akkaradb::engine::wal {
 
                 if (result.firstSeq == 0 || ehdr.seq < result.firstSeq) { result.firstSeq = ehdr.seq; }
                 if (ehdr.seq > result.lastSeq) { result.lastSeq = ehdr.seq; }
+                result.validBytes += ehdr.entryLen;
             }
             return result;
         }
@@ -235,14 +254,15 @@ namespace akkaradb::engine::wal {
 
             class ShardWriter {
                 public:
-                    ShardWriter(WalOptions options, uint16_t shardId)
-                        : options_{std::move(options)},
+                    ShardWriter(fs::path walDir, WalOptions options, uint16_t shardId)
+                        : walDir_{std::move(walDir)},
+                          options_{std::move(options)},
                           shardId_{shardId},
                           injectedWriteFailureAfterEntries_{resolveInjectedWriteFailureAfterEntries()},
                           segmentBytes_{resolveTestSegmentBytes()},
                           running_{options_.execution == WalExecutionMode::ASYNC} {
-                        fs::create_directories(options_.walDir);
-                        segmentId_ = findLastSegmentId(options_.walDir, shardId_);
+                        fs::create_directories(walDir_);
+                        segmentId_ = findLastSegmentId(walDir_, shardId_);
                         openSegment(segmentId_);
 
                         if (options_.execution == WalExecutionMode::ASYNC) { thread_ = std::thread([this] { runFlusher(); }); }
@@ -328,7 +348,7 @@ namespace akkaradb::engine::wal {
 
                         {
                             std::lock_guard fileLock{fileMutex_};
-                            for (const auto& entry : fs::directory_iterator(options_.walDir)) {
+                            for (const auto& entry : fs::directory_iterator(walDir_)) {
                                 if (!entry.is_regular_file() || entry.path().extension() != ".akwal" || entry.path() == path_) { continue; }
 
                                 std::ifstream file(entry.path(), std::ios::binary);
@@ -402,7 +422,7 @@ namespace akkaradb::engine::wal {
 
                 private:
                     void openSegment(uint64_t segmentId) {
-                        path_ = segmentPath(options_.walDir, shardId_, segmentId);
+                        path_ = segmentPath(walDir_, shardId_, segmentId);
                         const bool exists = fs::exists(path_) && fs::file_size(path_) >= WalSegmentHeader::SIZE;
                         file_ = openRw(path_, exists);
 
@@ -426,12 +446,14 @@ namespace akkaradb::engine::wal {
                                 header_.firstSeq = scan.firstSeq;
                                 header_.lastSeq = scan.lastSeq;
                             }
-                            currentSize_ = fs::file_size(path_);
+                            const uint64_t fileSize = fs::file_size(path_);
+                            currentSize_ = scan.validHeader ? scan.validBytes : fileSize;
+                            if (currentSize_ < fileSize) { truncateFile(file_, currentSize_); }
                             if (currentSize_ >= segmentBytes_) {
                                 rotateLocked();
                                 return;
                             }
-                            std::fseek(file_, 0, SEEK_END);
+                            seekFileOffset(file_, currentSize_);
                             return;
                         }
 
@@ -598,6 +620,7 @@ namespace akkaradb::engine::wal {
                         return asyncError_ != nullptr;
                     }
 
+                    fs::path walDir_;
                     WalOptions options_;
                     uint16_t shardId_ = 0;
                     uint64_t segmentId_ = 0;
@@ -629,10 +652,10 @@ namespace akkaradb::engine::wal {
                     std::atomic<uint64_t> asyncFailures_{0};
             };
 
-            explicit Impl(WalOptions options)
-                : options_{std::move(options)} {
+            explicit Impl(fs::path walDir, WalOptions options)
+                : walDir_{std::move(walDir)}, options_{std::move(options)} {
                 normalizeOptions(options_);
-                if (options_.walDir.empty()) { throw std::invalid_argument("WAL directory is required"); }
+                if (walDir_.empty()) { throw std::invalid_argument("WAL directory is required"); }
                 if (options_.shardCount == 0) { options_.shardCount = resolveAutoShardCount(); }
                 if (options_.shardCount > 16) { throw std::invalid_argument("WAL shardCount must be in range 1..16, or 0 for auto"); }
                 if (options_.groupN == 0) { options_.groupN = 128; }
@@ -642,7 +665,9 @@ namespace akkaradb::engine::wal {
                 if (options_.asyncMaxPendingBytes < options_.groupBytes) { options_.asyncMaxPendingBytes = options_.groupBytes; }
 
                 shards_.reserve(options_.shardCount);
-                for (uint16_t i = 0; i < options_.shardCount; ++i) { shards_.push_back(std::make_unique<ShardWriter>(options_, i)); }
+                for (uint16_t i = 0; i < options_.shardCount; ++i) {
+                    shards_.push_back(std::make_unique<ShardWriter>(walDir_, options_, i));
+                }
             }
 
             ~Impl() { close(); }
@@ -696,6 +721,7 @@ namespace akkaradb::engine::wal {
                 closed_ = true;
             }
 
+            fs::path walDir_;
             WalOptions options_;
             std::vector<std::unique_ptr<ShardWriter>> shards_;
             bool closed_ = false;
@@ -703,9 +729,9 @@ namespace akkaradb::engine::wal {
 
     WalWriter::WalWriter() = default;
 
-    std::unique_ptr<WalWriter> WalWriter::create(WalOptions options) {
+    std::unique_ptr<WalWriter> WalWriter::create(std::filesystem::path walDir, WalOptions options) {
         auto writer = std::unique_ptr < WalWriter > (new WalWriter{});
-        writer->impl_ = std::make_unique<Impl>(std::move(options));
+        writer->impl_ = std::make_unique<Impl>(std::move(walDir), std::move(options));
         return writer;
     }
 

@@ -80,7 +80,6 @@ namespace {
 
         auto mf = manifest::Manifest::create(dir / "manifest.akmf");
         sst::SSTManager::Options options;
-        options.sstDir = dir;
         options.compactionMode = sst::SSTCompactionMode::DISABLED;
         options.compactThreads = 0;
 
@@ -92,7 +91,7 @@ namespace {
         const std::vector<uint8_t> betaValue{'b', 'e', 't', 'a'};
 
         {
-            auto manager = sst::SSTManager::create(options, mf.get());
+            auto manager = sst::SSTManager::create(dir, options, mf.get());
             std::vector<akkaradb::core::RecordView> records{record(alpha, alphaOld, 1)};
             manager->flush(records);
             records = {record(beta, betaValue, 2)};
@@ -109,7 +108,7 @@ namespace {
         require(fs::exists(orphan), "failed to create orphan compaction output");
 
         {
-            auto recovered = sst::SSTManager::create(options, mf.get());
+            auto recovered = sst::SSTManager::create(dir, options, mf.get());
             recovered->recover();
             require(!fs::exists(orphan), "manifest recovery must prune uncommitted compaction output");
             std::vector<uint8_t> out;
@@ -127,7 +126,7 @@ namespace {
         mf->compactionCommit({compacted.filename().string()}, inputFiles);
 
         {
-            auto recovered = sst::SSTManager::create(options, mf.get());
+            auto recovered = sst::SSTManager::create(dir, options, mf.get());
             recovered->recover();
             for (const auto& input : inputFiles) {
                 require(!fs::exists(dir / input), "manifest recovery must prune committed compaction inputs");
@@ -256,13 +255,12 @@ namespace {
         require(hit.has_value() && *hit && out == value, "configured Zstd level must preserve values");
 
         sst::SSTManager::Options managerOptions;
-        managerOptions.sstDir = dir;
         managerOptions.compactionMode = sst::SSTCompactionMode::DISABLED;
         managerOptions.compactThreads = 0;
         managerOptions.zstdCompressionLevel = std::numeric_limits<int>::max();
         bool rejected = false;
         try {
-            (void)sst::SSTManager::create(managerOptions);
+            (void)sst::SSTManager::create(dir, managerOptions);
         }
         catch (const std::invalid_argument&) {
             rejected = true;
@@ -285,13 +283,12 @@ namespace {
 
         auto mf = manifest::Manifest::create(dir / "manifest.akmf");
         sst::SSTManager::Options options;
-        options.sstDir = dir;
         options.compactionMode = sst::SSTCompactionMode::DISABLED;
         options.compactThreads = 0;
 
         const std::vector<uint8_t> key{'k'};
         {
-            auto manager = sst::SSTManager::create(options, mf.get());
+            auto manager = sst::SSTManager::create(dir, options, mf.get());
             for (uint64_t seq = 1; seq <= 10; ++seq) {
                 const std::vector<uint8_t> value{'v', static_cast<uint8_t>(seq)};
                 const std::vector<akkaradb::core::RecordView> records{record(key, value, seq)};
@@ -301,7 +298,7 @@ namespace {
         }
 
         {
-            auto recovered = sst::SSTManager::create(options, mf.get());
+            auto recovered = sst::SSTManager::create(dir, options, mf.get());
             recovered->recover();
             std::vector<uint8_t> out;
             const auto hit = recovered->getInto(bytes(key), out);
@@ -436,9 +433,8 @@ int main() {
         fs::create_directories(dir);
 
         sst::SSTManager::Options options;
-        options.sstDir = dir;
         options.compactThreads = 0;
-        auto manager = sst::SSTManager::create(options);
+        auto manager = sst::SSTManager::create(dir, options);
 
         const std::vector<uint8_t> key{'k', 'e', 'y'};
         const std::vector<uint8_t> oldValue{'o', 'l', 'd'};

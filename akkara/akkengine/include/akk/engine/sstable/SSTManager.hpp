@@ -40,7 +40,6 @@ namespace akkaradb::engine::sst {
 
         public:
             struct Options {
-                std::filesystem::path sstDir;
                 // Sorted storage level layout and compaction trigger policy.
                 int maxLevels = 7;
                 int maxL0Files = 4;
@@ -92,7 +91,11 @@ namespace akkaradb::engine::sst {
                     std::unique_ptr<Impl> impl_;
             };
 
-            [[nodiscard]] static std::unique_ptr<SSTManager> create(Options options, manifest::Manifest* manifest = nullptr);
+            [[nodiscard]] static std::unique_ptr<SSTManager> create(
+                std::filesystem::path sstDir,
+                Options options,
+                manifest::Manifest* manifest = nullptr
+            );
 
             ~SSTManager();
             SSTManager(const SSTManager&) = delete;
@@ -122,7 +125,7 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] CompactionSnapshot compactionSnapshot() const noexcept;
 
         private:
-            SSTManager(Options options, manifest::Manifest* manifest);
+            SSTManager(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest);
             std::unique_ptr<Impl> impl_;
     };
 } // namespace akkaradb::engine::sst

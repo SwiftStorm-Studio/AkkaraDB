@@ -48,7 +48,6 @@ namespace akkaradb::engine::wal {
     };
 
     struct AKDB_API WalOptions {
-        std::filesystem::path walDir;
         // Compatibility shortcut. When execution or syncPolicy is AUTO, this is expanded into the explicit knobs below.
         WalSyncMode syncMode = WalSyncMode::SYNC;
         // Physical append execution. INLINE writes on the caller thread; ASYNC enqueues to a shard flusher.
@@ -82,7 +81,7 @@ namespace akkaradb::engine::wal {
 
     class AKDB_API WalWriter {
         public:
-            [[nodiscard]] static std::unique_ptr<WalWriter> create(WalOptions options);
+            [[nodiscard]] static std::unique_ptr<WalWriter> create(std::filesystem::path walDir, WalOptions options = {});
             ~WalWriter();
 
             WalWriter(const WalWriter&) = delete;

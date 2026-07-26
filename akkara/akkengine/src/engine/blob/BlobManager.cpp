@@ -182,8 +182,10 @@ namespace akkaradb::engine::blob {
 
     class BlobManager::Impl {
         public:
-            explicit Impl(Options optionsValue) : options(std::move(optionsValue)) {}
+            explicit Impl(fs::path blobDirValue, Options optionsValue)
+                : blobDir(std::move(blobDirValue)), options(std::move(optionsValue)) {}
 
+            fs::path blobDir;
             Options options;
             mutable std::mutex writeMu;
             std::mutex delMu;
@@ -200,18 +202,18 @@ namespace akkaradb::engine::blob {
 
             [[nodiscard]] fs::path pathFor(uint64_t blobId) const {
                 const uint8_t hi = static_cast<uint8_t>(blobId >> 56u);
-                return options.blobDir / hex2(hi) / (hex16(blobId) + ".akblob");
+                return blobDir / hex2(hi) / (hex16(blobId) + ".akblob");
             }
 
             void createShards() const {
-                fs::create_directories(options.blobDir);
-                for (uint32_t i = 0; i < 256; ++i) { fs::create_directories(options.blobDir / hex2(static_cast<uint8_t>(i))); }
+                fs::create_directories(blobDir);
+                for (uint32_t i = 0; i < 256; ++i) { fs::create_directories(blobDir / hex2(static_cast<uint8_t>(i))); }
             }
 
             void startupCleanup() const {
                 std::error_code ec;
-                if (!fs::exists(options.blobDir, ec)) { return; }
-                for (const auto& entry : fs::recursive_directory_iterator(options.blobDir, ec)) {
+                if (!fs::exists(blobDir, ec)) { return; }
+                for (const auto& entry : fs::recursive_directory_iterator(blobDir, ec)) {
                     if (ec) { break; }
                     if (!entry.is_regular_file(ec)) { continue; }
                     const auto name = entry.path().filename().string();
@@ -325,12 +327,12 @@ namespace akkaradb::engine::blob {
 
     BlobManager::BlobManager() = default;
 
-    std::unique_ptr<BlobManager> BlobManager::create(Options options) {
-        if (options.blobDir.empty()) { throw std::invalid_argument("BlobManager: blobDir is required"); }
+    std::unique_ptr<BlobManager> BlobManager::create(std::filesystem::path blobDir, Options options) {
+        if (blobDir.empty()) { throw std::invalid_argument("BlobManager: blobDir is required"); }
         if (options.thresholdBytes == 0) { throw std::invalid_argument("BlobManager: thresholdBytes must be > 0"); }
 
         auto manager = std::unique_ptr < BlobManager > (new BlobManager{});
-        manager->impl_ = std::make_unique<Impl>(std::move(options));
+        manager->impl_ = std::make_unique<Impl>(std::move(blobDir), std::move(options));
         return manager;
     }
 
@@ -427,7 +429,7 @@ namespace akkaradb::engine::blob {
         if (!impl_) { return; }
         std::vector<uint64_t> orphans;
         std::error_code ec;
-        for (const auto& entry : fs::recursive_directory_iterator(impl_->options.blobDir, ec)) {
+        for (const auto& entry : fs::recursive_directory_iterator(impl_->blobDir, ec)) {
             if (ec) { break; }
             if (!entry.is_regular_file(ec) || entry.path().extension() != ".akblob") { continue; }
 

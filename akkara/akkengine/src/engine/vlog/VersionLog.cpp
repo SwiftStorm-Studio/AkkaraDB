@@ -199,6 +199,7 @@ namespace akkaradb::engine::vlog {
     class VersionLog::Impl {
         public:
             struct AppendCompletion;
+            fs::path logPath_;
             VersionLogOptions opts_;
             mutable std::mutex writeMu_;
             mutable std::mutex serialAdmissionMu_;
@@ -663,9 +664,9 @@ namespace akkaradb::engine::vlog {
             }
 
             [[nodiscard]] fs::path segmentPath(uint64_t id) const {
-                if (id == 0) { return opts_.logPath; }
-                const auto name = opts_.logPath.stem().string() + "-seg-" + std::to_string(id) + opts_.logPath.extension().string();
-                return opts_.logPath.parent_path() / name;
+                if (id == 0) { return logPath_; }
+                const auto name = logPath_.stem().string() + "-seg-" + std::to_string(id) + logPath_.extension().string();
+                return logPath_.parent_path() / name;
             }
 
             [[nodiscard]] static fs::path segmentIndexPath(const fs::path& segmentPath) {
@@ -986,11 +987,11 @@ namespace akkaradb::engine::vlog {
 
             [[nodiscard]] std::vector<SegmentInfo> discoverSegments() const {
                 std::vector<SegmentInfo> discovered;
-                if (fs::exists(opts_.logPath)) { discovered.push_back(SegmentInfo{0, opts_.logPath}); }
+                if (fs::exists(logPath_)) { discovered.push_back(SegmentInfo{0, logPath_}); }
 
-                const auto parent = opts_.logPath.parent_path().empty() ? fs::path{"."} : opts_.logPath.parent_path();
-                const std::string prefix = opts_.logPath.stem().string() + "-seg-";
-                const std::string extension = opts_.logPath.extension().string();
+                const auto parent = logPath_.parent_path().empty() ? fs::path{"."} : logPath_.parent_path();
+                const std::string prefix = logPath_.stem().string() + "-seg-";
+                const std::string extension = logPath_.extension().string();
                 for (const auto& entry : fs::directory_iterator(parent)) {
                     if (!entry.is_regular_file()) { continue; }
                     const std::string name = entry.path().filename().string();
@@ -2163,7 +2164,7 @@ namespace akkaradb::engine::vlog {
             void joinRecoveryWorker() { if (recoveryThread_.joinable()) { recoveryThread_.join(); } }
 
             void openOrCreate() {
-                const auto& path = opts_.logPath;
+                const auto& path = logPath_;
                 const auto parent = path.parent_path();
                 if (!parent.empty()) { fs::create_directories(parent); }
 
@@ -2198,8 +2199,10 @@ namespace akkaradb::engine::vlog {
 
     VersionLog::VersionLog() = default;
 
-    std::unique_ptr<VersionLog> VersionLog::create(VersionLogOptions opts) {
+    std::unique_ptr<VersionLog> VersionLog::create(std::filesystem::path logPath, VersionLogOptions opts) {
+        if (logPath.empty()) { throw std::invalid_argument("VersionLog: logPath is required"); }
         auto impl = std::make_unique<Impl>();
+        impl->logPath_ = std::move(logPath);
         impl->opts_ = std::move(opts);
         impl->validateOptions();
 
@@ -2422,6 +2425,65 @@ namespace akkaradb::engine::vlog {
         return entries;
     }
 
+    std::vector<VersionRecord> VersionLog::collectSince(uint64_t afterSeq) const {
+        if (!impl_) { return {}; }
+
+        impl_->waitForRecovery();
+        impl_->checkAsyncError();
+        const uint64_t visibleSeq = impl_->visibleSeq();
+        std::vector<VersionRecord> records;
+        (void)impl_->scanLog(
+            true,
+            visibleSeq,
+            [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
+                if (header.seq <= afterSeq || header.seq > visibleSeq) { return; }
+                if ((header.flags & (VLOG_FLAG_ROLLBACK | VLOG_FLAG_RETENTION_BASE)) != 0) { return; }
+
+                VersionRecord record;
+                record.key.assign(entryKey.begin(), entryKey.end());
+                record.entry.seq = header.seq;
+                record.entry.sourceNodeId = header.sourceNodeId;
+                record.entry.timestampNs = header.timestampNs;
+                record.entry.flags = header.flags;
+                record.entry.value.assign(entryValue.begin(), entryValue.end());
+                records.push_back(std::move(record));
+            }
+        );
+        auto resident = impl_->residentSnapshot();
+        for (auto& [key, entries] : resident) {
+            for (auto& entry : entries) {
+                if (entry.seq <= afterSeq || entry.seq > visibleSeq) { continue; }
+                if ((entry.flags & (VLOG_FLAG_ROLLBACK | VLOG_FLAG_RETENTION_BASE)) != 0) { continue; }
+
+                VersionRecord record;
+                record.key.assign(key.begin(), key.end());
+                record.entry = std::move(entry);
+                records.push_back(std::move(record));
+            }
+        }
+        std::sort(
+            records.begin(),
+            records.end(),
+            [](const VersionRecord& left, const VersionRecord& right) {
+                if (left.entry.seq != right.entry.seq) { return left.entry.seq < right.entry.seq; }
+                return left.key < right.key;
+            }
+        );
+        records.erase(
+            std::unique(
+                records.begin(),
+                records.end(),
+                [](const VersionRecord& left, const VersionRecord& right) {
+                    return left.entry.seq == right.entry.seq && left.entry.sourceNodeId == right.entry.sourceNodeId &&
+                        left.entry.timestampNs == right.entry.timestampNs && left.entry.flags == right.entry.flags && left.key == right.key &&
+                        left.entry.value == right.entry.value;
+                }
+            ),
+            records.end()
+        );
+        return records;
+    }
+
     std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> VersionLog::collectRollbackTargets(uint64_t targetSeq) const {
         if (!impl_) { return {}; }
 
@@ -2483,6 +2545,13 @@ namespace akkaradb::engine::vlog {
         }
 
         return result;
+    }
+
+    void VersionLog::seedCommittedSeq(uint64_t seq) {
+        if (impl_) {
+            impl_->waitForRecovery();
+            impl_->resetCommittedSeq(seq);
+        }
     }
 
     VersionLogSnapshot VersionLog::snapshot() const noexcept {

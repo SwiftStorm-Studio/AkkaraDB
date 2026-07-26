@@ -16,8 +16,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
+#include <new>
 #include <optional>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -30,7 +31,8 @@ namespace akkaradb::engine::memtable {
     class AKDB_API BPTreeMemTable final : public IMemTable {
         public:
             static constexpr uint16_t MAX_KEYS = 63;
-            static constexpr uint8_t MAX_VERSIONS_PER_KEY = 4;
+            static constexpr size_t DEFAULT_MAX_VERSIONS_PER_KEY = 4;
+            static constexpr size_t MAX_CONFIGURED_VERSIONS_PER_KEY = 65535;
 
             explicit BPTreeMemTable(
                 size_t dataArenaInitialBlockSize = core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
@@ -58,11 +60,17 @@ namespace akkaradb::engine::memtable {
         private:
             struct VersionChain {
                 std::atomic<uint64_t> version{0};
-                std::atomic<uint8_t> head{0};
-                std::atomic<uint8_t> count{0};
-                std::array<std::atomic<const core::OwnedRecord*>, MAX_VERSIONS_PER_KEY> ring{};
+                uint16_t capacity{0};
+                std::atomic<uint16_t> head{0};
+                std::atomic<uint16_t> count{0};
 
-                VersionChain() noexcept = default;
+                [[nodiscard]] std::atomic<const core::OwnedRecord*>* ring() noexcept {
+                    return std::launder(reinterpret_cast<std::atomic<const core::OwnedRecord*>*>(this + 1));
+                }
+
+                [[nodiscard]] const std::atomic<const core::OwnedRecord*>* ring() const noexcept {
+                    return std::launder(reinterpret_cast<const std::atomic<const core::OwnedRecord*>*>(this + 1));
+                }
             };
 
             struct Node {
@@ -85,14 +93,17 @@ namespace akkaradb::engine::memtable {
             };
 
             core::BufferArena dataArena_;
-            mutable core::BufferArena generatorArena_;
-            mutable std::mutex generatorArenaMutex_;
+            mutable std::shared_mutex treeMutex_;
+            size_t generatorArenaInitialBlockSize_{64 * 1024};
+            size_t generatorArenaMaxBlockSize_{2 * 1024 * 1024};
 
             std::atomic<Node*> root_{nullptr};
             std::atomic<bool> frozen_{false};
             std::atomic<size_t> bytes_{0};
             std::atomic<size_t> entries_{0};
             MutableScanMode mutableScanMode_;
+            BPTreeConcurrencyMode concurrencyMode_{BPTreeConcurrencyMode::LOCKED};
+            uint16_t maxVersionsPerKey_{DEFAULT_MAX_VERSIONS_PER_KEY};
 
             [[nodiscard]] static std::span<const uint8_t> asU8(ByteView view) noexcept;
 
@@ -145,6 +156,16 @@ namespace akkaradb::engine::memtable {
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,
                 std::vector<uint8_t> endKey
+            ) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateWithReadLock(
+                uint64_t snapshotSeq,
+                std::shared_lock<std::shared_mutex> lock
+            ) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateRangeWithReadLock(
+                uint64_t snapshotSeq,
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey,
+                std::shared_lock<std::shared_mutex> lock
             ) const;
     };
 } // namespace akkaradb::engine::memtable

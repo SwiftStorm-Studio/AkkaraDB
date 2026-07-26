@@ -681,6 +681,24 @@ contiguous prefix into a fresh MemTable. A truncated or corrupt tail stops repla
 at the recovery boundary; later valid-looking bytes are not accepted as a
 replacement for a valid log sequence.
 
+When `runtime.truncateCorruptWalOnRecovery` is enabled, WAL recovery may rewrite
+physical WAL files while applying the same valid-prefix rule. The corrupt segment
+is truncated to its valid prefix, and later segments in the same shard are
+removed because they are beyond the accepted recovery boundary. The default is
+non-destructive recovery; truncation is opt-in.
+
+When VersionLog is enabled and WAL recovery stops at a corrupt boundary, engine
+startup uses VersionLog records newer than the checkpoint sequence to supplement
+the recovered MemTable. This is not WAL byte repair; it reconstructs missing
+mutations from an independent durable history source when that source contains
+the corresponding records.
+
+If `runtime.ignoreVersionLogSupplementErrors` is enabled, a VersionLog startup
+or supplement scan failure during corrupt-WAL recovery is ignored and startup
+continues with the WAL valid prefix only. The opened engine does not use
+VersionLog for that process. The default is to fail startup when VersionLog
+supplementation fails.
+
 ## 11. Blob Manager
 
 The Blob manager externalizes large values so MemTable, WAL, SST, and VersionLog
@@ -1412,6 +1430,8 @@ headers unless a high-level `StartupMode` modifies them.
 |---|---:|---|
 | `writerThreads` | 0 | Sizing hint for writer-related sharding |
 | `recoverWal` | `true` | Replay WAL during open |
+| `truncateCorruptWalOnRecovery` | `false` | Truncate corrupt WAL tails and remove later same-shard segments during WAL recovery |
+| `ignoreVersionLogSupplementErrors` | `false` | Continue with WAL valid prefix if VersionLog supplement fails during corrupt-WAL recovery |
 | `recoverSst` | `true` | Recover SST state during open |
 | `pruneWalOnFlush` | `true` | Remove WAL segments made obsolete by flush checkpoint |
 | `forceFlushOnClose` | `true` | Force MemTable flush during close |

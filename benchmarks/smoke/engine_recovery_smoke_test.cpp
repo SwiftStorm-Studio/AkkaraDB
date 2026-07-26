@@ -13,6 +13,7 @@
 
 #include "TestErrorHandlers.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -36,12 +37,34 @@ namespace {
         if (!condition) { throw std::runtime_error(message); }
     }
 
+    template <typename Operation>
+    void requireRuntimeError(Operation&& operation, const char* message) {
+        try {
+            operation();
+        }
+        catch (const std::runtime_error&) { return; }
+        throw std::runtime_error(message);
+    }
+
     [[nodiscard]] std::span<const uint8_t> bytes(const std::vector<uint8_t>& value) noexcept {
         return {value.data(), value.size()};
     }
 
     [[nodiscard]] std::span<const uint8_t> bytes(std::string_view value) noexcept {
         return {reinterpret_cast<const uint8_t*>(value.data()), value.size()};
+    }
+
+    void flipByte(const fs::path& path, std::streamoff offset) {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        require(static_cast<bool>(file), "test setup must open file for byte flip");
+        file.seekg(offset);
+        char byte = 0;
+        file.read(&byte, 1);
+        require(file.gcount() == 1, "test setup must read byte before flip");
+        byte ^= static_cast<char>(0x5a);
+        file.seekp(offset);
+        file.write(&byte, 1);
+        require(static_cast<bool>(file), "test setup must write flipped byte");
     }
 
     template <typename Predicate>
@@ -180,6 +203,23 @@ namespace {
             throw std::runtime_error("failed to set test WAL segment size");
         }
 #endif
+    }
+
+    void clearTestWalSegmentBytes() {
+#ifdef _WIN32
+        (void)_putenv_s("AKKARADB_TEST_WAL_SEGMENT_BYTES", "");
+#else
+        (void)::unsetenv("AKKARADB_TEST_WAL_SEGMENT_BYTES");
+#endif
+    }
+
+    [[nodiscard]] std::vector<fs::path> findWalSegments(const fs::path& dir) {
+        std::vector<fs::path> segments;
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".akwal") { segments.push_back(entry.path()); }
+        }
+        std::sort(segments.begin(), segments.end());
+        return segments;
     }
 
     [[nodiscard]] int expectedCrashStatus() noexcept {
@@ -445,11 +485,10 @@ namespace {
 
         {
             wal::WalOptions wopts;
-            wopts.walDir = dir / "wal";
             wopts.shardCount = 1;
             wopts.execution = wal::WalExecutionMode::INLINE;
             wopts.syncPolicy = wal::WalSyncPolicy::ALWAYS;
-            auto writer = wal::WalWriter::create(wopts);
+            auto writer = wal::WalWriter::create(dir / "wal", wopts);
             writer->append(bytes(key), bytes(staleWalValue), 1, 0, 0, wal::WalAppendAck::SYNCED);
             writer->close();
         }
@@ -464,6 +503,250 @@ namespace {
             engine->close();
         }
 
+        fs::remove_all(dir, ec);
+    }
+
+    void runVersionLogSupplementsCorruptWalRecoveryTest() {
+        namespace engine_ns = akkaradb::engine;
+        namespace memtable = engine_ns::memtable;
+        namespace wal = engine_ns::wal;
+        namespace vlog = engine_ns::vlog;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_vlog_supplements_corrupt_wal_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create VersionLog/WAL recovery test directory");
+
+        const std::vector<uint8_t> key1{'v', 'l', 'o', 'g', '-', '1'};
+        const std::vector<uint8_t> key2{'v', 'l', 'o', 'g', '-', '2'};
+        const std::vector<uint8_t> key3{'v', 'l', 'o', 'g', '-', '3'};
+        const std::vector<uint8_t> value1{'o', 'n', 'e'};
+        const std::vector<uint8_t> value2{'t', 'w', 'o'};
+        const std::vector<uint8_t> value3{'t', 'h', 'r', 'e', 'e'};
+
+        const auto makeOptions = [&] {
+            engine_ns::AkkEngineOptions options;
+            options.paths.dataDir = dir;
+            options.components.walEnabled = true;
+            options.components.blobEnabled = false;
+            options.components.manifestEnabled = false;
+            options.components.sstEnabled = false;
+            options.components.versionLogEnabled = true;
+            options.memtable.shardCount = 1;
+            options.memtable.flushMode = memtable::MemTableFlushMode::MANUAL_ONLY;
+            options.runtime.forceFlushOnClose = false;
+            options.runtime.forceSyncOnClose = true;
+            options.runtime.writeDurability = engine_ns::AkkEngineOptions::WriteDurabilityMode::SYNCED;
+            options.runtime.truncateCorruptWalOnRecovery = true;
+            options.wal.shardCount = 1;
+            options.wal.execution = wal::WalExecutionMode::INLINE;
+            options.wal.syncPolicy = wal::WalSyncPolicy::ALWAYS;
+            options.vlog.syncMode = vlog::VLogSyncMode::SYNC;
+            return options;
+        };
+
+        setTestWalSegmentBytes(120);
+        try {
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions());
+                engine->put(bytes(key1), bytes(value1));
+                engine->put(bytes(key2), bytes(value2));
+                engine->put(bytes(key3), bytes(value3));
+                engine->forceSync();
+                engine->close();
+            }
+
+            const auto segments = findWalSegments(dir / "wal");
+            require(segments.size() >= 3, "test expected at least three WAL segments");
+            {
+                std::ofstream out(segments[1], std::ios::binary | std::ios::app);
+                require(static_cast<bool>(out), "failed to append corrupt WAL segment tail");
+                const std::vector<uint8_t> garbage{0xff, 0x7f, 0x01, 0x02, 0x03};
+                out.write(reinterpret_cast<const char*>(garbage.data()), static_cast<std::streamsize>(garbage.size()));
+                require(static_cast<bool>(out), "failed to write corrupt WAL segment tail");
+            }
+
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions());
+                const auto recovered1 = engine->get(bytes(key1));
+                const auto recovered2 = engine->get(bytes(key2));
+                const auto recovered3 = engine->get(bytes(key3));
+                require(recovered1.has_value() && *recovered1 == value1, "VersionLog supplement lost prefix WAL entry");
+                require(recovered2.has_value() && *recovered2 == value2, "VersionLog supplement lost corrupt-segment entry");
+                require(recovered3.has_value() && *recovered3 == value3, "VersionLog supplement did not restore post-corruption entry");
+                require(engine->stats().currentSeq == 3, "VersionLog supplement did not restore the recovered sequence");
+                engine->close();
+            }
+        }
+        catch (...) {
+            clearTestWalSegmentBytes();
+            throw;
+        }
+        clearTestWalSegmentBytes();
+        fs::remove_all(dir, ec);
+    }
+
+    void runVersionLogSupplementsOrderedMutationSuffixTest() {
+        namespace engine_ns = akkaradb::engine;
+        namespace memtable = engine_ns::memtable;
+        namespace wal = engine_ns::wal;
+        namespace vlog = engine_ns::vlog;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_vlog_supplements_ordered_mutation_suffix_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create ordered VersionLog supplement test directory");
+
+        const std::vector<uint8_t> key{'v', 'l', 'o', 'g', '-', 'o', 'r', 'd', 'e', 'r', 'e', 'd'};
+        const std::vector<uint8_t> value1{'x'};
+        const std::vector<uint8_t> value2{'y'};
+
+        const auto makeOptions = [&] {
+            engine_ns::AkkEngineOptions options;
+            options.paths.dataDir = dir;
+            options.components.walEnabled = true;
+            options.components.blobEnabled = false;
+            options.components.manifestEnabled = false;
+            options.components.sstEnabled = false;
+            options.components.versionLogEnabled = true;
+            options.memtable.shardCount = 1;
+            options.memtable.flushMode = memtable::MemTableFlushMode::MANUAL_ONLY;
+            options.runtime.forceFlushOnClose = false;
+            options.runtime.forceSyncOnClose = true;
+            options.runtime.writeDurability = engine_ns::AkkEngineOptions::WriteDurabilityMode::SYNCED;
+            options.runtime.truncateCorruptWalOnRecovery = true;
+            options.wal.shardCount = 1;
+            options.wal.execution = wal::WalExecutionMode::INLINE;
+            options.wal.syncPolicy = wal::WalSyncPolicy::ALWAYS;
+            options.vlog.syncMode = vlog::VLogSyncMode::SYNC;
+            return options;
+        };
+
+        setTestWalSegmentBytes(120);
+        try {
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions());
+                engine->put(bytes(key), bytes(value1));
+                engine->put(bytes(key), bytes(value2));
+                engine->remove(bytes(key));
+                engine->forceSync();
+                engine->close();
+            }
+
+            const auto segments = findWalSegments(dir / "wal");
+            require(segments.size() >= 3, "ordered supplement test expected at least three WAL segments");
+            {
+                std::ofstream out(segments[0], std::ios::binary | std::ios::app);
+                require(static_cast<bool>(out), "failed to append corrupt prefix WAL segment tail");
+                const std::vector<uint8_t> garbage{0xff, 0x7f, 0x01, 0x02, 0x03};
+                out.write(reinterpret_cast<const char*>(garbage.data()), static_cast<std::streamsize>(garbage.size()));
+                require(static_cast<bool>(out), "failed to write corrupt prefix WAL segment tail");
+            }
+
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions());
+                const auto recovered = engine->get(bytes(key));
+                require(!recovered.has_value(), "VersionLog supplement did not replay same-key delete suffix");
+                require(engine->stats().currentSeq == 3, "VersionLog ordered supplement did not advance to suffix max sequence");
+                engine->close();
+            }
+        }
+        catch (...) {
+            clearTestWalSegmentBytes();
+            throw;
+        }
+        clearTestWalSegmentBytes();
+        fs::remove_all(dir, ec);
+    }
+
+    void runVersionLogSupplementErrorCanBeIgnoredTest() {
+        namespace engine_ns = akkaradb::engine;
+        namespace memtable = engine_ns::memtable;
+        namespace wal = engine_ns::wal;
+        namespace vlog = engine_ns::vlog;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_vlog_supplement_ignore_error_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create ignored VersionLog supplement error test directory");
+
+        const std::vector<uint8_t> key1{'i', 'g', 'n', '-', '1'};
+        const std::vector<uint8_t> key2{'i', 'g', 'n', '-', '2'};
+        const std::vector<uint8_t> key3{'i', 'g', 'n', '-', '3'};
+        const std::vector<uint8_t> value1{'o', 'n', 'e'};
+        const std::vector<uint8_t> value2{'t', 'w', 'o'};
+        const std::vector<uint8_t> value3{'t', 'h', 'r', 'e', 'e'};
+
+        const auto makeOptions = [&](bool ignoreSupplementErrors) {
+            engine_ns::AkkEngineOptions options;
+            options.paths.dataDir = dir;
+            options.components.walEnabled = true;
+            options.components.blobEnabled = false;
+            options.components.manifestEnabled = false;
+            options.components.sstEnabled = false;
+            options.components.versionLogEnabled = true;
+            options.memtable.shardCount = 1;
+            options.memtable.flushMode = memtable::MemTableFlushMode::MANUAL_ONLY;
+            options.runtime.forceFlushOnClose = false;
+            options.runtime.forceSyncOnClose = true;
+            options.runtime.writeDurability = engine_ns::AkkEngineOptions::WriteDurabilityMode::SYNCED;
+            options.runtime.truncateCorruptWalOnRecovery = ignoreSupplementErrors;
+            options.runtime.ignoreVersionLogSupplementErrors = ignoreSupplementErrors;
+            options.wal.shardCount = 1;
+            options.wal.execution = wal::WalExecutionMode::INLINE;
+            options.wal.syncPolicy = wal::WalSyncPolicy::ALWAYS;
+            options.vlog.syncMode = vlog::VLogSyncMode::SYNC;
+            return options;
+        };
+
+        setTestWalSegmentBytes(120);
+        try {
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions(false));
+                engine->put(bytes(key1), bytes(value1));
+                engine->put(bytes(key2), bytes(value2));
+                engine->put(bytes(key3), bytes(value3));
+                engine->forceSync();
+                engine->close();
+            }
+
+            const auto segments = findWalSegments(dir / "wal");
+            require(segments.size() >= 3, "test expected at least three WAL segments");
+            {
+                std::ofstream out(segments[1], std::ios::binary | std::ios::app);
+                require(static_cast<bool>(out), "failed to append corrupt WAL tail for ignored supplement test");
+                const std::vector<uint8_t> garbage{0xff, 0x7f, 0x01, 0x02, 0x03};
+                out.write(reinterpret_cast<const char*>(garbage.data()), static_cast<std::streamsize>(garbage.size()));
+                require(static_cast<bool>(out), "failed to write corrupt WAL tail for ignored supplement test");
+            }
+            flipByte(dir / "history.akvlog", 48);
+
+            requireRuntimeError(
+                [&] { (void)engine_ns::AkkEngine::open(makeOptions(false)); },
+                "corrupt VersionLog supplement must fail open unless ignored"
+            );
+
+            {
+                auto engine = engine_ns::AkkEngine::open(makeOptions(true));
+                const auto recovered1 = engine->get(bytes(key1));
+                const auto recovered2 = engine->get(bytes(key2));
+                const auto recovered3 = engine->get(bytes(key3));
+                require(recovered1.has_value() && *recovered1 == value1, "ignored VersionLog supplement lost first WAL prefix entry");
+                require(recovered2.has_value() && *recovered2 == value2, "ignored VersionLog supplement lost second WAL prefix entry");
+                require(!recovered3.has_value(), "ignored VersionLog supplement unexpectedly restored post-corruption entry");
+                require(!engine->stats().vlog.enabled, "ignored corrupt VersionLog must be disabled for the opened engine");
+                require(engine->stats().currentSeq == 2, "ignored VersionLog supplement restored the wrong sequence");
+                engine->close();
+            }
+        }
+        catch (...) {
+            clearTestWalSegmentBytes();
+            throw;
+        }
+        clearTestWalSegmentBytes();
         fs::remove_all(dir, ec);
     }
 
@@ -783,6 +1066,9 @@ int main(int argc, char** argv) {
         if (argc != 1) { throw std::invalid_argument("unexpected command line"); }
         runRecoveryTest(fs::absolute(fs::path{argv[0]}));
         runManifestCheckpointSkipsCoveredWalRecoveryTest();
+        runVersionLogSupplementsCorruptWalRecoveryTest();
+        runVersionLogSupplementsOrderedMutationSuffixTest();
+        runVersionLogSupplementErrorCanBeIgnoredTest();
         runManifestCheckpointIntegrityRejectsMissingSstTest();
         runManifestStatsExposeRecoveryMetadataTest();
         runManifestStatsExposeBlobLifecycleTest();

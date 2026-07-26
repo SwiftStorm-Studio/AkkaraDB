@@ -73,17 +73,15 @@ namespace {
             fs::path path_;
     };
 
-    [[nodiscard]] vlog::VersionLogOptions serialOptions(const fs::path& path) {
+    [[nodiscard]] vlog::VersionLogOptions serialOptions() {
         vlog::VersionLogOptions options;
-        options.logPath = path;
         options.syncMode = vlog::VLogSyncMode::SYNC;
         options.readVisibility = vlog::VLogReadVisibilityMode::COMMIT_ORDER;
         return options;
     }
 
-    [[nodiscard]] vlog::VersionLogOptions parallelOptions(const fs::path& path) {
+    [[nodiscard]] vlog::VersionLogOptions parallelOptions() {
         vlog::VersionLogOptions options;
-        options.logPath = path;
         options.syncMode = vlog::VLogSyncMode::ASYNC;
         options.writeAdmission = vlog::VLogWriteAdmissionMode::PARALLEL;
         options.parallelWriteLanes = 4;
@@ -142,20 +140,20 @@ namespace {
     void verifyCorruptEntryFailsRecovery(const fs::path& dir) {
         const auto path = dir / "corrupt-entry.akvlog";
         {
-            auto log = vlog::VersionLog::create(serialOptions(path));
+            auto log = vlog::VersionLog::create(path, serialOptions());
             log->append(bytes("corrupt-key"), 1, 0, 0, 0, bytes("corrupt-value"));
             log->close();
         }
 
         flipByte(path, 48);
-        requireRuntimeError([&] { (void)vlog::VersionLog::create(serialOptions(path)); },
+        requireRuntimeError([&] { (void)vlog::VersionLog::create(path, serialOptions()); },
                             "VersionLog recovery must reject a CRC-corrupted entry");
     }
 
     void verifyTruncatedEntryFailsRecovery(const fs::path& dir) {
         const auto path = dir / "truncated-entry.akvlog";
         {
-            auto log = vlog::VersionLog::create(serialOptions(path));
+            auto log = vlog::VersionLog::create(path, serialOptions());
             log->append(bytes("truncated-key"), 1, 0, 0, 0, bytes("truncated-value"));
             log->close();
         }
@@ -165,7 +163,7 @@ namespace {
         require(!error && size > 4, "test setup must read VLog size before truncation");
         fs::resize_file(path, size - 3, error);
         require(!error, "test setup must truncate VLog entry");
-        requireRuntimeError([&] { (void)vlog::VersionLog::create(serialOptions(path)); },
+        requireRuntimeError([&] { (void)vlog::VersionLog::create(path, serialOptions()); },
                             "VersionLog recovery must reject a truncated committed entry");
     }
 
@@ -173,7 +171,7 @@ namespace {
         const auto path = dir / "parallel-tail.akvlog";
         constexpr std::string_view key{"parallel-tail-key"};
         {
-            auto log = vlog::VersionLog::create(parallelOptions(path));
+            auto log = vlog::VersionLog::create(path, parallelOptions());
             log->append(bytes(key), 1, 0, 0, 0, bytes("value-1"));
             log->forceSync();
             log->close();
@@ -183,9 +181,9 @@ namespace {
         require(!lanePath.empty(), "parallel VLog must create a non-empty lane segment for tail test");
         appendGarbageTail(lanePath);
 
-        auto options = parallelOptions(path);
+        auto options = parallelOptions();
         options.recoveryMode = vlog::VLogRecoveryMode::BACKGROUND;
-        auto log = vlog::VersionLog::create(std::move(options));
+        auto log = vlog::VersionLog::create(path, std::move(options));
         const auto observed = log->getAt(bytes(key), 1);
         require(observed.has_value() && observed->value == std::vector<uint8_t>{'v', 'a', 'l', 'u', 'e', '-', '1'},
                 "parallel VLog recovery must ignore bytes beyond the durable tail");
@@ -200,14 +198,14 @@ namespace {
         const auto path = dir / "sidecar-fallback.akvlog";
         constexpr std::string_view key{"sidecar-key"};
         {
-            auto options = serialOptions(path);
+            auto options = serialOptions();
             options.segmentBytes = 192;
-            auto log = vlog::VersionLog::create(std::move(options));
+            auto log = vlog::VersionLog::create(path, std::move(options));
             for (uint64_t seq = 1; seq <= 8; ++seq) { log->append(bytes(key), seq, 0, 0, 0, bytes(seqValue(seq))); }
             log->close();
         }
 
-        auto log = vlog::VersionLog::create(serialOptions(path));
+        auto log = vlog::VersionLog::create(path, serialOptions());
         const auto index = dir / "sidecar-fallback.akvidx";
         require(fs::exists(index), "test setup must have a generated sidecar index");
         flipByte(index, static_cast<std::streamoff>(fs::file_size(index) - 1));
@@ -227,7 +225,7 @@ namespace {
         constexpr uint32_t readerIterations = 256;
         constexpr uint64_t totalEntries = static_cast<uint64_t>(writerCount) * entriesPerWriter;
 
-        auto log = vlog::VersionLog::create(parallelOptions(path));
+        auto log = vlog::VersionLog::create(path, parallelOptions());
         std::atomic<uint64_t> nextSeq{1};
         std::atomic<uint64_t> highestSubmitted{0};
         std::atomic<uint32_t> ready{0};
@@ -303,7 +301,7 @@ namespace {
         require(beforeClose.size() == totalEntries, "parallel stress must publish every written history entry before close");
         log->close();
 
-        auto recovered = vlog::VersionLog::create(parallelOptions(path));
+        auto recovered = vlog::VersionLog::create(path, parallelOptions());
         const auto recoverySnapshot = recovered->snapshot();
         require(recoverySnapshot.recoveredEntryCount == totalEntries, "parallel recovery stats must report recovered entry count");
         require(recoverySnapshot.recoveredSegmentCount != 0, "parallel recovery stats must report recovered segments");

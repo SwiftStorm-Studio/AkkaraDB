@@ -284,12 +284,12 @@ namespace akkaradb::engine::sst {
                 int dst = 0;
             };
 
-            Impl(Options options, manifest::Manifest* manifest)
-                : options_{std::move(options)}, manifest_{manifest} {
+            Impl(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest)
+                : sstDir_{std::move(sstDir)}, options_{std::move(options)}, manifest_{manifest} {
                 if (options_.maxLevels < 2) { options_.maxLevels = 2; }
-                if (options_.sstDir.empty()) { throw std::invalid_argument("SSTManager: sstDir is required"); }
+                if (sstDir_.empty()) { throw std::invalid_argument("SSTManager: sstDir is required"); }
                 validateZstdCompressionLevel(options_);
-                std::filesystem::create_directories(options_.sstDir);
+                std::filesystem::create_directories(sstDir_);
                 levels_.resize(static_cast<size_t>(options_.maxLevels));
                 publishLocked();
                 if (compactionEnabled(options_)) {
@@ -309,7 +309,7 @@ namespace akkaradb::engine::sst {
                 std::vector<std::filesystem::path> orphanSsts;
                 std::unordered_set<std::string> liveManifestFiles;
                 std::vector<std::string> allSstFiles;
-                for (const auto& entry : std::filesystem::directory_iterator(options_.sstDir)) {
+                for (const auto& entry : std::filesystem::directory_iterator(sstDir_)) {
                     const auto p = entry.path();
                     if (p.extension() == ".tmp") { removeFileDurable(p); }
                     else if (p.extension() == ".aksst") {
@@ -325,12 +325,12 @@ namespace akkaradb::engine::sst {
                     liveManifestFiles.insert(files.begin(), files.end());
                     for (const auto& filename : allSstFiles) {
                         if (liveManifestFiles.find(filename) == liveManifestFiles.end()) {
-                            orphanSsts.push_back(options_.sstDir / filename);
+                            orphanSsts.push_back(sstDir_ / filename);
                         }
                     }
                 }
                 else {
-                    for (const auto& entry : std::filesystem::directory_iterator(options_.sstDir)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(sstDir_)) {
                         if (entry.path().extension() == ".aksst") { files.push_back(entry.path().filename().string()); }
                     }
                 }
@@ -338,7 +338,7 @@ namespace akkaradb::engine::sst {
                 for (const auto& orphan : orphanSsts) { removeFileDurable(orphan); }
 
                 for (const auto& file : files) {
-                    const auto path = options_.sstDir / file;
+                    const auto path = sstDir_ / file;
                     auto reader = SSTReader::open(path, readerOptions());
                     if (!reader) { throw std::runtime_error("SSTManager: manifest references missing or corrupt SST: " + file); }
                     Meta meta = makeMeta(path, file, std::move(reader));
@@ -539,7 +539,7 @@ namespace akkaradb::engine::sst {
 
             [[nodiscard]] std::filesystem::path makeFilePath(int level) {
                 const uint64_t id = nextFileId_.fetch_add(1, std::memory_order_relaxed);
-                return options_.sstDir / std::format("L{}_{}.aksst", level, id);
+                return sstDir_ / std::format("L{}_{}.aksst", level, id);
             }
 
             [[nodiscard]] static uint64_t parseFileId(const std::string& file) noexcept {
@@ -842,6 +842,7 @@ namespace akkaradb::engine::sst {
                 return std::ranges::any_of(busyWork_, [=](const BusyWork& item) { return levelsOverlap(src, dst, item.src, item.dst); });
             }
 
+            std::filesystem::path sstDir_;
             Options options_;
             manifest::Manifest* manifest_;
 
@@ -879,11 +880,16 @@ namespace akkaradb::engine::sst {
         return impl_->next();
     }
 
-    std::unique_ptr<SSTManager> SSTManager::create(Options options, manifest::Manifest* manifest) {
-        return std::unique_ptr<SSTManager>(new SSTManager(std::move(options), manifest));
+    std::unique_ptr<SSTManager> SSTManager::create(
+        std::filesystem::path sstDir,
+        Options options,
+        manifest::Manifest* manifest
+    ) {
+        return std::unique_ptr<SSTManager>(new SSTManager(std::move(sstDir), std::move(options), manifest));
     }
 
-    SSTManager::SSTManager(Options options, manifest::Manifest* manifest) : impl_{std::make_unique<Impl>(std::move(options), manifest)} {}
+    SSTManager::SSTManager(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest)
+        : impl_{std::make_unique<Impl>(std::move(sstDir), std::move(options), manifest)} {}
 
     SSTManager::~SSTManager() = default;
     void SSTManager::recover() { impl_->recover(); }

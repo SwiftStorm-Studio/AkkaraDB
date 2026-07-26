@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -31,6 +33,13 @@ namespace akkaradb::engine::memtable {
             if (lhs.size() > rhs.size()) { return 1; }
             return 0;
         }
+
+        [[nodiscard]] uint16_t resolveMaxVersionsPerKey(size_t value) {
+            if (value == 0 || value > BPTreeMemTable::MAX_CONFIGURED_VERSIONS_PER_KEY) {
+                throw std::invalid_argument("BPTreeMemTable: maxVersionsPerKey must be in [1, 65535]");
+            }
+            return static_cast<uint16_t>(value);
+        }
     } // namespace
 
     BPTreeMemTable::BPTreeMemTable(
@@ -41,8 +50,11 @@ namespace akkaradb::engine::memtable {
         MemTableBackendOptions backendOptions
     )
         : dataArena_{dataArenaInitialBlockSize, dataArenaMaxBlockSize},
-          generatorArena_{generatorArenaInitialBlockSize, generatorArenaMaxBlockSize},
-          mutableScanMode_{backendOptions.mutableScanMode} {
+          generatorArenaInitialBlockSize_{generatorArenaInitialBlockSize},
+          generatorArenaMaxBlockSize_{generatorArenaMaxBlockSize},
+          mutableScanMode_{backendOptions.mutableScanMode},
+          concurrencyMode_{backendOptions.bptreeConcurrencyMode},
+          maxVersionsPerKey_{resolveMaxVersionsPerKey(backendOptions.maxVersionsPerKey)} {
         Node* initialRoot = makeNode(true);
         root_.store(initialRoot, std::memory_order_release);
     }
@@ -58,12 +70,18 @@ namespace akkaradb::engine::memtable {
     }
 
     BPTreeMemTable::VersionChain* BPTreeMemTable::makeChain(const core::OwnedRecord* initial) {
-        VersionChain* chain = arenaNew<VersionChain>();
-        chain->ring[0].store(initial, std::memory_order_relaxed);
+        const size_t slotBytes = static_cast<size_t>(maxVersionsPerKey_) * sizeof(std::atomic<const core::OwnedRecord*>);
+        const size_t bytes = sizeof(VersionChain) + slotBytes;
+        std::byte* mem = dataArena_.allocate(bytes, alignof(VersionChain));
+        VersionChain* chain = new(mem) VersionChain{};
+        chain->capacity = maxVersionsPerKey_;
+        auto* ring = chain->ring();
+        for (uint16_t i = 0; i < maxVersionsPerKey_; ++i) { new(&ring[i]) std::atomic<const core::OwnedRecord*>{nullptr}; }
+        ring[0].store(initial, std::memory_order_relaxed);
         chain->head.store(0, std::memory_order_relaxed);
         chain->count.store(1, std::memory_order_relaxed);
         entries_.fetch_add(1, std::memory_order_relaxed);
-        bytes_.fetch_add(sizeof(VersionChain), std::memory_order_relaxed);
+        bytes_.fetch_add(bytes, std::memory_order_relaxed);
         return chain;
     }
 
@@ -133,14 +151,16 @@ namespace akkaradb::engine::memtable {
 
         chain->version.fetch_add(1, std::memory_order_acq_rel);
 
-        const uint8_t prevHead = chain->head.load(std::memory_order_relaxed);
-        const uint8_t prevCount = chain->count.load(std::memory_order_relaxed);
-        const uint8_t nextHead = static_cast<uint8_t>((prevHead + 1) & (MAX_VERSIONS_PER_KEY - 1));
+        const uint16_t capacity = chain->capacity;
+        auto* ring = chain->ring();
+        const uint16_t prevHead = chain->head.load(std::memory_order_relaxed);
+        const uint16_t prevCount = chain->count.load(std::memory_order_relaxed);
+        const uint16_t nextHead = static_cast<uint16_t>((prevHead + 1) % capacity);
 
-        chain->ring[nextHead].store(record, std::memory_order_release);
+        ring[nextHead].store(record, std::memory_order_release);
 
-        if (prevCount < MAX_VERSIONS_PER_KEY) {
-            chain->count.store(static_cast<uint8_t>(prevCount + 1), std::memory_order_relaxed);
+        if (prevCount < capacity) {
+            chain->count.store(static_cast<uint16_t>(prevCount + 1), std::memory_order_relaxed);
             entries.fetch_add(1, std::memory_order_relaxed);
         }
         chain->head.store(nextHead, std::memory_order_release);
@@ -155,17 +175,19 @@ namespace akkaradb::engine::memtable {
             const uint64_t begin = chain->version.load(std::memory_order_acquire);
             if ((begin & 1ULL) != 0ULL) { continue; }
 
-            const uint8_t head = chain->head.load(std::memory_order_relaxed);
-            const uint8_t count = chain->count.load(std::memory_order_relaxed);
+            const uint16_t capacity = chain->capacity;
+            const auto* ring = chain->ring();
+            const uint16_t head = chain->head.load(std::memory_order_relaxed);
+            const uint16_t count = chain->count.load(std::memory_order_relaxed);
 
             const core::OwnedRecord* selected = nullptr;
             if (count > 0) {
-                const core::OwnedRecord* newest = chain->ring[head].load(std::memory_order_relaxed);
+                const core::OwnedRecord* newest = ring[head].load(std::memory_order_relaxed);
                 if (newest != nullptr && newest->seq() <= snapshotSeq) { selected = newest; }
                 else {
-                    for (uint8_t i = 1; i < count; ++i) {
-                        const uint8_t index = static_cast<uint8_t>((head - i) & (MAX_VERSIONS_PER_KEY - 1));
-                        const core::OwnedRecord* candidate = chain->ring[index].load(std::memory_order_relaxed);
+                    for (uint16_t i = 1; i < count; ++i) {
+                        const uint16_t index = static_cast<uint16_t>((head + capacity - i) % capacity);
+                        const core::OwnedRecord* candidate = ring[index].load(std::memory_order_relaxed);
                         if (candidate != nullptr && candidate->seq() <= snapshotSeq) {
                             selected = candidate;
                             break;
@@ -394,6 +416,9 @@ namespace akkaradb::engine::memtable {
         uint64_t precomputedFp64,
         uint64_t precomputedMk
     ) {
+        std::unique_lock lock{treeMutex_, std::defer_lock};
+        if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) { lock.lock(); }
+
         if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::INVALID_ARGUMENT, "memtable is frozen"); }
         if (key.size() > std::numeric_limits<uint16_t>::max() || value.size() > std::numeric_limits<uint16_t>::max()) {
             return Status::Error(Status::Code::INVALID_ARGUMENT, "key/value too large for MemHdr16");
@@ -419,6 +444,8 @@ namespace akkaradb::engine::memtable {
 
     bool BPTreeMemTable::get(ByteView key, uint64_t snapshotSeq, RecordView* out) const {
         if (out == nullptr) { return false; }
+        std::shared_lock lock{treeMutex_, std::defer_lock};
+        if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) { lock.lock(); }
 
         const std::span<const uint8_t> target = asU8(key);
         Node* leaf = descendToCandidateLeaf(target);
@@ -747,38 +774,85 @@ namespace akkaradb::engine::memtable {
         }
     }
 
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateWithReadLock(
+        uint64_t snapshotSeq,
+        std::shared_lock<std::shared_mutex> lock
+    ) const {
+        (void)lock;
+        const bool frozen = frozen_.load(std::memory_order_acquire);
+        auto records = frozen
+                           ? iterateFrozenSnapshot(snapshotSeq)
+                           : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                  ? iterateStreamingSnapshot(snapshotSeq)
+                                  : iterateSnapshot(snapshotSeq));
+        for (const RecordView& record : records) { co_yield record; }
+    }
+
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateRangeWithReadLock(
+        uint64_t snapshotSeq,
+        std::vector<uint8_t> startKey,
+        std::vector<uint8_t> endKey,
+        std::shared_lock<std::shared_mutex> lock
+    ) const {
+        (void)lock;
+        const bool frozen = frozen_.load(std::memory_order_acquire);
+        auto records = frozen
+                           ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey))
+                           : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                  ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey))
+                                  : iterateSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey)));
+        for (const RecordView& record : records) { co_yield record; }
+    }
+
     ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const {
         const std::span<const uint8_t> start = asU8(startKey);
         const std::span<const uint8_t> end = asU8(endKey);
-        const bool frozen = frozen_.load(std::memory_order_acquire);
 
-        std::lock_guard<std::mutex> lock{generatorArenaMutex_};
         if (start.empty() && end.empty()) {
-            return ArenaGenerator<RecordView>::withArena(
-                generatorArena_,
-                [this, snapshotSeq, frozen]() {
-                    if (frozen) { return iterateFrozenSnapshot(snapshotSeq); }
-                    return mutableScanMode_ == MutableScanMode::STREAMING_RESTART
-                               ? iterateStreamingSnapshot(snapshotSeq)
-                               : iterateSnapshot(snapshotSeq);
+            return ArenaGenerator<RecordView>::withOwnedArena(
+                generatorArenaInitialBlockSize_,
+                generatorArenaMaxBlockSize_,
+                [this, snapshotSeq]() {
+                    const bool frozen = frozen_.load(std::memory_order_acquire);
+                    if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) {
+                        return iterateWithReadLock(snapshotSeq, std::shared_lock{treeMutex_});
+                    }
+                    return frozen ? iterateFrozenSnapshot(snapshotSeq)
+                                  : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                         ? iterateStreamingSnapshot(snapshotSeq)
+                                         : iterateSnapshot(snapshotSeq));
                 }
             );
         }
 
         std::vector<uint8_t> startOwned(start.begin(), start.end());
         std::vector<uint8_t> endOwned(end.begin(), end.end());
-        return ArenaGenerator<RecordView>::withArena(
-            generatorArena_,
-            [this, snapshotSeq, frozen, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
-                if (frozen) { return iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)); }
-                return mutableScanMode_ == MutableScanMode::STREAMING_RESTART
-                           ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
-                           : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
+        return ArenaGenerator<RecordView>::withOwnedArena(
+            generatorArenaInitialBlockSize_,
+            generatorArenaMaxBlockSize_,
+            [this, snapshotSeq, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
+                const bool frozen = frozen_.load(std::memory_order_acquire);
+                if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) {
+                    return iterateRangeWithReadLock(
+                        snapshotSeq,
+                        std::move(startOwned),
+                        std::move(endOwned),
+                        std::shared_lock{treeMutex_}
+                    );
+                }
+                return frozen ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                              : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                     ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                                     : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)));
             }
         );
     }
 
-    void BPTreeMemTable::freeze() { frozen_.store(true, std::memory_order_release); }
+    void BPTreeMemTable::freeze() {
+        std::unique_lock lock{treeMutex_, std::defer_lock};
+        if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) { lock.lock(); }
+        frozen_.store(true, std::memory_order_release);
+    }
 
     size_t BPTreeMemTable::sizeBytes() const { return bytes_.load(std::memory_order_acquire); }
 
