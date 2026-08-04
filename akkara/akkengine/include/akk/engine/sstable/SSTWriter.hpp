@@ -1,4 +1,11 @@
-
+/*
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
 
 // akkengine/include/akk/engine/sstable/SSTWriter.hpp
 /*
@@ -22,6 +29,7 @@
 #include <vector>
 
 #include "akk/core/record/RecordView.hpp"
+#include "akk/core/utils/ArenaGenerator.hpp"
 #include "akk/engine/sstable/SSTFormat.hpp"
 
 namespace akkaradb::engine::sst {
@@ -62,6 +70,12 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] static Result write(
                 const std::filesystem::path& path,
                 std::span<const core::RecordView> records,
+                const Options& options
+            );
+            [[nodiscard]] static Result write(
+                const std::filesystem::path& path,
+                size_t estimatedRecordCount,
+                core::ArenaGenerator<core::RecordView> records,
                 const Options& options
             );
 

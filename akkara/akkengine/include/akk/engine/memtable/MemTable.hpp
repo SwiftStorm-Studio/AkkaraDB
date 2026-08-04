@@ -29,10 +29,15 @@ namespace akkaradb::engine::memtable {
         AUTO = 0, BYTES_PER_SHARD = 1, MANUAL_ONLY = 2,
     };
 
+    enum class MemTableFlushInputMode : uint8_t {
+        MATERIALIZE_VECTOR = 0, STREAMING = 1,
+    };
+
     class AKDB_API MemTable {
         public:
             using RecordView = core::RecordView;
             using FlushCallback = std::function<void(std::span<const RecordView>)>;
+            using StreamingFlushCallback = std::function<void(size_t, core::ArenaGenerator<RecordView>)>;
             using MemTableFactory = std::function<std::unique_ptr<IMemTable>()>;
             using ConfiguredMemTableFactory = std::function<std::unique_ptr<IMemTable>(const MemTableBackendOptions &)>;
 
@@ -45,6 +50,7 @@ namespace akkaradb::engine::memtable {
                 // AUTO maps to BYTES_PER_SHARD when thresholdBytesPerShard > 0, otherwise MANUAL_ONLY.
                 MemTableFlushMode flushMode = MemTableFlushMode::AUTO;
                 size_t thresholdBytesPerShard = 64ULL * 1024 * 1024;
+                MemTableFlushInputMode flushInputMode = MemTableFlushInputMode::MATERIALIZE_VECTOR;
                 // Backend construction policy. BPTree uses mutableScanMode;
                 // SkipList and ART accept it as a no-op.
                 MemTableBackendOptions backendOptions{};
@@ -53,6 +59,7 @@ namespace akkaradb::engine::memtable {
                 MemTableFactory backendFactory = nullptr;
                 ConfiguredMemTableFactory backendFactoryWithOptions = nullptr;
                 FlushCallback onFlush = nullptr;
+                StreamingFlushCallback onFlushStream = nullptr;
             };
 
             struct KeyRange {
@@ -134,6 +141,7 @@ namespace akkaradb::engine::memtable {
             // Rethrows the first asynchronous immutable-flush failure, if any.
             void throwIfFlushFailed() const;
             void setFlushCallback(const FlushCallback& cb);
+            void setStreamingFlushCallback(const StreamingFlushCallback& cb);
 
             [[nodiscard]] size_t approxSize() const noexcept;
             [[nodiscard]] MemTableSnapshot snapshot() const noexcept;

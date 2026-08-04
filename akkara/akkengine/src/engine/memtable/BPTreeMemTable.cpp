@@ -40,6 +40,11 @@ namespace akkaradb::engine::memtable {
             }
             return static_cast<uint16_t>(value);
         }
+
+        [[nodiscard]] size_t resolveIteratorBatchSize(size_t value) {
+            if (value == 0) { throw std::invalid_argument("BPTreeMemTable: bptreeIteratorBatchSize must be greater than 0"); }
+            return value;
+        }
     } // namespace
 
     BPTreeMemTable::BPTreeMemTable(
@@ -54,7 +59,9 @@ namespace akkaradb::engine::memtable {
           generatorArenaMaxBlockSize_{generatorArenaMaxBlockSize},
           mutableScanMode_{backendOptions.mutableScanMode},
           concurrencyMode_{backendOptions.bptreeConcurrencyMode},
-          maxVersionsPerKey_{resolveMaxVersionsPerKey(backendOptions.maxVersionsPerKey)} {
+          iteratorMode_{backendOptions.bptreeIteratorMode},
+          maxVersionsPerKey_{resolveMaxVersionsPerKey(backendOptions.maxVersionsPerKey)},
+          iteratorBatchSize_{resolveIteratorBatchSize(backendOptions.bptreeIteratorBatchSize)} {
         Node* initialRoot = makeNode(true);
         root_.store(initialRoot, std::memory_order_release);
     }
@@ -774,34 +781,108 @@ namespace akkaradb::engine::memtable {
         }
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterateWithReadLock(
-        uint64_t snapshotSeq,
-        std::shared_lock<std::shared_mutex> lock
-    ) const {
+    std::vector<RecordView> BPTreeMemTable::materializeWithReadLock(uint64_t snapshotSeq, std::shared_lock<std::shared_mutex> lock) const {
         (void)lock;
+        std::vector<RecordView> materialized;
         const bool frozen = frozen_.load(std::memory_order_acquire);
         auto records = frozen
                            ? iterateFrozenSnapshot(snapshotSeq)
                            : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
                                   ? iterateStreamingSnapshot(snapshotSeq)
                                   : iterateSnapshot(snapshotSeq));
-        for (const RecordView& record : records) { co_yield record; }
+        for (const RecordView& record : records) { materialized.push_back(record); }
+        return materialized;
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterateRangeWithReadLock(
+    std::vector<RecordView> BPTreeMemTable::materializeRangeWithReadLock(
         uint64_t snapshotSeq,
         std::vector<uint8_t> startKey,
         std::vector<uint8_t> endKey,
         std::shared_lock<std::shared_mutex> lock
     ) const {
         (void)lock;
+        std::vector<RecordView> materialized;
         const bool frozen = frozen_.load(std::memory_order_acquire);
         auto records = frozen
                            ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey))
                            : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
                                   ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey))
                                   : iterateSnapshotRange(snapshotSeq, std::move(startKey), std::move(endKey)));
+        for (const RecordView& record : records) { materialized.push_back(record); }
+        return materialized;
+    }
+
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateMaterialized(std::vector<RecordView> records) {
         for (const RecordView& record : records) { co_yield record; }
+    }
+
+    std::vector<RecordView> BPTreeMemTable::materializeBatchWithReadLock(
+        uint64_t snapshotSeq,
+        const std::vector<uint8_t>& startKey,
+        const std::vector<uint8_t>& endKey,
+        bool startExclusive,
+        size_t batchSize,
+        std::shared_lock<std::shared_mutex> lock
+    ) const {
+        (void)lock;
+        std::vector<RecordView> materialized;
+        materialized.reserve(std::min(batchSize, static_cast<size_t>(MAX_KEYS)));
+
+        const std::span<const uint8_t> lowerBound{startKey.data(), startKey.size()};
+        const std::span<const uint8_t> upperBound{endKey.data(), endKey.size()};
+        if (!lowerBound.empty() && !upperBound.empty()) {
+            const int cmp = compareKeyBytes(lowerBound, upperBound);
+            if (cmp > 0 || (cmp == 0 && startExclusive)) { return materialized; }
+        }
+
+        Node* node = lowerBound.empty() ? root_.load(std::memory_order_acquire) : descendToCandidateLeaf(lowerBound);
+        if (lowerBound.empty()) { while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); } }
+
+        while (node != nullptr && materialized.size() < batchSize) {
+            const uint16_t keyCount = node->keyCount.load(std::memory_order_acquire);
+            for (uint16_t i = 0; i < keyCount && materialized.size() < batchSize; ++i) {
+                const core::OwnedRecord* keyRecord = node->keys[i].load(std::memory_order_acquire);
+                if (keyRecord == nullptr) { continue; }
+
+                if (!lowerBound.empty()) {
+                    const int lowerCmp = compareRecordKey(keyRecord, lowerBound);
+                    if (lowerCmp < 0 || (startExclusive && lowerCmp == 0)) { continue; }
+                }
+                if (!upperBound.empty() && compareRecordKey(keyRecord, upperBound) >= 0) { return materialized; }
+
+                RecordView visible;
+                VersionChain* chain = node->chains[i].load(std::memory_order_acquire);
+                if (visibleRecord(chain, snapshotSeq, &visible)) { materialized.push_back(visible); }
+            }
+            node = node->nextLeaf.load(std::memory_order_acquire);
+        }
+
+        return materialized;
+    }
+
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateBatchedUnpinned(
+        uint64_t snapshotSeq,
+        std::vector<uint8_t> startKey,
+        std::vector<uint8_t> endKey
+    ) const {
+        bool startExclusive = false;
+        while (true) {
+            std::vector<RecordView> batch = materializeBatchWithReadLock(
+                snapshotSeq,
+                startKey,
+                endKey,
+                startExclusive,
+                iteratorBatchSize_,
+                std::shared_lock{treeMutex_}
+            );
+            if (batch.empty()) { co_return; }
+
+            const RecordView& last = batch.back();
+            startKey.assign(last.key().begin(), last.key().end());
+            startExclusive = true;
+
+            for (const RecordView& record : batch) { co_yield record; }
+        }
     }
 
     ArenaGenerator<RecordView> BPTreeMemTable::iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const {
@@ -815,12 +896,17 @@ namespace akkaradb::engine::memtable {
                 [this, snapshotSeq]() {
                     const bool frozen = frozen_.load(std::memory_order_acquire);
                     if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) {
-                        return iterateWithReadLock(snapshotSeq, std::shared_lock{treeMutex_});
+                        if (frozen) { return iterateFrozenSnapshot(snapshotSeq); }
+                        if (iteratorMode_ == BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED) {
+                            return iterateBatchedUnpinned(snapshotSeq, {}, {});
+                        }
+                        return iterateMaterialized(materializeWithReadLock(snapshotSeq, std::shared_lock{treeMutex_}));
                     }
-                    return frozen ? iterateFrozenSnapshot(snapshotSeq)
-                                  : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
-                                         ? iterateStreamingSnapshot(snapshotSeq)
-                                         : iterateSnapshot(snapshotSeq));
+                    return frozen
+                               ? iterateFrozenSnapshot(snapshotSeq)
+                               : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                      ? iterateStreamingSnapshot(snapshotSeq)
+                                      : iterateSnapshot(snapshotSeq));
                 }
             );
         }
@@ -833,17 +919,19 @@ namespace akkaradb::engine::memtable {
             [this, snapshotSeq, startOwned = std::move(startOwned), endOwned = std::move(endOwned)]() mutable {
                 const bool frozen = frozen_.load(std::memory_order_acquire);
                 if (concurrencyMode_ == BPTreeConcurrencyMode::LOCKED) {
-                    return iterateRangeWithReadLock(
-                        snapshotSeq,
-                        std::move(startOwned),
-                        std::move(endOwned),
-                        std::shared_lock{treeMutex_}
+                    if (frozen) { return iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)); }
+                    if (iteratorMode_ == BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED) {
+                        return iterateBatchedUnpinned(snapshotSeq, std::move(startOwned), std::move(endOwned));
+                    }
+                    return iterateMaterialized(
+                        materializeRangeWithReadLock(snapshotSeq, std::move(startOwned), std::move(endOwned), std::shared_lock{treeMutex_})
                     );
                 }
-                return frozen ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
-                              : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
-                                     ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
-                                     : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)));
+                return frozen
+                           ? iterateFrozenSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                           : (mutableScanMode_ == MutableScanMode::STREAMING_RESTART
+                                  ? iterateStreamingSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned))
+                                  : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)));
             }
         );
     }

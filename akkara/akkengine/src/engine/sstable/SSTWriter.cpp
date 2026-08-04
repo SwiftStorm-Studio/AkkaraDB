@@ -220,28 +220,19 @@ namespace akkaradb::engine::sst {
         }
     } // namespace
 
-    SSTWriter::Result SSTWriter::write(const std::filesystem::path& path, std::span<const core::RecordView> records) {
-        return write(path, records, Options{});
-    }
-
-    SSTWriter::Result SSTWriter::write(
+    template <typename Records>
+    [[nodiscard]] SSTWriter::Result writeRecords(
         const std::filesystem::path& path,
-        std::span<const core::RecordView> records,
-        const Options& options
+        size_t estimatedRecordCount,
+        Records&& records,
+        const SSTWriter::Options& options
     ) {
-        if (records.empty()) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         if (options.blockSize < 4096 || (options.blockSize & 7u) != 0) {
             throw std::invalid_argument("SSTWriter::write: blockSize must be >=4096 and 8-byte aligned");
         }
-        if (options.codec == Codec::ZSTD && (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel >
+        if (options.codec == SSTWriter::Codec::ZSTD && (options.zstdCompressionLevel < ZSTD_minCLevel() || options.zstdCompressionLevel >
             ZSTD_maxCLevel())) {
             throw std::invalid_argument("SSTWriter::write: zstdCompressionLevel is outside the supported Zstd range");
-        }
-
-        for (size_t i = 1; i < records.size(); ++i) {
-            if (records[i - 1].compareKey(records[i]) > 0) {
-                throw std::invalid_argument("SSTWriter::write: records must be sorted by key");
-            }
         }
 
         if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
@@ -251,23 +242,15 @@ namespace akkaradb::engine::sst {
         SSTFileHeaderV2 header{};
         writeExact(out, &header, sizeof(header));
 
-        Result result;
+        SSTWriter::Result result;
         result.path = path;
-        result.entryCount = records.size();
-        result.firstKey.assign(records.front().key().begin(), records.front().key().end());
-        result.lastKey.assign(records.back().key().begin(), records.back().key().end());
 
-        BloomBuild bloom(records.size(), options.bloomBitsPerKey);
-        for (const auto& rec : records) {
-            bloom.add(rec.keyFp64());
-            result.minSeq = std::min(result.minSeq, rec.seq());
-            result.maxSeq = std::max(result.maxSeq, rec.seq());
-            result.blobRefs.push_back(blobRefEntryFromRecord(rec));
-        }
+        BloomBuild bloom(estimatedRecordCount, options.bloomBitsPerKey);
 
         std::vector<SSTBlockIndexEntryV2> index;
         std::vector<uint8_t> keyArena;
         PendingBlock block;
+        std::optional<core::RecordView> previousRecord;
 
         auto flushBlock = [&]() {
             if (block.empty()) { return; }
@@ -337,10 +320,24 @@ namespace akkaradb::engine::sst {
         };
 
         for (const auto& rec : records) {
+            if (previousRecord.has_value() && previousRecord->compareKey(rec) > 0) {
+                throw std::invalid_argument("SSTWriter::write: records must be sorted by key");
+            }
+            if (result.entryCount == 0) { result.firstKey.assign(rec.key().begin(), rec.key().end()); }
+
+            bloom.add(rec.keyFp64());
+            result.minSeq = std::min(result.minSeq, rec.seq());
+            result.maxSeq = std::max(result.maxSeq, rec.seq());
+            result.lastKey.assign(rec.key().begin(), rec.key().end());
+            result.blobRefs.push_back(blobRefEntryFromRecord(rec));
+            ++result.entryCount;
+
             const uint64_t estimated = alignUpU64(32 + rec.keySize() + rec.valueSize(), 8);
             if (!block.empty() && block.raw.size() + estimated > options.blockSize) { flushBlock(); }
             appendRecord(block, rec);
+            previousRecord = rec;
         }
+        if (result.entryCount == 0) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         flushBlock();
 
         const uint64_t indexOffset = static_cast<uint64_t>(out.tellp());
@@ -366,10 +363,10 @@ namespace akkaradb::engine::sst {
         header.version = SST_VERSION_V2;
         header.headerSize = sizeof(SSTFileHeaderV2);
         header.flags = SST_FILE_FLAG_METADATA_CRC;
-        if (options.codec == Codec::ZSTD) { header.flags |= SST_FILE_FLAG_BLOCK_ZSTD; }
+        if (options.codec == SSTWriter::Codec::ZSTD) { header.flags |= SST_FILE_FLAG_BLOCK_ZSTD; }
         header.level = static_cast<uint32_t>(options.level);
         header.file_size = footer.file_size;
-        header.entryCount = records.size();
+        header.entryCount = result.entryCount;
         header.blockCount = index.size();
         header.dataOffset = sizeof(SSTFileHeaderV2);
         header.indexOffset = indexOffset;
@@ -408,4 +405,24 @@ namespace akkaradb::engine::sst {
         result.fileSizeBytes = header.file_size;
         return result;
     }
+
+    SSTWriter::Result SSTWriter::write(const std::filesystem::path& path, std::span<const core::RecordView> records) {
+        return write(path, records, Options{});
+    }
+
+    SSTWriter::Result SSTWriter::write(
+        const std::filesystem::path& path,
+        std::span<const core::RecordView> records,
+        const Options& options
+    ) {
+        if (records.empty()) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
+        return writeRecords(path, records.size(), records, options);
+    }
+
+    SSTWriter::Result SSTWriter::write(
+        const std::filesystem::path& path,
+        size_t estimatedRecordCount,
+        core::ArenaGenerator<core::RecordView> records,
+        const Options& options
+    ) { return writeRecords(path, estimatedRecordCount, records, options); }
 } // namespace akkaradb::engine::sst

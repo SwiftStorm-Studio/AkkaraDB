@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/throughput/parallel_memtable_visibility_rate_benchmark.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/core/record/KeyFingerprint.hpp"

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// akkengine/include/akk/engine/server/HttpApiServer.hpp
+// akkserver/include/akk/engine/server/HttpApiServer.hpp
 #pragma once
 
 #include "akk/engine/AkkEngine.hpp"

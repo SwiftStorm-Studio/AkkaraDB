@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/wal_async_failure_smoke_test.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"

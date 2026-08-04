@@ -263,8 +263,18 @@ namespace akkaradb::engine::memtable {
 
                     using FlushDone = std::function<void(uint32_t, uint64_t)>;
 
-                    FlushPool(uint32_t workerCount, FlushCallback callback, FlushDone done)
-                        : callback_{std::move(callback)}, onDone_{std::move(done)}, running_{true} {
+                    FlushPool(
+                        uint32_t workerCount,
+                        MemTableFlushInputMode inputMode,
+                        FlushCallback callback,
+                        StreamingFlushCallback streamingCallback,
+                        FlushDone done
+                    )
+                        : inputMode_{inputMode},
+                          callback_{std::move(callback)},
+                          streamingCallback_{std::move(streamingCallback)},
+                          onDone_{std::move(done)},
+                          running_{true} {
                         workers_.reserve(workerCount);
                         for (uint32_t i = 0; i < workerCount; ++i) { workers_.emplace_back([this]() { run(); }); }
                     }
@@ -321,14 +331,20 @@ namespace akkaradb::engine::memtable {
                             }
 
                             try {
-                                std::vector<RecordView> records;
-                                records.reserve(item.table->entryCount());
-                                for (const RecordView& rec : item.table->iterator(
-                                         core::ByteView{},
-                                         core::ByteView{},
-                                         std::numeric_limits<uint64_t>::max()
-                                     )) { records.push_back(rec); }
-                                if (callback_) { callback_(std::span<const RecordView>{records}); }
+                                auto records = item.table->iterator(
+                                    core::ByteView{},
+                                    core::ByteView{},
+                                    std::numeric_limits<uint64_t>::max()
+                                );
+                                if (inputMode_ == MemTableFlushInputMode::STREAMING && streamingCallback_) {
+                                    streamingCallback_(item.table->entryCount(), std::move(records));
+                                }
+                                else if (callback_) {
+                                    std::vector<RecordView> materialized;
+                                    materialized.reserve(item.table->entryCount());
+                                    for (const RecordView& rec : records) { materialized.push_back(rec); }
+                                    callback_(std::span<const RecordView>{materialized});
+                                }
                                 if (onDone_) { onDone_(item.shardIndex, item.id); }
                             }
                             catch (...) {
@@ -345,7 +361,9 @@ namespace akkaradb::engine::memtable {
                         }
                     }
 
+                    MemTableFlushInputMode inputMode_;
                     FlushCallback callback_;
+                    StreamingFlushCallback streamingCallback_;
                     FlushDone onDone_;
                     std::mutex mutex_;
                     std::condition_variable cv_;
@@ -378,7 +396,9 @@ namespace akkaradb::engine::memtable {
                     publishTablesLocked(*shards_[i]);
                 }
 
-                if (options_.onFlush) { setFlushCallback(options_.onFlush); }
+                if (options_.onFlush || options_.onFlushStream) {
+                    setFlushCallbacks(options_.onFlush, options_.onFlushStream, options_.flushInputMode);
+                }
             }
 
             [[nodiscard]] std::unique_ptr<IMemTable> makeBackend() const {
@@ -547,20 +567,28 @@ namespace akkaradb::engine::memtable {
 
             void throwIfFlushFailed() const { if (flushPool_) { flushPool_->throwIfFailed(); } }
 
-            void setFlushCallback(const FlushCallback& cb) {
+            void setFlushCallback(const FlushCallback& cb) { setFlushCallbacks(cb, nullptr, MemTableFlushInputMode::MATERIALIZE_VECTOR); }
+
+            void setStreamingFlushCallback(const StreamingFlushCallback& cb) {
+                setFlushCallbacks(nullptr, cb, MemTableFlushInputMode::STREAMING);
+            }
+
+            void setFlushCallbacks(FlushCallback callback, StreamingFlushCallback streamingCallback, MemTableFlushInputMode inputMode) {
                 rawActiveGetEnabled_.store(false, std::memory_order_release);
                 if (flushPool_) { flushPool_->drain(); }
 
                 flushPool_.reset();
 
-                if (!cb) {
+                if (!callback && !streamingCallback) {
                     rawActiveGetEnabled_.store(true, std::memory_order_release);
                     return;
                 }
 
                 flushPool_ = std::make_unique<FlushPool>(
                     resolveFlushWorkerCount(shardCount_),
-                    cb,
+                    inputMode,
+                    std::move(callback),
+                    std::move(streamingCallback),
                     [this](uint32_t shardIndex, uint64_t immutableId) { onFlushed(shardIndex, immutableId); }
                 );
             }
@@ -743,6 +771,8 @@ namespace akkaradb::engine::memtable {
     void MemTable::throwIfFlushFailed() const { impl_->throwIfFlushFailed(); }
 
     void MemTable::setFlushCallback(const FlushCallback& cb) { impl_->setFlushCallback(cb); }
+
+    void MemTable::setStreamingFlushCallback(const StreamingFlushCallback& cb) { impl_->setStreamingFlushCallback(cb); }
 
     size_t MemTable::approxSize() const noexcept { return impl_->approxSize(); }
 

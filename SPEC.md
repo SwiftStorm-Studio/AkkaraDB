@@ -578,8 +578,11 @@ sequence allocator used by the engine.
 | `autoShardCountCap` | 128 | Auto-shard upper bound before hard implementation ceiling |
 | `flushMode` | `AUTO` | Normalize to byte-triggered or manual-only |
 | `thresholdBytesPerShard` | 64 MiB | Active-shard rotation threshold |
+| `flushInputMode` | `MATERIALIZE_VECTOR` | Immutable flush callback input shape |
+| `backendOptions` | defaults | Backend-specific construction options |
 | `backendFactory` | null | Use default ordered backend |
 | `onFlush` | null | Optional immutable-table flush callback |
+| `onFlushStream` | null | Optional streaming immutable-table flush callback |
 
 The implementation hard ceiling is 256 MemTable shards. `AUTO` flush mode maps
 to `BYTES_PER_SHARD` when `thresholdBytesPerShard > 0`, otherwise to
@@ -591,9 +594,38 @@ Built-in ordered backends include SkipList, B+Tree, and ART implementations.
 The public contract is the `IMemTable` behavior, not a backend-specific memory
 layout.
 
-Built-in backends keep up to four in-memory versions per logical key. This is
-an in-memory optimization, not the historical-read API. Persistent history
-requires VersionLog.
+Built-in backends keep up to four in-memory versions per logical key by
+default. `MemTableBackendOptions::maxVersionsPerKey` may raise or lower this
+per mutable backend instance where supported. This is an in-memory optimization,
+not the historical-read API. Persistent history requires VersionLog.
+
+Backend construction options are:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `mutableScanMode` | `RECONCILE` | B+Tree mutable scan strategy; other built-in backends ignore it |
+| `bptreeConcurrencyMode` | `LOCKED` | B+Tree structural concurrency policy |
+| `bptreeIteratorMode` | `MATERIALIZE_ALL` | B+Tree locked-iterator materialization policy |
+| `bptreeIteratorBatchSize` | 1024 | Maximum visible records per read-lock section in batched B+Tree iteration |
+| `maxVersionsPerKey` | 4 | In-memory same-key version retention for supported backends |
+
+`BPTreeConcurrencyMode::LOCKED` serializes structural writes against mutable
+B+Tree readers. In this mode, `BPTreeIteratorMode::MATERIALIZE_ALL` materializes
+the full visible iterator result under one read lock and releases the lock
+before yielding to the caller. `MATERIALIZE_BATCHED_UNPINNED` materializes
+bounded batches under separate read locks, reducing long writer stalls during
+large scans. It does not pin older same-key versions beyond
+`maxVersionsPerKey`; long scans that overlap heavy same-key rewrites can lose
+older mutable versions and should use `MATERIALIZE_ALL` when strict mutable
+snapshot completeness is required.
+
+Frozen B+Tree MemTables have no structural writers, so they stream directly
+regardless of `bptreeIteratorMode`. This avoids an extra full-scan materialized
+vector during immutable-table flush.
+
+`BPTreeConcurrencyMode::OPTIMISTIC_UNSAFE` keeps the legacy optimistic reader
+path for experiments. It is not the default because concurrent internal splits
+can expose transient unreachable paths to readers.
 
 ### 9.3 Lookup Semantics
 
@@ -613,12 +645,24 @@ the SST search.
 
 When a shard reaches its flush threshold, the active table is frozen and moved
 to the immutable-table list. A fresh active backend is installed. Background
-flush workers iterate immutable tables in key order and invoke `onFlush` with
-sorted `RecordView` spans.
+flush workers iterate immutable tables in key order and invoke either `onFlush`
+or `onFlushStream`, depending on `flushInputMode`.
 
 In the engine, `onFlush` writes records through `SSTManager::flush`, checkpoints
 the Manifest, optionally prunes WAL through the returned checkpoint sequence,
 and can run Blob GC when configured.
+
+`MemTableFlushInputMode::MATERIALIZE_VECTOR` materializes each immutable table
+into one sorted `std::vector<RecordView>` before invoking `onFlush`. This keeps
+the legacy callback contract and gives consumers a contiguous span.
+
+`MemTableFlushInputMode::STREAMING` passes an estimated record count and an
+`ArenaGenerator<RecordView>` to `onFlushStream`. `AkkEngine` uses this mode to
+stream immutable records into `SSTManager::flush`, which forwards the generator
+to `SSTWriter::write`. This removes the flush worker's full `RecordView`
+materialization vector. SST writing still retains format metadata such as block
+index, key arena, Bloom filter bits, and Manifest blob-reference entries until
+the file is sealed.
 
 `forceFlush()` schedules all shards and waits for flush workers to drain.
 Asynchronous flush failure poisons later engine work and is rethrown by
@@ -911,9 +955,11 @@ active VLog/index budget is approximately the lane count times that threshold.
 each lane. `GLOBAL` applies that value once across all lane queues. Queues reject
 a write when their applicable pending-byte limit is reached; they do not turn
 ordinary puts into synchronous disk I/O. The durable tail
-advances at `forceSync`, lane rotation, or close. Entries that remain queued or
-unsynced at a crash are discarded rather than extending recovery beyond a
-durable prefix.
+advances at `forceSync`, lane rotation, or close. Serial ASYNC recovery also
+accepts only the valid prefix of the last active segment and truncates any
+interrupted trailing entry before reopening it for append. Entries that remain
+queued or unsynced at a crash are discarded rather than extending recovery
+beyond a durable or validated prefix.
 
 VersionLog does not retain persisted historical values in RAM. Each segment has
 a derived `*.akvidx` sidecar containing a Bloom filter and a sorted mapping
@@ -942,10 +988,13 @@ The base `logPath` is segment `0`; later segments insert `-seg-N` before the
 extension (for example, `vlog.akvlog`, `vlog-seg-1.akvlog`). Their derived
 indexes replace the VLog extension with `.akvidx` (for example, `vlog.akvidx`
 and `vlog-seg-1.akvidx`).
-`PARALLEL` also writes an `.akvtail` sibling for every active lane. It records
+VersionLog writes an `.akvtail` sibling at explicit sync boundaries, segment
+rotation, and close. `PARALLEL` keeps one tail for every active lane. It records
 the byte length of the durable contiguous VLog prefix. Recovery reads no bytes
-beyond that prefix, so a crash cannot turn an interrupted lane append into a
-corrupt VLog tail. The tail is a recovery boundary, not a historical index.
+beyond that prefix, so a crash cannot turn an interrupted append into a corrupt
+VLog tail. When a serial ASYNC active segment has no tail file, recovery scans
+only the valid prefix of that final segment and truncates the file to the last
+verified offset. The tail is a recovery boundary, not a historical index.
 A compact in-memory segment directory records each file's id, minimum sequence,
 maximum sequence, and byte size. `getAt` uses those ranges to skip segments
 that begin after its requested sequence. The directory is rebuilt during
@@ -1529,7 +1578,7 @@ counters:
 | `syncMode`, `groupN`, `groupMicros`, `groupBytes`, `asyncMaxPendingBytes` | Resolved write/sync configuration |
 | `indexedKeys`, `indexedEntries`, `rollbackEntries` | Resident and persisted historical-entry index counters |
 | `pendingWrites`, `pendingBytes` | Serial async/batched queue depth |
-| `durableBytes` | Bytes in durable VersionLog segments after known pruning |
+| `durableBytes` | Bytes accepted into recovered/known-written VersionLog segments after known pruning; in ASYNC live operation this is a diagnostic byte count and crash recovery is bounded by `.akvtail` or the validated active prefix |
 | `segmentCount`, `activeSegmentBytes` | Current segment directory size and active segment byte count |
 | `flushThreadRunning` | Serial async/batched flush worker is alive |
 | `recoveryDurationMicros`, `recoveredSegmentCount`, `recoveredEntryCount` | Latest recovery pass duration and accepted segment/entry counts |

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// akkengine/include/akk/engine/server/ApiFraming.hpp
+// akkserver/include/akk/engine/server/ApiFraming.hpp
 #pragma once
 
 #include <cstdint>

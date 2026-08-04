@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
@@ -142,6 +143,7 @@ namespace {
     void verifyEnginePassesBackendOptionsAtInitialization() {
         using EngineOptions = akkaradb::engine::AkkEngineOptions;
         using akkaradb::engine::memtable::BPTreeConcurrencyMode;
+        using akkaradb::engine::memtable::BPTreeIteratorMode;
         using akkaradb::engine::memtable::BPTreeMemTable;
         using akkaradb::engine::memtable::MutableScanMode;
 
@@ -157,6 +159,8 @@ namespace {
         options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::MANUAL_ONLY;
         options.memtable.backendOptions.mutableScanMode = MutableScanMode::STREAMING_RESTART;
         options.memtable.backendOptions.bptreeConcurrencyMode = BPTreeConcurrencyMode::LOCKED;
+        options.memtable.backendOptions.bptreeIteratorMode = BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED;
+        options.memtable.backendOptions.bptreeIteratorBatchSize = 8;
 
         bool configured = false;
         options.memtable.backendFactoryWithOptions = [&configured](const auto& backendOptions) {
@@ -167,6 +171,14 @@ namespace {
             require(
                 backendOptions.bptreeConcurrencyMode == BPTreeConcurrencyMode::LOCKED,
                 "AkkEngine must pass BPTree concurrency mode during initialization"
+            );
+            require(
+                backendOptions.bptreeIteratorMode == BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED,
+                "AkkEngine must pass BPTree iterator mode during initialization"
+            );
+            require(
+                backendOptions.bptreeIteratorBatchSize == 8,
+                "AkkEngine must pass BPTree iterator batch size during initialization"
             );
             configured = true;
             return std::make_unique<BPTreeMemTable>(

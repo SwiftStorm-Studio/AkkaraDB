@@ -1625,9 +1625,7 @@ namespace akkaradb::engine {
                         write.op = cluster::ReplOpType::PUT;
                         write.flags = MemHdr16::FLAG_NORMAL;
                         write.sourceNodeId = engine_.nodeId;
-                        try {
-                            engine_.replicateCommitted(write);
-                        }
+                        try { engine_.replicateCommitted(write); }
                         catch (...) {
                             engine_.markWriteCommitted(write.seq, true);
                             throw;
@@ -1655,9 +1653,7 @@ namespace akkaradb::engine {
                             writes.push_back(std::move(write));
                         }
                         size_t replicated = 0;
-                        try {
-                            for (; replicated < writes.size(); ++replicated) { engine_.replicateCommitted(writes[replicated]); }
-                        }
+                        try { for (; replicated < writes.size(); ++replicated) { engine_.replicateCommitted(writes[replicated]); } }
                         catch (...) {
                             for (const auto& write : writes) { engine_.markWriteCommitted(write.seq, true); }
                             throw;
@@ -1677,9 +1673,7 @@ namespace akkaradb::engine {
                         write.op = cluster::ReplOpType::REMOVE;
                         write.flags = MemHdr16::FLAG_TOMBSTONE;
                         write.sourceNodeId = engine_.nodeId;
-                        try {
-                            engine_.replicateCommitted(write);
-                        }
+                        try { engine_.replicateCommitted(write); }
                         catch (...) {
                             engine_.markWriteCommitted(write.seq, true);
                             throw;
@@ -1798,10 +1792,7 @@ namespace akkaradb::engine {
         if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
             throw std::invalid_argument("AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled");
         }
-        auto engine = std::unique_ptr < AkkEngine >
-        {
-            new AkkEngine()
-        };
+        auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
@@ -1817,9 +1808,8 @@ namespace akkaradb::engine {
         }
 
         if (impl.sstManager) {
-            impl.opts.memtable.onFlush = [&impl](std::span<const core::RecordView> records) {
-                if (records.empty()) { return; }
-                const uint64_t checkpointSeq = impl.sstManager->flush(records);
+            auto afterFlush = [&impl](uint64_t checkpointSeq) {
+                if (checkpointSeq == 0) { return; }
                 crashAtTestPoint("engine.flush.after_sst_flush");
                 if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
                 crashAtTestPoint("engine.flush.after_wal_prune");
@@ -1827,8 +1817,27 @@ namespace akkaradb::engine {
                 crashAtTestPoint("engine.flush.after_manifest_checkpoint");
                 if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
             };
+            if (impl.opts.memtable.flushInputMode == memtable::MemTableFlushInputMode::STREAMING) {
+                impl.opts.memtable.onFlushStream = [&, afterFlush](
+                    size_t estimatedRecordCount,
+                    core::ArenaGenerator<core::RecordView> records
+                ) {
+                        afterFlush(impl.sstManager->flush(estimatedRecordCount, std::move(records)));
+                    };
+                impl.opts.memtable.onFlush = {};
+            }
+            else {
+                impl.opts.memtable.onFlush = [&, afterFlush](std::span<const core::RecordView> records) {
+                    if (records.empty()) { return; }
+                    afterFlush(impl.sstManager->flush(records));
+                };
+                impl.opts.memtable.onFlushStream = {};
+            }
         }
-        else { impl.opts.memtable.onFlush = {}; }
+        else {
+            impl.opts.memtable.onFlush = {};
+            impl.opts.memtable.onFlushStream = {};
+        }
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
         uint64_t manifestCheckpointSeq = 0;
         if (impl.manifest) {
@@ -1871,9 +1880,7 @@ namespace akkaradb::engine {
                     const uint64_t versionLogSupplementAfterSeq = std::max(walRecoveryCheckpointSeq, recovery.maxSeq);
                     const auto records = impl.versionLog->collectSince(versionLogSupplementAfterSeq);
                     for (const auto& record : records) {
-                        const uint8_t flags = static_cast<uint8_t>(
-                            record.entry.flags & (MemHdr16::FLAG_TOMBSTONE | MemHdr16::FLAG_BLOB)
-                        );
+                        const uint8_t flags = static_cast<uint8_t>(record.entry.flags & (MemHdr16::FLAG_TOMBSTONE | MemHdr16::FLAG_BLOB));
                         const std::span<const uint8_t> key{record.key.data(), record.key.size()};
                         const uint64_t fp64 = core::computeKeyFp64(key);
                         const uint64_t mini = core::buildMiniKey(key);

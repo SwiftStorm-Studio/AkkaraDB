@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/version_log_recovery_concurrency_smoke_test.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/vlog/VersionLog.hpp"
@@ -76,6 +77,14 @@ namespace {
     [[nodiscard]] vlog::VersionLogOptions serialOptions() {
         vlog::VersionLogOptions options;
         options.syncMode = vlog::VLogSyncMode::SYNC;
+        options.readVisibility = vlog::VLogReadVisibilityMode::COMMIT_ORDER;
+        return options;
+    }
+
+    [[nodiscard]] vlog::VersionLogOptions serialAsyncOptions() {
+        vlog::VersionLogOptions options;
+        options.syncMode = vlog::VLogSyncMode::ASYNC;
+        options.writeAdmission = vlog::VLogWriteAdmissionMode::SERIAL;
         options.readVisibility = vlog::VLogReadVisibilityMode::COMMIT_ORDER;
         return options;
     }
@@ -165,6 +174,42 @@ namespace {
         require(!error, "test setup must truncate VLog entry");
         requireRuntimeError([&] { (void)vlog::VersionLog::create(path, serialOptions()); },
                             "VersionLog recovery must reject a truncated committed entry");
+    }
+
+    void verifyAppendAfterCloseFails(const fs::path& dir) {
+        const auto path = dir / "append-after-close.akvlog";
+        auto log = vlog::VersionLog::create(path, serialOptions());
+        log->append(bytes("closed-key"), 1, 0, 0, 0, bytes("value-1"));
+        log->close();
+        requireRuntimeError([&] { log->append(bytes("closed-key"), 2, 0, 0, 0, bytes("value-2")); },
+                            "VersionLog append after close must fail before advancing commit visibility");
+    }
+
+    void verifySerialAsyncTrailingEntryIsTruncated(const fs::path& dir) {
+        const auto path = dir / "serial-async-tail.akvlog";
+        constexpr std::string_view key{"serial-async-tail-key"};
+        uint64_t validBytes = 0;
+        {
+            auto log = vlog::VersionLog::create(path, serialAsyncOptions());
+            log->append(bytes(key), 1, 0, 0, 0, bytes("value-1"));
+            log->forceSync();
+            validBytes = fs::file_size(path);
+            log->close();
+        }
+
+        std::error_code error;
+        fs::remove(path.parent_path() / "serial-async-tail.akvtail", error);
+        appendGarbageTail(path);
+
+        auto log = vlog::VersionLog::create(path, serialAsyncOptions());
+        const auto observed = log->getAt(bytes(key), 1);
+        require(observed.has_value() && observed->value == std::vector<uint8_t>{'v', 'a', 'l', 'u', 'e', '-', '1'},
+                "serial ASYNC recovery must retain entries before an interrupted active tail");
+        require(log->history(bytes(key)).size() == 1, "serial ASYNC recovery must ignore bytes after the valid active prefix");
+        log->close();
+
+        const uint64_t recoveredBytes = fs::file_size(path);
+        require(recoveredBytes == validBytes, "serial ASYNC recovery must truncate the interrupted active tail");
     }
 
     void verifyParallelTailBoundsRecovery(const fs::path& dir) {
@@ -324,6 +369,8 @@ int main() {
         TempDir dir{"akkaradb-vlog-recovery-concurrency"};
         verifyCorruptEntryFailsRecovery(dir.path());
         verifyTruncatedEntryFailsRecovery(dir.path());
+        verifyAppendAfterCloseFails(dir.path());
+        verifySerialAsyncTrailingEntryIsTruncated(dir.path());
         verifyParallelTailBoundsRecovery(dir.path());
         verifySidecarCorruptionFallsBack(dir.path());
         verifyConcurrentParallelReadWriteStress(dir.path());

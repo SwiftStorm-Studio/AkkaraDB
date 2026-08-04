@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/query_planner_smoke_test.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akkaradb/AkkaraDB.hpp"

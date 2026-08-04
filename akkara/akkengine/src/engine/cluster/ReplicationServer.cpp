@@ -519,9 +519,7 @@ namespace akkaradb::engine::cluster {
                     }
                 }
                 if (!waitForAcks(seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.ackTimeoutAction ==
-                    AckTimeoutAction::FAIL_WRITE)) {
-                    throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
-                }
+                    AckTimeoutAction::FAIL_WRITE)) { throw std::runtime_error("ReplicationServer: write acknowledgement timeout"); }
             }
 
             bool waitForAcks(uint64_t seq) {

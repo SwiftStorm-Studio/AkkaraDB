@@ -1,4 +1,11 @@
-
+/*
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
 
 // akkengine/include/akk/engine/sstable/SSTManager.hpp
 /*
@@ -104,6 +111,7 @@ namespace akkaradb::engine::sst {
             void recover();
             void shutdown();
             uint64_t flush(std::span<const core::RecordView> records);
+            uint64_t flush(size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records);
             void throwIfBackgroundFailed() const;
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;

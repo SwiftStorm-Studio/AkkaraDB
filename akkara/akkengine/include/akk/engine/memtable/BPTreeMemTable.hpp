@@ -32,6 +32,7 @@ namespace akkaradb::engine::memtable {
         public:
             static constexpr uint16_t MAX_KEYS = 63;
             static constexpr size_t DEFAULT_MAX_VERSIONS_PER_KEY = 4;
+            static constexpr size_t DEFAULT_ITERATOR_BATCH_SIZE = 1024;
             static constexpr size_t MAX_CONFIGURED_VERSIONS_PER_KEY = 65535;
 
             explicit BPTreeMemTable(
@@ -103,7 +104,9 @@ namespace akkaradb::engine::memtable {
             std::atomic<size_t> entries_{0};
             MutableScanMode mutableScanMode_;
             BPTreeConcurrencyMode concurrencyMode_{BPTreeConcurrencyMode::LOCKED};
+            BPTreeIteratorMode iteratorMode_{BPTreeIteratorMode::MATERIALIZE_ALL};
             uint16_t maxVersionsPerKey_{DEFAULT_MAX_VERSIONS_PER_KEY};
+            size_t iteratorBatchSize_{DEFAULT_ITERATOR_BATCH_SIZE};
 
             [[nodiscard]] static std::span<const uint8_t> asU8(ByteView view) noexcept;
 
@@ -157,15 +160,29 @@ namespace akkaradb::engine::memtable {
                 std::vector<uint8_t> startKey,
                 std::vector<uint8_t> endKey
             ) const;
-            [[nodiscard]] ArenaGenerator<RecordView> iterateWithReadLock(
+            [[nodiscard]] std::vector<RecordView> materializeWithReadLock(
                 uint64_t snapshotSeq,
                 std::shared_lock<std::shared_mutex> lock
             ) const;
-            [[nodiscard]] ArenaGenerator<RecordView> iterateRangeWithReadLock(
+            [[nodiscard]] std::vector<RecordView> materializeRangeWithReadLock(
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,
                 std::vector<uint8_t> endKey,
                 std::shared_lock<std::shared_mutex> lock
+            ) const;
+            [[nodiscard]] static ArenaGenerator<RecordView> iterateMaterialized(std::vector<RecordView> records);
+            [[nodiscard]] std::vector<RecordView> materializeBatchWithReadLock(
+                uint64_t snapshotSeq,
+                const std::vector<uint8_t>& startKey,
+                const std::vector<uint8_t>& endKey,
+                bool startExclusive,
+                size_t batchSize,
+                std::shared_lock<std::shared_mutex> lock
+            ) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateBatchedUnpinned(
+                uint64_t snapshotSeq,
+                std::vector<uint8_t> startKey,
+                std::vector<uint8_t> endKey
             ) const;
     };
 } // namespace akkaradb::engine::memtable

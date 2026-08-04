@@ -324,9 +324,7 @@ namespace akkaradb::engine::sst {
                     files = manifest_->liveSst();
                     liveManifestFiles.insert(files.begin(), files.end());
                     for (const auto& filename : allSstFiles) {
-                        if (liveManifestFiles.find(filename) == liveManifestFiles.end()) {
-                            orphanSsts.push_back(sstDir_ / filename);
-                        }
+                        if (liveManifestFiles.find(filename) == liveManifestFiles.end()) { orphanSsts.push_back(sstDir_ / filename); }
                     }
                 }
                 else {
@@ -373,6 +371,42 @@ namespace akkaradb::engine::sst {
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
 
                 const auto result = SSTWriter::write(tmp, records, wopts);
+                crashAtTestPoint("sst.flush.after_tmp_write");
+                durableRename(tmp, path);
+                crashAtTestPoint("sst.flush.after_rename");
+                auto reader = SSTReader::open(path, readerOptions());
+                if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
+                Meta meta = makeMeta(path, path.filename().string(), std::move(reader));
+
+                if (manifest_) {
+                    manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
+                    manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
+                }
+                crashAtTestPoint("sst.flush.after_manifest_seal");
+
+                {
+                    std::unique_lock lock{levelsMu_};
+                    levels_[0].insert(levels_[0].begin(), std::move(meta));
+                    publishLocked();
+                }
+                requestCompaction();
+                return result.maxSeq;
+            }
+
+            uint64_t flush(size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
+                if (estimatedRecordCount == 0) { return 0; }
+                const auto path = makeFilePath(0);
+                const auto tmp = path.string() + ".tmp";
+
+                SSTWriter::Options wopts;
+                wopts.level = 0;
+                wopts.blockSize = options_.blockSize;
+                wopts.targetFileSize = options_.targetFileSize;
+                wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
+                wopts.codec = options_.codec;
+                wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
+
+                const auto result = SSTWriter::write(tmp, estimatedRecordCount, std::move(records), wopts);
                 crashAtTestPoint("sst.flush.after_tmp_write");
                 durableRename(tmp, path);
                 crashAtTestPoint("sst.flush.after_rename");
@@ -880,11 +914,7 @@ namespace akkaradb::engine::sst {
         return impl_->next();
     }
 
-    std::unique_ptr<SSTManager> SSTManager::create(
-        std::filesystem::path sstDir,
-        Options options,
-        manifest::Manifest* manifest
-    ) {
+    std::unique_ptr<SSTManager> SSTManager::create(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest) {
         return std::unique_ptr<SSTManager>(new SSTManager(std::move(sstDir), std::move(options), manifest));
     }
 
@@ -895,6 +925,11 @@ namespace akkaradb::engine::sst {
     void SSTManager::recover() { impl_->recover(); }
     void SSTManager::shutdown() { impl_->shutdown(); }
     uint64_t SSTManager::flush(std::span<const core::RecordView> records) { return impl_->flush(records); }
+
+    uint64_t SSTManager::flush(size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
+        return impl_->flush(estimatedRecordCount, std::move(records));
+    }
+
     void SSTManager::throwIfBackgroundFailed() const { impl_->throwIfBackgroundFailed(); }
 
     std::optional<SSTRecord> SSTManager::get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {

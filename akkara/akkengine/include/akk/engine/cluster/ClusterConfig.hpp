@@ -119,9 +119,7 @@ namespace akkaradb::engine::cluster {
 
     /** Behaviour when the requested write acknowledgement does not arrive in time. */
     enum class AckTimeoutAction : uint8_t {
-        ACCEPT_LOCAL = 0,
-        FAIL_ACK = 1,
-        FAIL_WRITE = 2,
+        ACCEPT_LOCAL = 0, FAIL_ACK = 1, FAIL_WRITE = 2,
     };
 
     /** Policy for replicas which cannot remain within the retained replication history. */

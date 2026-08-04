@@ -129,8 +129,7 @@ namespace akkaradb::core {
             ArenaGenerator& operator=(const ArenaGenerator&) = delete;
 
             ArenaGenerator(ArenaGenerator&& other) noexcept
-                : ownedArena_{std::move(other.ownedArena_)},
-                  handle_{std::exchange(other.handle_, {})} {}
+                : ownedArena_{std::move(other.ownedArena_)}, handle_{std::exchange(other.handle_, {})} {}
 
             ArenaGenerator& operator=(ArenaGenerator&& other) noexcept {
                 if (this != &other) {

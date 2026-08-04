@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
 
@@ -61,6 +62,35 @@ namespace {
         try { table->put(bytes(key), bytes(value), 2); }
         catch (const std::runtime_error&) { subsequentWriteFailed = true; }
         require(subsequentWriteFailed, "writes after a failed immutable flush must be rejected");
+    }
+
+    void testStreamingFlushCallback() {
+        namespace memtable = akkaradb::engine::memtable;
+
+        std::atomic<uint32_t> callbackAttempts{0};
+        memtable::MemTable::Options options;
+        options.shardCount = 1;
+        options.flushMode = memtable::MemTableFlushMode::BYTES_PER_SHARD;
+        options.thresholdBytesPerShard = 1;
+        options.flushInputMode = memtable::MemTableFlushInputMode::STREAMING;
+        options.onFlushStream = [&callbackAttempts](size_t estimatedRecords, akkaradb::core::ArenaGenerator<memtable::MemTable::RecordView> records) {
+            require(estimatedRecords >= 1, "streaming flush must receive an estimated record count");
+            size_t observed = 0;
+            for (const auto& record : records) {
+                require(!record.key().empty(), "streaming flush must expose record keys");
+                ++observed;
+            }
+            require(observed == 1, "streaming flush callback must stream each immutable record once");
+            callbackAttempts.fetch_add(1, std::memory_order_relaxed);
+        };
+
+        auto table = memtable::MemTable::create(options);
+        const std::vector<uint8_t> key{'s', 't', 'r', 'e', 'a', 'm'};
+        const std::vector<uint8_t> value{'v'};
+        table->put(bytes(key), bytes(value), 1);
+        table->forceFlush();
+
+        require(callbackAttempts.load(std::memory_order_relaxed) == 1, "streaming flush callback must run exactly once");
     }
 
     [[nodiscard]] akkaradb::engine::AkkEngineOptions memoryOptions() {
@@ -186,6 +216,38 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    void testEngineStreamingSstFlush() {
+        namespace engine = akkaradb::engine;
+        namespace memtable = akkaradb::engine::memtable;
+        namespace sst = akkaradb::engine::sst;
+
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_streaming_sst_flush_smoke";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create streaming flush smoke directory");
+
+        auto options = memoryOptions();
+        options.paths.dataDir = dir;
+        options.components.sstEnabled = true;
+        options.memtable.flushInputMode = memtable::MemTableFlushInputMode::STREAMING;
+        options.sst.compactionMode = sst::SSTCompactionMode::DISABLED;
+        options.sst.compactThreads = 0;
+
+        {
+            auto akkaradb = engine::AkkEngine::open(options);
+            const std::vector<uint8_t> key{'s', 's', 't', '-', 's', 't', 'r', 'e', 'a', 'm'};
+            const std::vector<uint8_t> value{'v'};
+            akkaradb->put(bytes(key), bytes(value));
+            akkaradb->forceFlush();
+            const auto found = akkaradb->get(bytes(key));
+            require(found.has_value() && *found == value, "streaming SST flush must preserve flushed values");
+            akkaradb->close();
+        }
+
+        fs::remove_all(dir, ec);
+    }
+
     void testBlockedBackpressureWriterObservesClose() {
         namespace engine = akkaradb::engine;
         namespace memtable = akkaradb::engine::memtable;
@@ -288,9 +350,11 @@ int main() {
     akkaradb::test::installMsvcTestErrorHandlers();
     try {
         testFlushFailurePropagation();
+        testStreamingFlushCallback();
         testConcurrentOperationsAndClose();
         testCloseWaitsForActiveScan();
         testSstBackpressureFailFast();
+        testEngineStreamingSstFlush();
         testBlockedBackpressureWriterObservesClose();
         testBlockedBackpressureTimesOutAndReportsStats();
         return 0;

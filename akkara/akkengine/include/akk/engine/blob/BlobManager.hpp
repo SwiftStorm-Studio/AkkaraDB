@@ -29,11 +29,11 @@ namespace akkaradb::engine::blob {
                 bool gcOnFlush = false;
                 bool gcOnClose = false;
                 std::function<void(
-                    uint64_t blobId,
-                    uint64_t totalSize,
-                    uint64_t storedSize,
-                    uint32_t contentCrc32c,
-                    uint32_t codec
+uint64_t blobId,
+ uint64_t totalSize,
+ uint64_t storedSize,
+ uint32_t contentCrc32c,
+ uint32_t codec
                 )> onBlobPut;
                 std::function<void(uint64_t blobId)> onBlobDelete;
             };

@@ -1,3 +1,13 @@
+/*
+ * AkkaraDB - The all-purpose KV store: blazing fast and reliably durable, scaling from tiny embedded cache to large-scale distributed database
+ * Copyright (C) 2026 Swift Storm Studio
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+
+// akkengine/src/engine/cluster/RaftConsensusRuntime.cpp
 #include "akk/engine/cluster/detail/RaftConsensusRuntime.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
@@ -883,13 +893,12 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointNewVoters_ && containsNode(*jointNewVoters_, node.nodeId) && !containsNode(committedVoters_, node.nodeId)) {
+                        if (jointNewVoters_ && containsNode(*jointNewVoters_, node.nodeId) && !
+                            containsNode(committedVoters_, node.nodeId)) {
                             newVoters = *jointNewVoters_;
                             finishExistingJoint = true;
                         }
-                        else {
-                            throw std::runtime_error("RaftConsensusRuntime: membership change already in progress");
-                        }
+                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
                     }
                     else if (containsNode(committedVoters_, node.nodeId)) {
                         throw std::invalid_argument("RaftConsensusRuntime: node is already a voting member");
@@ -949,13 +958,14 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointOldVoters_ && jointNewVoters_ && containsNode(*jointOldVoters_, nodeId) && !containsNode(*jointNewVoters_, nodeId)) {
+                        if (jointOldVoters_ && jointNewVoters_ && containsNode(*jointOldVoters_, nodeId) && !containsNode(
+                            *jointNewVoters_,
+                            nodeId
+                        )) {
                             newVoters = *jointNewVoters_;
                             finishExistingJoint = true;
                         }
-                        else {
-                            throw std::runtime_error("RaftConsensusRuntime: membership change already in progress");
-                        }
+                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
                     }
                     else if (!containsNode(committedVoters_, nodeId)) {
                         throw std::invalid_argument("RaftConsensusRuntime: node is not a voting member");
@@ -963,7 +973,9 @@ namespace akkaradb::engine::cluster {
                     else {
                         oldVoters = committedVoters_;
                         for (const auto& node : committedVoters_) { if (node.nodeId != nodeId) { newVoters.push_back(node); } }
-                        if (newVoters.empty()) { throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member"); }
+                        if (newVoters.empty()) {
+                            throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member");
+                        }
                     }
                 }
                 if (pendingConfigEntry) {
@@ -1042,15 +1054,8 @@ namespace akkaradb::engine::cluster {
             Clock::time_point nextElectionDeadline() {
                 static thread_local std::mt19937_64 rng{std::random_device{}()};
                 const auto configuredAckTimeoutMs = config_.consistency().ackTimeoutMs;
-                const auto baseTimeoutMs = std::clamp<uint32_t>(
-                    std::max<uint32_t>(3000u, configuredAckTimeoutMs * 2u),
-                    3000u,
-                    6000u
-                );
-                std::uniform_int_distribution<int> dist(
-                    static_cast<int>(baseTimeoutMs),
-                    static_cast<int>(baseTimeoutMs * 2u)
-                );
+                const auto baseTimeoutMs = std::clamp<uint32_t>(std::max<uint32_t>(3000u, configuredAckTimeoutMs * 2u), 3000u, 6000u);
+                std::uniform_int_distribution<int> dist(static_cast<int>(baseTimeoutMs), static_cast<int>(baseTimeoutMs * 2u));
                 return Clock::now() + std::chrono::milliseconds(dist(rng));
             }
 

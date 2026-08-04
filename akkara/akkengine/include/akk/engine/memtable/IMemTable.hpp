@@ -38,6 +38,16 @@ namespace akkaradb::engine::memtable {
         OPTIMISTIC_UNSAFE = 1,
     };
 
+    enum class BPTreeIteratorMode : uint8_t {
+        // Materialize the full visible snapshot under one read lock, then release
+        // the lock before yielding to the caller.
+        MATERIALIZE_ALL = 0,
+        // Materialize bounded batches under separate read locks. This reduces
+        // writer stalls during long scans, but it does not pin older same-key
+        // versions beyond the backend's configured retention window.
+        MATERIALIZE_BATCHED_UNPINNED = 1,
+    };
+
     struct MemTableBackendOptions {
         // BPTree uses this to select mutable scan behavior. SkipList and ART
         // already provide stable ordered traversal, so it is intentionally a no-op there.
@@ -45,6 +55,11 @@ namespace akkaradb::engine::memtable {
         // BPTree structural concurrency policy. Keep LOCKED for correctness
         // unless a caller is explicitly running unsafe experiments.
         BPTreeConcurrencyMode bptreeConcurrencyMode = BPTreeConcurrencyMode::LOCKED;
+        // BPTree iterator policy used with LOCKED concurrency mode.
+        BPTreeIteratorMode bptreeIteratorMode = BPTreeIteratorMode::MATERIALIZE_ALL;
+        // Maximum visible records collected per read-lock section in
+        // MATERIALIZE_BATCHED_UNPINNED mode.
+        size_t bptreeIteratorBatchSize = 1024;
         // Number of recent same-key versions retained inside a mutable MemTable
         // backend. SkipList and BPTree honor this option; ART currently keeps
         // its backend-local default.

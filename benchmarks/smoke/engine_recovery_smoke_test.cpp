@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/engine_recovery_smoke_test.cpp
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/wal/WalWriter.hpp"

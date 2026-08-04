@@ -7,6 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
+// benchmarks/smoke/bptree_mutable_concurrency_stress_test.cpp
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/memtable/BPTreeMemTable.hpp"
@@ -25,7 +26,9 @@
 
 namespace {
     using akkaradb::core::RecordView;
+    using akkaradb::engine::memtable::BPTreeIteratorMode;
     using akkaradb::engine::memtable::BPTreeMemTable;
+    using akkaradb::engine::memtable::MemTableBackendOptions;
 
     [[nodiscard]] std::span<const uint8_t> bytes(const std::vector<uint8_t>& value) noexcept {
         return {value.data(), value.size()};
@@ -185,12 +188,160 @@ namespace {
 
         verifyFullTreeAfterStress(table, keys, keyCount);
     }
+
+    void verifyLockedIteratorDoesNotHoldWriteLock() {
+        BPTreeMemTable table;
+        std::vector<std::vector<uint8_t>> keys;
+        keys.reserve(128);
+        for (size_t i = 0; i < 128; ++i) {
+            keys.push_back(keyFor(i));
+            const std::vector<uint8_t> value = valueFor(i);
+            require(
+                table.put(std::as_bytes(bytes(keys.back())), std::as_bytes(bytes(value)), i + 1, 0).ok(),
+                "iterator materialization setup insert failed"
+            );
+        }
+
+        auto heldIterator = table.iterator({}, {}, 128);
+        auto current = heldIterator.begin();
+        require(current != heldIterator.end(), "materialized iterator must yield the first record");
+        require(std::ranges::equal((*current).key(), bytes(keys.front())), "materialized iterator returned the wrong first key");
+
+        const std::vector<uint8_t> extraKey = keyFor(1'000);
+        const std::vector<uint8_t> extraValue = valueFor(1'000);
+        std::atomic<bool> writerDone{false};
+        bool writerOk = false;
+
+        std::thread writer{[&] {
+            writerOk = table.put(std::as_bytes(bytes(extraKey)), std::as_bytes(bytes(extraValue)), 129, 0).ok();
+            writerDone.store(true, std::memory_order_release);
+        }};
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!writerDone.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+
+        if (!writerDone.load(std::memory_order_acquire)) {
+            heldIterator = decltype(heldIterator){};
+            writer.join();
+            throw std::runtime_error("materialized iterator held the BPTree write lock");
+        }
+
+        writer.join();
+        require(writerOk, "writer must succeed while a materialized iterator is held");
+
+        size_t count = 0;
+        for (; current != heldIterator.end(); ++current) {
+            require(count < keys.size(), "materialized iterator returned too many records");
+            require(std::ranges::equal((*current).key(), bytes(keys[count])), "materialized iterator returned out-of-order keys");
+            ++count;
+        }
+        require(count == keys.size(), "materialized iterator must preserve the snapshot captured at iterator creation");
+    }
+
+    void verifyBatchedIteratorReleasesWriteLockBetweenBatches() {
+        MemTableBackendOptions options;
+        options.bptreeIteratorMode = BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED;
+        options.bptreeIteratorBatchSize = 8;
+
+        BPTreeMemTable table(
+            akkaradb::core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
+            akkaradb::core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
+            64 * 1024,
+            2 * 1024 * 1024,
+            options
+        );
+
+        std::vector<std::vector<uint8_t>> keys;
+        keys.reserve(128);
+        for (size_t i = 0; i < 128; ++i) {
+            keys.push_back(keyFor(i));
+            const std::vector<uint8_t> value = valueFor(i);
+            require(
+                table.put(std::as_bytes(bytes(keys.back())), std::as_bytes(bytes(value)), i + 1, 0).ok(),
+                "batched iterator setup insert failed"
+            );
+        }
+
+        auto iterator = table.iterator({}, {}, 128);
+        auto current = iterator.begin();
+        require(current != iterator.end(), "batched iterator must yield the first record");
+        require(std::ranges::equal((*current).key(), bytes(keys.front())), "batched iterator returned the wrong first key");
+
+        const std::vector<uint8_t> extraKey = keyFor(1'000);
+        const std::vector<uint8_t> extraValue = valueFor(1'000);
+        std::atomic<bool> writerDone{false};
+        bool writerOk = false;
+        std::thread writer{[&] {
+            writerOk = table.put(std::as_bytes(bytes(extraKey)), std::as_bytes(bytes(extraValue)), 129, 0).ok();
+            writerDone.store(true, std::memory_order_release);
+        }};
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+        while (!writerDone.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+
+        if (!writerDone.load(std::memory_order_acquire)) {
+            iterator = decltype(iterator){};
+            writer.join();
+            throw std::runtime_error("batched iterator held the BPTree write lock between batches");
+        }
+
+        writer.join();
+        require(writerOk, "writer must succeed while a batched iterator is held between batches");
+
+        size_t count = 1;
+        ++current;
+        for (; current != iterator.end(); ++current) {
+            require(count < keys.size(), "batched iterator returned too many snapshot records");
+            require(std::ranges::equal((*current).key(), bytes(keys[count])), "batched iterator returned out-of-order keys");
+            ++count;
+        }
+        require(count == keys.size(), "batched iterator must preserve visibility for the existing key set");
+    }
+
+    void verifyFrozenIteratorIgnoresLockedMaterializationMode() {
+        MemTableBackendOptions options;
+        options.bptreeIteratorMode = BPTreeIteratorMode::MATERIALIZE_BATCHED_UNPINNED;
+        options.bptreeIteratorBatchSize = 1;
+
+        BPTreeMemTable table(
+            akkaradb::core::BufferArena::DEFAULT_INITIAL_BLOCK_SIZE,
+            akkaradb::core::BufferArena::DEFAULT_MAX_BLOCK_SIZE,
+            64 * 1024,
+            2 * 1024 * 1024,
+            options
+        );
+
+        std::vector<std::vector<uint8_t>> keys;
+        keys.reserve(256);
+        for (size_t i = 0; i < 256; ++i) {
+            keys.push_back(keyFor(i));
+            const std::vector<uint8_t> value = valueFor(i);
+            require(table.put(std::as_bytes(bytes(keys.back())), std::as_bytes(bytes(value)), i + 1, 0).ok(), "frozen setup insert failed");
+        }
+
+        table.freeze();
+
+        size_t count = 0;
+        for (const RecordView& record : table.iterator({}, {}, 256)) {
+            require(count < keys.size(), "frozen iterator returned too many records");
+            require(std::ranges::equal(record.key(), bytes(keys[count])), "frozen iterator returned out-of-order keys");
+            ++count;
+        }
+        require(count == keys.size(), "frozen iterator must stream every record");
+    }
 } // namespace
 
 int main() {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     try {
+        verifyLockedIteratorDoesNotHoldWriteLock();
+        verifyBatchedIteratorReleasesWriteLockBetweenBatches();
+        verifyFrozenIteratorIgnoresLockedMaterializationMode();
         verifyConcurrentMutablePointLookups();
         return 0;
     }

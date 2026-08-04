@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// akkengine/src/engine/server/AkkApiServer.cpp
+// akkserver/src/server/AkkApiServer.cpp
 #include "akk/engine/server/AkkApiServer.hpp"
 
 #include <filesystem>
