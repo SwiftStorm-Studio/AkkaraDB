@@ -133,6 +133,7 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
         akkaradb_query_planner_smoke_test|benchmarks/smoke/query_planner_smoke_test.cpp
         akkaradb_version_log_admission_visibility_smoke_test|benchmarks/smoke/version_log_admission_visibility_smoke_test.cpp
+        akkaradb_version_log_fault_injection_smoke_test|benchmarks/smoke/version_log_fault_injection_smoke_test.cpp
         akkaradb_version_log_recovery_concurrency_smoke_test|benchmarks/smoke/version_log_recovery_concurrency_smoke_test.cpp
         akkaradb_version_log_tool_smoke_test|benchmarks/smoke/version_log_tool_smoke_test.cpp
         akkaradb_engine_recovery_smoke_test|benchmarks/smoke/engine_recovery_smoke_test.cpp
@@ -202,6 +203,7 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_parallel_memtable_visibility_smoke_test
         akkaradb_query_planner_smoke_test
         akkaradb_version_log_admission_visibility_smoke_test
+        akkaradb_version_log_fault_injection_smoke_test
         akkaradb_version_log_recovery_concurrency_smoke_test
         akkaradb_version_log_tool_smoke_test
         akkaradb_engine_recovery_smoke_test

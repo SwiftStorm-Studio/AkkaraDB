@@ -218,8 +218,9 @@ void rotateSegmentIfNeededLocked() {
     fdatasyncChecked(file_);
     writeTailFile(segmentPath(activeSegmentId_), activeSegmentBytes_, true);
     writeActiveSegmentIndexLocked();
-    fclose(file_);
+    FILE* oldFile = file_;
     file_ = nullptr;
+    closeChecked(oldFile);
 
     uint64_t nextId = activeSegmentId_ + 1;
     {
@@ -274,7 +275,7 @@ void addParallelLaneSegmentLocked(ParallelLane& lane) {
     parallelActiveSegmentIds_.insert(id);
     activeSegmentId_ = id;
     activeSegmentBytes_ = lane.bytes;
-    durableBytes_ += lane.bytes;
+    knownWrittenBytes_ += lane.bytes;
     {
         std::unique_lock segmentLock{segmentMu_};
         segments_.push_back(SegmentInfo{id, path, 0, 0, lane.bytes});
@@ -285,8 +286,9 @@ void initializeParallelLanesAfterRecovery() {
     if (!usesTrueParallelWrites()) { return; }
     std::lock_guard writeLock{writeMu_};
     if (file_) {
-        fclose(file_);
+        FILE* file = file_;
         file_ = nullptr;
+        closeChecked(file);
     }
     {
         std::shared_lock segmentLock{segmentMu_};
@@ -304,11 +306,40 @@ void initializeParallelLanesAfterRecovery() {
 void prepareSerialAppendAfterRecovery() {
     if (usesTrueParallelWrites()) { return; }
     const auto path = segmentPath(activeSegmentId_);
+    if (activeSegmentBytes_ == 0) {
+        if (file_) {
+            FILE* file = file_;
+            file_ = nullptr;
+            closeChecked(file);
+        }
+        std::error_code error;
+        fs::resize_file(path, 0, error);
+        if (error) { throw std::runtime_error("VersionLog: cannot reset empty active segment: " + error.message()); }
+        #ifdef _WIN32
+        file_ = _wfopen(path.wstring().c_str(), L"ab");
+        #else
+        file_ = fopen(path.string().c_str(), "ab");
+        #endif
+        if (!file_) { throw std::runtime_error("VersionLog: cannot reopen empty active segment"); }
+        writeFileHeader(file_);
+        activeSegmentBytes_ = FILE_HDR_SIZE;
+        {
+            std::unique_lock lock{segmentMu_};
+            const auto it = std::find_if(
+                segments_.begin(),
+                segments_.end(),
+                [this](const SegmentInfo& segment) { return segment.id == activeSegmentId_; }
+            );
+            if (it != segments_.end()) { it->bytes = activeSegmentBytes_; }
+        }
+        return;
+    }
     const auto tail = readTailFile(path);
     if (!tail.has_value()) { return; }
     if (file_) {
-        fclose(file_);
+        FILE* file = file_;
         file_ = nullptr;
+        closeChecked(file);
     }
     std::error_code error;
     fs::resize_file(path, *tail, error);
@@ -328,8 +359,9 @@ void truncateSerialActiveSegmentAfterRecovery(uint64_t bytes) {
     if (usesTrueParallelWrites()) { return; }
     const auto path = segmentPath(activeSegmentId_);
     if (file_) {
-        fclose(file_);
+        FILE* file = file_;
         file_ = nullptr;
+        closeChecked(file);
     }
     std::error_code error;
     fs::resize_file(path, bytes, error);

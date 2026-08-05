@@ -16,8 +16,9 @@ void rotateParallelLaneIfNeeded(ParallelLane& lane) {
     fdatasyncChecked(lane.file);
     writeTailFile(oldPath, lane.bytes, true);
     tryWriteSegmentIndex(oldPath, lane.bytes, lane.index);
-    fclose(lane.file);
+    FILE* oldFile = lane.file;
     lane.file = nullptr;
+    closeChecked(oldFile);
 
     std::lock_guard writeLock{writeMu_};
     parallelActiveSegmentIds_.erase(oldId);
@@ -69,7 +70,7 @@ void persistParallelLocked(ParallelLane& lane, PendingWrite write) {
         it->bytes = lane.bytes;
         ++it->entryCount;
         if ((write.flags & VLOG_FLAG_ROLLBACK) != 0) { ++it->rollbackCount; }
-        durableBytes_ += static_cast<uint64_t>(write.bytes.size());
+        knownWrittenBytes_ += static_cast<uint64_t>(write.bytes.size());
         activeSegmentId_ = lane.segmentId;
         activeSegmentBytes_ = lane.bytes;
         indexedEntries_.fetch_add(1, std::memory_order_relaxed);
@@ -188,8 +189,9 @@ void closeParallelLanes() {
         fdatasyncChecked(lane->file);
         writeTailFile(path, lane->bytes, true);
         tryWriteSegmentIndex(path, lane->bytes, lane->index);
-        fclose(lane->file);
+        FILE* file = lane->file;
         lane->file = nullptr;
+        closeChecked(file);
     }
     std::lock_guard writeLock{writeMu_};
     parallelActiveSegmentIds_.clear();

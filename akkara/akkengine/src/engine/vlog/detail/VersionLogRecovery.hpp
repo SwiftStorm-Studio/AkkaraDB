@@ -8,14 +8,25 @@
  */
 
 // akkengine/src/engine/vlog/detail/VersionLogRecovery.hpp
+[[nodiscard]] uint64_t trailingReadSegmentId() const {
+    if (usesTrueParallelWrites() || opts_.syncMode != VLogSyncMode::ASYNC) { return std::numeric_limits<uint64_t>::max(); }
+    std::lock_guard lock{writeMu_};
+    return activeSegmentId_;
+}
+
+[[nodiscard]] bool allowTrailingReadForSegment(const SegmentInfo& segment, uint64_t trailingSegmentId) const noexcept {
+    return segment.id == trailingSegmentId;
+}
+
 template <typename Visitor>
-[[nodiscard]] ScanSummary scanLog(bool allowTrailingEntry, uint64_t maxSeq, Visitor&& visitor) const {
+[[nodiscard]] ScanSummary scanLog(uint64_t maxSeq, Visitor&& visitor) const {
+    const uint64_t trailingSegmentId = trailingReadSegmentId();
     std::shared_lock scanLock{scanMu_};
     ScanSummary total;
     const auto segments = segmentSnapshot();
     for (const auto& segment : segments) {
         if (segment.hasEntries && segment.firstSeq > maxSeq) { continue; }
-        mergeScanSummary(total, scanSegment(segment.path, allowTrailingEntry, visitor));
+        mergeScanSummary(total, scanSegment(segment.path, allowTrailingReadForSegment(segment, trailingSegmentId), visitor));
     }
     return total;
 }
@@ -26,7 +37,7 @@ void applyRecoverySummary(const ScanSummary& summary, std::vector<SegmentInfo> s
         recoveredMaxSeq_ = summary.maxSeq;
         indexedEntries_.store(summary.entryCount, std::memory_order_relaxed);
         rollbackEntries_.store(summary.rollbackCount, std::memory_order_relaxed);
-        durableBytes_ = summary.durableBytes;
+        knownWrittenBytes_ = summary.durableBytes;
         activeSegmentId_ = segments.empty() ? 0 : segments.back().id;
         activeSegmentBytes_ = segments.empty() ? 0 : segments.back().bytes;
         std::unique_lock segmentLock{segmentMu_};
@@ -49,8 +60,8 @@ void runRecovery() noexcept {
         const uint64_t lastSegmentId = segments.empty() ? 0 : segments.back().id;
         for (auto& segment : segments) {
             SegmentKeyIndex segmentIndex;
-            const bool serialAsyncActiveSegment = !usesTrueParallelWrites() && opts_.syncMode == VLogSyncMode::ASYNC && segment.id ==
-                lastSegmentId;
+            const bool serialActiveSegment = !usesTrueParallelWrites() && segment.id == lastSegmentId;
+            const bool serialAsyncActiveSegment = serialActiveSegment && opts_.syncMode == VLogSyncMode::ASYNC;
             const auto summary = scanSegment(
                 segment.path,
                 serialAsyncActiveSegment,
@@ -58,7 +69,8 @@ void runRecovery() noexcept {
                     auto& versions = segmentIndex[std::string{key}];
                     versions.push_back(IndexVersion{header.seq, offset});
                 },
-                serialAsyncActiveSegment
+                serialAsyncActiveSegment,
+                serialActiveSegment
             );
             segment.firstSeq = summary.firstSeq;
             segment.lastSeq = summary.maxSeq;

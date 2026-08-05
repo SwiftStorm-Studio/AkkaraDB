@@ -26,7 +26,7 @@ using RetentionStateMap = std::unordered_map<std::string, RetentionBaseState, St
         if (segment.hasEntries && segment.firstSeq > baseSeq) { continue; }
         (void)scanSegment(
             segment.path,
-            true,
+            false,
             [&](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t> value) {
                 if (header.seq > baseSeq) { return; }
                 const auto it = states.find(key);
@@ -73,7 +73,7 @@ void persistRetentionBasesLocked(const RetentionStateMap& states, const std::uno
                 writeSerialized(base.file, write.bytes);
                 base.bytes += static_cast<uint64_t>(write.bytes.size());
                 base.index[key].push_back(IndexVersion{baseSeq, write.offset});
-                durableBytes_ += static_cast<uint64_t>(write.bytes.size());
+                knownWrittenBytes_ += static_cast<uint64_t>(write.bytes.size());
                 indexedEntries_.fetch_add(1, std::memory_order_relaxed);
                 if ((flags & VLOG_FLAG_ROLLBACK) != 0) { rollbackEntries_.fetch_add(1, std::memory_order_relaxed); }
                 {
@@ -100,7 +100,9 @@ void persistRetentionBasesLocked(const RetentionStateMap& states, const std::uno
             const auto basePath = segmentPath(base.segmentId);
             writeTailFile(basePath, base.bytes, true);
             tryWriteSegmentIndex(basePath, base.bytes, base.index);
-            fclose(base.file);
+            FILE* baseFile = base.file;
+            base.file = nullptr;
+            closeChecked(baseFile);
             parallelActiveSegmentIds_.erase(base.segmentId);
             persistedGeneration_.fetch_add(1, std::memory_order_release);
             retentionBaseEntriesWritten_.fetch_add(baseEntriesWritten, std::memory_order_relaxed);
@@ -128,7 +130,7 @@ void persistRetentionBasesLocked(const RetentionStateMap& states, const std::uno
             write.flags = flags;
             write.offset = activeSegmentBytes_;
             writeSerialized(file_, write.bytes);
-            durableBytes_ += static_cast<uint64_t>(write.bytes.size());
+            knownWrittenBytes_ += static_cast<uint64_t>(write.bytes.size());
             notePersistedLocked(write);
             trackEntryStats(flags);
             rotateSegmentIfNeededLocked();
@@ -167,7 +169,7 @@ void deleteRetentionSegmentsLocked(const std::unordered_set<uint64_t>& expiredId
         fs::remove(segmentIndexPath(segment.path), ignored);
         fs::remove(segmentTailPath(segment.path), ignored);
         forgetIndexPayloadValidation(segmentIndexPath(segment.path));
-        durableBytes_ = segment.bytes > durableBytes_ ? 0 : durableBytes_ - segment.bytes;
+        knownWrittenBytes_ = segment.bytes > knownWrittenBytes_ ? 0 : knownWrittenBytes_ - segment.bytes;
         indexedEntries_.fetch_sub(segment.entryCount, std::memory_order_relaxed);
         rollbackEntries_.fetch_sub(segment.rollbackCount, std::memory_order_relaxed);
         ++prunedSegments;

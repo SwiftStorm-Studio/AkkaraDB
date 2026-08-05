@@ -33,6 +33,7 @@ mutable std::mutex indexValidationMu_;
 mutable std::mutex retentionMu_;
 std::condition_variable flushCv_;
 std::condition_variable queueSpaceCv_;
+mutable std::mutex asyncErrorMu_;
 mutable std::mutex recoveryMu_;
 mutable std::condition_variable recoveryCv_;
 
@@ -139,7 +140,7 @@ std::vector<SegmentInfo> segments_;
 uint64_t pendingBytes_ = 0;
 std::atomic<uint64_t> indexedEntries_{0};
 std::atomic<uint64_t> rollbackEntries_{0};
-uint64_t durableBytes_ = 0;
+uint64_t knownWrittenBytes_ = 0;
 
 void trackEntryStats(uint8_t flags) noexcept {
     indexedEntries_.fetch_add(1, std::memory_order_relaxed);

@@ -105,6 +105,7 @@ static void writeSerialized(FILE* f, std::span<const uint8_t> bytes) {
 void checkAsyncError() const { if (asyncFailed_.load(std::memory_order_acquire)) { std::rethrow_exception(asyncError_); } }
 
 void recordAsyncError(std::exception_ptr error) noexcept {
+    std::lock_guard lock{asyncErrorMu_};
     if (asyncFailed_.load(std::memory_order_relaxed)) { return; }
     asyncError_ = std::move(error);
     asyncFailed_.store(true, std::memory_order_release);
@@ -207,7 +208,7 @@ void flushLoop() {
             if (opts_.syncMode == VLogSyncMode::BATCHED_SYNC) { fdatasyncChecked(file_); }
             {
                 std::lock_guard lock{writeMu_};
-                durableBytes_ += batchBytes;
+                knownWrittenBytes_ += batchBytes;
                 for (const auto& entry : batch) { notePersistedLocked(entry); }
                 rotateSegmentIfNeededLocked();
             }
@@ -259,7 +260,7 @@ void stopAsyncWorker() {
         writeSerialized(file_, write.bytes);
         flushChecked(file_);
         fdatasyncChecked(file_);
-        durableBytes_ += static_cast<uint64_t>(write.bytes.size());
+        knownWrittenBytes_ += static_cast<uint64_t>(write.bytes.size());
         notePersistedLocked(write);
         rotateSegmentIfNeededLocked();
         completeAppend(write.completion);

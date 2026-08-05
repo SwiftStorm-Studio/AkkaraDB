@@ -29,7 +29,7 @@ static void writeFileHeaderRaw(FILE* wf, VLogSyncMode syncModeHint) {
 
 void writeFileHeader(FILE* wf) {
     writeFileHeaderRaw(wf, opts_.syncMode);
-    durableBytes_ += FILE_HDR_SIZE;
+    knownWrittenBytes_ += FILE_HDR_SIZE;
 }
 
 [[nodiscard]] fs::path segmentPath(uint64_t id) const {

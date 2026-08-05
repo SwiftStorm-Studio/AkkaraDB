@@ -47,6 +47,7 @@ template <typename Visitor>
     FILE* rf,
     const fs::path& path,
     bool allowTrailingEntry,
+    bool allowTrailingHeader,
     bool allowTrailingCorruption,
     Visitor&& visitor,
     uint64_t maxBytes = std::numeric_limits<uint64_t>::max()
@@ -56,7 +57,13 @@ template <typename Visitor>
     std::array<uint8_t, FILE_HDR_SIZE> encodedFileHdr{};
     const size_t headerRead = fread(encodedFileHdr.data(), 1, encodedFileHdr.size(), rf);
     if (headerRead == 0 && feof(rf)) { return summary; }
-    if (headerRead != encodedFileHdr.size()) { throwVLogError("truncated file header", path, 0); }
+    if (headerRead != encodedFileHdr.size()) {
+        if (allowTrailingHeader && feof(rf)) {
+            summary.stoppedAtTrailingEntry = true;
+            return summary;
+        }
+        throwVLogError("truncated file header", path, 0);
+    }
 
     AkvlogV5FileHeader fileHdr = decodeFileHeader(encodedFileHdr.data());
     const uint32_t storedHeaderCrc = fileHdr.crc32c;
@@ -204,7 +211,8 @@ template <typename Visitor>
     const fs::path& path,
     bool allowTrailingEntry,
     Visitor&& visitor,
-    bool allowTrailingCorruption = false
+    bool allowTrailingCorruption = false,
+    bool allowTrailingHeader = false
 ) const {
     FILE* rf = openReadFile(path);
     if (!rf) { throw std::runtime_error("VersionLog: cannot open segment for reading: " + path.string()); }
@@ -217,7 +225,15 @@ template <typename Visitor>
             if (*tail > actualBytes) { throwVLogError("invalid durable tail length", path, *tail); }
             maxBytes = *tail;
         }
-        auto summary = scanFile(rf, path, allowTrailingEntry, allowTrailingCorruption, std::forward<Visitor>(visitor), maxBytes);
+        auto summary = scanFile(
+            rf,
+            path,
+            allowTrailingEntry,
+            allowTrailingHeader,
+            allowTrailingCorruption,
+            std::forward<Visitor>(visitor),
+            maxBytes
+        );
         fclose(rf);
         return summary;
     }

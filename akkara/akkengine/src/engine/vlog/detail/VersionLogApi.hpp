@@ -132,6 +132,7 @@ std::optional<VersionEntry> VersionLog::getAt(std::span<const uint8_t> key, uint
     const auto consider = [&](VersionEntry entry) {
         if (entry.seq <= visibleSeq && (!result || result->seq < entry.seq)) { result = std::move(entry); }
     };
+    const uint64_t trailingSegmentId = impl_->trailingReadSegmentId();
     std::shared_lock scanLock{impl_->scanMu_};
     const auto segments = impl_->segmentSnapshot();
     for (const auto& segment : segments) {
@@ -162,7 +163,7 @@ std::optional<VersionEntry> VersionLog::getAt(std::span<const uint8_t> key, uint
         if (usedIndex) { continue; }
         (void)impl_->scanSegment(
             segment.path,
-            true,
+            impl_->allowTrailingReadForSegment(segment, trailingSegmentId),
             [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
                 if (entryKey != keySv || header.seq > visibleSeq) { return; }
                 VersionEntry entry;
@@ -188,6 +189,7 @@ std::vector<VersionEntry> VersionLog::history(std::span<const uint8_t> key) cons
     const std::string_view keySv(reinterpret_cast<const char*>(key.data()), key.size());
     std::vector<VersionEntry> entries;
     auto resident = impl_->residentForKey(keySv);
+    const uint64_t trailingSegmentId = impl_->trailingReadSegmentId();
     std::shared_lock scanLock{impl_->scanMu_};
     const auto segments = impl_->segmentSnapshot();
     for (const auto& segment : segments) {
@@ -204,7 +206,7 @@ std::vector<VersionEntry> VersionLog::history(std::span<const uint8_t> key) cons
         if (usedIndex) { continue; }
         (void)impl_->scanSegment(
             segment.path,
-            true,
+            impl_->allowTrailingReadForSegment(segment, trailingSegmentId),
             [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
                 if (entryKey != keySv || header.seq > visibleSeq) { return; }
                 VersionEntry entry;
@@ -241,7 +243,6 @@ std::vector<VersionRecord> VersionLog::collectSince(uint64_t afterSeq) const {
     const uint64_t visibleSeq = impl_->visibleSeq();
     std::vector<VersionRecord> records;
     (void)impl_->scanLog(
-        true,
         visibleSeq,
         [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
             if (header.seq <= afterSeq || header.seq > visibleSeq) { return; }
@@ -302,7 +303,6 @@ std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> Versio
     std::unordered_map<std::string, std::vector<VersionEntry>> entriesByKey;
     auto resident = impl_->residentSnapshot();
     (void)impl_->scanLog(
-        true,
         visibleSeq,
         [&](std::string_view entryKey, const AkvlogV5EntryHeader& header, std::span<const uint8_t> entryValue) {
             if (header.seq > visibleSeq) { return; }
@@ -366,7 +366,8 @@ VersionLogSnapshot VersionLog::snapshot() const noexcept {
     VersionLogSnapshot out;
     if (!impl_) { return out; }
 
-    std::vector<VersionLog::Impl::ParallelLane*> lanes;
+    std::array<VersionLog::Impl::ParallelLane*, 64> lanes{};
+    size_t laneCount = 0;
     {
         std::lock_guard writeLock{impl_->writeMu_};
         std::shared_lock residentLock{impl_->residentMu_};
@@ -383,7 +384,7 @@ VersionLogSnapshot VersionLog::snapshot() const noexcept {
         out.rollbackEntries = impl_->rollbackEntries_.load(std::memory_order_relaxed);
         out.pendingWrites = impl_->pendingWrites_.size();
         out.pendingBytes = impl_->pendingBytes_;
-        out.durableBytes = impl_->durableBytes_;
+        out.durableBytes = impl_->knownWrittenBytes_;
         out.segmentCount = impl_->segments_.size();
         out.activeSegmentBytes = impl_->activeSegmentBytes_;
         out.retentionDays = impl_->opts_.retentionDays;
@@ -398,10 +399,13 @@ VersionLogSnapshot VersionLog::snapshot() const noexcept {
         out.retentionBaseEntriesWritten = impl_->retentionBaseEntriesWritten_.load(std::memory_order_relaxed);
         out.parallelQueueRejects = impl_->parallelQueueRejects_.load(std::memory_order_relaxed);
         out.parallelLaneCount = impl_->parallelLanes_.size();
-        lanes.reserve(impl_->parallelLanes_.size());
-        for (const auto& lane : impl_->parallelLanes_) { lanes.push_back(lane.get()); }
+        for (const auto& lane : impl_->parallelLanes_) {
+            if (laneCount >= lanes.size()) { break; }
+            lanes[laneCount++] = lane.get();
+        }
     }
-    for (const auto& lane : lanes) {
+    for (size_t i = 0; i < laneCount; ++i) {
+        auto* lane = lanes[i];
         std::lock_guard laneLock{lane->mutex};
         out.parallelPendingWrites += lane->pendingWrites.size();
         if (impl_->opts_.parallelPendingLimitScope != VLogParallelPendingLimitScope::GLOBAL) {
@@ -463,9 +467,11 @@ void VersionLog::close() {
 
     if (impl_->usesTrueParallelWrites()) {
         impl_->stopParallelWorkers();
+        const auto asyncError = impl_->asyncError_;
         impl_->closeParallelLanes();
         impl_->pruneClosedSegments();
         if (recoveryError) { std::rethrow_exception(recoveryError); }
+        if (asyncError) { std::rethrow_exception(asyncError); }
         return;
     }
     impl_->pruneClosedSegments();
@@ -483,8 +489,9 @@ void VersionLog::close() {
         fdatasyncChecked(impl_->file_);
         impl_->writeTailFile(impl_->segmentPath(impl_->activeSegmentId_), impl_->activeSegmentBytes_, true);
         impl_->writeActiveSegmentIndexLocked();
-        fclose(impl_->file_);
+        FILE* file = impl_->file_;
         impl_->file_ = nullptr;
+        closeChecked(file);
     }
     if (recoveryError) { std::rethrow_exception(recoveryError); }
     if (asyncError) { std::rethrow_exception(asyncError); }

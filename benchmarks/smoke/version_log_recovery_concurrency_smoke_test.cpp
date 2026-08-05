@@ -261,6 +261,33 @@ namespace {
         log->close();
     }
 
+    void verifyClosedSegmentFallbackRejectsTrailingGarbage(const fs::path& dir) {
+        const auto path = dir / "closed-segment-strict.akvlog";
+        constexpr std::string_view key{"closed-segment-key"};
+        {
+            auto options = serialOptions();
+            options.segmentBytes = 192;
+            auto log = vlog::VersionLog::create(path, std::move(options));
+            for (uint64_t seq = 1; seq <= 8; ++seq) { log->append(bytes(key), seq, 0, 0, 0, bytes(seqValue(seq))); }
+            log->close();
+        }
+
+        auto log = vlog::VersionLog::create(path, serialOptions());
+        auto index = path;
+        index.replace_extension(".akvidx");
+        auto tail = path;
+        tail.replace_extension(".akvtail");
+        require(fs::exists(index), "test setup must have a generated sidecar index for the closed base segment");
+        flipByte(index, static_cast<std::streamoff>(fs::file_size(index) - 1));
+        std::error_code error;
+        fs::remove(tail, error);
+        require(!error, "test setup must remove the closed segment durable tail");
+        appendGarbageTail(path);
+        requireRuntimeError([&] { (void)log->history(bytes(key)); },
+                            "closed segment fallback must reject trailing garbage instead of accepting a valid prefix");
+        log->close();
+    }
+
     void verifyConcurrentParallelReadWriteStress(const fs::path& dir) {
         const auto path = dir / "parallel-stress.akvlog";
         constexpr std::string_view sharedKey{"parallel-stress-shared-key"};
@@ -373,6 +400,7 @@ int main() {
         verifySerialAsyncTrailingEntryIsTruncated(dir.path());
         verifyParallelTailBoundsRecovery(dir.path());
         verifySidecarCorruptionFallsBack(dir.path());
+        verifyClosedSegmentFallbackRejectsTrailingGarbage(dir.path());
         verifyConcurrentParallelReadWriteStress(dir.path());
         return 0;
     }
