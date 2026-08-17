@@ -9,26 +9,33 @@
 
 // akkengine/src/engine/cluster/ReplicationClient.cpp
 #include "akk/engine/cluster/ReplicationClient.hpp"
+#include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -245,6 +252,139 @@ namespace akkaradb::engine::cluster {
             ::freeaddrinfo(result);
             return socket;
         }
+
+        struct MembershipState {
+            uint64_t groupId = 0;
+            uint64_t primaryNodeId = 0;
+            uint64_t groupEpoch = 0;
+        };
+
+        void writeLe32(std::vector<uint8_t>& out, uint32_t value) {
+            for (size_t i = 0; i < 4; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+        }
+
+        void writeLe64(std::vector<uint8_t>& out, uint64_t value) {
+            for (size_t i = 0; i < 8; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+        }
+
+        void writeLe32At(std::vector<uint8_t>& out, size_t off, uint32_t value) {
+            for (size_t i = 0; i < 4; ++i) { out[off + i] = static_cast<uint8_t>(value >> (i * 8)); }
+        }
+
+        uint32_t readLe32(std::span<const uint8_t> in, size_t off) {
+            return static_cast<uint32_t>(in[off]) | (static_cast<uint32_t>(in[off + 1]) << 8) | (static_cast<uint32_t>(in[off + 2]) << 16) |
+                (static_cast<uint32_t>(in[off + 3]) << 24);
+        }
+
+        uint64_t readLe64(std::span<const uint8_t> in, size_t off) {
+            uint64_t out = 0;
+            for (size_t i = 0; i < 8; ++i) { out |= static_cast<uint64_t>(in[off + i]) << (i * 8); }
+            return out;
+        }
+
+        uint32_t crcWithZeroedField(std::vector<uint8_t> bytes, size_t crcOffset) {
+            if (crcOffset + 4 > bytes.size()) { throw std::runtime_error("ReplicationClient: invalid CRC field"); }
+            writeLe32At(bytes, crcOffset, 0);
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+
+        std::filesystem::path corruptBackupPath(const std::filesystem::path& path) {
+            for (uint32_t i = 0; i < 10000; ++i) {
+                auto candidate = path;
+                candidate += i == 0 ? ".corrupt" : ".corrupt." + std::to_string(i);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("ReplicationClient: cannot allocate corrupt state backup path");
+        }
+
+        bool handleCorruptMembershipFile(
+            const std::filesystem::path& path,
+            CorruptClusterStateAction action,
+            const std::exception& cause
+        ) {
+            if (action == CorruptClusterStateAction::FAIL_STARTUP) {
+                throw std::runtime_error(std::string{"ReplicationClient: "} + cause.what());
+            }
+            std::error_code ec;
+            if (action == CorruptClusterStateAction::BACKUP_AND_RECREATE) {
+                std::filesystem::rename(path, corruptBackupPath(path), ec);
+                if (ec) { throw std::runtime_error("ReplicationClient: cannot back up corrupt membership state: " + ec.message()); }
+                return true;
+            }
+            if (action == CorruptClusterStateAction::DELETE_AND_RECREATE) {
+                std::filesystem::remove(path, ec);
+                if (ec) { throw std::runtime_error("ReplicationClient: cannot delete corrupt membership state: " + ec.message()); }
+                return true;
+            }
+            throw std::runtime_error("ReplicationClient: invalid corrupt state action");
+        }
+
+        void syncFile(const std::filesystem::path& path) {
+            #ifdef _WIN32
+            const int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+            if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync"); }
+            const int rc = _commit(fd);
+            const int closeRc = _close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: temp membership state sync failed"); }
+            #else
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: temp membership state sync failed"); }
+            #endif
+        }
+
+        std::optional<MembershipState> loadMembership(const std::filesystem::path& path, CorruptClusterStateAction corruptAction) {
+            if (path.empty() || !std::filesystem::exists(path)) { return std::nullopt; }
+            try {
+                std::ifstream in(path, std::ios::binary);
+                if (!in) { throw std::runtime_error("cannot open cluster membership state"); }
+                std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                constexpr size_t expectedSize = 5 + 8 + 8 + 8 + 4;
+                constexpr size_t crcOffset = expectedSize - 4;
+                if (bytes.size() != expectedSize) { throw std::runtime_error("invalid cluster membership state size"); }
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKCG2") {
+                    throw std::runtime_error("bad cluster membership state magic");
+                }
+                if (readLe32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) {
+                    throw std::runtime_error("cluster membership state CRC mismatch");
+                }
+                return MembershipState{
+                    .groupId = readLe64(bytes, 5),
+                    .primaryNodeId = readLe64(bytes, 13),
+                    .groupEpoch = readLe64(bytes, 21),
+                };
+            }
+            catch (const std::exception& ex) {
+                (void)handleCorruptMembershipFile(path, corruptAction, ex);
+                return std::nullopt;
+            }
+        }
+
+        void saveMembership(const std::filesystem::path& path, MembershipState state) {
+            if (path.empty()) { return; }
+            if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
+            std::vector<uint8_t> bytes;
+            bytes.insert(bytes.end(), {'A', 'K', 'C', 'G', '2'});
+            writeLe64(bytes, state.groupId);
+            writeLe64(bytes, state.primaryNodeId);
+            writeLe64(bytes, state.groupEpoch);
+            const size_t crcOffset = bytes.size();
+            writeLe32(bytes, 0);
+            writeLe32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
+
+            const auto tmpPath = path.parent_path() / (path.filename().string() + ".tmp");
+            {
+                std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+                if (!out) { throw std::runtime_error("ReplicationClient: cannot create cluster membership state"); }
+                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                out.flush();
+                if (!out) { throw std::runtime_error("ReplicationClient: cluster membership state write failed"); }
+            }
+            syncFile(tmpPath);
+            std::filesystem::rename(tmpPath, path);
+        }
     } // namespace
 
     class ReplicationClient::Impl {
@@ -381,7 +521,13 @@ namespace akkaradb::engine::cluster {
             }
 
             bool handshake(SocketHandle socket, crypto::SecureSession* secure, const crypto::PublicKey& secureRemotePublicKey) {
-                const ClientHello hello{.nodeId = selfNodeId_, .lastSeq = getLastSeq_ ? getLastSeq_() : 0, .role = NodeRole::REPLICA,};
+                const ClientHello hello{
+                    .nodeId = selfNodeId_,
+                    .lastSeq = getLastSeq_ ? getLastSeq_() : 0,
+                    .role = NodeRole::REPLICA,
+                    .groupId = runtimeOptions_.clusterGroupId,
+                    .groupEpoch = runtimeOptions_.clusterGroupEpoch,
+                };
                 const auto wire = encodeClientHello(hello);
                 if (!sendTo(socket, secure, wire.data(), wire.size())) { return false; }
 
@@ -389,12 +535,27 @@ namespace akkaradb::engine::cluster {
                 if (!recvFrameFrom(socket, secure, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
                 ServerHello serverHello;
                 if (!decodeServerHello(frame.payload, serverHello) || serverHello.role != NodeRole::PRIMARY) { return false; }
+                if (runtimeOptions_.clusterGroupId != 0 && serverHello.groupId != runtimeOptions_.clusterGroupId) { return false; }
+                if (runtimeOptions_.clusterGroupEpoch != 0 && serverHello.groupEpoch != runtimeOptions_.clusterGroupEpoch) { return false; }
                 if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.
                     expectedPrimaryNodeId) { return false; }
                 if (secure != nullptr) {
                     if (const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId); expected && secureRemotePublicKey != *
                         expected) { return false; }
                 }
+                const MembershipState incoming{
+                    .groupId = serverHello.groupId,
+                    .primaryNodeId = serverHello.nodeId,
+                    .groupEpoch = serverHello.groupEpoch,
+                };
+                try {
+                    if (const auto existing = loadMembership(runtimeOptions_.clusterMembershipPath, runtimeOptions_.corruptStateAction); existing &&
+                        !runtimeOptions_.resetClusterMembership &&
+                        (existing->groupId != incoming.groupId || existing->primaryNodeId != incoming.primaryNodeId || existing->groupEpoch
+                            != incoming.groupEpoch)) { return false; }
+                    saveMembership(runtimeOptions_.clusterMembershipPath, incoming);
+                }
+                catch (...) { return false; }
                 return true;
             }
 

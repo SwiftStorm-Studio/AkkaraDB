@@ -107,6 +107,8 @@ namespace akkaradb::engine::cluster {
         uint64_t nodeId = 0; ///< Replica node id.
         uint64_t lastSeq = 0; ///< Last sequence already applied by the replica.
         NodeRole role = NodeRole::REPLICA; ///< Expected to be NodeRole::REPLICA.
+        uint64_t groupId = 0; ///< Non-Raft cluster group identity.
+        uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
     };
 
     /** Primary-to-replica handshake response payload. */
@@ -114,6 +116,8 @@ namespace akkaradb::engine::cluster {
         uint64_t nodeId = 0; ///< Primary node id.
         uint64_t currentSeq = 0; ///< Primary's current sequence at handshake time.
         NodeRole role = NodeRole::PRIMARY; ///< Expected to be NodeRole::PRIMARY.
+        uint64_t groupId = 0; ///< Non-Raft cluster group identity.
+        uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
     };
 
     /** Replicated key/value mutation payload. */

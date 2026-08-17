@@ -29,6 +29,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -518,6 +519,35 @@ namespace akkaradb::engine {
                         return proposal;
                     }
 
+                    [[nodiscard]] RaftProposal appendPreparedProposal(
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        uint8_t flags,
+                        uint64_t sourceNodeId,
+                        const std::function<std::vector<uint8_t>(uint64_t proposalIndex, uint8_t& proposalFlags)>& prepareValue,
+                        uint64_t fp64 = 0,
+                        uint64_t miniKey = 0
+                    ) {
+                        std::lock_guard lock{mutex_};
+                        const uint64_t proposalIndex = lastIndex_ + 1;
+                        uint8_t proposalFlags = flags;
+                        std::vector<uint8_t> preparedValue = prepareValue(proposalIndex, proposalFlags);
+
+                        RaftProposal proposal;
+                        proposal.term = currentTerm_;
+                        proposal.index = proposalIndex;
+                        proposal.key.assign(key.begin(), key.end());
+                        proposal.value = std::move(preparedValue);
+                        proposal.flags = proposalFlags;
+                        proposal.op = op;
+                        proposal.sourceNodeId = sourceNodeId;
+                        proposal.fp64 = fp64;
+                        proposal.miniKey = miniKey;
+                        lastIndex_ = proposalIndex;
+                        appendRecord(RecordType::PROPOSAL, proposal);
+                        return proposal;
+                    }
+
                     void markCommitted(uint64_t term, uint64_t index) {
                         std::lock_guard lock{mutex_};
                         RaftProposal marker;
@@ -817,6 +847,24 @@ namespace akkaradb::engine {
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
                 blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
                 flags |= MemHdr16::FLAG_BLOB;
+                if (clusterRuntime) { clusterRuntime->shipBlob(seq, seq, value); }
+                return ref;
+            }
+
+            [[nodiscard]] std::vector<uint8_t> maybeExternalizeRaft(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
+                if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
+
+                std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
+                blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
+                flags |= MemHdr16::FLAG_BLOB;
+
+                if (opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG) {
+                    if (!clusterRuntime) { throw std::runtime_error("AkkEngine: RAFT_LOG Blob policy requires cluster runtime"); }
+                    clusterRuntime->shipBlob(seq, seq, value);
+                    return ref;
+                }
+
+                blobManager->write(seq, value);
                 if (clusterRuntime) { clusterRuntime->shipBlob(seq, seq, value); }
                 return ref;
             }
@@ -1435,6 +1483,7 @@ namespace akkaradb::engine {
                 }
                 else {
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
+                    if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                     appendAll(proposal.index, proposal.key, proposal.value, flags, proposal.sourceNodeId, proposal.fp64, proposal.miniKey);
                 }
             }
@@ -1719,6 +1768,19 @@ namespace akkaradb::engine {
                         uint64_t miniKey = 0
                     ) {
                         if (!engine_.raftLog) { throw std::runtime_error("AkkEngine: RAFT_QUORUM requires a Raft log"); }
+                        if (op == cluster::ReplOpType::PUT) {
+                            return engine_.raftLog->appendPreparedProposal(
+                                op,
+                                key,
+                                flags,
+                                engine_.nodeId,
+                                [this, value](uint64_t proposalIndex, uint8_t& proposalFlags) {
+                                    return engine_.maybeExternalizeRaft(proposalIndex, value, proposalFlags);
+                                },
+                                fp64,
+                                miniKey
+                            );
+                        }
                         return engine_.raftLog->appendProposal(op, key, value, flags, engine_.nodeId, fp64, miniKey);
                     }
 
@@ -1949,6 +2011,17 @@ namespace akkaradb::engine {
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
             writeCoordinatorMode = cfg.consistency().mode;
             impl.primaryAckTimeoutAction = cfg.consistency().ackTimeoutAction;
+            if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
+                const auto raftBlobPolicy = impl.opts.cluster.runtime.raftBlobPolicy;
+                if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT &&
+                    raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY &&
+                    raftBlobPolicy != cluster::RaftBlobPolicy::RAFT_LOG) {
+                    throw std::invalid_argument("AkkEngine: invalid Raft Blob policy");
+                }
+                if (impl.opts.components.blobEnabled && raftBlobPolicy == cluster::RaftBlobPolicy::REJECT) {
+                    throw std::invalid_argument("AkkEngine: RAFT_QUORUM does not support Blob payload replication");
+                }
+            }
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
             callbacks.getLastSeq = [&impl] { return impl.snapshotSeq(); };

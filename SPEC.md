@@ -1540,6 +1540,12 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `primaryHost` | empty | Replica-side primary host override |
 | `primaryReplPort` | 0 | Replica-side primary port override |
 | `primaryNodeId` | 0 | Replica-side primary node id override |
+| `clusterGroupId`, `clusterGroupEpoch` | 0 | Non-Raft group identity override; primary creates persisted defaults when zero |
+| `clusterMembershipPath` | empty | Non-Raft primary group state / replica membership state path |
+| `resetClusterMembership` | `false` | Explicitly allow a valid replica membership switch |
+| `corruptStateAction` | `FAIL_STARTUP` | Corrupt small cluster state files fail startup unless explicitly backed up/deleted and recreated |
+| `raftLogRecoveryAction` | `FAIL_STARTUP` | Raft log corruption fails startup unless explicitly allowed to truncate only the uncommitted tail |
+| `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations |
 | `secure.identitySeedPath` | empty | Persistent identity seed path |
 | `secure.pinnedPeers` | empty | Peer public-key pins |
 | `secure.expectedPrimaryNodeId` | 0 | Expected primary id or unknown |
@@ -1887,7 +1893,15 @@ stored error instead.
 
 Cluster config is a CRC-protected `AKC5` v4 binary file. It stores persistent
 membership, placement, acknowledgement, consistency, Raft, and stripe settings.
-Runtime transport settings remain out-of-band.
+Runtime transport settings remain out-of-band. `AKC5` readers reject CRC
+mismatches, oversized host names, truncation, and trailing bytes.
+
+Non-Raft primary group state and replica membership state use CRC-protected
+`AKCG2` little-endian binary files. Raft volatile consensus state uses
+CRC-protected `AKRS2`. Raft logs use `AKRL4`: a little-endian binary header with
+CRC32C plus per-entry length and CRC32C records so an explicitly configured
+recovery policy can truncate only damaged uncommitted tail records. By default,
+all corrupt cluster state and Raft log files fail startup.
 
 ### 24.9 Endianness Exceptions
 

@@ -11,6 +11,7 @@
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -18,9 +19,18 @@
 
 #include "akk/cpu/CRC32C.hpp"
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace akkaradb::engine::cluster {
     namespace {
         constexpr size_t HEADER_SIZE = 48;
+        constexpr size_t MAX_HOST_BYTES = 1024;
 
         uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -62,6 +72,22 @@ namespace akkaradb::engine::cluster {
         uint32_t crcFileImage(std::vector<uint8_t> bytes) {
             if (bytes.size() >= 28) { writeU32(bytes.data(), 24, 0); }
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+
+        void syncFile(const std::filesystem::path& path, const char* context) {
+            #ifdef _WIN32
+            const int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
+            const int rc = _commit(fd);
+            const int closeRc = _close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            #else
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            #endif
         }
     } // namespace
 
@@ -126,11 +152,13 @@ namespace akkaradb::engine::cluster {
             node.replPort = readU16(bytes.data(), cursor + 14);
             const uint16_t hostLen = readU16(bytes.data(), cursor + 16);
             cursor += 18;
+            if (hostLen > MAX_HOST_BYTES) { throw std::runtime_error("ClusterConfig: host name too long"); }
             if (cursor + hostLen > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated host"); }
             node.host.assign(reinterpret_cast<const char*>(bytes.data() + cursor), hostLen);
             cursor += hostLen;
             nodes.push_back(std::move(node));
         }
+        if (cursor != bytes.size()) { throw std::runtime_error("ClusterConfig: trailing bytes"); }
 
         ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe};
         cfg.flags_ = flags;
@@ -167,6 +195,7 @@ namespace akkaradb::engine::cluster {
         bytes[41] = config.stripe_.parityShards;
 
         for (const auto& node : config.nodes_) {
+            if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
             const auto hostLen = static_cast<uint16_t>(node.host.size());
             const size_t off = bytes.size();
             bytes.resize(off + 18 + hostLen);
@@ -185,8 +214,10 @@ namespace akkaradb::engine::cluster {
             std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
             if (!out) { throw std::runtime_error("ClusterConfig: cannot create " + tmpPath.string()); }
             out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            out.flush();
             if (!out) { throw std::runtime_error("ClusterConfig: write failed"); }
         }
+        syncFile(tmpPath, "ClusterConfig");
         std::filesystem::rename(tmpPath, path);
     }
 
@@ -258,6 +289,7 @@ namespace akkaradb::engine::cluster {
             if (node.nodeId == 0) { throw std::invalid_argument("ClusterConfig: nodeId 0 is reserved"); }
             if (!ids.insert(node.nodeId).second) { throw std::invalid_argument("ClusterConfig: duplicate nodeId"); }
             if (node.host.empty()) { throw std::invalid_argument("ClusterConfig: empty host"); }
+            if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
             if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING)) != 0) {
                 throw std::invalid_argument("ClusterConfig: unknown node capability");
             }

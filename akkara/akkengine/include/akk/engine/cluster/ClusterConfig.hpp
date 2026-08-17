@@ -127,6 +127,26 @@ namespace akkaradb::engine::cluster {
         ASYNC_RESYNC = 0, REJECT_REPLICA = 1, BLOCK_WRITES = 2,
     };
 
+    /** Recovery policy for corrupt small cluster state files. */
+    enum class CorruptClusterStateAction : uint8_t {
+        FAIL_STARTUP = 0,
+        BACKUP_AND_RECREATE = 1,
+        DELETE_AND_RECREATE = 2,
+    };
+
+    /** Recovery policy for Raft log damage after the last committed entry. */
+    enum class RaftLogRecoveryAction : uint8_t {
+        FAIL_STARTUP = 0,
+        TRUNCATE_UNCOMMITTED_TAIL = 1,
+    };
+
+    /** Policy for Blob payloads when RAFT_QUORUM is selected. */
+    enum class RaftBlobPolicy : uint8_t {
+        REJECT = 0,
+        PRIMARY_SIDE_ONLY = 1,
+        RAFT_LOG = 2,
+    };
+
     enum class RaftMembershipMode : uint8_t {
         STATIC = 0, JOINT_CONSENSUS = 1,
     };
@@ -208,6 +228,13 @@ namespace akkaradb::engine::cluster {
         std::string primaryHost; ///< Replica-side configured primary host override.
         uint16_t primaryReplPort = 0; ///< Replica-side configured primary replication port override.
         uint64_t primaryNodeId = 0; ///< Replica-side configured primary node id override.
+        uint64_t clusterGroupId = 0; ///< Non-Raft group instance id; primary generates and persists one when zero.
+        uint64_t clusterGroupEpoch = 0; ///< Non-Raft group epoch; primary defaults zero to epoch 1.
+        std::filesystem::path clusterMembershipPath; ///< Persisted non-Raft group state for primary, membership for replica.
+        bool resetClusterMembership = false; ///< Allows a replica to intentionally join a different non-Raft group.
+        CorruptClusterStateAction corruptStateAction = CorruptClusterStateAction::FAIL_STARTUP;
+        RaftLogRecoveryAction raftLogRecoveryAction = RaftLogRecoveryAction::FAIL_STARTUP;
+        RaftBlobPolicy raftBlobPolicy = RaftBlobPolicy::REJECT;
         ClusterSecureOptions secure;
     };
 

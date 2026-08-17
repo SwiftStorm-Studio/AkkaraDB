@@ -9,6 +9,7 @@
 
 // akkengine/src/engine/cluster/RaftConsensusRuntime.cpp
 #include "akk/engine/cluster/detail/RaftConsensusRuntime.hpp"
+#include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
 #include <algorithm>
@@ -35,8 +36,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -79,6 +83,10 @@ namespace akkaradb::engine::cluster {
             for (size_t i = 0; i < 8; ++i) { out.push_back(static_cast<uint8_t>(value >> (8 * i))); }
         }
 
+        void writeU32At(std::vector<uint8_t>& out, size_t off, uint32_t value) {
+            for (size_t i = 0; i < 4; ++i) { out[off + i] = static_cast<uint8_t>(value >> (8 * i)); }
+        }
+
         uint32_t readU32(std::span<const uint8_t> in, size_t off) {
             return static_cast<uint32_t>(in[off]) | (static_cast<uint32_t>(in[off + 1]) << 8) | (static_cast<uint32_t>(in[off + 2]) << 16) |
                 (static_cast<uint32_t>(in[off + 3]) << 24);
@@ -95,6 +103,80 @@ namespace akkaradb::engine::cluster {
             out.assign(in.begin() + static_cast<std::ptrdiff_t>(cursor), in.begin() + static_cast<std::ptrdiff_t>(cursor + len));
             cursor += len;
             return true;
+        }
+
+        uint32_t crcBytes(std::span<const uint8_t> bytes) {
+            return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+
+        uint32_t crcWithZeroedField(std::vector<uint8_t> bytes, size_t crcOffset) {
+            if (crcOffset + 4 > bytes.size()) { throw std::runtime_error("RaftConsensusRuntime: invalid CRC field"); }
+            writeU32At(bytes, crcOffset, 0);
+            return crcBytes(bytes);
+        }
+
+        std::vector<uint8_t> readWholeFile(const std::filesystem::path& path, const char* context) {
+            std::ifstream in(path, std::ios::binary);
+            if (!in) { throw std::runtime_error(std::string{context} + ": cannot open file"); }
+            return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        }
+
+        void writeFileAtomically(const std::filesystem::path& path, std::span<const uint8_t> bytes, const char* context) {
+            if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
+            const auto tmp = path.parent_path() / (path.filename().string() + ".tmp");
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                if (!out) { throw std::runtime_error(std::string{context} + ": cannot create temp file"); }
+                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                out.flush();
+                if (!out) { throw std::runtime_error(std::string{context} + ": write failed"); }
+            }
+            #ifdef _WIN32
+            const int fd = _wopen(tmp.c_str(), _O_RDWR | _O_BINARY);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
+            const int rc = _commit(fd);
+            const int closeRc = _close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            #else
+            const int fd = ::open(tmp.c_str(), O_RDONLY);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            #endif
+            std::filesystem::rename(tmp, path);
+        }
+
+        std::filesystem::path corruptBackupPath(const std::filesystem::path& path) {
+            for (uint32_t i = 0; i < 10000; ++i) {
+                auto candidate = path;
+                candidate += i == 0 ? ".corrupt" : ".corrupt." + std::to_string(i);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("RaftConsensusRuntime: cannot allocate corrupt state backup path");
+        }
+
+        bool handleCorruptStateFile(
+            const std::filesystem::path& path,
+            CorruptClusterStateAction action,
+            const char* context,
+            const std::exception& cause
+        ) {
+            if (action == CorruptClusterStateAction::FAIL_STARTUP) {
+                throw std::runtime_error(std::string{context} + ": " + cause.what());
+            }
+            std::error_code ec;
+            if (action == CorruptClusterStateAction::BACKUP_AND_RECREATE) {
+                std::filesystem::rename(path, corruptBackupPath(path), ec);
+                if (ec) { throw std::runtime_error(std::string{context} + ": cannot back up corrupt state: " + ec.message()); }
+                return true;
+            }
+            if (action == CorruptClusterStateAction::DELETE_AND_RECREATE) {
+                std::filesystem::remove(path, ec);
+                if (ec) { throw std::runtime_error(std::string{context} + ": cannot delete corrupt state: " + ec.message()); }
+                return true;
+            }
+            throw std::runtime_error(std::string{context} + ": invalid corrupt state action");
         }
 
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
@@ -127,7 +209,7 @@ namespace akkaradb::engine::cluster {
 
         void setTimeouts(SocketHandle s, int timeoutMs) {
             #ifdef _WIN32
-            const DWORD timeout = static_cast<DWORD>(timeoutMs); ::setsockopt(
+            const auto timeout = static_cast<DWORD>(timeoutMs); ::setsockopt(
                 s,
                 SOL_SOCKET,
                 SO_RCVTIMEO,
@@ -371,7 +453,7 @@ namespace akkaradb::engine::cluster {
         };
 
         enum class RaftEntryKind : uint8_t {
-            MUTATION = 0, CONFIG_JOINT = 1, CONFIG_FINAL = 2,
+            MUTATION = 0, CONFIG_JOINT = 1, CONFIG_FINAL = 2, BLOB = 3,
         };
 
         struct RaftLogEntry {
@@ -523,25 +605,6 @@ namespace akkaradb::engine::cluster {
             out.clientSeq = readU64(in, cursor);
             cursor += 8;
             out.kind = static_cast<RaftEntryKind>(in[cursor++]);
-            out.op = static_cast<ReplOpType>(in[cursor++]);
-            out.flags = in[cursor++];
-            out.sourceNodeId = readU64(in, cursor);
-            cursor += 8;
-            const uint32_t keyLen = readU32(in, cursor);
-            cursor += 4;
-            const uint32_t valueLen = readU32(in, cursor);
-            cursor += 4;
-            return readBytes(in, cursor, keyLen, out.key) && readBytes(in, cursor, valueLen, out.value);
-        }
-
-        bool decodeLegacyEntryPayload(std::span<const uint8_t> in, size_t& cursor, RaftLogEntry& out) {
-            if (cursor + 34 > in.size()) { return false; }
-            out.term = readU64(in, cursor);
-            cursor += 8;
-            out.index = readU64(in, cursor);
-            cursor += 8;
-            out.clientSeq = out.index;
-            out.kind = RaftEntryKind::MUTATION;
             out.op = static_cast<ReplOpType>(in[cursor++]);
             out.flags = in[cursor++];
             out.sourceNodeId = readU64(in, cursor);
@@ -730,8 +793,20 @@ namespace akkaradb::engine::cluster {
         }
 
         bool sameEntry(const RaftLogEntry& lhs, const RaftLogEntry& rhs) {
-            return lhs.term == rhs.term && lhs.index == rhs.index && lhs.op == rhs.op && lhs.flags == rhs.flags && lhs.sourceNodeId == rhs.
-                sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value;
+            return lhs.term == rhs.term && lhs.index == rhs.index && lhs.clientSeq == rhs.clientSeq && lhs.kind == rhs.kind && lhs.op ==
+                rhs.op && lhs.flags == rhs.flags && lhs.sourceNodeId == rhs.sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value;
+        }
+
+        std::vector<uint8_t> encodeBlobId(uint64_t blobId) {
+            std::vector<uint8_t> out;
+            writeU64(out, blobId);
+            return out;
+        }
+
+        bool decodeBlobId(std::span<const uint8_t> in, uint64_t& blobId) {
+            if (in.size() != 8) { return false; }
+            blobId = readU64(in, 0);
+            return true;
         }
     }
 
@@ -808,6 +883,11 @@ namespace akkaradb::engine::cluster {
                 return NodeRole::REPLICA;
             }
 
+            std::vector<NodeInfo> activeNodes() const {
+                std::lock_guard lock{mutex_};
+                return replicationTargetsLocked();
+            }
+
             const ClusterRouter& router() const noexcept { return router_; }
 
             void shipEntry(
@@ -863,8 +943,58 @@ namespace akkaradb::engine::cluster {
                 maybeCompactLog();
             }
 
-            void shipBlob(uint64_t, uint64_t, std::span<const uint8_t>) {
-                if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
+            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::REJECT) {
+                    throw std::runtime_error("RaftConsensusRuntime: RAFT_QUORUM does not support Blob payload replication");
+                }
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::PRIMARY_SIDE_ONLY) {
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    return;
+                }
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::RAFT_LOG) {
+                    RaftLogEntry entry;
+                    uint64_t term = 0;
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (role_.load() != RaftRole::LEADER) {
+                            throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                        }
+                        term = currentTerm_;
+                        entry.term = term;
+                        entry.index = lastLogIndex() + 1;
+                        entry.clientSeq = seq;
+                        entry.kind = RaftEntryKind::BLOB;
+                        entry.op = ReplOpType::PUT;
+                        entry.flags = 0;
+                        entry.sourceNodeId = selfNodeId_;
+                        entry.key = encodeBlobId(blobId);
+                        entry.value.assign(content.begin(), content.end());
+                        log_.push_back(entry);
+                        persistLog();
+                    }
+
+                    if (!replicateEntryToMajority(entry)) {
+                        throw std::runtime_error("RaftConsensusRuntime: failed to replicate Blob payload to Raft majority");
+                    }
+
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
+                            throw std::runtime_error("RaftConsensusRuntime: leadership changed before Blob payload commit");
+                        }
+                        if (entry.index > commitIndex_) {
+                            commitIndex_ = entry.index;
+                            persistLog();
+                        }
+                    }
+                    applyCommitted();
+                    sendHeartbeats();
+                    maybeCompactLog();
+                    return;
+                }
+                throw std::runtime_error("RaftConsensusRuntime: unsupported Raft Blob policy");
             }
 
             void addVotingNode(const NodeInfo& node) {
@@ -1075,13 +1205,12 @@ namespace akkaradb::engine::cluster {
             }
 
             static std::vector<NodeInfo> sortedUniqueVoters(std::vector<NodeInfo> nodes) {
-                std::sort(nodes.begin(), nodes.end(), [](const NodeInfo& lhs, const NodeInfo& rhs) { return lhs.nodeId < rhs.nodeId; });
+                std::ranges::sort(nodes, [](const NodeInfo& lhs, const NodeInfo& rhs) { return lhs.nodeId < rhs.nodeId; });
                 nodes.erase(
-                    std::unique(
-                        nodes.begin(),
-                        nodes.end(),
+                    std::ranges::unique(
+                        nodes,
                         [](const NodeInfo& lhs, const NodeInfo& rhs) { return lhs.nodeId == rhs.nodeId; }
-                    ),
+                    ).begin(),
                     nodes.end()
                 );
                 return nodes;
@@ -1110,13 +1239,9 @@ namespace akkaradb::engine::cluster {
                         peerReplication_.push_back(PeerReplicationState{.node = peer, .nextIndex = 1, .matchIndex = 0});
                     }
                 }
-                peerReplication_.erase(
-                    std::remove_if(
-                        peerReplication_.begin(),
-                        peerReplication_.end(),
-                        [&](const PeerReplicationState& state) { return !containsNode(peers_, state.node.nodeId); }
-                    ),
-                    peerReplication_.end()
+                std::erase_if(
+                    peerReplication_,
+                    [&](const PeerReplicationState& state) { return !containsNode(peers_, state.node.nodeId); }
                 );
             }
 
@@ -1199,85 +1324,153 @@ namespace akkaradb::engine::cluster {
                 for (const auto& entry : log_) {
                     if ((entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) && entry.index >
                         lastIncludedIndex_) { return target; }
-                    if (entry.kind == RaftEntryKind::MUTATION && entry.clientSeq <= snapshotSeq) { target = entry.index; }
+                    if ((entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) && entry.clientSeq <= snapshotSeq) {
+                        target = entry.index;
+                    }
                 }
                 return target;
             }
 
             void persistState() {
-                if (statePath_.has_parent_path()) { std::filesystem::create_directories(statePath_.parent_path()); }
-                const auto tmp = statePath_.parent_path() / (statePath_.filename().string() + ".tmp");
-                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                if (!out) { throw std::runtime_error("RaftConsensusRuntime: cannot write state"); }
-                out.write("AKRS1", 5);
-                out.write(reinterpret_cast<const char*>(&currentTerm_), sizeof(currentTerm_));
-                out.write(reinterpret_cast<const char*>(&votedFor_), sizeof(votedFor_));
-                out.close();
-                std::filesystem::rename(tmp, statePath_);
+                std::vector<uint8_t> bytes;
+                bytes.insert(bytes.end(), {'A', 'K', 'R', 'S', '2'});
+                writeU64(bytes, currentTerm_);
+                writeU64(bytes, votedFor_);
+                const size_t crcOffset = bytes.size();
+                writeU32(bytes, 0);
+                writeU32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
+                writeFileAtomically(statePath_, bytes, "RaftConsensusRuntime state");
             }
 
             void recoverState() {
-                std::ifstream in(statePath_, std::ios::binary);
-                if (!in) { return; }
-                char magic[5]{};
-                in.read(magic, sizeof(magic));
-                if (std::string_view{magic, sizeof(magic)} != "AKRS1") { throw std::runtime_error("RaftConsensusRuntime: bad state file"); }
-                in.read(reinterpret_cast<char*>(&currentTerm_), sizeof(currentTerm_));
-                in.read(reinterpret_cast<char*>(&votedFor_), sizeof(votedFor_));
-                if (!in) { throw std::runtime_error("RaftConsensusRuntime: truncated state file"); }
+                if (!std::filesystem::exists(statePath_)) { return; }
+                try {
+                    const auto bytes = readWholeFile(statePath_, "RaftConsensusRuntime state");
+                    constexpr size_t expectedSize = 5 + 8 + 8 + 4;
+                    constexpr size_t crcOffset = expectedSize - 4;
+                    if (bytes.size() != expectedSize) { throw std::runtime_error("invalid state file size"); }
+                    if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRS2") {
+                        throw std::runtime_error("bad state file magic");
+                    }
+                    if (readU32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) {
+                        throw std::runtime_error("state file CRC mismatch");
+                    }
+                    currentTerm_ = readU64(bytes, 5);
+                    votedFor_ = readU64(bytes, 13);
+                }
+                catch (const std::exception& ex) {
+                    (void)handleCorruptStateFile(statePath_, runtimeOptions_.corruptStateAction, "RaftConsensusRuntime state", ex);
+                    currentTerm_ = 0;
+                    votedFor_ = 0;
+                }
             }
 
             void persistLog() {
-                if (logPath_.has_parent_path()) { std::filesystem::create_directories(logPath_.parent_path()); }
-                const auto tmp = logPath_.parent_path() / (logPath_.filename().string() + ".tmp");
-                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                if (!out) { throw std::runtime_error("RaftConsensusRuntime: cannot write log"); }
-                out.write("AKRL3", 5);
-                out.write(reinterpret_cast<const char*>(&commitIndex_), sizeof(commitIndex_));
-                out.write(reinterpret_cast<const char*>(&lastIncludedIndex_), sizeof(lastIncludedIndex_));
-                out.write(reinterpret_cast<const char*>(&lastIncludedTerm_), sizeof(lastIncludedTerm_));
-                const uint64_t count = static_cast<uint64_t>(log_.size());
-                out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+                std::vector<uint8_t> bytes;
+                bytes.insert(bytes.end(), {'A', 'K', 'R', 'L', '4'});
+                writeU64(bytes, commitIndex_);
+                writeU64(bytes, lastIncludedIndex_);
+                writeU64(bytes, lastIncludedTerm_);
+                writeU64(bytes, static_cast<uint64_t>(log_.size()));
+                const size_t headerCrcOffset = bytes.size();
+                writeU32(bytes, 0);
+                writeU32At(bytes, headerCrcOffset, crcBytes(std::span<const uint8_t>{bytes.data(), headerCrcOffset}));
                 for (const auto& entry : log_) {
                     const auto payload = encodeEntryPayload(entry);
-                    const uint64_t len = static_cast<uint64_t>(payload.size());
-                    out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-                    out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+                    writeU64(bytes, static_cast<uint64_t>(payload.size()));
+                    writeU32(bytes, crcBytes(payload));
+                    bytes.insert(bytes.end(), payload.begin(), payload.end());
                 }
-                out.close();
-                std::filesystem::rename(tmp, logPath_);
+                writeFileAtomically(logPath_, bytes, "RaftConsensusRuntime log");
             }
 
             void recoverLog() {
-                std::ifstream in(logPath_, std::ios::binary);
-                if (!in) { return; }
-                char magic[5]{};
-                in.read(magic, sizeof(magic));
-                const std::string_view format{magic, sizeof(magic)};
-                if (format != "AKRL1" && format != "AKRL2" && format != "AKRL3") {
+                if (!std::filesystem::exists(logPath_)) { return; }
+                const auto bytes = readWholeFile(logPath_, "RaftConsensusRuntime log");
+                constexpr size_t headerSize = 5 + 8 + 8 + 8 + 8 + 4;
+                constexpr size_t headerCrcOffset = headerSize - 4;
+                if (bytes.size() < headerSize) { throw std::runtime_error("RaftConsensusRuntime: truncated log file"); }
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRL4") {
                     throw std::runtime_error("RaftConsensusRuntime: bad log file");
                 }
-                in.read(reinterpret_cast<char*>(&commitIndex_), sizeof(commitIndex_));
-                if (format == "AKRL2" || format == "AKRL3") {
-                    in.read(reinterpret_cast<char*>(&lastIncludedIndex_), sizeof(lastIncludedIndex_));
-                    in.read(reinterpret_cast<char*>(&lastIncludedTerm_), sizeof(lastIncludedTerm_));
+                if (readU32(bytes, headerCrcOffset) != crcBytes(std::span<const uint8_t>{bytes.data(), headerCrcOffset})) {
+                    throw std::runtime_error("RaftConsensusRuntime: log header CRC mismatch");
                 }
-                uint64_t count = 0;
-                in.read(reinterpret_cast<char*>(&count), sizeof(count));
+                commitIndex_ = readU64(bytes, 5);
+                lastIncludedIndex_ = readU64(bytes, 13);
+                lastIncludedTerm_ = readU64(bytes, 21);
+                const uint64_t count = readU64(bytes, 29);
+
+                size_t cursor = headerSize;
+                uint64_t lastGoodIndex = lastIncludedIndex_;
+                bool truncatedTail = false;
+                const auto canTruncateTail = [&] {
+                    return runtimeOptions_.raftLogRecoveryAction == RaftLogRecoveryAction::TRUNCATE_UNCOMMITTED_TAIL &&
+                           commitIndex_ <= lastGoodIndex;
+                };
+                const auto failOrTruncate = [&](const char* message) {
+                    if (canTruncateTail()) {
+                        truncatedTail = true;
+                        return;
+                    }
+                    throw std::runtime_error(std::string{"RaftConsensusRuntime: "} + message);
+                };
+
                 for (uint64_t i = 0; i < count; ++i) {
-                    uint64_t len = 0;
-                    in.read(reinterpret_cast<char*>(&len), sizeof(len));
-                    std::vector<uint8_t> payload(static_cast<size_t>(len));
-                    in.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
-                    size_t cursor = 0;
+                    if (cursor + 12 > bytes.size()) {
+                        failOrTruncate("truncated log entry header");
+                        break;
+                    }
+                    const uint64_t len = readU64(bytes, cursor);
+                    cursor += 8;
+                    const uint32_t storedCrc = readU32(bytes, cursor);
+                    cursor += 4;
+                    if (len > ReplFrameHeader::MAX_PAYLOAD_SIZE || len > bytes.size() - cursor) {
+                        failOrTruncate("truncated log entry payload");
+                        break;
+                    }
+                    const auto payload = std::span<const uint8_t>{bytes.data() + cursor, static_cast<size_t>(len)};
+                    cursor += static_cast<size_t>(len);
+                    if (storedCrc != crcBytes(payload)) {
+                        failOrTruncate("log entry CRC mismatch");
+                        break;
+                    }
+                    size_t payloadCursor = 0;
                     RaftLogEntry entry;
-                    const bool decoded = format == "AKRL3"
-                                             ? decodeEntryPayload(payload, cursor, entry)
-                                             : decodeLegacyEntryPayload(payload, cursor, entry);
-                    if (!decoded || cursor != payload.size()) { throw std::runtime_error("RaftConsensusRuntime: corrupt log entry"); }
+                    if (!decodeEntryPayload(payload, payloadCursor, entry) || payloadCursor != payload.size()) {
+                        failOrTruncate("corrupt log entry");
+                        break;
+                    }
+                    if (entry.index <= lastIncludedIndex_ || entry.index != lastGoodIndex + 1) {
+                        failOrTruncate("non-contiguous log entry");
+                        break;
+                    }
+                    if (entry.kind != RaftEntryKind::MUTATION && entry.kind != RaftEntryKind::CONFIG_JOINT && entry.kind !=
+                        RaftEntryKind::CONFIG_FINAL && entry.kind != RaftEntryKind::BLOB) {
+                        failOrTruncate("invalid log entry kind");
+                        break;
+                    }
+                    if (entry.kind == RaftEntryKind::BLOB) {
+                        uint64_t blobId = 0;
+                        if (entry.op != ReplOpType::PUT || entry.flags != 0 || !decodeBlobId(entry.key, blobId)) {
+                            failOrTruncate("invalid blob log entry");
+                            break;
+                        }
+                    }
+                    else if (entry.op != ReplOpType::PUT && entry.op != ReplOpType::REMOVE) {
+                        failOrTruncate("invalid log entry operation");
+                        break;
+                    }
+                    lastGoodIndex = entry.index;
                     log_.push_back(std::move(entry));
                 }
-                if (!in) { throw std::runtime_error("RaftConsensusRuntime: truncated log file"); }
+                if (!truncatedTail && cursor != bytes.size()) {
+                    failOrTruncate("trailing log bytes");
+                }
+                if (commitIndex_ > lastGoodIndex) {
+                    throw std::runtime_error("RaftConsensusRuntime: committed log entry is missing or corrupt");
+                }
+                if (truncatedTail) { persistLog(); }
             }
 
             void setRole(RaftRole role) {
@@ -1567,7 +1760,7 @@ namespace akkaradb::engine::cluster {
             void compactLogThrough(uint64_t index, uint64_t term) {
                 if (index <= lastIncludedIndex_) { return; }
                 log_.erase(
-                    std::remove_if(log_.begin(), log_.end(), [&](const RaftLogEntry& entry) { return entry.index <= index; }),
+                    std::ranges::remove_if(log_, [&](const RaftLogEntry& entry) { return entry.index <= index; }).begin(),
                     log_.end()
                 );
                 lastIncludedIndex_ = index;
@@ -1735,8 +1928,7 @@ namespace akkaradb::engine::cluster {
                 while (true) {
                     NodeInfo peer;
                     uint64_t requestTerm = 0;
-                    bool needsSnapshot = false;
-                    InstallSnapshot snapshotRequest;
+                    auto needsSnapshot = false;
                     AppendEntries appendRequest;
                     {
                         std::lock_guard lock{mutex_};
@@ -1760,6 +1952,7 @@ namespace akkaradb::engine::cluster {
                     forceHeartbeat = false;
 
                     if (needsSnapshot) {
+                        InstallSnapshot snapshotRequest;
                         if (!buildInstallSnapshot(requestTerm, snapshotRequest)) { return false; }
                         InstallSnapshotResponse response;
                         if (!installSnapshot(peer, snapshotRequest, response)) { return false; }
@@ -1985,10 +2178,7 @@ namespace akkaradb::engine::cluster {
                         if (entry.index <= lastIncludedIndex_) { continue; }
                         const auto existing = entryAt(entry.index);
                         if (existing && sameEntry(*existing, entry)) { continue; }
-                        log_.erase(
-                            std::remove_if(log_.begin(), log_.end(), [&](const RaftLogEntry& item) { return item.index >= entry.index; }),
-                            log_.end()
-                        );
+                        std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
                         log_.push_back(entry);
                     }
 
@@ -2014,6 +2204,13 @@ namespace akkaradb::engine::cluster {
                         std::lock_guard lock{mutex_};
                         applyConfigEntryLocked(entry);
                     }
+                    else if (entry.kind == RaftEntryKind::BLOB) {
+                        uint64_t blobId = 0;
+                        if (!decodeBlobId(entry.key, blobId)) { throw std::runtime_error("RaftConsensusRuntime: corrupt Blob log entry"); }
+                        if (callbacks_.applyBlob) {
+                            callbacks_.applyBlob(entry.clientSeq == 0 ? entry.index : entry.clientSeq, blobId, entry.value);
+                        }
+                    }
                     else if (callbacks_.apply) {
                         callbacks_.apply(
                             entry.clientSeq == 0 ? entry.index : entry.clientSeq,
@@ -2024,7 +2221,9 @@ namespace akkaradb::engine::cluster {
                             entry.sourceNodeId
                         );
                     }
-                    if (entry.kind == RaftEntryKind::MUTATION && callbacks_.forceDurable) { callbacks_.forceDurable(); }
+                    if ((entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) && callbacks_.forceDurable) {
+                        callbacks_.forceDurable();
+                    }
                     std::lock_guard lock{mutex_};
                     if (entry.index > lastApplied_) { lastApplied_ = entry.index; }
                 }
@@ -2086,6 +2285,7 @@ namespace akkaradb::engine::cluster {
     void RaftConsensusRuntime::start() { impl_->start(); }
     void RaftConsensusRuntime::close() { impl_->close(); }
     NodeRole RaftConsensusRuntime::role() const noexcept { return impl_->role(); }
+    std::vector<NodeInfo> RaftConsensusRuntime::activeNodes() const { return impl_->activeNodes(); }
     const ClusterRouter& RaftConsensusRuntime::router() const noexcept { return impl_->router(); }
 
     void RaftConsensusRuntime::shipEntry(

@@ -81,6 +81,8 @@ namespace akkaradb::engine::cluster {
         writeU64(p, hello.lastSeq);
         p.push_back(static_cast<uint8_t>(hello.role));
         p.push_back(0);
+        writeU64(p, hello.groupId);
+        writeU64(p, hello.groupEpoch);
         return encodeFrame(ReplMsgType::CLIENT_HELLO, p);
     }
 
@@ -90,6 +92,8 @@ namespace akkaradb::engine::cluster {
         writeU64(p, hello.currentSeq);
         p.push_back(static_cast<uint8_t>(hello.role));
         p.push_back(0);
+        writeU64(p, hello.groupId);
+        writeU64(p, hello.groupEpoch);
         return encodeFrame(ReplMsgType::SERVER_HELLO, p);
     }
 
@@ -166,18 +170,22 @@ namespace akkaradb::engine::cluster {
     }
 
     bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out) {
-        if (payload.size() != 18) { return false; }
+        if (payload.size() != 34) { return false; }
         out.nodeId = readU64(payload, 0);
         out.lastSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
+        out.groupId = readU64(payload, 18);
+        out.groupEpoch = readU64(payload, 26);
         return true;
     }
 
     bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out) {
-        if (payload.size() != 18) { return false; }
+        if (payload.size() != 34) { return false; }
         out.nodeId = readU64(payload, 0);
         out.currentSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
+        out.groupId = readU64(payload, 18);
+        out.groupEpoch = readU64(payload, 26);
         return true;
     }
 

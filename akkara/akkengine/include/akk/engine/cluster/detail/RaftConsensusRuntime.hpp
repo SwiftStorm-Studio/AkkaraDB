@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace akkaradb::engine::cluster {
     class RaftConsensusRuntime {
@@ -39,6 +40,7 @@ namespace akkaradb::engine::cluster {
             void start();
             void close();
             [[nodiscard]] NodeRole role() const noexcept;
+            [[nodiscard]] std::vector<NodeInfo> activeNodes() const;
             [[nodiscard]] const ClusterRouter& router() const noexcept;
 
             void shipEntry(

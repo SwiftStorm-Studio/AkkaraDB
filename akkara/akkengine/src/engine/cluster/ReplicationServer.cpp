@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <algorithm>
 #include <vector>
 
 #ifdef _WIN32
@@ -297,6 +298,7 @@ namespace akkaradb::engine::cluster {
             ConsistencyOptions consistency;
             uint16_t configuredReplicaCount = 0;
             ClusterRuntimeOptions runtimeOptions;
+            std::vector<uint64_t> configuredReplicaNodeIds;
             crypto::NodeIdentity localIdentity;
 
             SocketHandle listenSock = BAD_SOCKET;
@@ -376,6 +378,22 @@ namespace akkaradb::engine::cluster {
                         closeSocket(client);
                         continue;
                     }
+                    if (hello.groupId != 0 && hello.groupId != runtimeOptions.clusterGroupId) {
+                        closeSocket(client);
+                        continue;
+                    }
+                    if (hello.groupEpoch != 0 && hello.groupEpoch != runtimeOptions.clusterGroupEpoch) {
+                        closeSocket(client);
+                        continue;
+                    }
+                    if (!configuredReplicaNodeIds.empty() && std::find(
+                        configuredReplicaNodeIds.begin(),
+                        configuredReplicaNodeIds.end(),
+                        hello.nodeId
+                    ) == configuredReplicaNodeIds.end()) {
+                        closeSocket(client);
+                        continue;
+                    }
                     if (secure) {
                         if (const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId); expected && secureRemotePublicKey != *
                             expected) {
@@ -397,7 +415,20 @@ namespace akkaradb::engine::cluster {
                     bool resyncRequired = false;
                     {
                         std::lock_guard lock{replicasMutex};
+                        const auto duplicate = std::find_if(
+                            replicas.begin(),
+                            replicas.end(),
+                            [&](const std::shared_ptr<ReplicaState>& existing) {
+                                return !existing->dead.load() && existing->nodeId == hello.nodeId;
+                            }
+                        );
+                        if (duplicate != replicas.end()) {
+                            closeSocket(client);
+                            continue;
+                        }
                         response.currentSeq = getCurrentSeq ? getCurrentSeq() : 0;
+                        response.groupId = runtimeOptions.clusterGroupId;
+                        response.groupEpoch = runtimeOptions.clusterGroupEpoch;
                         if (historyProvider && hello.lastSeq < response.currentSeq) {
                             const auto entries = historyProvider(hello.lastSeq, response.currentSeq);
                             if (!entries && consistency.replicaLagAction == ReplicaLagAction::ASYNC_RESYNC && snapshotProvider) {
@@ -564,6 +595,7 @@ namespace akkaradb::engine::cluster {
         AckPolicy ackPolicy,
         ConsistencyOptions consistency,
         uint16_t configuredReplicaCount,
+        std::vector<uint64_t> configuredReplicaNodeIds,
         ClusterRuntimeOptions runtimeOptions,
         HistoryProvider historyProvider,
         SnapshotProvider snapshotProvider
@@ -575,6 +607,7 @@ namespace akkaradb::engine::cluster {
         impl->ackPolicy = ackPolicy;
         impl->consistency = consistency;
         impl->configuredReplicaCount = configuredReplicaCount;
+        impl->configuredReplicaNodeIds = std::move(configuredReplicaNodeIds);
         impl->runtimeOptions = std::move(runtimeOptions);
         impl->historyProvider = std::move(historyProvider);
         impl->snapshotProvider = std::move(snapshotProvider);
