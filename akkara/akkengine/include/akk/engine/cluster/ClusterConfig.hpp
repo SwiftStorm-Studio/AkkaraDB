@@ -235,6 +235,7 @@ namespace akkaradb::engine::cluster {
         CorruptClusterStateAction corruptStateAction = CorruptClusterStateAction::FAIL_STARTUP;
         RaftLogRecoveryAction raftLogRecoveryAction = RaftLogRecoveryAction::FAIL_STARTUP;
         RaftBlobPolicy raftBlobPolicy = RaftBlobPolicy::REJECT;
+        uint32_t raftBlobChunkSizeBytes = 1024u * 1024u;
         ClusterSecureOptions secure;
     };
 

@@ -69,9 +69,9 @@ Completed:
 - Added explicit corrupt-state and Raft-log recovery policies to `ClusterRuntimeOptions`, defaulting to fail-fast startup rejection.
 - Tightened `ClusterConfig` binary loading by rejecting oversized host names and trailing bytes.
 - Made `RAFT_QUORUM` `activeNodes()` report the committed Raft membership view, using old/new voter union during joint consensus and stable node-id ordering.
-- Made `RAFT_QUORUM` reject Blob payload replication by default through `raftBlobPolicy=REJECT`; explicit `PRIMARY_SIDE_ONLY` allows primary-local Blob payloads outside Raft quorum and `RAFT_LOG` quorum-commits Blob payload entries before Blob-reference mutations.
+- Made `RAFT_QUORUM` reject Blob payload replication by default through `raftBlobPolicy=REJECT`; explicit `PRIMARY_SIDE_ONLY` allows primary-local Blob payloads outside Raft quorum and `RAFT_LOG` automatically chunk-commits Blob payload entries before Blob-reference mutations.
 - Added smoke coverage for handshake group identity roundtrip, implicit group switch rejection, explicit reset-based rejoin, multiple primary-created group instances from the same config, corrupt primary `cluster.membership` rejection, primary group state reuse after restart, and `ClusterRuntime` ACK quorum rejection for unknown or duplicate replica node ids.
-- Added smoke coverage for corrupt membership backup-and-recreate, Raft log trailing-byte fail-fast/truncate recovery policies, Raft active membership reporting across online voter add/remove, default Raft Blob rejection, explicit primary-side-only Raft Blob handling, Raft-log Blob replication/recovery, and engine-level Raft Blob externalization.
+- Added smoke coverage for corrupt membership backup-and-recreate, Raft log trailing-byte fail-fast/truncate recovery policies, Raft active membership reporting across online voter add/remove, default Raft Blob rejection, explicit primary-side-only Raft Blob handling, chunked Raft-log Blob replication/recovery, and engine-level Raft Blob externalization.
 
 Verified:
 

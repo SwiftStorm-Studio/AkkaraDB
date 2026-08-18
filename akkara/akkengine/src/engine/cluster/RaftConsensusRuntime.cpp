@@ -25,6 +25,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -797,15 +798,42 @@ namespace akkaradb::engine::cluster {
                 rhs.op && lhs.flags == rhs.flags && lhs.sourceNodeId == rhs.sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value;
         }
 
-        std::vector<uint8_t> encodeBlobId(uint64_t blobId) {
+        struct RaftBlobChunk {
+            uint64_t blobId = 0;
+            uint64_t offset = 0;
+            uint64_t totalSize = 0;
+            uint32_t contentCrc32c = 0;
+        };
+
+        static constexpr size_t RAFT_APPEND_ENTRIES_BASE_SIZE = 44;
+        static constexpr size_t RAFT_ENTRY_LENGTH_PREFIX_SIZE = 4;
+        static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 43;
+        static constexpr size_t RAFT_BLOB_CHUNK_KEY_SIZE = 28;
+
+        uint32_t maxRaftBlobChunkSizeBytes() {
+            return ReplFrameHeader::MAX_PAYLOAD_SIZE -
+                   static_cast<uint32_t>(
+                       RAFT_APPEND_ENTRIES_BASE_SIZE + RAFT_ENTRY_LENGTH_PREFIX_SIZE + RAFT_ENTRY_PAYLOAD_BASE_SIZE +
+                       RAFT_BLOB_CHUNK_KEY_SIZE
+                   );
+        }
+
+        std::vector<uint8_t> encodeBlobChunkKey(const RaftBlobChunk& chunk) {
             std::vector<uint8_t> out;
-            writeU64(out, blobId);
+            writeU64(out, chunk.blobId);
+            writeU64(out, chunk.offset);
+            writeU64(out, chunk.totalSize);
+            writeU32(out, chunk.contentCrc32c);
             return out;
         }
 
-        bool decodeBlobId(std::span<const uint8_t> in, uint64_t& blobId) {
-            if (in.size() != 8) { return false; }
-            blobId = readU64(in, 0);
+        bool decodeBlobChunkKey(std::span<const uint8_t> in, RaftBlobChunk& chunk) {
+            if (in.size() != RAFT_BLOB_CHUNK_KEY_SIZE) { return false; }
+            chunk.blobId = readU64(in, 0);
+            chunk.offset = readU64(in, 8);
+            chunk.totalSize = readU64(in, 16);
+            chunk.contentCrc32c = readU32(in, 24);
+            if (chunk.offset > chunk.totalSize) { return false; }
             return true;
         }
     }
@@ -828,6 +856,10 @@ namespace akkaradb::engine::cluster {
                   callbacks_{std::move(callbacks)},
                   runtimeOptions_{std::move(runtimeOptions)} {
                 config_.validate();
+                if (runtimeOptions_.raftBlobChunkSizeBytes == 0 ||
+                    runtimeOptions_.raftBlobChunkSizeBytes > maxRaftBlobChunkSizeBytes()) {
+                    throw std::invalid_argument("RaftConsensusRuntime: invalid Raft Blob chunk size");
+                }
                 self_ = config_.findById(selfNodeId_);
                 if (self_ == nullptr || !self_->dataBearing()) {
                     throw std::invalid_argument("RaftConsensusRuntime: local node must be data-bearing");
@@ -954,7 +986,7 @@ namespace akkaradb::engine::cluster {
                     return;
                 }
                 if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::RAFT_LOG) {
-                    RaftLogEntry entry;
+                    std::vector<RaftLogEntry> entries;
                     uint64_t term = 0;
                     {
                         std::lock_guard lock{mutex_};
@@ -962,20 +994,41 @@ namespace akkaradb::engine::cluster {
                             throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
                         }
                         term = currentTerm_;
-                        entry.term = term;
-                        entry.index = lastLogIndex() + 1;
-                        entry.clientSeq = seq;
-                        entry.kind = RaftEntryKind::BLOB;
-                        entry.op = ReplOpType::PUT;
-                        entry.flags = 0;
-                        entry.sourceNodeId = selfNodeId_;
-                        entry.key = encodeBlobId(blobId);
-                        entry.value.assign(content.begin(), content.end());
-                        log_.push_back(entry);
+                        const uint32_t contentCrc32c = crcBytes(content);
+                        const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
+                        size_t offset = 0;
+                        do {
+                            const size_t remaining = content.size() - offset;
+                            const size_t currentChunkSize = std::min(chunkSize, remaining);
+                            RaftLogEntry entry;
+                            entry.term = term;
+                            entry.index = lastLogIndex() + entries.size() + 1;
+                            entry.clientSeq = seq;
+                            entry.kind = RaftEntryKind::BLOB;
+                            entry.op = ReplOpType::PUT;
+                            entry.flags = 0;
+                            entry.sourceNodeId = selfNodeId_;
+                            entry.key = encodeBlobChunkKey(
+                                RaftBlobChunk{
+                                    .blobId = blobId,
+                                    .offset = static_cast<uint64_t>(offset),
+                                    .totalSize = static_cast<uint64_t>(content.size()),
+                                    .contentCrc32c = contentCrc32c,
+                                }
+                            );
+                            entry.value.assign(content.begin() + static_cast<std::ptrdiff_t>(offset), content.begin() + static_cast<std::ptrdiff_t>(
+                                offset + currentChunkSize
+                            ));
+                            entries.push_back(std::move(entry));
+                            offset += currentChunkSize;
+                        }
+                        while (offset < content.size());
+                        log_.insert(log_.end(), entries.begin(), entries.end());
                         persistLog();
                     }
 
-                    if (!replicateEntryToMajority(entry)) {
+                    const RaftLogEntry& lastEntry = entries.back();
+                    if (!replicateEntryToMajority(lastEntry)) {
                         throw std::runtime_error("RaftConsensusRuntime: failed to replicate Blob payload to Raft majority");
                     }
 
@@ -984,8 +1037,8 @@ namespace akkaradb::engine::cluster {
                         if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
                             throw std::runtime_error("RaftConsensusRuntime: leadership changed before Blob payload commit");
                         }
-                        if (entry.index > commitIndex_) {
-                            commitIndex_ = entry.index;
+                        if (lastEntry.index > commitIndex_) {
+                            commitIndex_ = lastEntry.index;
                             persistLog();
                         }
                     }
@@ -1315,7 +1368,18 @@ namespace akkaradb::engine::cluster {
 
             std::vector<RaftLogEntry> entriesFrom(uint64_t nextIndex) const {
                 std::vector<RaftLogEntry> entries;
-                for (const auto& entry : log_) { if (entry.index >= nextIndex) { entries.push_back(entry); } }
+                size_t payloadSize = RAFT_APPEND_ENTRIES_BASE_SIZE;
+                for (const auto& entry : log_) {
+                    if (entry.index < nextIndex) { continue; }
+                    const auto entryPayload = encodeEntryPayload(entry);
+                    const size_t entrySize = RAFT_ENTRY_LENGTH_PREFIX_SIZE + entryPayload.size();
+                    if (payloadSize + entrySize > ReplFrameHeader::MAX_PAYLOAD_SIZE) {
+                        if (entries.empty()) { return {}; }
+                        break;
+                    }
+                    payloadSize += entrySize;
+                    entries.push_back(entry);
+                }
                 return entries;
             }
 
@@ -1451,8 +1515,9 @@ namespace akkaradb::engine::cluster {
                         break;
                     }
                     if (entry.kind == RaftEntryKind::BLOB) {
-                        uint64_t blobId = 0;
-                        if (entry.op != ReplOpType::PUT || entry.flags != 0 || !decodeBlobId(entry.key, blobId)) {
+                        RaftBlobChunk chunk;
+                        if (entry.op != ReplOpType::PUT || entry.flags != 0 || !decodeBlobChunkKey(entry.key, chunk) ||
+                            chunk.offset + entry.value.size() > chunk.totalSize) {
                             failOrTruncate("invalid blob log entry");
                             break;
                         }
@@ -1630,7 +1695,8 @@ namespace akkaradb::engine::cluster {
                         return false;
                     }
                 }
-                if (!sendFrame(socket, secure.get(), encodeAppendEntries(request))) {
+                const auto wire = encodeAppendEntries(request);
+                if (wire.empty() || !sendFrame(socket, secure.get(), wire)) {
                     close();
                     return false;
                 }
@@ -1946,7 +2012,10 @@ namespace akkaradb::engine::cluster {
                             appendRequest.prevLogIndex = state->nextIndex - 1;
                             appendRequest.prevLogTerm = termAt(appendRequest.prevLogIndex);
                             appendRequest.leaderCommit = commitIndex_;
-                            if (state->matchIndex < targetIndex) { appendRequest.entries = entriesFrom(state->nextIndex); }
+                            if (state->matchIndex < targetIndex) {
+                                appendRequest.entries = entriesFrom(state->nextIndex);
+                                if (appendRequest.entries.empty()) { return false; }
+                            }
                         }
                     }
                     forceHeartbeat = false;
@@ -2190,6 +2259,42 @@ namespace akkaradb::engine::cluster {
                 return response;
             }
 
+            struct PendingBlobApply {
+                uint64_t seq = 0;
+                uint64_t totalSize = 0;
+                uint32_t contentCrc32c = 0;
+                std::vector<uint8_t> content;
+            };
+
+            void applyBlobChunk(const RaftLogEntry& entry) {
+                RaftBlobChunk chunk;
+                if (!decodeBlobChunkKey(entry.key, chunk) || chunk.offset + entry.value.size() > chunk.totalSize) {
+                    throw std::runtime_error("RaftConsensusRuntime: corrupt Blob log entry");
+                }
+                if (!callbacks_.applyBlob) { return; }
+
+                auto& pending = pendingBlobApplies_[chunk.blobId];
+                const uint64_t seq = entry.clientSeq == 0 ? entry.index : entry.clientSeq;
+                if (pending.content.empty()) {
+                    pending.seq = seq;
+                    pending.totalSize = chunk.totalSize;
+                    pending.contentCrc32c = chunk.contentCrc32c;
+                    pending.content.reserve(static_cast<size_t>(std::min<uint64_t>(chunk.totalSize, runtimeOptions_.raftBlobChunkSizeBytes)));
+                }
+                if (pending.seq != seq || pending.totalSize != chunk.totalSize || pending.contentCrc32c != chunk.contentCrc32c ||
+                    pending.content.size() != chunk.offset) {
+                    throw std::runtime_error("RaftConsensusRuntime: out-of-order Blob log chunk");
+                }
+                pending.content.insert(pending.content.end(), entry.value.begin(), entry.value.end());
+                if (pending.content.size() == pending.totalSize) {
+                    if (crcBytes(pending.content) != pending.contentCrc32c) {
+                        throw std::runtime_error("RaftConsensusRuntime: Blob log payload CRC mismatch");
+                    }
+                    callbacks_.applyBlob(pending.seq, chunk.blobId, pending.content);
+                    pendingBlobApplies_.erase(chunk.blobId);
+                }
+            }
+
             void applyCommitted() {
                 std::lock_guard applyLock{applyMutex_};
                 std::vector<RaftLogEntry> toApply;
@@ -2205,11 +2310,7 @@ namespace akkaradb::engine::cluster {
                         applyConfigEntryLocked(entry);
                     }
                     else if (entry.kind == RaftEntryKind::BLOB) {
-                        uint64_t blobId = 0;
-                        if (!decodeBlobId(entry.key, blobId)) { throw std::runtime_error("RaftConsensusRuntime: corrupt Blob log entry"); }
-                        if (callbacks_.applyBlob) {
-                            callbacks_.applyBlob(entry.clientSeq == 0 ? entry.index : entry.clientSeq, blobId, entry.value);
-                        }
+                        applyBlobChunk(entry);
                     }
                     else if (callbacks_.apply) {
                         callbacks_.apply(
@@ -2258,6 +2359,7 @@ namespace akkaradb::engine::cluster {
             Clock::time_point electionDeadline_{};
             std::atomic<RaftRole> role_{RaftRole::FOLLOWER};
             std::mutex applyMutex_;
+            std::unordered_map<uint64_t, PendingBlobApply> pendingBlobApplies_;
 
             SocketHandle listenSock_ = BAD_SOCKET;
             std::thread acceptThread_;

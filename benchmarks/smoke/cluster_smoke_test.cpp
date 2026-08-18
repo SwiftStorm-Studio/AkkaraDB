@@ -1776,6 +1776,7 @@ namespace {
 
         ClusterRuntimeOptions options;
         options.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
+        options.raftBlobChunkSizeBytes = 5;
         auto n1 = makeRuntime(dir / "n1", cfg, 1, options);
         auto n2 = makeRuntime(dir / "n2", cfg, 2, options);
         auto n3 = makeRuntime(dir / "n3", cfg, 3, options);
@@ -1837,6 +1838,7 @@ namespace {
         options.blob.thresholdBytes = 4;
         options.cluster.config = cfg;
         options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
+        options.cluster.runtime.raftBlobChunkSizeBytes = 5;
         writeNodeIdFile(options.paths.dataDir / "node.id", 1);
 
         auto engine = akkaradb::engine::AkkEngine::open(options);

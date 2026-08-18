@@ -1546,6 +1546,7 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `corruptStateAction` | `FAIL_STARTUP` | Corrupt small cluster state files fail startup unless explicitly backed up/deleted and recreated |
 | `raftLogRecoveryAction` | `FAIL_STARTUP` | Raft log corruption fails startup unless explicitly allowed to truncate only the uncommitted tail |
 | `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations |
+| `raftBlobChunkSizeBytes` | 1048576 | Maximum payload bytes per automatic `RAFT_LOG` Blob chunk; must fit one Raft AppendEntries frame |
 | `secure.identitySeedPath` | empty | Persistent identity seed path |
 | `secure.pinnedPeers` | empty | Peer public-key pins |
 | `secure.expectedPrimaryNodeId` | 0 | Expected primary id or unknown |
