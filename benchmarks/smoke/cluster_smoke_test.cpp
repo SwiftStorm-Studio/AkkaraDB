@@ -10,6 +10,7 @@
 // benchmarks/smoke/cluster_smoke_test.cpp
 #include "TestErrorHandlers.hpp"
 
+#include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterManager.hpp"
@@ -21,6 +22,10 @@
 #include "akk/engine/erasure/ErasureCodec.hpp"
 #include "akk/engine/erasure/ErasureCodecExt.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
+#include "akk/engine/memtable/MemTable.hpp"
+#include "akk/engine/wal/WalFraming.hpp"
+#include "akk/engine/wal/WalRecovery.hpp"
+#include "akk/engine/wal/WalWriter.hpp"
 #include "akk/cpu/CRC32C.hpp"
 
 #include <array>
@@ -28,6 +33,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -43,6 +49,8 @@
 using namespace akkaradb::engine::cluster;
 namespace erasure = akkaradb::engine::erasure;
 namespace manifest = akkaradb::engine::manifest;
+namespace memtable = akkaradb::engine::memtable;
+namespace wal = akkaradb::engine::wal;
 
 extern "C" bool akkaradb_cluster_register() noexcept;
 
@@ -157,8 +165,78 @@ namespace {
         AKK_CLUSTER_CHECK(out);
     }
 
+    void corruptFileByte(const std::filesystem::path& path, std::streamoff offset = 0) {
+        std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+        AKK_CLUSTER_CHECK(file);
+        file.seekg(offset);
+        char byte = 0;
+        file.get(byte);
+        AKK_CLUSTER_CHECK(file);
+        byte = static_cast<char>(static_cast<unsigned char>(byte) ^ 0x5Au);
+        file.clear();
+        file.seekp(offset);
+        file.put(byte);
+        file.flush();
+        AKK_CLUSTER_CHECK(file);
+    }
+
+    void enableDeterministicRaftElection() {
+#ifdef _WIN32
+        AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_DETERMINISTIC_RAFT_ELECTION", "1") == 0);
+#else
+        AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_DETERMINISTIC_RAFT_ELECTION", "1", 1) == 0);
+#endif
+    }
+
+    void setSnapshotStagingCorruptionPoint(const char* point) {
+#ifdef _WIN32
+        AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT", point == nullptr ? "" : point) == 0);
+#else
+        if (point == nullptr) {
+            AKK_CLUSTER_CHECK(::unsetenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT") == 0);
+        }
+        else {
+            AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT", point, 1) == 0);
+        }
+#endif
+    }
+
+    class ScopedSnapshotStagingCorruption {
+        public:
+            explicit ScopedSnapshotStagingCorruption(const char* point) { setSnapshotStagingCorruptionPoint(point); }
+            ~ScopedSnapshotStagingCorruption() { clear(); }
+
+            ScopedSnapshotStagingCorruption(const ScopedSnapshotStagingCorruption&) = delete;
+            ScopedSnapshotStagingCorruption& operator=(const ScopedSnapshotStagingCorruption&) = delete;
+
+            void clear() {
+                if (!active_) { return; }
+                setSnapshotStagingCorruptionPoint(nullptr);
+                active_ = false;
+            }
+
+        private:
+            bool active_ = true;
+    };
+
     void writeU32Le(std::vector<uint8_t>& out, size_t offset, uint32_t value) {
         for (size_t i = 0; i < 4; ++i) { out[offset + i] = static_cast<uint8_t>(value >> (i * 8)); }
+    }
+
+    uint64_t readU64Le(std::span<const uint8_t> bytes, size_t offset) {
+        uint64_t out = 0;
+        for (size_t i = 0; i < 8; ++i) { out |= static_cast<uint64_t>(bytes[offset + i]) << (i * 8); }
+        return out;
+    }
+
+    uint64_t readRaftLogLastIncludedIndex(const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) { return 0; }
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (bytes.size() < 41) { return 0; }
+        const std::string_view magic{reinterpret_cast<const char*>(bytes.data()), 5};
+        if (magic != "AKRL4" && magic != "AKRL5") { return 0; }
+        return readU64Le(bytes, 13);
     }
 
     uint64_t nextPrng(uint64_t& state) noexcept {
@@ -312,23 +390,42 @@ namespace {
     }
 
     RuntimeHarness* findLeader(std::span<RuntimeHarness* const> nodes) {
+        RuntimeHarness* leader = nullptr;
         for (auto* n : nodes) {
-            if (n->runtime->role() == NodeRole::PRIMARY) { return n; }
+            if (n->runtime->role() != NodeRole::PRIMARY) { continue; }
+            if (leader != nullptr) { return nullptr; }
+            leader = n;
+        }
+        return leader;
+    }
+
+    RuntimeHarness* findNodeById(std::span<RuntimeHarness* const> nodes, uint64_t nodeId) {
+        for (auto* n : nodes) {
+            if (n->nodeId == nodeId) { return n; }
         }
         return nullptr;
+    }
+
+    uint64_t preferredLeaderId(std::span<RuntimeHarness* const> nodes) {
+        uint64_t out = std::numeric_limits<uint64_t>::max();
+        for (const auto* n : nodes) { out = std::min(out, n->nodeId); }
+        AKK_CLUSTER_CHECK(out != std::numeric_limits<uint64_t>::max());
+        return out;
     }
 
     bool isRetryableLeaderChange(const std::runtime_error& error) {
         const std::string message = error.what();
         return message.find("local node is not Raft leader") != std::string::npos ||
                message.find("leadership changed") != std::string::npos ||
+               message.find("failed to replicate entry to Raft majority") != std::string::npos ||
+               message.find("failed to replicate Blob payload to Raft majority") != std::string::npos ||
                message.find("prior entry is uncommitted") != std::string::npos ||
                message.find("membership change already in progress") != std::string::npos;
     }
 
     template <typename Fn>
     void runOnLeader(std::span<RuntimeHarness* const> nodes, Fn&& fn, std::chrono::milliseconds timeout = std::chrono::milliseconds{30000}) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, std::chrono::milliseconds{20000});
         std::optional<std::runtime_error> lastRetryable;
         while (std::chrono::steady_clock::now() < deadline) {
             RuntimeHarness* leader = findLeader(nodes);
@@ -348,6 +445,169 @@ namespace {
         }
         if (lastRetryable) { throw *lastRetryable; }
         throw std::runtime_error("cluster smoke: no Raft leader became available");
+    }
+
+    void ensureLeader(
+        std::span<RuntimeHarness* const> nodes,
+        uint64_t targetNodeId,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{30000}
+    ) {
+        RuntimeHarness* target = findNodeById(nodes, targetNodeId);
+        AKK_CLUSTER_CHECK(target != nullptr);
+
+        const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, std::chrono::milliseconds{20000});
+        std::optional<std::runtime_error> lastRetryable;
+        while (std::chrono::steady_clock::now() < deadline) {
+            RuntimeHarness* leader = findLeader(nodes);
+            if (leader == target) { return; }
+            if (leader == nullptr) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                continue;
+            }
+            try {
+                leader->runtime->transferRaftLeadership(targetNodeId);
+                if (waitUntil([&] { return findLeader(nodes) == target; }, std::chrono::milliseconds{5000})) { return; }
+            }
+            catch (const std::runtime_error& error) {
+                if (!isRetryableLeaderChange(error)) { throw; }
+                lastRetryable = error;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+        if (lastRetryable) { throw *lastRetryable; }
+        throw std::runtime_error("cluster smoke: failed to establish deterministic Raft leader");
+    }
+
+    void ensurePreferredLeader(
+        std::span<RuntimeHarness* const> nodes,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{30000}
+    ) {
+        ensureLeader(nodes, preferredLeaderId(nodes), timeout);
+    }
+
+    akkaradb::engine::AkkEngine* findEngineLeader(std::span<akkaradb::engine::AkkEngine* const> nodes) {
+        akkaradb::engine::AkkEngine* leader = nullptr;
+        for (auto* engine : nodes) {
+            if (engine->stats().cluster.role != static_cast<uint32_t>(NodeRole::PRIMARY)) { continue; }
+            if (leader != nullptr) { return nullptr; }
+            leader = engine;
+        }
+        return leader;
+    }
+
+    template <typename Fn>
+    void runOnEngineLeader(
+        std::span<akkaradb::engine::AkkEngine* const> nodes,
+        Fn&& fn,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{30000}
+    ) {
+        const auto deadline = std::chrono::steady_clock::now() + std::max(timeout, std::chrono::milliseconds{20000});
+        std::optional<std::runtime_error> lastRetryable;
+        while (std::chrono::steady_clock::now() < deadline) {
+            akkaradb::engine::AkkEngine* leader = findEngineLeader(nodes);
+            if (leader == nullptr) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                continue;
+            }
+            try {
+                fn(*leader);
+                return;
+            }
+            catch (const std::runtime_error& error) {
+                if (!isRetryableLeaderChange(error)) { throw; }
+                lastRetryable = error;
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+            }
+        }
+        if (lastRetryable) { throw *lastRetryable; }
+        throw std::runtime_error("cluster smoke: no Raft engine leader became available");
+    }
+
+    std::optional<std::vector<uint8_t>> engineGet(akkaradb::engine::AkkEngine& engine, const std::string& key) {
+        return engine.get(bytesOf(key));
+    }
+
+    [[nodiscard]] std::vector<uint8_t> snapshotCommitValue(uint64_t recordCount) {
+        std::vector<uint8_t> out;
+        out.insert(out.end(), {'A', 'K', 'S', 'C', '1'});
+        for (size_t i = 0; i < sizeof(uint64_t); ++i) { out.push_back(static_cast<uint8_t>(recordCount >> (i * 8))); }
+        return out;
+    }
+
+    [[nodiscard]] std::optional<std::vector<uint8_t>> memtableGet(memtable::MemTable& table, const std::string& key, uint64_t seq) {
+        std::vector<uint8_t> out;
+        const auto hit = table.getInto(bytesOf(key), seq, out);
+        if (!hit.has_value() || !*hit) { return std::nullopt; }
+        return out;
+    }
+
+    void testWalSnapshotTransactionRecovery() {
+        const auto dir = makeTempDir("wal-snapshot-transaction");
+        const std::string oldKey = "snapshot-old-key";
+        const std::string keepKey = "snapshot-keep-key";
+        const std::string newKey = "snapshot-new-key";
+        const std::string oldValue = "old-value";
+        const std::string keepValue = "keep-value";
+        const std::string newValue = "new-value";
+
+        auto writeBase = [&](const std::filesystem::path& walDir) {
+            auto writer = wal::WalWriter::create(walDir);
+            writer->append(bytesOf(oldKey), bytesOf(oldValue), 1, akkaradb::core::MemHdr16::FLAG_NORMAL);
+            writer->append(bytesOf(keepKey), bytesOf(oldValue), 2, akkaradb::core::MemHdr16::FLAG_NORMAL);
+            writer->close();
+        };
+        auto recoverTable = [](const std::filesystem::path& walDir) {
+            auto table = memtable::MemTable::create();
+            (void)wal::WalRecovery::recoverInto(wal::WalRecoveryOptions{.walDir = walDir}, *table);
+            return table;
+        };
+
+        const auto uncommittedWal = dir / "uncommitted";
+        writeBase(uncommittedWal);
+        {
+            auto writer = wal::WalWriter::create(uncommittedWal);
+            writer->append(
+                bytesOf(oldKey),
+                {},
+                5,
+                wal::WAL_FLAG_SNAPSHOT_RECORD | akkaradb::core::MemHdr16::FLAG_TOMBSTONE
+            );
+            writer->append(bytesOf(newKey), bytesOf(newValue), 5, wal::WAL_FLAG_SNAPSHOT_RECORD);
+            writer->close();
+        }
+        {
+            auto table = recoverTable(uncommittedWal);
+            const auto oldRecovered = memtableGet(*table, oldKey, 5);
+            const auto newRecovered = memtableGet(*table, newKey, 5);
+            AKK_CLUSTER_CHECK(oldRecovered.has_value() && textOf(*oldRecovered) == oldValue);
+            AKK_CLUSTER_CHECK(!newRecovered.has_value());
+        }
+
+        const auto committedWal = dir / "committed";
+        writeBase(committedWal);
+        {
+            auto writer = wal::WalWriter::create(committedWal);
+            writer->append(
+                bytesOf(oldKey),
+                {},
+                5,
+                wal::WAL_FLAG_SNAPSHOT_RECORD | akkaradb::core::MemHdr16::FLAG_TOMBSTONE
+            );
+            writer->append(bytesOf(keepKey), bytesOf(keepValue), 5, wal::WAL_FLAG_SNAPSHOT_RECORD);
+            writer->append(bytesOf(newKey), bytesOf(newValue), 5, wal::WAL_FLAG_SNAPSHOT_RECORD);
+            const auto commit = snapshotCommitValue(3);
+            writer->append(bytesOf("AKSC1"), commit, 5, wal::WAL_FLAG_SNAPSHOT_COMMIT, 0, wal::WalAppendAck::SYNCED);
+            writer->close();
+        }
+        {
+            auto table = recoverTable(committedWal);
+            const auto oldRecovered = memtableGet(*table, oldKey, 5);
+            const auto keepRecovered = memtableGet(*table, keepKey, 5);
+            const auto newRecovered = memtableGet(*table, newKey, 5);
+            AKK_CLUSTER_CHECK(!oldRecovered.has_value());
+            AKK_CLUSTER_CHECK(keepRecovered.has_value() && textOf(*keepRecovered) == keepValue);
+            AKK_CLUSTER_CHECK(newRecovered.has_value() && textOf(*newRecovered) == newValue);
+        }
     }
 
     void testRaftOptionsRoundtripAndValidation() {
@@ -918,27 +1178,20 @@ namespace {
         n3->runtime->start();
 
         std::array<RuntimeHarness*, 3> nodes{n1.get(), n2.get(), n3.get()};
-        AKK_CLUSTER_CHECK(waitUntil(
-            [&] {
-                size_t leaders = 0;
-                for (const auto* n : nodes) { if (n->runtime->role() == NodeRole::PRIMARY) { ++leaders; } }
-                return leaders == 1;
-            },
-            std::chrono::milliseconds{20000}
-        ));
-
-        RuntimeHarness* leader = nullptr;
-        for (auto* n : nodes) {
-            if (n->runtime->role() == NodeRole::PRIMARY) {
-                leader = n;
-                break;
-            }
-        }
-        AKK_CLUSTER_CHECK(leader != nullptr);
+        ensurePreferredLeader(nodes, std::chrono::milliseconds{20000});
 
         const std::string key = "raft-key";
         const std::string value = "raft-value";
-        leader->runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 7, leader->nodeId);
+        RuntimeHarness* leader = nullptr;
+        runOnLeader(
+            nodes,
+            [&](RuntimeHarness& currentLeader) {
+                leader = &currentLeader;
+                currentLeader.runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 7, currentLeader.nodeId);
+            },
+            std::chrono::milliseconds{8000}
+        );
+        AKK_CLUSTER_CHECK(leader != nullptr);
 
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
@@ -965,6 +1218,43 @@ namespace {
         n1->runtime->close();
     }
 
+    void testRaftHardStateCorruptionFailsStartup() {
+        const auto dir = makeTempDir("raft-hard-state-corrupt");
+        const ClusterConfig cfg{
+            {
+                node(1, 20121, 20221),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE},
+        };
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.corruptStateAction = CorruptClusterStateAction::DELETE_AND_RECREATE;
+
+        {
+            auto first = makeRuntime(dir / "n1", cfg, 1, options);
+            first->runtime->start();
+            AKK_CLUSTER_CHECK(waitUntil([&] { return first->runtime->role() == NodeRole::PRIMARY; }, std::chrono::milliseconds{8000}));
+            first->runtime->close();
+        }
+
+        const auto statePath = dir / "n1" / "cluster-raft.state";
+        AKK_CLUSTER_CHECK(std::filesystem::exists(statePath));
+        corruptFileByte(statePath);
+
+        bool rejected = false;
+        try {
+            auto recovered = makeRuntime(dir / "n1", cfg, 1, options);
+            (void)recovered;
+        }
+        catch (const std::runtime_error& error) {
+            rejected = std::string_view{error.what()}.find("corrupt hard state") != std::string_view::npos;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+        AKK_CLUSTER_CHECK(std::filesystem::exists(statePath));
+    }
+
     void testRaftSnapshotInstallForCompactedFollower() {
         const auto dir = makeTempDir("raft-snapshot-install");
         const ClusterConfig cfg{
@@ -978,46 +1268,62 @@ namespace {
             ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 250},
         };
 
-        auto n1 = makeRuntime(dir / "n1", cfg, 1);
-        auto n2 = makeRuntime(dir / "n2", cfg, 2);
-        auto n3 = makeRuntime(dir / "n3", cfg, 3);
+        ClusterRuntimeOptions options;
+        options.raftBlobChunkSizeBytes = 5;
+        auto n1 = makeRuntime(dir / "n1", cfg, 1, options);
+        auto n2 = makeRuntime(dir / "n2", cfg, 2, options);
+        auto n3 = makeRuntime(dir / "n3", cfg, 3, options);
 
         n1->runtime->start();
         n2->runtime->start();
         n3->runtime->start();
 
         std::array<RuntimeHarness*, 3> nodes{n1.get(), n2.get(), n3.get()};
-        AKK_CLUSTER_CHECK(waitUntil(
-            [&] {
-                size_t leaders = 0;
-                for (const auto* n : nodes) { if (n->runtime->role() == NodeRole::PRIMARY) { ++leaders; } }
-                return leaders == 1;
-            },
-            std::chrono::milliseconds{20000}
-        ));
+        ensurePreferredLeader(nodes, std::chrono::milliseconds{20000});
 
-        RuntimeHarness* leader = n1->runtime->role() == NodeRole::PRIMARY ? n1.get() : n3.get();
-        RuntimeHarness* onlineFollower = leader == n1.get() ? n3.get() : n1.get();
+        RuntimeHarness* leader = findLeader(nodes);
+        AKK_CLUSTER_CHECK(leader != nullptr);
 
         const std::string key1 = "snapshot-key-1";
         const std::string value1 = "snapshot-value-1";
-        leader->runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key1), bytesOf(value1), 0, leader->nodeId);
+        runOnLeader(
+            nodes,
+            [&](RuntimeHarness& currentLeader) {
+                leader = &currentLeader;
+                currentLeader.runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key1), bytesOf(value1), 0, currentLeader.nodeId);
+                currentLeader.setState(1, bytesOf(key1), bytesOf(value1));
+            },
+            std::chrono::milliseconds{8000}
+        );
+        RuntimeHarness* onlineFollower = leader == n1.get() ? n3.get() : n1.get();
         AKK_CLUSTER_CHECK(waitUntil([&] { return onlineFollower->hasState(1, key1, value1); }));
         AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, key1, value1); }));
-        leader->setState(1, bytesOf(key1), bytesOf(value1));
 
         n2->runtime->close();
         n2.reset();
         std::error_code ec;
         std::filesystem::remove_all(dir / "n2", ec);
         AKK_CLUSTER_CHECK(!ec);
-        n2 = makeRuntime(dir / "n2", cfg, 2);
+
+        RuntimeHarness* remainingNodes[] = {n1.get(), n3.get()};
+        ensurePreferredLeader(remainingNodes, std::chrono::milliseconds{20000});
+        leader = findLeader(remainingNodes);
+        AKK_CLUSTER_CHECK(leader != nullptr);
+        leader->setState(1, bytesOf(key1), bytesOf(value1));
+
+        n2 = makeRuntime(dir / "n2", cfg, 2, options);
         n2->runtime->start();
         AKK_CLUSTER_CHECK(waitUntil([&] { return n2->runtime->role() != NodeRole::PRIMARY; }, std::chrono::milliseconds{1000}));
 
         const std::string key2 = "snapshot-key-2";
         const std::string value2 = "snapshot-value-2";
-        leader->runtime->shipEntry(2, ReplOpType::PUT, bytesOf(key2), bytesOf(value2), 0, leader->nodeId);
+        runOnLeader(
+            remainingNodes,
+            [&](RuntimeHarness& currentLeader) {
+                currentLeader.runtime->shipEntry(2, ReplOpType::PUT, bytesOf(key2), bytesOf(value2), 0, currentLeader.nodeId);
+            },
+            std::chrono::milliseconds{8000}
+        );
 
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
@@ -1053,37 +1359,42 @@ namespace {
         n3->runtime->start();
 
         std::array<RuntimeHarness*, 3> nodes{n1.get(), n2.get(), n3.get()};
-        AKK_CLUSTER_CHECK(waitUntil(
-            [&] {
-                size_t leaders = 0;
-                for (const auto* n : nodes) { if (n->runtime->role() == NodeRole::PRIMARY) { ++leaders; } }
-                return leaders == 1;
+        ensurePreferredLeader(nodes, std::chrono::milliseconds{20000});
+
+        RuntimeHarness* target = nullptr;
+        runOnLeader(
+            nodes,
+            [&](RuntimeHarness& currentLeader) {
+                for (auto* n : nodes) {
+                    if (n != &currentLeader) {
+                        target = n;
+                        break;
+                    }
+                }
+                AKK_CLUSTER_CHECK(target != nullptr);
+                currentLeader.runtime->transferRaftLeadership(target->nodeId);
             },
             std::chrono::milliseconds{8000}
-        ));
-
-        RuntimeHarness* leader = findLeader(nodes);
-        AKK_CLUSTER_CHECK(leader != nullptr);
-        RuntimeHarness* target = nullptr;
-        for (auto* n : nodes) {
-            if (n != leader) {
-                target = n;
-                break;
-            }
-        }
-        AKK_CLUSTER_CHECK(target != nullptr);
-
-        leader->runtime->transferRaftLeadership(target->nodeId);
+        );
         AKK_CLUSTER_CHECK(waitUntil([&] { return target->runtime->role() == NodeRole::PRIMARY; }, std::chrono::milliseconds{8000}));
 
         const std::string key = "transfer-key";
         const std::string value = "transfer-value";
-        target->runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 0, target->nodeId);
+        RuntimeHarness* writer = nullptr;
+        runOnLeader(
+            nodes,
+            [&](RuntimeHarness& currentLeader) {
+                writer = &currentLeader;
+                currentLeader.runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 0, currentLeader.nodeId);
+            },
+            std::chrono::milliseconds{8000}
+        );
+        AKK_CLUSTER_CHECK(writer != nullptr);
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
                 size_t applied = 0;
                 for (const auto* n : nodes) {
-                    if (n != target && n->hasState(1, key, value)) { ++applied; }
+                    if (n != writer && n->hasState(1, key, value)) { ++applied; }
                 }
                 return applied == 2;
             },
@@ -1127,14 +1438,7 @@ namespace {
         n4->runtime->start();
 
         std::array<RuntimeHarness*, 3> initialNodes{n1.get(), n2.get(), n3.get()};
-        AKK_CLUSTER_CHECK(waitUntil(
-            [&] {
-                size_t leaders = 0;
-                for (const auto* n : initialNodes) { if (n->runtime->role() == NodeRole::PRIMARY) { ++leaders; } }
-                return leaders == 1;
-            },
-            std::chrono::milliseconds{8000}
-        ));
+        ensurePreferredLeader(initialNodes, std::chrono::milliseconds{20000});
 
         RuntimeHarness* leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
@@ -1155,7 +1459,7 @@ namespace {
                 }
             }
         );
-        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
+        ensurePreferredLeader(initialNodes, std::chrono::milliseconds{20000});
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
         AKK_CLUSTER_CHECK((nodeIdsOf(leader->runtime->activeNodes()) == std::vector<uint64_t>{1, 2, 3, 4}));
@@ -1170,7 +1474,7 @@ namespace {
         );
         AKK_CLUSTER_CHECK(waitUntil([&] { return n4->hasState(1, key1, value1); }, std::chrono::milliseconds{8000}));
 
-        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
+        ensurePreferredLeader(initialNodes, std::chrono::milliseconds{20000});
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
         runOnLeader(
@@ -1184,7 +1488,7 @@ namespace {
                 }
             }
         );
-        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(initialNodes) != nullptr; }, std::chrono::milliseconds{8000}));
+        ensurePreferredLeader(initialNodes, std::chrono::milliseconds{20000});
         leader = findLeader(initialNodes);
         AKK_CLUSTER_CHECK(leader != nullptr);
         AKK_CLUSTER_CHECK((nodeIdsOf(leader->runtime->activeNodes()) == std::vector<uint64_t>{1, 2, 3}));
@@ -1207,10 +1511,30 @@ namespace {
             },
             std::chrono::milliseconds{20000}
         ));
-        std::this_thread::sleep_for(std::chrono::milliseconds{300});
+        AKK_CLUSTER_CHECK(waitUntil([&] { return !n4->hasState(2, key2, value2); }, std::chrono::milliseconds{1000}));
         AKK_CLUSTER_CHECK(!n4->hasState(2, key2, value2));
 
         n4->runtime->close();
+        n3->runtime->close();
+        n2->runtime->close();
+        n1->runtime->close();
+
+        AKK_CLUSTER_CHECK(readRaftLogLastIncludedIndex(dir / "n1" / "cluster-raft.log") > 0 ||
+                          readRaftLogLastIncludedIndex(dir / "n2" / "cluster-raft.log") > 0 ||
+                          readRaftLogLastIncludedIndex(dir / "n3" / "cluster-raft.log") > 0);
+
+        n1 = makeRuntime(dir / "n1", initialCfg, 1);
+        n2 = makeRuntime(dir / "n2", initialCfg, 2);
+        n3 = makeRuntime(dir / "n3", initialCfg, 3);
+        n1->runtime->start();
+        n2->runtime->start();
+        n3->runtime->start();
+        initialNodes = {n1.get(), n2.get(), n3.get()};
+        ensurePreferredLeader(initialNodes, std::chrono::milliseconds{20000});
+        leader = findLeader(initialNodes);
+        AKK_CLUSTER_CHECK(leader != nullptr);
+        AKK_CLUSTER_CHECK((nodeIdsOf(leader->runtime->activeNodes()) == std::vector<uint64_t>{1, 2, 3}));
+
         n3->runtime->close();
         n2->runtime->close();
         n1->runtime->close();
@@ -1248,6 +1572,31 @@ namespace {
         const std::string value = "legacy-value";
         server->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 3, 1);
         AKK_CLUSTER_CHECK(waitUntil([&] { return applied.load() == 1; }));
+
+        client->close();
+        server->close();
+    }
+
+    void testSecureReplicationRequiresPeerPins() {
+        constexpr uint16_t port = 20215;
+        const auto dir = makeTempDir("secure-requires-peer-pins");
+        ClusterRuntimeOptions serverOptions;
+        serverOptions.transportMode = TransportMode::SECURE;
+        serverOptions.secure.identitySeedPath = dir / "server.identity";
+
+        ClusterRuntimeOptions clientOptions;
+        clientOptions.transportMode = TransportMode::SECURE;
+        clientOptions.secure.identitySeedPath = dir / "client.identity";
+        clientOptions.secure.expectedPrimaryNodeId = 1;
+
+        const AckPolicy ack{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        auto server = ReplicationServer::create(port, 1, [] { return uint64_t{0}; }, ack, {}, 0, {}, serverOptions);
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, ack, clientOptions);
+
+        server->start();
+        client->start();
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        AKK_CLUSTER_CHECK(server->replicaCount() == 0);
 
         client->close();
         server->close();
@@ -1626,8 +1975,14 @@ namespace {
         {
             auto first = makeRuntime(dir / "n1", cfg, 1, options);
             first->runtime->start();
-            AKK_CLUSTER_CHECK(waitUntil([&] { return first->runtime->role() == NodeRole::PRIMARY; }));
-            first->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("raft-log-key"), bytesOf("raft-log-value"), 0, 1);
+            RuntimeHarness* nodes[] = {first.get()};
+            runOnLeader(
+                nodes,
+                [](RuntimeHarness& leader) {
+                    leader.runtime->shipEntry(1, ReplOpType::PUT, bytesOf("raft-log-key"), bytesOf("raft-log-value"), 0, leader.nodeId);
+                },
+                std::chrono::milliseconds{8000}
+            );
             first->runtime->close();
         }
 
@@ -1732,8 +2087,14 @@ namespace {
         leaderOptions.raftBlobPolicy = RaftBlobPolicy::PRIMARY_SIDE_ONLY;
         auto leader = makeRuntime(dir / "leader-runtime", cfg, 1, leaderOptions);
         leader->runtime->start();
-        AKK_CLUSTER_CHECK(waitUntil([&] { return leader->runtime->role() == NodeRole::PRIMARY; }));
-        leader->runtime->shipBlob(1, 1, bytesOf("raft-primary-side-blob-payload"));
+        RuntimeHarness* leaderNodes[] = {leader.get()};
+        runOnLeader(
+            leaderNodes,
+            [](RuntimeHarness& currentLeader) {
+                currentLeader.runtime->shipBlob(1, 1, bytesOf("raft-primary-side-blob-payload"));
+            },
+            std::chrono::milliseconds{8000}
+        );
         leader->runtime->close();
 
         const ClusterConfig followerCfg{
@@ -1808,8 +2169,14 @@ namespace {
         };
         auto first = makeRuntime(dir / "single", singleNodeCfg, 1, options);
         first->runtime->start();
-        AKK_CLUSTER_CHECK(waitUntil([&] { return first->runtime->role() == NodeRole::PRIMARY; }));
-        first->runtime->shipBlob(7, 70, bytesOf("persisted-raft-log-blob"));
+        RuntimeHarness* singleNodes[] = {first.get()};
+        runOnLeader(
+            singleNodes,
+            [](RuntimeHarness& leader) {
+                leader.runtime->shipBlob(7, 70, bytesOf("persisted-raft-log-blob"));
+            },
+            std::chrono::milliseconds{8000}
+        );
         first->runtime->close();
         first.reset();
 
@@ -1842,21 +2209,289 @@ namespace {
         writeNodeIdFile(options.paths.dataDir / "node.id", 1);
 
         auto engine = akkaradb::engine::AkkEngine::open(options);
+        akkaradb::engine::AkkEngine* nodes[] = {engine.get()};
         const std::string key = "raft-log-engine-blob-key";
         const std::string value = "raft-log-engine-blob-value";
-        engine->put(bytesOf(key), bytesOf(value));
+        runOnEngineLeader(
+            nodes,
+            [&](akkaradb::engine::AkkEngine& leader) { leader.put(bytesOf(key), bytesOf(value)); },
+            std::chrono::milliseconds{8000}
+        );
         const auto stored = engine->get(bytesOf(key));
         AKK_CLUSTER_CHECK(stored.has_value());
         AKK_CLUSTER_CHECK(textOf(*stored) == value);
         AKK_CLUSTER_CHECK(engine->stats().blobPutsTotal >= 1);
         engine->close();
     }
+
+    void testRaftEngineLargeBlobSnapshotCatchUp() {
+        const auto dir = makeTempDir("raft-engine-blob-snapshot");
+        const ClusterConfig cfg{
+            {
+                node(1, 21411, 21511),
+                node(2, 21412, 21512),
+                node(3, 21413, 21513),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 500},
+        };
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = true;
+            options.blob.thresholdBytes = 4;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
+            options.cluster.runtime.raftBlobChunkSizeBytes = 17;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        akkaradb::engine::AkkEngine* liveNodes[] = {n1.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(liveNodes) != nullptr; }, std::chrono::milliseconds{20000}));
+
+        const std::string key = "raft-engine-large-blob-snapshot-key";
+        const std::vector<uint8_t> value = deterministicBytes(257, 0xA44A'5EED'B10B'0001ull);
+        runOnEngineLeader(
+            liveNodes,
+            [&](akkaradb::engine::AkkEngine& leader) {
+                leader.put(bytesOf(key), std::span<const uint8_t>{value.data(), value.size()});
+            },
+            std::chrono::milliseconds{20000}
+        );
+
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                for (auto* engine : liveNodes) {
+                    const auto stored = engineGet(*engine, key);
+                    if (!stored || *stored != value) { return false; }
+                }
+                return true;
+            },
+            std::chrono::milliseconds{10000}
+        ));
+        AKK_CLUSTER_CHECK(n1->stats().blob.blobsWritten > 0 || n3->stats().blob.blobsWritten > 0);
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                const auto* leader = findEngineLeader(liveNodes);
+                if (leader == nullptr) { return false; }
+                const auto leaderDir = leader == n1.get() ? dir / "n1" : dir / "n3";
+                return readRaftLogLastIncludedIndex(leaderDir / "cluster-raft.log") > 0;
+            },
+            std::chrono::milliseconds{5000}
+        ));
+
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                const auto stored = engineGet(*n2, key);
+                return stored.has_value() && *stored == value;
+            },
+            std::chrono::milliseconds{15000}
+        ));
+        AKK_CLUSTER_CHECK(!std::filesystem::exists(dir / "n2" / "replication-snapshot.staging"));
+
+        n2->close();
+        n3->close();
+        n1->close();
+    }
+
+    void testRaftEngineSnapshotStagingCrcRejectsCorruption() {
+        const auto dir = makeTempDir("raft-engine-snapshot-staging-crc");
+        const ClusterConfig cfg{
+            {
+                node(1, 21431, 21531),
+                node(2, 21432, 21532),
+                node(3, 21433, 21533),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 500},
+        };
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = true;
+            options.blob.thresholdBytes = 4;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
+            options.cluster.runtime.raftBlobChunkSizeBytes = 19;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        akkaradb::engine::AkkEngine* liveNodes[] = {n1.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(liveNodes) != nullptr; }, std::chrono::milliseconds{20000}));
+
+        const std::string key = "raft-engine-snapshot-staging-crc-key";
+        const std::vector<uint8_t> value = deterministicBytes(233, 0xA44A'5EED'5A6E'C001ull);
+        runOnEngineLeader(
+            liveNodes,
+            [&](akkaradb::engine::AkkEngine& leader) {
+                leader.put(bytesOf(key), std::span<const uint8_t>{value.data(), value.size()});
+            },
+            std::chrono::milliseconds{20000}
+        );
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                for (auto* engine : liveNodes) {
+                    const auto stored = engineGet(*engine, key);
+                    if (!stored || *stored != value) { return false; }
+                }
+                return true;
+            },
+            std::chrono::milliseconds{10000}
+        ));
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                const auto* leader = findEngineLeader(liveNodes);
+                if (leader == nullptr) { return false; }
+                const auto leaderDir = leader == n1.get() ? dir / "n1" : dir / "n3";
+                return readRaftLogLastIncludedIndex(leaderDir / "cluster-raft.log") > 0;
+            },
+            std::chrono::milliseconds{5000}
+        ));
+
+        ScopedSnapshotStagingCorruption corruption{"snapshot.finish.before_staging_apply"};
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        const auto stagingPath = dir / "n2" / "replication-snapshot.staging";
+        const auto corruptionMarkerPath = stagingPath.string() + ".corrupted";
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] { return std::filesystem::exists(corruptionMarkerPath); },
+            std::chrono::milliseconds{10000}
+        ));
+        corruption.clear();
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                const auto stored = engineGet(*n2, key);
+                return stored.has_value() && *stored == value;
+            },
+            std::chrono::milliseconds{20000}
+        ));
+        AKK_CLUSTER_CHECK(!std::filesystem::exists(stagingPath));
+
+        n2->close();
+        n3->close();
+        n1->close();
+    }
+
+    void testRaftEngineLargeBlobLeaderChurnKeepsBlobIdsUnique() {
+        const auto dir = makeTempDir("raft-engine-blob-leader-churn");
+        const ClusterConfig cfg{
+            {
+                node(1, 21421, 21521),
+                node(2, 21422, 21522),
+                node(3, 21423, 21523),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 500},
+        };
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = true;
+            options.blob.thresholdBytes = 4;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
+            options.cluster.runtime.raftBlobChunkSizeBytes = 13;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        akkaradb::engine::AkkEngine* allNodes[] = {n1.get(), n2.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(allNodes) != nullptr; }, std::chrono::milliseconds{20000}));
+
+        const std::string key1 = "raft-engine-leader-churn-blob-key-1";
+        const std::string key2 = "raft-engine-leader-churn-blob-key-2";
+        const std::vector<uint8_t> value1 = deterministicBytes(129, 0xA44A'5EED'C001'0001ull);
+        const std::vector<uint8_t> value2 = deterministicBytes(131, 0xA44A'5EED'C001'0002ull);
+
+        runOnEngineLeader(
+            allNodes,
+            [&](akkaradb::engine::AkkEngine& leader) {
+                leader.put(bytesOf(key1), std::span<const uint8_t>{value1.data(), value1.size()});
+            },
+            std::chrono::milliseconds{20000}
+        );
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                for (auto* engine : allNodes) {
+                    const auto stored = engineGet(*engine, key1);
+                    if (!stored || *stored != value1) { return false; }
+                }
+                return true;
+            },
+            std::chrono::milliseconds{15000}
+        ));
+
+        auto* oldLeader = findEngineLeader(allNodes);
+        AKK_CLUSTER_CHECK(oldLeader != nullptr);
+        oldLeader->close();
+
+        std::vector<akkaradb::engine::AkkEngine*> remaining;
+        for (auto* engine : allNodes) {
+            if (engine != oldLeader) { remaining.push_back(engine); }
+        }
+        auto remainingSpan = [&]() {
+            return std::span<akkaradb::engine::AkkEngine* const>{remaining.data(), remaining.size()};
+        };
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                auto* leader = findEngineLeader(remainingSpan());
+                return leader != nullptr && leader != oldLeader;
+            },
+            std::chrono::milliseconds{20000}
+        ));
+
+        runOnEngineLeader(
+            remainingSpan(),
+            [&](akkaradb::engine::AkkEngine& leader) {
+                leader.put(bytesOf(key2), std::span<const uint8_t>{value2.data(), value2.size()});
+            },
+            std::chrono::milliseconds{20000}
+        );
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                for (auto* engine : remaining) {
+                    const auto stored1 = engineGet(*engine, key1);
+                    const auto stored2 = engineGet(*engine, key2);
+                    if (!stored1 || *stored1 != value1 || !stored2 || *stored2 != value2) { return false; }
+                }
+                return true;
+            },
+            std::chrono::milliseconds{15000}
+        ));
+
+        n3->close();
+        n2->close();
+        n1->close();
+    }
 }
 
 int main() {
     try {
         akkaradb::test::installMsvcTestErrorHandlers();
+        enableDeterministicRaftElection();
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
+        testWalSnapshotTransactionRecovery();
         testRaftOptionsRoundtripAndValidation();
         testReplFramingRejectsOversizedPayloadLength();
         testReplHandshakeCarriesClusterGroupIdentity();
@@ -1870,10 +2505,12 @@ int main() {
         testRsErasureCodecProperties();
         testErsCodecRecovery();
         testRaftElectionAndLoopbackReplication();
+        testRaftHardStateCorruptionFailsStartup();
         testRaftSnapshotInstallForCompactedFollower();
         testRaftLeaderTransfer();
         testRaftOnlineMembershipChange();
         testPrimaryAckPathStillUsesLegacyRuntime();
+        testSecureReplicationRequiresPeerPins();
         testPrimaryAckAllTargetsFailsWithoutReplicas();
         testReplicaRejectsImplicitNonRaftGroupSwitch();
         testNonRaftPrimaryCreatesGroupInstanceIdentity();
@@ -1888,6 +2525,9 @@ int main() {
         testRaftPrimarySideOnlyBlobPolicy();
         testRaftLogBlobPolicyReplicatesPayload();
         testRaftLogBlobPolicyExternalizesEngineValue();
+        testRaftEngineLargeBlobSnapshotCatchUp();
+        testRaftEngineSnapshotStagingCrcRejectsCorruption();
+        testRaftEngineLargeBlobLeaderChurnKeepsBlobIdsUnique();
         return 0;
     }
     catch (const std::exception& ex) {

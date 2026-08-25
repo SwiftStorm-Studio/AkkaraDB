@@ -516,6 +516,7 @@ namespace akkaradb::engine::cluster {
                 }
 
                 const auto expected = pinnedPeerKey(runtimeOptions_, runtimeOptions_.secure.expectedPrimaryNodeId);
+                if (!expected) { throw std::runtime_error("ReplicationClient: missing secure primary peer pin"); }
                 auto session = initiator.finish(serverHello, expected);
                 return OpenSecureSession{std::move(session), serverHello.staticPublicKey};
             }
@@ -540,8 +541,8 @@ namespace akkaradb::engine::cluster {
                 if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.
                     expectedPrimaryNodeId) { return false; }
                 if (secure != nullptr) {
-                    if (const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId); expected && secureRemotePublicKey != *
-                        expected) { return false; }
+                    const auto expected = pinnedPeerKey(runtimeOptions_, serverHello.nodeId);
+                    if (!expected || secureRemotePublicKey != *expected) { return false; }
                 }
                 const MembershipState incoming{
                     .groupId = serverHello.groupId,

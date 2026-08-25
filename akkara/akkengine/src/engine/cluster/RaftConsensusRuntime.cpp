@@ -18,6 +18,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <thread>
 #include <unordered_set>
@@ -51,6 +53,7 @@
 namespace akkaradb::engine::cluster {
     namespace {
         using Clock = std::chrono::steady_clock;
+        constexpr size_t MAX_RAFT_CLIENT_HANDLERS = 128;
 
         #ifdef _WIN32
         using SocketHandle = SOCKET; constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET; void netInit() {
@@ -146,38 +149,6 @@ namespace akkaradb::engine::cluster {
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
             #endif
             std::filesystem::rename(tmp, path);
-        }
-
-        std::filesystem::path corruptBackupPath(const std::filesystem::path& path) {
-            for (uint32_t i = 0; i < 10000; ++i) {
-                auto candidate = path;
-                candidate += i == 0 ? ".corrupt" : ".corrupt." + std::to_string(i);
-                if (!std::filesystem::exists(candidate)) { return candidate; }
-            }
-            throw std::runtime_error("RaftConsensusRuntime: cannot allocate corrupt state backup path");
-        }
-
-        bool handleCorruptStateFile(
-            const std::filesystem::path& path,
-            CorruptClusterStateAction action,
-            const char* context,
-            const std::exception& cause
-        ) {
-            if (action == CorruptClusterStateAction::FAIL_STARTUP) {
-                throw std::runtime_error(std::string{context} + ": " + cause.what());
-            }
-            std::error_code ec;
-            if (action == CorruptClusterStateAction::BACKUP_AND_RECREATE) {
-                std::filesystem::rename(path, corruptBackupPath(path), ec);
-                if (ec) { throw std::runtime_error(std::string{context} + ": cannot back up corrupt state: " + ec.message()); }
-                return true;
-            }
-            if (action == CorruptClusterStateAction::DELETE_AND_RECREATE) {
-                std::filesystem::remove(path, ec);
-                if (ec) { throw std::runtime_error(std::string{context} + ": cannot delete corrupt state: " + ec.message()); }
-                return true;
-            }
-            throw std::runtime_error(std::string{context} + ": invalid corrupt state action");
         }
 
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
@@ -454,7 +425,7 @@ namespace akkaradb::engine::cluster {
         };
 
         enum class RaftEntryKind : uint8_t {
-            MUTATION = 0, CONFIG_JOINT = 1, CONFIG_FINAL = 2, BLOB = 3,
+            MUTATION = 0, CONFIG_JOINT = 1, CONFIG_FINAL = 2, BLOB = 3, NOOP = 4,
         };
 
         struct RaftLogEntry {
@@ -496,7 +467,11 @@ namespace akkaradb::engine::cluster {
             uint64_t matchIndex = 0;
         };
 
-        struct SnapshotKvEntry {
+        struct SnapshotKvChunk {
+            uint64_t entryIndex = 0;
+            uint64_t valueOffset = 0;
+            uint64_t valueSize = 0;
+            uint32_t valueCrc32c = 0;
             std::vector<uint8_t> key;
             std::vector<uint8_t> value;
         };
@@ -507,7 +482,12 @@ namespace akkaradb::engine::cluster {
             uint64_t lastIncludedIndex = 0;
             uint64_t lastIncludedTerm = 0;
             uint64_t snapshotSeq = 0;
-            std::vector<SnapshotKvEntry> entries;
+            uint64_t entryCount = 0;
+            std::vector<NodeInfo> committedVoters;
+            std::optional<std::vector<NodeInfo>> jointOldVoters;
+            std::optional<std::vector<NodeInfo>> jointNewVoters;
+            bool done = false;
+            std::vector<SnapshotKvChunk> chunks;
         };
 
         struct InstallSnapshotResponse {
@@ -571,6 +551,7 @@ namespace akkaradb::engine::cluster {
             if (in.size() < 4) { return false; }
             const uint32_t count = readU32(in, 0);
             size_t cursor = 4;
+            if (count > (in.size() - cursor) / 28) { return false; }
             nodes.clear();
             nodes.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
@@ -579,6 +560,40 @@ namespace akkaradb::engine::cluster {
                 nodes.push_back(std::move(node));
             }
             return cursor == in.size();
+        }
+
+        void writeNodeSetField(std::vector<uint8_t>& out, const std::vector<NodeInfo>& nodes) {
+            const auto encoded = encodeNodeSet(nodes);
+            writeU32(out, static_cast<uint32_t>(encoded.size()));
+            out.insert(out.end(), encoded.begin(), encoded.end());
+        }
+
+        bool readNodeSetField(std::span<const uint8_t> in, size_t& cursor, std::vector<NodeInfo>& nodes) {
+            if (cursor + 4 > in.size()) { return false; }
+            const uint32_t len = readU32(in, cursor);
+            cursor += 4;
+            if (cursor + len > in.size()) { return false; }
+            const auto encoded = in.subspan(cursor, len);
+            cursor += len;
+            return decodeNodeSet(encoded, nodes);
+        }
+
+        void writeOptionalNodeSetField(std::vector<uint8_t>& out, const std::optional<std::vector<NodeInfo>>& nodes) {
+            writeU8(out, nodes ? 1 : 0);
+            if (nodes) { writeNodeSetField(out, *nodes); }
+        }
+
+        bool readOptionalNodeSetField(std::span<const uint8_t> in, size_t& cursor, std::optional<std::vector<NodeInfo>>& nodes) {
+            if (cursor + 1 > in.size()) { return false; }
+            const bool hasValue = in[cursor++] != 0;
+            if (!hasValue) {
+                nodes.reset();
+                return true;
+            }
+            std::vector<NodeInfo> decoded;
+            if (!readNodeSetField(in, cursor, decoded)) { return false; }
+            nodes = std::move(decoded);
+            return true;
         }
 
         std::vector<uint8_t> encodeEntryPayload(const RaftLogEntry& entry) {
@@ -674,6 +689,7 @@ namespace akkaradb::engine::cluster {
             out.leaderCommit = readU64(in, 32);
             const uint32_t count = readU32(in, 40);
             size_t cursor = 44;
+            if (count > (in.size() - cursor) / 4) { return false; }
             out.entries.clear();
             out.entries.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
@@ -713,36 +729,64 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.lastIncludedIndex);
             writeU64(out, rpc.lastIncludedTerm);
             writeU64(out, rpc.snapshotSeq);
-            writeU32(out, static_cast<uint32_t>(rpc.entries.size()));
-            for (const auto& entry : rpc.entries) {
-                writeU32(out, static_cast<uint32_t>(entry.key.size()));
-                writeU32(out, static_cast<uint32_t>(entry.value.size()));
-                out.insert(out.end(), entry.key.begin(), entry.key.end());
-                out.insert(out.end(), entry.value.begin(), entry.value.end());
+            writeU64(out, rpc.entryCount);
+            writeNodeSetField(out, rpc.committedVoters);
+            writeOptionalNodeSetField(out, rpc.jointOldVoters);
+            writeOptionalNodeSetField(out, rpc.jointNewVoters);
+            writeU8(out, rpc.done ? 1 : 0);
+            writeU32(out, static_cast<uint32_t>(rpc.chunks.size()));
+            for (const auto& chunk : rpc.chunks) {
+                writeU64(out, chunk.entryIndex);
+                writeU64(out, chunk.valueOffset);
+                writeU64(out, chunk.valueSize);
+                writeU32(out, chunk.valueCrc32c);
+                writeU32(out, static_cast<uint32_t>(chunk.key.size()));
+                writeU32(out, static_cast<uint32_t>(chunk.value.size()));
+                out.insert(out.end(), chunk.key.begin(), chunk.key.end());
+                out.insert(out.end(), chunk.value.begin(), chunk.value.end());
             }
             return encodeFrame(ReplMsgType::RAFT_INSTALL_SNAPSHOT, out);
         }
 
         bool decodeInstallSnapshot(std::span<const uint8_t> in, InstallSnapshot& out) {
-            if (in.size() < 44) { return false; }
+            if (in.size() < 53) { return false; }
             out.term = readU64(in, 0);
             out.leaderId = readU64(in, 8);
             out.lastIncludedIndex = readU64(in, 16);
             out.lastIncludedTerm = readU64(in, 24);
             out.snapshotSeq = readU64(in, 32);
-            const uint32_t count = readU32(in, 40);
-            size_t cursor = 44;
-            out.entries.clear();
-            out.entries.reserve(count);
+            out.entryCount = readU64(in, 40);
+            size_t cursor = 48;
+            if (!readNodeSetField(in, cursor, out.committedVoters) ||
+                !readOptionalNodeSetField(in, cursor, out.jointOldVoters) ||
+                !readOptionalNodeSetField(in, cursor, out.jointNewVoters)) {
+                return false;
+            }
+            if (cursor + 5 > in.size()) { return false; }
+            out.done = in[cursor++] != 0;
+            const uint32_t count = readU32(in, cursor);
+            cursor += 4;
+            if (count > (in.size() - cursor) / 36) { return false; }
+            out.chunks.clear();
+            out.chunks.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
-                if (cursor + 8 > in.size()) { return false; }
+                if (cursor + 36 > in.size()) { return false; }
+                SnapshotKvChunk chunk;
+                chunk.entryIndex = readU64(in, cursor);
+                cursor += 8;
+                chunk.valueOffset = readU64(in, cursor);
+                cursor += 8;
+                chunk.valueSize = readU64(in, cursor);
+                cursor += 8;
+                chunk.valueCrc32c = readU32(in, cursor);
+                cursor += 4;
                 const uint32_t keyLen = readU32(in, cursor);
                 cursor += 4;
                 const uint32_t valueLen = readU32(in, cursor);
                 cursor += 4;
-                SnapshotKvEntry entry;
-                if (!readBytes(in, cursor, keyLen, entry.key) || !readBytes(in, cursor, valueLen, entry.value)) { return false; }
-                out.entries.push_back(std::move(entry));
+                if (chunk.valueOffset > chunk.valueSize || valueLen > chunk.valueSize - chunk.valueOffset) { return false; }
+                if (!readBytes(in, cursor, keyLen, chunk.key) || !readBytes(in, cursor, valueLen, chunk.value)) { return false; }
+                out.chunks.push_back(std::move(chunk));
             }
             return cursor == in.size();
         }
@@ -901,12 +945,8 @@ namespace akkaradb::engine::cluster {
                 cv_.notify_all();
                 if (acceptThread_.joinable()) { acceptThread_.join(); }
                 if (timerThread_.joinable()) { timerThread_.join(); }
-                std::vector<std::thread> clients;
-                {
-                    std::lock_guard lock{clientThreadsMutex_};
-                    clients.swap(clientThreads_);
-                }
-                for (auto& client : clients) { if (client.joinable()) { client.join(); } }
+                std::unique_lock clientLock{clientHandlersMutex_};
+                clientHandlersCv_.wait(clientLock, [this] { return activeClientHandlers_.load() == 0; });
             }
 
             NodeRole role() const noexcept {
@@ -1235,9 +1275,18 @@ namespace akkaradb::engine::cluster {
 
         private:
             Clock::time_point nextElectionDeadline() {
-                static thread_local std::mt19937_64 rng{std::random_device{}()};
                 const auto configuredAckTimeoutMs = config_.consistency().ackTimeoutMs;
                 const auto baseTimeoutMs = std::clamp<uint32_t>(std::max<uint32_t>(3000u, configuredAckTimeoutMs * 2u), 3000u, 6000u);
+                // Test hook: keep production Raft randomized, but let smoke tests make leadership reproducible.
+                if (const char* deterministic = std::getenv("AKKARADB_TEST_DETERMINISTIC_RAFT_ELECTION");
+                    deterministic != nullptr && std::string_view{deterministic} == "1") {
+                    uint32_t rank = 0;
+                    for (const auto& node : config_.dataNodes()) {
+                        if (node.nodeId < selfNodeId_) { ++rank; }
+                    }
+                    return Clock::now() + std::chrono::milliseconds{baseTimeoutMs + rank * 250u};
+                }
+                static thread_local std::mt19937_64 rng{std::random_device{}()};
                 std::uniform_int_distribution<int> dist(static_cast<int>(baseTimeoutMs), static_cast<int>(baseTimeoutMs * 2u));
                 return Clock::now() + std::chrono::milliseconds(dist(rng));
             }
@@ -1307,6 +1356,21 @@ namespace akkaradb::engine::cluster {
                 return replicated >= (voters.size() / 2) + 1;
             }
 
+            static bool votedByMajority(const std::vector<NodeInfo>& voters, const std::vector<uint64_t>& grantedVotes) {
+                size_t granted = 0;
+                for (const auto& voter : voters) {
+                    if (std::find(grantedVotes.begin(), grantedVotes.end(), voter.nodeId) != grantedVotes.end()) { ++granted; }
+                }
+                return granted >= (voters.size() / 2) + 1;
+            }
+
+            bool hasElectionQuorumLocked(const std::vector<uint64_t>& grantedVotes) const {
+                if (jointOldVoters_ && jointNewVoters_) {
+                    return votedByMajority(*jointOldVoters_, grantedVotes) && votedByMajority(*jointNewVoters_, grantedVotes);
+                }
+                return votedByMajority(committedVoters_, grantedVotes);
+            }
+
             bool hasCommitQuorumLocked(uint64_t index, const RaftLogEntry* entry = nullptr) {
                 if (entry != nullptr && entry->kind == RaftEntryKind::CONFIG_JOINT) {
                     std::vector<NodeInfo> oldVoters;
@@ -1318,6 +1382,22 @@ namespace akkaradb::engine::cluster {
                     return replicatedByMajorityLocked(*jointOldVoters_, index) && replicatedByMajorityLocked(*jointNewVoters_, index);
                 }
                 return replicatedByMajorityLocked(committedVoters_, index);
+            }
+
+            bool canCommitEntryLocked(const RaftLogEntry& entry) {
+                return entry.term == currentTerm_ && hasCommitQuorumLocked(entry.index, &entry);
+            }
+
+            static bool sameNodeSet(const std::vector<NodeInfo>& lhs, const std::vector<NodeInfo>& rhs) {
+                return encodeNodeSet(lhs) == encodeNodeSet(rhs);
+            }
+
+            static bool sameOptionalNodeSet(
+                const std::optional<std::vector<NodeInfo>>& lhs,
+                const std::optional<std::vector<NodeInfo>>& rhs
+            ) {
+                if (lhs.has_value() != rhs.has_value()) { return false; }
+                return !lhs || sameNodeSet(*lhs, *rhs);
             }
 
             std::optional<std::vector<NodeInfo>> replicationTargetsForEntry(const RaftLogEntry& entry) const {
@@ -1386,13 +1466,45 @@ namespace akkaradb::engine::cluster {
             std::optional<uint64_t> compactableLogIndexForSnapshotSeq(uint64_t snapshotSeq) const {
                 std::optional<uint64_t> target;
                 for (const auto& entry : log_) {
-                    if ((entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) && entry.index >
-                        lastIncludedIndex_) { return target; }
                     if ((entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) && entry.clientSeq <= snapshotSeq) {
+                        target = entry.index;
+                        continue;
+                    }
+                    if (entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) {
+                        return target;
+                    }
+                    if (entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL ||
+                        entry.kind == RaftEntryKind::NOOP) {
                         target = entry.index;
                     }
                 }
                 return target;
+            }
+
+            uint64_t conflictMatchHint(uint64_t conflictIndex) const {
+                if (conflictIndex <= lastIncludedIndex_) { return lastIncludedIndex_ == 0 ? 0 : lastIncludedIndex_ - 1; }
+                const uint64_t conflictTerm = termAt(conflictIndex);
+                if (conflictTerm == 0) { return conflictIndex == 0 ? 0 : conflictIndex - 1; }
+                uint64_t firstConflictIndex = conflictIndex;
+                for (const auto& entry : log_) {
+                    if (entry.index > conflictIndex) { break; }
+                    if (entry.term == conflictTerm) {
+                        firstConflictIndex = entry.index;
+                        break;
+                    }
+                }
+                return firstConflictIndex == 0 ? 0 : firstConflictIndex - 1;
+            }
+
+            RaftLogEntry makeNoopEntryLocked() const {
+                RaftLogEntry entry;
+                entry.term = currentTerm_;
+                entry.index = lastLogIndex() + 1;
+                entry.clientSeq = 0;
+                entry.kind = RaftEntryKind::NOOP;
+                entry.op = ReplOpType::PUT;
+                entry.sourceNodeId = selfNodeId_;
+                return entry;
             }
 
             void persistState() {
@@ -1423,19 +1535,20 @@ namespace akkaradb::engine::cluster {
                     votedFor_ = readU64(bytes, 13);
                 }
                 catch (const std::exception& ex) {
-                    (void)handleCorruptStateFile(statePath_, runtimeOptions_.corruptStateAction, "RaftConsensusRuntime state", ex);
-                    currentTerm_ = 0;
-                    votedFor_ = 0;
+                    throw std::runtime_error(std::string{"RaftConsensusRuntime: corrupt hard state: "} + ex.what());
                 }
             }
 
             void persistLog() {
                 std::vector<uint8_t> bytes;
-                bytes.insert(bytes.end(), {'A', 'K', 'R', 'L', '4'});
+                bytes.insert(bytes.end(), {'A', 'K', 'R', 'L', '5'});
                 writeU64(bytes, commitIndex_);
                 writeU64(bytes, lastIncludedIndex_);
                 writeU64(bytes, lastIncludedTerm_);
                 writeU64(bytes, static_cast<uint64_t>(log_.size()));
+                writeNodeSetField(bytes, committedVoters_);
+                writeOptionalNodeSetField(bytes, jointOldVoters_);
+                writeOptionalNodeSetField(bytes, jointNewVoters_);
                 const size_t headerCrcOffset = bytes.size();
                 writeU32(bytes, 0);
                 writeU32At(bytes, headerCrcOffset, crcBytes(std::span<const uint8_t>{bytes.data(), headerCrcOffset}));
@@ -1451,21 +1564,30 @@ namespace akkaradb::engine::cluster {
             void recoverLog() {
                 if (!std::filesystem::exists(logPath_)) { return; }
                 const auto bytes = readWholeFile(logPath_, "RaftConsensusRuntime log");
-                constexpr size_t headerSize = 5 + 8 + 8 + 8 + 8 + 4;
-                constexpr size_t headerCrcOffset = headerSize - 4;
-                if (bytes.size() < headerSize) { throw std::runtime_error("RaftConsensusRuntime: truncated log file"); }
-                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRL4") {
+                constexpr size_t fixedHeaderSize = 5 + 8 + 8 + 8 + 8;
+                if (bytes.size() < fixedHeaderSize + 4) { throw std::runtime_error("RaftConsensusRuntime: truncated log file"); }
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRL5") {
                     throw std::runtime_error("RaftConsensusRuntime: bad log file");
-                }
-                if (readU32(bytes, headerCrcOffset) != crcBytes(std::span<const uint8_t>{bytes.data(), headerCrcOffset})) {
-                    throw std::runtime_error("RaftConsensusRuntime: log header CRC mismatch");
                 }
                 commitIndex_ = readU64(bytes, 5);
                 lastIncludedIndex_ = readU64(bytes, 13);
                 lastIncludedTerm_ = readU64(bytes, 21);
                 const uint64_t count = readU64(bytes, 29);
+                size_t cursor = fixedHeaderSize;
+                if (!readNodeSetField(bytes, cursor, committedVoters_) ||
+                    !readOptionalNodeSetField(bytes, cursor, jointOldVoters_) ||
+                    !readOptionalNodeSetField(bytes, cursor, jointNewVoters_)) {
+                    throw std::runtime_error("RaftConsensusRuntime: corrupt log membership header");
+                }
+                if (committedVoters_.empty() || cursor + 4 > bytes.size()) {
+                    throw std::runtime_error("RaftConsensusRuntime: invalid log membership header");
+                }
+                const size_t headerCrcOffset = cursor;
+                if (readU32(bytes, headerCrcOffset) != crcBytes(std::span<const uint8_t>{bytes.data(), headerCrcOffset})) {
+                    throw std::runtime_error("RaftConsensusRuntime: log header CRC mismatch");
+                }
+                cursor += 4;
 
-                size_t cursor = headerSize;
                 uint64_t lastGoodIndex = lastIncludedIndex_;
                 bool truncatedTail = false;
                 const auto canTruncateTail = [&] {
@@ -1510,7 +1632,7 @@ namespace akkaradb::engine::cluster {
                         break;
                     }
                     if (entry.kind != RaftEntryKind::MUTATION && entry.kind != RaftEntryKind::CONFIG_JOINT && entry.kind !=
-                        RaftEntryKind::CONFIG_FINAL && entry.kind != RaftEntryKind::BLOB) {
+                        RaftEntryKind::CONFIG_FINAL && entry.kind != RaftEntryKind::BLOB && entry.kind != RaftEntryKind::NOOP) {
                         failOrTruncate("invalid log entry kind");
                         break;
                     }
@@ -1522,7 +1644,7 @@ namespace akkaradb::engine::cluster {
                             break;
                         }
                     }
-                    else if (entry.op != ReplOpType::PUT && entry.op != ReplOpType::REMOVE) {
+                    else if (entry.kind != RaftEntryKind::NOOP && entry.op != ReplOpType::PUT && entry.op != ReplOpType::REMOVE) {
                         failOrTruncate("invalid log entry operation");
                         break;
                     }
@@ -1567,10 +1689,12 @@ namespace akkaradb::engine::cluster {
                     votedFor_ = selfNodeId_;
                     persistState();
                     resetLeaderReplicationState();
+                    log_.push_back(makeNoopEntryLocked());
+                    persistLog();
                     electionDeadline_ = Clock::now() + std::chrono::hours(24);
                 }
                 setRole(RaftRole::LEADER);
-                sendHeartbeats();
+                (void)commitOutstandingEntry(std::chrono::milliseconds{0});
             }
 
             void resetLeaderReplicationState() {
@@ -1632,18 +1756,22 @@ namespace akkaradb::engine::cluster {
                     persistState();
                 }
 
-                std::atomic<size_t> votes{1};
+                std::mutex votesMutex;
+                std::vector<uint64_t> grantedVotes{selfNodeId_};
                 std::vector<std::thread> workers;
                 for (const auto& peer : electionPeers) {
                     workers.emplace_back(
-                        [this, peer, term, lastIndex, lastTerm, &votes] {
+                        [this, peer, term, lastIndex, lastTerm, &votesMutex, &grantedVotes] {
                             RequestVoteResponse response;
                             if (requestVote(peer, RequestVote{term, selfNodeId_, lastIndex, lastTerm}, response)) {
                                 if (response.term > term) {
                                     becomeFollower(response.term);
                                     return;
                                 }
-                                if (response.voteGranted) { votes.fetch_add(1); }
+                                if (response.voteGranted) {
+                                    std::lock_guard lock{votesMutex};
+                                    grantedVotes.push_back(peer.nodeId);
+                                }
                             }
                         }
                     );
@@ -1653,7 +1781,8 @@ namespace akkaradb::engine::cluster {
                 bool won = false;
                 {
                     std::lock_guard lock{mutex_};
-                    won = running_ && currentTerm_ == term && role_.load() == RaftRole::CANDIDATE && votes.load() >= quorum();
+                    std::lock_guard votesLock{votesMutex};
+                    won = running_ && currentTerm_ == term && role_.load() == RaftRole::CANDIDATE && hasElectionQuorumLocked(grantedVotes);
                 }
                 if (won) { becomeLeader(term); }
             }
@@ -1721,7 +1850,8 @@ namespace akkaradb::engine::cluster {
                         return false;
                     }
                 }
-                if (!sendFrame(socket, secure.get(), encodeInstallSnapshot(request))) {
+                const auto wire = encodeInstallSnapshot(request);
+                if (wire.empty() || !sendFrame(socket, secure.get(), wire)) {
                     close();
                     return false;
                 }
@@ -1765,7 +1895,9 @@ namespace akkaradb::engine::cluster {
                     if (!writeSecureClientHello(socket, initiator.hello())) { return nullptr; }
                     crypto::ServerHello serverHello{};
                     if (!readSecureServerHello(socket, serverHello)) { return nullptr; }
-                    auto session = initiator.finish(serverHello, pinnedPeerKey(runtimeOptions_, peerNodeId));
+                    const auto expected = pinnedPeerKey(runtimeOptions_, peerNodeId);
+                    if (!expected) { return nullptr; }
+                    auto session = initiator.finish(serverHello, expected);
                     return std::make_unique<crypto::SecureSession>(std::move(session));
                 }
                 catch (...) { return nullptr; }
@@ -1786,27 +1918,111 @@ namespace akkaradb::engine::cluster {
             bool verifySecurePeer(uint64_t nodeId, const crypto::PublicKey& remotePublicKey) const {
                 if (runtimeOptions_.transportMode != TransportMode::SECURE) { return true; }
                 const auto expected = pinnedPeerKey(runtimeOptions_, nodeId);
-                return !expected || remotePublicKey == *expected;
+                return expected && remotePublicKey == *expected;
             }
 
-            bool buildInstallSnapshot(uint64_t term, InstallSnapshot& out) {
+            bool buildInstallSnapshotRequests(uint64_t term, std::vector<InstallSnapshot>& out) {
                 if (!callbacks_.exportSnapshot) { return false; }
                 const auto snapshot = callbacks_.exportSnapshot();
                 if (!snapshot || snapshot->seq == 0) { return false; }
-                std::lock_guard lock{mutex_};
-                auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
-                if (!logIndex && lastIncludedIndex_ > 0) { logIndex = lastIncludedIndex_; }
-                if (!logIndex || *logIndex > commitIndex_) { return false; }
-                out.term = term;
-                out.leaderId = selfNodeId_;
-                out.lastIncludedIndex = *logIndex;
-                out.lastIncludedTerm = termAt(*logIndex);
-                out.snapshotSeq = snapshot->seq;
-                out.entries.clear();
-                out.entries.reserve(snapshot->entries.size());
-                for (const auto& entry : snapshot->entries) {
-                    out.entries.push_back(SnapshotKvEntry{.key = entry.key, .value = entry.value});
+                uint64_t logIndexValue = 0;
+                uint64_t logTermValue = 0;
+                std::vector<NodeInfo> committedVoters;
+                std::optional<std::vector<NodeInfo>> jointOldVoters;
+                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                {
+                    std::lock_guard lock{mutex_};
+                    auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
+                    if (!logIndex && lastIncludedIndex_ > 0) { logIndex = lastIncludedIndex_; }
+                    if (!logIndex || *logIndex > commitIndex_) { return false; }
+                    logIndexValue = *logIndex;
+                    logTermValue = termAt(logIndexValue);
+                    committedVoters = committedVoters_;
+                    jointOldVoters = jointOldVoters_;
+                    jointNewVoters = jointNewVoters_;
                 }
+                if (logTermValue == 0) { return false; }
+
+                const auto makeRequest = [&] {
+                    InstallSnapshot request;
+                    request.term = term;
+                    request.leaderId = selfNodeId_;
+                    request.lastIncludedIndex = logIndexValue;
+                    request.lastIncludedTerm = logTermValue;
+                    request.snapshotSeq = snapshot->seq;
+                    request.entryCount = snapshot->entries.size();
+                    request.committedVoters = committedVoters;
+                    request.jointOldVoters = jointOldVoters;
+                    request.jointNewVoters = jointNewVoters;
+                    return request;
+                };
+
+                out.clear();
+                InstallSnapshot current = makeRequest();
+                const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
+                for (uint64_t entryIndex = 0; entryIndex < snapshot->entries.size(); ++entryIndex) {
+                    const auto& entry = snapshot->entries[static_cast<size_t>(entryIndex)];
+                    const uint32_t valueCrc32c = crcBytes(entry.value);
+                    size_t offset = 0;
+                    bool emittedEntryChunk = false;
+                    do {
+                        const size_t remaining = entry.value.size() - offset;
+                        size_t currentChunkSize = std::min(chunkSize, remaining);
+                        auto makeChunk = [&](size_t valueBytes) {
+                            SnapshotKvChunk chunk;
+                            chunk.entryIndex = entryIndex;
+                            chunk.valueOffset = offset;
+                            chunk.valueSize = entry.value.size();
+                            chunk.valueCrc32c = valueCrc32c;
+                            if (offset == 0) { chunk.key = entry.key; }
+                            chunk.value.assign(
+                                entry.value.begin() + static_cast<std::ptrdiff_t>(offset),
+                                entry.value.begin() + static_cast<std::ptrdiff_t>(offset + valueBytes)
+                            );
+                            return chunk;
+                        };
+                        SnapshotKvChunk chunk = makeChunk(currentChunkSize);
+                        InstallSnapshot candidate = current;
+                        candidate.chunks.push_back(chunk);
+                        if (encodeInstallSnapshot(candidate).empty() && !current.chunks.empty()) {
+                            out.push_back(std::move(current));
+                            current = makeRequest();
+                            candidate = current;
+                            candidate.chunks.push_back(chunk);
+                        }
+                        if (encodeInstallSnapshot(candidate).empty()) {
+                            if (currentChunkSize == 0) { return false; }
+                            size_t low = 1;
+                            size_t high = currentChunkSize;
+                            size_t best = 0;
+                            while (low <= high) {
+                                const size_t mid = low + (high - low) / 2;
+                                chunk = makeChunk(mid);
+                                candidate = current;
+                                candidate.chunks.push_back(chunk);
+                                if (encodeInstallSnapshot(candidate).empty()) {
+                                    high = mid - 1;
+                                }
+                                else {
+                                    best = mid;
+                                    low = mid + 1;
+                                }
+                            }
+                            if (best == 0) { return false; }
+                            currentChunkSize = best;
+                            chunk = makeChunk(currentChunkSize);
+                            candidate = current;
+                            candidate.chunks.push_back(std::move(chunk));
+                        }
+                        current = std::move(candidate);
+                        offset += currentChunkSize;
+                        emittedEntryChunk = true;
+                    }
+                    while (offset < entry.value.size() || !emittedEntryChunk);
+                }
+                if (!current.chunks.empty() || snapshot->entries.empty()) { out.push_back(std::move(current)); }
+                if (out.empty()) { return false; }
+                out.back().done = true;
                 return true;
             }
 
@@ -1927,6 +2143,25 @@ namespace akkaradb::engine::cluster {
                 ensurePeerReplicationTargetsLocked();
             }
 
+            bool applySnapshotMembershipLocked(const InstallSnapshot& request) {
+                if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) {
+                    return false;
+                }
+                committedVoters_ = sortedUniqueVoters(request.committedVoters);
+                if (request.jointOldVoters && request.jointNewVoters) {
+                    jointOldVoters_ = sortedUniqueVoters(*request.jointOldVoters);
+                    jointNewVoters_ = sortedUniqueVoters(*request.jointNewVoters);
+                    if (jointOldVoters_->empty() || jointNewVoters_->empty()) { return false; }
+                }
+                else {
+                    jointOldVoters_.reset();
+                    jointNewVoters_.reset();
+                }
+                refreshPeersFromMembershipLocked();
+                ensurePeerReplicationTargetsLocked();
+                return true;
+            }
+
             void replayCommittedMembership() {
                 for (const auto& entry : log_) {
                     if (entry.index > commitIndex_) { break; }
@@ -1977,7 +2212,7 @@ namespace akkaradb::engine::cluster {
                 {
                     std::lock_guard lock{mutex_};
                     if (role_.load() != RaftRole::LEADER || currentTerm_ != term) { return false; }
-                    if (entry.index > commitIndex_) {
+                    if (entry.index > commitIndex_ && canCommitEntryLocked(entry)) {
                         commitIndex_ = entry.index;
                         if (entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) {
                             applyConfigEntryLocked(entry);
@@ -2021,15 +2256,17 @@ namespace akkaradb::engine::cluster {
                     forceHeartbeat = false;
 
                     if (needsSnapshot) {
-                        InstallSnapshot snapshotRequest;
-                        if (!buildInstallSnapshot(requestTerm, snapshotRequest)) { return false; }
+                        std::vector<InstallSnapshot> snapshotRequests;
+                        if (!buildInstallSnapshotRequests(requestTerm, snapshotRequests)) { return false; }
                         InstallSnapshotResponse response;
-                        if (!installSnapshot(peer, snapshotRequest, response)) { return false; }
-                        if (response.term > requestTerm) {
-                            becomeFollower(response.term);
-                            return false;
+                        for (const auto& snapshotRequest : snapshotRequests) {
+                            if (!installSnapshot(peer, snapshotRequest, response)) { return false; }
+                            if (response.term > requestTerm) {
+                                becomeFollower(response.term);
+                                return false;
+                            }
+                            if (!response.success) { return false; }
                         }
-                        if (!response.success) { return false; }
                         std::lock_guard lock{mutex_};
                         if (auto* state = peerState(peerId); state != nullptr) {
                             state->matchIndex = std::max(state->matchIndex, response.lastIncludedIndex);
@@ -2052,7 +2289,9 @@ namespace akkaradb::engine::cluster {
                         state->nextIndex = state->matchIndex + 1;
                     }
                     else {
-                        state->nextIndex = response.matchIndex > 0 ? response.matchIndex + 1 : state->nextIndex - 1;
+                        const uint64_t hintedNextIndex = response.matchIndex + 1;
+                        if (hintedNextIndex > 0 && hintedNextIndex < state->nextIndex) { state->nextIndex = hintedNextIndex; }
+                        else { --state->nextIndex; }
                         if (state->nextIndex == 0) { state->nextIndex = 1; }
                     }
                 }
@@ -2087,8 +2326,22 @@ namespace akkaradb::engine::cluster {
                     SocketHandle client = ::accept(listenSock_, nullptr, nullptr);
                     if (!socketOk(client)) { return; }
                     setTimeouts(client, 1000);
-                    std::lock_guard lock{clientThreadsMutex_};
-                    clientThreads_.emplace_back([this, client] { handleClient(client); });
+                    const size_t active = activeClientHandlers_.fetch_add(1, std::memory_order_acq_rel);
+                    if (active >= MAX_RAFT_CLIENT_HANDLERS) {
+                        activeClientHandlers_.fetch_sub(1, std::memory_order_acq_rel);
+                        closeSocket(client);
+                        continue;
+                    }
+                    std::thread(
+                        [this, client] {
+                            try { handleClient(client); }
+                            catch (...) { closeSocket(client); }
+                            if (activeClientHandlers_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                                std::lock_guard lock{clientHandlersMutex_};
+                                clientHandlersCv_.notify_all();
+                            }
+                        }
+                    ).detach();
                 }
             }
 
@@ -2186,6 +2439,107 @@ namespace akkaradb::engine::cluster {
                 return TimeoutNowResponse{.term = responseTerm, .accepted = true};
             }
 
+            struct PendingSnapshotInstall {
+                bool active = false;
+                uint64_t snapshotSeq = 0;
+                uint64_t lastIncludedIndex = 0;
+                uint64_t lastIncludedTerm = 0;
+                uint64_t entryCount = 0;
+                std::vector<NodeInfo> committedVoters;
+                std::optional<std::vector<NodeInfo>> jointOldVoters;
+                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                uint64_t nextEntryIndex = 0;
+                bool hasCurrentEntry = false;
+                uint64_t currentEntryIndex = 0;
+                uint64_t currentValueSize = 0;
+                uint32_t currentValueCrc32c = 0;
+                std::vector<uint8_t> currentKey;
+                std::vector<uint8_t> currentValue;
+            };
+
+            bool applySnapshotChunkRequest(const InstallSnapshot& request) {
+                std::lock_guard applyLock{applyMutex_};
+                if (request.chunks.empty() && !request.done) { return false; }
+                if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) {
+                    return false;
+                }
+                const bool sameSnapshot = pendingSnapshotInstall_.active && pendingSnapshotInstall_.snapshotSeq == request.snapshotSeq &&
+                                          pendingSnapshotInstall_.lastIncludedIndex == request.lastIncludedIndex &&
+                                          pendingSnapshotInstall_.lastIncludedTerm == request.lastIncludedTerm &&
+                                          pendingSnapshotInstall_.entryCount == request.entryCount &&
+                                          sameNodeSet(pendingSnapshotInstall_.committedVoters, request.committedVoters) &&
+                                          sameOptionalNodeSet(pendingSnapshotInstall_.jointOldVoters, request.jointOldVoters) &&
+                                          sameOptionalNodeSet(pendingSnapshotInstall_.jointNewVoters, request.jointNewVoters);
+                if (pendingSnapshotInstall_.active && !sameSnapshot) { return false; }
+                const bool restartsSnapshot = sameSnapshot && !request.chunks.empty() &&
+                                              request.chunks.front().entryIndex == 0 && request.chunks.front().valueOffset == 0 &&
+                                              (pendingSnapshotInstall_.nextEntryIndex != 0 || pendingSnapshotInstall_.hasCurrentEntry);
+                if (!sameSnapshot || restartsSnapshot) {
+                    pendingSnapshotInstall_ = PendingSnapshotInstall{};
+                    pendingSnapshotInstall_.active = true;
+                    pendingSnapshotInstall_.snapshotSeq = request.snapshotSeq;
+                    pendingSnapshotInstall_.lastIncludedIndex = request.lastIncludedIndex;
+                    pendingSnapshotInstall_.lastIncludedTerm = request.lastIncludedTerm;
+                    pendingSnapshotInstall_.entryCount = request.entryCount;
+                    pendingSnapshotInstall_.committedVoters = request.committedVoters;
+                    pendingSnapshotInstall_.jointOldVoters = request.jointOldVoters;
+                    pendingSnapshotInstall_.jointNewVoters = request.jointNewVoters;
+                    if (callbacks_.beginSnapshot) { callbacks_.beginSnapshot(request.snapshotSeq, request.entryCount); }
+                }
+
+                for (const auto& chunk : request.chunks) {
+                    if (chunk.entryIndex >= pendingSnapshotInstall_.entryCount || chunk.valueOffset > chunk.valueSize ||
+                        chunk.value.size() > chunk.valueSize - chunk.valueOffset) {
+                        return false;
+                    }
+                    if (!pendingSnapshotInstall_.hasCurrentEntry) {
+                        if (chunk.entryIndex != pendingSnapshotInstall_.nextEntryIndex || chunk.valueOffset != 0) { return false; }
+                        pendingSnapshotInstall_.hasCurrentEntry = true;
+                        pendingSnapshotInstall_.currentEntryIndex = chunk.entryIndex;
+                        pendingSnapshotInstall_.currentValueSize = chunk.valueSize;
+                        pendingSnapshotInstall_.currentValueCrc32c = chunk.valueCrc32c;
+                        pendingSnapshotInstall_.currentKey = chunk.key;
+                        pendingSnapshotInstall_.currentValue.clear();
+                        pendingSnapshotInstall_.currentValue.reserve(
+                            static_cast<size_t>(std::min<uint64_t>(chunk.valueSize, runtimeOptions_.raftBlobChunkSizeBytes))
+                        );
+                    }
+                    else if (chunk.entryIndex != pendingSnapshotInstall_.currentEntryIndex || !chunk.key.empty()) {
+                        return false;
+                    }
+
+                    if (pendingSnapshotInstall_.currentValueSize != chunk.valueSize ||
+                        pendingSnapshotInstall_.currentValueCrc32c != chunk.valueCrc32c ||
+                        pendingSnapshotInstall_.currentValue.size() != chunk.valueOffset) {
+                        return false;
+                    }
+                    pendingSnapshotInstall_.currentValue.insert(
+                        pendingSnapshotInstall_.currentValue.end(),
+                        chunk.value.begin(),
+                        chunk.value.end()
+                    );
+                    if (pendingSnapshotInstall_.currentValue.size() == pendingSnapshotInstall_.currentValueSize) {
+                        if (crcBytes(pendingSnapshotInstall_.currentValue) != pendingSnapshotInstall_.currentValueCrc32c) { return false; }
+                        if (callbacks_.applySnapshotEntry) {
+                            callbacks_.applySnapshotEntry(pendingSnapshotInstall_.currentKey, pendingSnapshotInstall_.currentValue);
+                        }
+                        ++pendingSnapshotInstall_.nextEntryIndex;
+                        pendingSnapshotInstall_.currentKey.clear();
+                        pendingSnapshotInstall_.currentValue.clear();
+                        pendingSnapshotInstall_.hasCurrentEntry = false;
+                    }
+                }
+
+                if (!request.done) { return true; }
+                if (pendingSnapshotInstall_.hasCurrentEntry || pendingSnapshotInstall_.nextEntryIndex != pendingSnapshotInstall_.entryCount) {
+                    return false;
+                }
+                if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq); }
+                if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
+                pendingSnapshotInstall_ = PendingSnapshotInstall{};
+                return true;
+            }
+
             InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
                 {
                     std::lock_guard lock{mutex_};
@@ -2204,14 +2558,29 @@ namespace akkaradb::engine::cluster {
                     }
                 }
 
-                if (callbacks_.beginSnapshot) { callbacks_.beginSnapshot(request.snapshotSeq, request.entries.size()); }
-                for (const auto& entry : request.entries) {
-                    if (callbacks_.applySnapshotEntry) { callbacks_.applySnapshotEntry(entry.key, entry.value); }
+                try {
+                    if (!applySnapshotChunkRequest(request)) {
+                        std::lock_guard lock{mutex_};
+                        return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
+                    }
                 }
-                if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq); }
-                if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
+                catch (...) {
+                    {
+                        std::lock_guard applyLock{applyMutex_};
+                        pendingSnapshotInstall_ = PendingSnapshotInstall{};
+                    }
+                    std::lock_guard lock{mutex_};
+                    return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
+                }
+                if (!request.done) {
+                    std::lock_guard lock{mutex_};
+                    return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
+                }
 
                 std::lock_guard lock{mutex_};
+                if (!applySnapshotMembershipLocked(request)) {
+                    return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
+                }
                 compactLogThrough(request.lastIncludedIndex, request.lastIncludedTerm);
                 persistLog();
                 return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
@@ -2235,25 +2604,31 @@ namespace akkaradb::engine::cluster {
                     if (request.prevLogIndex < lastIncludedIndex_) {
                         return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastIncludedIndex_};
                     }
-                    if (request.prevLogIndex > lastLogIndex() || termAt(request.prevLogIndex) != request.prevLogTerm) {
+                    if (request.prevLogIndex > lastLogIndex()) {
                         return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
+                    }
+                    if (termAt(request.prevLogIndex) != request.prevLogTerm) {
+                        return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = conflictMatchHint(request.prevLogIndex)};
                     }
 
                     uint64_t expectedIndex = request.prevLogIndex + 1;
+                    uint64_t acceptedMatchIndex = request.prevLogIndex;
                     for (const auto& entry : request.entries) {
                         if (entry.index != expectedIndex++) {
-                            return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
+                            return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = acceptedMatchIndex};
                         }
                         if (entry.index <= lastIncludedIndex_) { continue; }
                         const auto existing = entryAt(entry.index);
-                        if (existing && sameEntry(*existing, entry)) { continue; }
-                        std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
-                        log_.push_back(entry);
+                        if (!existing || !sameEntry(*existing, entry)) {
+                            std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
+                            log_.push_back(entry);
+                        }
+                        acceptedMatchIndex = entry.index;
                     }
 
-                    if (request.leaderCommit > commitIndex_) { commitIndex_ = std::min(request.leaderCommit, lastLogIndex()); }
+                    if (request.leaderCommit > commitIndex_) { commitIndex_ = std::min(request.leaderCommit, acceptedMatchIndex); }
                     persistLog();
-                    response = AppendEntriesResponse{.term = currentTerm_, .success = true, .matchIndex = lastLogIndex()};
+                    response = AppendEntriesResponse{.term = currentTerm_, .success = true, .matchIndex = acceptedMatchIndex};
                 }
                 applyCommitted();
                 return response;
@@ -2312,6 +2687,7 @@ namespace akkaradb::engine::cluster {
                     else if (entry.kind == RaftEntryKind::BLOB) {
                         applyBlobChunk(entry);
                     }
+                    else if (entry.kind == RaftEntryKind::NOOP) {}
                     else if (callbacks_.apply) {
                         callbacks_.apply(
                             entry.clientSeq == 0 ? entry.index : entry.clientSeq,
@@ -2359,13 +2735,15 @@ namespace akkaradb::engine::cluster {
             Clock::time_point electionDeadline_{};
             std::atomic<RaftRole> role_{RaftRole::FOLLOWER};
             std::mutex applyMutex_;
+            PendingSnapshotInstall pendingSnapshotInstall_;
             std::unordered_map<uint64_t, PendingBlobApply> pendingBlobApplies_;
 
             SocketHandle listenSock_ = BAD_SOCKET;
             std::thread acceptThread_;
             std::thread timerThread_;
-            std::mutex clientThreadsMutex_;
-            std::vector<std::thread> clientThreads_;
+            std::atomic<size_t> activeClientHandlers_{0};
+            std::mutex clientHandlersMutex_;
+            std::condition_variable clientHandlersCv_;
     };
 
     std::unique_ptr<RaftConsensusRuntime> RaftConsensusRuntime::create(

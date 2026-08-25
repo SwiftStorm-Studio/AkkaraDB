@@ -10,19 +10,25 @@
 // akkengine/src/engine/wal/WalRecovery.cpp
 #include "akk/engine/wal/WalRecovery.hpp"
 
+#include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
 #include "akk/engine/wal/WalFraming.hpp"
 
 #include <algorithm>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace akkaradb::engine::wal {
     namespace fs = std::filesystem;
 
     namespace {
+        static constexpr std::string_view SNAPSHOT_COMMIT_MAGIC = "AKSC1";
+
         struct SegmentFile {
             fs::path path;
             WalSegmentHeader header;
@@ -156,6 +162,16 @@ namespace akkaradb::engine::wal {
                 ++result.segmentsTruncated;
             }
         }
+
+        [[nodiscard]] std::optional<uint64_t> decodeSnapshotCommitCount(std::span<const uint8_t> value) noexcept {
+            if (value.size() != SNAPSHOT_COMMIT_MAGIC.size() + sizeof(uint64_t)) { return std::nullopt; }
+            if (!std::equal(SNAPSHOT_COMMIT_MAGIC.begin(), SNAPSHOT_COMMIT_MAGIC.end(), value.begin())) { return std::nullopt; }
+            uint64_t count = 0;
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+                count |= static_cast<uint64_t>(value[SNAPSHOT_COMMIT_MAGIC.size() + i]) << (i * 8);
+            }
+            return count;
+        }
     } // namespace
 
     WalRecoveryResult WalRecovery::recover(const WalRecoveryOptions& options, const Callback& callback) {
@@ -181,20 +197,61 @@ namespace akkaradb::engine::wal {
     }
 
     WalRecoveryResult WalRecovery::recoverInto(const WalRecoveryOptions& options, memtable::MemTable& memtable) {
-        WalRecoveryResult result = recover(
-            options,
-            [&](const WalRecoveredEntry& entry) {
-                memtable.put(
+        std::unordered_map<uint64_t, std::vector<WalRecoveredEntry>> pendingSnapshotBatches;
+        std::unordered_map<uint64_t, uint64_t> committedSnapshotCounts;
+        uint64_t appliedMaxSeq = 0;
+        const auto replayEntry = [&memtable](const WalRecoveredEntry& entry) {
+            const uint8_t flags = static_cast<uint8_t>(entry.flags & 0xffu);
+            if ((flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) {
+                memtable.remove(
                     std::span<const uint8_t>{entry.key.data(), entry.key.size()},
-                    std::span<const uint8_t>{entry.value.data(), entry.value.size()},
                     entry.seq,
-                    static_cast<uint8_t>(entry.flags & 0xffu),
                     entry.keyFp64,
                     0
                 );
+                return;
+            }
+            memtable.put(
+                std::span<const uint8_t>{entry.key.data(), entry.key.size()},
+                std::span<const uint8_t>{entry.value.data(), entry.value.size()},
+                entry.seq,
+                flags,
+                entry.keyFp64,
+                0
+            );
+        };
+
+        WalRecoveryResult result = recover(
+            options,
+            [&](const WalRecoveredEntry& entry) {
+                if ((entry.flags & WAL_FLAG_SNAPSHOT_COMMIT) != 0) {
+                    const auto expectedCount = decodeSnapshotCommitCount(entry.value);
+                    if (!expectedCount.has_value()) {
+                        throw std::runtime_error("WAL recovery found corrupt snapshot commit marker");
+                    }
+                    committedSnapshotCounts[entry.seq] = *expectedCount;
+                    return;
+                }
+                if ((entry.flags & WAL_FLAG_SNAPSHOT_RECORD) != 0) {
+                    pendingSnapshotBatches[entry.seq].push_back(entry);
+                    return;
+                }
+                replayEntry(entry);
+                appliedMaxSeq = std::max(appliedMaxSeq, entry.seq);
             }
         );
-        if (result.maxSeq > 0) { memtable.advanceSeq(result.maxSeq); }
+        for (const auto& [seq, expectedCount] : committedSnapshotCounts) {
+            const auto it = pendingSnapshotBatches.find(seq);
+            if (expectedCount == 0 && it == pendingSnapshotBatches.end()) { continue; }
+            if (it == pendingSnapshotBatches.end() || it->second.size() != expectedCount) {
+                throw std::runtime_error("WAL recovery found incomplete committed snapshot transaction");
+            }
+            for (const auto& snapshotEntry : it->second) {
+                replayEntry(snapshotEntry);
+                appliedMaxSeq = std::max(appliedMaxSeq, snapshotEntry.seq);
+            }
+        }
+        if (appliedMaxSeq > 0) { memtable.advanceSeq(appliedMaxSeq); }
         return result;
     }
 } // namespace akkaradb::engine::wal

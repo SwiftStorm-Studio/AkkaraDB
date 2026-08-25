@@ -214,7 +214,7 @@ namespace akkaradb::engine::cluster {
      */
     struct AKDB_API ClusterSecureOptions {
         std::filesystem::path identitySeedPath; ///< Persistent local identity seed; generated if missing.
-        std::vector<ClusterPeerPublicKeyPin> pinnedPeers; ///< Optional peer public-key pins by cluster node id.
+        std::vector<ClusterPeerPublicKeyPin> pinnedPeers; ///< Required peer public-key pins by cluster node id when transportMode=SECURE.
         uint64_t expectedPrimaryNodeId = 0; ///< Client-side expected primary id, or 0 if unknown.
     };
 

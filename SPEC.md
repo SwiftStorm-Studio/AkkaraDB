@@ -1543,12 +1543,12 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `clusterGroupId`, `clusterGroupEpoch` | 0 | Non-Raft group identity override; primary creates persisted defaults when zero |
 | `clusterMembershipPath` | empty | Non-Raft primary group state / replica membership state path |
 | `resetClusterMembership` | `false` | Explicitly allow a valid replica membership switch |
-| `corruptStateAction` | `FAIL_STARTUP` | Corrupt small cluster state files fail startup unless explicitly backed up/deleted and recreated |
+| `corruptStateAction` | `FAIL_STARTUP` | Corrupt small non-Raft cluster state files fail startup unless explicitly backed up/deleted and recreated. Raft hard state is always fail-fast and never resets persisted term/vote |
 | `raftLogRecoveryAction` | `FAIL_STARTUP` | Raft log corruption fails startup unless explicitly allowed to truncate only the uncommitted tail |
-| `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations |
-| `raftBlobChunkSizeBytes` | 1048576 | Maximum payload bytes per automatic `RAFT_LOG` Blob chunk; must fit one Raft AppendEntries frame |
+| `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations and uses reserved Blob-id namespaces so Raft-log Blob ids encode a 16-bit node id plus 46-bit seq, while snapshot Blob ids encode a 40-bit seq plus 22-bit snapshot-entry ordinal |
+| `raftBlobChunkSizeBytes` | 1048576 | Maximum payload bytes per automatic `RAFT_LOG` Blob and Raft snapshot chunk; must fit one Raft frame. Snapshot install streams entries into receiver staging instead of buffering the full snapshot in memory, records CRC32C per staged entry, externalizes large staged values to Blob refs before WAL finish, and finish recovery is WAL-transactional via snapshot record/commit markers |
 | `secure.identitySeedPath` | empty | Persistent identity seed path |
-| `secure.pinnedPeers` | empty | Peer public-key pins |
+| `secure.pinnedPeers` | empty | Peer public-key pins. `transportMode=SECURE` requires a pin for every accepted or dialed peer; use `PLAIN` only for explicitly unauthenticated test/local transport |
 | `secure.expectedPrimaryNodeId` | 0 | Expected primary id or unknown |
 
 ## 21. Statistics

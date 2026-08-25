@@ -19,6 +19,10 @@
 #include "akkaradb/Export.hpp"
 
 namespace akkaradb::engine::wal {
+    static constexpr uint16_t WAL_FLAG_SNAPSHOT_RECORD = 0x4000;
+    static constexpr uint16_t WAL_FLAG_SNAPSHOT_COMMIT = 0x8000;
+    static constexpr uint16_t WAL_FLAG_SNAPSHOT_MASK = WAL_FLAG_SNAPSHOT_RECORD | WAL_FLAG_SNAPSHOT_COMMIT;
+
     struct AKDB_API WalSegmentHeader {
         static constexpr uint32_t MAGIC = 0x414B5741; // "AKWA"
         static constexpr uint16_t VERSION = 0x0001;

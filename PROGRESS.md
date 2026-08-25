@@ -69,15 +69,14 @@ Completed:
 - Added explicit corrupt-state and Raft-log recovery policies to `ClusterRuntimeOptions`, defaulting to fail-fast startup rejection.
 - Tightened `ClusterConfig` binary loading by rejecting oversized host names and trailing bytes.
 - Made `RAFT_QUORUM` `activeNodes()` report the committed Raft membership view, using old/new voter union during joint consensus and stable node-id ordering.
-- Made `RAFT_QUORUM` reject Blob payload replication by default through `raftBlobPolicy=REJECT`; explicit `PRIMARY_SIDE_ONLY` allows primary-local Blob payloads outside Raft quorum and `RAFT_LOG` automatically chunk-commits Blob payload entries before Blob-reference mutations.
+- Made `RAFT_QUORUM` reject Blob payload replication by default through `raftBlobPolicy=REJECT`; explicit `PRIMARY_SIDE_ONLY` allows primary-local Blob payloads outside Raft quorum and `RAFT_LOG` automatically chunk-commits Blob payload entries before Blob-reference mutations. `RAFT_LOG` and snapshot Blob refs use reserved Blob-id namespaces to avoid leader-churn and multi-entry snapshot collisions, and Raft snapshot installation uses the same chunk boundary while streaming completed entries into CRC32C-protected receiver staging instead of buffering the full snapshot in memory. Snapshot finish externalizes large staged values before writing WAL snapshot record/commit markers, so recovery ignores uncommitted snapshot batches and replays committed batches atomically.
 - Added smoke coverage for handshake group identity roundtrip, implicit group switch rejection, explicit reset-based rejoin, multiple primary-created group instances from the same config, corrupt primary `cluster.membership` rejection, primary group state reuse after restart, and `ClusterRuntime` ACK quorum rejection for unknown or duplicate replica node ids.
-- Added smoke coverage for corrupt membership backup-and-recreate, Raft log trailing-byte fail-fast/truncate recovery policies, Raft active membership reporting across online voter add/remove, default Raft Blob rejection, explicit primary-side-only Raft Blob handling, chunked Raft-log Blob replication/recovery, and engine-level Raft Blob externalization.
+- Added smoke coverage for corrupt membership backup-and-recreate, Raft hard-state corruption fail-fast, Raft log trailing-byte fail-fast/truncate recovery policies, WAL snapshot transaction recovery, Raft active membership reporting across online voter add/remove and restart-after-compaction, chunked snapshot installation, default Raft Blob rejection, explicit primary-side-only Raft Blob handling, chunked Raft-log Blob replication/recovery, engine-level Raft Blob externalization, engine E2E large-Blob snapshot catch-up, snapshot staging CRC corruption rejection/retry, secure transport pin enforcement, and large-Blob writes across leader churn. Raft smoke enables deterministic node-id-ordered election timeouts and leader-sensitive writes/membership changes use retrying single-leader discovery instead of stale role snapshots.
 
 Verified:
 
 - `cmake --build . --target akkaradb_cluster_smoke_test --config Debug`
 - `builds/debug/bin/akkaradb_cluster_smoke_test.exe`
-- `ctest -R akkaradb_cluster_smoke_test --output-on-failure`
 - Cluster-related `git diff --check`
 
 Remaining before calling it fully production-ready:

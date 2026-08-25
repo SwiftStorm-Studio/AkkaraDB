@@ -395,8 +395,8 @@ namespace akkaradb::engine::cluster {
                         continue;
                     }
                     if (secure) {
-                        if (const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId); expected && secureRemotePublicKey != *
-                            expected) {
+                        const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId);
+                        if (!expected || secureRemotePublicKey != *expected) {
                             closeSocket(client);
                             continue;
                         }

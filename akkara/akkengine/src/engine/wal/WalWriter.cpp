@@ -676,7 +676,7 @@ namespace akkaradb::engine::wal {
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
                 uint64_t seq,
-                uint8_t flags,
+                uint16_t flags,
                 uint64_t precomputedFp64,
                 WalAppendAck ack
             ) {
@@ -744,7 +744,7 @@ namespace akkaradb::engine::wal {
         std::span<const uint8_t> key,
         std::span<const uint8_t> value,
         uint64_t seq,
-        uint8_t flags,
+        uint16_t flags,
         uint64_t precomputedFp64,
         WalAppendAck ack
     ) { impl_->append(key, value, seq, flags, precomputedFp64, ack); }

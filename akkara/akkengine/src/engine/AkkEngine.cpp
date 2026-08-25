@@ -17,6 +17,7 @@
 #include "akk/engine/generation/StorageGeneration.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/server/AkkApiServerProvider.hpp"
+#include "akk/engine/wal/WalFraming.hpp"
 #include "akk/engine/wal/WalRecovery.hpp"
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
@@ -64,10 +66,87 @@ namespace akkaradb::engine {
             if (requested != nullptr && std::strcmp(requested, point) == 0) { std::quick_exit(86); }
         }
 
+        void corruptSnapshotStagingAtTestPoint(const fs::path& path, const char* point) {
+            const char* requested = std::getenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
+            if (requested == nullptr || std::strcmp(requested, point) != 0) { return; }
+#ifdef _WIN32
+            (void)_putenv_s("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT", "");
+#else
+            (void)::unsetenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
+#endif
+
+            std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+            if (!file) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for test corruption"); }
+
+            constexpr std::streamoff firstRecordHeaderOffset = static_cast<std::streamoff>(5 + sizeof(uint64_t) + sizeof(uint64_t));
+            file.seekg(firstRecordHeaderOffset);
+            std::array<uint8_t, sizeof(uint32_t)> keyLenBytes{};
+            std::array<uint8_t, sizeof(uint64_t)> valueLenBytes{};
+            file.read(reinterpret_cast<char*>(keyLenBytes.data()), static_cast<std::streamsize>(keyLenBytes.size()));
+            file.read(reinterpret_cast<char*>(valueLenBytes.data()), static_cast<std::streamsize>(valueLenBytes.size()));
+            if (!file) { throw std::runtime_error("AkkEngine: failed to read replication snapshot staging header for test corruption"); }
+            uint32_t keyLen = 0;
+            for (size_t i = 0; i < keyLenBytes.size(); ++i) { keyLen |= static_cast<uint32_t>(keyLenBytes[i]) << (i * 8); }
+            uint64_t valueLen = 0;
+            for (size_t i = 0; i < valueLenBytes.size(); ++i) { valueLen |= static_cast<uint64_t>(valueLenBytes[i]) << (i * 8); }
+            if (valueLen == 0) {
+                throw std::runtime_error("AkkEngine: replication snapshot staging value is empty at test corruption point");
+            }
+
+            const std::streamoff firstValueByteOffset =
+                firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(uint64_t) + keyLen);
+            file.seekg(firstValueByteOffset);
+            char byte = 0;
+            file.get(byte);
+            if (!file) { throw std::runtime_error("AkkEngine: failed to read replication snapshot staging byte for test corruption"); }
+            byte = static_cast<char>(static_cast<unsigned char>(byte) ^ 0x5Au);
+            file.clear();
+            file.seekp(firstValueByteOffset);
+            file.put(byte);
+            file.flush();
+            if (!file) { throw std::runtime_error("AkkEngine: failed to corrupt replication snapshot staging byte"); }
+
+            std::ofstream marker{path.string() + ".corrupted", std::ios::binary | std::ios::trunc};
+            marker << "1";
+            if (!marker) { throw std::runtime_error("AkkEngine: failed to write replication snapshot staging corruption marker"); }
+        }
+
         [[nodiscard]] uint32_t nextPow2(uint32_t value) noexcept {
             uint32_t out = 1;
             while (out < value) { out <<= 1; }
             return out;
+        }
+
+        static constexpr uint64_t BLOB_ID_NAMESPACE_BITS = 2;
+        static constexpr uint64_t BLOB_ID_PAYLOAD_BITS = 64 - BLOB_ID_NAMESPACE_BITS;
+        static constexpr uint64_t BLOB_ID_NAMESPACE_RAFT_LOG = 1ULL << BLOB_ID_PAYLOAD_BITS;
+        static constexpr uint64_t BLOB_ID_NAMESPACE_SNAPSHOT = 2ULL << BLOB_ID_PAYLOAD_BITS;
+        static constexpr uint64_t LOCAL_BLOB_ID_LIMIT = 1ULL << BLOB_ID_PAYLOAD_BITS;
+
+        [[nodiscard]] uint64_t raftLogBlobId(uint64_t nodeId, uint64_t seq) {
+            constexpr uint64_t SEQ_BITS = 46;
+            constexpr uint64_t SEQ_MASK = (1ULL << SEQ_BITS) - 1ULL;
+            constexpr uint64_t MAX_NODE_ID = (1ULL << (BLOB_ID_PAYLOAD_BITS - SEQ_BITS)) - 1ULL;
+            if (nodeId == 0 || nodeId > MAX_NODE_ID) {
+                throw std::invalid_argument("AkkEngine: RAFT_LOG Blob nodeId is outside encodable range");
+            }
+            if (seq == 0 || seq > SEQ_MASK) {
+                throw std::overflow_error("AkkEngine: RAFT_LOG Blob sequence is outside encodable range");
+            }
+            return BLOB_ID_NAMESPACE_RAFT_LOG | (nodeId << SEQ_BITS) | seq;
+        }
+
+        [[nodiscard]] uint64_t snapshotBlobId(uint64_t seq, uint64_t ordinal) {
+            constexpr uint64_t ORDINAL_BITS = 22;
+            constexpr uint64_t ORDINAL_MASK = (1ULL << ORDINAL_BITS) - 1ULL;
+            constexpr uint64_t SEQ_MASK = (1ULL << (BLOB_ID_PAYLOAD_BITS - ORDINAL_BITS)) - 1ULL;
+            if (seq == 0 || seq > SEQ_MASK) {
+                throw std::overflow_error("AkkEngine: snapshot Blob sequence is outside encodable range");
+            }
+            if (ordinal == 0 || ordinal > ORDINAL_MASK) {
+                throw std::overflow_error("AkkEngine: snapshot Blob ordinal is outside encodable range");
+            }
+            return BLOB_ID_NAMESPACE_SNAPSHOT | (seq << ORDINAL_BITS) | ordinal;
         }
 
         [[nodiscard]] uint32_t shardsForThreads(uint32_t writers, uint32_t cap) noexcept {
@@ -201,6 +280,12 @@ namespace akkaradb::engine {
 
         void ensureDir(const fs::path& path) { if (!path.empty()) { fs::create_directories(path); } }
 
+        void removeFileIfExists(const fs::path& path) noexcept {
+            if (path.empty()) { return; }
+            std::error_code ec;
+            fs::remove(path, ec);
+        }
+
         void forceDurable(FILE* file) {
             if (file == nullptr) { return; }
             if (std::fflush(file) != 0) { throw std::runtime_error("AkkEngine: failed to flush Raft log"); }
@@ -209,6 +294,108 @@ namespace akkaradb::engine {
             #else
             if (::fsync(::fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
             #endif
+        }
+
+        void writeU32Le(std::ostream& out, uint32_t value) {
+            std::array<uint8_t, 4> bytes{};
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!out) { throw std::runtime_error("AkkEngine: failed to write snapshot staging record"); }
+        }
+
+        void writeU64Le(std::ostream& out, uint64_t value) {
+            std::array<uint8_t, 8> bytes{};
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            if (!out) { throw std::runtime_error("AkkEngine: failed to write snapshot staging record"); }
+        }
+
+        void appendU32Le(std::vector<uint8_t>& out, uint32_t value) {
+            for (size_t i = 0; i < sizeof(uint32_t); ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+        }
+
+        void appendU64Le(std::vector<uint8_t>& out, uint64_t value) {
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+        }
+
+        void readExact(std::istream& in, void* out, size_t bytes, const char* what) {
+            if (bytes == 0) { return; }
+            in.read(static_cast<char*>(out), static_cast<std::streamsize>(bytes));
+            if (!in) { throw std::runtime_error(std::string{"AkkEngine: failed to read snapshot staging "} + what); }
+        }
+
+        [[nodiscard]] uint32_t readU32Le(std::istream& in, const char* what) {
+            std::array<uint8_t, 4> bytes{};
+            readExact(in, bytes.data(), bytes.size(), what);
+            uint32_t out = 0;
+            for (size_t i = 0; i < bytes.size(); ++i) { out |= static_cast<uint32_t>(bytes[i]) << (i * 8); }
+            return out;
+        }
+
+        [[nodiscard]] uint64_t readU64Le(std::istream& in, const char* what) {
+            std::array<uint8_t, 8> bytes{};
+            readExact(in, bytes.data(), bytes.size(), what);
+            uint64_t out = 0;
+            for (size_t i = 0; i < bytes.size(); ++i) { out |= static_cast<uint64_t>(bytes[i]) << (i * 8); }
+            return out;
+        }
+
+        [[nodiscard]] uint32_t snapshotStagingRecordCrc(
+            uint32_t keyLen,
+            uint64_t valueLen,
+            std::span<const uint8_t> key,
+            std::span<const uint8_t> value
+        ) {
+            std::vector<uint8_t> crcInput;
+            crcInput.reserve(sizeof(uint32_t) + sizeof(uint64_t) + key.size() + value.size());
+            appendU32Le(crcInput, keyLen);
+            appendU64Le(crcInput, valueLen);
+            crcInput.insert(crcInput.end(), key.begin(), key.end());
+            crcInput.insert(crcInput.end(), value.begin(), value.end());
+            return blob::crc32c(crcInput);
+        }
+
+        void writeSnapshotStagingEntry(std::ostream& out, std::span<const uint8_t> key, std::span<const uint8_t> value) {
+            if (key.size() > UINT32_MAX) { throw std::invalid_argument("AkkEngine: replication snapshot key is too large"); }
+            const uint32_t keyLen = static_cast<uint32_t>(key.size());
+            const uint64_t valueLen = static_cast<uint64_t>(value.size());
+            writeU32Le(out, keyLen);
+            writeU64Le(out, valueLen);
+            if (!key.empty()) { out.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
+            if (!value.empty()) { out.write(reinterpret_cast<const char*>(value.data()), static_cast<std::streamsize>(value.size())); }
+            writeU32Le(out, snapshotStagingRecordCrc(keyLen, valueLen, key, value));
+            if (!out) { throw std::runtime_error("AkkEngine: failed to write replication snapshot staging entry"); }
+        }
+
+        struct SnapshotStagingEntry {
+            std::vector<uint8_t> key;
+            std::vector<uint8_t> value;
+        };
+
+        [[nodiscard]] SnapshotStagingEntry readSnapshotStagingEntry(std::istream& in) {
+            const uint32_t keyLen = readU32Le(in, "entry key length");
+            const uint64_t valueLen = readU64Le(in, "entry value length");
+            if (valueLen > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                throw std::runtime_error("AkkEngine: replication snapshot staged value is too large");
+            }
+            SnapshotStagingEntry entry;
+            entry.key.resize(keyLen);
+            entry.value.resize(static_cast<size_t>(valueLen));
+            readExact(in, entry.key.data(), entry.key.size(), "entry key");
+            readExact(in, entry.value.data(), entry.value.size(), "entry value");
+            const uint32_t storedCrc = readU32Le(in, "entry crc");
+            const uint32_t expectedCrc = snapshotStagingRecordCrc(keyLen, valueLen, entry.key, entry.value);
+            if (storedCrc != expectedCrc) {
+                throw std::runtime_error("AkkEngine: replication snapshot staging entry CRC mismatch");
+            }
+            return entry;
+        }
+
+        [[nodiscard]] std::vector<uint8_t> encodeSnapshotCommitValue(uint64_t recordCount) {
+            std::vector<uint8_t> out;
+            out.insert(out.end(), {'A', 'K', 'S', 'C', '1'});
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) { out.push_back(static_cast<uint8_t>(recordCount >> (i * 8))); }
+            return out;
         }
 
         [[nodiscard]] uint64_t loadOrCreateNodeId(const fs::path& path) {
@@ -445,7 +632,9 @@ namespace akkaradb::engine {
             bool snapshotInProgress = false;
             uint64_t pendingSnapshotSeq = 0;
             uint64_t pendingSnapshotEntryCount = 0;
-            std::vector<cluster::ClusterHistoryEntry> pendingSnapshotEntries;
+            uint64_t pendingSnapshotAppliedEntries = 0;
+            std::unordered_set<std::string> pendingSnapshotKeys;
+            std::ofstream pendingSnapshotOut;
 
             struct AppliedWrite {
                 uint64_t seq = 0;
@@ -554,6 +743,12 @@ namespace akkaradb::engine {
                         marker.term = term;
                         marker.index = index;
                         appendRecord(RecordType::COMMIT, marker);
+                        if (index > commitIndex_) { commitIndex_ = index; }
+                    }
+
+                    void observeCommitted(uint64_t index) {
+                        std::lock_guard lock{mutex_};
+                        if (index > lastIndex_) { lastIndex_ = index; }
                         if (index > commitIndex_) { commitIndex_ = index; }
                     }
 
@@ -842,6 +1037,9 @@ namespace akkaradb::engine {
 
             [[nodiscard]] std::vector<uint8_t> maybeExternalize(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
                 if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
+                if (seq >= LOCAL_BLOB_ID_LIMIT) {
+                    throw std::overflow_error("AkkEngine: local Blob sequence is outside encodable range");
+                }
 
                 blobManager->write(seq, value);
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
@@ -851,21 +1049,40 @@ namespace akkaradb::engine {
                 return ref;
             }
 
+            [[nodiscard]] std::vector<uint8_t> maybeExternalizeSnapshot(
+                uint64_t seq,
+                uint64_t ordinal,
+                std::span<const uint8_t> value,
+                uint8_t& flags
+            ) {
+                if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
+
+                const uint64_t blobId = snapshotBlobId(seq, ordinal);
+                blobManager->write(blobId, value);
+                std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
+                blob::encodeBlobRef(ref.data(), blob::BlobRef{blobId, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
+                flags |= MemHdr16::FLAG_BLOB;
+                return ref;
+            }
+
             [[nodiscard]] std::vector<uint8_t> maybeExternalizeRaft(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
                 if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
 
+                const uint64_t blobId = opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG
+                                            ? raftLogBlobId(nodeId, seq)
+                                            : seq;
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
-                blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
+                blob::encodeBlobRef(ref.data(), blob::BlobRef{blobId, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
                 flags |= MemHdr16::FLAG_BLOB;
 
                 if (opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG) {
                     if (!clusterRuntime) { throw std::runtime_error("AkkEngine: RAFT_LOG Blob policy requires cluster runtime"); }
-                    clusterRuntime->shipBlob(seq, seq, value);
+                    clusterRuntime->shipBlob(seq, blobId, value);
                     return ref;
                 }
 
-                blobManager->write(seq, value);
-                if (clusterRuntime) { clusterRuntime->shipBlob(seq, seq, value); }
+                blobManager->write(blobId, value);
+                if (clusterRuntime) { clusterRuntime->shipBlob(seq, blobId, value); }
                 return ref;
             }
 
@@ -1273,6 +1490,61 @@ namespace akkaradb::engine {
                 if (versionLog) { versionLog->markCommitted(seq); }
             }
 
+            [[nodiscard]] wal::WalAppendAck snapshotCommitWalAck() const noexcept {
+                return opts.wal.syncPolicy == wal::WalSyncPolicy::NEVER ? wal::WalAppendAck::WRITTEN : wal::WalAppendAck::SYNCED;
+            }
+
+            void appendSnapshotWalRecord(
+                uint64_t seq,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> storedValue,
+                uint8_t flags,
+                uint64_t precomputedFp64
+            ) {
+                if (!walWriter) { return; }
+                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
+                walWriter->append(
+                    key,
+                    storedValue,
+                    seq,
+                    static_cast<uint16_t>(flags) | wal::WAL_FLAG_SNAPSHOT_RECORD,
+                    fp64,
+                    wal::WalAppendAck::WRITTEN
+                );
+            }
+
+            void appendSnapshotWalCommit(uint64_t seq, uint64_t recordCount) {
+                if (!walWriter) { return; }
+                static constexpr std::array<uint8_t, 5> COMMIT_KEY = {'A', 'K', 'S', 'C', '1'};
+                const std::vector<uint8_t> value = encodeSnapshotCommitValue(recordCount);
+                walWriter->append(
+                    COMMIT_KEY,
+                    value,
+                    seq,
+                    wal::WAL_FLAG_SNAPSHOT_COMMIT,
+                    0,
+                    snapshotCommitWalAck()
+                );
+            }
+
+            void applySnapshotRecordMemory(
+                uint64_t seq,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> storedValue,
+                uint8_t flags,
+                uint64_t precomputedFp64 = 0,
+                uint64_t precomputedMiniKey = 0
+            ) {
+                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
+                const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
+                if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
+                else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
+                if (versionLog) {
+                    versionLog->appendDeferred(key, seq, 0, nowNs(), flags, storedValue);
+                    versionLog->markCommitted(seq);
+                }
+            }
+
             [[nodiscard]] AppliedWrite applyLocalPut(
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
@@ -1517,42 +1789,89 @@ namespace akkaradb::engine {
                                               : flags;
                 appendAll(seq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
                 memtable->advanceSeq(seq);
+                if (raftLog) { raftLog->observeCommitted(seq); }
+            }
+
+            [[nodiscard]] fs::path replicaSnapshotStagingPath() const {
+                return opts.paths.dataDir.empty()
+                           ? fs::path{"replication-snapshot.staging"}
+                           : opts.paths.dataDir / "replication-snapshot.staging";
+            }
+
+            void resetReplicaSnapshotStagingLocked() {
+                if (pendingSnapshotOut.is_open()) { pendingSnapshotOut.close(); }
+                removeFileIfExists(replicaSnapshotStagingPath());
+                snapshotInProgress = false;
+                pendingSnapshotSeq = 0;
+                pendingSnapshotEntryCount = 0;
+                pendingSnapshotAppliedEntries = 0;
+                pendingSnapshotKeys.clear();
             }
 
             void beginReplicaSnapshot(uint64_t seq, uint64_t entryCount) {
                 std::lock_guard lock(writeMu);
-                if (snapshotInProgress) { throw std::runtime_error("AkkEngine: received nested replication snapshot"); }
+                resetReplicaSnapshotStagingLocked();
+                const auto path = replicaSnapshotStagingPath();
+                ensureDir(path.parent_path());
+                pendingSnapshotOut.open(path, std::ios::binary | std::ios::trunc);
+                if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file"); }
+
+                static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
+                pendingSnapshotOut.write(SNAPSHOT_STAGING_MAGIC, sizeof(SNAPSHOT_STAGING_MAGIC));
+                writeU64Le(pendingSnapshotOut, seq);
+                writeU64Le(pendingSnapshotOut, entryCount);
+
                 snapshotInProgress = true;
                 pendingSnapshotSeq = seq;
                 pendingSnapshotEntryCount = entryCount;
-                pendingSnapshotEntries.clear();
-                pendingSnapshotEntries.reserve(static_cast<size_t>(std::min<uint64_t>(entryCount, SIZE_MAX)));
+                pendingSnapshotAppliedEntries = 0;
             }
 
             void stageReplicaSnapshotEntry(std::span<const uint8_t> key, std::span<const uint8_t> value) {
                 std::lock_guard lock(writeMu);
-                if (!snapshotInProgress) { throw std::runtime_error("AkkEngine: received replication snapshot entry without begin"); }
-                if (pendingSnapshotEntries.size() >= pendingSnapshotEntryCount) {
+                if (!snapshotInProgress || !pendingSnapshotOut.is_open()) {
+                    throw std::runtime_error("AkkEngine: received replication snapshot entry without begin");
+                }
+                if (pendingSnapshotAppliedEntries >= pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: replication snapshot has too many entries");
                 }
-                pendingSnapshotEntries.push_back(
-                    cluster::ClusterHistoryEntry{.key = {key.begin(), key.end()}, .value = {value.begin(), value.end()},}
-                );
+
+                const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(key.data()), key.size());
+                if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate keys"); }
+
+                writeSnapshotStagingEntry(pendingSnapshotOut, key, value);
+                ++pendingSnapshotAppliedEntries;
             }
 
             void finishReplicaSnapshot(uint64_t seq) {
                 std::lock_guard lock(writeMu);
-                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotEntries.size() != pendingSnapshotEntryCount) {
+                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotAppliedEntries != pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: invalid replication snapshot completion");
                 }
-
-                std::unordered_set<std::string> incomingKeys;
-                incomingKeys.reserve(pendingSnapshotEntries.size());
-                for (const auto& entry : pendingSnapshotEntries) {
-                    const auto [_, inserted] = incomingKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
-                    if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate keys"); }
+                if (pendingSnapshotOut.is_open()) {
+                    pendingSnapshotOut.flush();
+                    if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to flush replication snapshot staging file"); }
+                    pendingSnapshotOut.close();
                 }
 
+                const auto path = replicaSnapshotStagingPath();
+                corruptSnapshotStagingAtTestPoint(path, "snapshot.finish.before_staging_apply");
+                std::ifstream staged{path, std::ios::binary};
+                if (!staged) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for apply"); }
+
+                static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
+                std::array<char, sizeof(SNAPSHOT_STAGING_MAGIC)> magic{};
+                readExact(staged, magic.data(), magic.size(), "header");
+                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
+                    throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
+                }
+                const uint64_t stagedSeq = readU64Le(staged, "snapshot seq");
+                const uint64_t stagedEntryCount = readU64Le(staged, "entry count");
+                if (stagedSeq != seq || stagedEntryCount != pendingSnapshotEntryCount) {
+                    throw std::runtime_error("AkkEngine: replication snapshot staging metadata mismatch");
+                }
+
+                uint64_t snapshotWalRecordCount = 0;
                 core::BufferArena arena;
                 memtable::MemTable::KeyRange range;
                 const uint64_t visibleSeq = snapshotSeq();
@@ -1561,14 +1880,67 @@ namespace akkaradb::engine {
                 if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
-                    if (incomingKeys.find(key) == incomingKeys.end()) { appendAll(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0); }
+                    if (pendingSnapshotKeys.find(key) == pendingSnapshotKeys.end()) {
+                        appendSnapshotWalRecord(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0);
+                        ++snapshotWalRecordCount;
+                    }
                 }
-                for (const auto& entry : pendingSnapshotEntries) { appendAll(seq, entry.key, entry.value, MemHdr16::FLAG_NORMAL, 0); }
+
+                for (uint64_t i = 0; i < stagedEntryCount; ++i) {
+                    auto entry = readSnapshotStagingEntry(staged);
+                    uint8_t flags = MemHdr16::FLAG_NORMAL;
+                    std::vector<uint8_t> stored = maybeExternalizeSnapshot(seq, i + 1, entry.value, flags);
+                    appendSnapshotWalRecord(seq, entry.key, stored, flags, 0);
+                    ++snapshotWalRecordCount;
+                }
+
+                char trailing = 0;
+                if (staged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
+                staged.close();
+
+                if (walWriter) {
+                    crashAtTestPoint("snapshot.finish.after_wal_records");
+                    appendSnapshotWalCommit(seq, snapshotWalRecordCount);
+                    crashAtTestPoint("snapshot.finish.after_wal_commit");
+                }
+
+                core::BufferArena applyArena;
+                memtable::MemTable::KeyRange applyRange;
+                auto applyMt = memtable->iterator(applyRange, visibleSeq);
+                sst::SSTManager::Iterator applySst;
+                if (sstManager) { applySst = sstManager->scanIter({}, {}, visibleSeq); }
+                for (const auto& record : scanGenerator(applyArena, std::move(applyMt), std::move(applySst), blobManager.get())) {
+                    const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
+                    if (pendingSnapshotKeys.find(key) == pendingSnapshotKeys.end()) {
+                        applySnapshotRecordMemory(seq, record.key, {}, MemHdr16::FLAG_TOMBSTONE);
+                    }
+                }
+                crashAtTestPoint("snapshot.finish.after_tombstone_apply");
+                pendingSnapshotKeys.clear();
+
+                std::ifstream applyStaged{path, std::ios::binary};
+                if (!applyStaged) { throw std::runtime_error("AkkEngine: failed to reopen replication snapshot staging file for apply"); }
+                readExact(applyStaged, magic.data(), magic.size(), "header");
+                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
+                    throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
+                }
+                if (readU64Le(applyStaged, "snapshot seq") != seq ||
+                    readU64Le(applyStaged, "entry count") != stagedEntryCount) {
+                    throw std::runtime_error("AkkEngine: replication snapshot staging metadata changed during apply");
+                }
+                for (uint64_t i = 0; i < stagedEntryCount; ++i) {
+                    auto entry = readSnapshotStagingEntry(applyStaged);
+                    uint8_t flags = MemHdr16::FLAG_NORMAL;
+                    std::vector<uint8_t> stored = maybeExternalizeSnapshot(seq, i + 1, entry.value, flags);
+                    applySnapshotRecordMemory(seq, entry.key, stored, flags);
+                }
+                if (applyStaged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
+
                 memtable->advanceSeq(seq);
-                pendingSnapshotEntries.clear();
-                snapshotInProgress = false;
-                pendingSnapshotSeq = 0;
-                pendingSnapshotEntryCount = 0;
+                markWriteCommitted(seq);
+                if (raftLog) { raftLog->observeCommitted(seq); }
+                applyStaged.close();
+                resetReplicaSnapshotStagingLocked();
             }
 
             class WriteCoordinator {
@@ -1858,6 +2230,7 @@ namespace akkaradb::engine {
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
+        removeFileIfExists(impl.replicaSnapshotStagingPath());
         cluster::ConsistencyMode writeCoordinatorMode = cluster::ConsistencyMode::PRIMARY_ACK;
         if (impl.opts.components.manifestEnabled && !impl.opts.paths.manifestPath.empty()) {
             impl.manifest = manifest::Manifest::create(impl.opts.paths.manifestPath, impl.opts.manifest.fastMode);
@@ -2021,6 +2394,9 @@ namespace akkaradb::engine {
                 if (impl.opts.components.blobEnabled && raftBlobPolicy == cluster::RaftBlobPolicy::REJECT) {
                     throw std::invalid_argument("AkkEngine: RAFT_QUORUM does not support Blob payload replication");
                 }
+                const fs::path raftLogPath = impl.opts.paths.dataDir.empty() ? fs::path{"raft.log"} : impl.opts.paths.dataDir / "raft.log";
+                impl.raftLog = Impl::RaftLog::open(raftLogPath);
+                if (recoveredSeq > 0) { impl.raftLog->observeCommitted(recoveredSeq); }
             }
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
@@ -2035,6 +2411,7 @@ namespace akkaradb::engine {
                     const auto recovery = wal::WalRecovery::recover(
                         wal::WalRecoveryOptions{.walDir = impl.opts.paths.walDir},
                         [&](const wal::WalRecoveredEntry& item) {
+                            if ((item.flags & wal::WAL_FLAG_SNAPSHOT_MASK) != 0) { return; }
                             if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
                             const uint8_t flags = static_cast<uint8_t>(item.flags);
                             if ((flags & MemHdr16::FLAG_BLOB) != 0) {
@@ -2127,9 +2504,10 @@ namespace akkaradb::engine {
             impl.clusterRuntime->start();
         }
 
-        if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
+        if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM && !impl.raftLog) {
             const fs::path raftLogPath = impl.opts.paths.dataDir.empty() ? fs::path{"raft.log"} : impl.opts.paths.dataDir / "raft.log";
             impl.raftLog = Impl::RaftLog::open(raftLogPath);
+            if (recoveredSeq > 0) { impl.raftLog->observeCommitted(recoveredSeq); }
         }
 
         impl.writeCoordinator = impl.createWriteCoordinator(writeCoordinatorMode);
@@ -2641,6 +3019,12 @@ namespace akkaradb::engine {
                     impl_->clusterRuntime->close();
                     impl_->clusterRuntime.reset();
                 }
+            }
+        );
+        closeStep(
+            [&] {
+                std::lock_guard lock{impl_->writeMu};
+                impl_->resetReplicaSnapshotStagingLocked();
             }
         );
         closeStep([&] { if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); } });
