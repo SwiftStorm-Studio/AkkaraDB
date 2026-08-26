@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <condition_variable>
@@ -68,13 +69,28 @@ namespace akkaradb::engine::cluster {
         void netInit() {}
         #endif
 
+        void configureNoSigPipe(SocketHandle s) noexcept {
+            #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+            int enabled = 1;
+            (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+            #else
+            (void)s;
+            #endif
+        }
+
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) {
                 #ifdef _WIN32
                 const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
+                if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
-                const ssize_t rc = ::send(s, data + sent, size - sent, 0);
+                int flags = 0;
+                #ifdef MSG_NOSIGNAL
+                flags |= MSG_NOSIGNAL;
+                #endif
+                const ssize_t rc = ::send(s, data + sent, size - sent, flags);
+                if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 sent += static_cast<size_t>(rc);
@@ -87,8 +103,10 @@ namespace akkaradb::engine::cluster {
             while (got < size) {
                 #ifdef _WIN32
                 const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
+                if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
                 const ssize_t rc = ::recv(s, data + got, size - got, 0);
+                if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 got += static_cast<size_t>(rc);
@@ -121,7 +139,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::MAX_PAYLOAD_SIZE;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -347,6 +365,7 @@ namespace akkaradb::engine::cluster {
                 while (running.load()) {
                     SocketHandle client = ::accept(listenSock, nullptr, nullptr);
                     if (!socketOk(client)) { break; }
+                    configureNoSigPipe(client);
 
                     std::unique_ptr<crypto::SecureSession> secure;
                     crypto::PublicKey secureRemotePublicKey{};

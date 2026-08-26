@@ -13,6 +13,7 @@
 #include "akk/cpu/CRC32C.hpp"
 
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <cctype>
 #include <chrono>
@@ -31,6 +32,7 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -255,6 +257,50 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
+        std::filesystem::path makeTempPath(const std::filesystem::path& path, const char* context) {
+            static std::atomic<uint64_t> sequence{0};
+            const auto parent = path.parent_path();
+            const auto stem = path.filename().string();
+            #ifdef _WIN32
+            const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+            #else
+            const auto pid = static_cast<uint64_t>(::getpid());
+            #endif
+            for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
+                                    std::to_string(attempt);
+                auto candidate = parent / (stem + suffix);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error(std::string{context} + ": cannot allocate temp state file name");
+        }
+
+        #ifndef _WIN32
+        void syncParentDirectory(const std::filesystem::path& path, const char* context) {
+            const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
+            int flags = O_RDONLY;
+            #ifdef O_DIRECTORY
+            flags |= O_DIRECTORY;
+            #endif
+            const int fd = ::open(parent.c_str(), flags);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot open parent directory for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": parent directory sync failed"); }
+        }
+        #endif
+
+        void replaceFileAtomically(const std::filesystem::path& tmp, const std::filesystem::path& path, const char* context) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error(std::string{context} + ": atomic cluster group state replace failed");
+            }
+            #else
+            std::filesystem::rename(tmp, path);
+            syncParentDirectory(path, context);
+            #endif
+        }
+
         std::optional<GroupState> loadGroupState(
             const std::filesystem::path& path,
             CorruptClusterStateAction corruptAction,
@@ -298,7 +344,7 @@ namespace akkaradb::engine::cluster {
             writeLe32(bytes, 0);
             writeLe32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
 
-            const auto tmpPath = path.parent_path() / (path.filename().string() + ".tmp");
+            const auto tmpPath = makeTempPath(path, context);
             {
                 std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
                 if (!out) { throw std::runtime_error(std::string{context} + ": cannot create cluster group state"); }
@@ -307,7 +353,7 @@ namespace akkaradb::engine::cluster {
                 if (!out) { throw std::runtime_error(std::string{context} + ": cluster group state write failed"); }
             }
             syncFile(tmpPath, context);
-            std::filesystem::rename(tmpPath, path);
+            replaceFileAtomically(tmpPath, path, context);
         }
 
         GroupState loadOrCreatePrimaryGroup(
@@ -537,9 +583,15 @@ namespace akkaradb::engine::cluster {
                         std::move(clientOptions)
                     );
                     client_->setApplyCallback(callbacks_.apply);
-                    client_->setSnapshotCallbacks(callbacks_.beginSnapshot, callbacks_.applySnapshotEntry, callbacks_.finishSnapshot);
+                    client_->setSnapshotCallbacks(
+                        callbacks_.beginSnapshot,
+                        callbacks_.beginSnapshotEntry,
+                        callbacks_.appendSnapshotEntryChunk,
+                        callbacks_.finishSnapshotEntry,
+                        callbacks_.finishSnapshot
+                    );
                     client_->setForceDurableCallback(callbacks_.forceDurable);
-                    client_->setBlobCallback(callbacks_.applyBlob);
+                    client_->setBlobCallbacks(callbacks_.beginBlob, callbacks_.appendBlobChunk, callbacks_.finishBlob);
                     client_->start();
                 }
             }

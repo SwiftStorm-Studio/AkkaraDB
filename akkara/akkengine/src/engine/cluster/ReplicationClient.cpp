@@ -14,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -33,6 +34,7 @@
 #include <io.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -74,13 +76,79 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
+        void configureNoSigPipe(SocketHandle s) noexcept {
+            #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+            int enabled = 1;
+            (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+            #else
+            (void)s;
+            #endif
+        }
+
+        void setTimeouts(SocketHandle s, int timeoutMs) {
+            #ifdef _WIN32
+            const auto timeout = static_cast<DWORD>(timeoutMs);
+            ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            #else
+            timeval tv{};
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            #endif
+        }
+
+        bool setBlocking(SocketHandle s, bool blocking) noexcept {
+            #ifdef _WIN32
+            u_long mode = blocking ? 0u : 1u;
+            return ::ioctlsocket(s, FIONBIO, &mode) == 0;
+            #else
+            const int flags = ::fcntl(s, F_GETFL, 0);
+            if (flags < 0) { return false; }
+            const int nextFlags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+            return ::fcntl(s, F_SETFL, nextFlags) == 0;
+            #endif
+        }
+
+        bool waitForConnect(SocketHandle s, int timeoutMs) {
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(s, &writeSet);
+            timeval tv{};
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            #ifdef _WIN32
+            const int rc = ::select(0, nullptr, &writeSet, nullptr, &tv);
+            #else
+            int rc = 0;
+            do { rc = ::select(s + 1, nullptr, &writeSet, nullptr, &tv); }
+            while (rc < 0 && errno == EINTR);
+            #endif
+            if (rc <= 0) { return false; }
+            int error = 0;
+            #ifdef _WIN32
+            int len = sizeof(error);
+            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 && error == 0;
+            #else
+            socklen_t len = sizeof(error);
+            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
+            #endif
+        }
+
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
             size_t sent = 0;
             while (sent < size) {
                 #ifdef _WIN32
                 const int n = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
+                if (n < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
-                const ssize_t n = ::send(s, data + sent, size - sent, 0);
+                int flags = 0;
+                #ifdef MSG_NOSIGNAL
+                flags |= MSG_NOSIGNAL;
+                #endif
+                const ssize_t n = ::send(s, data + sent, size - sent, flags);
+                if (n < 0 && errno == EINTR) { continue; }
                 #endif
                 if (n <= 0) { return false; }
                 sent += static_cast<size_t>(n);
@@ -93,8 +161,10 @@ namespace akkaradb::engine::cluster {
             while (received < size) {
                 #ifdef _WIN32
                 const int n = ::recv(s, reinterpret_cast<char*>(data + received), static_cast<int>(size - received), 0);
+                if (n < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
                 const ssize_t n = ::recv(s, data + received, size - received, 0);
+                if (n < 0 && errno == EINTR) { continue; }
                 #endif
                 if (n <= 0) { return false; }
                 received += static_cast<size_t>(n);
@@ -125,7 +195,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::MAX_PAYLOAD_SIZE;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -230,6 +300,7 @@ namespace akkaradb::engine::cluster {
         }
 
         SocketHandle connectTo(const std::string& host, uint16_t port) {
+            constexpr int CONNECT_TIMEOUT_MS = 1000;
             ensureSocketRuntime();
 
             addrinfo hints{};
@@ -244,7 +315,25 @@ namespace akkaradb::engine::cluster {
             for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
                 socket = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
                 if (socket == INVALID_SOCKET_HANDLE) { continue; }
-                if (::connect(socket, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0) { break; }
+                configureNoSigPipe(socket);
+                setTimeouts(socket, CONNECT_TIMEOUT_MS);
+                if (!setBlocking(socket, false)) {
+                    closeSocket(socket);
+                    socket = INVALID_SOCKET_HANDLE;
+                    continue;
+                }
+                const int rc = ::connect(socket, it->ai_addr, static_cast<int>(it->ai_addrlen));
+                #ifdef _WIN32
+                const bool inProgress = rc != 0 && (::WSAGetLastError() == WSAEWOULDBLOCK || ::WSAGetLastError() == WSAEINPROGRESS ||
+                                                     ::WSAGetLastError() == WSAEINVAL);
+                #else
+                const bool inProgress = rc != 0 && errno == EINPROGRESS;
+                #endif
+                if (rc == 0 || (inProgress && waitForConnect(socket, CONNECT_TIMEOUT_MS))) {
+                    (void)setBlocking(socket, true);
+                    setTimeouts(socket, CONNECT_TIMEOUT_MS);
+                    break;
+                }
                 closeSocket(socket);
                 socket = INVALID_SOCKET_HANDLE;
             }
@@ -335,6 +424,50 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
+        std::filesystem::path makeTempPath(const std::filesystem::path& path) {
+            static std::atomic<uint64_t> sequence{0};
+            const auto parent = path.parent_path();
+            const auto stem = path.filename().string();
+            #ifdef _WIN32
+            const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+            #else
+            const auto pid = static_cast<uint64_t>(::getpid());
+            #endif
+            for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
+                                    std::to_string(attempt);
+                auto candidate = parent / (stem + suffix);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("ReplicationClient: cannot allocate temp membership state name");
+        }
+
+        #ifndef _WIN32
+        void syncParentDirectory(const std::filesystem::path& path) {
+            const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
+            int flags = O_RDONLY;
+            #ifdef O_DIRECTORY
+            flags |= O_DIRECTORY;
+            #endif
+            const int fd = ::open(parent.c_str(), flags);
+            if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot open membership parent directory for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: membership parent directory sync failed"); }
+        }
+        #endif
+
+        void replaceFileAtomically(const std::filesystem::path& tmp, const std::filesystem::path& path) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error("ReplicationClient: atomic membership state replace failed");
+            }
+            #else
+            std::filesystem::rename(tmp, path);
+            syncParentDirectory(path);
+            #endif
+        }
+
         std::optional<MembershipState> loadMembership(const std::filesystem::path& path, CorruptClusterStateAction corruptAction) {
             if (path.empty() || !std::filesystem::exists(path)) { return std::nullopt; }
             try {
@@ -374,7 +507,7 @@ namespace akkaradb::engine::cluster {
             writeLe32(bytes, 0);
             writeLe32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
 
-            const auto tmpPath = path.parent_path() / (path.filename().string() + ".tmp");
+            const auto tmpPath = makeTempPath(path);
             {
                 std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
                 if (!out) { throw std::runtime_error("ReplicationClient: cannot create cluster membership state"); }
@@ -383,7 +516,7 @@ namespace akkaradb::engine::cluster {
                 if (!out) { throw std::runtime_error("ReplicationClient: cluster membership state write failed"); }
             }
             syncFile(tmpPath);
-            std::filesystem::rename(tmpPath, path);
+            replaceFileAtomically(tmpPath, path);
         }
     } // namespace
 
@@ -414,9 +547,11 @@ namespace akkaradb::engine::cluster {
                 applyCallback_ = std::move(callback);
             }
 
-            void setBlobCallback(BlobCallback callback) {
+            void setBlobCallbacks(BlobBeginCallback begin, BlobChunkCallback chunk, BlobEndCallback end) {
                 std::lock_guard lock{callbackMutex_};
-                blobCallback_ = std::move(callback);
+                blobBeginCallback_ = std::move(begin);
+                blobChunkCallback_ = std::move(chunk);
+                blobEndCallback_ = std::move(end);
             }
 
             void setForceDurableCallback(std::function<void()> callback) {
@@ -424,10 +559,18 @@ namespace akkaradb::engine::cluster {
                 forceDurableCallback_ = std::move(callback);
             }
 
-            void setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end) {
+            void setSnapshotCallbacks(
+                SnapshotBeginCallback begin,
+                SnapshotEntryBeginCallback beginEntry,
+                SnapshotEntryChunkCallback chunk,
+                SnapshotEntryEndCallback endEntry,
+                SnapshotEndCallback end
+            ) {
                 std::lock_guard lock{callbackMutex_};
                 snapshotBeginCallback_ = std::move(begin);
-                snapshotEntryCallback_ = std::move(entry);
+                snapshotEntryBeginCallback_ = std::move(beginEntry);
+                snapshotEntryChunkCallback_ = std::move(chunk);
+                snapshotEntryEndCallback_ = std::move(endEntry);
                 snapshotEndCallback_ = std::move(end);
             }
 
@@ -617,12 +760,24 @@ namespace akkaradb::engine::cluster {
                     else if (frame.type == ReplMsgType::BLOB_PUT) {
                         ReplBlob blob;
                         if (!decodeBlob(frame.payload, blob)) { return; }
-                        BlobCallback callback;
+                        BlobBeginCallback beginCallback;
+                        BlobChunkCallback chunkCallback;
+                        BlobEndCallback endCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
-                            callback = blobCallback_;
+                            beginCallback = blobBeginCallback_;
+                            chunkCallback = blobChunkCallback_;
+                            endCallback = blobEndCallback_;
                         }
-                        if (callback) { callback(blob.seq, blob.blobId, blob.content); }
+                        if (beginCallback && chunkCallback && endCallback) {
+                            const uint32_t contentCrc32c = cpu::CRC32C(
+                                reinterpret_cast<const std::byte*>(blob.content.data()),
+                                blob.content.size()
+                            );
+                            beginCallback(blob.seq, blob.blobId, static_cast<uint64_t>(blob.content.size()), contentCrc32c);
+                            chunkCallback(blob.seq, blob.blobId, 0, blob.content);
+                            endCallback(blob.seq, blob.blobId);
+                        }
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_BEGIN) {
                         ReplSnapshotBegin begin;
@@ -640,13 +795,23 @@ namespace akkaradb::engine::cluster {
                     else if (frame.type == ReplMsgType::SNAPSHOT_ENTRY) {
                         ReplSnapshotEntry entry;
                         if (!receivingSnapshot || !decodeSnapshotEntry(frame.payload, entry)) { return; }
-                        SnapshotEntryCallback callback;
+                        SnapshotEntryBeginCallback beginCallback;
+                        SnapshotEntryChunkCallback chunkCallback;
+                        SnapshotEntryEndCallback endCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
-                            callback = snapshotEntryCallback_;
+                            beginCallback = snapshotEntryBeginCallback_;
+                            chunkCallback = snapshotEntryChunkCallback_;
+                            endCallback = snapshotEntryEndCallback_;
                         }
-                        if (!callback) { return; }
-                        callback(entry.key, entry.value);
+                        if (!beginCallback || !chunkCallback || !endCallback) { return; }
+                        const uint32_t valueCrc32c = cpu::CRC32C(
+                            reinterpret_cast<const std::byte*>(entry.value.data()),
+                            entry.value.size()
+                        );
+                        beginCallback(entry.key, static_cast<uint64_t>(entry.value.size()), valueCrc32c);
+                        chunkCallback(0, entry.value);
+                        endCallback();
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_END) {
                         uint64_t endSeq = 0;
@@ -683,10 +848,14 @@ namespace akkaradb::engine::cluster {
 
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;
-            BlobCallback blobCallback_;
+            BlobBeginCallback blobBeginCallback_;
+            BlobChunkCallback blobChunkCallback_;
+            BlobEndCallback blobEndCallback_;
             std::function<void()> forceDurableCallback_;
             SnapshotBeginCallback snapshotBeginCallback_;
-            SnapshotEntryCallback snapshotEntryCallback_;
+            SnapshotEntryBeginCallback snapshotEntryBeginCallback_;
+            SnapshotEntryChunkCallback snapshotEntryChunkCallback_;
+            SnapshotEntryEndCallback snapshotEntryEndCallback_;
             SnapshotEndCallback snapshotEndCallback_;
     };
 
@@ -718,12 +887,20 @@ namespace akkaradb::engine::cluster {
 
     void ReplicationClient::setApplyCallback(ApplyCallback callback) { impl_->setApplyCallback(std::move(callback)); }
 
-    void ReplicationClient::setBlobCallback(BlobCallback callback) { impl_->setBlobCallback(std::move(callback)); }
+    void ReplicationClient::setBlobCallbacks(BlobBeginCallback begin, BlobChunkCallback chunk, BlobEndCallback end) {
+        impl_->setBlobCallbacks(std::move(begin), std::move(chunk), std::move(end));
+    }
 
     void ReplicationClient::setForceDurableCallback(std::function<void()> callback) { impl_->setForceDurableCallback(std::move(callback)); }
 
-    void ReplicationClient::setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end) {
-        impl_->setSnapshotCallbacks(std::move(begin), std::move(entry), std::move(end));
+    void ReplicationClient::setSnapshotCallbacks(
+        SnapshotBeginCallback begin,
+        SnapshotEntryBeginCallback beginEntry,
+        SnapshotEntryChunkCallback chunk,
+        SnapshotEntryEndCallback endEntry,
+        SnapshotEndCallback end
+    ) {
+        impl_->setSnapshotCallbacks(std::move(begin), std::move(beginEntry), std::move(chunk), std::move(endEntry), std::move(end));
     }
 
     void ReplicationClient::start() { impl_->start(); }

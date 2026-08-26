@@ -62,6 +62,10 @@ uint64_t blobId,
             [[nodiscard]] std::filesystem::path blobPath(uint64_t blobId) const;
 
             void write(uint64_t blobId, std::span<const uint8_t> content);
+            void beginWrite(uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c);
+            void appendWriteChunk(uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk);
+            void finishWrite(uint64_t blobId);
+            void abortWrite(uint64_t blobId) noexcept;
 
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId) const;
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId, uint32_t expectedCrc32c) const;

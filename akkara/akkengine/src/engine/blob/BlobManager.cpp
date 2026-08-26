@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <zstd.h>
@@ -32,6 +33,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -95,6 +97,77 @@ namespace akkaradb::engine::blob {
             #endif
         }
 
+        class Crc32cStream {
+            public:
+                void update(std::span<const uint8_t> bytes) noexcept {
+                    for (const auto byte : bytes) { crc_ = (crc_ >> 8u) ^ table()[(crc_ ^ byte) & 0xffu]; }
+                }
+
+                [[nodiscard]] uint32_t finish() const noexcept { return ~crc_; }
+
+            private:
+                static const std::array<uint32_t, 256>& table() noexcept {
+                    static const std::array<uint32_t, 256> values = [] {
+                        std::array<uint32_t, 256> out{};
+                        for (uint32_t i = 0; i < out.size(); ++i) {
+                            uint32_t crc = i;
+                            for (uint32_t bit = 0; bit < 8; ++bit) {
+                                crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
+                            }
+                            out[i] = crc;
+                        }
+                        return out;
+                    }();
+                    return values;
+                }
+
+                uint32_t crc_ = 0xFFFFFFFFu;
+        };
+
+        [[nodiscard]] fs::path makeTempPath(const fs::path& path) {
+            static std::atomic<uint64_t> sequence{0};
+            #ifdef _WIN32
+            const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+            #else
+            const auto pid = static_cast<uint64_t>(::getpid());
+            #endif
+            const auto parent = path.parent_path();
+            const auto stem = path.filename().string();
+            for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+                auto candidate = parent / (stem + ".tmp." + std::to_string(pid) + "." +
+                                           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + "." +
+                                           std::to_string(attempt));
+                if (!fs::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("BlobManager: cannot allocate temp file name");
+        }
+
+        #ifndef _WIN32
+        void syncParentDirectory(const fs::path& path) {
+            const auto parent = path.parent_path().empty() ? fs::path{"."} : path.parent_path();
+            int flags = O_RDONLY;
+            #ifdef O_DIRECTORY
+            flags |= O_DIRECTORY;
+            #endif
+            const int fd = ::open(parent.c_str(), flags);
+            if (fd < 0) { throw std::runtime_error("BlobManager: cannot open parent directory for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error("BlobManager: parent directory sync failed"); }
+        }
+        #endif
+
+        void replaceFileAtomically(const fs::path& tmp, const fs::path& path) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error("BlobManager: rename tmp to akblob failed: " + path.string());
+            }
+            #else
+            fs::rename(tmp, path);
+            syncParentDirectory(path);
+            #endif
+        }
+
         void writeAll(FILE* f, const uint8_t* data, size_t size) {
             while (size > 0) {
                 const size_t n = fwrite(data, 1, size, f);
@@ -107,8 +180,7 @@ namespace akkaradb::engine::blob {
         void writeAtomicSplit(const fs::path& path, const uint8_t* header, size_t headerSize, const uint8_t* payload, size_t payloadSize) {
             fs::create_directories(path.parent_path());
 
-            fs::path tmp = path;
-            tmp += ".tmp";
+            const fs::path tmp = makeTempPath(path);
             {
                 FILE* f = openFileWrite(tmp);
                 if (!f) { throw std::runtime_error("BlobManager: cannot open tmp file: " + tmp.string()); }
@@ -126,17 +198,31 @@ namespace akkaradb::engine::blob {
                 }
             }
 
-            std::error_code ec;
-            fs::rename(tmp, path, ec);
-            if (ec) {
-                fs::remove(path, ec);
-                ec.clear();
-                fs::rename(tmp, path, ec);
-            }
-            if (ec) {
+            try { replaceFileAtomically(tmp, path); }
+            catch (...) {
+                std::error_code ec;
                 fs::remove(tmp, ec);
-                throw std::runtime_error("BlobManager: rename tmp to akblob failed: " + path.string());
+                throw;
             }
+        }
+
+        [[nodiscard]] AkBlobHeaderV5 readBlobHeaderOnly(const fs::path& path) {
+            FILE* f = openFileRead(path);
+            if (!f) { throw std::runtime_error("BlobManager: cannot open file: " + path.string()); }
+            uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+            try {
+                if (fread(headerBuf, 1, sizeof(headerBuf), f) != sizeof(headerBuf)) {
+                    throw std::runtime_error("BlobManager: cannot read header: " + path.string());
+                }
+                fclose(f);
+            }
+            catch (...) {
+                fclose(f);
+                throw;
+            }
+            auto header = deserializeBlobHeader(headerBuf);
+            if (!verifyBlobHeader(header)) { throw std::runtime_error("BlobManager: header corrupt: " + path.string()); }
+            return header;
         }
 
         [[nodiscard]] std::vector<uint8_t> readFile(const fs::path& path) {
@@ -200,6 +286,19 @@ namespace akkaradb::engine::blob {
             mutable std::atomic<uint64_t> blobsDeleted{0};
             mutable std::atomic<uint64_t> gcCycles{0};
 
+            struct PendingStreamingBlob {
+                fs::path path;
+                fs::path tmp;
+                FILE* file = nullptr;
+                uint64_t totalSize = 0;
+                uint64_t written = 0;
+                uint32_t expectedCrc32c = 0;
+                Crc32cStream crc;
+                bool skipExisting = false;
+            };
+
+            std::unordered_map<uint64_t, PendingStreamingBlob> pendingStreamingBlobs;
+
             [[nodiscard]] fs::path pathFor(uint64_t blobId) const {
                 const uint8_t hi = static_cast<uint8_t>(blobId >> 56u);
                 return blobDir / hex2(hi) / (hex16(blobId) + ".akblob");
@@ -217,7 +316,9 @@ namespace akkaradb::engine::blob {
                     if (ec) { break; }
                     if (!entry.is_regular_file(ec)) { continue; }
                     const auto name = entry.path().filename().string();
-                    if (name.ends_with(".akblob.tmp") || name.ends_with(".akblob.del")) { (void)removeQuiet(entry.path()); }
+                    if (name.find(".akblob.tmp.") != std::string::npos || name.ends_with(".akblob.tmp") || name.ends_with(".akblob.del")) {
+                        (void)removeQuiet(entry.path());
+                    }
                 }
             }
 
@@ -268,6 +369,114 @@ namespace akkaradb::engine::blob {
                     static_cast<uint64_t>(sizeof(headerBuf)) + static_cast<uint64_t>(payloadSize),
                     std::memory_order_relaxed
                 );
+            }
+
+            static void abortPendingNoThrow(PendingStreamingBlob& pending) noexcept {
+                if (pending.file != nullptr) {
+                    (void)fflush(pending.file);
+                    (void)fclose(pending.file);
+                    pending.file = nullptr;
+                }
+                if (!pending.tmp.empty()) {
+                    std::error_code ec;
+                    fs::remove(pending.tmp, ec);
+                }
+            }
+
+            void beginStreamingBlob(uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
+                if (pendingStreamingBlobs.contains(blobId)) {
+                    throw std::runtime_error("BlobManager: streaming blob write is already active");
+                }
+                const auto path = pathFor(blobId);
+                if (fs::exists(path)) {
+                    const auto header = readBlobHeaderOnly(path);
+                    if (header.blobId != blobId || header.totalSize != totalSize || header.contentCrc32c != contentCrc32c) {
+                        throw std::runtime_error("BlobManager: existing streaming blob metadata mismatch");
+                    }
+                    PendingStreamingBlob pending;
+                    pending.path = path;
+                    pending.totalSize = totalSize;
+                    pending.written = totalSize;
+                    pending.expectedCrc32c = contentCrc32c;
+                    pending.skipExisting = true;
+                    pendingStreamingBlobs.emplace(blobId, std::move(pending));
+                    return;
+                }
+
+                fs::create_directories(path.parent_path());
+                auto tmp = makeTempPath(path);
+                FILE* file = openFileWrite(tmp);
+                if (!file) { throw std::runtime_error("BlobManager: cannot open streaming tmp file: " + tmp.string()); }
+                PendingStreamingBlob pending;
+                pending.path = path;
+                pending.tmp = std::move(tmp);
+                pending.file = file;
+                pending.totalSize = totalSize;
+                pending.expectedCrc32c = contentCrc32c;
+                try {
+                    const auto header = buildBlobHeader(blobId, totalSize, totalSize, BlobCodec::NONE, contentCrc32c);
+                    uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+                    serializeBlobHeader(header, headerBuf);
+                    writeAll(pending.file, headerBuf, sizeof(headerBuf));
+                    pendingStreamingBlobs.emplace(blobId, std::move(pending));
+                }
+                catch (...) {
+                    abortPendingNoThrow(pending);
+                    throw;
+                }
+            }
+
+            void appendStreamingBlobChunk(uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk) {
+                auto it = pendingStreamingBlobs.find(blobId);
+                if (it == pendingStreamingBlobs.end()) { throw std::runtime_error("BlobManager: streaming blob write has not started"); }
+                auto& pending = it->second;
+                if (pending.skipExisting) { return; }
+                if (pending.file == nullptr || offset != pending.written || chunk.size() > pending.totalSize - pending.written) {
+                    throw std::runtime_error("BlobManager: invalid streaming blob chunk");
+                }
+                if (!chunk.empty()) { writeAll(pending.file, chunk.data(), chunk.size()); }
+                pending.crc.update(chunk);
+                pending.written += static_cast<uint64_t>(chunk.size());
+            }
+
+            void finishStreamingBlob(uint64_t blobId) {
+                auto it = pendingStreamingBlobs.find(blobId);
+                if (it == pendingStreamingBlobs.end()) { throw std::runtime_error("BlobManager: streaming blob write has not started"); }
+                auto pending = std::move(it->second);
+                pendingStreamingBlobs.erase(it);
+                if (pending.skipExisting) { return; }
+                try {
+                    if (pending.file == nullptr || pending.written != pending.totalSize || pending.crc.finish() != pending.expectedCrc32c) {
+                        throw std::runtime_error("BlobManager: streaming blob checksum or size mismatch");
+                    }
+                    syncFile(pending.file);
+                    fclose(pending.file);
+                    pending.file = nullptr;
+                    replaceFileAtomically(pending.tmp, pending.path);
+                    if (options.onBlobPut) {
+                        options.onBlobPut(
+                            blobId,
+                            pending.totalSize,
+                            pending.totalSize,
+                            pending.expectedCrc32c,
+                            static_cast<uint32_t>(BlobCodec::NONE)
+                        );
+                    }
+                    blobsWritten.fetch_add(1, std::memory_order_relaxed);
+                    bytesUncompressed.fetch_add(pending.totalSize, std::memory_order_relaxed);
+                    bytesOnDisk.fetch_add(static_cast<uint64_t>(AKBLOB_HEADER_SIZE_V5) + pending.totalSize, std::memory_order_relaxed);
+                }
+                catch (...) {
+                    abortPendingNoThrow(pending);
+                    throw;
+                }
+            }
+
+            void abortStreamingBlob(uint64_t blobId) noexcept {
+                const auto it = pendingStreamingBlobs.find(blobId);
+                if (it == pendingStreamingBlobs.end()) { return; }
+                abortPendingNoThrow(it->second);
+                pendingStreamingBlobs.erase(it);
             }
 
             void gcLoop() {
@@ -373,6 +582,30 @@ namespace akkaradb::engine::blob {
         std::lock_guard lock(impl_->writeMu);
         if (fs::exists(path)) { return; }
         impl_->writeBlob(blobId, content, path);
+    }
+
+    void BlobManager::beginWrite(uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
+        if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
+        std::lock_guard lock(impl_->writeMu);
+        impl_->beginStreamingBlob(blobId, totalSize, contentCrc32c);
+    }
+
+    void BlobManager::appendWriteChunk(uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk) {
+        if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
+        std::lock_guard lock(impl_->writeMu);
+        impl_->appendStreamingBlobChunk(blobId, offset, chunk);
+    }
+
+    void BlobManager::finishWrite(uint64_t blobId) {
+        if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
+        std::lock_guard lock(impl_->writeMu);
+        impl_->finishStreamingBlob(blobId);
+    }
+
+    void BlobManager::abortWrite(uint64_t blobId) noexcept {
+        if (!impl_) { return; }
+        std::lock_guard lock(impl_->writeMu);
+        impl_->abortStreamingBlob(blobId);
     }
 
     std::vector<uint8_t> BlobManager::read(uint64_t blobId) const {

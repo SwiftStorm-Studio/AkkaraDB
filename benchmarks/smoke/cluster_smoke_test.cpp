@@ -233,10 +233,10 @@ namespace {
         std::ifstream in(path, std::ios::binary);
         if (!in) { return 0; }
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 41) { return 0; }
+        if (bytes.size() < 5) { return 0; }
         const std::string_view magic{reinterpret_cast<const char*>(bytes.data()), 5};
-        if (magic != "AKRL4" && magic != "AKRL5") { return 0; }
-        return readU64Le(bytes, 13);
+        if (magic == "AKRL1" && bytes.size() >= 49) { return readU64Le(bytes, 21); }
+        return 0;
     }
 
     uint64_t nextPrng(uint64_t& state) noexcept {
@@ -302,13 +302,81 @@ namespace {
         std::string lastBlobContent;
         std::string pendingSnapshotKey;
         std::string pendingSnapshotValue;
+        std::filesystem::path durableStatePath;
         std::unique_ptr<ClusterRuntime> runtime;
+
+        void persistDurableStateLocked() const {
+            if (durableStatePath.empty()) { return; }
+            std::filesystem::create_directories(durableStatePath.parent_path());
+            const auto tmp = durableStatePath.parent_path() / (durableStatePath.filename().string() + ".tmp");
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            AKK_CLUSTER_CHECK(out.good());
+            const char magic[] = {'A', 'K', 'H', 'S', '1'};
+            out.write(magic, sizeof(magic));
+            const auto writeU64 = [&](uint64_t value) {
+                for (size_t i = 0; i < 8; ++i) { out.put(static_cast<char>(value >> (i * 8))); }
+            };
+            const auto writeString = [&](const std::string& value) {
+                writeU64(value.size());
+                out.write(value.data(), static_cast<std::streamsize>(value.size()));
+            };
+            writeU64(lastSeq.load());
+            writeString(lastKey);
+            writeString(lastValue);
+            writeU64(lastBlobSeq);
+            writeU64(lastBlobId);
+            writeString(lastBlobContent);
+            out.flush();
+            AKK_CLUSTER_CHECK(out.good());
+            out.close();
+            std::error_code ec;
+            std::filesystem::rename(tmp, durableStatePath, ec);
+            if (ec) {
+                std::filesystem::remove(durableStatePath, ec);
+                ec.clear();
+                std::filesystem::rename(tmp, durableStatePath, ec);
+            }
+            AKK_CLUSTER_CHECK(!ec);
+        }
+
+        void loadDurableState() {
+            if (durableStatePath.empty()) { return; }
+            std::ifstream in(durableStatePath, std::ios::binary);
+            if (!in) { return; }
+            const auto readU64 = [&]() -> uint64_t {
+                uint64_t value = 0;
+                for (size_t i = 0; i < 8; ++i) {
+                    const int ch = in.get();
+                    if (ch == EOF) { throw std::runtime_error("cluster smoke: truncated harness state"); }
+                    value |= static_cast<uint64_t>(static_cast<uint8_t>(ch)) << (i * 8);
+                }
+                return value;
+            };
+            const auto readString = [&]() -> std::string {
+                const uint64_t size = readU64();
+                if (size > 1024 * 1024) { throw std::runtime_error("cluster smoke: oversized harness state"); }
+                std::string value(static_cast<size_t>(size), '\0');
+                in.read(value.data(), static_cast<std::streamsize>(value.size()));
+                if (!in) { throw std::runtime_error("cluster smoke: truncated harness state string"); }
+                return value;
+            };
+            char magic[5]{};
+            in.read(magic, sizeof(magic));
+            if (!in || std::string_view{magic, sizeof(magic)} != "AKHS1") { return; }
+            lastSeq.store(readU64());
+            lastKey = readString();
+            lastValue = readString();
+            lastBlobSeq = readU64();
+            lastBlobId = readU64();
+            lastBlobContent = readString();
+        }
 
         void setState(uint64_t seq, std::span<const uint8_t> key, std::span<const uint8_t> value) {
             std::lock_guard lock{stateMutex};
             lastKey = textOf(key);
             lastValue = textOf(value);
             lastSeq.store(seq);
+            persistDurableStateLocked();
         }
 
         bool hasState(uint64_t seq, const std::string& key, const std::string& value) const {
@@ -330,6 +398,8 @@ namespace {
     ) {
         auto harness = std::make_unique<RuntimeHarness>();
         harness->nodeId = nodeId;
+        harness->durableStatePath = dir / "harness-state.bin";
+        harness->loadDurableState();
         options.transportMode = TransportMode::PLAIN;
         ClusterEngineCallbacks callbacks;
         callbacks.getLastSeq = [harness = harness.get()] { return harness->lastSeq.load(); };
@@ -355,17 +425,23 @@ namespace {
             harness->pendingSnapshotKey.clear();
             harness->pendingSnapshotValue.clear();
         };
-        callbacks.applySnapshotEntry = [harness = harness.get()](std::span<const uint8_t> key, std::span<const uint8_t> value) {
+        callbacks.beginSnapshotEntry = [harness = harness.get()](std::span<const uint8_t> key, uint64_t, uint32_t) {
             std::lock_guard lock{harness->stateMutex};
             harness->pendingSnapshotKey = textOf(key);
-            harness->pendingSnapshotValue = textOf(value);
+            harness->pendingSnapshotValue.clear();
         };
+        callbacks.appendSnapshotEntryChunk = [harness = harness.get()](uint64_t, std::span<const uint8_t> chunk) {
+            std::lock_guard lock{harness->stateMutex};
+            harness->pendingSnapshotValue += textOf(chunk);
+        };
+        callbacks.finishSnapshotEntry = [] {};
         callbacks.finishSnapshot = [harness = harness.get()](uint64_t snapshotSeq) {
             std::lock_guard lock{harness->stateMutex};
             harness->lastKey = harness->pendingSnapshotKey;
             harness->lastValue = harness->pendingSnapshotValue;
             harness->lastSeq.store(snapshotSeq);
             harness->snapshotsInstalled.fetch_add(1);
+            harness->persistDurableStateLocked();
         };
         callbacks.apply = [harness = harness.get()](
             uint64_t seq,
@@ -378,11 +454,23 @@ namespace {
             harness->setState(seq, key, value);
             harness->appliedCount.fetch_add(1);
         };
-        callbacks.applyBlob = [harness = harness.get()](uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+        callbacks.beginBlob = [harness = harness.get()](uint64_t seq, uint64_t blobId, uint64_t, uint32_t) {
             std::lock_guard lock{harness->stateMutex};
             harness->lastBlobSeq = seq;
             harness->lastBlobId = blobId;
-            harness->lastBlobContent = textOf(content);
+            harness->lastBlobContent.clear();
+        };
+        callbacks.appendBlobChunk = [harness = harness.get()](uint64_t, uint64_t, uint64_t, std::span<const uint8_t> chunk) {
+            std::lock_guard lock{harness->stateMutex};
+            harness->lastBlobContent += textOf(chunk);
+        };
+        callbacks.finishBlob = [harness = harness.get()](uint64_t, uint64_t) {
+            std::lock_guard lock{harness->stateMutex};
+            harness->persistDurableStateLocked();
+        };
+        callbacks.abortBlob = [harness = harness.get()](uint64_t, uint64_t) {
+            std::lock_guard lock{harness->stateMutex};
+            harness->lastBlobContent.clear();
         };
         callbacks.forceDurable = [harness = harness.get()] { harness->durableCount.fetch_add(1); };
         harness->runtime = ClusterRuntime::create(dir, cfg, nodeId, std::move(callbacks), options);
@@ -1253,6 +1341,46 @@ namespace {
         }
         AKK_CLUSTER_CHECK(rejected);
         AKK_CLUSTER_CHECK(std::filesystem::exists(statePath));
+    }
+
+    void testRaftDoesNotReplayAppliedEntryAfterRestart() {
+        const auto dir = makeTempDir("raft-applied-restart");
+        const ClusterConfig cfg{
+            {
+                node(1, 20141, 20241),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE},
+        };
+
+        auto first = makeRuntime(dir / "n1", cfg, 1);
+        first->runtime->start();
+        RuntimeHarness* nodes[] = {first.get()};
+        runOnLeader(
+            nodes,
+            [](RuntimeHarness& leader) {
+                leader.runtime->shipEntry(
+                    1,
+                    ReplOpType::PUT,
+                    bytesOf("applied-restart-key"),
+                    bytesOf("applied-restart-value"),
+                    0,
+                    leader.nodeId
+                );
+            },
+            std::chrono::milliseconds{8000}
+        );
+        AKK_CLUSTER_CHECK(first->hasState(1, "applied-restart-key", "applied-restart-value"));
+        first->runtime->close();
+        first.reset();
+
+        auto recovered = makeRuntime(dir / "n1", cfg, 1);
+        AKK_CLUSTER_CHECK(recovered->hasState(1, "applied-restart-key", "applied-restart-value"));
+        recovered->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return recovered->runtime->role() == NodeRole::PRIMARY; }));
+        AKK_CLUSTER_CHECK(recovered->appliedCount.load() == 0);
+        recovered->runtime->close();
     }
 
     void testRaftSnapshotInstallForCompactedFollower() {
@@ -2506,6 +2634,7 @@ int main() {
         testErsCodecRecovery();
         testRaftElectionAndLoopbackReplication();
         testRaftHardStateCorruptionFailsStartup();
+        testRaftDoesNotReplayAppliedEntryAfterRestart();
         testRaftSnapshotInstallForCompactedFollower();
         testRaftLeaderTransfer();
         testRaftOnlineMembershipChange();

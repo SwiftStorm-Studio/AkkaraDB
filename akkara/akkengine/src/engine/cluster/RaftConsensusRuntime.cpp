@@ -15,21 +15,21 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -113,6 +113,35 @@ namespace akkaradb::engine::cluster {
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         }
 
+        class Crc32cStream {
+            public:
+                void update(std::span<const uint8_t> bytes) noexcept {
+                    for (const auto byte : bytes) {
+                        crc_ = (crc_ >> 8u) ^ table()[(crc_ ^ byte) & 0xffu];
+                    }
+                }
+
+                [[nodiscard]] uint32_t finish() const noexcept { return ~crc_; }
+
+            private:
+                static const std::array<uint32_t, 256>& table() noexcept {
+                    static const std::array<uint32_t, 256> values = [] {
+                        std::array<uint32_t, 256> out{};
+                        for (uint32_t i = 0; i < out.size(); ++i) {
+                            uint32_t crc = i;
+                            for (uint32_t bit = 0; bit < 8; ++bit) {
+                                crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
+                            }
+                            out[i] = crc;
+                        }
+                        return out;
+                    }();
+                    return values;
+                }
+
+                uint32_t crc_ = 0xFFFFFFFFu;
+        };
+
         uint32_t crcWithZeroedField(std::vector<uint8_t> bytes, size_t crcOffset) {
             if (crcOffset + 4 > bytes.size()) { throw std::runtime_error("RaftConsensusRuntime: invalid CRC field"); }
             writeU32At(bytes, crcOffset, 0);
@@ -125,9 +154,53 @@ namespace akkaradb::engine::cluster {
             return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
         }
 
+        std::filesystem::path makeTempPath(const std::filesystem::path& path) {
+            static std::atomic<uint64_t> sequence{0};
+            const auto parent = path.parent_path();
+            const auto stem = path.filename().string();
+            #ifdef _WIN32
+            const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+            #else
+            const auto pid = static_cast<uint64_t>(::getpid());
+            #endif
+            for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
+                                    std::to_string(attempt);
+                auto candidate = parent / (stem + suffix);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("RaftConsensusRuntime: cannot allocate temp file name");
+        }
+
+        #ifndef _WIN32
+        void syncParentDirectory(const std::filesystem::path& path, const char* context) {
+            const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
+            int flags = O_RDONLY;
+            #ifdef O_DIRECTORY
+            flags |= O_DIRECTORY;
+            #endif
+            const int fd = ::open(parent.c_str(), flags);
+            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot open parent directory for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": parent directory sync failed"); }
+        }
+        #endif
+
+        void replaceFileAtomically(const std::filesystem::path& tmp, const std::filesystem::path& path, const char* context) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error(std::string{context} + ": atomic file replace failed");
+            }
+            #else
+            std::filesystem::rename(tmp, path);
+            syncParentDirectory(path, context);
+            #endif
+        }
+
         void writeFileAtomically(const std::filesystem::path& path, std::span<const uint8_t> bytes, const char* context) {
             if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
-            const auto tmp = path.parent_path() / (path.filename().string() + ".tmp");
+            const auto tmp = makeTempPath(path);
             {
                 std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
                 if (!out) { throw std::runtime_error(std::string{context} + ": cannot create temp file"); }
@@ -148,7 +221,53 @@ namespace akkaradb::engine::cluster {
             const int closeRc = ::close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
             #endif
-            std::filesystem::rename(tmp, path);
+            replaceFileAtomically(tmp, path, context);
+        }
+
+        void configureNoSigPipe(SocketHandle s) noexcept {
+            #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+            int enabled = 1;
+            (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+            #else
+            (void)s;
+            #endif
+        }
+
+        bool setBlocking(SocketHandle s, bool blocking) noexcept {
+            #ifdef _WIN32
+            u_long mode = blocking ? 0u : 1u;
+            return ::ioctlsocket(s, FIONBIO, &mode) == 0;
+            #else
+            const int flags = ::fcntl(s, F_GETFL, 0);
+            if (flags < 0) { return false; }
+            const int nextFlags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+            return ::fcntl(s, F_SETFL, nextFlags) == 0;
+            #endif
+        }
+
+        bool waitForConnect(SocketHandle s, int timeoutMs) {
+            fd_set writeSet;
+            FD_ZERO(&writeSet);
+            FD_SET(s, &writeSet);
+            timeval tv{};
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            #ifdef _WIN32
+            const int rc = ::select(0, nullptr, &writeSet, nullptr, &tv);
+            #else
+            int rc = 0;
+            do { rc = ::select(s + 1, nullptr, &writeSet, nullptr, &tv); }
+            while (rc < 0 && errno == EINTR);
+            #endif
+            if (rc <= 0) { return false; }
+            int error = 0;
+            #ifdef _WIN32
+            int len = sizeof(error);
+            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 && error == 0;
+            #else
+            socklen_t len = sizeof(error);
+            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
+            #endif
         }
 
         bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
@@ -156,8 +275,14 @@ namespace akkaradb::engine::cluster {
             while (sent < size) {
                 #ifdef _WIN32
                 const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
+                if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
-                const ssize_t rc = ::send(s, data + sent, size - sent, 0);
+                int flags = 0;
+                #ifdef MSG_NOSIGNAL
+                flags |= MSG_NOSIGNAL;
+                #endif
+                const ssize_t rc = ::send(s, data + sent, size - sent, flags);
+                if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 sent += static_cast<size_t>(rc);
@@ -170,8 +295,10 @@ namespace akkaradb::engine::cluster {
             while (got < size) {
                 #ifdef _WIN32
                 const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
+                if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
                 const ssize_t rc = ::recv(s, data + got, size - got, 0);
+                if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 got += static_cast<size_t>(rc);
@@ -214,6 +341,7 @@ namespace akkaradb::engine::cluster {
             for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
                 SocketHandle s = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
                 if (!socketOk(s)) { continue; }
+                configureNoSigPipe(s);
                 int reuse = 1;
                 ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
                 if (::bind(s, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0 && ::listen(s, 32) == 0) {
@@ -239,8 +367,22 @@ namespace akkaradb::engine::cluster {
             for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
                 SocketHandle s = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
                 if (!socketOk(s)) { continue; }
+                configureNoSigPipe(s);
                 setTimeouts(s, timeoutMs);
-                if (::connect(s, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0) {
+                if (!setBlocking(s, false)) {
+                    closeSocket(s);
+                    continue;
+                }
+                const int rc = ::connect(s, it->ai_addr, static_cast<int>(it->ai_addrlen));
+                #ifdef _WIN32
+                const bool inProgress = rc != 0 && (::WSAGetLastError() == WSAEWOULDBLOCK || ::WSAGetLastError() == WSAEINPROGRESS ||
+                                                     ::WSAGetLastError() == WSAEINVAL);
+                #else
+                const bool inProgress = rc != 0 && errno == EINPROGRESS;
+                #endif
+                if (rc == 0 || (inProgress && waitForConnect(s, timeoutMs))) {
+                    (void)setBlocking(s, true);
+                    setTimeouts(s, timeoutMs);
                     out = s;
                     break;
                 }
@@ -273,7 +415,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::MAX_PAYLOAD_SIZE;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -465,6 +607,8 @@ namespace akkaradb::engine::cluster {
             uint64_t term = 0;
             bool success = false;
             uint64_t matchIndex = 0;
+            uint64_t conflictIndex = 0;
+            uint64_t conflictTerm = 0;
         };
 
         struct SnapshotKvChunk {
@@ -523,7 +667,8 @@ namespace akkaradb::engine::cluster {
         }
 
         bool readNodeInfo(std::span<const uint8_t> in, size_t& cursor, NodeInfo& node) {
-            if (cursor + 28 > in.size()) { return false; }
+            constexpr size_t FIXED_NODE_INFO_SIZE = 24;
+            if (cursor + FIXED_NODE_INFO_SIZE > in.size()) { return false; }
             node.nodeId = readU64(in, cursor);
             cursor += 8;
             node.capabilities = readU32(in, cursor);
@@ -551,7 +696,8 @@ namespace akkaradb::engine::cluster {
             if (in.size() < 4) { return false; }
             const uint32_t count = readU32(in, 0);
             size_t cursor = 4;
-            if (count > (in.size() - cursor) / 28) { return false; }
+            constexpr size_t MIN_NODE_INFO_SIZE = 24;
+            if (count > (in.size() - cursor) / MIN_NODE_INFO_SIZE) { return false; }
             nodes.clear();
             nodes.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
@@ -711,14 +857,18 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.term);
             writeU8(out, rpc.success ? 1 : 0);
             writeU64(out, rpc.matchIndex);
+            writeU64(out, rpc.conflictIndex);
+            writeU64(out, rpc.conflictTerm);
             return encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE, out);
         }
 
         bool decodeAppendEntriesResponse(std::span<const uint8_t> in, AppendEntriesResponse& out) {
-            if (in.size() != 17) { return false; }
+            if (in.size() != 33) { return false; }
             out.term = readU64(in, 0);
             out.success = in[8] != 0;
             out.matchIndex = readU64(in, 9);
+            out.conflictIndex = readU64(in, 17);
+            out.conflictTerm = readU64(in, 25);
             return true;
         }
 
@@ -883,397 +1033,64 @@ namespace akkaradb::engine::cluster {
     }
 
     class RaftConsensusRuntime::Impl {
-        public:
-            Impl(
-                std::filesystem::path dbDir,
-                ClusterConfig config,
-                uint64_t selfNodeId,
-                ClusterEngineCallbacks callbacks,
-                ClusterRuntimeOptions runtimeOptions
-            )
-                : dbDir_{std::move(dbDir)},
-                  statePath_{dbDir_.empty() ? std::filesystem::path{"cluster-raft.state"} : dbDir_ / "cluster-raft.state"},
-                  logPath_{dbDir_.empty() ? std::filesystem::path{"cluster-raft.log"} : dbDir_ / "cluster-raft.log"},
-                  config_{std::move(config)},
-                  router_{config_},
-                  selfNodeId_{selfNodeId},
-                  callbacks_{std::move(callbacks)},
-                  runtimeOptions_{std::move(runtimeOptions)} {
-                config_.validate();
-                if (runtimeOptions_.raftBlobChunkSizeBytes == 0 ||
-                    runtimeOptions_.raftBlobChunkSizeBytes > maxRaftBlobChunkSizeBytes()) {
-                    throw std::invalid_argument("RaftConsensusRuntime: invalid Raft Blob chunk size");
-                }
-                self_ = config_.findById(selfNodeId_);
-                if (self_ == nullptr || !self_->dataBearing()) {
-                    throw std::invalid_argument("RaftConsensusRuntime: local node must be data-bearing");
-                }
-                if (runtimeOptions_.transportMode == TransportMode::SECURE) { localIdentity_ = loadSecureIdentity(runtimeOptions_); }
-                committedVoters_ = config_.dataNodes();
-                refreshPeersFromMembershipLocked();
-                if (config_.dataNodes().empty()) { throw std::invalid_argument("RaftConsensusRuntime: no data-bearing nodes"); }
-                recoverState();
-                recoverLog();
-                replayCommittedMembership();
-                if (commitIndex_ == 0 && callbacks_.getLastSeq) { commitIndex_ = std::min(lastLogIndex(), callbacks_.getLastSeq()); }
-            }
-
-            ~Impl() { close(); }
-
-            void start() {
-                {
-                    std::lock_guard lock{mutex_};
-                    if (running_) { return; }
-                    running_ = true;
-                    electionDeadline_ = nextElectionDeadline();
-                }
-                listenSock_ = listenOn(runtimeOptions_.replBindHost, self_->replPort);
-                acceptThread_ = std::thread([this] { acceptLoop(); });
-                timerThread_ = std::thread([this] { timerLoop(); });
-                applyCommitted();
-                if (peers_.empty()) { becomeLeader(currentTerm_ == 0 ? 1 : currentTerm_); }
-            }
-
-            void close() {
-                {
-                    std::lock_guard lock{mutex_};
-                    running_ = false;
-                }
-                shutdownSocket(listenSock_);
-                closeSocket(listenSock_);
-                listenSock_ = BAD_SOCKET;
-                cv_.notify_all();
-                if (acceptThread_.joinable()) { acceptThread_.join(); }
-                if (timerThread_.joinable()) { timerThread_.join(); }
-                std::unique_lock clientLock{clientHandlersMutex_};
-                clientHandlersCv_.wait(clientLock, [this] { return activeClientHandlers_.load() == 0; });
-            }
-
-            NodeRole role() const noexcept {
-                const auto role = role_.load();
-                if (role == RaftRole::LEADER) { return NodeRole::PRIMARY; }
-                return NodeRole::REPLICA;
-            }
-
-            std::vector<NodeInfo> activeNodes() const {
-                std::lock_guard lock{mutex_};
-                return replicationTargetsLocked();
-            }
-
-            const ClusterRouter& router() const noexcept { return router_; }
-
-            void shipEntry(
-                uint64_t seq,
-                ReplOpType op,
-                std::span<const uint8_t> key,
-                std::span<const uint8_t> value,
-                uint8_t recordFlags,
-                uint64_t sourceNodeId
-            ) {
-                maybeCompactLog();
-                (void)commitOutstandingEntry(std::chrono::milliseconds{20000});
-                RaftLogEntry entry;
-                uint64_t term = 0;
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() != RaftRole::LEADER) {
-                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                    }
-                    if (commitIndex_ != lastLogIndex()) {
-                        throw std::runtime_error("RaftConsensusRuntime: cannot accept a new proposal while a prior entry is uncommitted");
-                    }
-                    term = currentTerm_;
-                    entry.term = term;
-                    entry.index = lastLogIndex() + 1;
-                    entry.clientSeq = seq;
-                    entry.kind = RaftEntryKind::MUTATION;
-                    entry.op = op;
-                    entry.flags = recordFlags;
-                    entry.sourceNodeId = sourceNodeId;
-                    entry.key.assign(key.begin(), key.end());
-                    entry.value.assign(value.begin(), value.end());
-                    log_.push_back(entry);
-                    persistLog();
-                }
-
-                if (!replicateEntryToMajority(entry)) {
-                    throw std::runtime_error("RaftConsensusRuntime: failed to replicate entry to Raft majority");
-                }
-
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
-                        throw std::runtime_error("RaftConsensusRuntime: leadership changed before commit");
-                    }
-                    if (entry.index > commitIndex_) {
-                        commitIndex_ = entry.index;
-                        persistLog();
-                    }
-                }
-                applyCommitted();
-                sendHeartbeats();
-                maybeCompactLog();
-            }
-
-            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
-                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::REJECT) {
-                    throw std::runtime_error("RaftConsensusRuntime: RAFT_QUORUM does not support Blob payload replication");
-                }
-                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::PRIMARY_SIDE_ONLY) {
-                    if (role_.load() != RaftRole::LEADER) {
-                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                    }
-                    return;
-                }
-                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::RAFT_LOG) {
-                    std::vector<RaftLogEntry> entries;
-                    uint64_t term = 0;
-                    {
-                        std::lock_guard lock{mutex_};
-                        if (role_.load() != RaftRole::LEADER) {
-                            throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                        }
-                        term = currentTerm_;
-                        const uint32_t contentCrc32c = crcBytes(content);
-                        const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
-                        size_t offset = 0;
-                        do {
-                            const size_t remaining = content.size() - offset;
-                            const size_t currentChunkSize = std::min(chunkSize, remaining);
-                            RaftLogEntry entry;
-                            entry.term = term;
-                            entry.index = lastLogIndex() + entries.size() + 1;
-                            entry.clientSeq = seq;
-                            entry.kind = RaftEntryKind::BLOB;
-                            entry.op = ReplOpType::PUT;
-                            entry.flags = 0;
-                            entry.sourceNodeId = selfNodeId_;
-                            entry.key = encodeBlobChunkKey(
-                                RaftBlobChunk{
-                                    .blobId = blobId,
-                                    .offset = static_cast<uint64_t>(offset),
-                                    .totalSize = static_cast<uint64_t>(content.size()),
-                                    .contentCrc32c = contentCrc32c,
-                                }
-                            );
-                            entry.value.assign(content.begin() + static_cast<std::ptrdiff_t>(offset), content.begin() + static_cast<std::ptrdiff_t>(
-                                offset + currentChunkSize
-                            ));
-                            entries.push_back(std::move(entry));
-                            offset += currentChunkSize;
-                        }
-                        while (offset < content.size());
-                        log_.insert(log_.end(), entries.begin(), entries.end());
-                        persistLog();
-                    }
-
-                    const RaftLogEntry& lastEntry = entries.back();
-                    if (!replicateEntryToMajority(lastEntry)) {
-                        throw std::runtime_error("RaftConsensusRuntime: failed to replicate Blob payload to Raft majority");
-                    }
-
-                    {
-                        std::lock_guard lock{mutex_};
-                        if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
-                            throw std::runtime_error("RaftConsensusRuntime: leadership changed before Blob payload commit");
-                        }
-                        if (lastEntry.index > commitIndex_) {
-                            commitIndex_ = lastEntry.index;
-                            persistLog();
-                        }
-                    }
-                    applyCommitted();
-                    sendHeartbeats();
-                    maybeCompactLog();
-                    return;
-                }
-                throw std::runtime_error("RaftConsensusRuntime: unsupported Raft Blob policy");
-            }
-
-            void addVotingNode(const NodeInfo& node) {
-                if (!node.dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: Raft voting node must be data-bearing"); }
-                if (!onlineMembershipChangeEnabled()) {
-                    throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled");
-                }
-                (void)commitOutstandingEntry(std::chrono::milliseconds{20000});
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
-                bool finishExistingJoint = false;
-                std::optional<RaftLogEntry> pendingConfigEntry;
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() != RaftRole::LEADER) {
-                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                    }
-                    if (commitIndex_ != lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().
-                        kind == RaftEntryKind::CONFIG_FINAL)) {
-                        std::vector<NodeInfo> pendingNewVoters;
-                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && containsNode(pendingNewVoters, node.nodeId)) {
-                            pendingConfigEntry = log_.back();
-                        }
-                        else {
-                            throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
-                        }
-                    }
-                    else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointNewVoters_ && containsNode(*jointNewVoters_, node.nodeId) && !
-                            containsNode(committedVoters_, node.nodeId)) {
-                            newVoters = *jointNewVoters_;
-                            finishExistingJoint = true;
-                        }
-                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
-                    }
-                    else if (containsNode(committedVoters_, node.nodeId)) {
-                        throw std::invalid_argument("RaftConsensusRuntime: node is already a voting member");
-                    }
-                    else {
-                        oldVoters = committedVoters_;
-                        newVoters = committedVoters_;
-                        newVoters.push_back(node);
-                        newVoters = sortedUniqueVoters(std::move(newVoters));
-                    }
-                }
-                if (pendingConfigEntry) {
-                    appendReplicateAndCommitConfig(*pendingConfigEntry, false);
-                    if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
-                        std::vector<NodeInfo> finalVoters;
-                        if (!decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
-                            throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
-                        }
-                        RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, {}, finalVoters);
-                        appendReplicateAndCommitConfig(final);
-                    }
-                    return;
-                }
-                if (finishExistingJoint) {
-                    RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, {}, newVoters);
-                    appendReplicateAndCommitConfig(final);
-                    return;
-                }
-                proposeMembershipChange(oldVoters, newVoters);
-            }
-
-            void removeVotingNode(uint64_t nodeId) {
-                if (!onlineMembershipChangeEnabled()) {
-                    throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled");
-                }
-                (void)commitOutstandingEntry(std::chrono::milliseconds{20000});
-                if (nodeId == selfNodeId_) {
-                    throw std::runtime_error("RaftConsensusRuntime: removing the local leader is not supported by this API");
-                }
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
-                bool finishExistingJoint = false;
-                std::optional<RaftLogEntry> pendingConfigEntry;
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() != RaftRole::LEADER) {
-                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                    }
-                    if (commitIndex_ != lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().
-                        kind == RaftEntryKind::CONFIG_FINAL)) {
-                        std::vector<NodeInfo> pendingNewVoters;
-                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && !containsNode(pendingNewVoters, nodeId)) {
-                            pendingConfigEntry = log_.back();
-                        }
-                        else {
-                            throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
-                        }
-                    }
-                    else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointOldVoters_ && jointNewVoters_ && containsNode(*jointOldVoters_, nodeId) && !containsNode(
-                            *jointNewVoters_,
-                            nodeId
-                        )) {
-                            newVoters = *jointNewVoters_;
-                            finishExistingJoint = true;
-                        }
-                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
-                    }
-                    else if (!containsNode(committedVoters_, nodeId)) {
-                        throw std::invalid_argument("RaftConsensusRuntime: node is not a voting member");
-                    }
-                    else {
-                        oldVoters = committedVoters_;
-                        for (const auto& node : committedVoters_) { if (node.nodeId != nodeId) { newVoters.push_back(node); } }
-                        if (newVoters.empty()) {
-                            throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member");
-                        }
-                    }
-                }
-                if (pendingConfigEntry) {
-                    appendReplicateAndCommitConfig(*pendingConfigEntry, false);
-                    if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
-                        std::vector<NodeInfo> finalVoters;
-                        if (!decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
-                            throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
-                        }
-                        RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, {}, finalVoters);
-                        appendReplicateAndCommitConfig(final);
-                    }
-                    return;
-                }
-                if (finishExistingJoint) {
-                    RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, {}, newVoters);
-                    appendReplicateAndCommitConfig(final);
-                    return;
-                }
-                proposeMembershipChange(oldVoters, newVoters);
-            }
-
-            void transferLeadership(uint64_t targetNodeId) {
-                if (targetNodeId == selfNodeId_) { return; }
-                NodeInfo target;
-                uint64_t targetIndex = 0;
-                uint64_t term = 0;
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() != RaftRole::LEADER) {
-                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
-                    }
-                    if (!isVotingMemberLocked(targetNodeId)) {
-                        throw std::invalid_argument("RaftConsensusRuntime: transfer target is not a voting member");
-                    }
-                    auto* state = peerState(targetNodeId);
-                    if (state == nullptr) {
-                        throw std::invalid_argument("RaftConsensusRuntime: transfer target is not a replication peer");
-                    }
-                    target = state->node;
-                    targetIndex = lastLogIndex();
-                    term = currentTerm_;
-                }
-
-                if (!replicatePeerTo(targetNodeId, targetIndex)) {
-                    throw std::runtime_error("RaftConsensusRuntime: failed to catch up transfer target");
-                }
-                {
-                    std::lock_guard lock{mutex_};
-                    const auto* state = peerState(targetNodeId);
-                    if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
-                        throw std::runtime_error("RaftConsensusRuntime: leadership changed before transfer");
-                    }
-                    if (state == nullptr || state->matchIndex < targetIndex) {
-                        throw std::runtime_error("RaftConsensusRuntime: transfer target is not caught up");
-                    }
-                }
-
-                TimeoutNowResponse response;
-                if (!timeoutNow(target, TimeoutNow{.term = term, .leaderId = selfNodeId_, .targetId = targetNodeId}, response)) {
-                    throw std::runtime_error("RaftConsensusRuntime: failed to send leader transfer request");
-                }
-                if (response.term > term) {
-                    becomeFollower(response.term);
-                    throw std::runtime_error("RaftConsensusRuntime: leadership changed during transfer");
-                }
-                if (!response.accepted) { throw std::runtime_error("RaftConsensusRuntime: leader transfer target rejected request"); }
-                {
-                    std::lock_guard lock{mutex_};
-                    if (role_.load() == RaftRole::LEADER && currentTerm_ == term) { electionDeadline_ = nextElectionDeadline(); }
-                }
-                setRole(RaftRole::FOLLOWER);
-            }
-
         private:
+            struct PendingSnapshotInstall {
+                bool active = false;
+                uint64_t snapshotSeq = 0;
+                uint64_t lastIncludedIndex = 0;
+                uint64_t lastIncludedTerm = 0;
+                uint64_t entryCount = 0;
+                std::vector<NodeInfo> committedVoters;
+                std::optional<std::vector<NodeInfo>> jointOldVoters;
+                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                uint64_t nextEntryIndex = 0;
+                bool hasCurrentEntry = false;
+                uint64_t currentEntryIndex = 0;
+                uint64_t currentValueSize = 0;
+                uint64_t currentValueOffset = 0;
+                uint32_t currentValueCrc32c = 0;
+                std::vector<uint8_t> currentKey;
+                Crc32cStream currentValueCrc;
+            };
+
+            std::filesystem::path dbDir_;
+            std::filesystem::path statePath_;
+            std::filesystem::path logPath_;
+            ClusterConfig config_;
+            ClusterRouter router_;
+            uint64_t selfNodeId_ = 0;
+            const NodeInfo* self_ = nullptr;
+            std::vector<NodeInfo> peers_;
+            ClusterEngineCallbacks callbacks_;
+            ClusterRuntimeOptions runtimeOptions_;
+            crypto::NodeIdentity localIdentity_{};
+
+            mutable std::mutex mutex_;
+            std::condition_variable cv_;
+            bool running_ = false;
+            uint64_t currentTerm_ = 0;
+            uint64_t votedFor_ = 0;
+            uint64_t commitIndex_ = 0;
+            uint64_t lastApplied_ = 0;
+            uint64_t lastIncludedIndex_ = 0;
+            uint64_t lastIncludedTerm_ = 0;
+            std::vector<RaftLogEntry> log_;
+            std::vector<NodeInfo> committedVoters_;
+            std::optional<std::vector<NodeInfo>> jointOldVoters_;
+            std::optional<std::vector<NodeInfo>> jointNewVoters_;
+            std::vector<PeerReplicationState> peerReplication_;
+            Clock::time_point electionDeadline_{};
+            std::atomic<RaftRole> role_{RaftRole::FOLLOWER};
+            std::mutex applyMutex_;
+            PendingSnapshotInstall pendingSnapshotInstall_;
+
+            SocketHandle listenSock_ = BAD_SOCKET;
+            std::thread acceptThread_;
+            std::thread timerThread_;
+            std::atomic<size_t> activeClientHandlers_{0};
+            std::mutex clientHandlersMutex_;
+            std::condition_variable clientHandlersCv_;
+
             Clock::time_point nextElectionDeadline() {
                 const auto configuredAckTimeoutMs = config_.consistency().ackTimeoutMs;
                 const auto baseTimeoutMs = std::clamp<uint32_t>(std::max<uint32_t>(3000u, configuredAckTimeoutMs * 2u), 3000u, 6000u);
@@ -1289,11 +1106,6 @@ namespace akkaradb::engine::cluster {
                 static thread_local std::mt19937_64 rng{std::random_device{}()};
                 std::uniform_int_distribution<int> dist(static_cast<int>(baseTimeoutMs), static_cast<int>(baseTimeoutMs * 2u));
                 return Clock::now() + std::chrono::milliseconds(dist(rng));
-            }
-
-            size_t quorum() const {
-                const size_t voters = committedVoters_.empty() ? peers_.size() + 1 : committedVoters_.size();
-                return (voters / 2) + 1;
             }
 
             bool onlineMembershipChangeEnabled() const noexcept {
@@ -1337,7 +1149,7 @@ namespace akkaradb::engine::cluster {
                 }
                 else { refreshPeersFromMembershipLocked(); }
                 for (const auto& peer : peers_) {
-                    if (peerState(peer.nodeId) == nullptr) {
+                    if (this->peerState(peer.nodeId) == nullptr) {
                         peerReplication_.push_back(PeerReplicationState{.node = peer, .nextIndex = 1, .matchIndex = 0});
                     }
                 }
@@ -1350,8 +1162,8 @@ namespace akkaradb::engine::cluster {
             bool replicatedByMajorityLocked(const std::vector<NodeInfo>& voters, uint64_t index) {
                 size_t replicated = 0;
                 for (const auto& voter : voters) {
-                    if (voter.nodeId == selfNodeId_) { if (index <= lastLogIndex()) { ++replicated; } }
-                    else if (const auto* state = peerState(voter.nodeId); state != nullptr && state->matchIndex >= index) { ++replicated; }
+                    if (voter.nodeId == selfNodeId_) { if (index <= this->lastLogIndex()) { ++replicated; } }
+                    else if (const auto* state = this->peerState(voter.nodeId); state != nullptr && state->matchIndex >= index) { ++replicated; }
                 }
                 return replicated >= (voters.size() / 2) + 1;
             }
@@ -1373,6 +1185,12 @@ namespace akkaradb::engine::cluster {
 
             bool hasCommitQuorumLocked(uint64_t index, const RaftLogEntry* entry = nullptr) {
                 if (entry != nullptr && entry->kind == RaftEntryKind::CONFIG_JOINT) {
+                    std::vector<NodeInfo> oldVoters;
+                    std::vector<NodeInfo> newVoters;
+                    if (!decodeNodeSet(entry->key, oldVoters) || !decodeNodeSet(entry->value, newVoters)) { return false; }
+                    return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                }
+                if (entry != nullptr && entry->kind == RaftEntryKind::CONFIG_FINAL && !entry->key.empty()) {
                     std::vector<NodeInfo> oldVoters;
                     std::vector<NodeInfo> newVoters;
                     if (!decodeNodeSet(entry->key, oldVoters) || !decodeNodeSet(entry->value, newVoters)) { return false; }
@@ -1409,8 +1227,14 @@ namespace akkaradb::engine::cluster {
                     return sortedUniqueVoters(std::move(oldVoters));
                 }
                 if (entry.kind == RaftEntryKind::CONFIG_FINAL) {
+                    std::vector<NodeInfo> oldVoters;
                     std::vector<NodeInfo> newVoters;
                     if (!decodeNodeSet(entry.value, newVoters)) { return std::nullopt; }
+                    if (!entry.key.empty()) {
+                        if (!decodeNodeSet(entry.key, oldVoters)) { return std::nullopt; }
+                        oldVoters.insert(oldVoters.end(), newVoters.begin(), newVoters.end());
+                        return sortedUniqueVoters(std::move(oldVoters));
+                    }
                     return sortedUniqueVoters(std::move(newVoters));
                 }
                 return std::nullopt;
@@ -1481,19 +1305,86 @@ namespace akkaradb::engine::cluster {
                 return target;
             }
 
-            uint64_t conflictMatchHint(uint64_t conflictIndex) const {
-                if (conflictIndex <= lastIncludedIndex_) { return lastIncludedIndex_ == 0 ? 0 : lastIncludedIndex_ - 1; }
-                const uint64_t conflictTerm = termAt(conflictIndex);
-                if (conflictTerm == 0) { return conflictIndex == 0 ? 0 : conflictIndex - 1; }
-                uint64_t firstConflictIndex = conflictIndex;
+            std::optional<uint64_t> appliedLogIndexForClientSeq(uint64_t clientSeq) const {
+                std::optional<uint64_t> target = lastIncludedIndex_;
                 for (const auto& entry : log_) {
-                    if (entry.index > conflictIndex) { break; }
-                    if (entry.term == conflictTerm) {
-                        firstConflictIndex = entry.index;
-                        break;
+                    if (entry.index > commitIndex_) { break; }
+                    if (entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) {
+                        if (entry.clientSeq <= clientSeq) {
+                            target = entry.index;
+                            continue;
+                        }
+                        return target;
                     }
+                    target = entry.index;
                 }
-                return firstConflictIndex == 0 ? 0 : firstConflictIndex - 1;
+                return target;
+            }
+
+            uint64_t firstIndexOfTermLocked(uint64_t term, uint64_t atOrBeforeIndex) const {
+                if (term == 0) { return 0; }
+                if (lastIncludedIndex_ != 0 && lastIncludedIndex_ <= atOrBeforeIndex && lastIncludedTerm_ == term) { return lastIncludedIndex_; }
+                for (const auto& entry : log_) {
+                    if (entry.index > atOrBeforeIndex) { break; }
+                    if (entry.term == term) { return entry.index; }
+                }
+                return 0;
+            }
+
+            uint64_t lastIndexOfTermLocked(uint64_t term) const {
+                if (term == 0) { return 0; }
+                uint64_t out = 0;
+                if (lastIncludedIndex_ != 0 && lastIncludedTerm_ == term) { out = lastIncludedIndex_; }
+                for (const auto& entry : log_) {
+                    if (entry.term == term) { out = entry.index; }
+                    else if (out != 0 && entry.term > term) { break; }
+                }
+                return out;
+            }
+
+            AppendEntriesResponse conflictResponseLocked(uint64_t prevLogIndex) const {
+                if (prevLogIndex > lastLogIndex()) {
+                    return AppendEntriesResponse{
+                        .term = currentTerm_,
+                        .success = false,
+                        .matchIndex = lastLogIndex(),
+                        .conflictIndex = lastLogIndex() + 1,
+                        .conflictTerm = 0
+                    };
+                }
+                if (prevLogIndex <= lastIncludedIndex_) {
+                    return AppendEntriesResponse{
+                        .term = currentTerm_,
+                        .success = false,
+                        .matchIndex = lastIncludedIndex_,
+                        .conflictIndex = lastIncludedIndex_ + 1,
+                        .conflictTerm = lastIncludedTerm_
+                    };
+                }
+                const uint64_t conflictTerm = termAt(prevLogIndex);
+                const uint64_t firstConflictIndex = firstIndexOfTermLocked(conflictTerm, prevLogIndex);
+                return AppendEntriesResponse{
+                    .term = currentTerm_,
+                    .success = false,
+                    .matchIndex = firstConflictIndex == 0 ? 0 : firstConflictIndex - 1,
+                    .conflictIndex = firstConflictIndex == 0 ? prevLogIndex : firstConflictIndex,
+                    .conflictTerm = conflictTerm
+                };
+            }
+
+            void updateNextIndexAfterConflictLocked(PeerReplicationState& state, const AppendEntriesResponse& response) const {
+                uint64_t nextIndex = 1;
+                if (response.conflictTerm != 0) {
+                    if (const uint64_t leaderLastIndexForTerm = lastIndexOfTermLocked(response.conflictTerm); leaderLastIndexForTerm != 0) {
+                        nextIndex = leaderLastIndexForTerm + 1;
+                    }
+                    else if (response.conflictIndex != 0) { nextIndex = response.conflictIndex; }
+                    else { nextIndex = response.matchIndex + 1; }
+                }
+                else if (response.conflictIndex != 0) { nextIndex = response.conflictIndex; }
+                else { nextIndex = response.matchIndex + 1; }
+                if (nextIndex >= state.nextIndex && state.nextIndex > 1) { nextIndex = state.nextIndex - 1; }
+                state.nextIndex = std::max<uint64_t>(1, nextIndex);
             }
 
             RaftLogEntry makeNoopEntryLocked() const {
@@ -1518,6 +1409,26 @@ namespace akkaradb::engine::cluster {
                 writeFileAtomically(statePath_, bytes, "RaftConsensusRuntime state");
             }
 
+            void enforceLogInvariantsLocked(const char* context) const {
+                if (committedVoters_.empty()) { throw std::runtime_error(std::string{context} + ": empty committed voter set"); }
+                if (lastIncludedIndex_ > commitIndex_) {
+                    throw std::runtime_error(std::string{context} + ": lastIncludedIndex is ahead of commitIndex");
+                }
+                if (lastApplied_ < lastIncludedIndex_) {
+                    throw std::runtime_error(std::string{context} + ": lastApplied is behind lastIncludedIndex");
+                }
+                if (lastApplied_ > commitIndex_) { throw std::runtime_error(std::string{context} + ": lastApplied is ahead of commitIndex"); }
+                if (commitIndex_ > lastLogIndex()) { throw std::runtime_error(std::string{context} + ": commitIndex is ahead of log"); }
+                uint64_t expectedIndex = lastIncludedIndex_ + 1;
+                for (const auto& entry : log_) {
+                    if (entry.index != expectedIndex) { throw std::runtime_error(std::string{context} + ": non-contiguous log"); }
+                    ++expectedIndex;
+                }
+                if (jointOldVoters_.has_value() != jointNewVoters_.has_value()) {
+                    throw std::runtime_error(std::string{context} + ": incomplete joint voter set");
+                }
+            }
+
             void recoverState() {
                 if (!std::filesystem::exists(statePath_)) { return; }
                 try {
@@ -1540,9 +1451,11 @@ namespace akkaradb::engine::cluster {
             }
 
             void persistLog() {
+                enforceLogInvariantsLocked("RaftConsensusRuntime log");
                 std::vector<uint8_t> bytes;
-                bytes.insert(bytes.end(), {'A', 'K', 'R', 'L', '5'});
+                bytes.insert(bytes.end(), {'A', 'K', 'R', 'L', '1'});
                 writeU64(bytes, commitIndex_);
+                writeU64(bytes, lastApplied_);
                 writeU64(bytes, lastIncludedIndex_);
                 writeU64(bytes, lastIncludedTerm_);
                 writeU64(bytes, static_cast<uint64_t>(log_.size()));
@@ -1564,15 +1477,16 @@ namespace akkaradb::engine::cluster {
             void recoverLog() {
                 if (!std::filesystem::exists(logPath_)) { return; }
                 const auto bytes = readWholeFile(logPath_, "RaftConsensusRuntime log");
-                constexpr size_t fixedHeaderSize = 5 + 8 + 8 + 8 + 8;
+                constexpr size_t fixedHeaderSize = 5 + 8 + 8 + 8 + 8 + 8;
                 if (bytes.size() < fixedHeaderSize + 4) { throw std::runtime_error("RaftConsensusRuntime: truncated log file"); }
-                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRL5") {
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRL1") {
                     throw std::runtime_error("RaftConsensusRuntime: bad log file");
                 }
                 commitIndex_ = readU64(bytes, 5);
-                lastIncludedIndex_ = readU64(bytes, 13);
-                lastIncludedTerm_ = readU64(bytes, 21);
-                const uint64_t count = readU64(bytes, 29);
+                lastApplied_ = readU64(bytes, 13);
+                lastIncludedIndex_ = readU64(bytes, 21);
+                lastIncludedTerm_ = readU64(bytes, 29);
+                const uint64_t count = readU64(bytes, 37);
                 size_t cursor = fixedHeaderSize;
                 if (!readNodeSetField(bytes, cursor, committedVoters_) ||
                     !readOptionalNodeSetField(bytes, cursor, jointOldVoters_) ||
@@ -1657,14 +1571,42 @@ namespace akkaradb::engine::cluster {
                 if (commitIndex_ > lastGoodIndex) {
                     throw std::runtime_error("RaftConsensusRuntime: committed log entry is missing or corrupt");
                 }
+                if (lastIncludedIndex_ > commitIndex_ || lastApplied_ > commitIndex_) {
+                    throw std::runtime_error("RaftConsensusRuntime: invalid applied/commit index metadata");
+                }
+                if (lastApplied_ < lastIncludedIndex_) { lastApplied_ = lastIncludedIndex_; }
                 if (truncatedTail) { persistLog(); }
             }
 
-            void setRole(RaftRole role) {
-                const auto old = role_.exchange(role);
-                if (old == role) { return; }
-                if (callbacks_.roleChange) { callbacks_.roleChange(role == RaftRole::LEADER ? NodeRole::PRIMARY : NodeRole::REPLICA); }
+            void recoverAppliedProgressFromStateMachine() {
+                if (!callbacks_.getLastSeq) { return; }
+                const uint64_t durableClientSeq = callbacks_.getLastSeq();
+                bool advanced = false;
+                {
+                    std::lock_guard lock{mutex_};
+                    const auto recoveredAppliedIndex = appliedLogIndexForClientSeq(durableClientSeq);
+                    if (recoveredAppliedIndex && *recoveredAppliedIndex > lastApplied_) {
+                        lastApplied_ = std::min(*recoveredAppliedIndex, commitIndex_);
+                        advanced = true;
+                    }
+                }
+                if (advanced) {
+                    std::lock_guard lock{mutex_};
+                    persistLog();
+                }
             }
+
+            std::optional<NodeRole> setRole(RaftRole role) {
+                const auto old = role_.exchange(role);
+                if (old == role) { return std::nullopt; }
+                return role == RaftRole::LEADER ? NodeRole::PRIMARY : NodeRole::REPLICA;
+            }
+
+            void notifyRoleChange(std::optional<NodeRole> role) {
+                if (role && callbacks_.roleChange) { callbacks_.roleChange(*role); }
+            }
+
+            void setRoleAndNotify(RaftRole role) { notifyRoleChange(setRole(role)); }
 
             void becomeFollower(uint64_t term) {
                 bool changed = false;
@@ -1678,7 +1620,7 @@ namespace akkaradb::engine::cluster {
                     }
                     electionDeadline_ = nextElectionDeadline();
                 }
-                setRole(RaftRole::FOLLOWER);
+                setRoleAndNotify(RaftRole::FOLLOWER);
                 (void)changed;
             }
 
@@ -1693,7 +1635,7 @@ namespace akkaradb::engine::cluster {
                     persistLog();
                     electionDeadline_ = Clock::now() + std::chrono::hours(24);
                 }
-                setRole(RaftRole::LEADER);
+                setRoleAndNotify(RaftRole::LEADER);
                 (void)commitOutstandingEntry(std::chrono::milliseconds{0});
             }
 
@@ -2054,7 +1996,7 @@ namespace akkaradb::engine::cluster {
             void proposeMembershipChange(const std::vector<NodeInfo>& oldVoters, const std::vector<NodeInfo>& newVoters) {
                 RaftLogEntry joint = makeConfigEntry(RaftEntryKind::CONFIG_JOINT, oldVoters, newVoters);
                 appendReplicateAndCommitConfig(joint);
-                RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, {}, newVoters);
+                RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
                 appendReplicateAndCommitConfig(final);
             }
 
@@ -2114,9 +2056,9 @@ namespace akkaradb::engine::cluster {
                         throw std::runtime_error("RaftConsensusRuntime: leadership changed before membership commit");
                     }
                     commitIndex_ = entry.index;
-                    applyConfigEntryLocked(entry);
                     persistLog();
                 }
+                applyCommitted();
                 sendHeartbeats();
             }
 
@@ -2172,7 +2114,6 @@ namespace akkaradb::engine::cluster {
             }
 
             bool replicateEntryToMajority(const RaftLogEntry& entry, std::chrono::milliseconds retryWindow = std::chrono::milliseconds{0}) {
-                if (quorum() == 1) { return true; }
                 const auto deadline = Clock::now() + retryWindow;
                 const auto entryTargets = replicationTargetsForEntry(entry);
                 do {
@@ -2214,9 +2155,6 @@ namespace akkaradb::engine::cluster {
                     if (role_.load() != RaftRole::LEADER || currentTerm_ != term) { return false; }
                     if (entry.index > commitIndex_ && canCommitEntryLocked(entry)) {
                         commitIndex_ = entry.index;
-                        if (entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) {
-                            applyConfigEntryLocked(entry);
-                        }
                         persistLog();
                     }
                 }
@@ -2288,12 +2226,7 @@ namespace akkaradb::engine::cluster {
                         state->matchIndex = std::max(state->matchIndex, response.matchIndex);
                         state->nextIndex = state->matchIndex + 1;
                     }
-                    else {
-                        const uint64_t hintedNextIndex = response.matchIndex + 1;
-                        if (hintedNextIndex > 0 && hintedNextIndex < state->nextIndex) { state->nextIndex = hintedNextIndex; }
-                        else { --state->nextIndex; }
-                        if (state->nextIndex == 0) { state->nextIndex = 1; }
-                    }
+                    else { updateNextIndexAfterConflictLocked(*state, response); }
                 }
             }
 
@@ -2325,6 +2258,7 @@ namespace akkaradb::engine::cluster {
                     }
                     SocketHandle client = ::accept(listenSock_, nullptr, nullptr);
                     if (!socketOk(client)) { return; }
+                    configureNoSigPipe(client);
                     setTimeouts(client, 1000);
                     const size_t active = activeClientHandlers_.fetch_add(1, std::memory_order_acq_rel);
                     if (active >= MAX_RAFT_CLIENT_HANDLERS) {
@@ -2396,30 +2330,37 @@ namespace akkaradb::engine::cluster {
             }
 
             RequestVoteResponse handleRequestVote(const RequestVote& request) {
-                std::lock_guard lock{mutex_};
-                if (!isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.candidateId)) {
-                    return RequestVoteResponse{.term = currentTerm_, .voteGranted = false};
+                std::optional<NodeRole> roleChange;
+                RequestVoteResponse response;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (!isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.candidateId)) {
+                        return RequestVoteResponse{.term = currentTerm_, .voteGranted = false};
+                    }
+                    if (request.term < currentTerm_) { return RequestVoteResponse{.term = currentTerm_, .voteGranted = false}; }
+                    if (request.term > currentTerm_) {
+                        currentTerm_ = request.term;
+                        votedFor_ = 0;
+                        roleChange = setRole(RaftRole::FOLLOWER);
+                    }
+                    const bool upToDate = request.lastLogTerm > lastLogTerm() || (request.lastLogTerm == lastLogTerm() && request.lastLogIndex
+                        >= lastLogIndex());
+                    const bool canVote = votedFor_ == 0 || votedFor_ == request.candidateId;
+                    const bool granted = canVote && upToDate;
+                    if (granted) {
+                        votedFor_ = request.candidateId;
+                        electionDeadline_ = nextElectionDeadline();
+                    }
+                    persistState();
+                    response = RequestVoteResponse{.term = currentTerm_, .voteGranted = granted};
                 }
-                if (request.term < currentTerm_) { return RequestVoteResponse{.term = currentTerm_, .voteGranted = false}; }
-                if (request.term > currentTerm_) {
-                    currentTerm_ = request.term;
-                    votedFor_ = 0;
-                    setRole(RaftRole::FOLLOWER);
-                }
-                const bool upToDate = request.lastLogTerm > lastLogTerm() || (request.lastLogTerm == lastLogTerm() && request.lastLogIndex
-                    >= lastLogIndex());
-                const bool canVote = votedFor_ == 0 || votedFor_ == request.candidateId;
-                const bool granted = canVote && upToDate;
-                if (granted) {
-                    votedFor_ = request.candidateId;
-                    electionDeadline_ = nextElectionDeadline();
-                }
-                persistState();
-                return RequestVoteResponse{.term = currentTerm_, .voteGranted = granted};
+                notifyRoleChange(roleChange);
+                return response;
             }
 
             TimeoutNowResponse handleTimeoutNow(const TimeoutNow& request) {
                 uint64_t responseTerm = 0;
+                std::optional<NodeRole> roleChange;
                 {
                     std::lock_guard lock{mutex_};
                     if (request.targetId != selfNodeId_ || !isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
@@ -2431,38 +2372,21 @@ namespace akkaradb::engine::cluster {
                         votedFor_ = 0;
                         persistState();
                     }
-                    setRole(RaftRole::FOLLOWER);
+                    roleChange = setRole(RaftRole::FOLLOWER);
                     electionDeadline_ = Clock::now();
                     responseTerm = currentTerm_;
                 }
+                notifyRoleChange(roleChange);
                 cv_.notify_all();
                 return TimeoutNowResponse{.term = responseTerm, .accepted = true};
             }
 
-            struct PendingSnapshotInstall {
-                bool active = false;
-                uint64_t snapshotSeq = 0;
-                uint64_t lastIncludedIndex = 0;
-                uint64_t lastIncludedTerm = 0;
-                uint64_t entryCount = 0;
-                std::vector<NodeInfo> committedVoters;
-                std::optional<std::vector<NodeInfo>> jointOldVoters;
-                std::optional<std::vector<NodeInfo>> jointNewVoters;
-                uint64_t nextEntryIndex = 0;
-                bool hasCurrentEntry = false;
-                uint64_t currentEntryIndex = 0;
-                uint64_t currentValueSize = 0;
-                uint32_t currentValueCrc32c = 0;
-                std::vector<uint8_t> currentKey;
-                std::vector<uint8_t> currentValue;
-            };
-
-            bool applySnapshotChunkRequest(const InstallSnapshot& request) {
-                std::lock_guard applyLock{applyMutex_};
+            bool applySnapshotChunkRequestLocked(const InstallSnapshot& request) {
                 if (request.chunks.empty() && !request.done) { return false; }
                 if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) {
                     return false;
                 }
+                if (request.jointOldVoters && (request.jointOldVoters->empty() || request.jointNewVoters->empty())) { return false; }
                 const bool sameSnapshot = pendingSnapshotInstall_.active && pendingSnapshotInstall_.snapshotSeq == request.snapshotSeq &&
                                           pendingSnapshotInstall_.lastIncludedIndex == request.lastIncludedIndex &&
                                           pendingSnapshotInstall_.lastIncludedTerm == request.lastIncludedTerm &&
@@ -2497,12 +2421,17 @@ namespace akkaradb::engine::cluster {
                         pendingSnapshotInstall_.hasCurrentEntry = true;
                         pendingSnapshotInstall_.currentEntryIndex = chunk.entryIndex;
                         pendingSnapshotInstall_.currentValueSize = chunk.valueSize;
+                        pendingSnapshotInstall_.currentValueOffset = 0;
                         pendingSnapshotInstall_.currentValueCrc32c = chunk.valueCrc32c;
                         pendingSnapshotInstall_.currentKey = chunk.key;
-                        pendingSnapshotInstall_.currentValue.clear();
-                        pendingSnapshotInstall_.currentValue.reserve(
-                            static_cast<size_t>(std::min<uint64_t>(chunk.valueSize, runtimeOptions_.raftBlobChunkSizeBytes))
-                        );
+                        pendingSnapshotInstall_.currentValueCrc = Crc32cStream{};
+                        if (callbacks_.beginSnapshotEntry) {
+                            callbacks_.beginSnapshotEntry(
+                                pendingSnapshotInstall_.currentKey,
+                                pendingSnapshotInstall_.currentValueSize,
+                                pendingSnapshotInstall_.currentValueCrc32c
+                            );
+                        }
                     }
                     else if (chunk.entryIndex != pendingSnapshotInstall_.currentEntryIndex || !chunk.key.empty()) {
                         return false;
@@ -2510,22 +2439,22 @@ namespace akkaradb::engine::cluster {
 
                     if (pendingSnapshotInstall_.currentValueSize != chunk.valueSize ||
                         pendingSnapshotInstall_.currentValueCrc32c != chunk.valueCrc32c ||
-                        pendingSnapshotInstall_.currentValue.size() != chunk.valueOffset) {
+                        pendingSnapshotInstall_.currentValueOffset != chunk.valueOffset) {
                         return false;
                     }
-                    pendingSnapshotInstall_.currentValue.insert(
-                        pendingSnapshotInstall_.currentValue.end(),
-                        chunk.value.begin(),
-                        chunk.value.end()
-                    );
-                    if (pendingSnapshotInstall_.currentValue.size() == pendingSnapshotInstall_.currentValueSize) {
-                        if (crcBytes(pendingSnapshotInstall_.currentValue) != pendingSnapshotInstall_.currentValueCrc32c) { return false; }
-                        if (callbacks_.applySnapshotEntry) {
-                            callbacks_.applySnapshotEntry(pendingSnapshotInstall_.currentKey, pendingSnapshotInstall_.currentValue);
+                    pendingSnapshotInstall_.currentValueCrc.update(chunk.value);
+                    if (callbacks_.appendSnapshotEntryChunk) {
+                        callbacks_.appendSnapshotEntryChunk(chunk.valueOffset, chunk.value);
+                    }
+                    pendingSnapshotInstall_.currentValueOffset += chunk.value.size();
+                    if (pendingSnapshotInstall_.currentValueOffset == pendingSnapshotInstall_.currentValueSize) {
+                        if (pendingSnapshotInstall_.currentValueCrc.finish() != pendingSnapshotInstall_.currentValueCrc32c) { return false; }
+                        if (callbacks_.finishSnapshotEntry) {
+                            callbacks_.finishSnapshotEntry();
                         }
                         ++pendingSnapshotInstall_.nextEntryIndex;
                         pendingSnapshotInstall_.currentKey.clear();
-                        pendingSnapshotInstall_.currentValue.clear();
+                        pendingSnapshotInstall_.currentValueCrc = Crc32cStream{};
                         pendingSnapshotInstall_.hasCurrentEntry = false;
                     }
                 }
@@ -2536,11 +2465,12 @@ namespace akkaradb::engine::cluster {
                 }
                 if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq); }
                 if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
-                pendingSnapshotInstall_ = PendingSnapshotInstall{};
                 return true;
             }
 
             InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
+                std::optional<NodeRole> roleChange;
+                std::optional<InstallSnapshotResponse> earlyResponse;
                 {
                     std::lock_guard lock{mutex_};
                     if (request.term < currentTerm_) {
@@ -2551,18 +2481,33 @@ namespace akkaradb::engine::cluster {
                         votedFor_ = 0;
                         persistState();
                     }
-                    setRole(RaftRole::FOLLOWER);
+                    roleChange = setRole(RaftRole::FOLLOWER);
                     electionDeadline_ = nextElectionDeadline();
                     if (request.lastIncludedIndex <= lastIncludedIndex_) {
-                        return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
+                        earlyResponse = InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
                     }
                 }
+                notifyRoleChange(roleChange);
+                if (earlyResponse) { return *earlyResponse; }
 
                 try {
-                    if (!applySnapshotChunkRequest(request)) {
+                    std::lock_guard applyLock{applyMutex_};
+                    if (!applySnapshotChunkRequestLocked(request)) {
                         std::lock_guard lock{mutex_};
                         return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
                     }
+                    if (!request.done) {
+                        std::lock_guard lock{mutex_};
+                        return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
+                    }
+                    std::lock_guard lock{mutex_};
+                    if (!applySnapshotMembershipLocked(request)) {
+                        return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
+                    }
+                    compactLogThrough(request.lastIncludedIndex, request.lastIncludedTerm);
+                    persistLog();
+                    pendingSnapshotInstall_ = PendingSnapshotInstall{};
+                    return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
                 }
                 catch (...) {
                     {
@@ -2572,22 +2517,12 @@ namespace akkaradb::engine::cluster {
                     std::lock_guard lock{mutex_};
                     return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
                 }
-                if (!request.done) {
-                    std::lock_guard lock{mutex_};
-                    return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
-                }
-
-                std::lock_guard lock{mutex_};
-                if (!applySnapshotMembershipLocked(request)) {
-                    return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
-                }
-                compactLogThrough(request.lastIncludedIndex, request.lastIncludedTerm);
-                persistLog();
-                return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
             }
 
             AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
                 AppendEntriesResponse response;
+                std::optional<NodeRole> roleChange;
+                std::optional<AppendEntriesResponse> earlyResponse;
                 {
                     std::lock_guard lock{mutex_};
                     if (request.term < currentTerm_) {
@@ -2598,76 +2533,128 @@ namespace akkaradb::engine::cluster {
                         votedFor_ = 0;
                         persistState();
                     }
-                    setRole(RaftRole::FOLLOWER);
+                    roleChange = setRole(RaftRole::FOLLOWER);
                     electionDeadline_ = nextElectionDeadline();
 
                     if (request.prevLogIndex < lastIncludedIndex_) {
-                        return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastIncludedIndex_};
+                        earlyResponse = conflictResponseLocked(request.prevLogIndex);
                     }
-                    if (request.prevLogIndex > lastLogIndex()) {
-                        return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
+                    else if (request.prevLogIndex > lastLogIndex()) {
+                        earlyResponse = conflictResponseLocked(request.prevLogIndex);
                     }
-                    if (termAt(request.prevLogIndex) != request.prevLogTerm) {
-                        return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = conflictMatchHint(request.prevLogIndex)};
+                    else if (termAt(request.prevLogIndex) != request.prevLogTerm) {
+                        earlyResponse = conflictResponseLocked(request.prevLogIndex);
                     }
+                    if (earlyResponse) { response = *earlyResponse; }
+                    else {
 
-                    uint64_t expectedIndex = request.prevLogIndex + 1;
-                    uint64_t acceptedMatchIndex = request.prevLogIndex;
-                    for (const auto& entry : request.entries) {
-                        if (entry.index != expectedIndex++) {
-                            return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = acceptedMatchIndex};
+                        uint64_t expectedIndex = request.prevLogIndex + 1;
+                        uint64_t acceptedMatchIndex = request.prevLogIndex;
+                        for (const auto& entry : request.entries) {
+                            if (entry.index != expectedIndex++) {
+                                earlyResponse = AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = acceptedMatchIndex};
+                                response = *earlyResponse;
+                                break;
+                            }
+                            if (entry.index <= lastIncludedIndex_) { continue; }
+                            const auto existing = entryAt(entry.index);
+                            if (!existing || !sameEntry(*existing, entry)) {
+                                std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
+                                log_.push_back(entry);
+                            }
+                            acceptedMatchIndex = entry.index;
                         }
-                        if (entry.index <= lastIncludedIndex_) { continue; }
-                        const auto existing = entryAt(entry.index);
-                        if (!existing || !sameEntry(*existing, entry)) {
-                            std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
-                            log_.push_back(entry);
-                        }
-                        acceptedMatchIndex = entry.index;
-                    }
 
-                    if (request.leaderCommit > commitIndex_) { commitIndex_ = std::min(request.leaderCommit, acceptedMatchIndex); }
-                    persistLog();
-                    response = AppendEntriesResponse{.term = currentTerm_, .success = true, .matchIndex = acceptedMatchIndex};
+                        if (!earlyResponse) {
+                            if (request.leaderCommit > commitIndex_) { commitIndex_ = std::min(request.leaderCommit, acceptedMatchIndex); }
+                            persistLog();
+                            response = AppendEntriesResponse{.term = currentTerm_, .success = true, .matchIndex = acceptedMatchIndex};
+                        }
+                    }
                 }
+                notifyRoleChange(roleChange);
+                if (earlyResponse) { return response; }
                 applyCommitted();
                 return response;
             }
 
-            struct PendingBlobApply {
+            struct BlobApplyBatch {
+                bool complete = false;
+                size_t nextEntryOffset = 0;
+                uint64_t finalLogIndex = 0;
                 uint64_t seq = 0;
+                uint64_t blobId = 0;
                 uint64_t totalSize = 0;
                 uint32_t contentCrc32c = 0;
-                std::vector<uint8_t> content;
             };
 
-            void applyBlobChunk(const RaftLogEntry& entry) {
+            BlobApplyBatch applyBlobBatch(const std::vector<RaftLogEntry>& entries, size_t start) const {
+                BlobApplyBatch batch;
+                batch.nextEntryOffset = start;
+                if (start >= entries.size()) { return batch; }
+                const auto& first = entries[start];
                 RaftBlobChunk chunk;
-                if (!decodeBlobChunkKey(entry.key, chunk) || chunk.offset + entry.value.size() > chunk.totalSize) {
+                if (first.kind != RaftEntryKind::BLOB || !decodeBlobChunkKey(first.key, chunk) || chunk.offset != 0 ||
+                    first.value.size() > chunk.totalSize) {
                     throw std::runtime_error("RaftConsensusRuntime: corrupt Blob log entry");
                 }
-                if (!callbacks_.applyBlob) { return; }
+                const uint64_t seq = first.clientSeq == 0 ? first.index : first.clientSeq;
+                Crc32cStream contentCrc;
 
-                auto& pending = pendingBlobApplies_[chunk.blobId];
-                const uint64_t seq = entry.clientSeq == 0 ? entry.index : entry.clientSeq;
-                if (pending.content.empty()) {
-                    pending.seq = seq;
-                    pending.totalSize = chunk.totalSize;
-                    pending.contentCrc32c = chunk.contentCrc32c;
-                    pending.content.reserve(static_cast<size_t>(std::min<uint64_t>(chunk.totalSize, runtimeOptions_.raftBlobChunkSizeBytes)));
-                }
-                if (pending.seq != seq || pending.totalSize != chunk.totalSize || pending.contentCrc32c != chunk.contentCrc32c ||
-                    pending.content.size() != chunk.offset) {
-                    throw std::runtime_error("RaftConsensusRuntime: out-of-order Blob log chunk");
-                }
-                pending.content.insert(pending.content.end(), entry.value.begin(), entry.value.end());
-                if (pending.content.size() == pending.totalSize) {
-                    if (crcBytes(pending.content) != pending.contentCrc32c) {
-                        throw std::runtime_error("RaftConsensusRuntime: Blob log payload CRC mismatch");
+                uint64_t expectedOffset = 0;
+                size_t pos = start;
+                while (pos < entries.size()) {
+                    const auto& entry = entries[pos];
+                    RaftBlobChunk current;
+                    const uint64_t entrySeq = entry.clientSeq == 0 ? entry.index : entry.clientSeq;
+                    if (entry.kind != RaftEntryKind::BLOB || !decodeBlobChunkKey(entry.key, current) || current.blobId != chunk.blobId ||
+                        entrySeq != seq || current.totalSize != chunk.totalSize || current.contentCrc32c != chunk.contentCrc32c ||
+                        current.offset != expectedOffset || entry.value.size() > current.totalSize - current.offset) {
+                        throw std::runtime_error("RaftConsensusRuntime: out-of-order Blob log chunk");
                     }
-                    callbacks_.applyBlob(pending.seq, chunk.blobId, pending.content);
-                    pendingBlobApplies_.erase(chunk.blobId);
+                    contentCrc.update(entry.value);
+                    expectedOffset += entry.value.size();
+                    batch.finalLogIndex = entry.index;
+                    ++pos;
+                    if (expectedOffset == chunk.totalSize) {
+                        if (contentCrc.finish() != chunk.contentCrc32c) {
+                            throw std::runtime_error("RaftConsensusRuntime: Blob log payload CRC mismatch");
+                        }
+                        bool blobStarted = false;
+                        try {
+                            if (callbacks_.beginBlob) {
+                                callbacks_.beginBlob(seq, chunk.blobId, chunk.totalSize, chunk.contentCrc32c);
+                                blobStarted = true;
+                            }
+                            for (size_t callbackPos = start; callbackPos < pos; ++callbackPos) {
+                                RaftBlobChunk callbackChunk;
+                                if (!decodeBlobChunkKey(entries[callbackPos].key, callbackChunk)) {
+                                    throw std::runtime_error("RaftConsensusRuntime: corrupt Blob log entry");
+                                }
+                                if (callbacks_.appendBlobChunk) {
+                                    callbacks_.appendBlobChunk(seq, chunk.blobId, callbackChunk.offset, entries[callbackPos].value);
+                                }
+                            }
+                            if (callbacks_.finishBlob) { callbacks_.finishBlob(seq, chunk.blobId); }
+                        }
+                        catch (...) {
+                            if (blobStarted && callbacks_.abortBlob) { callbacks_.abortBlob(seq, chunk.blobId); }
+                            throw;
+                        }
+                        batch.complete = true;
+                        batch.nextEntryOffset = pos;
+                        batch.seq = seq;
+                        batch.blobId = chunk.blobId;
+                        batch.totalSize = chunk.totalSize;
+                        batch.contentCrc32c = chunk.contentCrc32c;
+                        return batch;
+                    }
                 }
+                if (expectedOffset > chunk.totalSize) {
+                    throw std::runtime_error("RaftConsensusRuntime: Blob log payload exceeds declared size");
+                }
+                batch.nextEntryOffset = pos;
+                return batch;
             }
 
             void applyCommitted() {
@@ -2679,71 +2666,446 @@ namespace akkaradb::engine::cluster {
                         if (entry.index > lastApplied_ && entry.index <= commitIndex_) { toApply.push_back(entry); }
                     }
                 }
-                for (const auto& entry : toApply) {
+
+                uint64_t appliedThrough = 0;
+                bool appliedDurableMutation = false;
+                for (size_t i = 0; i < toApply.size();) {
+                    const auto& entry = toApply[i];
                     if (entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) {
                         std::lock_guard lock{mutex_};
                         applyConfigEntryLocked(entry);
+                        appliedThrough = entry.index;
+                        ++i;
                     }
                     else if (entry.kind == RaftEntryKind::BLOB) {
-                        applyBlobChunk(entry);
+                        auto batch = applyBlobBatch(toApply, i);
+                        if (!batch.complete) { break; }
+                        appliedDurableMutation = true;
+                        appliedThrough = batch.finalLogIndex;
+                        i = batch.nextEntryOffset;
                     }
-                    else if (entry.kind == RaftEntryKind::NOOP) {}
-                    else if (callbacks_.apply) {
-                        callbacks_.apply(
-                            entry.clientSeq == 0 ? entry.index : entry.clientSeq,
-                            entry.op,
-                            entry.key,
-                            entry.value,
-                            entry.flags,
-                            entry.sourceNodeId
-                        );
+                    else {
+                        if (entry.kind != RaftEntryKind::NOOP && callbacks_.apply) {
+                            callbacks_.apply(
+                                entry.clientSeq == 0 ? entry.index : entry.clientSeq,
+                                entry.op,
+                                entry.key,
+                                entry.value,
+                                entry.flags,
+                                entry.sourceNodeId
+                            );
+                            appliedDurableMutation = true;
+                        }
+                        appliedThrough = entry.index;
+                        ++i;
                     }
-                    if ((entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) && callbacks_.forceDurable) {
-                        callbacks_.forceDurable();
-                    }
-                    std::lock_guard lock{mutex_};
-                    if (entry.index > lastApplied_) { lastApplied_ = entry.index; }
+                }
+
+                if (appliedThrough == 0) { return; }
+                if (appliedDurableMutation && callbacks_.forceDurable) { callbacks_.forceDurable(); }
+                std::lock_guard lock{mutex_};
+                if (appliedThrough > lastApplied_) {
+                    lastApplied_ = appliedThrough;
+                    persistLog();
                 }
             }
 
-            std::filesystem::path dbDir_;
-            std::filesystem::path statePath_;
-            std::filesystem::path logPath_;
-            ClusterConfig config_;
-            ClusterRouter router_;
-            uint64_t selfNodeId_ = 0;
-            const NodeInfo* self_ = nullptr;
-            std::vector<NodeInfo> peers_;
-            ClusterEngineCallbacks callbacks_;
-            ClusterRuntimeOptions runtimeOptions_;
-            crypto::NodeIdentity localIdentity_{};
+        public:
+            Impl(
+                std::filesystem::path dbDir,
+                ClusterConfig config,
+                uint64_t selfNodeId,
+                ClusterEngineCallbacks callbacks,
+                ClusterRuntimeOptions runtimeOptions
+            )
+                : dbDir_{std::move(dbDir)},
+                  statePath_{dbDir_.empty() ? std::filesystem::path{"cluster-raft.state"} : dbDir_ / "cluster-raft.state"},
+                  logPath_{dbDir_.empty() ? std::filesystem::path{"cluster-raft.log"} : dbDir_ / "cluster-raft.log"},
+                  config_{std::move(config)},
+                  router_{config_},
+                  selfNodeId_{selfNodeId},
+                  callbacks_{std::move(callbacks)},
+                  runtimeOptions_{std::move(runtimeOptions)} {
+                config_.validate();
+                if (runtimeOptions_.raftBlobChunkSizeBytes == 0 ||
+                    runtimeOptions_.raftBlobChunkSizeBytes > maxRaftBlobChunkSizeBytes()) {
+                    throw std::invalid_argument("RaftConsensusRuntime: invalid Raft Blob chunk size");
+                }
+                self_ = config_.findById(selfNodeId_);
+                if (self_ == nullptr || !self_->dataBearing()) {
+                    throw std::invalid_argument("RaftConsensusRuntime: local node must be data-bearing");
+                }
+                if (runtimeOptions_.transportMode == TransportMode::SECURE) { localIdentity_ = loadSecureIdentity(runtimeOptions_); }
+                committedVoters_ = config_.dataNodes();
+                refreshPeersFromMembershipLocked();
+                if (config_.dataNodes().empty()) { throw std::invalid_argument("RaftConsensusRuntime: no data-bearing nodes"); }
+                recoverState();
+                recoverLog();
+                recoverAppliedProgressFromStateMachine();
+                this->replayCommittedMembership();
+            }
 
-            mutable std::mutex mutex_;
-            std::condition_variable cv_;
-            bool running_ = false;
-            uint64_t currentTerm_ = 0;
-            uint64_t votedFor_ = 0;
-            uint64_t commitIndex_ = 0;
-            uint64_t lastApplied_ = 0;
-            uint64_t lastIncludedIndex_ = 0;
-            uint64_t lastIncludedTerm_ = 0;
-            std::vector<RaftLogEntry> log_;
-            std::vector<NodeInfo> committedVoters_;
-            std::optional<std::vector<NodeInfo>> jointOldVoters_;
-            std::optional<std::vector<NodeInfo>> jointNewVoters_;
-            std::vector<PeerReplicationState> peerReplication_;
-            Clock::time_point electionDeadline_{};
-            std::atomic<RaftRole> role_{RaftRole::FOLLOWER};
-            std::mutex applyMutex_;
-            PendingSnapshotInstall pendingSnapshotInstall_;
-            std::unordered_map<uint64_t, PendingBlobApply> pendingBlobApplies_;
+            ~Impl() { this->close(); }
 
-            SocketHandle listenSock_ = BAD_SOCKET;
-            std::thread acceptThread_;
-            std::thread timerThread_;
-            std::atomic<size_t> activeClientHandlers_{0};
-            std::mutex clientHandlersMutex_;
-            std::condition_variable clientHandlersCv_;
+            void start() {
+                {
+                    std::lock_guard lock{mutex_};
+                    if (running_) { return; }
+                    running_ = true;
+                    electionDeadline_ = this->nextElectionDeadline();
+                }
+                listenSock_ = listenOn(runtimeOptions_.replBindHost, self_->replPort);
+                acceptThread_ = std::thread([this] { this->acceptLoop(); });
+                timerThread_ = std::thread([this] { this->timerLoop(); });
+                this->applyCommitted();
+                if (peers_.empty()) { this->becomeLeader(currentTerm_ == 0 ? 1 : currentTerm_); }
+            }
+
+            void close() {
+                {
+                    std::lock_guard lock{mutex_};
+                    running_ = false;
+                }
+                shutdownSocket(listenSock_);
+                closeSocket(listenSock_);
+                listenSock_ = BAD_SOCKET;
+                cv_.notify_all();
+                if (acceptThread_.joinable()) { acceptThread_.join(); }
+                if (timerThread_.joinable()) { timerThread_.join(); }
+                std::unique_lock clientLock{clientHandlersMutex_};
+                clientHandlersCv_.wait(clientLock, [this] { return activeClientHandlers_.load() == 0; });
+            }
+
+            NodeRole role() const noexcept {
+                const auto role = role_.load();
+                if (role == RaftRole::LEADER) { return NodeRole::PRIMARY; }
+                return NodeRole::REPLICA;
+            }
+
+            std::vector<NodeInfo> activeNodes() const {
+                std::lock_guard lock{mutex_};
+                return this->replicationTargetsLocked();
+            }
+
+            const ClusterRouter& router() const noexcept { return router_; }
+
+            void shipEntry(
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId
+            ) {
+                this->maybeCompactLog();
+                (void)this->commitOutstandingEntry(std::chrono::milliseconds{20000});
+                RaftLogEntry entry;
+                uint64_t term = 0;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    if (commitIndex_ != lastLogIndex()) {
+                        throw std::runtime_error("RaftConsensusRuntime: cannot accept a new proposal while a prior entry is uncommitted");
+                    }
+                    term = currentTerm_;
+                    entry.term = term;
+                    entry.index = this->lastLogIndex() + 1;
+                    entry.clientSeq = seq;
+                    entry.kind = RaftEntryKind::MUTATION;
+                    entry.op = op;
+                    entry.flags = recordFlags;
+                    entry.sourceNodeId = sourceNodeId;
+                    entry.key.assign(key.begin(), key.end());
+                    entry.value.assign(value.begin(), value.end());
+                    log_.push_back(entry);
+                    this->persistLog();
+                }
+
+                if (!this->replicateEntryToMajority(entry)) {
+                    throw std::runtime_error("RaftConsensusRuntime: failed to replicate entry to Raft majority");
+                }
+
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
+                        throw std::runtime_error("RaftConsensusRuntime: leadership changed before commit");
+                    }
+                    if (entry.index > commitIndex_) {
+                        commitIndex_ = entry.index;
+                        this->persistLog();
+                    }
+                }
+                this->applyCommitted();
+                this->sendHeartbeats();
+                this->maybeCompactLog();
+            }
+
+            void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::REJECT) {
+                    throw std::runtime_error("RaftConsensusRuntime: RAFT_QUORUM does not support Blob payload replication");
+                }
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::PRIMARY_SIDE_ONLY) {
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    return;
+                }
+                if (runtimeOptions_.raftBlobPolicy == RaftBlobPolicy::RAFT_LOG) {
+                    std::vector<RaftLogEntry> entries;
+                    uint64_t term = 0;
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (role_.load() != RaftRole::LEADER) {
+                            throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                        }
+                        term = currentTerm_;
+                        const uint32_t contentCrc32c = crcBytes(content);
+                        const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
+                        size_t offset = 0;
+                        do {
+                            const size_t remaining = content.size() - offset;
+                            const size_t currentChunkSize = std::min(chunkSize, remaining);
+                            RaftLogEntry entry;
+                            entry.term = term;
+                            entry.index = this->lastLogIndex() + entries.size() + 1;
+                            entry.clientSeq = seq;
+                            entry.kind = RaftEntryKind::BLOB;
+                            entry.op = ReplOpType::PUT;
+                            entry.flags = 0;
+                            entry.sourceNodeId = selfNodeId_;
+                            entry.key = encodeBlobChunkKey(
+                                RaftBlobChunk{
+                                    .blobId = blobId,
+                                    .offset = static_cast<uint64_t>(offset),
+                                    .totalSize = static_cast<uint64_t>(content.size()),
+                                    .contentCrc32c = contentCrc32c,
+                                }
+                            );
+                            entry.value.assign(content.begin() + static_cast<std::ptrdiff_t>(offset), content.begin() + static_cast<std::ptrdiff_t>(
+                                offset + currentChunkSize
+                            ));
+                            entries.push_back(std::move(entry));
+                            offset += currentChunkSize;
+                        }
+                        while (offset < content.size());
+                        log_.insert(log_.end(), entries.begin(), entries.end());
+                        this->persistLog();
+                    }
+
+                    const RaftLogEntry& lastEntry = entries.back();
+                    if (!this->replicateEntryToMajority(lastEntry)) {
+                        throw std::runtime_error("RaftConsensusRuntime: failed to replicate Blob payload to Raft majority");
+                    }
+
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
+                            throw std::runtime_error("RaftConsensusRuntime: leadership changed before Blob payload commit");
+                        }
+                        if (lastEntry.index > commitIndex_) {
+                            commitIndex_ = lastEntry.index;
+                            this->persistLog();
+                        }
+                    }
+                    this->applyCommitted();
+                    this->sendHeartbeats();
+                    this->maybeCompactLog();
+                    return;
+                }
+                throw std::runtime_error("RaftConsensusRuntime: unsupported Raft Blob policy");
+            }
+
+            void addVotingNode(const NodeInfo& node) {
+                if (!node.dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: Raft voting node must be data-bearing"); }
+                if (!onlineMembershipChangeEnabled()) {
+                    throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled");
+                }
+                (void)this->commitOutstandingEntry(std::chrono::milliseconds{20000});
+                std::vector<NodeInfo> oldVoters;
+                std::vector<NodeInfo> newVoters;
+                bool finishExistingJoint = false;
+                std::optional<RaftLogEntry> pendingConfigEntry;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    if (commitIndex_ != lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().
+                        kind == RaftEntryKind::CONFIG_FINAL)) {
+                        std::vector<NodeInfo> pendingNewVoters;
+                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && containsNode(pendingNewVoters, node.nodeId)) {
+                            pendingConfigEntry = log_.back();
+                        }
+                        else {
+                            throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
+                        }
+                    }
+                    else if (jointOldVoters_ || jointNewVoters_) {
+                        if (jointNewVoters_ && containsNode(*jointNewVoters_, node.nodeId) && !
+                            containsNode(committedVoters_, node.nodeId)) {
+                            oldVoters = jointOldVoters_.value_or(committedVoters_);
+                            newVoters = *jointNewVoters_;
+                            finishExistingJoint = true;
+                        }
+                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
+                    }
+                    else if (containsNode(committedVoters_, node.nodeId)) {
+                        throw std::invalid_argument("RaftConsensusRuntime: node is already a voting member");
+                    }
+                    else {
+                        oldVoters = committedVoters_;
+                        newVoters = committedVoters_;
+                        newVoters.push_back(node);
+                        newVoters = sortedUniqueVoters(std::move(newVoters));
+                    }
+                }
+                if (pendingConfigEntry) {
+                    this->appendReplicateAndCommitConfig(*pendingConfigEntry, false);
+                    if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
+                        std::vector<NodeInfo> oldFinalVoters;
+                        std::vector<NodeInfo> finalVoters;
+                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalVoters) ||
+                            !decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
+                            throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
+                        }
+                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalVoters, finalVoters);
+                        this->appendReplicateAndCommitConfig(final);
+                    }
+                    return;
+                }
+                if (finishExistingJoint) {
+                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
+                    this->appendReplicateAndCommitConfig(final);
+                    return;
+                }
+                this->proposeMembershipChange(oldVoters, newVoters);
+            }
+
+            void removeVotingNode(uint64_t nodeId) {
+                if (!onlineMembershipChangeEnabled()) {
+                    throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled");
+                }
+                (void)this->commitOutstandingEntry(std::chrono::milliseconds{20000});
+                if (nodeId == selfNodeId_) {
+                    throw std::runtime_error("RaftConsensusRuntime: removing the local leader is not supported by this API");
+                }
+                std::vector<NodeInfo> oldVoters;
+                std::vector<NodeInfo> newVoters;
+                bool finishExistingJoint = false;
+                std::optional<RaftLogEntry> pendingConfigEntry;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    if (commitIndex_ != this->lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().
+                        kind == RaftEntryKind::CONFIG_FINAL)) {
+                        std::vector<NodeInfo> pendingNewVoters;
+                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && !containsNode(pendingNewVoters, nodeId)) {
+                            pendingConfigEntry = log_.back();
+                        }
+                        else {
+                            throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
+                        }
+                    }
+                    else if (jointOldVoters_ || jointNewVoters_) {
+                        if (jointOldVoters_ && jointNewVoters_ && containsNode(*jointOldVoters_, nodeId) && !containsNode(
+                            *jointNewVoters_,
+                            nodeId
+                        )) {
+                            oldVoters = *jointOldVoters_;
+                            newVoters = *jointNewVoters_;
+                            finishExistingJoint = true;
+                        }
+                        else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
+                    }
+                    else if (!containsNode(committedVoters_, nodeId)) {
+                        throw std::invalid_argument("RaftConsensusRuntime: node is not a voting member");
+                    }
+                    else {
+                        oldVoters = committedVoters_;
+                        for (const auto& node : committedVoters_) { if (node.nodeId != nodeId) { newVoters.push_back(node); } }
+                        if (newVoters.empty()) {
+                            throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member");
+                        }
+                    }
+                }
+                if (pendingConfigEntry) {
+                    this->appendReplicateAndCommitConfig(*pendingConfigEntry, false);
+                    if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
+                        std::vector<NodeInfo> oldFinalVoters;
+                        std::vector<NodeInfo> finalVoters;
+                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalVoters) ||
+                            !decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
+                            throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
+                        }
+                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalVoters, finalVoters);
+                        this->appendReplicateAndCommitConfig(final);
+                    }
+                    return;
+                }
+                if (finishExistingJoint) {
+                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
+                    this->appendReplicateAndCommitConfig(final);
+                    return;
+                }
+                this->proposeMembershipChange(oldVoters, newVoters);
+            }
+
+            void transferLeadership(uint64_t targetNodeId) {
+                if (targetNodeId == selfNodeId_) { return; }
+                NodeInfo target;
+                uint64_t targetIndex = 0;
+                uint64_t term = 0;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    if (!isVotingMemberLocked(targetNodeId)) {
+                        throw std::invalid_argument("RaftConsensusRuntime: transfer target is not a voting member");
+                    }
+                    auto* state = this->peerState(targetNodeId);
+                    if (state == nullptr) {
+                        throw std::invalid_argument("RaftConsensusRuntime: transfer target is not a replication peer");
+                    }
+                    target = state->node;
+                    targetIndex = this->lastLogIndex();
+                    term = currentTerm_;
+                }
+
+                if (!this->replicatePeerTo(targetNodeId, targetIndex)) {
+                    throw std::runtime_error("RaftConsensusRuntime: failed to catch up transfer target");
+                }
+                {
+                    std::lock_guard lock{mutex_};
+                    const auto* state = this->peerState(targetNodeId);
+                    if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
+                        throw std::runtime_error("RaftConsensusRuntime: leadership changed before transfer");
+                    }
+                    if (state == nullptr || state->matchIndex < targetIndex) {
+                        throw std::runtime_error("RaftConsensusRuntime: transfer target is not caught up");
+                    }
+                }
+
+                TimeoutNowResponse response;
+                if (!this->timeoutNow(target, TimeoutNow{.term = term, .leaderId = selfNodeId_, .targetId = targetNodeId}, response)) {
+                    throw std::runtime_error("RaftConsensusRuntime: failed to send leader transfer request");
+                }
+                if (response.term > term) {
+                    this->becomeFollower(response.term);
+                    throw std::runtime_error("RaftConsensusRuntime: leadership changed during transfer");
+                }
+                if (!response.accepted) { throw std::runtime_error("RaftConsensusRuntime: leader transfer target rejected request"); }
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() == RaftRole::LEADER && currentTerm_ == term) { electionDeadline_ = this->nextElectionDeadline(); }
+                }
+                this->setRoleAndNotify(RaftRole::FOLLOWER);
+            }
+
     };
 
     std::unique_ptr<RaftConsensusRuntime> RaftConsensusRuntime::create(

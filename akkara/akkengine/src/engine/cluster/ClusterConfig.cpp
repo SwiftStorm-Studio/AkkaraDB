@@ -10,6 +10,7 @@
 // akkengine/src/engine/cluster/ClusterConfig.cpp
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -22,6 +23,7 @@
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -87,6 +89,50 @@ namespace akkaradb::engine::cluster {
             const int rc = ::fsync(fd);
             const int closeRc = ::close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            #endif
+        }
+
+        std::filesystem::path makeTempPath(const std::filesystem::path& path) {
+            static std::atomic<uint64_t> sequence{0};
+            const auto parent = path.parent_path();
+            const auto stem = path.filename().string();
+            #ifdef _WIN32
+            const auto pid = static_cast<uint64_t>(::GetCurrentProcessId());
+            #else
+            const auto pid = static_cast<uint64_t>(::getpid());
+            #endif
+            for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
+                                    std::to_string(attempt);
+                auto candidate = parent / (stem + suffix);
+                if (!std::filesystem::exists(candidate)) { return candidate; }
+            }
+            throw std::runtime_error("ClusterConfig: cannot allocate temp file name");
+        }
+
+        #ifndef _WIN32
+        void syncParentDirectory(const std::filesystem::path& path) {
+            const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
+            int flags = O_RDONLY;
+            #ifdef O_DIRECTORY
+            flags |= O_DIRECTORY;
+            #endif
+            const int fd = ::open(parent.c_str(), flags);
+            if (fd < 0) { throw std::runtime_error("ClusterConfig: cannot open parent directory for sync"); }
+            const int rc = ::fsync(fd);
+            const int closeRc = ::close(fd);
+            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ClusterConfig: parent directory sync failed"); }
+        }
+        #endif
+
+        void replaceFileAtomically(const std::filesystem::path& tmp, const std::filesystem::path& path) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.wstring().c_str(), path.wstring().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error("ClusterConfig: atomic file replace failed");
+            }
+            #else
+            std::filesystem::rename(tmp, path);
+            syncParentDirectory(path);
             #endif
         }
     } // namespace
@@ -209,7 +255,7 @@ namespace akkaradb::engine::cluster {
 
         writeU32(bytes.data(), 24, crcFileImage(bytes));
 
-        const auto tmpPath = path.parent_path() / (path.filename().string() + ".tmp");
+        const auto tmpPath = makeTempPath(path);
         {
             std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
             if (!out) { throw std::runtime_error("ClusterConfig: cannot create " + tmpPath.string()); }
@@ -218,7 +264,7 @@ namespace akkaradb::engine::cluster {
             if (!out) { throw std::runtime_error("ClusterConfig: write failed"); }
         }
         syncFile(tmpPath, "ClusterConfig");
-        std::filesystem::rename(tmpPath, path);
+        replaceFileAtomically(tmpPath, path);
     }
 
     const NodeInfo* ClusterConfig::findById(uint64_t nodeId) const noexcept {

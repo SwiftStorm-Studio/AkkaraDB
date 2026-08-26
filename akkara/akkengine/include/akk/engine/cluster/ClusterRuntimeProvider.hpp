@@ -49,7 +49,9 @@ namespace akkaradb::engine::cluster {
         std::function<std::optional<std::vector<ClusterHistoryEntry>>(uint64_t afterSeq, uint64_t throughSeq)> getEntries;
         std::function<std::optional<ClusterSnapshot>()> exportSnapshot;
         std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> beginSnapshot;
-        std::function<void(std::span<const uint8_t> key, std::span<const uint8_t> value)> applySnapshotEntry;
+        std::function<void(std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c)> beginSnapshotEntry;
+        std::function<void(uint64_t offset, std::span<const uint8_t> chunk)> appendSnapshotEntryChunk;
+        std::function<void()> finishSnapshotEntry;
         std::function<void(uint64_t snapshotSeq)> finishSnapshot;
         std::function<void(
 uint64_t seq,
@@ -60,7 +62,10 @@ uint64_t seq,
  uint64_t sourceNodeId
         )> apply;
         std::function<void()> forceDurable;
-        std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)> applyBlob;
+        std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)> beginBlob;
+        std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)> appendBlobChunk;
+        std::function<void(uint64_t seq, uint64_t blobId)> finishBlob;
+        std::function<void(uint64_t seq, uint64_t blobId)> abortBlob;
         std::function<void(NodeRole role)> roleChange;
     };
 

@@ -40,9 +40,13 @@ uint64_t seq,
  uint8_t recordFlags,
  uint64_t sourceNodeId
             )>;
-            using BlobCallback = std::function<void(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content)>;
+            using BlobBeginCallback = std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)>;
+            using BlobChunkCallback = std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)>;
+            using BlobEndCallback = std::function<void(uint64_t seq, uint64_t blobId)>;
             using SnapshotBeginCallback = std::function<void(uint64_t snapshotSeq, uint64_t entryCount)>;
-            using SnapshotEntryCallback = std::function<void(std::span<const uint8_t> key, std::span<const uint8_t> value)>;
+            using SnapshotEntryBeginCallback = std::function<void(std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c)>;
+            using SnapshotEntryChunkCallback = std::function<void(uint64_t offset, std::span<const uint8_t> chunk)>;
+            using SnapshotEntryEndCallback = std::function<void()>;
             using SnapshotEndCallback = std::function<void(uint64_t snapshotSeq)>;
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
                 std::string primaryHost,
@@ -56,9 +60,15 @@ uint64_t seq,
             ReplicationClient(const ReplicationClient&) = delete;
             ReplicationClient& operator=(const ReplicationClient&) = delete;
             void setApplyCallback(ApplyCallback callback);
-            void setBlobCallback(BlobCallback callback);
+            void setBlobCallbacks(BlobBeginCallback begin, BlobChunkCallback chunk, BlobEndCallback end);
             void setForceDurableCallback(std::function<void()> callback);
-            void setSnapshotCallbacks(SnapshotBeginCallback begin, SnapshotEntryCallback entry, SnapshotEndCallback end);
+            void setSnapshotCallbacks(
+                SnapshotBeginCallback begin,
+                SnapshotEntryBeginCallback beginEntry,
+                SnapshotEntryChunkCallback chunk,
+                SnapshotEntryEndCallback endEntry,
+                SnapshotEndCallback end
+            );
             void start();
             void close();
             [[nodiscard]] bool connected() const noexcept;

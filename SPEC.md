@@ -1899,10 +1899,11 @@ mismatches, oversized host names, truncation, and trailing bytes.
 
 Non-Raft primary group state and replica membership state use CRC-protected
 `AKCG2` little-endian binary files. Raft volatile consensus state uses
-CRC-protected `AKRS2`. Raft logs use `AKRL4`: a little-endian binary header with
-CRC32C plus per-entry length and CRC32C records so an explicitly configured
-recovery policy can truncate only damaged uncommitted tail records. By default,
-all corrupt cluster state and Raft log files fail startup.
+CRC-protected `AKRS2`. Raft logs use `AKRL1`: a little-endian binary header with
+CRC32C-protected commit, applied, snapshot, and membership metadata plus
+per-entry length and CRC32C records so an explicitly configured recovery policy
+can truncate only damaged uncommitted tail records. By default, all corrupt
+cluster state and Raft log files fail startup.
 
 ### 24.9 Endianness Exceptions
 
