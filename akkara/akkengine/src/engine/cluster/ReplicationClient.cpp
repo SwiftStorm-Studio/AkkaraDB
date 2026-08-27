@@ -46,18 +46,19 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using SocketHandle = SOCKET; constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET; void shutdownSocket(
-            SocketHandle s
-        ) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
+        using SocketHandle = SOCKET;
+        constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
+        void shutdownSocket(SocketHandle s) noexcept { if (s != INVALID_SOCKET_HANDLE) { ::shutdown(s, SD_BOTH); } }
         #else
-        using SocketHandle = int;
-        constexpr SocketHandle INVALID_SOCKET_HANDLE = -1;
-        void shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
+        using SocketHandle = int; constexpr SocketHandle INVALID_SOCKET_HANDLE = -1; void shutdownSocket(SocketHandle s) noexcept {
+            if (s >= 0) { ::shutdown(s, SHUT_RDWR); }
+        }
         #endif
 
         void ensureSocketRuntime() {
             #ifdef _WIN32
-            static std::once_flag once; std::call_once(
+            static std::once_flag once;
+            std::call_once(
                 once,
                 [] {
                     WSADATA data{};
@@ -78,8 +79,7 @@ namespace akkaradb::engine::cluster {
 
         void configureNoSigPipe(SocketHandle s) noexcept {
             #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
-            int enabled = 1;
-            (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+            int enabled = 1; (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
             #else
             (void)s;
             #endif
@@ -91,11 +91,13 @@ namespace akkaradb::engine::cluster {
             ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
             #else
-            timeval tv{};
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
-            ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            timeval tv{}; tv.tv_sec = timeoutMs / 1000; tv.tv_usec = (timeoutMs % 1000) * 1000; ::setsockopt(
+                s,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &tv,
+                sizeof(tv)
+            ); ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             #endif
         }
 
@@ -104,10 +106,8 @@ namespace akkaradb::engine::cluster {
             u_long mode = blocking ? 0u : 1u;
             return ::ioctlsocket(s, FIONBIO, &mode) == 0;
             #else
-            const int flags = ::fcntl(s, F_GETFL, 0);
-            if (flags < 0) { return false; }
-            const int nextFlags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-            return ::fcntl(s, F_SETFL, nextFlags) == 0;
+            const int flags = ::fcntl(s, F_GETFL, 0); if (flags < 0) { return false; } const int nextFlags =
+                blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK); return ::fcntl(s, F_SETFL, nextFlags) == 0;
             #endif
         }
 
@@ -121,8 +121,7 @@ namespace akkaradb::engine::cluster {
             #ifdef _WIN32
             const int rc = ::select(0, nullptr, &writeSet, nullptr, &tv);
             #else
-            int rc = 0;
-            do { rc = ::select(s + 1, nullptr, &writeSet, nullptr, &tv); }
+            int rc = 0; do { rc = ::select(s + 1, nullptr, &writeSet, nullptr, &tv); }
             while (rc < 0 && errno == EINTR);
             #endif
             if (rc <= 0) { return false; }
@@ -131,8 +130,7 @@ namespace akkaradb::engine::cluster {
             int len = sizeof(error);
             return ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 && error == 0;
             #else
-            socklen_t len = sizeof(error);
-            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
+            socklen_t len = sizeof(error); return ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
             #endif
         }
 
@@ -147,8 +145,7 @@ namespace akkaradb::engine::cluster {
                 #ifdef MSG_NOSIGNAL
                 flags |= MSG_NOSIGNAL;
                 #endif
-                const ssize_t n = ::send(s, data + sent, size - sent, flags);
-                if (n < 0 && errno == EINTR) { continue; }
+                const ssize_t n = ::send(s, data + sent, size - sent, flags); if (n < 0 && errno == EINTR) { continue; }
                 #endif
                 if (n <= 0) { return false; }
                 sent += static_cast<size_t>(n);
@@ -163,8 +160,7 @@ namespace akkaradb::engine::cluster {
                 const int n = ::recv(s, reinterpret_cast<char*>(data + received), static_cast<int>(size - received), 0);
                 if (n < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
-                const ssize_t n = ::recv(s, data + received, size - received, 0);
-                if (n < 0 && errno == EINTR) { continue; }
+                const ssize_t n = ::recv(s, data + received, size - received, 0); if (n < 0 && errno == EINTR) { continue; }
                 #endif
                 if (n <= 0) { return false; }
                 received += static_cast<size_t>(n);
@@ -325,7 +321,7 @@ namespace akkaradb::engine::cluster {
                 const int rc = ::connect(socket, it->ai_addr, static_cast<int>(it->ai_addrlen));
                 #ifdef _WIN32
                 const bool inProgress = rc != 0 && (::WSAGetLastError() == WSAEWOULDBLOCK || ::WSAGetLastError() == WSAEINPROGRESS ||
-                                                     ::WSAGetLastError() == WSAEINVAL);
+                    ::WSAGetLastError() == WSAEINVAL);
                 #else
                 const bool inProgress = rc != 0 && errno == EINPROGRESS;
                 #endif
@@ -386,11 +382,7 @@ namespace akkaradb::engine::cluster {
             throw std::runtime_error("ReplicationClient: cannot allocate corrupt state backup path");
         }
 
-        bool handleCorruptMembershipFile(
-            const std::filesystem::path& path,
-            CorruptClusterStateAction action,
-            const std::exception& cause
-        ) {
+        bool handleCorruptMembershipFile(const std::filesystem::path& path, CorruptClusterStateAction action, const std::exception& cause) {
             if (action == CorruptClusterStateAction::FAIL_STARTUP) {
                 throw std::runtime_error(std::string{"ReplicationClient: "} + cause.what());
             }
@@ -416,11 +408,11 @@ namespace akkaradb::engine::cluster {
             const int closeRc = _close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: temp membership state sync failed"); }
             #else
-            const int fd = ::open(path.c_str(), O_RDONLY);
-            if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: temp membership state sync failed"); }
+            const int fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
+                throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync");
+            } const int rc = ::fsync(fd); const int closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
+                throw std::runtime_error("ReplicationClient: temp membership state sync failed");
+            }
             #endif
         }
 
@@ -434,8 +426,9 @@ namespace akkaradb::engine::cluster {
             const auto pid = static_cast<uint64_t>(::getpid());
             #endif
             for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
-                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
-                                    std::to_string(attempt);
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." + std::to_string(
+                    attempt
+                );
                 auto candidate = parent / (stem + suffix);
                 if (!std::filesystem::exists(candidate)) { return candidate; }
             }
@@ -446,14 +439,13 @@ namespace akkaradb::engine::cluster {
         void syncParentDirectory(const std::filesystem::path& path) {
             const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
             int flags = O_RDONLY;
-            #ifdef O_DIRECTORY
-            flags |= O_DIRECTORY;
-            #endif
-            const int fd = ::open(parent.c_str(), flags);
-            if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot open membership parent directory for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: membership parent directory sync failed"); }
+        #ifdef O_DIRECTORY
+        flags|= O_DIRECTORY;
+        #endif
+        const int fd = ::open(parent.c_str(), flags);if (fd<0) {
+            throw std::runtime_error("ReplicationClient: cannot open membership parent directory for sync");
+        } const int rc = ::fsync(fd); const int closeRc = ::close(fd);if (rc!= 0 || closeRc
+!= 0) { throw std::runtime_error("ReplicationClient: membership parent directory sync failed"); }
         }
         #endif
 
@@ -463,8 +455,7 @@ namespace akkaradb::engine::cluster {
                 throw std::runtime_error("ReplicationClient: atomic membership state replace failed");
             }
             #else
-            std::filesystem::rename(tmp, path);
-            syncParentDirectory(path);
+            std::filesystem::rename(tmp, path); syncParentDirectory(path);
             #endif
         }
 
@@ -693,10 +684,9 @@ namespace akkaradb::engine::cluster {
                     .groupEpoch = serverHello.groupEpoch,
                 };
                 try {
-                    if (const auto existing = loadMembership(runtimeOptions_.clusterMembershipPath, runtimeOptions_.corruptStateAction); existing &&
-                        !runtimeOptions_.resetClusterMembership &&
-                        (existing->groupId != incoming.groupId || existing->primaryNodeId != incoming.primaryNodeId || existing->groupEpoch
-                            != incoming.groupEpoch)) { return false; }
+                    if (const auto existing = loadMembership(runtimeOptions_.clusterMembershipPath, runtimeOptions_.corruptStateAction);
+                        existing && !runtimeOptions_.resetClusterMembership && (existing->groupId != incoming.groupId || existing->
+                            primaryNodeId != incoming.primaryNodeId || existing->groupEpoch != incoming.groupEpoch)) { return false; }
                     saveMembership(runtimeOptions_.clusterMembershipPath, incoming);
                 }
                 catch (...) { return false; }
@@ -740,7 +730,7 @@ namespace akkaradb::engine::cluster {
                         }
                         if (entry.seq != expectedSeq) { return; }
                         ApplyCallback applyCallback;
-                        std::function < void() > forceDurableCallback;
+                        std::function<void()> forceDurableCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
                             applyCallback = applyCallback_;
@@ -899,9 +889,7 @@ namespace akkaradb::engine::cluster {
         SnapshotEntryChunkCallback chunk,
         SnapshotEntryEndCallback endEntry,
         SnapshotEndCallback end
-    ) {
-        impl_->setSnapshotCallbacks(std::move(begin), std::move(beginEntry), std::move(chunk), std::move(endEntry), std::move(end));
-    }
+    ) { impl_->setSnapshotCallbacks(std::move(begin), std::move(beginEntry), std::move(chunk), std::move(endEntry), std::move(end)); }
 
     void ReplicationClient::start() { impl_->start(); }
 

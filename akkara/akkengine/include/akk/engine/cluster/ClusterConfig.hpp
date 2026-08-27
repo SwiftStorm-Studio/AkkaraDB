@@ -129,22 +129,17 @@ namespace akkaradb::engine::cluster {
 
     /** Recovery policy for corrupt small cluster state files. */
     enum class CorruptClusterStateAction : uint8_t {
-        FAIL_STARTUP = 0,
-        BACKUP_AND_RECREATE = 1,
-        DELETE_AND_RECREATE = 2,
+        FAIL_STARTUP = 0, BACKUP_AND_RECREATE = 1, DELETE_AND_RECREATE = 2,
     };
 
     /** Recovery policy for Raft log damage after the last committed entry. */
     enum class RaftLogRecoveryAction : uint8_t {
-        FAIL_STARTUP = 0,
-        TRUNCATE_UNCOMMITTED_TAIL = 1,
+        FAIL_STARTUP = 0, TRUNCATE_UNCOMMITTED_TAIL = 1,
     };
 
     /** Policy for Blob payloads when RAFT_QUORUM is selected. */
     enum class RaftBlobPolicy : uint8_t {
-        REJECT = 0,
-        PRIMARY_SIDE_ONLY = 1,
-        RAFT_LOG = 2,
+        REJECT = 0, PRIMARY_SIDE_ONLY = 1, RAFT_LOG = 2,
     };
 
     enum class RaftMembershipMode : uint8_t {

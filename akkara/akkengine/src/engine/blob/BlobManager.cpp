@@ -111,9 +111,7 @@ namespace akkaradb::engine::blob {
                         std::array<uint32_t, 256> out{};
                         for (uint32_t i = 0; i < out.size(); ++i) {
                             uint32_t crc = i;
-                            for (uint32_t bit = 0; bit < 8; ++bit) {
-                                crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
-                            }
+                            for (uint32_t bit = 0; bit < 8; ++bit) { crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u))); }
                             out[i] = crc;
                         }
                         return out;
@@ -134,9 +132,9 @@ namespace akkaradb::engine::blob {
             const auto parent = path.parent_path();
             const auto stem = path.filename().string();
             for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
-                auto candidate = parent / (stem + ".tmp." + std::to_string(pid) + "." +
-                                           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + "." +
-                                           std::to_string(attempt));
+                auto candidate = parent / (stem + ".tmp." + std::to_string(pid) + "." + std::to_string(
+                    sequence.fetch_add(1, std::memory_order_relaxed)
+                ) + "." + std::to_string(attempt));
                 if (!fs::exists(candidate)) { return candidate; }
             }
             throw std::runtime_error("BlobManager: cannot allocate temp file name");

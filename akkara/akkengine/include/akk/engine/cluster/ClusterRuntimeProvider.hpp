@@ -53,6 +53,7 @@ namespace akkaradb::engine::cluster {
         std::function<void(uint64_t offset, std::span<const uint8_t> chunk)> appendSnapshotEntryChunk;
         std::function<void()> finishSnapshotEntry;
         std::function<void(uint64_t snapshotSeq)> finishSnapshot;
+        std::function<void(uint64_t snapshotSeq)> recoverSnapshot;
         std::function<void(
 uint64_t seq,
  ReplOpType op,

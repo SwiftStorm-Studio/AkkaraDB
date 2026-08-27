@@ -156,18 +156,15 @@ namespace akkaradb::engine::cluster {
 
         std::vector<uint64_t> configuredReplicaNodeIds(const ClusterConfig& config, uint64_t selfNodeId) {
             std::vector<uint64_t> out;
-            for (const auto& node : config.nodes()) {
-                if (node.nodeId != selfNodeId && node.dataBearing()) { out.push_back(node.nodeId); }
-            }
+            for (const auto& node : config.nodes()) { if (node.nodeId != selfNodeId && node.dataBearing()) { out.push_back(node.nodeId); } }
             return out;
         }
 
         uint64_t randomNonZeroU64() {
             std::random_device rd;
             std::mt19937_64 rng{
-                (static_cast<uint64_t>(rd()) << 32) ^
-                static_cast<uint64_t>(rd()) ^
-                static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())
+                (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd()) ^ static_cast<uint64_t>(std::chrono::steady_clock::now().
+                    time_since_epoch().count())
             };
             uint64_t value = 0;
             while (value == 0) { value = rng(); }
@@ -224,9 +221,7 @@ namespace akkaradb::engine::cluster {
             const char* context,
             const std::exception& cause
         ) {
-            if (action == CorruptClusterStateAction::FAIL_STARTUP) {
-                throw std::runtime_error(std::string{context} + ": " + cause.what());
-            }
+            if (action == CorruptClusterStateAction::FAIL_STARTUP) { throw std::runtime_error(std::string{context} + ": " + cause.what()); }
             std::error_code ec;
             if (action == CorruptClusterStateAction::BACKUP_AND_RECREATE) {
                 std::filesystem::rename(path, corruptBackupPath(path), ec);
@@ -249,11 +244,11 @@ namespace akkaradb::engine::cluster {
             const int closeRc = _close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp state sync failed"); }
             #else
-            const int fd = ::open(path.c_str(), O_RDONLY);
-            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp state for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp state sync failed"); }
+            const int fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
+                throw std::runtime_error(std::string{context} + ": cannot reopen temp state for sync");
+            } const int rc = ::fsync(fd); const int closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
+                throw std::runtime_error(std::string{context} + ": temp state sync failed");
+            }
             #endif
         }
 
@@ -267,8 +262,9 @@ namespace akkaradb::engine::cluster {
             const auto pid = static_cast<uint64_t>(::getpid());
             #endif
             for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
-                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
-                                    std::to_string(attempt);
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." + std::to_string(
+                    attempt
+                );
                 auto candidate = parent / (stem + suffix);
                 if (!std::filesystem::exists(candidate)) { return candidate; }
             }
@@ -279,14 +275,13 @@ namespace akkaradb::engine::cluster {
         void syncParentDirectory(const std::filesystem::path& path, const char* context) {
             const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
             int flags = O_RDONLY;
-            #ifdef O_DIRECTORY
-            flags |= O_DIRECTORY;
-            #endif
-            const int fd = ::open(parent.c_str(), flags);
-            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot open parent directory for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": parent directory sync failed"); }
+        #ifdef O_DIRECTORY
+        flags|= O_DIRECTORY;
+        #endif
+        const int fd = ::open(parent.c_str(), flags);if (fd<0) {
+            throw std::runtime_error(std::string{context} + ": cannot open parent directory for sync");
+        } const int rc = ::fsync(fd); const int closeRc = ::close(fd);if (rc!= 0 || closeRc
+!= 0) { throw std::runtime_error(std::string{context} + ": parent directory sync failed"); }
         }
         #endif
 
@@ -296,8 +291,7 @@ namespace akkaradb::engine::cluster {
                 throw std::runtime_error(std::string{context} + ": atomic cluster group state replace failed");
             }
             #else
-            std::filesystem::rename(tmp, path);
-            syncParentDirectory(path, context);
+            std::filesystem::rename(tmp, path); syncParentDirectory(path, context);
             #endif
         }
 
@@ -320,11 +314,7 @@ namespace akkaradb::engine::cluster {
                 if (readLe32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) {
                     throw std::runtime_error("cluster group state CRC mismatch");
                 }
-                return GroupState{
-                    .groupId = readLe64(bytes, 5),
-                    .primaryNodeId = readLe64(bytes, 13),
-                    .groupEpoch = readLe64(bytes, 21),
-                };
+                return GroupState{.groupId = readLe64(bytes, 5), .primaryNodeId = readLe64(bytes, 13), .groupEpoch = readLe64(bytes, 21),};
             }
             catch (const std::exception& ex) {
                 (void)handleCorruptStateFile(path, corruptAction, context, ex);

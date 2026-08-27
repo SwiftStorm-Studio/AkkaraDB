@@ -84,11 +84,11 @@ namespace akkaradb::engine::cluster {
             const int closeRc = _close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
             #else
-            const int fd = ::open(path.c_str(), O_RDONLY);
-            if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
+            const int fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
+                throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync");
+            } const int rc = ::fsync(fd); const int closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
+                throw std::runtime_error(std::string{context} + ": temp file sync failed");
+            }
             #endif
         }
 
@@ -102,8 +102,9 @@ namespace akkaradb::engine::cluster {
             const auto pid = static_cast<uint64_t>(::getpid());
             #endif
             for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
-                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." +
-                                    std::to_string(attempt);
+                const auto suffix = ".tmp." + std::to_string(pid) + "." + std::to_string(sequence.fetch_add(1)) + "." + std::to_string(
+                    attempt
+                );
                 auto candidate = parent / (stem + suffix);
                 if (!std::filesystem::exists(candidate)) { return candidate; }
             }
@@ -114,14 +115,13 @@ namespace akkaradb::engine::cluster {
         void syncParentDirectory(const std::filesystem::path& path) {
             const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
             int flags = O_RDONLY;
-            #ifdef O_DIRECTORY
-            flags |= O_DIRECTORY;
-            #endif
-            const int fd = ::open(parent.c_str(), flags);
-            if (fd < 0) { throw std::runtime_error("ClusterConfig: cannot open parent directory for sync"); }
-            const int rc = ::fsync(fd);
-            const int closeRc = ::close(fd);
-            if (rc != 0 || closeRc != 0) { throw std::runtime_error("ClusterConfig: parent directory sync failed"); }
+        #ifdef O_DIRECTORY
+        flags|= O_DIRECTORY;
+        #endif
+        const int fd = ::open(parent.c_str(), flags);if (fd<0) {
+            throw std::runtime_error("ClusterConfig: cannot open parent directory for sync");
+        } const int rc = ::fsync(fd); const int closeRc = ::close(fd);if (rc!= 0 || closeRc
+!= 0) { throw std::runtime_error("ClusterConfig: parent directory sync failed"); }
         }
         #endif
 
@@ -131,8 +131,7 @@ namespace akkaradb::engine::cluster {
                 throw std::runtime_error("ClusterConfig: atomic file replace failed");
             }
             #else
-            std::filesystem::rename(tmp, path);
-            syncParentDirectory(path);
+            std::filesystem::rename(tmp, path); syncParentDirectory(path);
             #endif
         }
     } // namespace

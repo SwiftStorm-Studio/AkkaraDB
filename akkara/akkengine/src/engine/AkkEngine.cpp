@@ -41,6 +41,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #ifdef _WIN32
 #include <io.h>
@@ -69,11 +70,11 @@ namespace akkaradb::engine {
         void corruptSnapshotStagingAtTestPoint(const fs::path& path, const char* point) {
             const char* requested = std::getenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
             if (requested == nullptr || std::strcmp(requested, point) != 0) { return; }
-#ifdef _WIN32
+            #ifdef _WIN32
             (void)_putenv_s("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT", "");
-#else
+            #else
             (void)::unsetenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
-#endif
+            #endif
 
             std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
             if (!file) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for test corruption"); }
@@ -93,8 +94,8 @@ namespace akkaradb::engine {
                 throw std::runtime_error("AkkEngine: replication snapshot staging value is empty at test corruption point");
             }
 
-            const std::streamoff firstValueByteOffset =
-                firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t) + keyLen);
+            const std::streamoff firstValueByteOffset = firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(
+                uint64_t) + sizeof(uint32_t) + keyLen);
             file.seekg(firstValueByteOffset);
             char byte = 0;
             file.get(byte);
@@ -131,9 +132,7 @@ namespace akkaradb::engine {
             if (nodeId == 0 || nodeId > MAX_NODE_ID) {
                 throw std::invalid_argument("AkkEngine: RAFT_LOG Blob nodeId is outside encodable range");
             }
-            if (seq == 0 || seq > SEQ_MASK) {
-                throw std::overflow_error("AkkEngine: RAFT_LOG Blob sequence is outside encodable range");
-            }
+            if (seq == 0 || seq > SEQ_MASK) { throw std::overflow_error("AkkEngine: RAFT_LOG Blob sequence is outside encodable range"); }
             return BLOB_ID_NAMESPACE_RAFT_LOG | (nodeId << SEQ_BITS) | seq;
         }
 
@@ -141,9 +140,7 @@ namespace akkaradb::engine {
             constexpr uint64_t ORDINAL_BITS = 22;
             constexpr uint64_t ORDINAL_MASK = (1ULL << ORDINAL_BITS) - 1ULL;
             constexpr uint64_t SEQ_MASK = (1ULL << (BLOB_ID_PAYLOAD_BITS - ORDINAL_BITS)) - 1ULL;
-            if (seq == 0 || seq > SEQ_MASK) {
-                throw std::overflow_error("AkkEngine: snapshot Blob sequence is outside encodable range");
-            }
+            if (seq == 0 || seq > SEQ_MASK) { throw std::overflow_error("AkkEngine: snapshot Blob sequence is outside encodable range"); }
             if (ordinal == 0 || ordinal > ORDINAL_MASK) {
                 throw std::overflow_error("AkkEngine: snapshot Blob ordinal is outside encodable range");
             }
@@ -347,9 +344,7 @@ namespace akkaradb::engine {
                         std::array<uint32_t, 256> out{};
                         for (uint32_t i = 0; i < out.size(); ++i) {
                             uint32_t crc = i;
-                            for (uint32_t bit = 0; bit < 8; ++bit) {
-                                crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u)));
-                            }
+                            for (uint32_t bit = 0; bit < 8; ++bit) { crc = (crc >> 1u) ^ (0x82F63B78u & (0u - (crc & 1u))); }
                             out[i] = crc;
                         }
                         return out;
@@ -723,7 +718,7 @@ namespace akkaradb::engine {
                         std::span<const uint8_t> key,
                         uint8_t flags,
                         uint64_t sourceNodeId,
-                        const std::function<std::vector<uint8_t>(uint64_t proposalIndex, uint8_t& proposalFlags)>& prepareValue,
+                        const std::function<std::vector<uint8_t>(uint64_t proposalIndex, uint8_t & proposalFlags)>& prepareValue,
                         uint64_t fp64 = 0,
                         uint64_t miniKey = 0
                     ) {
@@ -1047,9 +1042,7 @@ namespace akkaradb::engine {
 
             [[nodiscard]] std::vector<uint8_t> maybeExternalize(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
                 if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
-                if (seq >= LOCAL_BLOB_ID_LIMIT) {
-                    throw std::overflow_error("AkkEngine: local Blob sequence is outside encodable range");
-                }
+                if (seq >= LOCAL_BLOB_ID_LIMIT) { throw std::overflow_error("AkkEngine: local Blob sequence is outside encodable range"); }
 
                 blobManager->write(seq, value);
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
@@ -1067,12 +1060,7 @@ namespace akkaradb::engine {
                 uint64_t miniKey = 0;
             };
 
-            [[nodiscard]] StagedSnapshotRecord readStagedSnapshotRecord(
-                std::istream& in,
-                uint64_t seq,
-                uint64_t ordinal,
-                bool writeBlob
-            ) {
+            [[nodiscard]] StagedSnapshotRecord readStagedSnapshotRecord(std::istream& in, uint64_t seq, uint64_t ordinal, bool writeBlob) {
                 auto header = readSnapshotStagingEntryHeader(in);
                 Crc32cStream valueCrc;
                 StagedSnapshotRecord record;
@@ -1087,10 +1075,7 @@ namespace akkaradb::engine {
                     if (externalize) {
                         blobId = snapshotBlobId(seq, ordinal);
                         record.storedValue.resize(blob::BLOB_REF_SIZE);
-                        blob::encodeBlobRef(
-                            record.storedValue.data(),
-                            blob::BlobRef{blobId, header.valueSize, header.valueCrc32c}
-                        );
+                        blob::encodeBlobRef(record.storedValue.data(), blob::BlobRef{blobId, header.valueSize, header.valueCrc32c});
                         record.flags |= MemHdr16::FLAG_BLOB;
                         if (writeBlob) {
                             blobManager->abortWrite(blobId);
@@ -1102,9 +1087,7 @@ namespace akkaradb::engine {
                         buffer.resize(static_cast<size_t>(std::min<uint64_t>(SNAPSHOT_STAGING_VALUE_CHUNK_BYTES, header.valueSize)));
                         uint64_t offset = 0;
                         while (offset < header.valueSize) {
-                            const size_t chunkSize = static_cast<size_t>(
-                                std::min<uint64_t>(buffer.size(), header.valueSize - offset)
-                            );
+                            const size_t chunkSize = static_cast<size_t>(std::min<uint64_t>(buffer.size(), header.valueSize - offset));
                             readExact(in, buffer.data(), chunkSize, "entry value chunk");
                             const std::span<const uint8_t> chunk{buffer.data(), chunkSize};
                             header.recordCrc.update(chunk);
@@ -1592,14 +1575,7 @@ namespace akkaradb::engine {
                 if (!walWriter) { return; }
                 static constexpr std::array<uint8_t, 5> COMMIT_KEY = {'A', 'K', 'S', 'C', '1'};
                 const std::vector<uint8_t> value = encodeSnapshotCommitValue(recordCount);
-                walWriter->append(
-                    COMMIT_KEY,
-                    value,
-                    seq,
-                    wal::WAL_FLAG_SNAPSHOT_COMMIT,
-                    0,
-                    snapshotCommitWalAck()
-                );
+                walWriter->append(COMMIT_KEY, value, seq, wal::WAL_FLAG_SNAPSHOT_COMMIT, 0, snapshotCommitWalAck());
             }
 
             void applySnapshotRecordMemory(
@@ -1873,6 +1849,18 @@ namespace akkaradb::engine {
                            : opts.paths.dataDir / "replication-snapshot.staging";
             }
 
+            [[nodiscard]] std::pair<uint64_t, uint64_t> readReplicaSnapshotStagingHeader(std::istream& in) const {
+                static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
+                std::array<char, sizeof(SNAPSHOT_STAGING_MAGIC)> magic{};
+                readExact(in, magic.data(), magic.size(), "header");
+                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
+                    throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
+                }
+                const uint64_t stagedSeq = readU64Le(in, "snapshot seq");
+                const uint64_t stagedEntryCount = readU64Le(in, "entry count");
+                return {stagedSeq, stagedEntryCount};
+            }
+
             void resetReplicaSnapshotStagingLocked() {
                 if (pendingSnapshotOut.is_open()) { pendingSnapshotOut.close(); }
                 removeFileIfExists(replicaSnapshotStagingPath());
@@ -1881,6 +1869,42 @@ namespace akkaradb::engine {
                 pendingSnapshotEntryCount = 0;
                 pendingSnapshotAppliedEntries = 0;
                 pendingSnapshotKeys.clear();
+                pendingSnapshotEntryInProgress = false;
+                pendingSnapshotEntryValueSize = 0;
+                pendingSnapshotEntryValueOffset = 0;
+                pendingSnapshotEntryValueCrc32c = 0;
+                pendingSnapshotEntryRecordCrc = Crc32cStream{};
+                pendingSnapshotEntryValueCrc = Crc32cStream{};
+            }
+
+            void loadReplicaSnapshotStagingForRecoveryLocked(uint64_t seq) {
+                if (snapshotInProgress && seq == pendingSnapshotSeq && pendingSnapshotAppliedEntries == pendingSnapshotEntryCount && !
+                    pendingSnapshotEntryInProgress) {
+                    if (pendingSnapshotOut.is_open()) { pendingSnapshotOut.close(); }
+                    return;
+                }
+                if (pendingSnapshotOut.is_open()) { pendingSnapshotOut.close(); }
+
+                const auto path = replicaSnapshotStagingPath();
+                std::ifstream staged{path, std::ios::binary};
+                if (!staged) { throw std::runtime_error("AkkEngine: missing replication snapshot staging file for recovery"); }
+
+                const auto [stagedSeq, stagedEntryCount] = readReplicaSnapshotStagingHeader(staged);
+                if (stagedSeq != seq) { throw std::runtime_error("AkkEngine: replication snapshot recovery sequence mismatch"); }
+
+                pendingSnapshotKeys.clear();
+                for (uint64_t i = 0; i < stagedEntryCount; ++i) {
+                    const auto entry = readStagedSnapshotRecord(staged, seq, i + 1, false);
+                    const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
+                    if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate keys"); }
+                }
+                char trailing = 0;
+                if (staged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
+
+                snapshotInProgress = true;
+                pendingSnapshotSeq = seq;
+                pendingSnapshotEntryCount = stagedEntryCount;
+                pendingSnapshotAppliedEntries = stagedEntryCount;
                 pendingSnapshotEntryInProgress = false;
                 pendingSnapshotEntryValueSize = 0;
                 pendingSnapshotEntryValueOffset = 0;
@@ -1913,9 +1937,7 @@ namespace akkaradb::engine {
                 if (!snapshotInProgress || !pendingSnapshotOut.is_open()) {
                     throw std::runtime_error("AkkEngine: received replication snapshot entry without begin");
                 }
-                if (pendingSnapshotEntryInProgress) {
-                    throw std::runtime_error("AkkEngine: replication snapshot entry is already active");
-                }
+                if (pendingSnapshotEntryInProgress) { throw std::runtime_error("AkkEngine: replication snapshot entry is already active"); }
                 if (pendingSnapshotAppliedEntries >= pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: replication snapshot has too many entries");
                 }
@@ -1928,7 +1950,9 @@ namespace akkaradb::engine {
                 writeU32Le(pendingSnapshotOut, keyLen);
                 writeU64Le(pendingSnapshotOut, valueSize);
                 writeU32Le(pendingSnapshotOut, valueCrc32c);
-                if (!key.empty()) { pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
+                if (!key.empty()) {
+                    pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size()));
+                }
                 if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot staging entry"); }
 
                 pendingSnapshotEntryInProgress = true;
@@ -1948,10 +1972,8 @@ namespace akkaradb::engine {
                 if (!snapshotInProgress || !pendingSnapshotOut.is_open() || !pendingSnapshotEntryInProgress) {
                     throw std::runtime_error("AkkEngine: received replication snapshot chunk without active entry");
                 }
-                if (offset != pendingSnapshotEntryValueOffset ||
-                    chunk.size() > pendingSnapshotEntryValueSize - pendingSnapshotEntryValueOffset) {
-                    throw std::runtime_error("AkkEngine: invalid replication snapshot chunk");
-                }
+                if (offset != pendingSnapshotEntryValueOffset || chunk.size() > pendingSnapshotEntryValueSize -
+                    pendingSnapshotEntryValueOffset) { throw std::runtime_error("AkkEngine: invalid replication snapshot chunk"); }
                 if (!chunk.empty()) {
                     pendingSnapshotOut.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
                     if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot chunk"); }
@@ -1966,8 +1988,8 @@ namespace akkaradb::engine {
                 if (!snapshotInProgress || !pendingSnapshotOut.is_open() || !pendingSnapshotEntryInProgress) {
                     throw std::runtime_error("AkkEngine: finished replication snapshot entry without active entry");
                 }
-                if (pendingSnapshotEntryValueOffset != pendingSnapshotEntryValueSize ||
-                    pendingSnapshotEntryValueCrc.finish() != pendingSnapshotEntryValueCrc32c) {
+                if (pendingSnapshotEntryValueOffset != pendingSnapshotEntryValueSize || pendingSnapshotEntryValueCrc.finish() !=
+                    pendingSnapshotEntryValueCrc32c) {
                     throw std::runtime_error("AkkEngine: replication snapshot entry checksum or size mismatch");
                 }
                 writeU32Le(pendingSnapshotOut, pendingSnapshotEntryRecordCrc.finish());
@@ -1980,8 +2002,7 @@ namespace akkaradb::engine {
                 pendingSnapshotEntryValueCrc = Crc32cStream{};
             }
 
-            void finishReplicaSnapshot(uint64_t seq) {
-                std::lock_guard lock(writeMu);
+            void finishReplicaSnapshotLocked(uint64_t seq) {
                 if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotAppliedEntries != pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: invalid replication snapshot completion");
                 }
@@ -1996,14 +2017,7 @@ namespace akkaradb::engine {
                 std::ifstream staged{path, std::ios::binary};
                 if (!staged) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for apply"); }
 
-                static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
-                std::array<char, sizeof(SNAPSHOT_STAGING_MAGIC)> magic{};
-                readExact(staged, magic.data(), magic.size(), "header");
-                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
-                    throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
-                }
-                const uint64_t stagedSeq = readU64Le(staged, "snapshot seq");
-                const uint64_t stagedEntryCount = readU64Le(staged, "entry count");
+                const auto [stagedSeq, stagedEntryCount] = readReplicaSnapshotStagingHeader(staged);
                 if (stagedSeq != seq || stagedEntryCount != pendingSnapshotEntryCount) {
                     throw std::runtime_error("AkkEngine: replication snapshot staging metadata mismatch");
                 }
@@ -2055,25 +2069,38 @@ namespace akkaradb::engine {
 
                 std::ifstream applyStaged{path, std::ios::binary};
                 if (!applyStaged) { throw std::runtime_error("AkkEngine: failed to reopen replication snapshot staging file for apply"); }
-                readExact(applyStaged, magic.data(), magic.size(), "header");
-                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
-                    throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
-                }
-                if (readU64Le(applyStaged, "snapshot seq") != seq ||
-                    readU64Le(applyStaged, "entry count") != stagedEntryCount) {
+                const auto [applyStagedSeq, applyStagedEntryCount] = readReplicaSnapshotStagingHeader(applyStaged);
+                if (applyStagedSeq != seq || applyStagedEntryCount != stagedEntryCount) {
                     throw std::runtime_error("AkkEngine: replication snapshot staging metadata changed during apply");
                 }
                 for (uint64_t i = 0; i < stagedEntryCount; ++i) {
                     const auto entry = readStagedSnapshotRecord(applyStaged, seq, i + 1, false);
                     applySnapshotRecordMemory(seq, entry.key, entry.storedValue, entry.flags, entry.fp64, entry.miniKey);
                 }
-                if (applyStaged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
+                if (applyStaged.get(trailing)) {
+                    throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file");
+                }
 
                 memtable->advanceSeq(seq);
                 markWriteCommitted(seq);
                 if (raftLog) { raftLog->observeCommitted(seq); }
                 applyStaged.close();
                 resetReplicaSnapshotStagingLocked();
+            }
+
+            void finishReplicaSnapshot(uint64_t seq) {
+                std::lock_guard lock(writeMu);
+                finishReplicaSnapshotLocked(seq);
+            }
+
+            void recoverReplicaSnapshot(uint64_t seq) {
+                std::lock_guard lock(writeMu);
+                if (snapshotSeq() >= seq) {
+                    resetReplicaSnapshotStagingLocked();
+                    return;
+                }
+                loadReplicaSnapshotStagingForRecoveryLocked(seq);
+                finishReplicaSnapshotLocked(seq);
             }
 
             class WriteCoordinator {
@@ -2359,7 +2386,10 @@ namespace akkaradb::engine {
         if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
             throw std::invalid_argument("AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled");
         }
-        auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
+        auto engine = std::unique_ptr < AkkEngine >
+        {
+            new AkkEngine()
+        };
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
@@ -2519,8 +2549,7 @@ namespace akkaradb::engine {
             impl.primaryAckTimeoutAction = cfg.consistency().ackTimeoutAction;
             if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
                 const auto raftBlobPolicy = impl.opts.cluster.runtime.raftBlobPolicy;
-                if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT &&
-                    raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY &&
+                if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT && raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY &&
                     raftBlobPolicy != cluster::RaftBlobPolicy::RAFT_LOG) {
                     throw std::invalid_argument("AkkEngine: invalid Raft Blob policy");
                 }
@@ -2605,6 +2634,7 @@ namespace akkaradb::engine {
             };
             callbacks.finishSnapshotEntry = [&impl] { impl.finishReplicaSnapshotEntry(); };
             callbacks.finishSnapshot = [&impl](uint64_t seq) { impl.finishReplicaSnapshot(seq); };
+            callbacks.recoverSnapshot = [&impl](uint64_t seq) { impl.recoverReplicaSnapshot(seq); };
             callbacks.forceDurable = [&impl] {
                 if (impl.walWriter) { impl.walWriter->forceSync(); }
                 if (impl.versionLog) { impl.versionLog->forceSync(); }

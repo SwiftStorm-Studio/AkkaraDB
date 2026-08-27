@@ -203,12 +203,7 @@ namespace akkaradb::engine::wal {
         const auto replayEntry = [&memtable](const WalRecoveredEntry& entry) {
             const uint8_t flags = static_cast<uint8_t>(entry.flags & 0xffu);
             if ((flags & core::MemHdr16::FLAG_TOMBSTONE) != 0) {
-                memtable.remove(
-                    std::span<const uint8_t>{entry.key.data(), entry.key.size()},
-                    entry.seq,
-                    entry.keyFp64,
-                    0
-                );
+                memtable.remove(std::span<const uint8_t>{entry.key.data(), entry.key.size()}, entry.seq, entry.keyFp64, 0);
                 return;
             }
             memtable.put(
@@ -226,9 +221,7 @@ namespace akkaradb::engine::wal {
             [&](const WalRecoveredEntry& entry) {
                 if ((entry.flags & WAL_FLAG_SNAPSHOT_COMMIT) != 0) {
                     const auto expectedCount = decodeSnapshotCommitCount(entry.value);
-                    if (!expectedCount.has_value()) {
-                        throw std::runtime_error("WAL recovery found corrupt snapshot commit marker");
-                    }
+                    if (!expectedCount.has_value()) { throw std::runtime_error("WAL recovery found corrupt snapshot commit marker"); }
                     committedSnapshotCounts[entry.seq] = *expectedCount;
                     return;
                 }

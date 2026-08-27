@@ -46,11 +46,13 @@
 namespace akkaradb::engine::cluster {
     namespace {
         #ifdef _WIN32
-        using SocketHandle = SOCKET; constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET; void shutdownSocket(SocketHandle s) noexcept {
-            if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); }
-        } void closeSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } } bool socketOk(SocketHandle s) noexcept {
-            return s != INVALID_SOCKET;
-        } void netInit() {
+        using SocketHandle = SOCKET;
+        constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET;
+        void shutdownSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::shutdown(s, SD_BOTH); } }
+        void closeSocket(SocketHandle s) noexcept { if (s != BAD_SOCKET) { ::closesocket(s); } }
+        bool socketOk(SocketHandle s) noexcept { return s != INVALID_SOCKET; }
+
+        void netInit() {
             static std::once_flag once;
             std::call_once(
                 once,
@@ -61,18 +63,15 @@ namespace akkaradb::engine::cluster {
             );
         }
         #else
-        using SocketHandle = int;
-        constexpr SocketHandle BAD_SOCKET = -1;
-        void shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } }
-        void closeSocket(SocketHandle s) noexcept { if (s >= 0) { ::close(s); } }
-        bool socketOk(SocketHandle s) noexcept { return s >= 0; }
-        void netInit() {}
+        using SocketHandle = int; constexpr SocketHandle BAD_SOCKET = -1; void
+        shutdownSocket(SocketHandle s) noexcept { if (s >= 0) { ::shutdown(s, SHUT_RDWR); } } void closeSocket(SocketHandle s) noexcept {
+            if (s >= 0) { ::close(s); }
+        } bool socketOk(SocketHandle s) noexcept { return s >= 0; } void netInit() {}
         #endif
 
         void configureNoSigPipe(SocketHandle s) noexcept {
             #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
-            int enabled = 1;
-            (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+            int enabled = 1; (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
             #else
             (void)s;
             #endif
@@ -89,8 +88,7 @@ namespace akkaradb::engine::cluster {
                 #ifdef MSG_NOSIGNAL
                 flags |= MSG_NOSIGNAL;
                 #endif
-                const ssize_t rc = ::send(s, data + sent, size - sent, flags);
-                if (rc < 0 && errno == EINTR) { continue; }
+                const ssize_t rc = ::send(s, data + sent, size - sent, flags); if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 sent += static_cast<size_t>(rc);
@@ -105,8 +103,7 @@ namespace akkaradb::engine::cluster {
                 const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
                 if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
-                const ssize_t rc = ::recv(s, data + got, size - got, 0);
-                if (rc < 0 && errno == EINTR) { continue; }
+                const ssize_t rc = ::recv(s, data + got, size - got, 0); if (rc < 0 && errno == EINTR) { continue; }
                 #endif
                 if (rc <= 0) { return false; }
                 got += static_cast<size_t>(rc);
@@ -405,11 +402,8 @@ namespace akkaradb::engine::cluster {
                         closeSocket(client);
                         continue;
                     }
-                    if (!configuredReplicaNodeIds.empty() && std::find(
-                        configuredReplicaNodeIds.begin(),
-                        configuredReplicaNodeIds.end(),
-                        hello.nodeId
-                    ) == configuredReplicaNodeIds.end()) {
+                    if (!configuredReplicaNodeIds.empty() && std::ranges::find(configuredReplicaNodeIds, hello.nodeId) ==
+                        configuredReplicaNodeIds.end()) {
                         closeSocket(client);
                         continue;
                     }
@@ -434,9 +428,8 @@ namespace akkaradb::engine::cluster {
                     bool resyncRequired = false;
                     {
                         std::lock_guard lock{replicasMutex};
-                        const auto duplicate = std::find_if(
-                            replicas.begin(),
-                            replicas.end(),
+                        const auto duplicate = std::ranges::find_if(
+                            replicas,
                             [&](const std::shared_ptr<ReplicaState>& existing) {
                                 return !existing->dead.load() && existing->nodeId == hello.nodeId;
                             }
@@ -631,7 +624,7 @@ namespace akkaradb::engine::cluster {
         impl->historyProvider = std::move(historyProvider);
         impl->snapshotProvider = std::move(snapshotProvider);
         if (impl->runtimeOptions.transportMode == TransportMode::SECURE) { impl->localIdentity = loadSecureIdentity(impl->runtimeOptions); }
-        return std::unique_ptr < ReplicationServer > (new ReplicationServer(std::move(impl)));
+        return std::unique_ptr<ReplicationServer>(new ReplicationServer(std::move(impl)));
     }
 
     void ReplicationServer::start() { impl_->start(); }
