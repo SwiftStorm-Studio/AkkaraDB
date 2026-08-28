@@ -640,6 +640,7 @@ namespace akkaradb::engine {
             uint32_t pendingSnapshotEntryValueCrc32c = 0;
             Crc32cStream pendingSnapshotEntryRecordCrc;
             Crc32cStream pendingSnapshotEntryValueCrc;
+            uint64_t durableReplicaSnapshotSeq = 0;
 
             struct AppliedWrite {
                 uint64_t seq = 0;
@@ -2050,6 +2051,7 @@ namespace akkaradb::engine {
                 if (walWriter) {
                     crashAtTestPoint("snapshot.finish.after_wal_records");
                     appendSnapshotWalCommit(seq, snapshotWalRecordCount);
+                    durableReplicaSnapshotSeq = std::max(durableReplicaSnapshotSeq, seq);
                     crashAtTestPoint("snapshot.finish.after_wal_commit");
                 }
 
@@ -2096,11 +2098,17 @@ namespace akkaradb::engine {
             void recoverReplicaSnapshot(uint64_t seq) {
                 std::lock_guard lock(writeMu);
                 if (snapshotSeq() >= seq) {
+                    durableReplicaSnapshotSeq = std::max(durableReplicaSnapshotSeq, seq);
                     resetReplicaSnapshotStagingLocked();
                     return;
                 }
                 loadReplicaSnapshotStagingForRecoveryLocked(seq);
                 finishReplicaSnapshotLocked(seq);
+            }
+
+            [[nodiscard]] bool isReplicaSnapshotDurable(uint64_t seq) {
+                std::lock_guard lock(writeMu);
+                return snapshotSeq() >= seq || durableReplicaSnapshotSeq >= seq;
             }
 
             class WriteCoordinator {
@@ -2635,6 +2643,7 @@ namespace akkaradb::engine {
             callbacks.finishSnapshotEntry = [&impl] { impl.finishReplicaSnapshotEntry(); };
             callbacks.finishSnapshot = [&impl](uint64_t seq) { impl.finishReplicaSnapshot(seq); };
             callbacks.recoverSnapshot = [&impl](uint64_t seq) { impl.recoverReplicaSnapshot(seq); };
+            callbacks.isSnapshotDurable = [&impl](uint64_t seq) { return impl.isReplicaSnapshotDurable(seq); };
             callbacks.forceDurable = [&impl] {
                 if (impl.walWriter) { impl.walWriter->forceSync(); }
                 if (impl.versionLog) { impl.versionLog->forceSync(); }

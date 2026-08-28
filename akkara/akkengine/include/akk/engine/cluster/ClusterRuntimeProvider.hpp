@@ -54,6 +54,7 @@ namespace akkaradb::engine::cluster {
         std::function<void()> finishSnapshotEntry;
         std::function<void(uint64_t snapshotSeq)> finishSnapshot;
         std::function<void(uint64_t snapshotSeq)> recoverSnapshot;
+        std::function<bool(uint64_t snapshotSeq)> isSnapshotDurable;
         std::function<void(
 uint64_t seq,
  ReplOpType op,
