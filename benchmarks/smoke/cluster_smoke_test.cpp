@@ -615,6 +615,16 @@ namespace {
         return engine.get(bytesOf(key));
     }
 
+    std::string keyOwnedBy(const ClusterConfig& cfg, uint64_t nodeId, const std::string& prefix) {
+        ClusterRouter router{cfg};
+        for (uint32_t i = 0; i < 10000; ++i) {
+            std::string key = prefix + "-" + std::to_string(i);
+            const auto targets = router.writeTargets(bytesOf(key));
+            if (!targets.empty() && targets.front().nodeId == nodeId) { return key; }
+        }
+        throw std::runtime_error("cluster smoke: failed to find partitioned owner key");
+    }
+
     [[nodiscard]] std::vector<uint8_t> snapshotCommitValue(uint64_t recordCount) {
         std::vector<uint8_t> out;
         out.insert(out.end(), {'A', 'K', 'S', 'C', '1'});
@@ -714,6 +724,7 @@ namespace {
         const auto path = dir / "cluster.cfg";
         ClusterConfig::save(path, cfg);
         const auto loaded = ClusterConfig::load(path);
+        AKK_CLUSTER_CHECK(loaded.primaryNodeId() == 0);
         AKK_CLUSTER_CHECK(loaded.consistency().ackTimeoutAction == AckTimeoutAction::FAIL_WRITE);
         AKK_CLUSTER_CHECK(loaded.raft().membership.mode == RaftMembershipMode::JOINT_CONSENSUS);
         AKK_CLUSTER_CHECK(loaded.raft().membership.allowOnlineVoterChanges);
@@ -735,6 +746,100 @@ namespace {
             rejected = true;
         }
         AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testMirrorPrimaryRoundtripAndValidation() {
+        const auto dir = makeTempDir("mirror-primary-config");
+        const ClusterConfig cfg{
+            {
+                node(1, 20161, 20261),
+                node(2, 20162, 20262),
+                node(3, 20163, 20263),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
+            {},
+            {},
+            2,
+        };
+        const auto path = dir / "cluster.cfg";
+        ClusterConfig::save(path, cfg);
+        const auto loaded = ClusterConfig::load(path);
+        AKK_CLUSTER_CHECK(loaded.primaryNodeId() == 2);
+
+        ClusterRuntimeOptions primaryOptions;
+        primaryOptions.transportMode = TransportMode::PLAIN;
+        primaryOptions.startupRole = NodeStartupRole::PRIMARY;
+        auto configuredPrimary = makeRuntime(dir / "n2", loaded, 2, primaryOptions);
+        configuredPrimary->runtime->start();
+        AKK_CLUSTER_CHECK(configuredPrimary->runtime->role() == NodeRole::PRIMARY);
+
+        auto wrongPrimary = makeRuntime(dir / "n1", loaded, 1, primaryOptions);
+        bool rejectedWrongPrimary = false;
+        try {
+            wrongPrimary->runtime->start();
+        }
+        catch (const std::runtime_error&) {
+            rejectedWrongPrimary = true;
+        }
+        AKK_CLUSTER_CHECK(rejectedWrongPrimary);
+        wrongPrimary->runtime->close();
+        configuredPrimary->runtime->close();
+
+        bool rejectedUnknown = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 20164, 20264), node(2, 20165, 20265)},
+                ReplicationMode::MIRROR,
+                AckPolicy{},
+                ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
+                {},
+                {},
+                3,
+            };
+        }
+        catch (const std::invalid_argument&) {
+            rejectedUnknown = true;
+        }
+        AKK_CLUSTER_CHECK(rejectedUnknown);
+
+        bool rejectedIneligible = false;
+        try {
+            (void)ClusterConfig{
+                {
+                    node(1, 20166, 20266),
+                    node(2, 20167, 20267, NodeCapability::DATA_BEARING),
+                },
+                ReplicationMode::MIRROR,
+                AckPolicy{},
+                ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
+                {},
+                {},
+                2,
+            };
+        }
+        catch (const std::invalid_argument&) {
+            rejectedIneligible = true;
+        }
+        AKK_CLUSTER_CHECK(rejectedIneligible);
+
+        bool rejectedPartitionedPrimary = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 20168, 20268), node(2, 20169, 20269)},
+                ReplicationMode::PARTITIONED,
+                AckPolicy{},
+                ConsistencyOptions{},
+                {},
+                {},
+                1,
+            };
+        }
+        catch (const std::invalid_argument&) {
+            rejectedPartitionedPrimary = true;
+        }
+        AKK_CLUSTER_CHECK(rejectedPartitionedPrimary);
     }
 
     void testReplFramingRejectsOversizedPayloadLength() {
@@ -832,6 +937,332 @@ namespace {
         AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
     }
 
+    void testStripeRuntimeStartsActivePlacement() {
+        const auto dir = makeTempDir("stripe-runtime-active-placement");
+
+        StripeOptions stripeOptions;
+        stripeOptions.dataShards = 2;
+        stripeOptions.parityShards = 1;
+        const ClusterConfig stripe{
+            {
+                node(1, 20318, 20418),
+                node(2, 20319, 20419),
+                node(3, 20320, 20420),
+            },
+            ReplicationMode::STRIPE,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 500},
+            {},
+            stripeOptions,
+        };
+
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.clusterGroupId = 9010;
+        options.clusterGroupEpoch = 1;
+
+        auto runtime = makeRuntime(dir / "stripe", stripe, 1, options);
+        runtime->runtime->start();
+        AKK_CLUSTER_CHECK(runtime->runtime->role() == NodeRole::PRIMARY);
+        runtime->runtime->close();
+    }
+
+    void testPartitionedRuntimeOwnerOnlyReplication() {
+        const auto dir = makeTempDir("partitioned-runtime-owner");
+        const ClusterConfig cfg{
+            {
+                node(1, 21601, 21701),
+                node(2, 21602, 21702),
+            },
+            ReplicationMode::PARTITIONED,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 500},
+        };
+
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.clusterGroupId = 9001;
+        options.clusterGroupEpoch = 1;
+
+        auto n1 = makeRuntime(dir / "n1", cfg, 1, options);
+        auto n2 = makeRuntime(dir / "n2", cfg, 2, options);
+        n1->runtime->start();
+        n2->runtime->start();
+        AKK_CLUSTER_CHECK(n1->runtime->role() == NodeRole::PRIMARY);
+        AKK_CLUSTER_CHECK(n2->runtime->role() == NodeRole::PRIMARY);
+
+        const std::string owner1Key = keyOwnedBy(cfg, 1, "partitioned-owner1");
+        const std::string value = "owner-value";
+
+        bool nonOwnerRejected = false;
+        try {
+            n2->runtime->shipEntry(1, ReplOpType::PUT, bytesOf(owner1Key), bytesOf(value), 0, 2);
+        }
+        catch (const std::runtime_error&) {
+            nonOwnerRejected = true;
+        }
+        AKK_CLUSTER_CHECK(nonOwnerRejected);
+
+        n1->runtime->shipEntry(1, ReplOpType::PUT, bytesOf(owner1Key), bytesOf(value), 0, 1);
+        n1->setState(1, bytesOf(owner1Key), bytesOf(value));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, owner1Key, value); }, std::chrono::milliseconds{8000}));
+
+        n2->runtime->close();
+        n1->runtime->close();
+    }
+
+    void testPartitionedEngineOwnerLinearizableRead() {
+        const auto dir = makeTempDir("partitioned-engine-owner-read");
+        const ClusterConfig cfg{
+            {
+                node(1, 21611, 21711),
+                node(2, 21612, 21712),
+            },
+            ReplicationMode::PARTITIONED,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 500},
+        };
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9002;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+
+        const std::string owner1Key = keyOwnedBy(cfg, 1, "engine-owner1");
+        const std::string value = "linearizable-owner-value";
+
+        bool nonOwnerRejected = false;
+        try {
+            n2->put(bytesOf(owner1Key), bytesOf("wrong-owner"));
+        }
+        catch (const std::runtime_error&) {
+            nonOwnerRejected = true;
+        }
+        AKK_CLUSTER_CHECK(nonOwnerRejected);
+
+        n1->put(bytesOf(owner1Key), bytesOf(value));
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                try {
+                    const auto stored = engineGet(*n2, owner1Key);
+                    return stored && *stored == std::vector<uint8_t>{value.begin(), value.end()};
+                }
+                catch (const std::runtime_error&) {
+                    return false;
+                }
+            },
+            std::chrono::milliseconds{8000}
+        ));
+
+        n2->close();
+        n1->close();
+    }
+
+    void testStripeEngineOwnerOnlyWritesAndCoordinatorReads() {
+        const auto dir = makeTempDir("stripe-engine-owner-read");
+        StripeOptions stripeOptions;
+        stripeOptions.dataShards = 2;
+        stripeOptions.parityShards = 1;
+        const AckPolicy appliedAck{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        const ClusterConfig cfg{
+            {
+                node(1, 21621, 21721),
+                node(2, 21622, 21722),
+                node(3, 21623, 21723),
+            },
+            ReplicationMode::STRIPE,
+            appliedAck,
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 750},
+            {},
+            stripeOptions,
+        };
+
+        auto makeOptions = [&](uint64_t nodeId, StripeReadCoordinatorMode coordinatorMode = StripeReadCoordinatorMode::OWNER) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9011;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.stripeReadCoordinatorMode = coordinatorMode;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+
+        const std::string owner1Key = keyOwnedBy(cfg, 1, "stripe-owner1");
+        const std::string value = "stripe-owner-value";
+
+        bool nonOwnerRejected = false;
+        try {
+            n2->put(bytesOf(owner1Key), bytesOf("wrong-owner"));
+        }
+        catch (const std::runtime_error&) {
+            nonOwnerRejected = true;
+        }
+        AKK_CLUSTER_CHECK(nonOwnerRejected);
+
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                try {
+                    n1->put(bytesOf(owner1Key), bytesOf(value));
+                    return true;
+                }
+                catch (const std::runtime_error&) {
+                    return false;
+                }
+            },
+            std::chrono::milliseconds{8000}
+        ));
+
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                try {
+                    const auto ownerRead = engineGet(*n3, owner1Key);
+                    const auto localCoordinatorRead = engineGet(*n2, owner1Key);
+                    const std::vector<uint8_t> expected{value.begin(), value.end()};
+                    return ownerRead && localCoordinatorRead && *ownerRead == expected && *localCoordinatorRead == expected;
+                }
+                catch (const std::runtime_error&) {
+                    return false;
+                }
+            },
+            std::chrono::milliseconds{8000}
+        ));
+
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
+    void testStripeEngineRejectsDegradedWriteCommit() {
+        const auto dir = makeTempDir("stripe-engine-data-shard-commit");
+        StripeOptions stripeOptions;
+        stripeOptions.dataShards = 2;
+        stripeOptions.parityShards = 1;
+        const AckPolicy appliedAck{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        const ClusterConfig cfg{
+            {
+                node(1, 21631, 21731),
+                node(2, 21632, 21732),
+                node(3, 21633, 21733),
+            },
+            ReplicationMode::STRIPE,
+            appliedAck,
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            {},
+            stripeOptions,
+        };
+
+        auto makeOptions = [&](uint64_t nodeId, StripeReadCoordinatorMode coordinatorMode) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9012;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.stripeWriteCommitMode = static_cast<StripeWriteCommitMode>(1);
+            options.cluster.runtime.stripeReadCoordinatorMode = coordinatorMode;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        bool rejected = false;
+        try {
+            auto engine = akkaradb::engine::AkkEngine::open(makeOptions(1, StripeReadCoordinatorMode::OWNER));
+            (void)engine;
+        }
+        catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testStripeEngineRejectsOnlineReconfiguration() {
+        const auto dir = makeTempDir("stripe-engine-reconfigure");
+        StripeOptions stripeOptions;
+        stripeOptions.dataShards = 2;
+        stripeOptions.parityShards = 1;
+        const AckPolicy appliedAck{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        const ClusterConfig oldCfg{
+            {
+                node(1, 21641, 21741),
+                node(2, 21642, 21742),
+                node(3, 21643, 21743),
+            },
+            ReplicationMode::STRIPE,
+            appliedAck,
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 2000},
+            {},
+            stripeOptions,
+        };
+        const ClusterConfig newCfg{
+            {
+                node(1, 21641, 21741),
+                node(2, 21642, 21742),
+                node(3, 21643, 21743),
+                node(4, 21644, 21744),
+            },
+            ReplicationMode::STRIPE,
+            appliedAck,
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 2000},
+            {},
+            stripeOptions,
+        };
+
+        auto makeOptions = [&](uint64_t nodeId, const ClusterConfig& cfg) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9013;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1, oldCfg));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2, oldCfg));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3, oldCfg));
+
+        bool rejected = false;
+        try {
+            n1->reconfigureCluster(newCfg);
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
     void testClusterManagerRecoversPrimaryLeaseFromManifest() {
         const auto dir = makeTempDir("manifest-primary-lease");
         const ClusterConfig cfg{
@@ -888,8 +1319,8 @@ namespace {
         AKK_CLUSTER_CHECK(rejected);
     }
 
-    void testClusterManagerAutoPromotesAfterExpiredManifestLease() {
-        const auto dir = makeTempDir("manifest-expired-primary-lease-promote");
+    void testClusterManagerRejectsAutoRoleAfterExpiredManifestLease() {
+        const auto dir = makeTempDir("manifest-expired-auto-role");
         const ClusterConfig cfg{
             {
                 node(1, 20341, 20441),
@@ -906,13 +1337,46 @@ namespace {
             mf->close();
         }
 
-        auto primary = ClusterManager::create(dir, cfg, 1);
-        primary->start();
-        AKK_CLUSTER_CHECK(primary->role() == NodeRole::PRIMARY);
-        AKK_CLUSTER_CHECK(primary->primaryNodeId() == 1);
-        AKK_CLUSTER_CHECK(primary->primaryHost() == "127.0.0.1");
-        AKK_CLUSTER_CHECK(primary->primaryReplPort() == 20441);
-        primary->close();
+        auto manager = ClusterManager::create(dir, cfg, 1);
+        bool rejected = false;
+        try {
+            manager->start();
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    void testClusterManagerRejectsPrimaryStartupWithForeignLease() {
+        const auto dir = makeTempDir("manifest-foreign-primary-lease");
+        const ClusterConfig cfg{
+            {
+                node(1, 20346, 20446),
+                node(2, 20347, 20447),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+        };
+
+        {
+            auto mf = manifest::Manifest::create(dir / "cluster.akmf", false);
+            mf->primaryLease(2, nowUs() + 30'000'000);
+            mf->nodeJoin(2, 25447, "foreign-primary.local");
+            mf->close();
+        }
+
+        ClusterRuntimeOptions options;
+        options.startupRole = NodeStartupRole::PRIMARY;
+        auto manager = ClusterManager::create(dir, cfg, 1, options);
+        bool rejected = false;
+        try {
+            manager->start();
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
     }
 
     void testClusterManagerDoesNotAutoPromoteRaftAfterExpiredManifestLease() {
@@ -1275,7 +1739,14 @@ namespace {
             nodes,
             [&](RuntimeHarness& currentLeader) {
                 leader = &currentLeader;
-                currentLeader.runtime->shipEntry(1, ReplOpType::PUT, bytesOf(key), bytesOf(value), 7, currentLeader.nodeId);
+                currentLeader.runtime->shipEntry(
+                    1,
+                    ReplOpType::PUT,
+                    bytesOf(key),
+                    bytesOf(value),
+                    akkaradb::core::MemHdr16::FLAG_NORMAL,
+                    currentLeader.nodeId
+                );
             },
             std::chrono::milliseconds{8000}
         );
@@ -1705,6 +2176,179 @@ namespace {
         server->close();
     }
 
+    void testReplicationServerRejectsOversizedCatchupQueue() {
+        constexpr uint16_t port = 20216;
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.maxReplicaQueueFrames = 2;
+        options.maxReplicaQueueBytes = 96;
+
+        const AckPolicy ack{};
+        ReplicationServer::Snapshot snapshot;
+        snapshot.seq = 1;
+        snapshot.entries.push_back(ReplSnapshotEntry{
+            .key = std::vector<uint8_t>{'q', 'u', 'e', 'u', 'e', '-', 'k', 'e', 'y'},
+            .value = std::vector<uint8_t>(256, 0x5A),
+        });
+
+        auto server = ReplicationServer::create(
+            port,
+            1,
+            [] { return uint64_t{1}; },
+            ack,
+            {},
+            1,
+            {2},
+            options,
+            [](uint64_t, uint64_t) -> std::optional<std::vector<ReplEntry>> { return std::nullopt; },
+            [snapshot] { return std::optional<ReplicationServer::Snapshot>{snapshot}; }
+        );
+        auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, ack, options);
+
+        server->start();
+        client->start();
+        std::this_thread::sleep_for(std::chrono::milliseconds{400});
+        AKK_CLUSTER_CHECK(server->replicaCount() == 0);
+
+        client->close();
+        server->close();
+    }
+
+    void testReplicationServerReapsDisconnectedReplicas() {
+        constexpr uint16_t port = 20217;
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+
+        const AckPolicy ack{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, ack, {}, 1, {2}, options);
+        server->start();
+
+        for (size_t iteration = 0; iteration < 64; ++iteration) {
+            auto client = ReplicationClient::create("127.0.0.1", port, 2, [] { return uint64_t{0}; }, ack, options);
+            client->start();
+            AKK_CLUSTER_CHECK(waitUntil([&] { return server->replicaCount() == 1; }));
+            client->close();
+            AKK_CLUSTER_CHECK(waitUntil([&] { return server->replicaCount() == 0; }));
+        }
+
+        std::atomic<uint64_t> appliedSeq{0};
+        auto finalClient = ReplicationClient::create("127.0.0.1", port, 2, [&] { return appliedSeq.load(); }, ack, options);
+        finalClient->setApplyCallback(
+            [&](uint64_t seq, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t) { appliedSeq.store(seq); }
+        );
+        finalClient->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return server->replicaCount() == 1; }));
+        server->shipEntry(1, ReplOpType::PUT, bytesOf("reap-key"), bytesOf("reap-value"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return appliedSeq.load() == 1; }));
+
+        finalClient->close();
+        server->close();
+    }
+
+    void testAkkEngineRejectsUnsafeNativeClusterConfigurations() {
+        const auto dir = makeTempDir("engine-unsafe-native-cluster");
+
+        {
+            const ClusterConfig nonRaft{
+                {
+                    node(1, 20368, 20468),
+                    node(2, 20369, 20469),
+                },
+                ReplicationMode::MIRROR,
+                AckPolicy{},
+                ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
+            };
+
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / "non-raft-blob";
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = true;
+            options.cluster.config = nonRaft;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.startupRole = NodeStartupRole::PRIMARY;
+            writeNodeIdFile(options.paths.dataDir / "node.id", 1);
+
+            bool rejected = false;
+            try {
+                auto engine = akkaradb::engine::AkkEngine::open(options);
+                (void)engine;
+            }
+            catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            AKK_CLUSTER_CHECK(rejected);
+        }
+
+        {
+            StripeOptions stripeOptions;
+            stripeOptions.dataShards = 2;
+            stripeOptions.parityShards = 1;
+            bool rejected = false;
+            try {
+                const ClusterConfig raftStripe{
+                    {
+                        node(1, 20370, 20470),
+                        node(2, 20371, 20471),
+                        node(3, 20372, 20472),
+                    },
+                    ReplicationMode::STRIPE,
+                    AckPolicy{},
+                    ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM},
+                    {},
+                    stripeOptions,
+                };
+                (void)raftStripe;
+            }
+            catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            AKK_CLUSTER_CHECK(rejected);
+        }
+    }
+
+    void testPrimaryAckFailWriteCommitsLocalBeforeAckFailure() {
+        const auto dir = makeTempDir("primary-ack-failwrite-local-first");
+        const AckPolicy allApplied{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
+        ConsistencyOptions consistency;
+        consistency.mode = ConsistencyMode::PRIMARY_ACK;
+        consistency.ackTimeoutAction = AckTimeoutAction::FAIL_WRITE;
+        consistency.ackTimeoutMs = 50;
+        const ClusterConfig cfg{
+            {
+                node(1, 20373, 20473),
+                node(2, 20374, 20474),
+            },
+            ReplicationMode::MIRROR,
+            allApplied,
+            consistency,
+        };
+
+        auto options = akkaradb::engine::AkkEngineOptions{};
+        options.paths.dataDir = dir / "primary";
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.cluster.config = cfg;
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.startupRole = NodeStartupRole::PRIMARY;
+        writeNodeIdFile(options.paths.dataDir / "node.id", 1);
+
+        auto engine = akkaradb::engine::AkkEngine::open(options);
+        const std::string key = "failwrite-local-first-key";
+        const std::string value = "failwrite-local-first-value";
+        bool rejected = false;
+        try {
+            engine->put(bytesOf(key), bytesOf(value));
+        }
+        catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        AKK_CLUSTER_CHECK(rejected);
+        const auto stored = engineGet(*engine, key);
+        AKK_CLUSTER_CHECK(stored.has_value());
+        AKK_CLUSTER_CHECK(textOf(*stored) == value);
+        engine->close();
+    }
+
     void testSecureReplicationRequiresPeerPins() {
         constexpr uint16_t port = 20215;
         const auto dir = makeTempDir("secure-requires-peer-pins");
@@ -1814,8 +2458,8 @@ namespace {
         second->close();
     }
 
-    void testNonRaftPrimaryCreatesGroupInstanceIdentity() {
-        const auto dir = makeTempDir("non-raft-group-instance");
+    void testNonRaftMirrorRejectsSecondPrimary() {
+        const auto dir = makeTempDir("non-raft-single-primary");
         const ClusterConfig cfg{
             {
                 node(1, 20181, 20281),
@@ -1826,6 +2470,7 @@ namespace {
             AckPolicy{},
             ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
         };
+        AKK_CLUSTER_CHECK(cfg.primaryNodeId() == 1);
 
         ClusterRuntimeOptions n1Options;
         n1Options.transportMode = TransportMode::PLAIN;
@@ -1838,18 +2483,20 @@ namespace {
         n3Options.transportMode = TransportMode::PLAIN;
         n3Options.startupRole = NodeStartupRole::PRIMARY;
         auto n3 = makeRuntime(dir / "n3", cfg, 3, n3Options);
-        n3->runtime->start();
-        AKK_CLUSTER_CHECK(n3->runtime->role() == NodeRole::PRIMARY);
+        bool rejectedSecondPrimary = false;
+        try {
+            n3->runtime->start();
+        }
+        catch (const std::runtime_error&) {
+            rejectedSecondPrimary = true;
+        }
+        AKK_CLUSTER_CHECK(rejectedSecondPrimary);
 
         const auto group1 = readGroupState(dir / "n1" / "cluster.membership");
-        const auto group3 = readGroupState(dir / "n3" / "cluster.membership");
         AKK_CLUSTER_CHECK(group1.groupId != 0);
-        AKK_CLUSTER_CHECK(group3.groupId != 0);
-        AKK_CLUSTER_CHECK(group1.groupId != group3.groupId);
         AKK_CLUSTER_CHECK(group1.primaryNodeId == 1);
-        AKK_CLUSTER_CHECK(group3.primaryNodeId == 3);
         AKK_CLUSTER_CHECK(group1.groupEpoch == 1);
-        AKK_CLUSTER_CHECK(group3.groupEpoch == 1);
+        AKK_CLUSTER_CHECK(!std::filesystem::exists(dir / "n3" / "cluster.membership"));
 
         n3->runtime->close();
         n1->runtime->close();
@@ -2352,6 +2999,92 @@ namespace {
         engine->close();
     }
 
+    void testRaftEngineLeaderAppliesMutationOnce() {
+        const auto dir = makeTempDir("raft-engine-apply-once");
+        const ClusterConfig cfg{
+            {
+                node(1, 21409, 21509),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 300},
+        };
+
+        auto options = akkaradb::engine::AkkEngineOptions{};
+        options.paths.dataDir = dir / "engine";
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.components.versionLogEnabled = true;
+        options.cluster.config = cfg;
+        options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        writeNodeIdFile(options.paths.dataDir / "node.id", 1);
+
+        auto engine = akkaradb::engine::AkkEngine::open(options);
+        akkaradb::engine::AkkEngine* nodes[] = {engine.get()};
+        const std::string key = "raft-apply-once-key";
+        const std::string value = "raft-apply-once-value";
+        runOnEngineLeader(
+            nodes,
+            [&](akkaradb::engine::AkkEngine& leader) { leader.put(bytesOf(key), bytesOf(value)); },
+            std::chrono::milliseconds{8000}
+        );
+        const auto stored = engine->get(bytesOf(key));
+        AKK_CLUSTER_CHECK(stored.has_value());
+        AKK_CLUSTER_CHECK(textOf(*stored) == value);
+        const auto history = engine->history(bytesOf(key));
+        AKK_CLUSTER_CHECK(history.size() == 1);
+        AKK_CLUSTER_CHECK(engine->stats().putsTotal == 1);
+        engine->close();
+    }
+
+    void testRaftEngineLeadershipTransferApi() {
+        const auto dir = makeTempDir("raft-engine-leader-transfer-api");
+        const ClusterConfig cfg{
+            {
+                node(1, 21406, 21506),
+                node(2, 21407, 21507),
+                node(3, 21408, 21508),
+            },
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 500},
+        };
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            auto options = akkaradb::engine::AkkEngineOptions{};
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        akkaradb::engine::AkkEngine* nodes[] = {n1.get(), n2.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(nodes) != nullptr; }, std::chrono::milliseconds{20000}));
+
+        auto* leader = findEngineLeader(nodes);
+        AKK_CLUSTER_CHECK(leader != nullptr);
+        const uint64_t targetNodeId = leader == n1.get() ? 2 : 1;
+        leader->transferClusterLeadership(targetNodeId);
+        AKK_CLUSTER_CHECK(waitUntil(
+            [&] {
+                const auto* current = findEngineLeader(nodes);
+                if (current == nullptr) { return false; }
+                return current->stats().nodeId == targetNodeId;
+            },
+            std::chrono::milliseconds{15000}
+        ));
+
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
     void testRaftEngineLargeBlobSnapshotCatchUp() {
         const auto dir = makeTempDir("raft-engine-blob-snapshot");
         const ClusterConfig cfg{
@@ -2621,12 +3354,20 @@ int main() {
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
         testWalSnapshotTransactionRecovery();
         testRaftOptionsRoundtripAndValidation();
+        testMirrorPrimaryRoundtripAndValidation();
         testReplFramingRejectsOversizedPayloadLength();
         testReplHandshakeCarriesClusterGroupIdentity();
         testPartitionedAndStripeRouting();
+        testStripeRuntimeStartsActivePlacement();
+        testPartitionedRuntimeOwnerOnlyReplication();
+        testPartitionedEngineOwnerLinearizableRead();
+        testStripeEngineOwnerOnlyWritesAndCoordinatorReads();
+        testStripeEngineRejectsDegradedWriteCommit();
+        testStripeEngineRejectsOnlineReconfiguration();
         testClusterManagerRecoversPrimaryLeaseFromManifest();
         testClusterManagerIgnoresExpiredManifestPrimaryLease();
-        testClusterManagerAutoPromotesAfterExpiredManifestLease();
+        testClusterManagerRejectsAutoRoleAfterExpiredManifestLease();
+        testClusterManagerRejectsPrimaryStartupWithForeignLease();
         testClusterManagerDoesNotAutoPromoteRaftAfterExpiredManifestLease();
         testClusterManagerReportsManifestActiveNodes();
         testStripeErasureCodecRecovery();
@@ -2639,10 +3380,14 @@ int main() {
         testRaftLeaderTransfer();
         testRaftOnlineMembershipChange();
         testPrimaryAckPathStillUsesLegacyRuntime();
+        testReplicationServerRejectsOversizedCatchupQueue();
+        testReplicationServerReapsDisconnectedReplicas();
+        testAkkEngineRejectsUnsafeNativeClusterConfigurations();
+        testPrimaryAckFailWriteCommitsLocalBeforeAckFailure();
         testSecureReplicationRequiresPeerPins();
         testPrimaryAckAllTargetsFailsWithoutReplicas();
         testReplicaRejectsImplicitNonRaftGroupSwitch();
-        testNonRaftPrimaryCreatesGroupInstanceIdentity();
+        testNonRaftMirrorRejectsSecondPrimary();
         testNonRaftPrimaryRejectsCorruptGroupState();
         testNonRaftPrimaryBacksUpCorruptGroupState();
         testNonRaftPrimaryReusesGroupStateAfterRestart();
@@ -2654,6 +3399,8 @@ int main() {
         testRaftPrimarySideOnlyBlobPolicy();
         testRaftLogBlobPolicyReplicatesPayload();
         testRaftLogBlobPolicyExternalizesEngineValue();
+        testRaftEngineLeaderAppliesMutationOnce();
+        testRaftEngineLeadershipTransferApi();
         testRaftEngineLargeBlobSnapshotCatchUp();
         testRaftEngineSnapshotStagingCrcRejectsCorruption();
         testRaftEngineLargeBlobLeaderChurnKeepsBlobIdsUnique();

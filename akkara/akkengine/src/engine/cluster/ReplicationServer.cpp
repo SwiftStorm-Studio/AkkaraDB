@@ -45,6 +45,7 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
+        constexpr int HANDSHAKE_TIMEOUT_MS = 5'000;
         #ifdef _WIN32
         using SocketHandle = SOCKET;
         constexpr SocketHandle BAD_SOCKET = INVALID_SOCKET;
@@ -109,6 +110,20 @@ namespace akkaradb::engine::cluster {
                 got += static_cast<size_t>(rc);
             }
             return true;
+        }
+
+        void setSocketTimeouts(SocketHandle s, int timeoutMs) {
+            #ifdef _WIN32
+            const auto timeout = static_cast<DWORD>(timeoutMs);
+            (void)::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            (void)::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            #else
+            timeval timeout{};
+            timeout.tv_sec = timeoutMs / 1000;
+            timeout.tv_usec = (timeoutMs % 1000) * 1000;
+            (void)::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            (void)::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            #endif
         }
 
         uint32_t readU32(const uint8_t* b) noexcept {
@@ -292,9 +307,12 @@ namespace akkaradb::engine::cluster {
             std::atomic<uint64_t> lastAckedSeq{0};
             std::atomic<uint8_t> lastAckStage{static_cast<uint8_t>(AckStage::DURABLE)};
             std::atomic<bool> dead{false};
+            std::atomic<bool> shutdownStarted{false};
             std::mutex queueMutex;
             std::condition_variable queueCv;
             std::deque<std::vector<uint8_t>> queue;
+            uint64_t queuedBytes = 0;
+            std::mutex sendMutex;
             std::thread sendThread;
             std::thread recvThread;
 
@@ -309,6 +327,7 @@ namespace akkaradb::engine::cluster {
             std::function<uint64_t()> getCurrentSeq;
             HistoryProvider historyProvider;
             SnapshotProvider snapshotProvider;
+            ReadCallback readCallback;
             AckPolicy ackPolicy;
             ConsistencyOptions consistency;
             uint16_t configuredReplicaCount = 0;
@@ -319,6 +338,12 @@ namespace akkaradb::engine::cluster {
             SocketHandle listenSock = BAD_SOCKET;
             std::atomic<bool> running{false};
             std::thread acceptThread;
+            std::atomic<bool> reaperStopping{false};
+            std::thread reaperThread;
+            std::mutex reaperMutex;
+            std::condition_variable reaperCv;
+            std::mutex handshakeSocketsMutex;
+            std::unordered_set<SocketHandle> handshakeSockets;
 
             mutable std::mutex replicasMutex;
             std::vector<std::shared_ptr<ReplicaState>> replicas;
@@ -328,9 +353,42 @@ namespace akkaradb::engine::cluster {
             std::condition_variable ackCv;
             std::unordered_set<uint64_t> lagBlockedReplicas;
 
+            bool queueHasCapacityLocked(const ReplicaState& replica, size_t wireSize) const noexcept {
+                if (runtimeOptions.maxReplicaQueueFrames != 0 && replica.queue.size() >= runtimeOptions.maxReplicaQueueFrames) { return false; }
+                if (runtimeOptions.maxReplicaQueueBytes != 0) {
+                    const uint64_t bytes = static_cast<uint64_t>(wireSize);
+                    if (bytes > runtimeOptions.maxReplicaQueueBytes || replica.queuedBytes > runtimeOptions.maxReplicaQueueBytes - bytes) { return false; }
+                }
+                return true;
+            }
+
+            bool queueInitialWire(const std::shared_ptr<ReplicaState>& replica, std::vector<uint8_t> wire) {
+                if (wire.empty()) { return false; }
+                if (!queueHasCapacityLocked(*replica, wire.size())) { return false; }
+                replica->queuedBytes += static_cast<uint64_t>(wire.size());
+                replica->queue.push_back(std::move(wire));
+                return true;
+            }
+
+            bool queueLiveWireLocked(const std::shared_ptr<ReplicaState>& replica, const std::vector<uint8_t>& wire) {
+                if (wire.empty()) { return false; }
+                std::lock_guard qlock{replica->queueMutex};
+                if (!queueHasCapacityLocked(*replica, wire.size())) {
+                    requestReplicaStop(replica);
+                    if (consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES) { lagBlockedReplicas.insert(replica->nodeId); }
+                    return false;
+                }
+                replica->queuedBytes += static_cast<uint64_t>(wire.size());
+                replica->queue.push_back(wire);
+                replica->queueCv.notify_one();
+                return true;
+            }
+
             void start() {
                 listenSock = listenOn(runtimeOptions.replBindHost, replPort);
                 running.store(true);
+                reaperStopping.store(false);
+                reaperThread = std::thread([this] { reapLoop(); });
                 acceptThread = std::thread([this] { acceptLoop(); });
             }
 
@@ -339,22 +397,47 @@ namespace akkaradb::engine::cluster {
                 shutdownSocket(listenSock);
                 closeSocket(listenSock);
                 listenSock = BAD_SOCKET;
-
-                std::vector<std::shared_ptr<ReplicaState>> copy;
                 {
-                    std::lock_guard lock{replicasMutex};
-                    copy = replicas;
-                    replicas.clear();
-                }
-                for (auto& replica : copy) {
-                    replica->dead.store(true);
-                    closeReplica(replica);
-                    replica->queueCv.notify_all();
+                    std::lock_guard lock{handshakeSocketsMutex};
+                    for (const auto socket : handshakeSockets) {
+                        shutdownSocket(socket);
+                    }
                 }
                 if (acceptThread.joinable()) { acceptThread.join(); }
-                for (auto& replica : copy) {
-                    if (replica->sendThread.joinable()) { replica->sendThread.join(); }
-                    if (replica->recvThread.joinable()) { replica->recvThread.join(); }
+                {
+                    std::lock_guard lock{handshakeSocketsMutex};
+                    for (const auto socket : handshakeSockets) { closeSocket(socket); }
+                    handshakeSockets.clear();
+                }
+                {
+                    std::lock_guard lock{replicasMutex};
+                    for (const auto& replica : replicas) { requestReplicaStop(replica); }
+                }
+                reaperStopping.store(true);
+                reaperCv.notify_all();
+                if (reaperThread.joinable()) { reaperThread.join(); }
+            }
+
+            void reapLoop() {
+                while (true) {
+                    std::vector<std::shared_ptr<ReplicaState>> deadReplicas;
+                    bool done = false;
+                    {
+                        std::lock_guard lock{replicasMutex};
+                        for (auto it = replicas.begin(); it != replicas.end();) {
+                            if ((*it)->dead.load()) {
+                                deadReplicas.push_back(std::move(*it));
+                                it = replicas.erase(it);
+                            }
+                            else { ++it; }
+                        }
+                        done = reaperStopping.load() && replicas.empty();
+                    }
+                    for (const auto& replica : deadReplicas) { finalizeReplica(replica); }
+                    if (done) { return; }
+
+                    std::unique_lock lock{reaperMutex};
+                    reaperCv.wait_for(lock, std::chrono::milliseconds{100});
                 }
             }
 
@@ -363,6 +446,19 @@ namespace akkaradb::engine::cluster {
                     SocketHandle client = ::accept(listenSock, nullptr, nullptr);
                     if (!socketOk(client)) { break; }
                     configureNoSigPipe(client);
+                    setSocketTimeouts(client, HANDSHAKE_TIMEOUT_MS);
+                    {
+                        std::lock_guard lock{handshakeSocketsMutex};
+                        if (!running.load()) {
+                            closeSocket(client);
+                            break;
+                        }
+                        handshakeSockets.insert(client);
+                    }
+                    const auto finishHandshake = [&] {
+                        std::lock_guard lock{handshakeSocketsMutex};
+                        handshakeSockets.erase(client);
+                    };
 
                     std::unique_ptr<crypto::SecureSession> secure;
                     crypto::PublicKey secureRemotePublicKey{};
@@ -376,6 +472,7 @@ namespace akkaradb::engine::cluster {
                             secure = std::make_unique<crypto::SecureSession>(std::move(accepted.session));
                         }
                         catch (...) {
+                            finishHandshake();
                             closeSocket(client);
                             continue;
                         }
@@ -387,29 +484,35 @@ namespace akkaradb::engine::cluster {
                         frame.payload,
                         hello
                     )) {
+                        finishHandshake();
                         closeSocket(client);
                         continue;
                     }
                     if (hello.role != NodeRole::REPLICA) {
+                        finishHandshake();
                         closeSocket(client);
                         continue;
                     }
                     if (hello.groupId != 0 && hello.groupId != runtimeOptions.clusterGroupId) {
+                        finishHandshake();
                         closeSocket(client);
                         continue;
                     }
                     if (hello.groupEpoch != 0 && hello.groupEpoch != runtimeOptions.clusterGroupEpoch) {
+                        finishHandshake();
                         closeSocket(client);
                         continue;
                     }
                     if (!configuredReplicaNodeIds.empty() && std::ranges::find(configuredReplicaNodeIds, hello.nodeId) ==
                         configuredReplicaNodeIds.end()) {
+                        finishHandshake();
                         closeSocket(client);
                         continue;
                     }
                     if (secure) {
                         const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId);
                         if (!expected || secureRemotePublicKey != *expected) {
+                            finishHandshake();
                             closeSocket(client);
                             continue;
                         }
@@ -435,6 +538,7 @@ namespace akkaradb::engine::cluster {
                             }
                         );
                         if (duplicate != replicas.end()) {
+                            finishHandshake();
                             closeSocket(client);
                             continue;
                         }
@@ -448,21 +552,39 @@ namespace akkaradb::engine::cluster {
                                 if (!snapshot) { resyncRequired = true; }
                                 else {
                                     response.currentSeq = snapshot->seq;
-                                    replica->queue.push_back(
+                                    if (!queueInitialWire(
+                                        replica,
                                         encodeSnapshotBegin(
                                             ReplSnapshotBegin{.snapshotSeq = snapshot->seq, .entryCount = snapshot->entries.size(),}
                                         )
-                                    );
-                                    for (const auto& entry : snapshot->entries) { replica->queue.push_back(encodeSnapshotEntry(entry)); }
-                                    replica->queue.push_back(encodeSnapshotEnd(snapshot->seq));
+                                    )) {
+                                        resyncRequired = true;
+                                    }
+                                    for (const auto& entry : snapshot->entries) {
+                                        if (resyncRequired || !queueInitialWire(replica, encodeSnapshotEntry(entry))) {
+                                            resyncRequired = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!resyncRequired && !queueInitialWire(replica, encodeSnapshotEnd(snapshot->seq))) { resyncRequired = true; }
                                 }
                             }
                             else if (!entries) { resyncRequired = true; }
-                            else { for (const auto& entry : *entries) { replica->queue.push_back(encodeEntry(entry)); } }
+                            else {
+                                for (const auto& entry : *entries) {
+                                    if (!queueInitialWire(replica, encodeEntry(entry))) {
+                                        resyncRequired = true;
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         else if (!historyProvider) {
                             for (const auto& buffered : entryBuffer) {
-                                if (buffered.seq == 0 || buffered.seq > hello.lastSeq) { replica->queue.push_back(buffered.wire); }
+                                if (buffered.seq > hello.lastSeq && !queueInitialWire(replica, buffered.wire)) {
+                                    resyncRequired = true;
+                                    break;
+                                }
                             }
                         }
                         if (resyncRequired && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES) {
@@ -475,17 +597,19 @@ namespace akkaradb::engine::cluster {
                     }
                     const auto helloWire = encodeServerHello(response);
                     if (!sendTo(client, replica->secure.get(), helloWire.data(), helloWire.size())) {
-                        replica->dead.store(true);
-                        closeReplica(replica);
+                        finishHandshake();
+                        requestReplicaStop(replica);
                         continue;
                     }
                     if (resyncRequired) {
                         const auto resync = encodeFrame(ReplMsgType::RESYNC_REQUIRED, {});
                         (void)sendTo(client, replica->secure.get(), resync.data(), resync.size());
-                        replica->dead.store(true);
-                        closeReplica(replica);
+                        finishHandshake();
+                        requestReplicaStop(replica);
                         continue;
                     }
+                    finishHandshake();
+                    setSocketTimeouts(client, 0);
                     replica->sendThread = std::thread([this, replica] { sendLoop(replica); });
                     replica->recvThread = std::thread([this, replica] { recvLoop(replica); });
                     replica->queueCv.notify_one();
@@ -505,11 +629,22 @@ namespace akkaradb::engine::cluster {
                 return recvFrame(sock, out);
             }
 
-            static void closeReplica(const std::shared_ptr<ReplicaState>& replica) {
-                shutdownSocket(replica->sock);
+            void requestReplicaStop(const std::shared_ptr<ReplicaState>& replica) {
+                replica->dead.store(true);
+                if (!replica->shutdownStarted.exchange(true)) { shutdownSocket(replica->sock); }
+                replica->queueCv.notify_all();
+                reaperCv.notify_all();
+            }
+
+            void finalizeReplica(const std::shared_ptr<ReplicaState>& replica) {
+                requestReplicaStop(replica);
+                if (replica->sendThread.joinable()) { replica->sendThread.join(); }
+                if (replica->recvThread.joinable()) { replica->recvThread.join(); }
                 closeSocket(replica->sock);
                 replica->sock = BAD_SOCKET;
             }
+
+            void setReadCallback(ReadCallback callback) { readCallback = std::move(callback); }
 
             void sendLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
@@ -518,21 +653,48 @@ namespace akkaradb::engine::cluster {
                         std::unique_lock lock{replica->queueMutex};
                         replica->queueCv.wait(lock, [&] { return replica->dead.load() || !replica->queue.empty(); });
                         if (replica->dead.load() && replica->queue.empty()) { break; }
+                        const uint64_t wireBytes = static_cast<uint64_t>(replica->queue.front().size());
                         wire = std::move(replica->queue.front());
                         replica->queue.pop_front();
+                        replica->queuedBytes = replica->queuedBytes > wireBytes ? replica->queuedBytes - wireBytes : 0;
                     }
+                    std::lock_guard sendLock{replica->sendMutex};
                     if (!sendTo(replica->sock, replica->secure.get(), wire.data(), wire.size())) {
-                        replica->dead.store(true);
-                        closeReplica(replica);
+                        requestReplicaStop(replica);
                         break;
                     }
                 }
+            }
+
+            bool handleReadRequest(const std::shared_ptr<ReplicaState>& replica, const DecodedFrame& frame) {
+                ReadRequest request;
+                if (!decodeReadRequest(frame.payload, request)) { return false; }
+                ReadResponse response;
+                if (readCallback) {
+                    try { response = readCallback(request); }
+                    catch (...) {
+                        response.requestId = request.requestId;
+                        response.status = ReadStatus::ERROR_STATUS;
+                    }
+                }
+                else {
+                    response.requestId = request.requestId;
+                    response.status = ReadStatus::ERROR_STATUS;
+                }
+                response.requestId = request.requestId;
+                const auto wire = encodeReadResponse(response);
+                std::lock_guard sendLock{replica->sendMutex};
+                return sendTo(replica->sock, replica->secure.get(), wire.data(), wire.size());
             }
 
             void recvLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
                     DecodedFrame frame;
                     if (!recvFrameFrom(replica->sock, replica->secure.get(), frame)) { break; }
+                    if (frame.type == ReplMsgType::READ_REQUEST) {
+                        if (!handleReadRequest(replica, frame)) { break; }
+                        continue;
+                    }
                     if (frame.type != ReplMsgType::ACK) { break; }
                     ReplAck ack;
                     if (!decodeAck(frame.payload, ack)) { break; }
@@ -540,29 +702,46 @@ namespace akkaradb::engine::cluster {
                     replica->lastAckStage.store(static_cast<uint8_t>(ack.stage));
                     ackCv.notify_all();
                 }
-                replica->dead.store(true);
-                closeReplica(replica);
-                replica->queueCv.notify_all();
+                requestReplicaStop(replica);
             }
 
-            void enqueueWire(uint64_t seq, std::vector<uint8_t> wire) {
+            void enqueueWire(uint64_t seq, std::vector<uint8_t> wire, bool retainForCatchup) {
+                if (wire.empty()) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
                 {
                     std::lock_guard lock{replicasMutex};
                     if (seq != 0 && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES && !lagBlockedReplicas.empty()) {
                         throw std::runtime_error("ReplicationServer: write blocked by lagging replica");
                     }
-                    entryBuffer.push_back(BufferedWire{seq, wire});
-                    while (entryBuffer.size() > ENTRY_BUFFER_SIZE) { entryBuffer.pop_front(); }
+                    if (retainForCatchup) {
+                        entryBuffer.push_back(BufferedWire{seq, wire});
+                        while (entryBuffer.size() > ENTRY_BUFFER_SIZE) { entryBuffer.pop_front(); }
+                    }
                     for (auto& replica : replicas) {
-                        if (!replica->dead.load()) {
-                            std::lock_guard qlock{replica->queueMutex};
-                            replica->queue.push_back(wire);
-                            replica->queueCv.notify_one();
-                        }
+                        if (!replica->dead.load()) { (void)queueLiveWireLocked(replica, wire); }
                     }
                 }
                 if (!waitForAcks(seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.ackTimeoutAction ==
                     AckTimeoutAction::FAIL_WRITE)) { throw std::runtime_error("ReplicationServer: write acknowledgement timeout"); }
+            }
+
+            void enqueueWireTo(uint64_t targetNodeId, uint64_t seq, std::vector<uint8_t> wire, bool waitForAck) {
+                if (wire.empty()) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
+                {
+                    std::lock_guard lock{replicasMutex};
+                    const auto it = std::ranges::find_if(
+                        replicas,
+                        [targetNodeId](const std::shared_ptr<ReplicaState>& replica) {
+                            return !replica->dead.load() && replica->nodeId == targetNodeId;
+                        }
+                    );
+                    if (it == replicas.end()) { throw std::runtime_error("ReplicationServer: target replica is not connected"); }
+                    if (!queueLiveWireLocked(*it, wire)) { throw std::runtime_error("ReplicationServer: target replica queue is full"); }
+                }
+                if (!waitForAck) { return; }
+                if (!waitForTargetAck(targetNodeId, seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.
+                    ackTimeoutAction == AckTimeoutAction::FAIL_WRITE)) {
+                    throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
+                }
             }
 
             bool waitForAcks(uint64_t seq) {
@@ -589,6 +768,26 @@ namespace akkaradb::engine::cluster {
                                                : live > 0 && acked >= live)
                                         : acked >= ackPolicy.quorum;
                     if (ok) { return true; }
+
+                    std::unique_lock lock{ackMutex};
+                    ackCv.wait_for(lock, std::chrono::milliseconds(50));
+                }
+                return false;
+            }
+
+            bool waitForTargetAck(uint64_t targetNodeId, uint64_t seq) {
+                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return true; }
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    {
+                        std::lock_guard lock{replicasMutex};
+                        for (const auto& replica : replicas) {
+                            if (replica->dead.load() || replica->nodeId != targetNodeId) { continue; }
+                            const uint64_t ackSeq = replica->lastAckedSeq.load();
+                            const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
+                            if (ackSeq > seq || (ackSeq == seq && ackStage >= ackPolicy.stage)) { return true; }
+                        }
+                    }
 
                     std::unique_lock lock{ackMutex};
                     ackCv.wait_for(lock, std::chrono::milliseconds(50));
@@ -629,6 +828,7 @@ namespace akkaradb::engine::cluster {
 
     void ReplicationServer::start() { impl_->start(); }
     void ReplicationServer::close() { if (impl_) { impl_->close(); } }
+    void ReplicationServer::setReadCallback(ReadCallback callback) { impl_->setReadCallback(std::move(callback)); }
 
     void ReplicationServer::shipEntry(
         uint64_t seq,
@@ -645,7 +845,27 @@ namespace akkaradb::engine::cluster {
         entry.recordFlags = recordFlags;
         entry.key.assign(key.begin(), key.end());
         entry.value.assign(value.begin(), value.end());
-        impl_->enqueueWire(seq, encodeEntry(entry));
+        impl_->enqueueWire(seq, encodeEntry(entry), true);
+    }
+
+    void ReplicationServer::shipEntryTo(
+        uint64_t targetNodeId,
+        uint64_t seq,
+        ReplOpType op,
+        std::span<const uint8_t> key,
+        std::span<const uint8_t> value,
+        uint8_t recordFlags,
+        uint64_t sourceNodeId,
+        bool waitForAck
+    ) {
+        ReplEntry entry;
+        entry.seq = seq;
+        entry.sourceNodeId = sourceNodeId;
+        entry.op = op;
+        entry.recordFlags = recordFlags;
+        entry.key.assign(key.begin(), key.end());
+        entry.value.assign(value.begin(), value.end());
+        impl_->enqueueWireTo(targetNodeId, seq, encodeEntry(entry), waitForAck);
     }
 
     void ReplicationServer::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
@@ -653,7 +873,7 @@ namespace akkaradb::engine::cluster {
         blob.seq = seq;
         blob.blobId = blobId;
         blob.content.assign(content.begin(), content.end());
-        impl_->enqueueWire(0, encodeBlob(blob));
+        impl_->enqueueWire(0, encodeBlob(blob), false);
     }
 
     size_t ReplicationServer::replicaCount() const noexcept {

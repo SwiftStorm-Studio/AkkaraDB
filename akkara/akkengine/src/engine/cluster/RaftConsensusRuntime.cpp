@@ -1249,6 +1249,21 @@ namespace akkaradb::engine::cluster {
                 if (jointOldVoters_ && jointNewVoters_) {
                     return replicatedByMajorityLocked(*jointOldVoters_, index) && replicatedByMajorityLocked(*jointNewVoters_, index);
                 }
+                for (const auto& pending : log_) {
+                    if (pending.index <= commitIndex_ || pending.index > index) { continue; }
+                    if (pending.kind == RaftEntryKind::CONFIG_JOINT) {
+                        std::vector<NodeInfo> oldVoters;
+                        std::vector<NodeInfo> newVoters;
+                        if (!decodeNodeSet(pending.key, oldVoters) || !decodeNodeSet(pending.value, newVoters)) { return false; }
+                        return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                    }
+                    if (pending.kind == RaftEntryKind::CONFIG_FINAL && !pending.key.empty()) {
+                        std::vector<NodeInfo> oldVoters;
+                        std::vector<NodeInfo> newVoters;
+                        if (!decodeNodeSet(pending.key, oldVoters) || !decodeNodeSet(pending.value, newVoters)) { return false; }
+                        return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                    }
+                }
                 return replicatedByMajorityLocked(committedVoters_, index);
             }
 
@@ -1755,6 +1770,13 @@ namespace akkaradb::engine::cluster {
             void becomeLeader(uint64_t term) {
                 {
                     std::lock_guard lock{mutex_};
+                    const auto role = role_.load();
+                    const bool directSingleNodeElection =
+                        role == RaftRole::FOLLOWER && peers_.empty() && term >= currentTerm_;
+                    if (!running_ || term < currentTerm_ || (!directSingleNodeElection && (currentTerm_ != term || role != RaftRole::CANDIDATE)) ||
+                        !self_->coordinatorEligible() || !isVotingMemberLocked(selfNodeId_)) {
+                        return;
+                    }
                     const auto hardBackup = captureDurableHardStateLocked();
                     const auto logBackup = captureDurableLogStateLocked();
                     currentTerm_ = std::max(currentTerm_, term);
@@ -2450,6 +2472,63 @@ namespace akkaradb::engine::cluster {
                 return true;
             }
 
+        public:
+            void linearizableReadBarrier() {
+                this->maybeCompactLog();
+                if (!this->commitOutstandingEntry(std::chrono::milliseconds{20000})) {
+                    throw std::runtime_error("RaftConsensusRuntime: failed to commit outstanding entry before linearizable read");
+                }
+
+                RaftLogEntry barrier;
+                uint64_t term = 0;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (!running_ || role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader");
+                    }
+                    if (commitIndex_ != lastLogIndex()) {
+                        throw std::runtime_error("RaftConsensusRuntime: cannot establish read barrier while a prior entry is uncommitted");
+                    }
+                    barrier = makeNoopEntryLocked();
+                    term = currentTerm_;
+                    const auto backup = captureDurableLogStateLocked();
+                    try {
+                        log_.push_back(barrier);
+                        persistLog();
+                    }
+                    catch (...) {
+                        restoreDurableLogStateLocked(backup);
+                        throw;
+                    }
+                }
+
+                if (!this->replicateEntryToMajority(barrier, std::chrono::milliseconds{20000})) {
+                    throw std::runtime_error("RaftConsensusRuntime: failed to replicate linearizable read barrier to Raft quorum");
+                }
+
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
+                        throw std::runtime_error("RaftConsensusRuntime: leadership changed before linearizable read barrier commit");
+                    }
+                    if (!canCommitEntryLocked(barrier)) {
+                        throw std::runtime_error("RaftConsensusRuntime: linearizable read barrier lost quorum");
+                    }
+                    const auto backup = captureDurableLogStateLocked();
+                    try {
+                        commitIndex_ = barrier.index;
+                        persistLog();
+                    }
+                    catch (...) {
+                        restoreDurableLogStateLocked(backup);
+                        throw;
+                    }
+                }
+                applyCommitted();
+                sendHeartbeats();
+            }
+
+        private:
             bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat = false) {
                 if (!claimPeerReplication(peerId)) { return false; }
                 struct PeerReplicationGuard {
@@ -2846,6 +2925,10 @@ namespace akkaradb::engine::cluster {
                     if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
                     {
                         std::lock_guard lock{mutex_};
+                        if (currentTerm_ != request.term || !isVotingMemberLocked(request.leaderId)) {
+                            if (snapshotInstallIntentDurable) { stopRuntimeLocked(); }
+                            return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
+                        }
                         const auto backup = captureDurableLogStateLocked();
                         if (!finalizeSnapshotInstallMetadataLocked(transaction)) {
                             restoreDurableLogStateLocked(backup);
@@ -3291,6 +3374,9 @@ namespace akkaradb::engine::cluster {
                     {
                         std::lock_guard lock{mutex_};
                         if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
+                        if (commitIndex_ != lastLogIndex()) {
+                            throw std::runtime_error("RaftConsensusRuntime: cannot accept a Blob proposal while a prior entry is uncommitted");
+                        }
                         term = currentTerm_;
                         const uint32_t contentCrc32c = crcBytes(content);
                         const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
@@ -3560,6 +3646,8 @@ namespace akkaradb::engine::cluster {
     ) { impl_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
 
     void RaftConsensusRuntime::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) { impl_->shipBlob(seq, blobId, content); }
+
+    void RaftConsensusRuntime::linearizableReadBarrier() { impl_->linearizableReadBarrier(); }
 
     void RaftConsensusRuntime::addVotingNode(const NodeInfo& node) { impl_->addVotingNode(node); }
 

@@ -31,7 +31,7 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        constexpr size_t HEADER_SIZE = 48;
+        constexpr size_t HEADER_SIZE = 56;
         constexpr size_t MAX_HOST_BYTES = 1024;
 
         uint64_t nowUs() noexcept {
@@ -142,9 +142,24 @@ namespace akkaradb::engine::cluster {
         AckPolicy ackPolicy,
         ConsistencyOptions consistency,
         RaftOptions raft,
-        StripeOptions stripe
+        StripeOptions stripe,
+        uint64_t primaryNodeId
     )
-        : nodes_{std::move(nodes)}, mode_{mode}, ackPolicy_{ackPolicy}, consistency_{consistency}, raft_{raft}, stripe_{stripe} {
+        : nodes_{std::move(nodes)},
+          mode_{mode},
+          ackPolicy_{ackPolicy},
+          consistency_{consistency},
+          raft_{raft},
+          stripe_{stripe},
+          primaryNodeId_{primaryNodeId} {
+        if (mode_ == ReplicationMode::MIRROR && consistency_.mode != ConsistencyMode::RAFT_QUORUM && primaryNodeId_ == 0) {
+            for (const auto& node : nodes_) {
+                if (node.coordinatorEligible() && node.dataBearing()) {
+                    primaryNodeId_ = node.nodeId;
+                    break;
+                }
+            }
+        }
         validate();
     }
 
@@ -184,6 +199,7 @@ namespace akkaradb::engine::cluster {
         StripeOptions stripe{};
         stripe.dataShards = bytes[40];
         stripe.parityShards = bytes[41];
+        const uint64_t primaryNodeId = readU64(bytes.data(), 48);
 
         size_t cursor = HEADER_SIZE;
         std::vector<NodeInfo> nodes;
@@ -205,7 +221,7 @@ namespace akkaradb::engine::cluster {
         }
         if (cursor != bytes.size()) { throw std::runtime_error("ClusterConfig: trailing bytes"); }
 
-        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe};
+        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe, primaryNodeId};
         cfg.flags_ = flags;
         cfg.validate();
         return cfg;
@@ -238,6 +254,7 @@ namespace akkaradb::engine::cluster {
         bytes[39] = config.raft_.membership.allowLearners ? 1 : 0;
         bytes[40] = config.stripe_.dataShards;
         bytes[41] = config.stripe_.parityShards;
+        writeU64(bytes.data(), 48, config.primaryNodeId_);
 
         for (const auto& node : config.nodes_) {
             if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
@@ -326,6 +343,14 @@ namespace akkaradb::engine::cluster {
             RaftMembershipMode::JOINT_CONSENSUS) && consistency_.mode != ConsistencyMode::RAFT_QUORUM) {
             throw std::invalid_argument("ClusterConfig: Raft membership options require RAFT_QUORUM consistency");
         }
+        if (consistency_.mode == ConsistencyMode::RAFT_QUORUM &&
+            (mode_ == ReplicationMode::PARTITIONED || mode_ == ReplicationMode::STRIPE)) {
+            throw std::invalid_argument("ClusterConfig: RAFT_QUORUM currently requires STANDALONE or MIRROR placement");
+        }
+        const bool fixedMirrorPrimary = mode_ == ReplicationMode::MIRROR && consistency_.mode != ConsistencyMode::RAFT_QUORUM;
+        if (!fixedMirrorPrimary && primaryNodeId_ != 0) {
+            throw std::invalid_argument("ClusterConfig: primaryNodeId is only valid for non-Raft MIRROR placement");
+        }
         std::unordered_set<uint64_t> ids;
         bool hasDataNode = false;
         bool hasCoordinator = false;
@@ -347,6 +372,14 @@ namespace akkaradb::engine::cluster {
         }
         if (mode_ != ReplicationMode::STANDALONE && !hasCoordinator) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a coordinator-eligible node");
+        }
+        if (fixedMirrorPrimary) {
+            if (primaryNodeId_ == 0) { throw std::invalid_argument("ClusterConfig: non-Raft MIRROR requires one Primary"); }
+            const auto* primary = findById(primaryNodeId_);
+            if (primary == nullptr) { throw std::invalid_argument("ClusterConfig: MIRROR Primary is not a configured node"); }
+            if (!primary->coordinatorEligible() || !primary->dataBearing()) {
+                throw std::invalid_argument("ClusterConfig: MIRROR Primary must be coordinator-eligible and data-bearing");
+            }
         }
         if (mode_ == ReplicationMode::STRIPE) {
             if (stripe_.dataShards == 0) { throw std::invalid_argument("ClusterConfig: stripe dataShards must be > 0"); }

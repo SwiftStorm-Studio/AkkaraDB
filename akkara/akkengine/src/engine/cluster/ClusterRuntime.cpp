@@ -13,6 +13,7 @@
 #include "akk/cpu/CRC32C.hpp"
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <charconv>
 #include <cctype>
@@ -26,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -102,6 +104,29 @@ namespace akkaradb::engine::cluster {
             }
         }
 
+        void validateRuntimePlacement(const ClusterConfig& config) {
+            if (config.isStandalone() || config.mode() == ReplicationMode::MIRROR || config.mode() == ReplicationMode::PARTITIONED ||
+                config.mode() == ReplicationMode::STRIPE) {
+                return;
+            }
+            throw std::invalid_argument("ClusterRuntime: invalid native placement mode");
+        }
+
+        void validateRuntimeOptions(const ClusterConfig& config, const ClusterRuntimeOptions& options) {
+            (void)config;
+            if (options.readMode != ClusterReadMode::LOCAL_STALE_OK && options.readMode != ClusterReadMode::OWNER_ONLY &&
+                options.readMode != ClusterReadMode::OWNER_LINEARIZABLE) {
+                throw std::invalid_argument("ClusterRuntime: invalid read mode");
+            }
+            if (options.stripeWriteCommitMode != StripeWriteCommitMode::ALL_SHARDS) {
+                throw std::invalid_argument("ClusterRuntime: invalid or unsafe STRIPE write commit mode");
+            }
+            if (options.stripeReadCoordinatorMode != StripeReadCoordinatorMode::OWNER && options.stripeReadCoordinatorMode !=
+                StripeReadCoordinatorMode::LOCAL_COORDINATOR) {
+                throw std::invalid_argument("ClusterRuntime: invalid STRIPE read coordinator mode");
+            }
+        }
+
         uint16_t configuredReplicaCount(const ClusterConfig& config, uint64_t selfNodeId) {
             size_t count = 0;
             for (const auto& node : config.nodes()) { if (node.nodeId != selfNodeId && node.dataBearing()) { ++count; } }
@@ -175,6 +200,13 @@ namespace akkaradb::engine::cluster {
             uint64_t groupId = 0;
             uint64_t primaryNodeId = 0;
             uint64_t groupEpoch = 1;
+        };
+
+        struct PeerProgressState {
+            uint64_t groupId = 0;
+            uint64_t groupEpoch = 0;
+            uint64_t peerNodeId = 0;
+            uint64_t lastSeq = 0;
         };
 
         void writeLe32(std::vector<uint8_t>& out, uint32_t value) {
@@ -346,6 +378,62 @@ namespace akkaradb::engine::cluster {
             replaceFileAtomically(tmpPath, path, context);
         }
 
+        std::optional<PeerProgressState> loadPeerProgressState(
+            const std::filesystem::path& path,
+            CorruptClusterStateAction corruptAction
+        ) {
+            if (path.empty() || !std::filesystem::exists(path)) { return std::nullopt; }
+            try {
+                std::ifstream in(path, std::ios::binary);
+                if (!in) { throw std::runtime_error("cannot open peer progress state"); }
+                std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                constexpr size_t expectedSize = 5 + 8 + 8 + 8 + 8 + 4;
+                constexpr size_t crcOffset = expectedSize - 4;
+                if (bytes.size() != expectedSize) { throw std::runtime_error("invalid peer progress state size"); }
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKCP1") {
+                    throw std::runtime_error("bad peer progress state magic");
+                }
+                if (readLe32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) {
+                    throw std::runtime_error("peer progress state CRC mismatch");
+                }
+                return PeerProgressState{
+                    .groupId = readLe64(bytes, 5),
+                    .groupEpoch = readLe64(bytes, 13),
+                    .peerNodeId = readLe64(bytes, 21),
+                    .lastSeq = readLe64(bytes, 29),
+                };
+            }
+            catch (const std::exception& ex) {
+                (void)handleCorruptStateFile(path, corruptAction, "ClusterRuntime peer progress", ex);
+                return std::nullopt;
+            }
+        }
+
+        void savePeerProgressState(const std::filesystem::path& path, PeerProgressState state) {
+            if (path.empty()) { return; }
+            if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
+            std::vector<uint8_t> bytes;
+            bytes.insert(bytes.end(), {'A', 'K', 'C', 'P', '1'});
+            writeLe64(bytes, state.groupId);
+            writeLe64(bytes, state.groupEpoch);
+            writeLe64(bytes, state.peerNodeId);
+            writeLe64(bytes, state.lastSeq);
+            const size_t crcOffset = bytes.size();
+            writeLe32(bytes, 0);
+            writeLe32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
+
+            const auto tmpPath = makeTempPath(path, "ClusterRuntime peer progress");
+            {
+                std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+                if (!out) { throw std::runtime_error("ClusterRuntime peer progress: cannot create state"); }
+                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                out.flush();
+                if (!out) { throw std::runtime_error("ClusterRuntime peer progress: write failed"); }
+            }
+            syncFile(tmpPath, "ClusterRuntime peer progress");
+            replaceFileAtomically(tmpPath, path, "ClusterRuntime peer progress");
+        }
+
         GroupState loadOrCreatePrimaryGroup(
             const std::filesystem::path& path,
             uint64_t selfNodeId,
@@ -398,23 +486,27 @@ namespace akkaradb::engine::cluster {
                 if (runtimeOptions_.clusterMembershipPath.empty() && !dbDir.empty() && config_.consistency().mode !=
                     ConsistencyMode::RAFT_QUORUM) { runtimeOptions_.clusterMembershipPath = dbDir / "cluster.membership"; }
                 validateTransportScope(config_, runtimeOptions_);
+                validateRuntimePlacement(config_);
+                validateRuntimeOptions(config_, runtimeOptions_);
                 if (config_.consistency().mode == ConsistencyMode::RAFT_QUORUM) {
                     raftRuntime_ = RaftConsensusRuntime::create(dbDir, config_, selfNodeId_, callbacks_, runtimeOptions_);
                     return;
                 }
-                manager_ = ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions);
                 effectiveAckPolicy_ = effectiveAckPolicy(config_, selfNodeId_);
                 effectiveConsistency_ = effectiveConsistency(config_);
                 configuredReplicaCount_ = configuredReplicaCount(config_, selfNodeId_);
                 if (effectiveAckPolicy_.mode == AckPolicyMode::QUORUM && effectiveAckPolicy_.quorum > configuredReplicaCount_) {
                     throw std::invalid_argument("ClusterRuntime: write quorum exceeds configured replica count");
                 }
-                manager_->setRoleChangeCallback(
-                    [this](NodeRole role) {
-                        installRole(role);
-                        if (callbacks_.roleChange) { callbacks_.roleChange(role); }
-                    }
-                );
+                if (config_.mode() != ReplicationMode::PARTITIONED) {
+                    manager_ = ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions);
+                    manager_->setRoleChangeCallback(
+                        [this](NodeRole role) {
+                            installRole(role);
+                            if (callbacks_.roleChange) { callbacks_.roleChange(role); }
+                        }
+                    );
+                }
             }
 
             ~Impl() { close(); }
@@ -429,8 +521,12 @@ namespace akkaradb::engine::cluster {
                     if (started_) { return; }
                     started_ = true;
                 }
+                if (config_.mode() == ReplicationMode::PARTITIONED || config_.mode() == ReplicationMode::STRIPE) {
+                    installPartitioned();
+                    if (callbacks_.roleChange) { callbacks_.roleChange(role()); }
+                    return;
+                }
                 manager_->start();
-                installRole(manager_->role());
             }
 
             void close() {
@@ -440,15 +536,74 @@ namespace akkaradb::engine::cluster {
                 }
                 std::lock_guard lock{mutex_};
                 stopReplication();
-                manager_->close();
+                if (manager_) { manager_->close(); }
                 started_ = false;
             }
 
-            NodeRole role() const noexcept { return raftRuntime_ ? raftRuntime_->role() : manager_->role(); }
+            NodeRole role() const noexcept {
+                if (raftRuntime_) { return raftRuntime_->role(); }
+                if (config_.mode() == ReplicationMode::PARTITIONED || config_.mode() == ReplicationMode::STRIPE) {
+                    const auto* self = config_.findById(selfNodeId_);
+                    return self != nullptr && self->dataBearing() ? NodeRole::PRIMARY : NodeRole::REPLICA;
+                }
+                return manager_ ? manager_->role() : NodeRole::STANDALONE;
+            }
 
-            std::vector<NodeInfo> activeNodes() const { return raftRuntime_ ? raftRuntime_->activeNodes() : manager_->activeNodes(); }
+            std::vector<NodeInfo> activeNodes() const {
+                if (raftRuntime_) { return raftRuntime_->activeNodes(); }
+                if (config_.mode() == ReplicationMode::PARTITIONED || config_.mode() == ReplicationMode::STRIPE) { return config_.dataNodes(); }
+                return manager_ ? manager_->activeNodes() : std::vector<NodeInfo>{};
+            }
 
             const ClusterRouter& router() const noexcept { return raftRuntime_ ? raftRuntime_->router() : router_; }
+
+            bool ownsWriteKey(std::span<const uint8_t> key) const {
+                if (raftRuntime_) { return raftRuntime_->role() == NodeRole::PRIMARY; }
+                if (config_.isStandalone()) { return true; }
+                if (config_.mode() == ReplicationMode::MIRROR) { return manager_ && manager_->role() == NodeRole::PRIMARY; }
+                if (config_.mode() == ReplicationMode::PARTITIONED || config_.mode() == ReplicationMode::STRIPE) {
+                    return ownerForKey(key).nodeId == selfNodeId_;
+                }
+                return false;
+            }
+
+            ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                if (runtimeOptions_.readMode == ClusterReadMode::LOCAL_STALE_OK) { return readLocal(key, snapshotSeq); }
+                if (raftRuntime_) {
+                    if (raftRuntime_->role() != NodeRole::PRIMARY) {
+                        ReadResponse response;
+                        response.status = ReadStatus::ERROR_STATUS;
+                        return response;
+                    }
+                    if (runtimeOptions_.readMode == ClusterReadMode::OWNER_LINEARIZABLE) {
+                        try { raftRuntime_->linearizableReadBarrier(); }
+                        catch (...) {
+                            ReadResponse response;
+                            response.status = ReadStatus::ERROR_STATUS;
+                            return response;
+                        }
+                    }
+                    return readLocal(key, snapshotSeq);
+                }
+                if (ownsWriteKey(key)) { return readLocal(key, snapshotSeq); }
+                if (runtimeOptions_.readMode == ClusterReadMode::OWNER_ONLY) {
+                    ReadResponse response;
+                    response.status = ReadStatus::ERROR_STATUS;
+                    return response;
+                }
+                if (runtimeOptions_.readMode != ClusterReadMode::OWNER_LINEARIZABLE) {
+                    ReadResponse response;
+                    response.status = ReadStatus::ERROR_STATUS;
+                    return response;
+                }
+                const NodeInfo owner = ownerForKey(key);
+                return readPeer(owner.nodeId, key, snapshotSeq);
+            }
+
+            ReadResponse readKeyFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                if (nodeId == selfNodeId_) { return readLocal(key, snapshotSeq); }
+                return readPeer(nodeId, key, snapshotSeq);
+            }
 
             void shipEntry(
                 uint64_t seq,
@@ -463,7 +618,38 @@ namespace akkaradb::engine::cluster {
                     return;
                 }
                 std::lock_guard lock{mutex_};
+                if ((config_.mode() == ReplicationMode::PARTITIONED || config_.mode() == ReplicationMode::STRIPE) &&
+                    ownerForKey(key).nodeId != selfNodeId_) {
+                    throw std::runtime_error("ClusterRuntime: write attempted on non-owner node");
+                }
                 if (server_) { server_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
+            }
+
+            void shipEntryTo(
+                uint64_t targetNodeId,
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId,
+                bool waitForAck
+            ) {
+                if (raftRuntime_) {
+                    raftRuntime_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId);
+                    return;
+                }
+                if (targetNodeId == selfNodeId_) { return; }
+                std::lock_guard lock{mutex_};
+                if (!server_) { throw std::runtime_error("ClusterRuntime: targeted write requires local replication server"); }
+                if (config_.mode() == ReplicationMode::STRIPE) {
+                    auto& targetSeq = nextSeqByTarget_[targetNodeId];
+                    const uint64_t wireSeq = targetSeq + 1;
+                    server_->shipEntryTo(targetNodeId, wireSeq, op, key, value, recordFlags, sourceNodeId, waitForAck);
+                    targetSeq = wireSeq;
+                    return;
+                }
+                server_->shipEntryTo(targetNodeId, seq, op, key, value, recordFlags, sourceNodeId, waitForAck);
             }
 
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
@@ -490,12 +676,236 @@ namespace akkaradb::engine::cluster {
                 raftRuntime_->transferLeadership(targetNodeId);
             }
 
+            void reconfigure(ClusterConfig config) {
+                (void)config;
+                throw std::runtime_error(
+                    "ClusterRuntime: online placement reconfiguration is unsupported; stop every node, persist one new ClusterConfig, and reopen. "
+                    "Use the Raft voting-member APIs for online RAFT_QUORUM membership changes"
+                );
+            }
+
         private:
-            void installRole(NodeRole role) {
+            NodeInfo ownerForKey(std::span<const uint8_t> key) const {
+                const auto targets = router_.writeTargets(key);
+                if (targets.empty()) { throw std::runtime_error("ClusterRuntime: key has no owner"); }
+                return targets.front();
+            }
+
+            ReadResponse readLocal(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+                if (!callbacks_.read) {
+                    ReadResponse response;
+                    response.status = ReadStatus::ERROR_STATUS;
+                    return response;
+                }
+                return callbacks_.read(key, snapshotSeq);
+            }
+
+            ReadResponse readPeer(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effectiveConsistency_.ackTimeoutMs);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    try {
+                        std::lock_guard lock{mutex_};
+                        const auto it = peerClients_.find(nodeId);
+                        if (it != peerClients_.end() && it->second) {
+                            const auto now = std::chrono::steady_clock::now();
+                            const auto remaining = deadline > now
+                                                       ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count()
+                                                       : int64_t{0};
+                            return it->second->readKey(key, snapshotSeq, static_cast<uint32_t>(std::max<int64_t>(1, remaining)));
+                        }
+                    }
+                    catch (const std::runtime_error&) {
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                }
+                ReadResponse response;
+                response.status = ReadStatus::ERROR_STATUS;
+                return response;
+            }
+
+            uint64_t lastSeqFromPeer(uint64_t nodeId) const {
+                std::lock_guard lock{peerSeqMutex_};
+                const auto it = lastSeqByPeer_.find(nodeId);
+                return it == lastSeqByPeer_.end() ? 0 : it->second;
+            }
+
+            [[nodiscard]] std::filesystem::path peerProgressPath(uint64_t nodeId) const {
+                if (runtimeOptions_.clusterMembershipPath.empty()) { return {}; }
+                auto path = runtimeOptions_.clusterMembershipPath;
+                path += ".peer-" + std::to_string(nodeId) + ".progress";
+                return path;
+            }
+
+            void loadPeerProgress(uint64_t nodeId) {
+                const auto path = peerProgressPath(nodeId);
+                if (path.empty()) { return; }
+                if (runtimeOptions_.resetClusterMembership) {
+                    std::error_code ec;
+                    std::filesystem::remove(path, ec);
+                    if (ec) { throw std::runtime_error("ClusterRuntime: cannot reset peer progress: " + ec.message()); }
+                    return;
+                }
+                const auto persisted = loadPeerProgressState(path, runtimeOptions_.corruptStateAction);
+                if (!persisted) { return; }
+                if (persisted->groupId != runtimeOptions_.clusterGroupId || persisted->groupEpoch != runtimeOptions_.clusterGroupEpoch ||
+                    persisted->peerNodeId != nodeId) {
+                    throw std::runtime_error("ClusterRuntime: peer progress belongs to a different cluster group or peer");
+                }
+                std::lock_guard lock{peerSeqMutex_};
+                lastSeqByPeer_[nodeId] = std::max(lastSeqByPeer_[nodeId], persisted->lastSeq);
+            }
+
+            void recordSeqFromPeer(uint64_t nodeId, uint64_t seq) {
+                std::lock_guard lock{peerSeqMutex_};
+                auto& current = lastSeqByPeer_[nodeId];
+                if (seq <= current) { return; }
+                savePeerProgressState(
+                    peerProgressPath(nodeId),
+                    PeerProgressState{
+                        .groupId = runtimeOptions_.clusterGroupId,
+                        .groupEpoch = runtimeOptions_.clusterGroupEpoch,
+                        .peerNodeId = nodeId,
+                        .lastSeq = seq,
+                    }
+                );
+                current = seq;
+            }
+
+            std::unique_ptr<ReplicationClient> createPeerClient(const NodeInfo& peer) {
+                loadPeerProgress(peer.nodeId);
+                auto clientOptions = runtimeOptions_;
+                clientOptions.secure.expectedPrimaryNodeId = peer.nodeId;
+                if (!clientOptions.clusterMembershipPath.empty()) {
+                    clientOptions.clusterMembershipPath += ".peer-" + std::to_string(peer.nodeId);
+                }
+                auto client = ReplicationClient::create(
+                    peer.host,
+                    peer.replPort,
+                    selfNodeId_,
+                    [this, peerNodeId = peer.nodeId] { return lastSeqFromPeer(peerNodeId); },
+                    effectiveAckPolicy_,
+                    std::move(clientOptions)
+                );
+                client->setApplyCallback(
+                    [this, peerNodeId = peer.nodeId](
+                    uint64_t seq,
+                    ReplOpType op,
+                    std::span<const uint8_t> key,
+                    std::span<const uint8_t> value,
+                    uint8_t recordFlags,
+                    uint64_t sourceNodeId
+                ) {
+                        if (sourceNodeId != peerNodeId) { return; }
+                        if (config_.mode() == ReplicationMode::PARTITIONED && ownerForKey(key).nodeId != sourceNodeId) { return; }
+                        if (callbacks_.apply) { callbacks_.apply(seq, op, key, value, recordFlags, sourceNodeId); }
+                        recordSeqFromPeer(sourceNodeId, seq);
+                    }
+                );
+                client->setForceDurableCallback(callbacks_.forceDurable);
+                return client;
+            }
+
+            ReplicationServer::HistoryProvider makeHistoryProvider() const {
+                if (!callbacks_.getEntries) { return {}; }
+                return [getEntries = callbacks_.getEntries](
+                    uint64_t afterSeq,
+                    uint64_t throughSeq
+                ) -> std::optional<std::vector<ReplEntry>> {
+                        const auto history = getEntries(afterSeq, throughSeq);
+                        if (!history) { return std::nullopt; }
+                        std::vector<ReplEntry> entries;
+                        entries.reserve(history->size());
+                        for (const auto& entry : *history) {
+                            entries.push_back(
+                                ReplEntry{
+                                    .seq = entry.seq,
+                                    .sourceNodeId = entry.sourceNodeId,
+                                    .op = static_cast<ReplOpType>(entry.op),
+                                    .recordFlags = entry.recordFlags,
+                                    .key = entry.key,
+                                    .value = entry.value,
+                                }
+                            );
+                        }
+                        return entries;
+                    };
+            }
+
+            ReplicationServer::SnapshotProvider makeSnapshotProvider() const {
+                if (!callbacks_.exportSnapshot) { return {}; }
+                return [exportSnapshot = callbacks_.exportSnapshot]() -> std::optional<ReplicationServer::Snapshot> {
+                    const auto source = exportSnapshot();
+                    if (!source) { return std::nullopt; }
+                    ReplicationServer::Snapshot snapshot;
+                    snapshot.seq = source->seq;
+                    snapshot.entries.reserve(source->entries.size());
+                    for (const auto& entry : source->entries) {
+                        snapshot.entries.push_back(ReplSnapshotEntry{.key = entry.key, .value = entry.value});
+                    }
+                    return snapshot;
+                };
+            }
+
+            void installPartitionedLocked() {
+                stopReplication();
+                const auto* self = config_.findById(selfNodeId_);
+                if (self == nullptr || !self->dataBearing()) {
+                    throw std::runtime_error("ClusterRuntime: partitioned/stripe runtime requires self to be data-bearing");
+                }
+
+                const auto groupState = loadOrCreatePrimaryGroup(
+                    runtimeOptions_.clusterMembershipPath,
+                    selfNodeId_,
+                    runtimeOptions_.clusterGroupId,
+                    runtimeOptions_.clusterGroupEpoch,
+                    runtimeOptions_.corruptStateAction
+                );
+                runtimeOptions_.clusterGroupId = groupState.groupId;
+                runtimeOptions_.clusterGroupEpoch = groupState.groupEpoch;
+
+                server_ = ReplicationServer::create(
+                    self->replPort,
+                    selfNodeId_,
+                    callbacks_.getCurrentSeq,
+                    effectiveAckPolicy_,
+                    effectiveConsistency_,
+                    configuredReplicaCount_,
+                    configuredReplicaNodeIds(config_, selfNodeId_),
+                    runtimeOptions_,
+                    config_.mode() == ReplicationMode::PARTITIONED ? makeHistoryProvider() : ReplicationServer::HistoryProvider{},
+                    config_.mode() == ReplicationMode::PARTITIONED ? makeSnapshotProvider() : ReplicationServer::SnapshotProvider{}
+                );
+                server_->setReadCallback(
+                    [this](const ReadRequest& request) {
+                        return readLocal(
+                            std::span<const uint8_t>{request.key.data(), request.key.size()},
+                            request.snapshotSeq
+                        );
+                    }
+                );
+                server_->start();
+
+                for (const auto& peer : config_.dataNodes()) {
+                    if (peer.nodeId == selfNodeId_) { continue; }
+                    auto client = createPeerClient(peer);
+                    client->start();
+                    peerClients_.emplace(peer.nodeId, std::move(client));
+                }
+            }
+
+            void installPartitioned() {
                 std::lock_guard lock{mutex_};
+                installPartitionedLocked();
+            }
+
+            void installRoleLocked(NodeRole role) {
                 stopReplication();
 
                 if (role == NodeRole::PRIMARY) {
+                    if (config_.mode() == ReplicationMode::MIRROR && config_.primaryNodeId() != 0 &&
+                        config_.primaryNodeId() != selfNodeId_) {
+                        throw std::runtime_error("ClusterRuntime: only the configured MIRROR Primary may install the PRIMARY role");
+                    }
                     const auto* self = config_.findById(selfNodeId_);
                     if (!self && !config_.isStandalone()) { throw std::runtime_error("ClusterRuntime: self node is missing from config"); }
                     const auto groupState = loadOrCreatePrimaryGroup(
@@ -508,45 +918,6 @@ namespace akkaradb::engine::cluster {
                     runtimeOptions_.clusterGroupId = groupState.groupId;
                     runtimeOptions_.clusterGroupEpoch = groupState.groupEpoch;
                     const uint16_t replPort = self ? self->replPort : 0;
-                    ReplicationServer::HistoryProvider historyProvider;
-                    if (callbacks_.getEntries) {
-                        historyProvider = [getEntries = callbacks_.getEntries](
-                            uint64_t afterSeq,
-                            uint64_t throughSeq
-                        ) -> std::optional<std::vector<ReplEntry>> {
-                                const auto history = getEntries(afterSeq, throughSeq);
-                                if (!history) { return std::nullopt; }
-                                std::vector<ReplEntry> entries;
-                                entries.reserve(history->size());
-                                for (const auto& entry : *history) {
-                                    entries.push_back(
-                                        ReplEntry{
-                                            .seq = entry.seq,
-                                            .sourceNodeId = entry.sourceNodeId,
-                                            .op = static_cast<ReplOpType>(entry.op),
-                                            .recordFlags = entry.recordFlags,
-                                            .key = entry.key,
-                                            .value = entry.value,
-                                        }
-                                    );
-                                }
-                                return entries;
-                            };
-                    }
-                    ReplicationServer::SnapshotProvider snapshotProvider;
-                    if (callbacks_.exportSnapshot) {
-                        snapshotProvider = [exportSnapshot = callbacks_.exportSnapshot]() -> std::optional<ReplicationServer::Snapshot> {
-                            const auto source = exportSnapshot();
-                            if (!source) { return std::nullopt; }
-                            ReplicationServer::Snapshot snapshot;
-                            snapshot.seq = source->seq;
-                            snapshot.entries.reserve(source->entries.size());
-                            for (const auto& entry : source->entries) {
-                                snapshot.entries.push_back(ReplSnapshotEntry{.key = entry.key, .value = entry.value});
-                            }
-                            return snapshot;
-                        };
-                    }
                     server_ = ReplicationServer::create(
                         replPort,
                         selfNodeId_,
@@ -556,8 +927,16 @@ namespace akkaradb::engine::cluster {
                         configuredReplicaCount_,
                         configuredReplicaNodeIds(config_, selfNodeId_),
                         runtimeOptions_,
-                        std::move(historyProvider),
-                        std::move(snapshotProvider)
+                        makeHistoryProvider(),
+                        makeSnapshotProvider()
+                    );
+                    server_->setReadCallback(
+                        [this](const ReadRequest& request) {
+                            return readLocal(
+                                std::span<const uint8_t>{request.key.data(), request.key.size()},
+                                request.snapshotSeq
+                            );
+                        }
                     );
                     server_->start();
                 }
@@ -586,11 +965,20 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
+            void installRole(NodeRole role) {
+                std::lock_guard lock{mutex_};
+                installRoleLocked(role);
+            }
+
             void stopReplication() {
                 if (client_) {
                     client_->close();
                     client_.reset();
                 }
+                for (auto& [_, client] : peerClients_) {
+                    if (client) { client->close(); }
+                }
+                peerClients_.clear();
                 if (server_) {
                     server_->close();
                     server_.reset();
@@ -609,9 +997,13 @@ namespace akkaradb::engine::cluster {
             uint16_t configuredReplicaCount_ = 0;
 
             mutable std::mutex mutex_;
+            mutable std::mutex peerSeqMutex_;
+            std::unordered_map<uint64_t, uint64_t> lastSeqByPeer_;
+            std::unordered_map<uint64_t, uint64_t> nextSeqByTarget_;
             bool started_ = false;
             std::unique_ptr<ReplicationServer> server_;
             std::unique_ptr<ReplicationClient> client_;
+            std::unordered_map<uint64_t, std::unique_ptr<ReplicationClient>> peerClients_;
     };
 
     std::unique_ptr<ClusterRuntime> ClusterRuntime::create(
@@ -640,6 +1032,14 @@ namespace akkaradb::engine::cluster {
 
     std::vector<NodeInfo> ClusterRuntime::activeNodes() const { return impl_->activeNodes(); }
 
+    bool ClusterRuntime::ownsWriteKey(std::span<const uint8_t> key) const { return impl_->ownsWriteKey(key); }
+
+    ReadResponse ClusterRuntime::readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) { return impl_->readKey(key, snapshotSeq); }
+
+    ReadResponse ClusterRuntime::readKeyFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) {
+        return impl_->readKeyFromNode(nodeId, key, snapshotSeq);
+    }
+
     const ClusterRouter& ClusterRuntime::router() const noexcept { return impl_->router(); }
 
     void ClusterRuntime::shipEntry(
@@ -651,6 +1051,19 @@ namespace akkaradb::engine::cluster {
         uint64_t sourceNodeId
     ) { impl_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
 
+    void ClusterRuntime::shipEntryTo(
+        uint64_t targetNodeId,
+        uint64_t seq,
+        ReplOpType op,
+        std::span<const uint8_t> key,
+        std::span<const uint8_t> value,
+        uint8_t recordFlags,
+        uint64_t sourceNodeId,
+        bool waitForAck
+    ) {
+        impl_->shipEntryTo(targetNodeId, seq, op, key, value, recordFlags, sourceNodeId, waitForAck);
+    }
+
     void ClusterRuntime::shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) {
         impl_->shipBlob(seq, blobId, content);
     }
@@ -660,6 +1073,8 @@ namespace akkaradb::engine::cluster {
     void ClusterRuntime::removeRaftVotingNode(uint64_t nodeId) { impl_->removeRaftVotingNode(nodeId); }
 
     void ClusterRuntime::transferRaftLeadership(uint64_t targetNodeId) { impl_->transferRaftLeadership(targetNodeId); }
+
+    void ClusterRuntime::reconfigure(ClusterConfig config) { impl_->reconfigure(std::move(config)); }
 } // namespace akkaradb::engine::cluster
 
 extern "C" AKKARADB_CLUSTER_RUNTIME_API bool akkaradb_cluster_register() noexcept {

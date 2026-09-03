@@ -154,14 +154,14 @@ namespace akkaradb::engine::cluster {
     };
 
     /** Reserved point-in-time read request payload. */
-    struct AKKARADB_CLUSTER_RUNTIME_API ReadRequest {
+    struct ReadRequest {
         uint64_t requestId = 0;
         uint64_t snapshotSeq = 0;
         std::vector<uint8_t> key;
     };
 
     /** Reserved point-in-time read response payload. */
-    struct AKKARADB_CLUSTER_RUNTIME_API ReadResponse {
+    struct ReadResponse {
         uint64_t requestId = 0;
         ReadStatus status = ReadStatus::ERROR_STATUS;
         uint8_t recordFlags = 0;

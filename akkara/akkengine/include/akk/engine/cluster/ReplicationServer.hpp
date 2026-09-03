@@ -53,6 +53,7 @@ namespace akkaradb::engine::cluster {
             };
 
             using SnapshotProvider = std::function<std::optional<Snapshot>()>;
+            using ReadCallback = std::function<ReadResponse(const ReadRequest&)>;
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.
              *
@@ -74,7 +75,7 @@ namespace akkaradb::engine::cluster {
              *        replicas too; legacy ALL_TARGETS only counts live links.
              * @param configuredReplicaNodeIds Valid data-bearing replica node ids;
              *        empty preserves direct test/server use without membership filtering.
-             * @param runtimeOptions Transport options.
+             * @param runtimeOptions Transport and per-replica outbound queue limits.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationServer> create(
                 uint16_t replPort,
@@ -103,6 +104,7 @@ namespace akkaradb::engine::cluster {
 
             /** Stops accepting, disconnects replicas, and joins worker threads. */
             void close();
+            void setReadCallback(ReadCallback callback);
 
             /**
              * Ships a replicated key/value entry to all current replication targets.
@@ -118,12 +120,22 @@ namespace akkaradb::engine::cluster {
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
             );
+            void shipEntryTo(
+                uint64_t targetNodeId,
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId,
+                bool waitForAck = true
+            );
 
             /**
              * Ships a blob payload to all current replication targets.
              *
-             * Blob frames are sent with an internal buffer seq of zero and are not
-             * waited on by the acknowledgement policy.
+             * Blob frames are live-only: they are not retained for catch-up and
+             * are not waited on by the acknowledgement policy.
              */
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
 

@@ -13,14 +13,17 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace akkaradb::engine::cluster {
     namespace {
         constexpr uint64_t PRIMARY_LEASE_WINDOW_US = 30'000'000;
+        constexpr auto PRIMARY_LEASE_RENEW_INTERVAL = std::chrono::seconds{10};
 
         [[nodiscard]] uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -69,10 +72,6 @@ namespace akkaradb::engine::cluster {
                         recordSelfJoin();
                         return;
                     }
-                    if (configureFromExpiredManifestLease()) {
-                        recordSelfJoin();
-                        return;
-                    }
                     selectRole();
                     recordSelfJoin();
                 }
@@ -84,6 +83,7 @@ namespace akkaradb::engine::cluster {
 
             void close() {
                 const bool wasRunning = running_.exchange(false);
+                stopLeaseRenewal();
                 if (wasRunning) { recordSelfLeave(); }
             }
 
@@ -152,10 +152,17 @@ namespace akkaradb::engine::cluster {
                 if (!lease.has_value() || lease->leaseUntilUs <= nowUs()) { return false; }
                 if (manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) { return false; }
 
+                const uint64_t configuredPrimaryNodeId = config_.primaryNodeId();
+                if (configuredPrimaryNodeId != 0 && lease->nodeId != configuredPrimaryNodeId) {
+                    throw std::runtime_error("ClusterManager: persisted Primary lease conflicts with ClusterConfig");
+                }
+
                 const auto* primary = config_.findById(lease->nodeId);
                 if (primary == nullptr || !primary->coordinatorEligible()) { return false; }
 
-                if (runtimeOptions_.startupRole == NodeStartupRole::PRIMARY && lease->nodeId != selfNodeId_) { return false; }
+                if (runtimeOptions_.startupRole == NodeStartupRole::PRIMARY && lease->nodeId != selfNodeId_) {
+                    throw std::runtime_error("ClusterManager: valid foreign primary lease blocks PRIMARY startup");
+                }
                 if (runtimeOptions_.startupRole == NodeStartupRole::REPLICA && lease->nodeId == selfNodeId_) { return false; }
 
                 if (lease->nodeId == selfNodeId_) {
@@ -193,34 +200,6 @@ namespace akkaradb::engine::cluster {
                 return true;
             }
 
-            bool configureFromExpiredManifestLease() {
-                if (!clusterManifest_ || runtimeOptions_.startupRole != NodeStartupRole::AUTO) { return false; }
-                if (config_.consistency().mode == ConsistencyMode::RAFT_QUORUM) { return false; }
-
-                const auto lease = clusterManifest_->lastPrimaryLease();
-                if (!lease.has_value()) { return false; }
-                const bool expired = lease->leaseUntilUs <= nowUs();
-                const bool left = manifestNodeLeftAfter(lease->nodeId, lease->tsUs);
-                if (!expired && !left) { return false; }
-                if (!isDeterministicPrimaryCandidate()) { return false; }
-
-                configurePrimarySelf();
-                setRole(NodeRole::PRIMARY);
-                return true;
-            }
-
-            bool isDeterministicPrimaryCandidate() const noexcept {
-                const auto* self = config_.findById(selfNodeId_);
-                if (self == nullptr || !self->coordinatorEligible()) { return false; }
-
-                uint64_t selectedNodeId = 0;
-                for (const auto& node : config_.nodes()) {
-                    if (!node.coordinatorEligible()) { continue; }
-                    if (selectedNodeId == 0 || node.nodeId < selectedNodeId) { selectedNodeId = node.nodeId; }
-                }
-                return selectedNodeId == selfNodeId_;
-            }
-
             bool manifestNodeLeftAfter(uint64_t nodeId, uint64_t tsUs) const {
                 if (!clusterManifest_) { return false; }
                 for (const auto& leave : clusterManifest_->nodeLeaves()) {
@@ -252,6 +231,9 @@ namespace akkaradb::engine::cluster {
             void configurePrimarySelf() {
                 const auto* self = config_.findById(selfNodeId_);
                 if (self == nullptr) { throw std::runtime_error("ClusterManager: self node is missing from config"); }
+                if (config_.primaryNodeId() != 0 && config_.primaryNodeId() != selfNodeId_) {
+                    throw std::runtime_error("ClusterManager: only the configured MIRROR Primary may start as PRIMARY");
+                }
                 if (!self->coordinatorEligible()) {
                     throw std::runtime_error("ClusterManager: self node is not coordinator-eligible and cannot start as PRIMARY");
                 }
@@ -262,6 +244,46 @@ namespace akkaradb::engine::cluster {
                     primaryReplPort_ = self->replPort;
                 }
                 if (clusterManifest_) { clusterManifest_->primaryLease(self->nodeId, nowUs() + PRIMARY_LEASE_WINDOW_US); }
+                startLeaseRenewal();
+            }
+
+            void startLeaseRenewal() {
+                if (!clusterManifest_) { return; }
+                std::lock_guard lock{leaseRenewMutex_};
+                if (leaseRenewThread_.joinable()) { return; }
+                leaseRenewStopping_ = false;
+                leaseRenewThread_ = std::thread([this] { leaseRenewLoop(); });
+            }
+
+            void stopLeaseRenewal() {
+                {
+                    std::lock_guard lock{leaseRenewMutex_};
+                    leaseRenewStopping_ = true;
+                }
+                leaseRenewCv_.notify_all();
+                if (leaseRenewThread_.joinable()) { leaseRenewThread_.join(); }
+            }
+
+            void leaseRenewLoop() {
+                std::unique_lock lock{leaseRenewMutex_};
+                while (!leaseRenewStopping_) {
+                    if (leaseRenewCv_.wait_for(lock, PRIMARY_LEASE_RENEW_INTERVAL, [this] { return leaseRenewStopping_; })) { break; }
+                    lock.unlock();
+                    renewPrimaryLease();
+                    lock.lock();
+                }
+            }
+
+            void renewPrimaryLease() {
+                if (!clusterManifest_ || !running_.load(std::memory_order_acquire) || role_.load() != NodeRole::PRIMARY) { return; }
+                const uint64_t now = nowUs();
+                const auto lease = clusterManifest_->lastPrimaryLease();
+                if (lease.has_value() && lease->nodeId != selfNodeId_ && lease->leaseUntilUs > now && !manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) {
+                    running_.store(false, std::memory_order_release);
+                    setRole(NodeRole::REPLICA);
+                    return;
+                }
+                clusterManifest_->primaryLease(selfNodeId_, now + PRIMARY_LEASE_WINDOW_US);
             }
 
             void configureReplicaPrimary() {
@@ -269,7 +291,18 @@ namespace akkaradb::engine::cluster {
                 std::string primaryHost = runtimeOptions_.primaryHost;
                 uint16_t primaryReplPort = runtimeOptions_.primaryReplPort;
 
-                if (primaryNodeId == 0) { primaryNodeId = runtimeOptions_.secure.expectedPrimaryNodeId; }
+                const uint64_t securePrimaryNodeId = runtimeOptions_.secure.expectedPrimaryNodeId;
+                const uint64_t configuredPrimaryNodeId = config_.primaryNodeId();
+                if (configuredPrimaryNodeId != 0) {
+                    if (primaryNodeId != 0 && primaryNodeId != configuredPrimaryNodeId) {
+                        throw std::runtime_error("ClusterManager: primaryNodeId conflicts with configured MIRROR Primary");
+                    }
+                    if (securePrimaryNodeId != 0 && securePrimaryNodeId != configuredPrimaryNodeId) {
+                        throw std::runtime_error("ClusterManager: secure expected Primary conflicts with configured MIRROR Primary");
+                    }
+                    primaryNodeId = configuredPrimaryNodeId;
+                }
+                else if (primaryNodeId == 0) { primaryNodeId = securePrimaryNodeId; }
                 if (primaryNodeId == 0) {
                     throw std::runtime_error("ClusterManager: REPLICA startup requires primaryNodeId or secure.expectedPrimaryNodeId");
                 }
@@ -323,6 +356,11 @@ namespace akkaradb::engine::cluster {
 
             std::mutex callbackMutex_;
             RoleChangeCallback callback_;
+
+            std::mutex leaseRenewMutex_;
+            std::condition_variable leaseRenewCv_;
+            bool leaseRenewStopping_ = false;
+            std::thread leaseRenewThread_;
     };
 
     std::unique_ptr<ClusterManager> ClusterManager::create(

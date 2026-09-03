@@ -327,6 +327,7 @@ namespace akkaradb::crypto {
     }
 
     EncryptedFrame SecureSession::seal(BytesView plaintext, BytesView aad) {
+        std::lock_guard lock{mutex_};
         if (!valid_) { throw std::runtime_error("SecureSession::seal on invalid session"); }
         if (sendCounter_ == std::numeric_limits<std::uint64_t>::max()) {
             valid_ = false;
@@ -352,6 +353,7 @@ namespace akkaradb::crypto {
     }
 
     bool SecureSession::open(const EncryptedFrame& frame, std::vector<std::uint8_t>& plaintext, BytesView aad) {
+        std::lock_guard lock{mutex_};
         if (!valid_ || frame.counter != recvCounter_) { return false; }
         if (recvCounter_ == std::numeric_limits<std::uint64_t>::max()) {
             valid_ = false;

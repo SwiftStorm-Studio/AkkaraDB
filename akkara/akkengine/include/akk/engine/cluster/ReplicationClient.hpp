@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -72,6 +73,7 @@ uint64_t seq,
             void start();
             void close();
             [[nodiscard]] bool connected() const noexcept;
+            [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs);
 
         private:
             class Impl;

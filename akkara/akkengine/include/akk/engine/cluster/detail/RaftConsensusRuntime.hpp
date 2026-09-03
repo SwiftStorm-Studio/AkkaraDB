@@ -54,6 +54,8 @@ namespace akkaradb::engine::cluster {
 
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
 
+            void linearizableReadBarrier();
+
             void addVotingNode(const NodeInfo& node);
 
             void removeVotingNode(uint64_t nodeId);

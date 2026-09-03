@@ -1112,10 +1112,11 @@ The config file uses `AKC5` magic and version 4.
 - write consistency controls,
 - replica lag behavior,
 - Raft membership options,
-- stripe data/parity shard counts.
+- stripe data/parity shard counts,
+- the single fixed Primary node id for non-Raft `MIRROR`.
 
-Runtime-only values such as bind host, primary override, identity seed path, and
-peer key pins are not serialized into `ClusterConfig`.
+Runtime-only values such as bind host, replica-side primary endpoint overrides,
+identity seed path, and peer key pins are not serialized into `ClusterConfig`.
 
 ### 15.2 Placement Modes
 
@@ -1125,6 +1126,55 @@ peer key pins are not serialized into `ClusterConfig`.
 | `MIRROR` | Ship writes to every data-bearing node |
 | `PARTITIONED` | Assign each key to one owner using rendezvous-style placement |
 | `STRIPE` | Split data and parity shards across distinct data-bearing nodes |
+
+The active native cluster runtime accepts `MIRROR`, `PARTITIONED`, and
+`STRIPE`. Non-Raft `MIRROR` has exactly one Primary selected by the persistent
+config; only that node may accept writes or start with the `PRIMARY` role.
+`RAFT_QUORUM` does not store a fixed Primary and instead elects one leader.
+`PARTITIONED` runs every data-bearing node as a partition owner for
+its rendezvous-hash key range. Writes are always owner-only: a node rejects a
+mutation whose key is owned by another node instead of forwarding it. Owner
+mutations are replicated to the other data-bearing nodes, and remote entries are
+assigned local storage sequence numbers on receipt so independent owners do not
+collide in the local MemTable/WAL sequence space.
+
+`ClusterRuntimeOptions::readMode` controls point-read routing for native
+placement. Non-Raft placement uses owner routing; Raft placement serves
+`OWNER_LINEARIZABLE` only on the current leader after committing a quorum NOOP
+read barrier:
+
+| Value | Meaning |
+|---|---|
+| `LOCAL_STALE_OK` | Serve reads from local storage without freshness coordination |
+| `OWNER_ONLY` | Serve only keys owned by the local node; remote-owner reads fail |
+| `OWNER_LINEARIZABLE` | Non-Raft routes each key to its current owner; Raft leaders commit a quorum read barrier before reading locally |
+
+`STRIPE` stores public values as internal metadata plus Reed-Solomon data/parity
+shard records. The first shard target is the key owner and the only node allowed
+to accept public writes for that key. Non-owner public writes are rejected rather
+than forwarded. Reads reconstruct the value from the latest owner metadata and
+at least `dataShards` available shards.
+
+`ClusterRuntimeOptions::stripeWriteCommitMode` controls STRIPE write completion:
+
+| Value | Meaning |
+|---|---|
+| `ALL_SHARDS` | Require every data and parity shard, plus owner metadata, to be placed |
+
+`ClusterRuntimeOptions::stripeReadCoordinatorMode` controls where STRIPE reads
+are assembled:
+
+| Value | Meaning |
+|---|---|
+| `OWNER` | Route public reads to the key owner; the owner gathers shards |
+| `LOCAL_COORDINATOR` | Let the caller fetch owner metadata and gather shards directly |
+
+`ClusterRuntimeOptions::stripeReadRepair` enables best-effort repair of missing
+shards when a read has enough shards to reconstruct the value. Online placement
+reconfiguration is intentionally unsupported: stop every node, atomically
+replace the one shared `ClusterConfig`, and reopen the cluster. Online membership
+changes are available only for `RAFT_QUORUM` through its joint-consensus voter
+APIs.
 
 ### 15.3 Node Roles and Capabilities
 
@@ -1170,12 +1220,27 @@ Consistency mode:
 `RAFT_QUORUM` derives quorum from data-bearing voters and forces failed writes
 on acknowledgement timeout.
 
+Non-Raft `PRIMARY_ACK` and `ASYNC` are primary-owned replication groups, not
+consensus clusters. For `MIRROR`, the persistent config names exactly one
+Primary; a conflicting startup role, replica target, security pin, or manifest
+lease is rejected. `AUTO` follows a valid unexpired manifest primary lease only
+when it matches that configured Primary; expired or missing leases do not
+self-promote a primary. Changing the Primary requires an offline shared-config
+replacement. Explicit `PRIMARY` startup is rejected on every other node.
+
 Timeout action is `ACCEPT_LOCAL`, `FAIL_ACK`, or `FAIL_WRITE`. `FAIL_ACK`
 reports acknowledgement failure after local commit in local-first primary-ack
-paths. `FAIL_WRITE` is the strict primary-ack path: the primary reserves a
-sequence and requires the configured acknowledgement before publishing the
-local WAL/MemTable record. Replica lag action is `ASYNC_RESYNC`,
-`REJECT_REPLICA`, or `BLOCK_WRITES`.
+paths. `FAIL_WRITE` also reports acknowledgement failure, but engine-level
+non-Raft writes first commit and sync the primary-local WAL/MemTable state
+before waiting for replica acknowledgements. This keeps the primary from
+acknowledging replicas for a write it has not recorded locally. Replica lag
+action is `ASYNC_RESYNC`, `REJECT_REPLICA`, or `BLOCK_WRITES`.
+
+At the engine layer, non-Raft native cluster configurations require Blob storage
+to be disabled. Low-level non-Raft `ReplicationServer::shipBlob` remains a
+live-only frame path for tests and embedding, but Blob frames are not retained
+for catch-up and are not acknowledgement-gated. Engine Blob replication uses
+`RAFT_QUORUM` with the configured `raftBlobPolicy`.
 
 ### 15.5 Secure Transport
 
@@ -1193,8 +1258,8 @@ advertised addresses.
 
 The native erasure codec API supports Reed-Solomon-style and external codec
 selection contracts. Stripe configuration records data and parity shard counts,
-defaulting to 4 data and 2 parity shards. Current stripe metadata and codec
-support do not by themselves guarantee a complete degraded-read/repair system.
+defaulting to 4 data and 2 parity shards. Active native STRIPE uses the RS codec
+for data/parity placement, degraded reads, and best-effort read repair.
 
 ## 16. API Servers and Wire Protocol
 
@@ -1539,7 +1604,7 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `startupRole` | `AUTO` | Startup role selection |
 | `primaryHost` | empty | Replica-side primary host override |
 | `primaryReplPort` | 0 | Replica-side primary port override |
-| `primaryNodeId` | 0 | Replica-side primary node id override |
+| `primaryNodeId` | 0 | Replica-side primary node id assertion/override; for non-Raft `MIRROR` it must match the persistent configured Primary |
 | `clusterGroupId`, `clusterGroupEpoch` | 0 | Non-Raft group identity override; primary creates persisted defaults when zero |
 | `clusterMembershipPath` | empty | Non-Raft primary group state / replica membership state path |
 | `resetClusterMembership` | `false` | Explicitly allow a valid replica membership switch |
@@ -1547,6 +1612,8 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `raftLogRecoveryAction` | `FAIL_STARTUP` | Raft log corruption fails startup unless explicitly allowed to truncate only the uncommitted tail |
 | `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations and uses reserved Blob-id namespaces so Raft-log Blob ids encode a 16-bit node id plus 46-bit seq, while snapshot Blob ids encode a 40-bit seq plus 22-bit snapshot-entry ordinal |
 | `raftBlobChunkSizeBytes` | 1048576 | Maximum payload bytes per automatic `RAFT_LOG` Blob and Raft snapshot chunk; must fit one Raft frame. Snapshot install streams entries into receiver staging instead of buffering the full snapshot in memory, records CRC32C per staged entry, externalizes large staged values to Blob refs before WAL finish, and finish recovery is WAL-transactional via snapshot record/commit markers |
+| `maxReplicaQueueFrames` | 16384 | Per-replica outbound frame queue limit for non-Raft replication; 0 disables the frame-count limit |
+| `maxReplicaQueueBytes` | 268435456 | Per-replica outbound queued wire-byte limit for non-Raft replication; 0 disables the byte limit |
 | `secure.identitySeedPath` | empty | Persistent identity seed path |
 | `secure.pinnedPeers` | empty | Peer public-key pins. `transportMode=SECURE` requires a pin for every accepted or dialed peer; use `PLAIN` only for explicitly unauthenticated test/local transport |
 | `secure.expectedPrimaryNodeId` | 0 | Expected primary id or unknown |
@@ -1893,9 +1960,12 @@ stored error instead.
 ### 24.8 Cluster Config
 
 Cluster config is a CRC-protected `AKC5` v4 binary file. It stores persistent
-membership, placement, acknowledgement, consistency, Raft, and stripe settings.
-Runtime transport settings remain out-of-band. `AKC5` readers reject CRC
-mismatches, oversized host names, truncation, and trailing bytes.
+membership, placement, acknowledgement, consistency, Raft, stripe, and the
+fixed non-Raft `MIRROR` Primary settings. This pre-release layout replaces the
+earlier development-only v4 layout without migration support; existing config
+files must be recreated. Runtime transport settings remain out-of-band. `AKC5`
+readers reject CRC mismatches, oversized host names, truncation, and trailing
+bytes.
 
 Non-Raft primary group state and replica membership state use CRC-protected
 `AKCG2` little-endian binary files. Raft volatile consensus state uses
@@ -1954,8 +2024,8 @@ database behavior.
 - Blob GC is disabled with VersionLog because historical versions may reference
   old blobs.
 - L0 blocking backpressure requires a compaction path that can make progress.
-- Stripe metadata and erasure codec APIs do not guarantee completed degraded
-  read/repair behavior by themselves.
+- STRIPE degraded reads require at least `dataShards` readable shards and
+  reachable owner metadata; they are not consensus reads.
 - Server backend availability depends on build flags and runtime library
   loading.
 - Low-level C++ object layout is not an external ABI.

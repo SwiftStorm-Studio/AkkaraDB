@@ -75,6 +75,13 @@ namespace akkaradb::engine::cluster {
             /** Returns Manifest-derived active nodes for non-Raft runtimes. */
             [[nodiscard]] std::vector<NodeInfo> activeNodes() const override;
 
+            /** Returns true when the local node owns writes for key. */
+            [[nodiscard]] bool ownsWriteKey(std::span<const uint8_t> key) const override;
+
+            /** Performs a cluster-routed key read according to runtime options. */
+            [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) override;
+            [[nodiscard]] ReadResponse readKeyFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) override;
+
             /** Returns the immutable key router for this config. */
             [[nodiscard]] const ClusterRouter& router() const noexcept;
 
@@ -91,11 +98,22 @@ namespace akkaradb::engine::cluster {
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
             ) override;
+            void shipEntryTo(
+                uint64_t targetNodeId,
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId,
+                bool waitForAck = true
+            ) override;
 
             /**
              * Ships a blob payload to connected replicas when primary.
              *
-             * Blob frames are not sequence-ack gated by ReplicationServer.
+             * In non-Raft modes Blob frames are live-only and are not
+             * sequence-ack gated by ReplicationServer.
              */
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) override;
 
@@ -104,6 +122,7 @@ namespace akkaradb::engine::cluster {
             void removeRaftVotingNode(uint64_t nodeId) override;
 
             void transferRaftLeadership(uint64_t targetNodeId) override;
+            void reconfigure(ClusterConfig config) override;
 
         private:
             class Impl;

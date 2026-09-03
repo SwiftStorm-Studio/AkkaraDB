@@ -63,6 +63,7 @@ uint64_t seq,
  uint8_t recordFlags,
  uint64_t sourceNodeId
         )> apply;
+        std::function<ReadResponse(std::span<const uint8_t> key, uint64_t snapshotSeq)> read;
         std::function<void()> forceDurable;
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)> beginBlob;
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)> appendBlobChunk;
@@ -82,6 +83,13 @@ uint64_t seq,
             virtual void close() = 0;
             [[nodiscard]] virtual NodeRole role() const noexcept { return NodeRole::STANDALONE; }
             [[nodiscard]] virtual std::vector<NodeInfo> activeNodes() const { return {}; }
+            [[nodiscard]] virtual bool ownsWriteKey(std::span<const uint8_t>) const { return true; }
+            [[nodiscard]] virtual ReadResponse readKey(std::span<const uint8_t>, uint64_t) {
+                throw std::runtime_error("IClusterRuntime: cluster reads are not supported");
+            }
+            [[nodiscard]] virtual ReadResponse readKeyFromNode(uint64_t, std::span<const uint8_t>, uint64_t) {
+                throw std::runtime_error("IClusterRuntime: targeted cluster reads are not supported");
+            }
             virtual void shipEntry(
                 uint64_t seq,
                 ReplOpType op,
@@ -90,7 +98,24 @@ uint64_t seq,
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
             ) = 0;
+            virtual void shipEntryTo(
+                uint64_t targetNodeId,
+                uint64_t seq,
+                ReplOpType op,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t recordFlags,
+                uint64_t sourceNodeId,
+                bool waitForAck = true
+            ) {
+                (void)targetNodeId;
+                (void)waitForAck;
+                shipEntry(seq, op, key, value, recordFlags, sourceNodeId);
+            }
             virtual void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) = 0;
+            virtual void reconfigure(ClusterConfig) {
+                throw std::runtime_error("IClusterRuntime: cluster reconfiguration is not supported");
+            }
 
             virtual void addRaftVotingNode(const NodeInfo&) {
                 throw std::runtime_error("IClusterRuntime: online Raft membership change is not supported");

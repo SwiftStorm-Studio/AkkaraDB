@@ -300,6 +300,16 @@ namespace akkaradb::engine {
 
             [[nodiscard]] EngineStats stats() const noexcept;
 
+            void addClusterVotingNode(const cluster::NodeInfo& node);
+            void removeClusterVotingNode(uint64_t nodeId);
+            void transferClusterLeadership(uint64_t targetNodeId);
+            /**
+             * Online placement reconfiguration is intentionally unsupported.
+             * Stop all nodes, atomically replace the shared ClusterConfig, and
+             * reopen instead. RAFT_QUORUM voter changes use the dedicated APIs.
+             */
+            void reconfigureCluster(cluster::ClusterConfig config);
+
             void forceSync();
             void forceFlush();
             void runBlobGc();

@@ -142,6 +142,28 @@ namespace akkaradb::engine::cluster {
         REJECT = 0, PRIMARY_SIDE_ONLY = 1, RAFT_LOG = 2,
     };
 
+    /** Read routing policy for native cluster placement. */
+    enum class ClusterReadMode : uint8_t {
+        LOCAL_STALE_OK = 0,
+        ///< Serve reads from the local node without freshness coordination.
+        OWNER_ONLY = 1,
+        ///< Serve a key only when the local node owns that key.
+        OWNER_LINEARIZABLE = 2,
+        ///< Non-Raft routes each key to its owner; Raft leaders first commit a quorum read barrier.
+    };
+
+    enum class StripeWriteCommitMode : uint8_t {
+        ALL_SHARDS = 0,
+        ///< A stripe write commits only after every data and parity shard is placed.
+    };
+
+    enum class StripeReadCoordinatorMode : uint8_t {
+        OWNER = 0,
+        ///< Route stripe reads to the key owner, which gathers shards and repairs missing shards.
+        LOCAL_COORDINATOR = 1,
+        ///< Let the caller gather shards after reading the latest owner metadata.
+    };
+
     enum class RaftMembershipMode : uint8_t {
         STATIC = 0, JOINT_CONSENSUS = 1,
     };
@@ -231,6 +253,12 @@ namespace akkaradb::engine::cluster {
         RaftLogRecoveryAction raftLogRecoveryAction = RaftLogRecoveryAction::FAIL_STARTUP;
         RaftBlobPolicy raftBlobPolicy = RaftBlobPolicy::REJECT;
         uint32_t raftBlobChunkSizeBytes = 1024u * 1024u;
+        ClusterReadMode readMode = ClusterReadMode::LOCAL_STALE_OK;
+        StripeWriteCommitMode stripeWriteCommitMode = StripeWriteCommitMode::ALL_SHARDS;
+        StripeReadCoordinatorMode stripeReadCoordinatorMode = StripeReadCoordinatorMode::OWNER;
+        bool stripeReadRepair = true;
+        uint32_t maxReplicaQueueFrames = 16u * 1024u; ///< Per-replica outbound frame queue limit; 0 disables the frame-count limit.
+        uint64_t maxReplicaQueueBytes = 256ull * 1024ull * 1024ull; ///< Per-replica outbound queued wire bytes; 0 disables the byte limit.
         ClusterSecureOptions secure;
     };
 
@@ -261,7 +289,8 @@ namespace akkaradb::engine::cluster {
                 AckPolicy ackPolicy,
                 ConsistencyOptions consistency = {},
                 RaftOptions raft = {},
-                StripeOptions stripe = {}
+                StripeOptions stripe = {},
+                uint64_t primaryNodeId = 0
             );
 
             /**
@@ -299,6 +328,9 @@ namespace akkaradb::engine::cluster {
             /** Returns erasure-stripe layout options. */
             [[nodiscard]] StripeOptions stripe() const noexcept { return stripe_; }
 
+            /** Returns the single configured Primary for non-Raft MIRROR, or zero for other modes. */
+            [[nodiscard]] uint64_t primaryNodeId() const noexcept { return primaryNodeId_; }
+
             /** Returns reserved config flags from the file header. */
             [[nodiscard]] uint16_t flags() const noexcept { return flags_; }
 
@@ -330,6 +362,7 @@ namespace akkaradb::engine::cluster {
             ConsistencyOptions consistency_{};
             RaftOptions raft_{};
             StripeOptions stripe_{};
+            uint64_t primaryNodeId_ = 0;
             uint16_t flags_ = 0;
     };
 } // namespace akkaradb::engine::cluster

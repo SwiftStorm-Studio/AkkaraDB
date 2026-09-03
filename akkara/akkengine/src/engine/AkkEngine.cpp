@@ -14,6 +14,7 @@
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/blob/BlobFraming.hpp"
 #include "akk/engine/cluster/ClusterRuntimeProvider.hpp"
+#include "akk/engine/erasure/ErasureCodec.hpp"
 #include "akk/engine/generation/StorageGeneration.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/server/AkkApiServerProvider.hpp"
@@ -57,6 +58,21 @@ namespace akkaradb::engine {
             timespec ts{};
             timespec_get(&ts, TIME_UTC);
             return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
+        }
+
+        [[nodiscard]] uint64_t clusterFnv1a64(std::span<const uint8_t> bytes, uint64_t seed = 14695981039346656037ull) noexcept {
+            uint64_t hash = seed;
+            for (uint8_t b : bytes) {
+                hash ^= b;
+                hash *= 1099511628211ull;
+            }
+            return hash;
+        }
+
+        [[nodiscard]] uint64_t clusterRendezvousScore(std::span<const uint8_t> key, uint64_t nodeId) noexcept {
+            uint8_t idBytes[8];
+            for (size_t i = 0; i < 8; ++i) { idBytes[i] = static_cast<uint8_t>(nodeId >> (8 * i)); }
+            return clusterFnv1a64(std::span<const uint8_t>(idBytes, 8), clusterFnv1a64(key));
         }
 
         // Test-only fault injection used by the recovery smoke test. The process
@@ -590,8 +606,11 @@ namespace akkaradb::engine {
             std::unique_ptr<cluster::IClusterRuntime> clusterRuntime;
             std::unique_ptr<server::IAkkApiServer> apiServer;
             std::unique_ptr<RaftLog> raftLog;
+            cluster::ClusterConfig clusterConfig;
+            cluster::ReplicationMode clusterReplicationMode = cluster::ReplicationMode::STANDALONE;
             uint64_t clusterConfiguredNodeCount = 0;
             cluster::AckTimeoutAction primaryAckTimeoutAction = cluster::AckTimeoutAction::ACCEPT_LOCAL;
+            std::atomic<uint64_t> stripeVersionSeq{0};
 
             mutable std::mutex writeMu;
             std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
@@ -1154,6 +1173,168 @@ namespace akkaradb::engine {
                 return out;
             }
 
+            struct StripeMetadata {
+                bool tombstone = false;
+                uint64_t version = 0;
+                uint64_t originalSize = 0;
+                erasure::ErasureLayout layout;
+                std::vector<uint64_t> nodeIds;
+            };
+
+            static void pushU16(std::vector<uint8_t>& out, uint16_t value) {
+                out.push_back(static_cast<uint8_t>(value));
+                out.push_back(static_cast<uint8_t>(value >> 8));
+            }
+
+            static void pushU32(std::vector<uint8_t>& out, uint32_t value) {
+                for (size_t i = 0; i < 4; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+            }
+
+            static void pushU64(std::vector<uint8_t>& out, uint64_t value) {
+                for (size_t i = 0; i < 8; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+            }
+
+            static bool pullU16(std::span<const uint8_t> bytes, size_t& cursor, uint16_t& out) {
+                if (cursor + 2 > bytes.size()) { return false; }
+                out = static_cast<uint16_t>(bytes[cursor]) | static_cast<uint16_t>(bytes[cursor + 1] << 8);
+                cursor += 2;
+                return true;
+            }
+
+            static bool pullU32(std::span<const uint8_t> bytes, size_t& cursor, uint32_t& out) {
+                if (cursor + 4 > bytes.size()) { return false; }
+                out = 0;
+                for (size_t i = 0; i < 4; ++i) { out |= static_cast<uint32_t>(bytes[cursor + i]) << (i * 8); }
+                cursor += 4;
+                return true;
+            }
+
+            static bool pullU64(std::span<const uint8_t> bytes, size_t& cursor, uint64_t& out) {
+                if (cursor + 8 > bytes.size()) { return false; }
+                out = 0;
+                for (size_t i = 0; i < 8; ++i) { out |= static_cast<uint64_t>(bytes[cursor + i]) << (i * 8); }
+                cursor += 8;
+                return true;
+            }
+
+            static bool pullBytes(std::span<const uint8_t> bytes, size_t& cursor, size_t size, std::vector<uint8_t>& out) {
+                if (size > bytes.size() - cursor) { return false; }
+                out.assign(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), bytes.begin() + static_cast<std::ptrdiff_t>(cursor + size));
+                cursor += size;
+                return true;
+            }
+
+            static std::vector<uint8_t> stripeMetaKey(std::span<const uint8_t> key) {
+                std::vector<uint8_t> out{0, 'A', 'K', 'S', 'M', '1'};
+                pushU32(out, static_cast<uint32_t>(key.size()));
+                out.insert(out.end(), key.begin(), key.end());
+                return out;
+            }
+
+            static std::vector<uint8_t> stripeShardKey(std::span<const uint8_t> key, uint64_t version, uint16_t shardIndex) {
+                std::vector<uint8_t> out{0, 'A', 'K', 'S', 'S', '1'};
+                pushU64(out, version);
+                pushU16(out, shardIndex);
+                pushU32(out, static_cast<uint32_t>(key.size()));
+                out.insert(out.end(), key.begin(), key.end());
+                return out;
+            }
+
+            static bool isStripeInternalKey(std::span<const uint8_t> key) {
+                return key.size() >= 6 && key[0] == 0 && key[1] == 'A' && key[2] == 'K' && key[3] == 'S' &&
+                       (key[4] == 'M' || key[4] == 'S') && key[5] == '1';
+            }
+
+            static std::optional<std::vector<uint8_t>> publicKeyFromStripeMetaKey(std::span<const uint8_t> key) {
+                if (key.size() < 10 || key[0] != 0 || key[1] != 'A' || key[2] != 'K' || key[3] != 'S' || key[4] != 'M' ||
+                    key[5] != '1') {
+                    return std::nullopt;
+                }
+                size_t cursor = 6;
+                uint32_t keyLen = 0;
+                if (!pullU32(key, cursor, keyLen) || keyLen != key.size() - cursor) { return std::nullopt; }
+                std::vector<uint8_t> out;
+                out.assign(key.begin() + static_cast<std::ptrdiff_t>(cursor), key.end());
+                return out;
+            }
+
+            static std::vector<uint8_t> encodeStripeMetadata(const StripeMetadata& metadata) {
+                std::vector<uint8_t> out{'A', 'K', 'S', 'M', '2'};
+                out.push_back(metadata.tombstone ? 1 : 0);
+                pushU64(out, metadata.version);
+                pushU64(out, metadata.originalSize);
+                pushU16(out, metadata.layout.dataShards);
+                pushU16(out, metadata.layout.parityShards);
+                pushU16(out, static_cast<uint16_t>(metadata.nodeIds.size()));
+                for (const auto nodeId : metadata.nodeIds) { pushU64(out, nodeId); }
+                return out;
+            }
+
+            static std::optional<StripeMetadata> decodeStripeMetadata(std::span<const uint8_t> bytes) {
+                if (bytes.size() < 28 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'M' || bytes[4] != '2') {
+                    return std::nullopt;
+                }
+                size_t cursor = 5;
+                StripeMetadata metadata;
+                metadata.tombstone = bytes[cursor++] != 0;
+                if (!pullU64(bytes, cursor, metadata.version) || !pullU64(bytes, cursor, metadata.originalSize) ||
+                    !pullU16(bytes, cursor, metadata.layout.dataShards) || !pullU16(bytes, cursor, metadata.layout.parityShards)) {
+                    return std::nullopt;
+                }
+                uint16_t nodeCount = 0;
+                if (!pullU16(bytes, cursor, nodeCount) || nodeCount != metadata.layout.totalShards()) { return std::nullopt; }
+                metadata.nodeIds.reserve(nodeCount);
+                for (uint16_t i = 0; i < nodeCount; ++i) {
+                    uint64_t nodeId = 0;
+                    if (!pullU64(bytes, cursor, nodeId)) { return std::nullopt; }
+                    metadata.nodeIds.push_back(nodeId);
+                }
+                return cursor == bytes.size() ? std::optional<StripeMetadata>{std::move(metadata)} : std::nullopt;
+            }
+
+            static std::vector<uint8_t> encodeStripeShard(uint64_t version, const erasure::ErasureShard& shard, erasure::ErasureLayout layout) {
+                std::vector<uint8_t> out{'A', 'K', 'S', 'S', '2'};
+                pushU64(out, version);
+                pushU16(out, shard.index);
+                pushU64(out, shard.originalSize);
+                pushU16(out, layout.dataShards);
+                pushU16(out, layout.parityShards);
+                pushU32(out, shard.crc32c);
+                pushU32(out, static_cast<uint32_t>(shard.payload.size()));
+                out.insert(out.end(), shard.payload.begin(), shard.payload.end());
+                return out;
+            }
+
+            static std::optional<erasure::ErasureShard> decodeStripeShard(std::span<const uint8_t> bytes, uint64_t version, erasure::ErasureLayout layout) {
+                if (bytes.size() < 33 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'S' || bytes[4] != '2') {
+                    return std::nullopt;
+                }
+                size_t cursor = 5;
+                uint64_t storedVersion = 0;
+                uint16_t index = 0;
+                uint64_t originalSize = 0;
+                erasure::ErasureLayout storedLayout;
+                uint32_t crc = 0;
+                uint32_t payloadSize = 0;
+                if (!pullU64(bytes, cursor, storedVersion) || !pullU16(bytes, cursor, index) || !pullU64(bytes, cursor, originalSize) ||
+                    !pullU16(bytes, cursor, storedLayout.dataShards) || !pullU16(bytes, cursor, storedLayout.parityShards) ||
+                    !pullU32(bytes, cursor, crc) || !pullU32(bytes, cursor, payloadSize)) {
+                    return std::nullopt;
+                }
+                if (storedVersion != version || storedLayout.dataShards != layout.dataShards || storedLayout.parityShards != layout.parityShards) {
+                    return std::nullopt;
+                }
+                erasure::ErasureShard shard;
+                shard.index = index;
+                shard.originalSize = originalSize;
+                shard.codec = erasure::ErasureCodecKind::RS;
+                shard.crc32c = crc;
+                if (!pullBytes(bytes, cursor, payloadSize, shard.payload) || cursor != bytes.size() || !shard.verifyCrc()) {
+                    return std::nullopt;
+                }
+                return shard;
+            }
+
             [[nodiscard]] std::optional<std::vector<uint8_t>> getValueInternal(
                 std::span<const uint8_t> key,
                 bool countStats,
@@ -1194,6 +1375,418 @@ namespace akkaradb::engine {
                 }
                 getsMiss.fetch_add(1, std::memory_order_relaxed);
                 return std::nullopt;
+            }
+
+            [[nodiscard]] erasure::ErasureLayout stripeLayoutFor(const cluster::ClusterConfig& config) const {
+                return erasure::ErasureLayout{
+                    .dataShards = config.stripe().dataShards,
+                    .parityShards = config.stripe().parityShards,
+                };
+            }
+
+            [[nodiscard]] std::vector<uint64_t> stripeNodeIdsFor(const cluster::ClusterConfig& config, std::span<const uint8_t> key) const {
+                const uint16_t totalShards = config.stripe().totalShards();
+                if (totalShards == 0) { throw std::runtime_error("AkkEngine: invalid STRIPE shard count"); }
+                const auto dataNodes = config.dataNodes();
+                if (dataNodes.size() < totalShards) { throw std::runtime_error("AkkEngine: not enough data-bearing nodes for STRIPE"); }
+
+                std::vector<std::pair<uint64_t, uint64_t>> scored;
+                scored.reserve(dataNodes.size());
+                for (const auto& target : dataNodes) { scored.emplace_back(clusterRendezvousScore(key, target.nodeId), target.nodeId); }
+                std::ranges::sort(
+                    scored,
+                    [](const auto& left, const auto& right) {
+                        if (left.first != right.first) { return left.first > right.first; }
+                        return left.second < right.second;
+                    }
+                );
+
+                std::vector<uint64_t> ids;
+                ids.reserve(totalShards);
+                for (uint16_t i = 0; i < totalShards; ++i) { ids.push_back(scored[i].second); }
+                return ids;
+            }
+
+            [[nodiscard]] uint64_t stripeOwnerFor(const cluster::ClusterConfig& config, std::span<const uint8_t> key) const {
+                const auto ids = stripeNodeIdsFor(config, key);
+                if (ids.empty()) { throw std::runtime_error("AkkEngine: STRIPE key has no owner"); }
+                return ids.front();
+            }
+
+            void applyStripeInternalPutLocked(
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t sourceNodeId,
+                uint64_t storageSeq = 0
+            ) {
+                const uint64_t seq = storageSeq != 0 ? storageSeq : reserveWriteSeq(1);
+                appendAll(seq, key, value, MemHdr16::FLAG_NORMAL, sourceNodeId, 0, 0, 0xFF, true);
+            }
+
+            void writeStripeRecordToNode(
+                uint64_t targetNodeId,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t version,
+                bool waitForAck = true
+            ) {
+                if (targetNodeId == nodeId) {
+                    std::lock_guard lock{writeMu};
+                    applyStripeInternalPutLocked(key, value, nodeId);
+                    return;
+                }
+                if (!clusterRuntime) { throw std::runtime_error("AkkEngine: STRIPE write requires cluster runtime"); }
+                if (!waitForAck) {
+                    clusterRuntime->shipEntryTo(
+                        targetNodeId,
+                        version,
+                        cluster::ReplOpType::PUT,
+                        key,
+                        value,
+                        MemHdr16::FLAG_NORMAL,
+                        nodeId,
+                        false
+                    );
+                    return;
+                }
+                const auto timeout = std::chrono::milliseconds{std::max<uint32_t>(1, clusterConfig.consistency().ackTimeoutMs)};
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                while (true) {
+                    try {
+                        clusterRuntime->shipEntryTo(targetNodeId, version, cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL, nodeId);
+                        return;
+                    }
+                    catch (...) {
+                        if (std::chrono::steady_clock::now() >= deadline) { throw; }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                    }
+                }
+            }
+
+            void writeStripeRecordToNodeLocked(
+                uint64_t targetNodeId,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t version,
+                bool waitForAck = true
+            ) {
+                if (targetNodeId == nodeId) {
+                    applyStripeInternalPutLocked(key, value, nodeId);
+                    return;
+                }
+                if (!clusterRuntime) { throw std::runtime_error("AkkEngine: STRIPE write requires cluster runtime"); }
+                if (!waitForAck) {
+                    clusterRuntime->shipEntryTo(
+                        targetNodeId,
+                        version,
+                        cluster::ReplOpType::PUT,
+                        key,
+                        value,
+                        MemHdr16::FLAG_NORMAL,
+                        nodeId,
+                        false
+                    );
+                    return;
+                }
+                const auto timeout = std::chrono::milliseconds{std::max<uint32_t>(1, clusterConfig.consistency().ackTimeoutMs)};
+                const auto deadline = std::chrono::steady_clock::now() + timeout;
+                while (true) {
+                    try {
+                        clusterRuntime->shipEntryTo(targetNodeId, version, cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL, nodeId);
+                        return;
+                    }
+                    catch (...) {
+                        if (std::chrono::steady_clock::now() >= deadline) { throw; }
+                        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+                    }
+                }
+            }
+
+            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeRecordFromNode(uint64_t targetNodeId, std::span<const uint8_t> key) {
+                if (targetNodeId == nodeId) { return getValueInternal(key, false); }
+                if (!clusterRuntime) { return std::nullopt; }
+                const auto response = clusterRuntime->readKeyFromNode(targetNodeId, key, 0);
+                if (response.status != cluster::ReadStatus::FOUND) { return std::nullopt; }
+                return response.value;
+            }
+
+            void publishStripeMetadata(const std::vector<uint64_t>& nodeIds, std::span<const uint8_t> publicKey, const StripeMetadata& metadata) {
+                const auto metaKey = stripeMetaKey(publicKey);
+                const auto metaValue = encodeStripeMetadata(metadata);
+                const bool requireAll = opts.cluster.runtime.stripeWriteCommitMode == cluster::StripeWriteCommitMode::ALL_SHARDS;
+                const uint64_t ownerNodeId = nodeIds.empty() ? 0 : nodeIds.front();
+                for (const auto targetNodeId : nodeIds) {
+                    const bool waitForAck = requireAll || targetNodeId == nodeId || targetNodeId == ownerNodeId;
+                    try { writeStripeRecordToNode(targetNodeId, metaKey, metaValue, metadata.version, waitForAck); }
+                    catch (...) {
+                        if (targetNodeId == nodeId || targetNodeId == ownerNodeId) { throw; }
+                    }
+                }
+            }
+
+            void publishStripeMetadataLocked(
+                const std::vector<uint64_t>& nodeIds,
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata
+            ) {
+                const auto metaKey = stripeMetaKey(publicKey);
+                const auto metaValue = encodeStripeMetadata(metadata);
+                const bool requireAll = opts.cluster.runtime.stripeWriteCommitMode == cluster::StripeWriteCommitMode::ALL_SHARDS;
+                const uint64_t ownerNodeId = nodeIds.empty() ? 0 : nodeIds.front();
+                for (const auto targetNodeId : nodeIds) {
+                    const bool waitForAck = requireAll || targetNodeId == nodeId || targetNodeId == ownerNodeId;
+                    try { writeStripeRecordToNodeLocked(targetNodeId, metaKey, metaValue, metadata.version, waitForAck); }
+                    catch (...) {
+                        if (targetNodeId == nodeId || targetNodeId == ownerNodeId) { throw; }
+                    }
+                }
+            }
+
+            [[nodiscard]] std::optional<StripeMetadata> readStripeMetadata(std::span<const uint8_t> publicKey) {
+                const auto metaKey = stripeMetaKey(publicKey);
+                if (auto local = getValueInternal(metaKey, false)) {
+                    if (auto decoded = decodeStripeMetadata(*local)) { return decoded; }
+                }
+                if (!clusterRuntime) { return std::nullopt; }
+                const uint64_t ownerNodeId = stripeOwnerFor(clusterConfig, publicKey);
+                if (ownerNodeId == nodeId) { return std::nullopt; }
+                const auto response = clusterRuntime->readKeyFromNode(ownerNodeId, metaKey, 0);
+                if (response.status != cluster::ReadStatus::FOUND) { return std::nullopt; }
+                return decodeStripeMetadata(response.value);
+            }
+
+            void repairStripeShards(
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata,
+                const std::vector<erasure::ErasureShard>& available,
+                const std::vector<bool>& present
+            ) {
+                if (!opts.cluster.runtime.stripeReadRepair || metadata.tombstone) { return; }
+                for (uint16_t i = 0; i < metadata.layout.totalShards(); ++i) {
+                    if (i < present.size() && present[i]) { continue; }
+                    try {
+                        const auto repaired = erasure::RsErasureCodec::repairOne(i, available, metadata.layout);
+                        const auto key = stripeShardKey(publicKey, metadata.version, i);
+                        const auto value = encodeStripeShard(metadata.version, repaired, metadata.layout);
+                        writeStripeRecordToNode(metadata.nodeIds[i], key, value, metadata.version);
+                    }
+                    catch (...) {}
+                }
+            }
+
+            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeValueFromMetadata(
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata,
+                bool repair
+            ) {
+                if (metadata.tombstone) { return std::nullopt; }
+                if (metadata.nodeIds.size() != metadata.layout.totalShards()) {
+                    throw std::runtime_error("AkkEngine: corrupt STRIPE metadata");
+                }
+
+                std::vector<erasure::ErasureShard> available;
+                std::vector<bool> present(metadata.layout.totalShards(), false);
+                for (uint16_t i = 0; i < metadata.layout.totalShards(); ++i) {
+                    const auto shardKey = stripeShardKey(publicKey, metadata.version, i);
+                    const auto stored = readStripeRecordFromNode(metadata.nodeIds[i], shardKey);
+                    if (!stored) { continue; }
+                    auto shard = decodeStripeShard(*stored, metadata.version, metadata.layout);
+                    if (!shard || shard->index >= present.size()) { continue; }
+                    present[shard->index] = true;
+                    available.push_back(std::move(*shard));
+                }
+                if (available.size() < metadata.layout.dataShards) { return std::nullopt; }
+                auto value = erasure::RsErasureCodec::decode(available, metadata.layout);
+                if (repair) { repairStripeShards(publicKey, metadata, available, present); }
+                return value;
+            }
+
+            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeValue(std::span<const uint8_t> publicKey) {
+                auto metadata = readStripeMetadata(publicKey);
+                if (!metadata) { return std::nullopt; }
+                return readStripeValueFromMetadata(publicKey, *metadata, true);
+            }
+
+            void writeStripeValueForConfig(std::span<const uint8_t> publicKey, std::span<const uint8_t> value, const cluster::ClusterConfig& config) {
+                std::lock_guard lock{writeMu};
+                const uint64_t version = stripeVersionSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+                const auto layout = stripeLayoutFor(config);
+                const auto nodeIds = stripeNodeIdsFor(config, publicKey);
+                const auto shards = erasure::RsErasureCodec::encode(value, layout);
+                const uint16_t required = opts.cluster.runtime.stripeWriteCommitMode == cluster::StripeWriteCommitMode::ALL_SHARDS
+                                              ? layout.totalShards()
+                                              : layout.dataShards;
+
+                uint16_t placed = 0;
+                std::exception_ptr firstFailure;
+                for (const auto& shard : shards) {
+                    try {
+                        const auto shardKey = stripeShardKey(publicKey, version, shard.index);
+                        const auto shardValue = encodeStripeShard(version, shard, layout);
+                        writeStripeRecordToNodeLocked(nodeIds[shard.index], shardKey, shardValue, version, placed < required);
+                        ++placed;
+                    }
+                    catch (...) {
+                        if (!firstFailure) { firstFailure = std::current_exception(); }
+                    }
+                }
+
+                if (placed < required) {
+                    if (firstFailure) { std::rethrow_exception(firstFailure); }
+                    throw std::runtime_error("AkkEngine: STRIPE write did not place enough shards");
+                }
+
+                StripeMetadata metadata;
+                metadata.version = version;
+                metadata.originalSize = value.size();
+                metadata.layout = layout;
+                metadata.nodeIds = nodeIds;
+                publishStripeMetadataLocked(nodeIds, publicKey, metadata);
+                putsTotal.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            void writeStripeValue(std::span<const uint8_t> publicKey, std::span<const uint8_t> value) {
+                requireOwnsWriteKey(publicKey);
+                writeStripeValueForConfig(publicKey, value, clusterConfig);
+            }
+
+            void removeStripeValue(std::span<const uint8_t> publicKey) {
+                requireOwnsWriteKey(publicKey);
+                std::lock_guard lock{writeMu};
+                const uint64_t version = stripeVersionSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+                StripeMetadata metadata;
+                metadata.tombstone = true;
+                metadata.version = version;
+                metadata.layout = stripeLayoutFor(clusterConfig);
+                metadata.nodeIds = stripeNodeIdsFor(clusterConfig, publicKey);
+                publishStripeMetadataLocked(metadata.nodeIds, publicKey, metadata);
+                removesTotal.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            struct StripeRebalanceRecord {
+                std::vector<uint8_t> key;
+                StripeMetadata metadata;
+                std::optional<std::vector<uint8_t>> value;
+            };
+
+            [[nodiscard]] std::vector<StripeRebalanceRecord> collectStripeRebalanceRecords() {
+                std::vector<StripeRebalanceRecord> out;
+                core::BufferArena arena;
+                memtable::MemTable::KeyRange range;
+                const uint64_t visibleSeq = snapshotSeq();
+                auto mt = memtable->iterator(range, visibleSeq);
+                sst::SSTManager::Iterator sst;
+                if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
+                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                    auto publicKey = publicKeyFromStripeMetaKey(record.key);
+                    if (!publicKey) { continue; }
+                    auto metadata = decodeStripeMetadata(record.value);
+                    if (!metadata || metadata->nodeIds.empty() || metadata->nodeIds.front() != nodeId) { continue; }
+
+                    StripeRebalanceRecord item;
+                    item.key = std::move(*publicKey);
+                    item.metadata = std::move(*metadata);
+                    if (!item.metadata.tombstone) {
+                        item.value = readStripeValueFromMetadata(item.key, item.metadata, false);
+                        if (!item.value) { continue; }
+                    }
+                    out.push_back(std::move(item));
+                }
+                return out;
+            }
+
+            void reconfigureCluster(cluster::ClusterConfig config) {
+                (void)config;
+                throw std::runtime_error(
+                    "AkkEngine: online placement reconfiguration is unsupported; close every node, atomically replace the shared cluster config, "
+                    "then reopen. Use addClusterVotingNode/removeClusterVotingNode for online RAFT_QUORUM membership changes"
+                );
+            }
+
+            [[nodiscard]] cluster::ReadResponse readLocalForCluster(std::span<const uint8_t> key, uint64_t requestedSnapshot) {
+                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE && !isStripeInternalKey(key)) {
+                    cluster::ReadResponse response;
+                    const auto value = readStripeValue(key);
+                    response.seq = snapshotSeq();
+                    if (!value) {
+                        response.status = cluster::ReadStatus::NOT_FOUND;
+                        return response;
+                    }
+                    response.status = cluster::ReadStatus::FOUND;
+                    response.value = *value;
+                    return response;
+                }
+                const auto snapshot = requestedSnapshot == 0 ? std::optional<uint64_t>{} : std::optional<uint64_t>{requestedSnapshot};
+                const auto value = getValueInternal(key, false, snapshot);
+                cluster::ReadResponse response;
+                response.seq = requestedSnapshot == 0 ? snapshotSeq() : requestedSnapshot;
+                if (!value) {
+                    response.status = cluster::ReadStatus::NOT_FOUND;
+                    return response;
+                }
+                response.status = cluster::ReadStatus::FOUND;
+                response.value = *value;
+                return response;
+            }
+
+            [[nodiscard]] bool clusterReadMustRoute() const noexcept {
+                return clusterRuntime && (clusterReplicationMode == cluster::ReplicationMode::STRIPE ||
+                                          opts.cluster.runtime.readMode != cluster::ClusterReadMode::LOCAL_STALE_OK);
+            }
+
+            [[nodiscard]] std::optional<std::vector<uint8_t>> getValueClusterAware(std::span<const uint8_t> key, bool countStats = true) {
+                if (!clusterReadMustRoute()) { return getValueInternal(key, countStats); }
+                if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
+                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
+                    if (isStripeInternalKey(key)) { return getValueInternal(key, false); }
+                    if (opts.cluster.runtime.readMode == cluster::ClusterReadMode::OWNER_ONLY && !clusterRuntime->ownsWriteKey(key)) {
+                        throw std::runtime_error("AkkEngine: cluster owner read failed");
+                    }
+                    std::optional<std::vector<uint8_t>> value;
+                    if (opts.cluster.runtime.stripeReadCoordinatorMode == cluster::StripeReadCoordinatorMode::LOCAL_COORDINATOR) {
+                        value = readStripeValue(key);
+                    }
+                    else {
+                        const auto response = clusterRuntime->readKey(key, 0);
+                        if (response.status == cluster::ReadStatus::FOUND) { value = response.value; }
+                        else if (response.status != cluster::ReadStatus::NOT_FOUND) {
+                            throw std::runtime_error("AkkEngine: cluster owner read failed");
+                        }
+                    }
+                    if (!value) {
+                        if (countStats) { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                        return std::nullopt;
+                    }
+                    if (countStats) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
+                    return value;
+                }
+                const auto response = clusterRuntime->readKey(key, 0);
+                if (response.status == cluster::ReadStatus::NOT_FOUND) {
+                    if (countStats) { getsMiss.fetch_add(1, std::memory_order_relaxed); }
+                    return std::nullopt;
+                }
+                if (response.status != cluster::ReadStatus::FOUND) {
+                    throw std::runtime_error("AkkEngine: cluster owner read failed");
+                }
+                if (countStats) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
+                return response.value;
+            }
+
+            [[nodiscard]] bool getIntoClusterAware(std::span<const uint8_t> key, std::vector<uint8_t>& out) {
+                auto value = getValueClusterAware(key);
+                if (!value) { return false; }
+                out = std::move(*value);
+                return true;
+            }
+
+            void requireOwnsWriteKey(std::span<const uint8_t> key) const {
+                if (clusterRuntime && !clusterRuntime->ownsWriteKey(key)) {
+                    throw std::runtime_error("AkkEngine: write attempted on non-owner node");
+                }
+            }
+
+            void requireOwnsWriteBatch(std::span<const BatchPutEntry> entries) const {
+                for (const auto& entry : entries) { requireOwnsWriteKey(entry.key); }
             }
 
             [[nodiscard]] bool getIntoInternal(
@@ -1796,20 +2389,22 @@ namespace akkaradb::engine {
                 return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE;
             }
 
-            void applyCommittedRaftProposal(const RaftProposal& proposal) {
-                std::lock_guard lock(writeMu);
+            void recordCommittedRaftProposalStats(const RaftProposal& proposal) {
                 const uint8_t flags = proposal.op == cluster::ReplOpType::REMOVE
                                           ? static_cast<uint8_t>(proposal.flags | MemHdr16::FLAG_TOMBSTONE)
                                           : proposal.flags;
                 if (proposal.op == cluster::ReplOpType::REMOVE) {
                     removesTotal.fetch_add(1, std::memory_order_relaxed);
-                    appendAll(proposal.index, proposal.key, {}, flags, proposal.sourceNodeId, proposal.fp64, proposal.miniKey);
                 }
                 else {
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
                     if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
-                    appendAll(proposal.index, proposal.key, proposal.value, flags, proposal.sourceNodeId, proposal.fp64, proposal.miniKey);
                 }
+            }
+
+            void forceClusterLocalDurable() {
+                if (walWriter) { walWriter->forceSync(); }
+                if (versionLog) { versionLog->forceSync(); }
             }
 
             void replicateRaftProposal(const RaftProposal& proposal) {
@@ -1839,9 +2434,13 @@ namespace akkaradb::engine {
                 const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE
                                               ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK)
                                               : flags;
-                appendAll(seq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
-                memtable->advanceSeq(seq);
-                if (raftLog) { raftLog->observeCommitted(seq); }
+                const bool partitionedRemote =
+                    (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED || clusterReplicationMode == cluster::ReplicationMode::STRIPE) &&
+                    sourceNodeId != 0 && sourceNodeId != nodeId;
+                const uint64_t storageSeq = partitionedRemote ? reserveWriteSeq(1) : seq;
+                appendAll(storageSeq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
+                memtable->advanceSeq(storageSeq);
+                if (raftLog && !partitionedRemote) { raftLog->observeCommitted(seq); }
             }
 
             [[nodiscard]] fs::path replicaSnapshotStagingPath() const {
@@ -2159,6 +2758,7 @@ namespace akkaradb::engine {
                     using WriteCoordinator::WriteCoordinator;
 
                     void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        engine_.requireOwnsWriteKey(key);
                         if (engine_.strictPrimaryAckFailWrite()) {
                             strictPut(key, value);
                             return;
@@ -2168,6 +2768,7 @@ namespace akkaradb::engine {
                     }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
+                        engine_.requireOwnsWriteKey(key);
                         if (engine_.strictPrimaryAckFailWrite()) {
                             strictPut(key, value, fp64, miniKey);
                             return;
@@ -2177,6 +2778,7 @@ namespace akkaradb::engine {
                     }
 
                     void putBatch(std::span<const BatchPutEntry> entries) override {
+                        engine_.requireOwnsWriteBatch(entries);
                         if (engine_.strictPrimaryAckFailWrite()) {
                             strictPutBatch(entries);
                             return;
@@ -2186,6 +2788,7 @@ namespace akkaradb::engine {
                     }
 
                     void remove(std::span<const uint8_t> key) override {
+                        engine_.requireOwnsWriteKey(key);
                         if (engine_.strictPrimaryAckFailWrite()) {
                             strictRemove(key);
                             return;
@@ -2195,6 +2798,7 @@ namespace akkaradb::engine {
                     }
 
                     void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
+                        engine_.requireOwnsWriteKey(key);
                         if (engine_.strictPrimaryAckFailWrite()) {
                             strictRemove(key, fp64, miniKey);
                             return;
@@ -2205,71 +2809,45 @@ namespace akkaradb::engine {
 
                 private:
                     void strictPut(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64 = 0, uint64_t miniKey = 0) {
-                        engine_.applyWriteBackpressure();
-                        std::lock_guard lock{engine_.writeMu};
-                        AppliedWrite write;
-                        write.seq = engine_.reserveWriteSeq(1);
-                        write.key = key;
-                        write.stored.assign(value.begin(), value.end());
-                        write.op = cluster::ReplOpType::PUT;
-                        write.flags = MemHdr16::FLAG_NORMAL;
-                        write.sourceNodeId = engine_.nodeId;
-                        try { engine_.replicateCommitted(write); }
-                        catch (...) {
-                            engine_.markWriteCommitted(write.seq, true);
-                            throw;
-                        }
-                        engine_.putsTotal.fetch_add(1, std::memory_order_relaxed);
-                        engine_.appendAll(write.seq, key, write.stored, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, true);
+                        const auto write = engine_.applyLocalPut(key, value, fp64, miniKey);
+                        engine_.forceClusterLocalDurable();
+                        engine_.replicateCommitted(write);
                     }
 
                     void strictPutBatch(std::span<const BatchPutEntry> entries) {
                         if (entries.empty()) { return; }
-                        engine_.applyWriteBackpressure();
-                        std::lock_guard lock{engine_.writeMu};
-                        const uint64_t baseSeq = engine_.reserveWriteSeq(entries.size());
-                        std::vector<AppliedWrite> writes;
-                        writes.reserve(entries.size());
-                        for (size_t i = 0; i < entries.size(); ++i) {
-                            const auto& [key, value] = entries[i];
-                            AppliedWrite write;
-                            write.seq = baseSeq + i;
-                            write.key = key;
-                            write.stored.assign(value.begin(), value.end());
-                            write.op = cluster::ReplOpType::PUT;
-                            write.flags = MemHdr16::FLAG_NORMAL;
-                            write.sourceNodeId = engine_.nodeId;
-                            writes.push_back(std::move(write));
-                        }
-                        size_t replicated = 0;
-                        try { for (; replicated < writes.size(); ++replicated) { engine_.replicateCommitted(writes[replicated]); } }
-                        catch (...) {
-                            for (const auto& write : writes) { engine_.markWriteCommitted(write.seq, true); }
-                            throw;
-                        }
-                        for (const auto& write : writes) {
-                            engine_.putsTotal.fetch_add(1, std::memory_order_relaxed);
-                            engine_.appendAll(write.seq, write.key, write.stored, write.flags, write.sourceNodeId);
-                        }
+                        const auto writes = engine_.applyLocalPutBatch(entries);
+                        engine_.forceClusterLocalDurable();
+                        for (const auto& write : writes) { engine_.replicateCommitted(write); }
                     }
 
                     void strictRemove(std::span<const uint8_t> key, uint64_t fp64 = 0, uint64_t miniKey = 0) {
-                        engine_.applyWriteBackpressure();
-                        std::lock_guard lock{engine_.writeMu};
-                        AppliedWrite write;
-                        write.seq = engine_.reserveWriteSeq(1);
-                        write.key = key;
-                        write.op = cluster::ReplOpType::REMOVE;
-                        write.flags = MemHdr16::FLAG_TOMBSTONE;
-                        write.sourceNodeId = engine_.nodeId;
-                        try { engine_.replicateCommitted(write); }
-                        catch (...) {
-                            engine_.markWriteCommitted(write.seq, true);
-                            throw;
-                        }
-                        engine_.removesTotal.fetch_add(1, std::memory_order_relaxed);
-                        engine_.appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, true);
+                        const auto write = engine_.applyLocalRemove(key, fp64, miniKey);
+                        engine_.forceClusterLocalDurable();
+                        engine_.replicateCommitted(write);
                     }
+            };
+
+            class StripeWriteCoordinator final : public WriteCoordinator {
+                public:
+                    using WriteCoordinator::WriteCoordinator;
+
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        engine_.writeStripeValue(key, value);
+                    }
+
+                    void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t, uint64_t) override {
+                        engine_.writeStripeValue(key, value);
+                    }
+
+                    void putBatch(std::span<const BatchPutEntry> entries) override {
+                        engine_.requireOwnsWriteBatch(entries);
+                        for (const auto& entry : entries) { engine_.writeStripeValue(entry.key, entry.value); }
+                    }
+
+                    void remove(std::span<const uint8_t> key) override { engine_.removeStripeValue(key); }
+
+                    void removeHinted(std::span<const uint8_t> key, uint64_t, uint64_t) override { engine_.removeStripeValue(key); }
             };
 
             class RaftQuorumWriteCoordinator final : public WriteCoordinator {
@@ -2327,13 +2905,14 @@ namespace akkaradb::engine {
                     void commitLocalProposal(const RaftProposal& proposal) {
                         engine_.replicateRaftProposal(proposal);
                         engine_.raftLog->markCommitted(proposal.term, proposal.index);
-                        engine_.applyCommittedRaftProposal(proposal);
+                        engine_.recordCommittedRaftProposalStats(proposal);
                     }
             };
 
             [[nodiscard]] std::unique_ptr<WriteCoordinator> createWriteCoordinator(cluster::ConsistencyMode mode) {
                 if (mode == cluster::ConsistencyMode::RAFT_QUORUM) { return std::make_unique<RaftQuorumWriteCoordinator>(*this); }
                 if (!clusterRuntime) { return std::make_unique<LocalUnreplicatedWriteCoordinator>(*this); }
+                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) { return std::make_unique<StripeWriteCoordinator>(*this); }
                 return std::make_unique<LocalReplicationWriteCoordinator>(*this);
             }
 
@@ -2552,9 +3131,15 @@ namespace akkaradb::engine {
             cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
                                              ? *impl.opts.cluster.config
                                              : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
+            impl.clusterConfig = cfg;
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
+            impl.clusterReplicationMode = cfg.mode();
+            if (cfg.mode() == cluster::ReplicationMode::STRIPE) { impl.stripeVersionSeq.store(recoveredSeq, std::memory_order_release); }
             writeCoordinatorMode = cfg.consistency().mode;
             impl.primaryAckTimeoutAction = cfg.consistency().ackTimeoutAction;
+            if (writeCoordinatorMode != cluster::ConsistencyMode::RAFT_QUORUM && impl.opts.components.blobEnabled) {
+                throw std::invalid_argument("AkkEngine: non-Raft native cluster requires blob storage to be disabled");
+            }
             if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM) {
                 const auto raftBlobPolicy = impl.opts.cluster.runtime.raftBlobPolicy;
                 if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT && raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY &&
@@ -2658,6 +3243,9 @@ namespace akkaradb::engine {
             ) {
                     impl.applyReplicaRecord(seq, op, key, value, recordFlags, sourceNodeId);
                 };
+            callbacks.read = [&impl](std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                return impl.readLocalForCluster(key, snapshotSeq);
+            };
             callbacks.beginBlob = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
                 if (impl.blobManager) {
                     impl.blobManager->abortWrite(blobId);
@@ -2765,7 +3353,7 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        return impl_->getValueInternal(key, true);
+        return impl_->getValueClusterAware(key);
     }
 
     std::vector<AkkEngine::BatchGetResult> AkkEngine::getBatch(std::span<const std::span<const uint8_t>> keys) const {
@@ -2773,7 +3361,7 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        impl_->waitForKeySequenceReadVisibility();
+        if (!impl_->clusterReadMustRoute()) { impl_->waitForKeySequenceReadVisibility(); }
         const uint64_t snapshot = impl_->snapshotSeq();
 
         std::vector<BatchGetResult> out;
@@ -2781,7 +3369,9 @@ namespace akkaradb::engine {
 
         for (const auto& key : keys) {
             BatchGetResult result;
-            result.found = impl_->getIntoInternal(key, result.value, true, snapshot);
+            result.found = impl_->clusterReadMustRoute()
+                               ? impl_->getIntoClusterAware(key, result.value)
+                               : impl_->getIntoInternal(key, result.value, true, snapshot);
             out.push_back(std::move(result));
         }
 
@@ -2793,6 +3383,10 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
+        if (impl_->clusterReadMustRoute()) {
+            impl_->existsTotal.fetch_add(1, std::memory_order_relaxed);
+            return impl_->getValueClusterAware(key, false).has_value();
+        }
         impl_->waitForKeySequenceReadVisibility();
         impl_->existsTotal.fetch_add(1, std::memory_order_relaxed);
         const uint64_t seq = impl_->snapshotSeq();
@@ -2806,7 +3400,7 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        return impl_->getIntoInternal(key, out, true);
+        return impl_->getIntoClusterAware(key, out);
     }
 
     bool AkkEngine::getIntoArena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const {
@@ -2814,6 +3408,15 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
+        if (impl_->clusterReadMustRoute()) {
+            auto value = impl_->getValueClusterAware(key);
+            if (!value) {
+                out = {};
+                return false;
+            }
+            out = copySpanToArena(*value, arena);
+            return true;
+        }
         return impl_->getIntoArenaInternal(key, arena, out, true);
     }
 
@@ -2926,6 +3529,9 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
+        if (impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
+            throw std::runtime_error("AkkEngine: rollback is not supported for STRIPE cluster values");
+        }
         for (const auto& [key, prev] : impl_->versionLog->collectRollbackTargets(targetSeq)) {
             uint64_t seq = 0;
             uint8_t recordFlags = MemHdr16::FLAG_TOMBSTONE;
@@ -2962,6 +3568,9 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
+        if (impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
+            throw std::runtime_error("AkkEngine: rollback is not supported for STRIPE cluster values");
+        }
         const auto prev = impl_->versionLog->getAt(key, targetSeq);
         uint64_t seq = 0;
         uint8_t recordFlags = MemHdr16::FLAG_TOMBSTONE;
@@ -3155,6 +3764,33 @@ namespace akkaradb::engine {
             out.vlog.flushThreadRunning = snap.flushThreadRunning;
         }
         return out;
+    }
+
+    void AkkEngine::addClusterVotingNode(const cluster::NodeInfo& node) {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        impl_->clusterRuntime->addRaftVotingNode(node);
+    }
+
+    void AkkEngine::removeClusterVotingNode(uint64_t nodeId) {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        impl_->clusterRuntime->removeRaftVotingNode(nodeId);
+    }
+
+    void AkkEngine::transferClusterLeadership(uint64_t targetNodeId) {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        impl_->clusterRuntime->transferRaftLeadership(targetNodeId);
+    }
+
+    void AkkEngine::reconfigureCluster(cluster::ClusterConfig config) {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->reconfigureCluster(std::move(config));
     }
 
     void AkkEngine::forceSync() {

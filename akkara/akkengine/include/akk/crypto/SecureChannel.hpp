@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -79,6 +80,7 @@ namespace akkaradb::crypto {
             std::uint64_t sendCounter_ = 0;
             std::uint64_t recvCounter_ = 0;
             bool valid_ = false;
+            mutable std::mutex mutex_;
     };
 
     struct AKDB_API ResponderHandshake {

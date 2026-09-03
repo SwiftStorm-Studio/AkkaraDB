@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -580,11 +581,67 @@ namespace akkaradb::engine::cluster {
                 }
                 if (worker_.joinable()) { worker_.join(); }
                 connected_ = false;
+                failPendingRead();
             }
 
             bool connected() const noexcept { return connected_; }
 
+            ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
+                std::unique_lock readLock{readMutex_};
+                const uint64_t requestId = nextReadRequestId_++;
+                pendingReadRequestId_ = requestId;
+                pendingReadResponse_.reset();
+                pendingReadFailed_ = false;
+
+                ReadRequest request;
+                request.requestId = requestId;
+                request.snapshotSeq = snapshotSeq;
+                request.key.assign(key.begin(), key.end());
+                const auto wire = encodeReadRequest(request);
+
+                bool sent = false;
+                {
+                    std::lock_guard sendLock{sendMutex_};
+                    std::lock_guard socketLock{socketMutex_};
+                    if (connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
+                        sent = sendTo(socket_, activeSecure_, wire.data(), wire.size());
+                    }
+                }
+                if (!sent) {
+                    pendingReadRequestId_ = 0;
+                    throw std::runtime_error("ReplicationClient: owner read request send failed");
+                }
+
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+                while (!pendingReadResponse_.has_value() && !pendingReadFailed_) {
+                    if (readCv_.wait_until(readLock, deadline) == std::cv_status::timeout) { break; }
+                }
+                if (!pendingReadResponse_.has_value()) {
+                    pendingReadRequestId_ = 0;
+                    if (pendingReadFailed_) { throw std::runtime_error("ReplicationClient: owner read connection closed"); }
+                    throw std::runtime_error("ReplicationClient: owner read request timeout");
+                }
+                ReadResponse response = std::move(*pendingReadResponse_);
+                pendingReadResponse_.reset();
+                pendingReadRequestId_ = 0;
+                return response;
+            }
+
         private:
+            void completePendingRead(ReadResponse response) {
+                std::lock_guard lock{readMutex_};
+                if (response.requestId == pendingReadRequestId_) {
+                    pendingReadResponse_ = std::move(response);
+                    readCv_.notify_all();
+                }
+            }
+
+            void failPendingRead() {
+                std::lock_guard lock{readMutex_};
+                pendingReadFailed_ = true;
+                readCv_.notify_all();
+            }
+
             void run() {
                 while (running_) {
                     SocketHandle socket = INVALID_SOCKET_HANDLE;
@@ -618,14 +675,22 @@ namespace akkaradb::engine::cluster {
                     }
 
                     if (handshake(socket, secure.get(), secureRemotePublicKey)) {
+                        {
+                            std::lock_guard lock{socketMutex_};
+                            if (socket_ == socket) { activeSecure_ = secure.get(); }
+                        }
                         connected_ = true;
                         receiveLoop(socket, secure.get());
                     }
 
                     connected_ = false;
+                    failPendingRead();
                     {
                         std::lock_guard lock{socketMutex_};
-                        if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
+                        if (socket_ == socket) {
+                            activeSecure_ = nullptr;
+                            socket_ = INVALID_SOCKET_HANDLE;
+                        }
                     }
                     closeSocket(socket);
 
@@ -709,6 +774,7 @@ namespace akkaradb::engine::cluster {
             bool sendAck(SocketHandle socket, crypto::SecureSession* secure, uint64_t seq, AckStage stage) {
                 if (ackPolicy_.mode == AckPolicyMode::NONE || ackPolicy_.stage != stage) { return true; }
                 const auto ack = encodeAck(ReplAck{.seq = seq, .stage = stage});
+                std::lock_guard lock{sendMutex_};
                 return sendTo(socket, secure, ack.data(), ack.size());
             }
 
@@ -817,7 +883,12 @@ namespace akkaradb::engine::cluster {
                         expectedSeq = endSeq + 1;
                     }
                     else if (frame.type == ReplMsgType::RESYNC_REQUIRED) { return; }
-                    else if (frame.type != ReplMsgType::READ_RESPONSE) { return; }
+                    else if (frame.type == ReplMsgType::READ_RESPONSE) {
+                        ReadResponse response;
+                        if (!decodeReadResponse(frame.payload, response)) { return; }
+                        completePendingRead(std::move(response));
+                    }
+                    else { return; }
                 }
             }
 
@@ -835,6 +906,15 @@ namespace akkaradb::engine::cluster {
 
             mutable std::mutex socketMutex_;
             SocketHandle socket_ = INVALID_SOCKET_HANDLE;
+            crypto::SecureSession* activeSecure_ = nullptr;
+            std::mutex sendMutex_;
+
+            mutable std::mutex readMutex_;
+            std::condition_variable readCv_;
+            uint64_t nextReadRequestId_ = 1;
+            uint64_t pendingReadRequestId_ = 0;
+            std::optional<ReadResponse> pendingReadResponse_;
+            bool pendingReadFailed_ = false;
 
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;
@@ -896,4 +976,8 @@ namespace akkaradb::engine::cluster {
     void ReplicationClient::close() { impl_->close(); }
 
     bool ReplicationClient::connected() const noexcept { return impl_->connected(); }
+
+    ReadResponse ReplicationClient::readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
+        return impl_->readKey(key, snapshotSeq, timeoutMs);
+    }
 } // namespace akkaradb::engine::cluster
