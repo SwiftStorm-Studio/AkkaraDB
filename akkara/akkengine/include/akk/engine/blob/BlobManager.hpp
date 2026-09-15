@@ -17,12 +17,29 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <shared_mutex>
 #include <span>
 #include <vector>
 
 namespace akkaradb::engine::blob {
     class AKDB_API BlobManager {
         public:
+            class ReadPin {
+                public:
+                    ReadPin() = default;
+                    ReadPin(ReadPin&&) noexcept = default;
+                    ReadPin& operator=(ReadPin&&) noexcept = default;
+
+                    ReadPin(const ReadPin&) = delete;
+                    ReadPin& operator=(const ReadPin&) = delete;
+
+                private:
+                    friend class BlobManager;
+                    explicit ReadPin(std::shared_mutex& mutex) : lock_(mutex) {}
+
+                    std::shared_lock<std::shared_mutex> lock_;
+            };
+
             struct Options {
                 uint64_t thresholdBytes = DEFAULT_THRESHOLD_BYTES;
                 BlobCodec codec = BlobCodec::NONE;
@@ -69,6 +86,9 @@ uint64_t blobId,
 
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId) const;
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId, uint32_t expectedCrc32c) const;
+            // Prevents the background collector from unlinking Blob files
+            // while a caller resolves a fixed multi-record view.
+            [[nodiscard]] ReadPin pinReads() const;
 
             void scheduleDelete(uint64_t blobId);
             void scanOrphans(std::function<bool(uint64_t)> isReferenced);

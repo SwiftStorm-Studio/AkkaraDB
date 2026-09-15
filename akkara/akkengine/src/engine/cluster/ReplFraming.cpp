@@ -169,6 +169,30 @@ namespace akkaradb::engine::cluster {
         return encodeFrame(ReplMsgType::READ_RESPONSE, p);
     }
 
+    std::vector<uint8_t> encodeStripeControlRequest(const StripeControlRequest& request) {
+        std::vector<uint8_t> p;
+        writeU64(p, request.requestId);
+        p.push_back(static_cast<uint8_t>(request.action));
+        writeU64(p, request.ownerNodeId);
+        writeU64(p, request.fenceToken);
+        writeU32(p, static_cast<uint32_t>(request.key.size()));
+        writeU32(p, static_cast<uint32_t>(request.metadata.size()));
+        p.insert(p.end(), request.key.begin(), request.key.end());
+        p.insert(p.end(), request.metadata.begin(), request.metadata.end());
+        return encodeFrame(ReplMsgType::STRIPE_CONTROL_REQUEST, p);
+    }
+
+    std::vector<uint8_t> encodeStripeControlResponse(const StripeControlResponse& response) {
+        std::vector<uint8_t> p;
+        writeU64(p, response.requestId);
+        p.push_back(static_cast<uint8_t>(response.status));
+        writeU64(p, response.authorityNodeId);
+        writeU64(p, response.fenceToken);
+        writeU32(p, static_cast<uint32_t>(response.metadata.size()));
+        p.insert(p.end(), response.metadata.begin(), response.metadata.end());
+        return encodeFrame(ReplMsgType::STRIPE_CONTROL_RESPONSE, p);
+    }
+
     bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out) {
         if (payload.size() != 34) { return false; }
         out.nodeId = readU64(payload, 0);
@@ -257,5 +281,35 @@ namespace akkaradb::engine::cluster {
         const uint32_t valueLen = readU32(payload, 18);
         size_t cursor = 22;
         return readBytes(payload, cursor, valueLen, out.value) && cursor == payload.size();
+    }
+
+    bool decodeStripeControlRequest(std::span<const uint8_t> payload, StripeControlRequest& out) {
+        if (payload.size() < 33) { return false; }
+        out.requestId = readU64(payload, 0);
+        out.action = static_cast<StripeControlAction>(payload[8]);
+        if (out.action != StripeControlAction::ACQUIRE && out.action != StripeControlAction::COMMIT &&
+            out.action != StripeControlAction::RELEASE && out.action != StripeControlAction::READ_METADATA) { return false; }
+        out.ownerNodeId = readU64(payload, 9);
+        out.fenceToken = readU64(payload, 17);
+        const uint32_t keyLen = readU32(payload, 25);
+        const uint32_t metadataLen = readU32(payload, 29);
+        size_t cursor = 33;
+        return readBytes(payload, cursor, keyLen, out.key) && readBytes(payload, cursor, metadataLen, out.metadata) &&
+               cursor == payload.size();
+    }
+
+    bool decodeStripeControlResponse(std::span<const uint8_t> payload, StripeControlResponse& out) {
+        if (payload.size() < 29) { return false; }
+        out.requestId = readU64(payload, 0);
+        out.status = static_cast<StripeControlStatus>(payload[8]);
+        out.authorityNodeId = readU64(payload, 9);
+        out.fenceToken = readU64(payload, 17);
+        const uint32_t metadataLen = readU32(payload, 25);
+        size_t cursor = 29;
+        if (!readBytes(payload, cursor, metadataLen, out.metadata) || cursor != payload.size()) { return false; }
+        return out.status == StripeControlStatus::GRANTED || out.status == StripeControlStatus::COMMITTED ||
+               out.status == StripeControlStatus::RELEASED || out.status == StripeControlStatus::BUSY ||
+               out.status == StripeControlStatus::REJECTED || out.status == StripeControlStatus::ERROR_STATUS ||
+               out.status == StripeControlStatus::FOUND || out.status == StripeControlStatus::NOT_FOUND;
     }
 } // namespace akkaradb::engine::cluster

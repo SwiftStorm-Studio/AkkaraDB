@@ -272,6 +272,7 @@ namespace akkaradb::engine::blob {
             fs::path blobDir;
             Options options;
             mutable std::mutex writeMu;
+            mutable std::shared_mutex readPinMu;
             std::mutex delMu;
             std::condition_variable delCv;
             std::vector<uint64_t> delQueue;
@@ -490,15 +491,18 @@ namespace akkaradb::engine::blob {
                         batch.swap(delQueue);
                     }
 
-                    if (!batch.empty()) { gcCycles.fetch_add(1, std::memory_order_relaxed); }
-                    for (uint64_t id : batch) {
-                        const auto src = pathFor(id);
-                        auto dst = src;
-                        dst += ".del";
-                        if (renameQuiet(src, dst)) {
-                            (void)removeQuiet(dst);
-                            if (options.onBlobDelete) { options.onBlobDelete(id); }
-                            blobsDeleted.fetch_add(1, std::memory_order_relaxed);
+                    if (!batch.empty()) {
+                        gcCycles.fetch_add(1, std::memory_order_relaxed);
+                        std::unique_lock readPinLock{readPinMu};
+                        for (uint64_t id : batch) {
+                            const auto src = pathFor(id);
+                            auto dst = src;
+                            dst += ".del";
+                            if (renameQuiet(src, dst)) {
+                                (void)removeQuiet(dst);
+                                if (options.onBlobDelete) { options.onBlobDelete(id); }
+                                blobsDeleted.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
                     }
                 }
@@ -508,15 +512,18 @@ namespace akkaradb::engine::blob {
                     std::lock_guard lock(delMu);
                     finalBatch.swap(delQueue);
                 }
-                if (!finalBatch.empty()) { gcCycles.fetch_add(1, std::memory_order_relaxed); }
-                for (uint64_t id : finalBatch) {
-                    const auto src = pathFor(id);
-                    auto dst = src;
-                    dst += ".del";
-                    if (renameQuiet(src, dst)) {
-                        (void)removeQuiet(dst);
-                        if (options.onBlobDelete) { options.onBlobDelete(id); }
-                        blobsDeleted.fetch_add(1, std::memory_order_relaxed);
+                if (!finalBatch.empty()) {
+                    gcCycles.fetch_add(1, std::memory_order_relaxed);
+                    std::unique_lock readPinLock{readPinMu};
+                    for (uint64_t id : finalBatch) {
+                        const auto src = pathFor(id);
+                        auto dst = src;
+                        dst += ".del";
+                        if (renameQuiet(src, dst)) {
+                            (void)removeQuiet(dst);
+                            if (options.onBlobDelete) { options.onBlobDelete(id); }
+                            blobsDeleted.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                 }
             }
@@ -645,6 +652,11 @@ namespace akkaradb::engine::blob {
         auto content = read(blobId);
         if (crc32c(content) != expectedCrc32c) { throw std::runtime_error("BlobManager: expected crc mismatch"); }
         return content;
+    }
+
+    BlobManager::ReadPin BlobManager::pinReads() const {
+        if (!impl_) { return {}; }
+        return ReadPin{impl_->readPinMu};
     }
 
     void BlobManager::scheduleDelete(uint64_t blobId) {

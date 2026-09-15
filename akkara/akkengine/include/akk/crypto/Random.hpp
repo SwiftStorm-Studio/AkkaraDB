@@ -13,6 +13,7 @@
 #include "akkaradb/Export.hpp"
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <span>
 
@@ -26,6 +27,8 @@ namespace akkaradb::crypto {
      * @throws std::runtime_error when the OS random source is unavailable.
      */
     AKDB_API void secureRandom(std::span<std::uint8_t> out);
+    /// BLAKE2b-256 over length-delimited parts.
+    AKDB_API std::array<uint8_t, 32> hash256(std::span<const std::span<const uint8_t>> parts);
 
     /**
      * @brief Best-effort constant-time wipe for temporary secret material.

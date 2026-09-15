@@ -68,6 +68,7 @@ namespace akkaradb::engine::cluster {
 
             /** Stops the active replication endpoint and cluster manager. */
             void close() override;
+            [[nodiscard]] RaftRuntimeStats raftStats() const override;
 
             /** Returns the current local cluster role. */
             [[nodiscard]] NodeRole role() const noexcept override;
@@ -81,6 +82,14 @@ namespace akkaradb::engine::cluster {
             /** Performs a cluster-routed key read according to runtime options. */
             [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) override;
             [[nodiscard]] ReadResponse readKeyFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) override;
+            [[nodiscard]] StripeOperationLease acquireStripeOperation(std::span<const uint8_t> key, uint64_t ownerNodeId) override;
+            void commitStripeMetadata(const StripeOperationLease& lease, std::span<const uint8_t> key,
+                std::span<const uint8_t> metadata) override;
+            void releaseStripeOperation(const StripeOperationLease& lease, std::span<const uint8_t> key) noexcept override;
+            [[nodiscard]] uint64_t stripeFailoverNodeId() const noexcept override;
+            [[nodiscard]] bool stripeNodeReachable(uint64_t nodeId) const noexcept override;
+            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeMetadata(std::span<const uint8_t> key,
+                uint64_t ownerNodeId) override;
 
             /** Returns the immutable key router for this config. */
             [[nodiscard]] const ClusterRouter& router() const noexcept;
@@ -98,6 +107,11 @@ namespace akkaradb::engine::cluster {
                 uint8_t recordFlags,
                 uint64_t sourceNodeId
             ) override;
+            std::future<void> submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
+                std::span<const uint8_t> value, uint8_t flags, uint64_t source) override;
+            std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
+                std::function<ClusterHistoryEntry()>) override;
+            ClusterRequestResult queryRequest(const ClusterRequestId&) override;
             void shipEntryTo(
                 uint64_t targetNodeId,
                 uint64_t seq,

@@ -20,6 +20,7 @@
 #include <string>
 
 namespace akkaradb::engine::cluster {
+    namespace detail { class TransferBudget; }
     /**
      * ReplicationClient - Replica-side connection to the current primary.
      *
@@ -55,7 +56,20 @@ uint64_t seq,
                 uint64_t selfNodeId,
                 std::function<uint64_t()> getLastSeq,
                 AckPolicy ackPolicy = {},
-                ClusterRuntimeOptions runtimeOptions = {}
+                ClusterRuntimeOptions runtimeOptions = {},
+                bool targetedEntries = false,
+                std::shared_ptr<detail::TransferBudget> transferBudget = {}
+            );
+            [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
+                std::string primaryHost,
+                uint16_t primaryReplPort,
+                uint64_t selfNodeId,
+                std::function<uint64_t()> getLastSeq,
+                AckPolicy ackPolicy,
+                ClusterRuntimeOptions runtimeOptions,
+                bool targetedEntries,
+                std::shared_ptr<detail::TransferBudget> transferBudget,
+                bool allowSequenceGaps
             );
             ~ReplicationClient();
             ReplicationClient(const ReplicationClient&) = delete;
@@ -73,7 +87,10 @@ uint64_t seq,
             void start();
             void close();
             [[nodiscard]] bool connected() const noexcept;
+            /** Unix timestamp in microseconds of the latest accepted handshake or valid frame; zero before first contact. */
+            [[nodiscard]] uint64_t lastSuccessfulContactAtUs() const noexcept;
             [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs);
+            [[nodiscard]] StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs);
 
         private:
             class Impl;

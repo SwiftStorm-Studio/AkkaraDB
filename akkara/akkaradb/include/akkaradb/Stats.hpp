@@ -22,11 +22,42 @@
 
 #include "akkaradb/Export.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <string>
 #include <vector>
 
 namespace akkaradb::engine {
+    enum class ClusterHealthState : uint32_t {
+        HEALTHY = 0,
+        DEGRADED = 1,
+        FAILED = 2,
+    };
+
+    enum class ClusterFailureCode : uint32_t {
+        NONE = 0,
+        FOREIGN_CLUSTER = 1,
+        POLICY_MISMATCH = 2,
+        LEASE_RENEWAL = 3,
+        ENDPOINT_START = 4,
+        PEER_READ_TIMEOUT = 5,
+        RAFT_PERSISTENCE = 6,
+    };
+
+    /** Self-describing cumulative latency histogram suitable for management UIs. */
+    struct ClusterLatencyHistogram {
+        std::array<uint64_t, 8> bucketUpperBoundsUs{
+            100, 500, 1'000, 5'000, 10'000, 50'000, 250'000, std::numeric_limits<uint64_t>::max(),
+        };
+        /// Cumulative counts: bucketCounts[i] contains every sample <= bucketUpperBoundsUs[i].
+        std::array<uint64_t, 8> bucketCounts{};
+        uint64_t sampleCount = 0;
+        uint64_t totalUs = 0;
+        uint64_t maxUs = 0;
+    };
+
     struct LevelStats {
         int level = 0;
         size_t fileCount = 0;
@@ -216,11 +247,97 @@ namespace akkaradb::engine {
         } manifest;
 
         struct ClusterStats {
+            struct NodeStats {
+                uint64_t nodeId = 0;
+                std::string host;
+                uint16_t dataPort = 0;
+                uint16_t replPort = 0;
+                uint32_t capabilities = 0;
+            };
+
+            struct PeerStats {
+                uint64_t nodeId = 0;
+                uint64_t matchIndex = 0;
+                uint64_t nextIndex = 0;
+                uint64_t replicationLag = 0;
+                bool connected = false;
+                /// Unix timestamp in microseconds; zero before the first successful contact.
+                uint64_t lastSuccessfulContactAtUs = 0;
+                uint64_t roundTripsSucceededTotal = 0;
+                uint64_t roundTripsFailedTotal = 0;
+                uint64_t consecutiveRoundTripFailures = 0;
+                /// Unix timestamp in microseconds of the latest completed round trip.
+                uint64_t lastRoundTripAtUs = 0;
+                /// Unix timestamp in microseconds; zero until the first failed round trip.
+                uint64_t lastRoundTripFailureAtUs = 0;
+                ClusterLatencyHistogram roundTripLatencyUs;
+            };
+
             bool enabled = false;
             uint32_t role = 0;
+            /// Unix timestamp in microseconds at which this snapshot was sampled.
+            uint64_t sampledAtUs = 0;
+            /// Unix timestamp in microseconds of the latest runtime start attempt.
+            uint64_t runtimeStartedAtUs = 0;
+            std::array<uint8_t, 16> clusterId{};
+            uint32_t replicationMode = 0;
+            uint32_t consistencyMode = 0;
+            uint32_t transportMode = 0;
+            uint64_t clusterGroupId = 0;
+            uint64_t clusterGroupEpoch = 0;
+            /// Current process-local cluster state; failure history remains below after recovery.
+            ClusterHealthState health = ClusterHealthState::HEALTHY;
+            ClusterFailureCode lastFailure = ClusterFailureCode::NONE;
+            /// Unix timestamp in microseconds, or zero when no failure has been observed.
+            uint64_t lastFailureAtUs = 0;
             uint64_t configuredNodeCount = 0;
             uint64_t activeNodeCount = 0;
+            bool raftEnabled = false;
+            uint64_t raftTerm = 0;
+            uint64_t leaderNodeId = 0;
+            uint64_t commitIndex = 0;
+            uint64_t appliedIndex = 0;
+            uint64_t lastLogIndex = 0;
+            uint64_t snapshotIndex = 0;
+            uint64_t outboundConnectionsTotal = 0;
+            uint64_t peerWorkers = 0;
+            uint64_t proposalBatches = 0;
+            uint64_t proposalQueueDepth = 0;
+            uint64_t pendingProposals = 0;
+            uint64_t retainedRequestResults = 0;
+            uint64_t pendingRequests = 0;
+            uint64_t requestCapacity = 0;
+            uint64_t expiredRequestsTotal = 0;
+            uint64_t rejectedRequestsTotal = 0;
+            uint64_t requestJournalBytes = 0;
+            uint64_t requestJournalRecords = 0;
+            uint64_t requestJournalBytesWrittenTotal = 0;
+            uint64_t requestJournalCompactionsTotal = 0;
+            uint64_t peerPolicyMismatchRejectsTotal = 0;
+            uint64_t foreignClusterRejectsTotal = 0;
+            uint64_t leaseRenewFailuresTotal = 0;
+            uint64_t endpointStartFailuresTotal = 0;
+            uint64_t peerReadTimeoutsTotal = 0;
+            uint64_t replicationQueueFrames = 0;
+            uint64_t replicationQueueBytes = 0;
+            uint64_t transferMemoryBytes = 0;
+            uint64_t transferSpoolBytes = 0;
+            uint64_t activeTransfers = 0;
+            uint64_t transferResumeAttemptsTotal = 0;
+            uint64_t transferResumedTotal = 0;
+            uint64_t transferResumedBytesTotal = 0;
+            uint64_t transferDiscardedPartialsTotal = 0;
+            uint64_t transferRetainedPartials = 0;
+            std::vector<NodeStats> configuredNodes;
+            std::vector<PeerStats> peers;
         } cluster;
+
+        struct StripeReadRepairStats {
+            uint64_t attempts = 0;
+            uint64_t succeeded = 0;
+            uint64_t failed = 0;
+            uint64_t lastFailureNodeId = 0; ///< Zero until the first failure; no key or value is exposed.
+        } stripeReadRepair;
 
         struct VLogStats {
             bool enabled = false;

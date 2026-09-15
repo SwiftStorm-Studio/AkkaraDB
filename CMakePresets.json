@@ -92,6 +92,26 @@
       }
     },
     {
+      "name": "linux-sanitizers",
+      "displayName": "Linux Clang ASan + UBSan",
+      "binaryDir": "${sourceDir}/builds/linux-sanitizers",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "AKKARADB_BUILD_SHARED_LIBS": "OFF",
+        "AKKARADB_BUILD_TESTS": "ON",
+        "AKKARADB_BUILD_JNI": "OFF",
+        "AKKARADB_BUILD_API_SERVERS": "OFF",
+        "AKKARADB_ENABLE_SANITIZERS": "ON"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
       "name": "jni",
       "displayName": "JNI Release Artifact",
       "binaryDir": "${sourceDir}/builds/jni",
@@ -168,6 +188,20 @@
       "name": "release-jni",
       "configurePreset": "release-jni",
       "configuration": "Release"
+    },
+    {
+      "name": "linux-sanitizers",
+      "configurePreset": "linux-sanitizers",
+      "targets": [
+        "akkaradb_cluster_smoke_test"
+      ]
+    },
+    {
+      "name": "linux-sanitizer-soak",
+      "configurePreset": "linux-sanitizers",
+      "targets": [
+        "akkaradb_cluster_soak"
+      ]
     },
     {
       "name": "jni",

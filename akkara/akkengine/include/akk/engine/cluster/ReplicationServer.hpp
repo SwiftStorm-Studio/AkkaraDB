@@ -32,28 +32,45 @@
 #include <vector>
 
 namespace akkaradb::engine::cluster {
+    namespace detail { class TransferBudget; }
     /**
      * ReplicationServer - Primary-side replication fan-out server.
      *
      * The server listens on the primary replication port, accepts replica
      * handshakes, sends buffered entries newer than each replica's lastSeq,
      * streams new entries/blobs to current replication targets, and waits for entry
-     * acknowledgements according to AckPolicy.
+     * acknowledgements according to AckPolicy. Catch-up is streamed through the
+     * bounded outbound queue before the connection becomes a live target.
      *
      * Thread-safety: start(), close(), shipEntry(), shipBlob(), and
      * replicaCount() may be called concurrently.  close() is idempotent.
      */
     class AKKARADB_CLUSTER_RUNTIME_API ReplicationServer {
         public:
+            struct Stats {
+                struct Peer {
+                    uint64_t nodeId = 0;
+                    bool connected = false;
+                    uint64_t lastSuccessfulContactAtUs = 0;
+                };
+                uint64_t connectedReplicas = 0;
+                uint64_t queuedFrames = 0;
+                uint64_t queuedBytes = 0;
+                std::vector<Peer> peers;
+            };
             using HistoryProvider = std::function<std::optional<std::vector<ReplEntry>>(uint64_t afterSeq, uint64_t throughSeq)>;
 
             struct Snapshot {
+                using EntryVisitor = std::function<bool(std::span<const uint8_t> key, std::span<const uint8_t> value)>;
+
                 uint64_t seq = 0;
-                std::vector<ReplSnapshotEntry> entries;
+                uint64_t entryCount = 0;
+                std::function<bool(const EntryVisitor&)> forEachEntry;
             };
 
             using SnapshotProvider = std::function<std::optional<Snapshot>()>;
             using ReadCallback = std::function<ReadResponse(const ReadRequest&)>;
+            using StripeControlCallback = std::function<StripeControlResponse(uint64_t peerNodeId, const StripeControlRequest&)>;
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.
              *
@@ -87,7 +104,8 @@ namespace akkaradb::engine::cluster {
                 std::vector<uint64_t> configuredReplicaNodeIds = {},
                 ClusterRuntimeOptions runtimeOptions = {},
                 HistoryProvider historyProvider = {},
-                SnapshotProvider snapshotProvider = {}
+                SnapshotProvider snapshotProvider = {},
+                std::shared_ptr<detail::TransferBudget> transferBudget = {}
             );
 
             ~ReplicationServer();
@@ -105,6 +123,7 @@ namespace akkaradb::engine::cluster {
             /** Stops accepting, disconnects replicas, and joins worker threads. */
             void close();
             void setReadCallback(ReadCallback callback);
+            void setStripeControlCallback(StripeControlCallback callback);
 
             /**
              * Ships a replicated key/value entry to all current replication targets.
@@ -141,6 +160,7 @@ namespace akkaradb::engine::cluster {
 
             /** Returns the number of currently live replica connections. */
             [[nodiscard]] size_t replicaCount() const noexcept;
+            [[nodiscard]] Stats stats() const noexcept;
 
         private:
             class Impl;

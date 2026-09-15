@@ -16,6 +16,7 @@ option(AKKARADB_BUILD_API_HTTP "Build HTTP API transport backend" ON)
 option(AKKARADB_BUILD_API_TCP "Build TCP API transport backend" ON)
 option(AKKARADB_BUILD_API_GRPC "Build gRPC API transport backend" ON)
 option(AKKARADB_WARNINGS_AS_ERRORS "Treat AkkaraDB compiler warnings as errors" ON)
+option(AKKARADB_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer (Clang/GCC)" OFF)
 
 if (NOT IS_ABSOLUTE "${AKKARADB_REVISION_FILE}")
     get_filename_component(AKKARADB_REVISION_FILE "${AKKARADB_REVISION_FILE}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -143,6 +144,14 @@ endif ()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-c++26-extensions>)
+endif ()
+
+if (AKKARADB_ENABLE_SANITIZERS)
+    if (MSVC OR NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        message(FATAL_ERROR "AKKARADB_ENABLE_SANITIZERS requires non-MSVC Clang or GCC")
+    endif ()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
+    add_link_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
 endif ()
 
 # ==================== Windows-specific definitions ====================

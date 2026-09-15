@@ -128,6 +128,7 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_sstable_throughput_benchmark|benchmarks/throughput/sstable_throughput_benchmark.cpp
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
         akkaradb_bptree_mutable_concurrency_stress_test|benchmarks/smoke/bptree_mutable_concurrency_stress_test.cpp
+        akkaradb_cluster_observability_test|benchmarks/smoke/cluster_observability_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
         akkaradb_memtable_lifecycle_smoke_test|benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
         akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
@@ -180,6 +181,17 @@ add_custom_command(TARGET akkaradb_sstable_throughput_benchmark POST_BUILD
 )
 
 target_link_libraries(akkaradb_cluster_smoke_test PRIVATE akkaradb_cluster)
+target_link_libraries(akkaradb_cluster_observability_test PRIVATE akkaradb_cluster)
+add_custom_target(akkaradb_cluster_soak
+        COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --soak 0xA44A5EED 1
+        DEPENDS akkaradb_cluster_smoke_test
+        USES_TERMINAL
+        COMMENT "Running deterministic cluster crash/latency/disconnect/leader/snapshot/transfer soak"
+)
+if (WIN32)
+    target_link_libraries(akkaradb_cluster_smoke_test PRIVATE ws2_32)
+    target_link_libraries(akkaradb_cluster_observability_test PRIVATE ws2_32)
+endif ()
 
 if (WIN32 AND BUILD_SHARED_LIBS)
     add_custom_command(TARGET akkaradb_benchmark POST_BUILD
@@ -198,6 +210,7 @@ endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_bptree_mutable_concurrency_stress_test
+        akkaradb_cluster_observability_test
         akkaradb_cluster_smoke_test
         akkaradb_memtable_lifecycle_smoke_test
         akkaradb_parallel_memtable_visibility_smoke_test
@@ -244,4 +257,5 @@ if (AKKARADB_BUILD_TESTS)
             endforeach ()
         endif ()
     endforeach ()
+    set_tests_properties(akkaradb_cluster_observability_test PROPERTIES LABELS "cluster;observability" TIMEOUT 90)
 endif ()

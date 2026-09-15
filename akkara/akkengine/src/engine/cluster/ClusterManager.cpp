@@ -14,6 +14,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -24,6 +26,23 @@ namespace akkaradb::engine::cluster {
     namespace {
         constexpr uint64_t PRIMARY_LEASE_WINDOW_US = 30'000'000;
         constexpr auto PRIMARY_LEASE_RENEW_INTERVAL = std::chrono::seconds{10};
+
+        std::chrono::milliseconds primaryLeaseRenewInterval() noexcept {
+            const char* value = std::getenv("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS");
+            if (value == nullptr || *value == '\0') {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(PRIMARY_LEASE_RENEW_INTERVAL);
+            }
+            char* end = nullptr;
+            const auto parsed = std::strtoull(value, &end, 10);
+            return end != value && *end == '\0' && parsed > 0 && parsed <= 60'000
+                       ? std::chrono::milliseconds{parsed}
+                       : std::chrono::duration_cast<std::chrono::milliseconds>(PRIMARY_LEASE_RENEW_INTERVAL);
+        }
+
+        bool failPrimaryLeaseRenewalForTest() noexcept {
+            const char* value = std::getenv("AKKARADB_TEST_FAIL_LEASE_RENEWAL");
+            return value != nullptr && std::string_view{value} == "1";
+        }
 
         [[nodiscard]] uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -54,7 +73,14 @@ namespace akkaradb::engine::cluster {
             }
 
             void start() {
-                if (running_.exchange(true)) { return; }
+                if (running_.exchange(true)) {
+                    checkHealth();
+                    return;
+                }
+                {
+                    std::lock_guard lock{failureMutex_};
+                    backgroundFailure_ = nullptr;
+                }
                 try {
                     if (config_.isStandalone()) {
                         const auto* self = config_.findById(selfNodeId_);
@@ -85,6 +111,20 @@ namespace akkaradb::engine::cluster {
                 const bool wasRunning = running_.exchange(false);
                 stopLeaseRenewal();
                 if (wasRunning) { recordSelfLeave(); }
+            }
+
+            void checkHealth() const {
+                std::exception_ptr failure;
+                {
+                    std::lock_guard lock{failureMutex_};
+                    failure = backgroundFailure_;
+                }
+                if (!failure) { return; }
+                try { std::rethrow_exception(failure); }
+                catch (const std::exception& ex) {
+                    throw std::runtime_error(std::string{"ClusterManager: primary lease renewal failed: "} + ex.what());
+                }
+                catch (...) { throw std::runtime_error("ClusterManager: primary lease renewal failed"); }
             }
 
             NodeRole role() const noexcept { return role_.load(); }
@@ -264,18 +304,29 @@ namespace akkaradb::engine::cluster {
                 if (leaseRenewThread_.joinable()) { leaseRenewThread_.join(); }
             }
 
-            void leaseRenewLoop() {
-                std::unique_lock lock{leaseRenewMutex_};
-                while (!leaseRenewStopping_) {
-                    if (leaseRenewCv_.wait_for(lock, PRIMARY_LEASE_RENEW_INTERVAL, [this] { return leaseRenewStopping_; })) { break; }
-                    lock.unlock();
-                    renewPrimaryLease();
-                    lock.lock();
+            void leaseRenewLoop() noexcept {
+                try {
+                    std::unique_lock lock{leaseRenewMutex_};
+                    while (!leaseRenewStopping_) {
+                        if (leaseRenewCv_.wait_for(lock, primaryLeaseRenewInterval(), [this] { return leaseRenewStopping_; })) { break; }
+                        lock.unlock();
+                        renewPrimaryLease();
+                        lock.lock();
+                    }
+                }
+                catch (...) {
+                    {
+                        std::lock_guard lock{failureMutex_};
+                        backgroundFailure_ = std::current_exception();
+                    }
+                    running_.store(false, std::memory_order_release);
+                    try { setRole(NodeRole::REPLICA); } catch (...) {}
                 }
             }
 
             void renewPrimaryLease() {
                 if (!clusterManifest_ || !running_.load(std::memory_order_acquire) || role_.load() != NodeRole::PRIMARY) { return; }
+                if (failPrimaryLeaseRenewalForTest()) { throw std::runtime_error("injected lease renewal failure"); }
                 const uint64_t now = nowUs();
                 const auto lease = clusterManifest_->lastPrimaryLease();
                 if (lease.has_value() && lease->nodeId != selfNodeId_ && lease->leaseUntilUs > now && !manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) {
@@ -357,6 +408,9 @@ namespace akkaradb::engine::cluster {
             std::mutex callbackMutex_;
             RoleChangeCallback callback_;
 
+            mutable std::mutex failureMutex_;
+            std::exception_ptr backgroundFailure_;
+
             std::mutex leaseRenewMutex_;
             std::condition_variable leaseRenewCv_;
             bool leaseRenewStopping_ = false;
@@ -380,6 +434,7 @@ namespace akkaradb::engine::cluster {
     void ClusterManager::setRoleChangeCallback(RoleChangeCallback callback) { impl_->setRoleChangeCallback(std::move(callback)); }
     void ClusterManager::start() { impl_->start(); }
     void ClusterManager::close() { impl_->close(); }
+    void ClusterManager::checkHealth() const { impl_->checkHealth(); }
     NodeRole ClusterManager::role() const noexcept { return impl_->role(); }
     uint64_t ClusterManager::selfNodeId() const noexcept { return impl_->selfNodeId(); }
     std::string ClusterManager::primaryHost() const { return impl_->primaryHost(); }

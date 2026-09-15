@@ -528,6 +528,92 @@ namespace akkaradb::engine::memtable {
                 return makeIterator(range, snapshotSeqProvider(), std::move(scanLocks));
             }
 
+            [[nodiscard]] RangeIterator sealAndPinIterator(const KeyRange& range, uint64_t snapshotSeq) {
+                throwIfFlushFailed();
+                if (!flushPool_) { throw std::logic_error("MemTable: sealed snapshot requires an installed flush callback"); }
+
+                // Construct replacement backends outside the all-shard barrier.
+                // If a previously empty shard receives its first write before
+                // the barrier is acquired, retry only that shard.
+                std::vector<std::shared_ptr<IMemTable>> replacements(shards_.size());
+                std::vector<bool> needsReplacement(shards_.size(), false);
+                std::vector<std::unique_lock<std::shared_mutex>> locks;
+                locks.reserve(shards_.size());
+                std::vector<FlushPool::Item> flushItems;
+                flushItems.reserve(shards_.size());
+                std::vector<std::shared_ptr<const IMemTable>> sources;
+                while (true) {
+                    locks.clear();
+                    for (const auto& shard : shards_) { locks.emplace_back(shard->mutex); }
+
+                    std::fill(needsReplacement.begin(), needsReplacement.end(), false);
+                    bool retry = false;
+                    size_t sourceCount = shards_.size();
+                    for (size_t i = 0; i < shards_.size(); ++i) {
+                        const auto& shard = *shards_[i];
+                        const bool nonEmpty = shard.active->entryCount() != 0;
+                        if (nonEmpty && !replacements[i]) {
+                            needsReplacement[i] = true;
+                            retry = true;
+                        }
+                        sourceCount += shard.immutables.size() + static_cast<size_t>(nonEmpty);
+                    }
+                    if (sources.capacity() < sourceCount) { retry = true; }
+                    if (!retry) { break; }
+
+                    locks.clear();
+                    sources.reserve(sourceCount);
+                    for (size_t i = 0; i < shards_.size(); ++i) {
+                        if (!needsReplacement[i]) { continue; }
+                        auto replacement = makeBackend();
+                        if (!replacement) { throw std::invalid_argument("MemTable backend factory returned null"); }
+                        replacements[i] = std::shared_ptr<IMemTable>{std::move(replacement)};
+                    }
+                }
+
+                for (size_t i = 0; i < shards_.size(); ++i) {
+                    auto& shard = *shards_[i];
+                    if (replacements[i]) {
+                        shard.active->freeze();
+                        auto sealed = shard.active;
+                        const size_t sealedBytes = shard.activeBytes;
+                        const uint64_t immutableId = shard.nextImmutableId++;
+                        shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes});
+
+                        shard.active = std::move(replacements[i]);
+                        shard.activeRaw.store(shard.active.get(), std::memory_order_release);
+                        shard.activeBytes = shard.active->sizeBytes();
+                        const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                        shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
+                        publishTablesLocked(shard);
+                        flushItems.push_back(FlushPool::Item{static_cast<uint32_t>(i), immutableId, std::move(sealed)});
+                    }
+
+                    // Capture ownership while every shard is still locked.
+                    // A completed flush may later unpublish an immutable, but
+                    // this iterator keeps the exact table alive.
+                    if (shard.active) { sources.push_back(std::const_pointer_cast<const IMemTable>(shard.active)); }
+                    for (auto it = shard.immutables.rbegin(); it != shard.immutables.rend(); ++it) {
+                        if (it->table) { sources.push_back(std::const_pointer_cast<const IMemTable>(it->table)); }
+                    }
+                }
+
+                std::unique_ptr<RangeIterator::Impl> result;
+                try {
+                    result = std::make_unique<RangeIterator::Impl>(
+                        std::vector<std::shared_lock<std::shared_mutex>>{}, std::move(sources), range.start, range.end, snapshotSeq
+                    );
+                }
+                catch (...) {
+                    locks.clear();
+                    for (auto& item : flushItems) { flushPool_->enqueue(std::move(item)); }
+                    throw;
+                }
+                locks.clear();
+                for (auto& item : flushItems) { flushPool_->enqueue(std::move(item)); }
+                return RangeIterator{std::move(result)};
+            }
+
             [[nodiscard]] uint64_t nextSeq() noexcept { return seqGen_.fetch_add(1, std::memory_order_relaxed); }
 
             [[nodiscard]] uint64_t reserveSeq(uint64_t count) {
@@ -756,6 +842,10 @@ namespace akkaradb::engine::memtable {
 
     MemTable::RangeIterator MemTable::pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const {
         return impl_->pinnedIterator(range, snapshotSeqProvider);
+    }
+
+    MemTable::RangeIterator MemTable::sealAndPinIterator(const KeyRange& range, uint64_t snapshotSeq) {
+        return impl_->sealAndPinIterator(range, snapshotSeq);
     }
 
     uint64_t MemTable::nextSeq() noexcept { return impl_->nextSeq(); }

@@ -278,6 +278,11 @@ namespace akkaradb::engine {
             void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey);
             void putBatch(std::span<const BatchPutEntry> entries);
             void remove(std::span<const uint8_t> key);
+            [[nodiscard]] cluster::ClusterRequestId newRequestId(uint64_t retentionMs = 0) const;
+            cluster::ClusterRequestResult putWithRequest(const cluster::ClusterRequestId& id,
+                std::span<const uint8_t> key, std::span<const uint8_t> value);
+            cluster::ClusterRequestResult removeWithRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key);
+            [[nodiscard]] cluster::ClusterRequestResult queryRequest(const cluster::ClusterRequestId& id);
             void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey);
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> get(std::span<const uint8_t> key) const;

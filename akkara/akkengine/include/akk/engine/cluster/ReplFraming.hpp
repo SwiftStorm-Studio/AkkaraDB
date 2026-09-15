@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <span>
+#include <memory>
 #include <vector>
 
 #include "akk/engine/cluster/AkkClusterRuntimeExport.hpp"
@@ -37,10 +38,19 @@ namespace akkaradb::engine::cluster {
         SNAPSHOT_BEGIN = 0x14,
         SNAPSHOT_ENTRY = 0x15,
         SNAPSHOT_END = 0x16,
+        TRANSFER_BEGIN = 0x17,
+        TRANSFER_CHUNK = 0x18,
+        TRANSFER_END = 0x19,
+        TRANSFER_READY = 0x1A,
+        ///< Receiver's durable byte offset for a content-addressed transfer.
         READ_REQUEST = 0x20,
         ///< Reserved point-in-time read request.
         READ_RESPONSE = 0x21,
         ///< Reserved point-in-time read response.
+        STRIPE_CONTROL_REQUEST = 0x22,
+        ///< STRIPE authority lease/metadata commit request.
+        STRIPE_CONTROL_RESPONSE = 0x23,
+        ///< STRIPE authority lease/metadata commit response.
         RAFT_REQUEST_VOTE = 0x30,
         ///< Raft RequestVote RPC.
         RAFT_REQUEST_VOTE_RESPONSE = 0x31,
@@ -57,6 +67,10 @@ namespace akkaradb::engine::cluster {
         ///< Raft leadership transfer election trigger.
         RAFT_TIMEOUT_NOW_RESPONSE = 0x37,
         ///< Raft leadership transfer election trigger response.
+        RAFT_PEER_HELLO = 0x38,
+        ///< Raft transport contract sent before the first RPC on a connection.
+        RAFT_PEER_HELLO_RESPONSE = 0x39,
+        ///< Accepts or rejects the Raft transport contract.
     };
 
     /**
@@ -100,6 +114,7 @@ namespace akkaradb::engine::cluster {
         ReplMsgType type{};
         uint8_t flags = 0;
         std::vector<uint8_t> payload;
+        std::shared_ptr<void> memoryReservation; ///< Internal non-Raft receive-budget lease.
     };
 
     /** Replica-to-primary handshake payload. */
@@ -109,6 +124,28 @@ namespace akkaradb::engine::cluster {
         NodeRole role = NodeRole::REPLICA; ///< Expected to be NodeRole::REPLICA.
         uint64_t groupId = 0; ///< Non-Raft cluster group identity.
         uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
+    };
+
+    enum class StripeControlAction : uint8_t { ACQUIRE = 0, COMMIT = 1, RELEASE = 2, READ_METADATA = 3 };
+    enum class StripeControlStatus : uint8_t {
+        GRANTED = 0, COMMITTED = 1, RELEASED = 2, BUSY = 3, REJECTED = 4, ERROR_STATUS = 5, FOUND = 6, NOT_FOUND = 7,
+    };
+
+    struct StripeControlRequest {
+        uint64_t requestId = 0;
+        StripeControlAction action = StripeControlAction::ACQUIRE;
+        uint64_t ownerNodeId = 0;
+        uint64_t fenceToken = 0;
+        std::vector<uint8_t> key;
+        std::vector<uint8_t> metadata;
+    };
+
+    struct StripeControlResponse {
+        uint64_t requestId = 0;
+        StripeControlStatus status = StripeControlStatus::ERROR_STATUS;
+        uint64_t authorityNodeId = 0;
+        uint64_t fenceToken = 0;
+        std::vector<uint8_t> metadata;
     };
 
     /** Primary-to-replica handshake response payload. */
@@ -208,6 +245,8 @@ namespace akkaradb::engine::cluster {
 
     /** Encodes a ReadResponse frame. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeReadResponse(const ReadResponse& response);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeStripeControlRequest(const StripeControlRequest& request);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeStripeControlResponse(const StripeControlResponse& response);
 
     /** Decodes a ClientHello payload. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out);
@@ -232,4 +271,6 @@ namespace akkaradb::engine::cluster {
 
     /** Decodes a ReadResponse payload. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeReadResponse(std::span<const uint8_t> payload, ReadResponse& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeStripeControlRequest(std::span<const uint8_t> payload, StripeControlRequest& out);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeStripeControlResponse(std::span<const uint8_t> payload, StripeControlResponse& out);
 } // namespace akkaradb::engine::cluster

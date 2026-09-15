@@ -24,6 +24,20 @@
 #include <vector>
 
 namespace akkaradb::crypto {
+    std::array<uint8_t, 32> hash256(std::span<const std::span<const uint8_t>> parts) {
+        crypto_blake2b_ctx context;
+        crypto_blake2b_init(&context, 32);
+        for (const auto part : parts) {
+            std::array<uint8_t, 8> length{};
+            for (size_t i = 0; i < length.size(); ++i) { length[i] = static_cast<uint8_t>(static_cast<uint64_t>(part.size()) >> (i * 8)); }
+            crypto_blake2b_update(&context, length.data(), length.size());
+            crypto_blake2b_update(&context, part.data(), part.size());
+        }
+        std::array<uint8_t, 32> digest{};
+        crypto_blake2b_final(&context, digest.data());
+        return digest;
+    }
+
     namespace {
         constexpr std::string_view PROTOCOL_NAME = "AkkaraDB-NoiseStyle-X25519-XChaCha20Poly1305-BLAKE2b-v1";
         constexpr std::string_view SERVER_FINISHED = "server-finished";

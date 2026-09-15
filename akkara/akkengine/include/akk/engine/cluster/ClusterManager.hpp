@@ -78,6 +78,9 @@ namespace akkaradb::engine::cluster {
             /** Stops the manager. */
             void close();
 
+            /** Throws when a background lease-renewal failure has stopped this manager. */
+            void checkHealth() const;
+
             /** Returns the current local role. */
             [[nodiscard]] NodeRole role() const noexcept;
 

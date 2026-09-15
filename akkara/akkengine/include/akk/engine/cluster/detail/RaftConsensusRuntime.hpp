@@ -39,6 +39,7 @@ namespace akkaradb::engine::cluster {
 
             void start();
             void close();
+            [[nodiscard]] RaftRuntimeStats stats() const;
             [[nodiscard]] NodeRole role() const noexcept;
             [[nodiscard]] std::vector<NodeInfo> activeNodes() const;
             [[nodiscard]] const ClusterRouter& router() const noexcept;
@@ -53,8 +54,13 @@ namespace akkaradb::engine::cluster {
             );
 
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
+            std::future<void> submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
+                std::span<const uint8_t> value, uint8_t flags, uint64_t source);
 
             void linearizableReadBarrier();
+            std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
+                std::function<ClusterHistoryEntry()>);
+            ClusterRequestResult queryRequest(const ClusterRequestId&);
 
             void addVotingNode(const NodeInfo& node);
 

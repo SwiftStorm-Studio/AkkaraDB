@@ -93,6 +93,39 @@ namespace {
         require(callbackAttempts.load(std::memory_order_relaxed) == 1, "streaming flush callback must run exactly once");
     }
 
+    void testSealedSnapshotDoesNotBlockOrDriftWithConcurrentWrites() {
+        namespace memtable = akkaradb::engine::memtable;
+
+        memtable::MemTable::Options options;
+        options.shardCount = 1;
+        options.flushMode = memtable::MemTableFlushMode::MANUAL_ONLY;
+        options.backendOptions.maxVersionsPerKey = 2;
+        options.onFlush = [](std::span<const memtable::MemTable::RecordView>) {};
+
+        auto table = memtable::MemTable::create(options);
+        const std::vector<uint8_t> key{'s', 'n', 'a', 'p'};
+        const std::vector<uint8_t> original{'o', 'l', 'd'};
+        table->put(bytes(key), bytes(original), 1);
+
+        memtable::MemTable::KeyRange range;
+        auto snapshot = table->sealAndPinIterator(range, 1);
+        for (uint64_t seq = 2; seq <= 16; ++seq) {
+            const std::vector<uint8_t> current{
+                'n', 'e', 'w', static_cast<uint8_t>(seq)
+            };
+            table->put(bytes(key), bytes(current), seq);
+        }
+
+        require(snapshot.hasNext(), "sealed snapshot lost its original record");
+        const auto record = snapshot.next();
+        require(record.has_value(), "sealed snapshot returned no record");
+        require(std::vector<uint8_t>{record->key().begin(), record->key().end()} == key,
+                "sealed snapshot returned the wrong key");
+        require(std::vector<uint8_t>{record->value().begin(), record->value().end()} == original,
+                "sealed snapshot drifted to a concurrent update");
+        require(!snapshot.hasNext(), "sealed snapshot returned a duplicate record");
+    }
+
     [[nodiscard]] akkaradb::engine::AkkEngineOptions memoryOptions() {
         akkaradb::engine::AkkEngineOptions options;
         options.components.walEnabled = false;
@@ -351,6 +384,7 @@ int main() {
     try {
         testFlushFailurePropagation();
         testStreamingFlushCallback();
+        testSealedSnapshotDoesNotBlockOrDriftWithConcurrentWrites();
         testConcurrentOperationsAndClose();
         testCloseWaitsForActiveScan();
         testSstBackpressureFailFast();

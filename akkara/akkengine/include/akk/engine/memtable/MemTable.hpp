@@ -131,6 +131,10 @@ namespace akkaradb::engine::memtable {
             // Acquires all shard read locks before invoking snapshotSeqProvider.
             // The returned iterator retains those locks until it is destroyed.
             [[nodiscard]] RangeIterator pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const;
+            // Atomically rotates every non-empty active shard into an immutable
+            // table and returns an iterator that owns those fixed sources.
+            // Requires an installed flush callback.
+            [[nodiscard]] RangeIterator sealAndPinIterator(const KeyRange& range, uint64_t snapshotSeq);
 
             [[nodiscard]] uint64_t nextSeq() noexcept;
             [[nodiscard]] uint64_t reserveSeq(uint64_t count);

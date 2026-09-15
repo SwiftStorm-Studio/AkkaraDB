@@ -9,7 +9,9 @@
 
 // akkengine/src/engine/cluster/ClusterConfig.cpp
 #include "akk/engine/cluster/ClusterConfig.hpp"
+#include "akk/crypto/Random.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -31,13 +33,17 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        constexpr size_t HEADER_SIZE = 56;
+        constexpr size_t HEADER_SIZE = 72;
         constexpr size_t MAX_HOST_BYTES = 1024;
 
         uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count());
+        }
+
+        bool isZeroClusterId(const ClusterId& id) noexcept {
+            return std::all_of(id.begin(), id.end(), [](uint8_t value) { return value == 0; });
         }
 
         void writeU16(uint8_t* b, size_t off, uint16_t v) noexcept {
@@ -136,6 +142,8 @@ namespace akkaradb::engine::cluster {
         }
     } // namespace
 
+    ClusterConfig::ClusterConfig() { crypto::secureRandom(clusterId_); }
+
     ClusterConfig::ClusterConfig(
         std::vector<NodeInfo> nodes,
         ReplicationMode mode,
@@ -143,7 +151,8 @@ namespace akkaradb::engine::cluster {
         ConsistencyOptions consistency,
         RaftOptions raft,
         StripeOptions stripe,
-        uint64_t primaryNodeId
+        uint64_t primaryNodeId,
+        ClusterId clusterId
     )
         : nodes_{std::move(nodes)},
           mode_{mode},
@@ -151,7 +160,9 @@ namespace akkaradb::engine::cluster {
           consistency_{consistency},
           raft_{raft},
           stripe_{stripe},
-          primaryNodeId_{primaryNodeId} {
+          primaryNodeId_{primaryNodeId},
+          clusterId_{clusterId} {
+        if (isZeroClusterId(clusterId_)) { crypto::secureRandom(clusterId_); }
         if (mode_ == ReplicationMode::MIRROR && consistency_.mode != ConsistencyMode::RAFT_QUORUM && primaryNodeId_ == 0) {
             for (const auto& node : nodes_) {
                 if (node.coordinatorEligible() && node.dataBearing()) {
@@ -200,6 +211,8 @@ namespace akkaradb::engine::cluster {
         stripe.dataShards = bytes[40];
         stripe.parityShards = bytes[41];
         const uint64_t primaryNodeId = readU64(bytes.data(), 48);
+        ClusterId clusterId{};
+        std::copy_n(bytes.data() + 56, clusterId.size(), clusterId.begin());
 
         size_t cursor = HEADER_SIZE;
         std::vector<NodeInfo> nodes;
@@ -221,7 +234,7 @@ namespace akkaradb::engine::cluster {
         }
         if (cursor != bytes.size()) { throw std::runtime_error("ClusterConfig: trailing bytes"); }
 
-        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe, primaryNodeId};
+        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe, primaryNodeId, clusterId};
         cfg.flags_ = flags;
         cfg.validate();
         return cfg;
@@ -255,6 +268,7 @@ namespace akkaradb::engine::cluster {
         bytes[40] = config.stripe_.dataShards;
         bytes[41] = config.stripe_.parityShards;
         writeU64(bytes.data(), 48, config.primaryNodeId_);
+        std::copy(config.clusterId_.begin(), config.clusterId_.end(), bytes.begin() + 56);
 
         for (const auto& node : config.nodes_) {
             if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
@@ -300,9 +314,15 @@ namespace akkaradb::engine::cluster {
         return result;
     }
 
+    const NodeInfo* ClusterConfig::stripeFailoverNode() const noexcept {
+        for (const auto& node : nodes_) { if (node.stripeFailoverEligible()) { return &node; } }
+        return nullptr;
+    }
+
     bool ClusterConfig::isStandalone() const noexcept { return mode_ == ReplicationMode::STANDALONE || nodes_.size() <= 1; }
 
     void ClusterConfig::validate() const {
+        if (isZeroClusterId(clusterId_)) { throw std::invalid_argument("ClusterConfig: cluster id must be nonzero"); }
         if (nodes_.size() > UINT16_MAX) { throw std::invalid_argument("ClusterConfig: too many nodes"); }
         if (mode_ != ReplicationMode::STANDALONE && mode_ != ReplicationMode::MIRROR && mode_ != ReplicationMode::PARTITIONED && mode_ !=
             ReplicationMode::STRIPE) { throw std::invalid_argument("ClusterConfig: invalid replication mode"); }
@@ -352,16 +372,38 @@ namespace akkaradb::engine::cluster {
             throw std::invalid_argument("ClusterConfig: primaryNodeId is only valid for non-Raft MIRROR placement");
         }
         std::unordered_set<uint64_t> ids;
+        std::unordered_set<std::string> replicationEndpoints;
         bool hasDataNode = false;
         bool hasCoordinator = false;
         size_t dataNodeCount = 0;
+        size_t stripeFailoverCount = 0;
         for (const auto& node : nodes_) {
             if (node.nodeId == 0) { throw std::invalid_argument("ClusterConfig: nodeId 0 is reserved"); }
             if (!ids.insert(node.nodeId).second) { throw std::invalid_argument("ClusterConfig: duplicate nodeId"); }
             if (node.host.empty()) { throw std::invalid_argument("ClusterConfig: empty host"); }
             if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
-            if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING)) != 0) {
+            std::string endpointHost = node.host;
+            for (auto& ch : endpointHost) {
+                if (static_cast<unsigned char>(ch) <= 32 || static_cast<unsigned char>(ch) == 127) {
+                    throw std::invalid_argument("ClusterConfig: host contains whitespace or control characters");
+                }
+                if (ch >= 'A' && ch <= 'Z') { ch = static_cast<char>(ch + ('a' - 'A')); }
+            }
+            if (endpointHost.size() > 1 && endpointHost.back() == '.') { endpointHost.pop_back(); }
+            if ((mode_ != ReplicationMode::STANDALONE || consistency_.mode == ConsistencyMode::RAFT_QUORUM) && node.replPort == 0) {
+                throw std::invalid_argument("ClusterConfig: cluster replication port must be nonzero");
+            }
+            if (node.replPort != 0 && !replicationEndpoints.insert(endpointHost + ":" + std::to_string(node.replPort)).second) {
+                throw std::invalid_argument("ClusterConfig: duplicate replication endpoint");
+            }
+            if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING | STRIPE_FAILOVER_ELIGIBLE)) != 0) {
                 throw std::invalid_argument("ClusterConfig: unknown node capability");
+            }
+            if (node.stripeFailoverEligible()) {
+                ++stripeFailoverCount;
+                if (!node.dataBearing() || !node.coordinatorEligible()) {
+                    throw std::invalid_argument("ClusterConfig: STRIPE failover candidate must be coordinator-eligible and data-bearing");
+                }
             }
             if (node.dataBearing()) { ++dataNodeCount; }
             hasDataNode = hasDataNode || node.dataBearing();
@@ -372,6 +414,12 @@ namespace akkaradb::engine::cluster {
         }
         if (mode_ != ReplicationMode::STANDALONE && !hasCoordinator) {
             throw std::invalid_argument("ClusterConfig: cluster mode requires a coordinator-eligible node");
+        }
+        if (stripeFailoverCount > 1) {
+            throw std::invalid_argument("ClusterConfig: at most one STRIPE failover candidate may be configured");
+        }
+        if (stripeFailoverCount != 0 && mode_ != ReplicationMode::STRIPE) {
+            throw std::invalid_argument("ClusterConfig: STRIPE failover capability requires STRIPE placement");
         }
         if (fixedMirrorPrimary) {
             if (primaryNodeId_ == 0) { throw std::invalid_argument("ClusterConfig: non-Raft MIRROR requires one Primary"); }
@@ -388,6 +436,66 @@ namespace akkaradb::engine::cluster {
             if (dataNodeCount < stripe_.totalShards()) {
                 throw std::invalid_argument("ClusterConfig: stripe mode requires at least dataShards + parityShards data-bearing nodes");
             }
+            if (stripeFailoverCount == 1 && dataNodeCount <= stripe_.totalShards()) {
+                throw std::invalid_argument("ClusterConfig: STRIPE owner failover requires one spare data-bearing node");
+            }
         }
+    }
+    void ClusterSecureOptions::validatePins(std::span<const uint64_t> requiredPeerIds) const {
+        std::unordered_set<uint64_t> pinnedIds;
+        for (const auto& pin : pinnedPeers) {
+            if (pin.nodeId == 0 || !pinnedIds.insert(pin.nodeId).second) {
+                throw std::invalid_argument("ClusterConfig: peer pins require unique nonzero node ids");
+            }
+        }
+        for (const auto id : requiredPeerIds) {
+            if (!pinnedIds.contains(id)) {
+                throw std::invalid_argument("ClusterConfig: missing SECURE peer pin for node " + std::to_string(id));
+            }
+        }
+    }
+
+    void ReplicationTransferOptions::validate() const {
+        if (thresholdBytes == 0 || thresholdBytes > 64u * 1024 || chunkBytes == 0 || chunkBytes > 64u * 1024 - 8 ||
+            maxConcurrentTransfers == 0 || maxConcurrentTransfers > 1024 || maxMemoryBytes < 8u * 64u * 1024 || maxSpoolBytes == 0 ||
+            resumeRetentionMs == 0 || resumeRetentionMs > 7ull * 24 * 60 * 60 * 1000 || maxResumeTransfers == 0 ||
+            maxResumeTransfers > 65'536 || resumeHandshakeTimeoutMs == 0 || resumeHandshakeTimeoutMs > 300'000) {
+            throw std::invalid_argument("ClusterConfig: invalid replication transfer limits");
+        }
+    }
+
+    void ClusterConfig::validateRuntime(uint64_t selfNodeId, const ClusterRuntimeOptions& options) const {
+        validate();
+        options.transfer.validate();
+        if (options.transportMode != TransportMode::PLAIN && options.transportMode != TransportMode::SECURE) {
+            throw std::invalid_argument("ClusterConfig: invalid transport mode");
+        }
+        const bool raft = consistency_.mode == ConsistencyMode::RAFT_QUORUM;
+        if (options.requests.maxRetentionMs == 0 || options.requests.maxRetentionMs > 365ull * 24 * 60 * 60 * 1000 ||
+            options.requests.maxTrackedRequests == 0 || options.requests.maxTrackedRequests > 65'536) {
+            throw std::invalid_argument("ClusterConfig: invalid request retention or result capacity");
+        }
+        if (raft && (options.raftSnapshot.minLogEntries == 0 || options.raftSnapshot.minLogEntries > 1'000'000'000ull ||
+            options.raftSnapshot.minLogBytes == 0 || options.raftSnapshot.minLogBytes > 1024ull * 1024 * 1024 * 1024 ||
+            options.raftSnapshot.maxIntervalMs == 0 || options.raftSnapshot.maxIntervalMs > 7ull * 24 * 60 * 60 * 1000)) {
+            throw std::invalid_argument("ClusterConfig: invalid Raft snapshot policy");
+        }
+        if (options.requests.enabled && !raft) { throw std::invalid_argument("ClusterConfig: retry-safe requests require RAFT_QUORUM"); }
+        if ((mode_ == ReplicationMode::PARTITIONED || mode_ == ReplicationMode::STRIPE) && options.clusterGroupId == 0) {
+            throw std::invalid_argument("ClusterConfig: PARTITIONED and STRIPE require an explicit nonzero shared cluster group id");
+        }
+        if (!isStandalone() || raft) {
+            if (findById(selfNodeId) == nullptr) { throw std::invalid_argument("ClusterConfig: self node is not configured"); }
+        }
+        std::vector<uint64_t> required;
+        if (options.transportMode == TransportMode::SECURE && (!isStandalone() || raft)) {
+            for (const auto& peer : nodes_) {
+                if (peer.nodeId == selfNodeId || !peer.dataBearing()) { continue; }
+                if (!raft && mode_ == ReplicationMode::MIRROR && selfNodeId != primaryNodeId_ && peer.nodeId != primaryNodeId_) { continue; }
+                required.push_back(peer.nodeId);
+            }
+        }
+        // Extra pins are allowed so future Raft voters can be provisioned before joining.
+        options.secure.validatePins(required);
     }
 } // namespace akkaradb::engine::cluster

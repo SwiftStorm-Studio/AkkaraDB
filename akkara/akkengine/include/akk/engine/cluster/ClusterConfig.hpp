@@ -12,15 +12,19 @@
 
 #include "akkaradb/Export.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "akk/crypto/Identity.hpp"
 
 namespace akkaradb::engine::cluster {
+    using ClusterId = std::array<uint8_t, 16>;
+
     /**
      * ReplicationMode - Placement strategy for write/read routing.
      *
@@ -61,7 +65,8 @@ namespace akkaradb::engine::cluster {
      * TransportMode - Network transport used by replication links.
      */
     enum class TransportMode : uint8_t {
-        PLAIN = 0, SECURE = 1,
+        PLAIN = 0, ///< Intentionally unauthenticated; node ids and ACKs are trusted only in trusted networks/processes.
+        SECURE = 1,
     };
 
     /**
@@ -86,6 +91,8 @@ namespace akkaradb::engine::cluster {
         ///< Node may be selected as primary by ClusterManager.
         DATA_BEARING = 1u << 1,
         ///< Node can store key/value data and receive routed writes.
+        STRIPE_FAILOVER_ELIGIBLE = 1u << 2,
+        ///< Sole STRIPE node allowed to temporarily fence and replace an unavailable key owner.
     };
 
     /**
@@ -154,14 +161,14 @@ namespace akkaradb::engine::cluster {
 
     enum class StripeWriteCommitMode : uint8_t {
         ALL_SHARDS = 0,
-        ///< A stripe write commits only after every data and parity shard is placed.
+        ///< Commit owner metadata only after all data/parity shards are durably acknowledged.
     };
 
     enum class StripeReadCoordinatorMode : uint8_t {
         OWNER = 0,
         ///< Route stripe reads to the key owner, which gathers shards and repairs missing shards.
         LOCAL_COORDINATOR = 1,
-        ///< Let the caller gather shards after reading the latest owner metadata.
+        ///< Gather shards locally and revalidate the generation with the live owner before returning.
     };
 
     enum class RaftMembershipMode : uint8_t {
@@ -219,6 +226,9 @@ namespace akkaradb::engine::cluster {
 
         /** Returns true if this node participates in data placement. */
         [[nodiscard]] bool dataBearing() const noexcept { return (capabilities & DATA_BEARING) != 0; }
+
+        /** Returns true if this node may temporarily replace an unavailable STRIPE owner. */
+        [[nodiscard]] bool stripeFailoverEligible() const noexcept { return (capabilities & STRIPE_FAILOVER_ELIGIBLE) != 0; }
     };
 
     struct AKDB_API ClusterPeerPublicKeyPin {
@@ -233,19 +243,62 @@ namespace akkaradb::engine::cluster {
         std::filesystem::path identitySeedPath; ///< Persistent local identity seed; generated if missing.
         std::vector<ClusterPeerPublicKeyPin> pinnedPeers; ///< Required peer public-key pins by cluster node id when transportMode=SECURE.
         uint64_t expectedPrimaryNodeId = 0; ///< Client-side expected primary id, or 0 if unknown.
+        void validatePins(std::span<const uint64_t> requiredPeerIds = {}) const;
     };
 
-    /**
-     * ClusterRuntimeOptions - Runtime-only network options.
-     */
+    /** Immutable identity retained by the caller across retries of one mutation. */
+    struct ClusterRequestId {
+        std::array<uint8_t, 16> nonce{};
+        uint64_t expiresAtUnixMs = 0; ///< Immutable part of the request identity.
+        auto operator<=>(const ClusterRequestId&) const = default;
+    };
+
+    enum class ClusterRequestStatus : uint8_t { APPLIED, NOT_FOUND, PENDING, EXPIRED };
+
+    struct ClusterRequestResult {
+        ClusterRequestStatus status = ClusterRequestStatus::NOT_FOUND;
+        uint64_t sequence = 0;
+        uint64_t logIndex = 0;
+    };
+
+    struct RaftRequestOptions {
+        bool enabled = false;
+        uint64_t maxRetentionMs = 24ull * 60 * 60 * 1000;
+        uint32_t maxTrackedRequests = 4096;
+    };
+
+    /** Bounds Raft log growth without rebuilding a full database snapshot for ordinary writes. */
+    struct RaftSnapshotOptions {
+        uint64_t minLogEntries = 4096; ///< Compact after this many committed entries since the previous snapshot.
+        uint64_t minLogBytes = 64ull * 1024 * 1024; ///< Approximate committed Raft-log bytes that trigger compaction.
+        uint64_t maxIntervalMs = 5ull * 60 * 1000; ///< Maximum time between snapshots while committed entries remain uncompacted.
+    };
+
+    struct AKDB_API ReplicationTransferOptions {
+        void validate() const;
+        uint32_t thresholdBytes = 32u * 1024u; ///< Above this payload size, use bounded chunks and temporary-file staging.
+        uint32_t chunkBytes = 32u * 1024u;
+        uint32_t maxConcurrentTransfers = 8;
+        uint64_t maxMemoryBytes = 8ull * 1024 * 1024; ///< Transport heap reservations, not storage/cache or total process RSS.
+        uint64_t maxSpoolBytes = 1024ull * 1024 * 1024; ///< Queued and incoming temporary payloads combined.
+        std::filesystem::path spoolDirectory; ///< Empty selects the OS temporary directory.
+        bool resumeEnabled = true; ///< Persist incomplete incoming payloads and resume them after reconnect.
+        uint64_t resumeRetentionMs = 15ull * 60 * 1000; ///< Maximum age of an unclaimed partial payload.
+        uint32_t maxResumeTransfers = 64; ///< Maximum retained partial payload count per spool directory.
+        uint32_t resumeHandshakeTimeoutMs = 5'000; ///< Maximum wait for the receiver's durable resume offset.
+    };
+
+    /** Runtime-only cluster policy and network options. */
     struct AKDB_API ClusterRuntimeOptions {
+        ReplicationTransferOptions transfer;
+        RaftRequestOptions requests;
         TransportMode transportMode = TransportMode::SECURE;
         std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
         NodeStartupRole startupRole = NodeStartupRole::AUTO; ///< Explicit startup role used for non-standalone modes.
         std::string primaryHost; ///< Replica-side configured primary host override.
         uint16_t primaryReplPort = 0; ///< Replica-side configured primary replication port override.
         uint64_t primaryNodeId = 0; ///< Replica-side configured primary node id override.
-        uint64_t clusterGroupId = 0; ///< Non-Raft group instance id; primary generates and persists one when zero.
+        uint64_t clusterGroupId = 0; ///< Non-Raft group id; PARTITIONED and STRIPE require the same explicit nonzero value on every node.
         uint64_t clusterGroupEpoch = 0; ///< Non-Raft group epoch; primary defaults zero to epoch 1.
         std::filesystem::path clusterMembershipPath; ///< Persisted non-Raft group state for primary, membership for replica.
         bool resetClusterMembership = false; ///< Allows a replica to intentionally join a different non-Raft group.
@@ -257,9 +310,10 @@ namespace akkaradb::engine::cluster {
         StripeWriteCommitMode stripeWriteCommitMode = StripeWriteCommitMode::ALL_SHARDS;
         StripeReadCoordinatorMode stripeReadCoordinatorMode = StripeReadCoordinatorMode::OWNER;
         bool stripeReadRepair = true;
-        uint32_t maxReplicaQueueFrames = 16u * 1024u; ///< Per-replica outbound frame queue limit; 0 disables the frame-count limit.
-        uint64_t maxReplicaQueueBytes = 256ull * 1024ull * 1024ull; ///< Per-replica outbound queued wire bytes; 0 disables the byte limit.
+        uint32_t maxReplicaQueueFrames = 16u * 1024u; ///< Per-replica live/bootstrap outbound frame queue limit; 0 disables it.
+        uint64_t maxReplicaQueueBytes = 256ull * 1024ull * 1024ull; ///< Per-replica live/bootstrap queued wire bytes; 0 disables it.
         ClusterSecureOptions secure;
+        RaftSnapshotOptions raftSnapshot;
     };
 
     /**
@@ -273,9 +327,9 @@ namespace akkaradb::engine::cluster {
     class AKDB_API ClusterConfig {
         public:
             static constexpr uint32_t MAGIC = 0x35434B41; // "AKC5"
-            static constexpr uint16_t VERSION = 4;
+            static constexpr uint16_t VERSION = 5;
 
-            ClusterConfig() = default;
+            ClusterConfig();
 
             /**
              * Creates a config and validates it immediately.
@@ -290,7 +344,8 @@ namespace akkaradb::engine::cluster {
                 ConsistencyOptions consistency = {},
                 RaftOptions raft = {},
                 StripeOptions stripe = {},
-                uint64_t primaryNodeId = 0
+                uint64_t primaryNodeId = 0,
+                ClusterId clusterId = {}
             );
 
             /**
@@ -331,6 +386,9 @@ namespace akkaradb::engine::cluster {
             /** Returns the single configured Primary for non-Raft MIRROR, or zero for other modes. */
             [[nodiscard]] uint64_t primaryNodeId() const noexcept { return primaryNodeId_; }
 
+            /** Returns the persistent identity shared by every node using this config. */
+            [[nodiscard]] const ClusterId& clusterId() const noexcept { return clusterId_; }
+
             /** Returns reserved config flags from the file header. */
             [[nodiscard]] uint16_t flags() const noexcept { return flags_; }
 
@@ -343,6 +401,9 @@ namespace akkaradb::engine::cluster {
             /** Returns nodes with NodeCapability::COORDINATOR_ELIGIBLE set. */
             [[nodiscard]] std::vector<NodeInfo> coordinatorNodes() const;
 
+            /** Returns the sole configured STRIPE failover candidate, or nullptr when disabled. */
+            [[nodiscard]] const NodeInfo* stripeFailoverNode() const noexcept;
+
             /** Returns true when the config should run without replication. */
             [[nodiscard]] bool isStandalone() const noexcept;
 
@@ -354,6 +415,7 @@ namespace akkaradb::engine::cluster {
              *         capabilities, or missing required node classes.
              */
             void validate() const;
+            void validateRuntime(uint64_t selfNodeId, const ClusterRuntimeOptions& options) const;
 
         private:
             std::vector<NodeInfo> nodes_;
@@ -363,6 +425,7 @@ namespace akkaradb::engine::cluster {
             RaftOptions raft_{};
             StripeOptions stripe_{};
             uint64_t primaryNodeId_ = 0;
+            ClusterId clusterId_{};
             uint16_t flags_ = 0;
     };
 } // namespace akkaradb::engine::cluster

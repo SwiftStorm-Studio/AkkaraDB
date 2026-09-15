@@ -9,6 +9,7 @@
 
 // akkengine/src/engine/cluster/ReplicationClient.cpp
 #include "akk/engine/cluster/ReplicationClient.hpp"
+#include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
@@ -46,6 +47,11 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
+        uint64_t contactNowUs() noexcept {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        }
+
         #ifdef _WIN32
         using SocketHandle = SOCKET;
         constexpr SocketHandle INVALID_SOCKET_HANDLE = INVALID_SOCKET;
@@ -169,13 +175,15 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool recvFrame(SocketHandle s, DecodedFrame& out) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget) {
             uint8_t header[ReplFrameHeader::SIZE];
             if (!recvAll(s, header, sizeof(header))) { return false; }
 
             const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(
                 header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
-            if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
+            if (payloadLen > detail::TRANSFER_FRAME_LIMIT) { return false; }
+            auto wireMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, ReplFrameHeader::SIZE + payloadLen);
+            out.memoryReservation = budget->reserve(detail::TransferBudget::Resource::MEMORY, payloadLen);
 
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
@@ -192,7 +200,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_PAYLOAD_SIZE;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + detail::TRANSFER_FRAME_LIMIT;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept {
             for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -258,8 +266,10 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool sendSecureFrame(SocketHandle socket, crypto::SecureSession& session, const uint8_t* data, size_t size) {
+        bool sendSecureFrame(SocketHandle socket, crypto::SecureSession& session, const uint8_t* data, size_t size,
+            const std::shared_ptr<detail::TransferBudget>& budget) {
             if (size > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
+            auto encryptedMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, size);
             const auto encrypted = session.seal(std::span<const uint8_t>{data, size});
             if (encrypted.ciphertext.size() > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
 
@@ -278,7 +288,7 @@ namespace akkaradb::engine::cluster {
             ));
         }
 
-        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out) {
+        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget) {
             std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
             if (!recvAll(socket, header.data(), header.size())) { return false; }
             if (readU32Le(header.data()) != SECURE_FRAME_MAGIC || header[4] != SECURE_VERSION) { return false; }
@@ -288,6 +298,9 @@ namespace akkaradb::engine::cluster {
             const uint32_t ciphertextSize = readU32Le(header.data() + 14);
             if (ciphertextSize > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
             std::memcpy(encrypted.tag.data(), header.data() + 18, encrypted.tag.size());
+            auto decryptMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, 2ull * ciphertextSize);
+            out.memoryReservation = budget->reserve(detail::TransferBudget::Resource::MEMORY,
+                ciphertextSize > ReplFrameHeader::SIZE ? ciphertextSize - ReplFrameHeader::SIZE : 0);
             encrypted.ciphertext.resize(ciphertextSize);
             if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize)) { return false; }
 
@@ -520,7 +533,10 @@ namespace akkaradb::engine::cluster {
                 uint64_t selfNodeId,
                 std::function<uint64_t()> getLastSeq,
                 AckPolicy ackPolicy,
-                ClusterRuntimeOptions runtimeOptions
+                ClusterRuntimeOptions runtimeOptions,
+                bool targetedEntries,
+                std::shared_ptr<detail::TransferBudget> transferBudget,
+                bool allowSequenceGaps
             )
                 : primaryHost_{std::move(primaryHost)},
                   primaryReplPort_{primaryReplPort},
@@ -530,7 +546,11 @@ namespace akkaradb::engine::cluster {
                   runtimeOptions_{std::move(runtimeOptions)},
                   localIdentity_{
                       runtimeOptions_.transportMode == TransportMode::SECURE ? loadSecureIdentity(runtimeOptions_) : crypto::NodeIdentity{}
-                  } {}
+                  },
+                  targetedEntries_{targetedEntries}, allowSequenceGaps_{allowSequenceGaps},
+                  transferBudget_{std::move(transferBudget)} {
+                transferSession_->setScope(runtimeOptions_.clusterGroupId, selfNodeId_, runtimeOptions_.secure.expectedPrimaryNodeId);
+            }
 
             ~Impl() { close(); }
 
@@ -573,6 +593,7 @@ namespace akkaradb::engine::cluster {
 
             void close() {
                 running_ = false;
+                transferSession_->cancel();
                 {
                     std::lock_guard lock{socketMutex_};
                     shutdownSocket(socket_);
@@ -582,29 +603,35 @@ namespace akkaradb::engine::cluster {
                 if (worker_.joinable()) { worker_.join(); }
                 connected_ = false;
                 failPendingRead();
+                failPendingStripeControl();
             }
 
             bool connected() const noexcept { return connected_; }
+            uint64_t lastSuccessfulContactAtUs() const noexcept { return lastSuccessfulContactAtUs_.load(std::memory_order_relaxed); }
 
             ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
+                std::lock_guard admission{readAdmissionMutex_};
                 std::unique_lock readLock{readMutex_};
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+                // A caller timeout does not cancel the wire request. Drain its
+                // response before admitting another, without blocking write ACKs.
+                while (pendingReadRequestId_ != 0) {
+                    if (readCv_.wait_until(readLock, deadline) == std::cv_status::timeout && pendingReadRequestId_ != 0) {
+                        throw std::runtime_error("ReplicationClient: previous owner read is still pending");
+                    }
+                }
                 const uint64_t requestId = nextReadRequestId_++;
+                const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_);
                 pendingReadRequestId_ = requestId;
                 pendingReadResponse_.reset();
                 pendingReadFailed_ = false;
-
-                ReadRequest request;
-                request.requestId = requestId;
-                request.snapshotSeq = snapshotSeq;
-                request.key.assign(key.begin(), key.end());
-                const auto wire = encodeReadRequest(request);
+                pendingReadAbandoned_ = false;
 
                 bool sent = false;
                 {
-                    std::lock_guard sendLock{sendMutex_};
                     std::lock_guard socketLock{socketMutex_};
                     if (connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
-                        sent = sendTo(socket_, activeSecure_, wire.data(), wire.size());
+                        sent = sendTo(socket_, activeSecure_, *message);
                     }
                 }
                 if (!sent) {
@@ -612,13 +639,15 @@ namespace akkaradb::engine::cluster {
                     throw std::runtime_error("ReplicationClient: owner read request send failed");
                 }
 
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
                 while (!pendingReadResponse_.has_value() && !pendingReadFailed_) {
                     if (readCv_.wait_until(readLock, deadline) == std::cv_status::timeout) { break; }
                 }
                 if (!pendingReadResponse_.has_value()) {
-                    pendingReadRequestId_ = 0;
-                    if (pendingReadFailed_) { throw std::runtime_error("ReplicationClient: owner read connection closed"); }
+                    if (pendingReadFailed_) {
+                        pendingReadRequestId_ = 0;
+                        throw std::runtime_error("ReplicationClient: owner read connection closed");
+                    }
+                    pendingReadAbandoned_ = true;
                     throw std::runtime_error("ReplicationClient: owner read request timeout");
                 }
                 ReadResponse response = std::move(*pendingReadResponse_);
@@ -627,11 +656,52 @@ namespace akkaradb::engine::cluster {
                 return response;
             }
 
+            StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs) {
+                std::lock_guard admission{stripeControlAdmissionMutex_};
+                std::unique_lock lock{stripeControlMutex_};
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+                while (pendingStripeControlRequestId_ != 0) {
+                    if (stripeControlCv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                        throw std::runtime_error("ReplicationClient: previous STRIPE control request is still pending");
+                    }
+                }
+                request.requestId = nextStripeControlRequestId_++;
+                pendingStripeControlRequestId_ = request.requestId;
+                pendingStripeControlResponse_.reset();
+                pendingStripeControlFailed_ = false;
+                const auto wire = encodeStripeControlRequest(request);
+                bool sent = false;
+                {
+                    std::lock_guard socketLock{socketMutex_};
+                    if (connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
+                        sent = sendTo(socket_, activeSecure_, wire.data(), wire.size());
+                    }
+                }
+                if (!sent) {
+                    pendingStripeControlRequestId_ = 0;
+                    throw std::runtime_error("ReplicationClient: STRIPE control request send failed");
+                }
+                while (!pendingStripeControlResponse_ && !pendingStripeControlFailed_) {
+                    if (stripeControlCv_.wait_until(lock, deadline) == std::cv_status::timeout) { break; }
+                }
+                if (!pendingStripeControlResponse_) {
+                    pendingStripeControlRequestId_ = 0;
+                    throw std::runtime_error(pendingStripeControlFailed_
+                        ? "ReplicationClient: STRIPE control connection closed"
+                        : "ReplicationClient: STRIPE control request timeout");
+                }
+                auto response = *pendingStripeControlResponse_;
+                pendingStripeControlResponse_.reset();
+                pendingStripeControlRequestId_ = 0;
+                return response;
+            }
+
         private:
             void completePendingRead(ReadResponse response) {
                 std::lock_guard lock{readMutex_};
                 if (response.requestId == pendingReadRequestId_) {
-                    pendingReadResponse_ = std::move(response);
+                    if (pendingReadAbandoned_) { pendingReadRequestId_ = 0; }
+                    else { pendingReadResponse_ = std::move(response); }
                     readCv_.notify_all();
                 }
             }
@@ -639,7 +709,23 @@ namespace akkaradb::engine::cluster {
             void failPendingRead() {
                 std::lock_guard lock{readMutex_};
                 pendingReadFailed_ = true;
+                if (pendingReadAbandoned_) { pendingReadRequestId_ = 0; }
                 readCv_.notify_all();
+            }
+
+            void completePendingStripeControl(StripeControlResponse response) {
+                std::lock_guard lock{stripeControlMutex_};
+                if (response.requestId == pendingStripeControlRequestId_) {
+                    pendingStripeControlResponse_ = response;
+                    stripeControlCv_.notify_all();
+                }
+            }
+
+            void failPendingStripeControl() {
+                std::lock_guard lock{stripeControlMutex_};
+                pendingStripeControlFailed_ = true;
+                pendingStripeControlRequestId_ = 0;
+                stripeControlCv_.notify_all();
             }
 
             void run() {
@@ -658,6 +744,7 @@ namespace akkaradb::engine::cluster {
                         std::lock_guard lock{socketMutex_};
                         socket_ = socket;
                     }
+                    transferSession_->reset();
 
                     if (runtimeOptions_.transportMode == TransportMode::SECURE) {
                         try {
@@ -674,17 +761,26 @@ namespace akkaradb::engine::cluster {
                         }
                     }
 
-                    if (handshake(socket, secure.get(), secureRemotePublicKey)) {
-                        {
-                            std::lock_guard lock{socketMutex_};
-                            if (socket_ == socket) { activeSecure_ = secure.get(); }
+                    try {
+                        if (handshake(socket, secure.get(), secureRemotePublicKey)) {
+                            {
+                                std::lock_guard lock{socketMutex_};
+                                if (socket_ == socket) { activeSecure_ = secure.get(); }
+                            }
+                            connected_ = true;
+                            lastSuccessfulContactAtUs_.store(contactNowUs(), std::memory_order_relaxed);
+                            receiveLoop(socket, secure.get());
                         }
-                        connected_ = true;
-                        receiveLoop(socket, secure.get());
+                    }
+                    catch (...) {
+                        // Framing/resource/apply failures abort this connection.
+                        // No completion ACK is sent; reconnect uses durable progress.
                     }
 
                     connected_ = false;
+                    transferSession_->cancel();
                     failPendingRead();
+                    failPendingStripeControl();
                     {
                         std::lock_guard lock{socketMutex_};
                         if (socket_ == socket) {
@@ -755,27 +851,47 @@ namespace akkaradb::engine::cluster {
                     saveMembership(runtimeOptions_.clusterMembershipPath, incoming);
                 }
                 catch (...) { return false; }
+                transferSession_->setScope(serverHello.groupId, selfNodeId_, serverHello.nodeId);
                 return true;
             }
 
-            static bool sendTo(SocketHandle socket, crypto::SecureSession* secure, const uint8_t* data, size_t size) {
+            bool sendTo(SocketHandle socket, crypto::SecureSession* secure, const detail::TransferMessage& message) {
+                std::lock_guard messageLock{messageMutex_};
                 try {
-                    if (secure != nullptr) { return sendSecureFrame(socket, *secure, data, size); }
-                    return sendAll(socket, data, size);
+                    return detail::sendMessage(message, transferBudget_, transferSession_, [&](std::span<const uint8_t> wire) {
+                        return sendFrame(socket, secure, wire);
+                    });
                 }
                 catch (...) { return false; }
             }
 
-            static bool recvFrameFrom(SocketHandle socket, crypto::SecureSession* secure, DecodedFrame& frame) {
-                if (secure != nullptr) { return recvSecureFrame(socket, *secure, frame); }
-                return recvFrame(socket, frame);
+            bool sendFrame(SocketHandle socket, crypto::SecureSession* secure, std::span<const uint8_t> wire) {
+                std::lock_guard lock{sendMutex_};
+                try {
+                    return secure ? sendSecureFrame(socket, *secure, wire.data(), wire.size(), transferBudget_) :
+                           sendAll(socket, wire.data(), wire.size());
+                }
+                catch (...) { return false; }
+            }
+
+            bool sendTo(SocketHandle socket, crypto::SecureSession* secure, const uint8_t* data, size_t size) {
+                try {
+                    const auto message = detail::messageFromWire(std::vector<uint8_t>{data, data + size}, transferBudget_);
+                    return sendTo(socket, secure, *message);
+                }
+                catch (...) { return false; }
+            }
+
+            bool recvFrameFrom(SocketHandle socket, crypto::SecureSession* secure, DecodedFrame& frame) {
+                if (secure != nullptr) { return recvSecureFrame(socket, *secure, frame, transferBudget_); }
+                return recvFrame(socket, frame, transferBudget_);
             }
 
             bool sendAck(SocketHandle socket, crypto::SecureSession* secure, uint64_t seq, AckStage stage) {
                 if (ackPolicy_.mode == AckPolicyMode::NONE || ackPolicy_.stage != stage) { return true; }
                 const auto ack = encodeAck(ReplAck{.seq = seq, .stage = stage});
-                std::lock_guard lock{sendMutex_};
-                return sendTo(socket, secure, ack.data(), ack.size());
+                auto memory = transferBudget_->reserve(detail::TransferBudget::Resource::MEMORY, ack.size());
+                return sendFrame(socket, secure, ack);
             }
 
             void receiveLoop(SocketHandle socket, crypto::SecureSession* secure) {
@@ -783,18 +899,22 @@ namespace akkaradb::engine::cluster {
                 bool receivingSnapshot = false;
                 uint64_t snapshotSeq = 0;
                 while (running_) {
-                    DecodedFrame frame;
-                    if (!recvFrameFrom(socket, secure, frame)) { return; }
+                    const auto message = detail::receiveMessage(transferBudget_, transferSession_,
+                        [&](DecodedFrame& part) { return recvFrameFrom(socket, secure, part); },
+                        [&](std::span<const uint8_t> wire) { return sendFrame(socket, secure, wire); });
+                    if (!message) { return; }
+                    const auto& frame = *message;
+                    lastSuccessfulContactAtUs_.store(contactNowUs(), std::memory_order_relaxed);
 
                     if (frame.type == ReplMsgType::ENTRY) {
-                        ReplEntry entry;
-                        if (!decodeEntry(frame.payload, entry)) { return; }
+                        detail::EntryView entry;
+                        if (!detail::entryView(frame.payload, entry)) { return; }
                         if (receivingSnapshot) { return; }
-                        if (entry.seq < expectedSeq) {
-                            if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
+                        if (!targetedEntries_ && entry.seq < expectedSeq) {
+                            if (!sendAck(socket, secure, entry.seq, ackPolicy_.stage)) { return; }
                             continue;
                         }
-                        if (entry.seq != expectedSeq) { return; }
+                        if (!targetedEntries_ && !allowSequenceGaps_ && entry.seq != expectedSeq) { return; }
                         ApplyCallback applyCallback;
                         std::function<void()> forceDurableCallback;
                         {
@@ -806,7 +926,10 @@ namespace akkaradb::engine::cluster {
                         if (applyCallback) {
                             applyCallback(entry.seq, entry.op, entry.key, entry.value, entry.recordFlags, entry.sourceNodeId);
                         }
-                        ++expectedSeq;
+                        if (!targetedEntries_) {
+                            if (entry.seq == UINT64_MAX) { return; }
+                            expectedSeq = entry.seq + 1;
+                        }
                         if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
                         if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
                             if (forceDurableCallback) { forceDurableCallback(); }
@@ -814,8 +937,12 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     else if (frame.type == ReplMsgType::BLOB_PUT) {
-                        ReplBlob blob;
-                        if (!decodeBlob(frame.payload, blob)) { return; }
+                        if (frame.payload.size() < 24) { return; }
+                        const auto blobSeq = readU64Le(frame.payload.data());
+                        const auto blobId = readU64Le(frame.payload.data() + 8);
+                        const auto size = readU64Le(frame.payload.data() + 16);
+                        if (size != frame.payload.size() - 24) { return; }
+                        const auto content = frame.payload.subspan(24);
                         BlobBeginCallback beginCallback;
                         BlobChunkCallback chunkCallback;
                         BlobEndCallback endCallback;
@@ -827,12 +954,16 @@ namespace akkaradb::engine::cluster {
                         }
                         if (beginCallback && chunkCallback && endCallback) {
                             const uint32_t contentCrc32c = cpu::CRC32C(
-                                reinterpret_cast<const std::byte*>(blob.content.data()),
-                                blob.content.size()
+                                reinterpret_cast<const std::byte*>(content.data()),
+                                content.size()
                             );
-                            beginCallback(blob.seq, blob.blobId, static_cast<uint64_t>(blob.content.size()), contentCrc32c);
-                            chunkCallback(blob.seq, blob.blobId, 0, blob.content);
-                            endCallback(blob.seq, blob.blobId);
+                            beginCallback(blobSeq, blobId, static_cast<uint64_t>(content.size()), contentCrc32c);
+                            for (size_t offset = 0; offset < content.size();) {
+                                const auto count = std::min<size_t>(runtimeOptions_.transfer.chunkBytes, content.size() - offset);
+                                chunkCallback(blobSeq, blobId, offset, content.subspan(offset, count));
+                                offset += count;
+                            }
+                            endCallback(blobSeq, blobId);
                         }
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_BEGIN) {
@@ -849,8 +980,8 @@ namespace akkaradb::engine::cluster {
                         snapshotSeq = begin.snapshotSeq;
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_ENTRY) {
-                        ReplSnapshotEntry entry;
-                        if (!receivingSnapshot || !decodeSnapshotEntry(frame.payload, entry)) { return; }
+                        detail::EntryView entry;
+                        if (!receivingSnapshot || !detail::snapshotView(frame.payload, entry.key, entry.value)) { return; }
                         SnapshotEntryBeginCallback beginCallback;
                         SnapshotEntryChunkCallback chunkCallback;
                         SnapshotEntryEndCallback endCallback;
@@ -866,7 +997,11 @@ namespace akkaradb::engine::cluster {
                             entry.value.size()
                         );
                         beginCallback(entry.key, static_cast<uint64_t>(entry.value.size()), valueCrc32c);
-                        chunkCallback(0, entry.value);
+                        for (size_t offset = 0; offset < entry.value.size();) {
+                            const auto count = std::min<size_t>(runtimeOptions_.transfer.chunkBytes, entry.value.size() - offset);
+                            chunkCallback(offset, entry.value.subspan(offset, count));
+                            offset += count;
+                        }
                         endCallback();
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_END) {
@@ -888,6 +1023,11 @@ namespace akkaradb::engine::cluster {
                         if (!decodeReadResponse(frame.payload, response)) { return; }
                         completePendingRead(std::move(response));
                     }
+                    else if (frame.type == ReplMsgType::STRIPE_CONTROL_RESPONSE) {
+                        StripeControlResponse response;
+                        if (!decodeStripeControlResponse(frame.payload, response)) { return; }
+                        completePendingStripeControl(response);
+                    }
                     else { return; }
                 }
             }
@@ -902,19 +1042,35 @@ namespace akkaradb::engine::cluster {
 
             std::atomic<bool> running_{false};
             std::atomic<bool> connected_{false};
+            std::atomic<uint64_t> lastSuccessfulContactAtUs_{0};
             std::thread worker_;
 
             mutable std::mutex socketMutex_;
+            const bool targetedEntries_;
+            const bool allowSequenceGaps_;
+            std::shared_ptr<detail::TransferBudget> transferBudget_;
             SocketHandle socket_ = INVALID_SOCKET_HANDLE;
             crypto::SecureSession* activeSecure_ = nullptr;
+            std::mutex messageMutex_;
             std::mutex sendMutex_;
+            std::shared_ptr<detail::TransferSession> transferSession_ = std::make_shared<detail::TransferSession>();
 
+            std::mutex readAdmissionMutex_;
             mutable std::mutex readMutex_;
+            bool pendingReadAbandoned_ = false;
             std::condition_variable readCv_;
             uint64_t nextReadRequestId_ = 1;
             uint64_t pendingReadRequestId_ = 0;
             std::optional<ReadResponse> pendingReadResponse_;
             bool pendingReadFailed_ = false;
+
+            std::mutex stripeControlAdmissionMutex_;
+            mutable std::mutex stripeControlMutex_;
+            std::condition_variable stripeControlCv_;
+            uint64_t nextStripeControlRequestId_ = 1;
+            uint64_t pendingStripeControlRequestId_ = 0;
+            std::optional<StripeControlResponse> pendingStripeControlResponse_;
+            bool pendingStripeControlFailed_ = false;
 
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;
@@ -935,8 +1091,39 @@ namespace akkaradb::engine::cluster {
         uint64_t selfNodeId,
         std::function<uint64_t()> getLastSeq,
         AckPolicy ackPolicy,
-        ClusterRuntimeOptions runtimeOptions
+        ClusterRuntimeOptions runtimeOptions,
+        bool targetedEntries,
+        std::shared_ptr<detail::TransferBudget> transferBudget
     ) {
+        return create(
+            std::move(primaryHost), primaryReplPort, selfNodeId, std::move(getLastSeq), ackPolicy,
+            std::move(runtimeOptions), targetedEntries, std::move(transferBudget), false
+        );
+    }
+
+    std::unique_ptr<ReplicationClient> ReplicationClient::create(
+        std::string primaryHost,
+        uint16_t primaryReplPort,
+        uint64_t selfNodeId,
+        std::function<uint64_t()> getLastSeq,
+        AckPolicy ackPolicy,
+        ClusterRuntimeOptions runtimeOptions,
+        bool targetedEntries,
+        std::shared_ptr<detail::TransferBudget> transferBudget,
+        bool allowSequenceGaps
+    ) {
+        if (primaryHost.empty() || primaryReplPort == 0 || selfNodeId == 0) {
+            throw std::invalid_argument("ReplicationClient: host, nonzero port and node id are required");
+        }
+        if (!transferBudget) { transferBudget = std::make_shared<detail::TransferBudget>(runtimeOptions.transfer); }
+        runtimeOptions.secure.validatePins();
+        if (runtimeOptions.transportMode == TransportMode::SECURE) {
+            const uint64_t primaryId = runtimeOptions.secure.expectedPrimaryNodeId != 0
+                ? runtimeOptions.secure.expectedPrimaryNodeId : runtimeOptions.primaryNodeId;
+            if (primaryId == 0) { throw std::invalid_argument("ReplicationClient: SECURE requires an expected primary node id"); }
+            runtimeOptions.secure.validatePins(std::span<const uint64_t>{&primaryId, 1});
+            runtimeOptions.secure.expectedPrimaryNodeId = primaryId;
+        }
         return std::unique_ptr<ReplicationClient>(
             new ReplicationClient(
                 std::make_unique<Impl>(
@@ -945,7 +1132,10 @@ namespace akkaradb::engine::cluster {
                     selfNodeId,
                     std::move(getLastSeq),
                     ackPolicy,
-                    std::move(runtimeOptions)
+                    std::move(runtimeOptions),
+                    targetedEntries,
+                    std::move(transferBudget),
+                    allowSequenceGaps
                 )
             )
         );
@@ -977,7 +1167,13 @@ namespace akkaradb::engine::cluster {
 
     bool ReplicationClient::connected() const noexcept { return impl_->connected(); }
 
+    uint64_t ReplicationClient::lastSuccessfulContactAtUs() const noexcept { return impl_->lastSuccessfulContactAtUs(); }
+
     ReadResponse ReplicationClient::readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
         return impl_->readKey(key, snapshotSeq, timeoutMs);
+    }
+
+    StripeControlResponse ReplicationClient::stripeControl(StripeControlRequest request, uint32_t timeoutMs) {
+        return impl_->stripeControl(std::move(request), timeoutMs);
     }
 } // namespace akkaradb::engine::cluster
