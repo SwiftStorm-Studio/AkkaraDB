@@ -32,6 +32,7 @@
 #include "akk/engine/erasure/ErasureCodecExt.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
+#include "akk/engine/memtable/SkipListMemTable.hpp"
 #include "akk/engine/wal/WalFraming.hpp"
 #include "akk/engine/wal/WalRecovery.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
@@ -78,6 +79,10 @@ namespace {
 
 #define AKK_CLUSTER_CHECK(expr) do { if (!(expr)) { fail(#expr, __FILE__, __LINE__); } } while (false)
 
+    [[nodiscard]] uint32_t snapshotValueCrc(std::span<const uint8_t> value) noexcept {
+        return akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(value.data()), value.size());
+    }
+
     std::filesystem::path makeTempDir(const std::string& suffix) {
         const auto dir = std::filesystem::temp_directory_path() / ("akkaradbClusterTest_" + suffix);
         std::error_code ec;
@@ -93,8 +98,17 @@ namespace {
             .host = "127.0.0.1",
             .dataPort = dataPort,
             .replPort = replPort,
+            .stripeMetadataPort = static_cast<uint16_t>(replPort + 1000),
             .capabilities = capabilities,
         };
+    }
+
+    ClusterId testClusterId(uint64_t tag) {
+        ClusterId id{};
+        for (size_t index = 0; index < id.size(); ++index) {
+            id[index] = static_cast<uint8_t>((tag >> ((index % 8) * 8)) ^ (0x5DU + index * 17U));
+        }
+        return id;
     }
 
     RaftOptions onlineRaftMembership() {
@@ -217,14 +231,15 @@ namespace {
             ScopedRequestJournalCompactionThreshold& operator=(const ScopedRequestJournalCompactionThreshold&) = delete;
     };
 
-    void setLeaseRenewalFailureTestEnvironment(bool enabled) {
+    void setLeaseRenewalFailureTestEnvironment(bool enabled, bool failRenewal) {
 #ifdef _WIN32
         AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS", enabled ? "10" : "") == 0);
-        AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_FAIL_LEASE_RENEWAL", enabled ? "1" : "") == 0);
+        AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_FAIL_LEASE_RENEWAL", enabled && failRenewal ? "1" : "") == 0);
 #else
         if (enabled) {
             AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS", "10", 1) == 0);
-            AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_FAIL_LEASE_RENEWAL", "1", 1) == 0);
+            if (failRenewal) { AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_FAIL_LEASE_RENEWAL", "1", 1) == 0); }
+            else { AKK_CLUSTER_CHECK(::unsetenv("AKKARADB_TEST_FAIL_LEASE_RENEWAL") == 0); }
         }
         else {
             AKK_CLUSTER_CHECK(::unsetenv("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS") == 0);
@@ -235,10 +250,43 @@ namespace {
 
     class ScopedLeaseRenewalFailure {
         public:
-            ScopedLeaseRenewalFailure() { setLeaseRenewalFailureTestEnvironment(true); }
-            ~ScopedLeaseRenewalFailure() { setLeaseRenewalFailureTestEnvironment(false); }
+            ScopedLeaseRenewalFailure() { setLeaseRenewalFailureTestEnvironment(true, false); }
+            void trigger() { setLeaseRenewalFailureTestEnvironment(true, true); }
+            ~ScopedLeaseRenewalFailure() { setLeaseRenewalFailureTestEnvironment(false, false); }
             ScopedLeaseRenewalFailure(const ScopedLeaseRenewalFailure&) = delete;
             ScopedLeaseRenewalFailure& operator=(const ScopedLeaseRenewalFailure&) = delete;
+    };
+
+    class ScopedPrimaryStepDown {
+        public:
+            ScopedPrimaryStepDown() {
+#ifdef _WIN32
+                AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS", "10") == 0);
+#else
+                AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS", "10", 1) == 0);
+#endif
+            }
+
+            void trigger() {
+#ifdef _WIN32
+                AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_STEP_DOWN_PRIMARY", "1") == 0);
+#else
+                AKK_CLUSTER_CHECK(::setenv("AKKARADB_TEST_STEP_DOWN_PRIMARY", "1", 1) == 0);
+#endif
+            }
+
+            ~ScopedPrimaryStepDown() {
+#ifdef _WIN32
+                AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS", "") == 0);
+                AKK_CLUSTER_CHECK(_putenv_s("AKKARADB_TEST_STEP_DOWN_PRIMARY", "") == 0);
+#else
+                AKK_CLUSTER_CHECK(::unsetenv("AKKARADB_TEST_LEASE_RENEW_INTERVAL_MS") == 0);
+                AKK_CLUSTER_CHECK(::unsetenv("AKKARADB_TEST_STEP_DOWN_PRIMARY") == 0);
+#endif
+            }
+
+            ScopedPrimaryStepDown(const ScopedPrimaryStepDown&) = delete;
+            ScopedPrimaryStepDown& operator=(const ScopedPrimaryStepDown&) = delete;
     };
 
     void setSnapshotStagingCorruptionPoint(const char* point) {
@@ -356,6 +404,7 @@ namespace {
         std::string lastBlobContent;
         std::string pendingSnapshotKey;
         std::string pendingSnapshotValue;
+        std::unordered_map<std::string, std::vector<uint8_t>> stripeMetadata;
         std::filesystem::path durableStatePath;
         std::unique_ptr<ClusterRuntime> runtime;
 
@@ -467,6 +516,22 @@ namespace {
             response.value.assign(harness->lastValue.begin(), harness->lastValue.end());
             return response;
         };
+        callbacks.commitStripeMetadata = [harness = harness.get()](
+            std::span<const uint8_t> key, std::span<const uint8_t> metadata
+        ) {
+            std::lock_guard lock{harness->stateMutex};
+            harness->stripeMetadata[std::string{reinterpret_cast<const char*>(key.data()), key.size()}] =
+                std::vector<uint8_t>{metadata.begin(), metadata.end()};
+        };
+        callbacks.readStripeMetadata = [harness = harness.get()](std::span<const uint8_t> key)
+            -> std::optional<std::vector<uint8_t>> {
+            std::lock_guard lock{harness->stateMutex};
+            const auto found = harness->stripeMetadata.find(
+                std::string{reinterpret_cast<const char*>(key.data()), key.size()}
+            );
+            if (found == harness->stripeMetadata.end()) { return std::nullopt; }
+            return found->second;
+        };
         callbacks.exportSnapshot = [harness = harness.get()]() -> std::optional<ClusterSnapshot> {
             harness->snapshotsExported.fetch_add(1);
             std::lock_guard lock{harness->stateMutex};
@@ -474,7 +539,6 @@ namespace {
             if (seq == 0) { return std::nullopt; }
             ClusterSnapshot snapshot;
             snapshot.seq = seq;
-            snapshot.entryCount = 1;
             const auto entry = std::make_shared<ClusterHistoryEntry>(ClusterHistoryEntry{
                     .seq = seq,
                     .sourceNodeId = harness->nodeId,
@@ -482,9 +546,10 @@ namespace {
                     .recordFlags = 0,
                     .key = std::vector<uint8_t>{harness->lastKey.begin(), harness->lastKey.end()},
                     .value = std::vector<uint8_t>{harness->lastValue.begin(), harness->lastValue.end()},
-                });
+            });
             snapshot.forEachEntry = [entry](const ClusterSnapshot::EntryVisitor& visitor) {
-                return visitor(entry->key, entry->value);
+                return visitor.beginEntry(entry->key, entry->value.size(), snapshotValueCrc(entry->value)) &&
+                    visitor.appendValueChunk(0, entry->value) && visitor.finishEntry();
             };
             return snapshot;
         };
@@ -503,7 +568,8 @@ namespace {
             harness->pendingSnapshotValue += textOf(chunk);
         };
         callbacks.finishSnapshotEntry = [] {};
-        callbacks.finishSnapshot = [harness = harness.get()](uint64_t snapshotSeq) {
+        callbacks.finishSnapshot = [harness = harness.get()](uint64_t snapshotSeq, uint64_t entryCount) {
+            AKK_CLUSTER_CHECK(entryCount == 1);
             std::lock_guard lock{harness->stateMutex};
             harness->lastKey = harness->pendingSnapshotKey;
             harness->lastValue = harness->pendingSnapshotValue;
@@ -693,6 +759,21 @@ namespace {
         throw std::runtime_error("cluster smoke: failed to find partitioned owner key");
     }
 
+    std::string keyPlacedOn(const ClusterConfig& cfg, std::span<const uint64_t> nodeIds, const std::string& prefix) {
+        ClusterRouter router{cfg};
+        for (uint32_t i = 0; i < 10000; ++i) {
+            std::string key = prefix + "-" + std::to_string(i);
+            const auto targets = router.writeTargets(bytesOf(key));
+            if (targets.size() != nodeIds.size()) { continue; }
+            bool matches = true;
+            for (size_t index = 0; index < targets.size(); ++index) {
+                if (targets[index].nodeId != nodeIds[index]) { matches = false; break; }
+            }
+            if (matches) { return key; }
+        }
+        throw std::runtime_error("cluster smoke: failed to find STRIPE placement key");
+    }
+
     [[nodiscard]] std::vector<uint8_t> snapshotCommitValue(uint64_t recordCount) {
         std::vector<uint8_t> out;
         out.insert(out.end(), {'A', 'K', 'S', 'C', '1'});
@@ -797,10 +878,13 @@ namespace {
 
     ClusterConfig stripeStorageConfig() {
         return ClusterConfig{
-            {node(1, 21801, 21901), node(2, 21802, 21902)},
+            {node(1, 21801, 21901), node(2, 21802, 21902), node(3, 21803, 21903)},
             ReplicationMode::STRIPE, AckPolicy{},
-            ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 400},
+            // STRIPE forces a durable target acknowledgement even in ASYNC mode.
+            // Leave enough time for a real Windows FlushFileBuffers cycle under load.
+            ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 2000},
             {}, StripeOptions{.dataShards = 1, .parityShards = 1},
+            0, testClusterId(9180),
         };
     }
 
@@ -822,7 +906,9 @@ namespace {
     int runStripeCrashWriter(const char* point, const std::filesystem::path& dir) {
         auto n1 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 1));
         auto n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
-        const auto key = keyOwnedBy(stripeStorageConfig(), 1, "stripe-crash");
+        auto n3 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 3));
+        constexpr std::array<uint64_t, 2> placement{1, 2};
+        const auto key = keyPlacedOn(stripeStorageConfig(), placement, "stripe-crash");
         AKK_CLUSTER_CHECK(waitUntil([&] {
             try { n1->put(bytesOf(key), bytesOf("before")); return true; }
             catch (const std::runtime_error&) { return false; }
@@ -844,13 +930,27 @@ namespace {
         return {shards, intents};
     }
 
+    bool hasStripeMetadataMagic(akkaradb::engine::AkkEngine& engine, std::string_view magic) {
+        akkaradb::core::BufferArena arena;
+        for (const auto& record : engine.scan(arena)) {
+            if (record.key.size() >= 6 && record.key[0] == 0 && record.key[1] == 'A' && record.key[2] == 'K' &&
+                record.key[3] == 'S' && record.key[4] == 'M' && record.key[5] == '1') {
+                return record.value.size() >= magic.size() &&
+                    std::equal(magic.begin(), magic.end(), record.value.begin());
+            }
+        }
+        return false;
+    }
+
     void testStripePublicationCrashRecovery(const std::filesystem::path& executable) {
-        const auto key = keyOwnedBy(stripeStorageConfig(), 1, "stripe-crash");
+        constexpr std::array<uint64_t, 2> placement{1, 2};
+        const auto key = keyPlacedOn(stripeStorageConfig(), placement, "stripe-crash");
         for (const char* point : {"stripe.after_intent", "stripe.after_shard", "stripe.before_publish", "stripe.after_publish"}) {
             const auto dir = makeTempDir(point);
             runStorageCrashChild(executable, "--stripe-crash-writer", point, dir);
             auto n1 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 1));
             auto n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
+            auto n3 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 3));
             const std::string expected = std::string_view{point} == "stripe.after_publish" ? "after" : "before";
             AKK_CLUSTER_CHECK(waitUntil([&] {
                 try {
@@ -859,11 +959,20 @@ namespace {
                 }
                 catch (const std::runtime_error&) { return false; }
             }));
-            AKK_CLUSTER_CHECK(waitUntil([&] {
+            const bool intentsRetired = waitUntil([&] {
                 const auto a = stripeInternalCounts(*n1);
                 const auto b = stripeInternalCounts(*n2);
                 return a.first == 1 && b.first == 1 && a.second == 0 && b.second == 0;
-            }, std::chrono::milliseconds{10000}));
+            }, std::chrono::milliseconds{20000});
+            if (!intentsRetired) {
+                const auto a = stripeInternalCounts(*n1);
+                const auto b = stripeInternalCounts(*n2);
+                throw std::runtime_error(
+                    std::string{"STRIPE crash recovery did not retire intents at "} + point +
+                    ": n1=" + std::to_string(a.first) + "/" + std::to_string(a.second) +
+                    " n2=" + std::to_string(b.first) + "/" + std::to_string(b.second)
+                );
+            }
             const auto recoveredSeq = n1->stats().currentSeq;
             n1->put(bytesOf(key), bytesOf("next-generation"));
             AKK_CLUSTER_CHECK(n1->stats().currentSeq > recoveredSeq);
@@ -878,31 +987,35 @@ namespace {
             catch (const std::runtime_error&) { rejected = true; }
             AKK_CLUSTER_CHECK(rejected);
             n2->close();
+            n3->close();
         }
     }
 
     void testStripeFailureAndConcurrentReads() {
         const auto dir = makeTempDir("stripe-failure-and-concurrency");
-        const auto key = keyOwnedBy(stripeStorageConfig(), 1, "stripe-failure");
+        constexpr std::array<uint64_t, 2> placement{1, 2};
+        const auto key = keyPlacedOn(stripeStorageConfig(), placement, "stripe-failure");
         auto n1 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 1));
         auto n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
-        AKK_CLUSTER_CHECK(waitUntil([&] {
+        auto n3 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 3));
+        std::string initialWriteFailure;
+        const bool initialWriteReady = waitUntil([&] {
             try { n1->put(bytesOf(key), bytesOf("stable")); return true; }
-            catch (const std::runtime_error&) { return false; }
-        }));
+            catch (const std::runtime_error& error) { initialWriteFailure = error.what(); return false; }
+        });
+        if (!initialWriteReady) {
+            throw std::runtime_error("STRIPE concurrent-read setup write did not become ready: " + initialWriteFailure);
+        }
         n2->close();
         n2.reset();
-        bool rejected = false;
-        try { n1->put(bytesOf(key), bytesOf("must-not-publish")); }
-        catch (const std::runtime_error&) { rejected = true; }
-        AKK_CLUSTER_CHECK(rejected); // ASYNC in the config cannot bypass all-shard durability.
+        n1->put(bytesOf(key), bytesOf("degraded-write"));
         const auto previous = engineGet(*n1, key);
-        AKK_CLUSTER_CHECK(previous && textOf(*previous) == "stable");
+        AKK_CLUSTER_CHECK(previous && textOf(*previous) == "degraded-write");
         n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
         AKK_CLUSTER_CHECK(waitUntil([&] {
             try {
                 const auto value = engineGet(*n2, key);
-                return value && textOf(*value) == "stable";
+                return value && textOf(*value) == "degraded-write";
             }
             catch (const std::runtime_error&) { return false; }
         }));
@@ -920,7 +1033,8 @@ namespace {
                     const auto value = engineGet(*n2, key);
                     if (!value) { invalidRead.store(true); continue; }
                     const auto text = textOf(*value);
-                    if (text != "stable" && text != std::string(4096, 'a') && text != std::string(4096, 'b')) {
+                    if (text != "stable" && text != "degraded-write" &&
+                        text != std::string(4096, 'a') && text != std::string(4096, 'b')) {
                         invalidRead.store(true);
                     }
                     successfulReads.fetch_add(1);
@@ -946,14 +1060,244 @@ namespace {
             return a.first == 0 && b.first == 0 && a.second == 0;
         }, std::chrono::milliseconds{10000}));
         n2->close();
+        n3->close();
         n1->close();
 
         auto options = stripeStorageOptions(makeTempDir("stripe-requires-wal"), 1);
         options.components.walEnabled = false;
-        rejected = false;
+        bool rejected = false;
         try { (void)akkaradb::engine::AkkEngine::open(options); }
         catch (const std::invalid_argument&) { rejected = true; }
         AKK_CLUSTER_CHECK(rejected);
+    }
+
+    ClusterConfig raid0StorageConfig() {
+        return ClusterConfig{
+            {
+                node(1, 23801, 23901),
+                node(2, 23802, 23902),
+                node(3, 23803, 23903),
+            },
+            RaidOptions{.preset = RaidPreset::RAID0, .dataShards = 3},
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 2000},
+            testClusterId(9190),
+        };
+    }
+
+    akkaradb::engine::AkkEngineOptions raid0StorageOptions(const std::filesystem::path& dir, uint64_t id) {
+        akkaradb::engine::AkkEngineOptions options;
+        options.paths.dataDir = dir / ("n" + std::to_string(id));
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.cluster.config = raid0StorageConfig();
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.clusterGroupId = 9190;
+        options.cluster.runtime.clusterGroupEpoch = 1;
+        options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+        writeNodeIdFile(options.paths.dataDir / "node.id", id);
+        return options;
+    }
+
+    void testRaid0PresetStorageAndFailure() {
+        const auto dir = makeTempDir("raid0-preset");
+        const auto config = raid0StorageConfig();
+        AKK_CLUSTER_CHECK(config.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID0);
+        AKK_CLUSTER_CHECK(config.stripe().dataShards == 3);
+        AKK_CLUSTER_CHECK(config.stripe().parityShards == 0);
+
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, config);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID0);
+        AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 3);
+        AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 0);
+
+        bool rejectedSingleShard = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 23811, 23911)},
+                RaidOptions{.preset = RaidPreset::RAID0, .dataShards = 1},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedSingleShard = true; }
+        AKK_CLUSTER_CHECK(rejectedSingleShard);
+
+        auto n1 = akkaradb::engine::AkkEngine::open(raid0StorageOptions(dir, 1));
+        auto n2 = akkaradb::engine::AkkEngine::open(raid0StorageOptions(dir, 2));
+        auto n3 = akkaradb::engine::AkkEngine::open(raid0StorageOptions(dir, 3));
+        const auto key = keyOwnedBy(config, 1, "raid0-key");
+        const auto value = deterministicBytes(4099, 0xA11A'1D00'0000'0001ull);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                n1->put(bytesOf(key), value);
+                return true;
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{10000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto stored = engineGet(*n2, key);
+                return stored && *stored == value;
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{10000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto a = stripeInternalCounts(*n1);
+            const auto b = stripeInternalCounts(*n2);
+            const auto c = stripeInternalCounts(*n3);
+            return a.first == 1 && b.first == 1 && c.first == 1;
+        }));
+
+        n3->close();
+        n3.reset();
+        bool rejectedIncompleteWrite = false;
+        try { n1->put(bytesOf(key), bytesOf("must-not-publish")); }
+        catch (const std::runtime_error&) { rejectedIncompleteWrite = true; }
+        AKK_CLUSTER_CHECK(rejectedIncompleteWrite);
+        bool rejectedMissingShard = false;
+        try { (void)engineGet(*n2, key); }
+        catch (const std::runtime_error&) { rejectedMissingShard = true; }
+        AKK_CLUSTER_CHECK(rejectedMissingShard);
+
+        n3 = akkaradb::engine::AkkEngine::open(raid0StorageOptions(dir, 3));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto stored = engineGet(*n2, key);
+                return stored && *stored == value;
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{10000}));
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
+    ClusterConfig raid1StorageConfig() {
+        return ClusterConfig{
+            {
+                node(1, 23821, 23921),
+                node(2, 23822, 23922),
+            },
+            RaidOptions{.preset = RaidPreset::RAID1, .primaryNodeId = 1},
+            AckPolicy{.mode = AckPolicyMode::NONE, .stage = AckStage::RECEIVED},
+            ConsistencyOptions{
+                .mode = ConsistencyMode::ASYNC,
+                .writeConsistency = WriteConsistency::LOCAL,
+                .ackTimeoutAction = AckTimeoutAction::ACCEPT_LOCAL,
+                .replicaLagAction = ReplicaLagAction::REJECT_REPLICA,
+                .ackTimeoutMs = 2000,
+            },
+            testClusterId(9191),
+        };
+    }
+
+    akkaradb::engine::AkkEngineOptions raid1StorageOptions(const std::filesystem::path& dir, uint64_t id) {
+        akkaradb::engine::AkkEngineOptions options;
+        options.paths.dataDir = dir / ("n" + std::to_string(id));
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.cluster.config = raid1StorageConfig();
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+        writeNodeIdFile(options.paths.dataDir / "node.id", id);
+        return options;
+    }
+
+    void testRaid1PresetMirroringAndRebuild() {
+        const auto dir = makeTempDir("raid1-preset");
+        const auto config = raid1StorageConfig();
+        AKK_CLUSTER_CHECK(config.mode() == ReplicationMode::MIRROR);
+        AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID1);
+        AKK_CLUSTER_CHECK(config.primaryNodeId() == 1);
+        AKK_CLUSTER_CHECK(config.ackPolicy().mode == AckPolicyMode::ALL_TARGETS);
+        AKK_CLUSTER_CHECK(config.ackPolicy().stage == AckStage::DURABLE);
+        AKK_CLUSTER_CHECK(config.consistency().mode == ConsistencyMode::PRIMARY_ACK);
+        AKK_CLUSTER_CHECK(config.consistency().writeConsistency == WriteConsistency::AVAILABLE_REPLICAS);
+        AKK_CLUSTER_CHECK(config.consistency().ackTimeoutAction == AckTimeoutAction::FAIL_WRITE);
+        AKK_CLUSTER_CHECK(config.consistency().replicaLagAction == ReplicaLagAction::ASYNC_RESYNC);
+
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, config);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID1);
+        AKK_CLUSTER_CHECK(loaded.primaryNodeId() == 1);
+
+        bool rejectedSingleNode = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 23823, 23923)},
+                RaidOptions{.preset = RaidPreset::RAID1, .primaryNodeId = 1},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedSingleNode = true; }
+        AKK_CLUSTER_CHECK(rejectedSingleNode);
+
+        auto noWal = raid1StorageOptions(makeTempDir("raid1-requires-wal"), 1);
+        noWal.components.walEnabled = false;
+        bool rejectedWithoutWal = false;
+        try { (void)akkaradb::engine::AkkEngine::open(noWal); }
+        catch (const std::invalid_argument&) { rejectedWithoutWal = true; }
+        AKK_CLUSTER_CHECK(rejectedWithoutWal);
+
+        auto primary = akkaradb::engine::AkkEngine::open(raid1StorageOptions(dir, 1));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return primary->stats().cluster.health == akkaradb::engine::ClusterHealthState::DEGRADED;
+        }));
+        primary->put(bytesOf("raid1-offline"), bytesOf("primary-durable"));
+
+        for (unsigned i = 0; i < 128; ++i) {
+            const auto key = "raid1-rebuild-" + std::to_string(i);
+            primary->put(bytesOf(key), deterministicBytes(4096, 0xA11A'1D01'0000'0000ull + i));
+        }
+
+        auto replica = akkaradb::engine::AkkEngine::open(raid1StorageOptions(dir, 2));
+        const bool observedRebuilding = waitUntil([&] {
+            return primary->stats().cluster.health == akkaradb::engine::ClusterHealthState::REBUILDING;
+        }, std::chrono::milliseconds{10000});
+        AKK_CLUSTER_CHECK(observedRebuilding);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return primary->stats().cluster.health == akkaradb::engine::ClusterHealthState::HEALTHY;
+        }, std::chrono::milliseconds{20000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*replica, "raid1-offline");
+            return value && textOf(*value) == "primary-durable";
+        }, std::chrono::milliseconds{10000}));
+
+        primary->put(bytesOf("raid1-live"), bytesOf("both-durable"));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*replica, "raid1-live");
+            return value && textOf(*value) == "both-durable";
+        }));
+
+        replica->close();
+        replica.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return primary->stats().cluster.health == akkaradb::engine::ClusterHealthState::DEGRADED;
+        }));
+        primary->put(bytesOf("raid1-degraded"), bytesOf("survives-rebuild"));
+
+        replica = akkaradb::engine::AkkEngine::open(raid1StorageOptions(dir, 2));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return primary->stats().cluster.health == akkaradb::engine::ClusterHealthState::HEALTHY;
+        }, std::chrono::milliseconds{20000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*replica, "raid1-degraded");
+            return value && textOf(*value) == "survives-rebuild";
+        }));
+
+        primary->close();
+        primary.reset();
+        bool replicaRejectedWrite = false;
+        try { replica->put(bytesOf("no-auto-promotion"), bytesOf("rejected")); }
+        catch (const std::runtime_error&) { replicaRejectedWrite = true; }
+        AKK_CLUSTER_CHECK(replicaRejectedWrite);
+        replica->close();
     }
 
     ClusterConfig stripeFailoverStorageConfig() {
@@ -964,6 +1308,7 @@ namespace {
             ReplicationMode::STRIPE, AckPolicy{},
             ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 2000},
             {}, StripeOptions{.dataShards = 1, .parityShards = 1},
+            0, testClusterId(9181),
         };
     }
 
@@ -1007,9 +1352,16 @@ namespace {
 
         owner = akkaradb::engine::AkkEngine::open(stripeFailoverStorageOptions(dir, 1));
         AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = owner->stats();
+            const auto peer = std::ranges::find(stats.cluster.peers, uint64_t{3}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId);
+            return peer != stats.cluster.peers.end() && peer->connected;
+        }, std::chrono::milliseconds{15000}));
+        std::string returnedOwnerError;
+        AKK_CLUSTER_CHECK(waitUntil([&] {
             try { owner->put(bytesOf(key), bytesOf("owner-returned")); return true; }
-            catch (const std::runtime_error&) { return false; }
-        }, std::chrono::milliseconds{10000}));
+            catch (const std::runtime_error& error) { returnedOwnerError = error.what(); return false; }
+        }, std::chrono::milliseconds{10000}) ||
+            (std::fprintf(stderr, "stripe returned owner write: %s\n", returnedOwnerError.c_str()), false));
         const auto afterHandoff = engineGet(*owner, key);
         AKK_CLUSTER_CHECK(afterHandoff && textOf(*afterHandoff) == "owner-returned");
 
@@ -1104,14 +1456,19 @@ namespace {
         auto runtime = makeSegmentedRaft(rotateDir);
         runtime->start();
         AKK_CLUSTER_CHECK(waitUntil([&] { return runtime->role() == NodeRole::PRIMARY; }));
-        const std::string payload(6 * 1024 * 1024, 'x');
-        for (uint64_t seq = 1; seq <= 3; ++seq) {
+        const std::string oversizedPayload(ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE, 'o');
+        bool oversizedRejected = false;
+        try { runtime->shipEntry(1, ReplOpType::PUT, bytesOf("oversized"), bytesOf(oversizedPayload), 0, 1); }
+        catch (const std::invalid_argument&) { oversizedRejected = true; }
+        AKK_CLUSTER_CHECK(oversizedRejected);
+        const std::string payload(3 * 1024 * 1024, 'x');
+        for (uint64_t seq = 1; seq <= 6; ++seq) {
             runtime->shipEntry(seq, ReplOpType::PUT, bytesOf("large"), bytesOf(payload), 0, 1);
         }
         const auto firstSegment = rotateDir / "cluster-raft.log.segments" / "segment-1.akrl";
         const auto firstBytes = readTestFile(firstSegment);
         const auto modified = std::filesystem::last_write_time(firstSegment);
-        runtime->shipEntry(4, ReplOpType::PUT, bytesOf("small"), bytesOf("tail"), 0, 1);
+        runtime->shipEntry(7, ReplOpType::PUT, bytesOf("small"), bytesOf("tail"), 0, 1);
         AKK_CLUSTER_CHECK(readTestFile(firstSegment) == firstBytes);
         AKK_CLUSTER_CHECK(std::filesystem::last_write_time(firstSegment) == modified);
         AKK_CLUSTER_CHECK(std::filesystem::exists(rotateDir / "cluster-raft.log.segments" / "segment-2.akrl"));
@@ -1125,6 +1482,8 @@ namespace {
 
 
     void testRaftOptionsRoundtripAndValidation() {
+        AKK_CLUSTER_CHECK(ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE == 4u * 1024u * 1024u);
+        AKK_CLUSTER_CHECK(ClusterRuntimeOptions{}.raftMaxReceiveMemoryBytes == 64ull * 1024 * 1024);
         const auto dir = makeTempDir("raft-options");
         const ClusterConfig cfg{
             {
@@ -1164,7 +1523,7 @@ namespace {
         }
         AKK_CLUSTER_CHECK(rejected);
 
-        const auto rejectsSnapshotPolicy = [&](ClusterRuntimeOptions options) {
+        const auto rejectsRuntimeOptions = [&](ClusterRuntimeOptions options) {
             options.transportMode = TransportMode::PLAIN;
             try {
                 cfg.validateRuntime(1, options);
@@ -1174,13 +1533,48 @@ namespace {
         };
         ClusterRuntimeOptions invalidEntries;
         invalidEntries.raftSnapshot.minLogEntries = 0;
-        AKK_CLUSTER_CHECK(rejectsSnapshotPolicy(invalidEntries));
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidEntries));
         ClusterRuntimeOptions invalidBytes;
         invalidBytes.raftSnapshot.minLogBytes = 0;
-        AKK_CLUSTER_CHECK(rejectsSnapshotPolicy(invalidBytes));
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidBytes));
         ClusterRuntimeOptions invalidInterval;
         invalidInterval.raftSnapshot.maxIntervalMs = 0;
-        AKK_CLUSTER_CHECK(rejectsSnapshotPolicy(invalidInterval));
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidInterval));
+        ClusterRuntimeOptions minimumHeartbeat;
+        minimumHeartbeat.raftHeartbeatIntervalMs = 10;
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(minimumHeartbeat));
+        ClusterRuntimeOptions maximumHeartbeat;
+        maximumHeartbeat.raftHeartbeatIntervalMs = 1'000;
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(maximumHeartbeat));
+        ClusterRuntimeOptions tooFrequentHeartbeat;
+        tooFrequentHeartbeat.raftHeartbeatIntervalMs = 9;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(tooFrequentHeartbeat));
+        ClusterRuntimeOptions tooInfrequentHeartbeat;
+        tooInfrequentHeartbeat.raftHeartbeatIntervalMs = 1'001;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(tooInfrequentHeartbeat));
+        constexpr uint64_t minimumRaftReceiveMemory =
+            3ull * (ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE);
+        ClusterRuntimeOptions minimumReceiveMemory;
+        minimumReceiveMemory.raftMaxReceiveMemoryBytes = minimumRaftReceiveMemory;
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(minimumReceiveMemory));
+        ClusterRuntimeOptions insufficientReceiveMemory;
+        insufficientReceiveMemory.raftMaxReceiveMemoryBytes = minimumRaftReceiveMemory - 1;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(insufficientReceiveMemory));
+        ClusterRuntimeOptions maximumRequestCapacity;
+        maximumRequestCapacity.requests.maxTrackedRequests = 32'768;
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(maximumRequestCapacity));
+        ClusterRuntimeOptions excessiveRequestCapacity;
+        excessiveRequestCapacity.requests.maxTrackedRequests = 32'769;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(excessiveRequestCapacity));
+        ClusterRuntimeOptions invalidMemorySnapshotBytes;
+        invalidMemorySnapshotBytes.memoryOnlySnapshot.maxPinnedBytes = 1024;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidMemorySnapshotBytes));
+        ClusterRuntimeOptions invalidMemorySnapshotGenerations;
+        invalidMemorySnapshotGenerations.memoryOnlySnapshot.maxPinnedGenerations = 0;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidMemorySnapshotGenerations));
+        ClusterRuntimeOptions throughputSnapshot;
+        throughputSnapshot.memoryOnlySnapshot.mode = MemoryOnlySnapshotMode::THROUGHPUT_FIRST;
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(throughputSnapshot));
     }
 
     void testMirrorPrimaryRoundtripAndValidation() {
@@ -1598,8 +1992,13 @@ namespace {
         n2->put(bytesOf(owner2Key), bytesOf(owner2Value));
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
-                const auto stored = engineGet(*n1, owner2Key);
-                return stored && *stored == std::vector<uint8_t>{owner2Value.begin(), owner2Value.end()};
+                try {
+                    const auto stored = engineGet(*n1, owner2Key);
+                    return stored && *stored == std::vector<uint8_t>{owner2Value.begin(), owner2Value.end()};
+                }
+                catch (const std::runtime_error&) {
+                    return false;
+                }
             },
             std::chrono::milliseconds{8000}
         ));
@@ -1608,8 +2007,13 @@ namespace {
         n1->put(bytesOf(owner1Key), bytesOf(updatedValue));
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
-                const auto stored = engineGet(*n2, owner1Key);
-                return stored && *stored == std::vector<uint8_t>{updatedValue.begin(), updatedValue.end()};
+                try {
+                    const auto stored = engineGet(*n2, owner1Key);
+                    return stored && *stored == std::vector<uint8_t>{updatedValue.begin(), updatedValue.end()};
+                }
+                catch (const std::runtime_error&) {
+                    return false;
+                }
             },
             std::chrono::milliseconds{8000}
         ));
@@ -1701,7 +2105,7 @@ namespace {
         n1->close();
     }
 
-    void testStripeEngineRejectsDegradedWriteCommit() {
+    void testStripeEngineDegradedWriteAndAutomaticRebuild() {
         const auto dir = makeTempDir("stripe-engine-data-shard-commit");
         StripeOptions stripeOptions;
         stripeOptions.dataShards = 2;
@@ -1730,21 +2134,298 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9012;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
-            options.cluster.runtime.stripeWriteCommitMode = static_cast<StripeWriteCommitMode>(1);
+            options.cluster.runtime.stripeWriteCommitMode = StripeWriteCommitMode::DATA_SHARDS;
             options.cluster.runtime.stripeReadCoordinatorMode = coordinatorMode;
+            options.cluster.runtime.stripeRebuildIntervalMs = 100;
+            options.cluster.runtime.stripeRebuildBatchKeys = 16;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
         };
 
-        bool rejected = false;
+        auto invalidOptions = makeOptions(1, StripeReadCoordinatorMode::OWNER);
+        invalidOptions.cluster.runtime.stripeWriteCommitMode = static_cast<StripeWriteCommitMode>(2);
+        bool rejectedInvalidMode = false;
         try {
-            auto engine = akkaradb::engine::AkkEngine::open(makeOptions(1, StripeReadCoordinatorMode::OWNER));
+            auto engine = akkaradb::engine::AkkEngine::open(invalidOptions);
             (void)engine;
         }
-        catch (const std::invalid_argument&) {
-            rejected = true;
+        catch (const std::invalid_argument&) { rejectedInvalidMode = true; }
+        AKK_CLUSTER_CHECK(rejectedInvalidMode);
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        const auto key = keyOwnedBy(cfg, 1, "degraded-write-rebuild");
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("fully-redundant")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }));
+        AKK_CLUSTER_CHECK(hasStripeMetadataMagic(*n1, "AKSM1"));
+
+        n3->close();
+        n3.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats();
+            const auto peer = std::ranges::find(stats.cluster.peers, uint64_t{3}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId);
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
+        n1->put(bytesOf(key), bytesOf("committed-degraded"));
+        AKK_CLUSTER_CHECK(n1->stats().cluster.health == akkaradb::engine::ClusterHealthState::REBUILDING);
+
+        n3 = akkaradb::engine::AkkEngine::open(makeOptions(3, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto n1Stats = n1->stats();
+            const auto n2Stats = n2->stats();
+            const auto n3Stats = n3->stats();
+            return n1Stats.stripeRebuild.succeeded + n2Stats.stripeRebuild.succeeded +
+                    n3Stats.stripeRebuild.succeeded >= 1 &&
+                stripeInternalCounts(*n3).first == 1;
+        }, std::chrono::milliseconds{15000}));
+        const auto rebuilt = engineGet(*n2, key);
+        AKK_CLUSTER_CHECK(rebuilt && textOf(*rebuilt) == "committed-degraded");
+
+        n2->close();
+        n2.reset();
+        n3->close();
+        n3.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats();
+            return std::ranges::count_if(stats.cluster.peers, [](const auto& peer) { return !peer.connected; }) == 2;
+        }));
+        bool rejectedBelowDataShards = false;
+        try { n1->put(bytesOf(key), bytesOf("must-not-publish")); }
+        catch (const std::runtime_error&) { rejectedBelowDataShards = true; }
+        AKK_CLUSTER_CHECK(rejectedBelowDataShards);
+
+        n2 = akkaradb::engine::AkkEngine::open(makeOptions(2, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        n3 = akkaradb::engine::AkkEngine::open(makeOptions(3, StripeReadCoordinatorMode::LOCAL_COORDINATOR));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n2, key);
+                return value && textOf(*value) == "committed-degraded";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
+    void testStripeMetadataLeaderAutomaticRebuild() {
+        const auto dir = makeTempDir("stripe-metadata-leader-rebuild");
+        constexpr uint32_t failoverCapabilities = DATA_AND_COORDINATOR |
+            static_cast<uint32_t>(NodeCapability::STRIPE_FAILOVER_ELIGIBLE);
+        const ClusterConfig cfg{
+            {
+                node(1, 21634, 21734),
+                node(2, 21635, 21735),
+                node(3, 21636, 21736, failoverCapabilities),
+            },
+            ReplicationMode::STRIPE,
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            {},
+            StripeOptions{.dataShards = 1, .parityShards = 1},
+        };
+
+        ClusterRouter router{cfg};
+        std::string key;
+        for (uint32_t i = 0; i < 10000; ++i) {
+            auto candidate = std::string{"failover-rebuild-"} + std::to_string(i);
+            const auto targets = router.writeTargets(bytesOf(candidate));
+            if (targets.size() == 2 && targets[0].nodeId == 1 && targets[1].nodeId == 2) {
+                key = std::move(candidate);
+                break;
+            }
         }
-        AKK_CLUSTER_CHECK(rejected);
+        AKK_CLUSTER_CHECK(!key.empty());
+
+        auto makeOptions = [&](uint64_t nodeId) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9013;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.stripeRebuildIntervalMs = 100;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto owner = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto shard = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto failover = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { owner->put(bytesOf(key), bytesOf("full-generation")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return hasStripeMetadataMagic(*failover, "AKSM1"); }));
+
+        shard->close();
+        shard.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = owner->stats();
+            const auto peer = std::ranges::find(stats.cluster.peers, uint64_t{2}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId);
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
+        owner->put(bytesOf(key), bytesOf("sequenced-degraded"));
+
+        shard = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        const bool rebuiltByMetadataLeader = waitUntil([&] {
+            const auto ownerStats = owner->stats();
+            const auto shardStats = shard->stats();
+            const auto failoverStats = failover->stats();
+            return ownerStats.stripeRebuild.succeeded + shardStats.stripeRebuild.succeeded +
+                    failoverStats.stripeRebuild.succeeded >= 1 &&
+                stripeInternalCounts(*shard).first >= 1;
+        }, std::chrono::milliseconds{15000});
+        if (!rebuiltByMetadataLeader) {
+            const auto ownerStats = owner->stats();
+            const auto shardStats = shard->stats();
+            const auto failoverStats = failover->stats();
+            std::fprintf(
+                stderr,
+                "stripe metadata leader rebuild: owner=%llu shard=%llu failover=%llu shardRecords=%zu\n",
+                static_cast<unsigned long long>(ownerStats.stripeRebuild.succeeded),
+                static_cast<unsigned long long>(shardStats.stripeRebuild.succeeded),
+                static_cast<unsigned long long>(failoverStats.stripeRebuild.succeeded),
+                stripeInternalCounts(*shard).first
+            );
+        }
+        AKK_CLUSTER_CHECK(rebuiltByMetadataLeader);
+        const auto rebuilt = engineGet(*owner, key);
+        AKK_CLUSTER_CHECK(rebuilt && textOf(*rebuilt) == "sequenced-degraded");
+
+        failover->close();
+        shard->close();
+        owner->close();
+    }
+
+    void testStripeMetadataRaftLeaderFailover() {
+        const auto dir = makeTempDir("stripe-metadata-raft-leader-failover");
+        constexpr uint32_t failoverCapabilities = DATA_AND_COORDINATOR |
+            static_cast<uint32_t>(NodeCapability::STRIPE_FAILOVER_ELIGIBLE);
+        const ClusterConfig cfg{
+            {
+                node(1, 21637, 21737),
+                node(2, 21638, 21738),
+                node(3, 21639, 21739, failoverCapabilities),
+            },
+            ReplicationMode::STRIPE,
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            {},
+            StripeOptions{.dataShards = 1, .parityShards = 1},
+        };
+        constexpr std::array<uint64_t, 2> placement{1, 2};
+        const auto key = keyPlacedOn(cfg, placement, "metadata-leader-failover");
+        const auto makeOptions = [&](uint64_t nodeId) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9014;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+            options.cluster.runtime.raftSnapshot.minLogEntries = 2;
+            options.cluster.runtime.raftSnapshot.minLogBytes = 1024ull * 1024 * 1024;
+            options.cluster.runtime.raftSnapshot.maxIntervalMs = 60'000;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("before-leader-loss")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }));
+
+        uint64_t oldLeader = 0;
+        uint64_t oldTerm = 0;
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto a = n1->stats().cluster;
+            const auto b = n2->stats().cluster;
+            const auto c = n3->stats().cluster;
+            if (a.stripeMetadataLeaderNodeId == 0 || a.stripeMetadataLeaderNodeId != b.stripeMetadataLeaderNodeId ||
+                a.stripeMetadataLeaderNodeId != c.stripeMetadataLeaderNodeId) {
+                return false;
+            }
+            oldLeader = a.stripeMetadataLeaderNodeId;
+            oldTerm = a.stripeMetadataRaftTerm;
+            return true;
+        }));
+
+        if (oldLeader == 1) { n1->close(); n1.reset(); }
+        else if (oldLeader == 2) { n2->close(); n2.reset(); }
+        else { n3->close(); n3.reset(); }
+
+        auto survivorStats = [&]() {
+            if (n1) { return n1->stats().cluster; }
+            if (n2) { return n2->stats().cluster; }
+            return n3->stats().cluster;
+        };
+        auto metadataLeaderStats = [&]() {
+            for (auto* engine : {n1.get(), n2.get(), n3.get()}) {
+                if (!engine) { continue; }
+                const auto stats = engine->stats();
+                if (stats.nodeId == stats.cluster.stripeMetadataLeaderNodeId) { return stats.cluster; }
+            }
+            return survivorStats();
+        };
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = survivorStats();
+            return stats.stripeMetadataLeaderNodeId != 0 && stats.stripeMetadataLeaderNodeId != oldLeader &&
+                stats.stripeMetadataRaftTerm > oldTerm;
+        }, std::chrono::milliseconds{10000}));
+
+        auto* writer = n1 ? n1.get() : n3.get();
+        AKK_CLUSTER_CHECK(writer != nullptr);
+        for (unsigned generation = 0; generation < 6; ++generation) {
+            const auto value = "after-leader-loss-" + std::to_string(generation);
+            AKK_CLUSTER_CHECK(waitUntil([&] {
+                try { writer->put(bytesOf(key), bytesOf(value)); return true; }
+                catch (const std::runtime_error&) { return false; }
+            }, std::chrono::milliseconds{10000}));
+        }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*writer, key);
+                return value && textOf(*value) == "after-leader-loss-5";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return metadataLeaderStats().stripeMetadataSnapshotIndex != 0;
+        }, std::chrono::milliseconds{10000}));
+
+        if (oldLeader == 1) { n1 = akkaradb::engine::AkkEngine::open(makeOptions(1)); }
+        else if (oldLeader == 2) { n2 = akkaradb::engine::AkkEngine::open(makeOptions(2)); }
+        else { n3 = akkaradb::engine::AkkEngine::open(makeOptions(3)); }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto restarted = oldLeader == 1 ? n1->stats().cluster : oldLeader == 2 ? n2->stats().cluster : n3->stats().cluster;
+            return restarted.stripeMetadataLeaderNodeId != 0 &&
+                restarted.stripeMetadataAppliedIndex >= metadataLeaderStats().stripeMetadataCommitIndex;
+        }, std::chrono::milliseconds{10000}));
+        auto* restarted = oldLeader == 1 ? n1.get() : oldLeader == 2 ? n2.get() : n3.get();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*restarted, key);
+                return value && textOf(*value) == "after-leader-loss-5";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }));
+
+        n3->close();
+        n2->close();
+        n1->close();
     }
 
     void testStripeEngineRejectsOnlineReconfiguration() {
@@ -2008,6 +2689,7 @@ namespace {
         auto manager = ClusterManager::create(dir, cfg, 1, options);
         manager->start();
         AKK_CLUSTER_CHECK(manager->role() == NodeRole::PRIMARY);
+        injectedFailure.trigger();
         AKK_CLUSTER_CHECK(waitUntil(
             [&] { return manager->role() == NodeRole::REPLICA; },
             std::chrono::milliseconds{2000}
@@ -2035,6 +2717,7 @@ namespace {
         options.startupRole = NodeStartupRole::PRIMARY;
         auto runtime = makeRuntime(dir / "n1", cfg, 1, options);
         runtime->runtime->start();
+        injectedFailure.trigger();
         AKK_CLUSTER_CHECK(waitUntil(
             [&] {
                 return runtime->runtime->role() == NodeRole::REPLICA &&
@@ -2051,6 +2734,28 @@ namespace {
 
     void testStripeErasureCodecRecovery() {
         const std::string value = "AkkaraDB parity stripe recovery across missing shards";
+
+        const erasure::ErasureLayout raid0Layout{.dataShards = 3, .parityShards = 0};
+        const auto raid0Shards = erasure::RsErasureCodec::encode(bytesOf(value), raid0Layout);
+        AKK_CLUSTER_CHECK(raid0Shards.size() == 3);
+        AKK_CLUSTER_CHECK(textOf(erasure::RsErasureCodec::decode(raid0Shards, raid0Layout)) == value);
+        bool raid0MissingShardRejected = false;
+        try {
+            (void)erasure::RsErasureCodec::decode(
+                std::vector<erasure::ErasureShard>{raid0Shards[0], raid0Shards[2]}, raid0Layout
+            );
+        }
+        catch (const std::runtime_error&) { raid0MissingShardRejected = true; }
+        AKK_CLUSTER_CHECK(raid0MissingShardRejected);
+        bool raid0RepairRejected = false;
+        try {
+            (void)erasure::RsErasureCodec::repairOne(
+                1, std::vector<erasure::ErasureShard>{raid0Shards[0], raid0Shards[2]}, raid0Layout
+            );
+        }
+        catch (const std::runtime_error&) { raid0RepairRejected = true; }
+        AKK_CLUSTER_CHECK(raid0RepairRejected);
+
         const erasure::ErasureLayout layout{.dataShards = 4, .parityShards = 2};
         auto shards = erasure::RsErasureCodec::encode(bytesOf(value), layout);
         AKK_CLUSTER_CHECK(shards.size() == 6);
@@ -2326,9 +3031,11 @@ namespace {
             ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000},
         };
 
-        auto n1 = makeRuntime(dir / "n1", cfg, 1);
-        auto n2 = makeRuntime(dir / "n2", cfg, 2);
-        auto n3 = makeRuntime(dir / "n3", cfg, 3);
+        ClusterRuntimeOptions options;
+        options.raftHeartbeatIntervalMs = 500;
+        auto n1 = makeRuntime(dir / "n1", cfg, 1, options);
+        auto n2 = makeRuntime(dir / "n2", cfg, 2, options);
+        auto n3 = makeRuntime(dir / "n3", cfg, 3, options);
 
         n1->runtime->start();
         n2->runtime->start();
@@ -2674,6 +3381,209 @@ namespace {
         }
     }
 
+    void testFileBackedSnapshotTransfer() {
+        namespace transfer = akkaradb::engine::cluster::detail;
+        const auto dir = makeTempDir("file-backed-snapshot-transfer");
+        const auto exportPath = dir / "snapshot-export";
+        const std::string key = "file-backed-key";
+        const std::string value(512 * 1024, 'f');
+        const std::string padding = "export-metadata";
+        std::ofstream exportOut{exportPath, std::ios::binary | std::ios::trunc};
+        exportOut.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+        exportOut.write(key.data(), static_cast<std::streamsize>(key.size()));
+        exportOut.write(value.data(), static_cast<std::streamsize>(value.size()));
+        exportOut.flush();
+        AKK_CLUSTER_CHECK(static_cast<bool>(exportOut));
+
+        std::vector<uint8_t> expected;
+        expected.reserve(8 + key.size() + value.size());
+        for (size_t i = 0; i < 4; ++i) { expected.push_back(static_cast<uint8_t>(key.size() >> (i * 8))); }
+        for (size_t i = 0; i < 4; ++i) { expected.push_back(static_cast<uint8_t>(value.size() >> (i * 8))); }
+        expected.insert(expected.end(), key.begin(), key.end());
+        expected.insert(expected.end(), value.begin(), value.end());
+
+        ReplicationTransferOptions options;
+        options.thresholdBytes = 128;
+        options.chunkBytes = 4096;
+        options.maxMemoryBytes = 2 * 1024 * 1024;
+        options.maxSpoolBytes = 4 * 1024 * 1024;
+        options.spoolDirectory = dir / "transfer-spools";
+        auto sender = std::make_shared<transfer::TransferBudget>(options);
+        auto receiver = std::make_shared<transfer::TransferBudget>(options);
+        auto exportOwner = std::shared_ptr<void>{new int{1}, [exportPath](void* value) {
+            delete static_cast<int*>(value);
+            std::error_code ignored;
+            std::filesystem::remove(exportPath, ignored);
+        }};
+        auto message = transfer::snapshotFileMessage(SnapshotFileEntry{
+            .path = exportPath,
+            .dataOffset = padding.size(),
+            .keySize = static_cast<uint32_t>(key.size()),
+            .valueSize = value.size(),
+            .payloadCrc32c = akkaradb::cpu::CRC32C(
+                reinterpret_cast<const std::byte*>(expected.data()), expected.size()),
+            .storage = exportOwner,
+        }, sender);
+        exportOwner.reset();
+        AKK_CLUSTER_CHECK(std::filesystem::exists(exportPath));
+        AKK_CLUSTER_CHECK(message->payload.empty());
+        AKK_CLUSTER_CHECK(message->payloadSize() == expected.size());
+        AKK_CLUSTER_CHECK(sender->used(transfer::TransferBudget::Resource::SPOOL) == 0);
+
+        std::vector<std::vector<uint8_t>> frames;
+        AKK_CLUSTER_CHECK(transfer::sendMessage(*message, sender, [&](std::span<const uint8_t> wire) {
+            frames.emplace_back(wire.begin(), wire.end());
+            return true;
+        }));
+        size_t frameIndex = 0;
+        const auto received = transfer::receiveMessage(receiver, [&](DecodedFrame& frame) {
+            return frameIndex < frames.size() && decodeFrame(frames[frameIndex++], frame);
+        });
+        std::span<const uint8_t> receivedKey;
+        std::span<const uint8_t> receivedValue;
+        AKK_CLUSTER_CHECK(received && transfer::snapshotView(received->payload, receivedKey, receivedValue));
+        AKK_CLUSTER_CHECK(textOf(receivedKey) == key && textOf(receivedValue) == value);
+
+        auto session = std::make_shared<transfer::TransferSession>();
+        std::mutex framesMutex;
+        std::vector<std::vector<uint8_t>> resumedFrames;
+        const uint64_t resumeOffset = expected.size() / 2;
+        auto sending = std::async(std::launch::async, [&] {
+            return transfer::sendMessage(*message, sender, session, [&](std::span<const uint8_t> wire) {
+                std::lock_guard lock{framesMutex};
+                resumedFrames.emplace_back(wire.begin(), wire.end());
+                return true;
+            });
+        });
+        AKK_CLUSTER_CHECK(waitUntil([&] { std::lock_guard lock{framesMutex}; return !resumedFrames.empty(); }));
+        DecodedFrame begin;
+        {
+            std::lock_guard lock{framesMutex};
+            AKK_CLUSTER_CHECK(decodeFrame(resumedFrames.front(), begin));
+        }
+        transfer::TransferId id{};
+        std::copy_n(begin.payload.begin() + 14, id.size(), id.begin());
+        AKK_CLUSTER_CHECK(session->notifyReady(id, resumeOffset));
+        AKK_CLUSTER_CHECK(sending.get());
+        DecodedFrame firstChunk;
+        {
+            std::lock_guard lock{framesMutex};
+            AKK_CLUSTER_CHECK(resumedFrames.size() > 2 && decodeFrame(resumedFrames[1], firstChunk));
+        }
+        AKK_CLUSTER_CHECK(firstChunk.type == ReplMsgType::TRANSFER_CHUNK && readU64Le(firstChunk.payload, 0) == resumeOffset);
+        AKK_CLUSTER_CHECK(std::equal(firstChunk.payload.begin() + 8, firstChunk.payload.end(),
+            expected.begin() + static_cast<std::ptrdiff_t>(resumeOffset)));
+        AKK_CLUSTER_CHECK(sender->used(transfer::TransferBudget::Resource::SPOOL) == 0);
+        exportOut.write("next-entry", 10);
+        exportOut.flush();
+        AKK_CLUSTER_CHECK(static_cast<bool>(exportOut));
+        exportOut.close();
+        message.reset();
+        AKK_CLUSTER_CHECK(!std::filesystem::exists(exportPath));
+    }
+
+    void testMemoryOnlySnapshotModes() {
+        using akkaradb::engine::memtable::MemTable;
+        MemTable::Options options;
+        options.shardCount = 1;
+        options.flushMode = akkaradb::engine::memtable::MemTableFlushMode::MANUAL_ONLY;
+        options.thresholdBytesPerShard = 0;
+        auto table = MemTable::create(options);
+        table->put(bytesOf("key"), bytesOf("old"), 1);
+        table->put(bytesOf("removed"), bytesOf("present"), 2);
+
+        MemTable::KeyRange range;
+        auto first = table->sealAndPinMemoryIterator(range, 2, true, 16 * 1024 * 1024, 1);
+        AKK_CLUSTER_CHECK(first.has_value());
+        table->put(bytesOf("key"), bytesOf("new"), 3);
+        table->remove(bytesOf("removed"), 4);
+        table->put(bytesOf("added"), bytesOf("later"), 5);
+
+        std::vector<std::pair<std::string, std::string>> snapshotRows;
+        while (first->hasNext()) {
+            const auto record = first->next();
+            AKK_CLUSTER_CHECK(record.has_value());
+            snapshotRows.emplace_back(textOf(record->key()), textOf(record->value()));
+        }
+        const std::vector<std::pair<std::string, std::string>> expectedRows{
+            {"key", "old"}, {"removed", "present"}
+        };
+        AKK_CLUSTER_CHECK(snapshotRows == expectedRows);
+
+        akkaradb::core::RecordView current;
+        AKK_CLUSTER_CHECK(table->get(bytesOf("key"), 5, &current) && textOf(current.value()) == "new");
+        AKK_CLUSTER_CHECK(table->get(bytesOf("removed"), 5, &current) && current.isTombstone());
+
+        // THROUGHPUT_FIRST never waits behind an existing pin or an
+        // undersized pinned-byte budget.
+        AKK_CLUSTER_CHECK(!table->sealAndPinMemoryIterator(range, 5, false, 16 * 1024 * 1024, 1));
+        first.reset();
+        AKK_CLUSTER_CHECK(!table->sealAndPinMemoryIterator(range, 5, false, 1, 1));
+
+        auto blocker = table->sealAndPinMemoryIterator(range, 5, true, 16 * 1024 * 1024, 1);
+        AKK_CLUSTER_CHECK(blocker.has_value());
+        auto waiting = std::async(std::launch::async, [&] {
+            return table->sealAndPinMemoryIterator(range, 5, true, 16 * 1024 * 1024, 1);
+        });
+        AKK_CLUSTER_CHECK(waiting.wait_for(std::chrono::milliseconds{50}) == std::future_status::timeout);
+        blocker.reset();
+        auto completed = waiting.get();
+        AKK_CLUSTER_CHECK(completed.has_value());
+        completed.reset();
+
+        AKK_CLUSTER_CHECK(table->get(bytesOf("key"), 5, &current) && textOf(current.value()) == "new");
+        AKK_CLUSTER_CHECK(table->get(bytesOf("removed"), 5, &current) && current.isTombstone());
+        AKK_CLUSTER_CHECK(waitUntil([&] { return table->snapshot().immutableTables <= 1; }));
+
+        uint64_t sequence = 5;
+        for (unsigned cycle = 0; cycle < 8; ++cycle) {
+            auto pinned = table->sealAndPinMemoryIterator(range, sequence, true, 16 * 1024 * 1024, 1);
+            AKK_CLUSTER_CHECK(pinned.has_value());
+            table->put(bytesOf("key"), bytesOf(std::to_string(cycle)), ++sequence);
+            pinned.reset();
+            AKK_CLUSTER_CHECK(waitUntil([&] { return table->snapshot().immutableTables <= 1; }));
+        }
+
+        std::atomic<bool> rejectBackends{false};
+        MemTable::Options retryOptions = options;
+        retryOptions.backendFactory = [&]() -> std::unique_ptr<akkaradb::engine::memtable::IMemTable> {
+            if (rejectBackends.load(std::memory_order_acquire)) { return nullptr; }
+            return std::make_unique<akkaradb::engine::memtable::SkipListMemTable>();
+        };
+        auto retryTable = MemTable::create(retryOptions);
+        retryTable->put(bytesOf("retry"), bytesOf("old"), 1);
+        auto retrySnapshot = retryTable->sealAndPinMemoryIterator(range, 1, true, 16 * 1024 * 1024, 1);
+        AKK_CLUSTER_CHECK(retrySnapshot.has_value());
+        retryTable->put(bytesOf("retry"), bytesOf("new"), 2);
+        rejectBackends.store(true, std::memory_order_release);
+        retrySnapshot.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = retryTable->snapshot();
+            return stats.memorySnapshotCompactionFailures != 0 && stats.memorySnapshotCompactionPending &&
+                stats.memorySnapshotCompactionLastFailureAtUs != 0;
+        }));
+        AKK_CLUSTER_CHECK(retryTable->get(bytesOf("retry"), 2, &current) && textOf(current.value()) == "new");
+        rejectBackends.store(false, std::memory_order_release);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = retryTable->snapshot();
+            return stats.memorySnapshotCompactionsCompleted != 0 && !stats.memorySnapshotCompactionPending &&
+                stats.immutableTables <= 1;
+        }));
+        auto retryThroughput = retryTable->sealAndPinMemoryIterator(range, 2, false, 16 * 1024 * 1024, 1);
+        AKK_CLUSTER_CHECK(retryThroughput.has_value());
+        retryThroughput.reset();
+
+        auto closingTable = MemTable::create(options);
+        closingTable->put(bytesOf("close"), bytesOf("safe"), 1);
+        auto survivesClose = closingTable->sealAndPinMemoryIterator(range, 1, true, 16 * 1024 * 1024, 1);
+        AKK_CLUSTER_CHECK(survivesClose.has_value());
+        closingTable.reset();
+        AKK_CLUSTER_CHECK(survivesClose->hasNext());
+        const auto closeRecord = survivesClose->next();
+        AKK_CLUSTER_CHECK(closeRecord && textOf(closeRecord->value()) == "safe");
+        survivesClose.reset();
+    }
+
     void testLargeReplicationTransfer(bool secure) {
         namespace transfer = akkaradb::engine::cluster::detail;
         const auto dir = makeTempDir(secure ? "large-secure-transfer" : "large-plain-transfer");
@@ -2716,8 +3626,22 @@ namespace {
         }
         server->start();
         for (auto& client : clients) { client->start(); }
-        AKK_CLUSTER_CHECK(waitUntil([&] { return server->replicaCount() == 2; }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return server->replicaCount() == 2 && std::ranges::all_of(clients, [](const auto& client) { return client->connected(); });
+        }));
         AKK_CLUSTER_CHECK(server->stats().connectedReplicas == 2);
+        std::vector<uint64_t> initialContacts;
+        initialContacts.reserve(clients.size());
+        for (const auto& client : clients) {
+            AKK_CLUSTER_CHECK(client->lastSuccessfulContactAtUs() != 0);
+            initialContacts.push_back(client->lastSuccessfulContactAtUs());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1'500});
+        AKK_CLUSTER_CHECK(server->replicaCount() == 2);
+        for (size_t i = 0; i < clients.size(); ++i) {
+            AKK_CLUSTER_CHECK(clients[i]->connected());
+            AKK_CLUSTER_CHECK(clients[i]->lastSuccessfulContactAtUs() == initialContacts[i]);
+        }
         server->shipEntry(1, ReplOpType::PUT, bytesOf("large"), bytesOf(value), 0, 1);
         AKK_CLUSTER_CHECK(applied.load() == 2);
         // Both queues and the retained history share one temporary payload.
@@ -2834,6 +3758,72 @@ namespace {
         AKK_CLUSTER_CHECK(completed.peers.front().roundTripLatencyUs.bucketCounts.back() == 1);
         local->runtime->close();
         peer->close();
+    }
+
+    void testClusterRuntimeRoleChangeDoesNotJoinEndpointUnderStateLock() {
+        ScopedPrimaryStepDown primaryStepDown;
+        const auto dir = makeTempDir("runtime-role-change-lock");
+        const ClusterConfig cfg{
+            {node(1, 23661, 23671), node(2, 23662, 23672)},
+            ReplicationMode::MIRROR,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 1000},
+        };
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.startupRole = NodeStartupRole::PRIMARY;
+        options.clusterGroupId = 9025;
+        options.clusterGroupEpoch = 1;
+
+        ClusterRuntime* runtimeView = nullptr;
+        std::promise<void> readEntered;
+        auto readEnteredFuture = readEntered.get_future();
+        std::promise<void> releaseRead;
+        auto readReleased = releaseRead.get_future().share();
+        std::promise<void> roleChangeFinished;
+        auto roleChangeFinishedFuture = roleChangeFinished.get_future();
+        std::atomic<bool> replicaRoleReported{false};
+
+        ClusterEngineCallbacks callbacks;
+        callbacks.getCurrentSeq = [] { return uint64_t{0}; };
+        callbacks.getLastSeq = [] { return uint64_t{0}; };
+        callbacks.read = [&](std::span<const uint8_t>, uint64_t) {
+            readEntered.set_value();
+            readReleased.wait();
+            (void)runtimeView->raftStats();
+            ReadResponse response;
+            response.status = ReadStatus::NOT_FOUND;
+            return response;
+        };
+        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t) {};
+        callbacks.forceDurable = [] {};
+        callbacks.roleChange = [&](NodeRole role) {
+            if (role == NodeRole::REPLICA && !replicaRoleReported.exchange(true)) { roleChangeFinished.set_value(); }
+        };
+
+        auto runtime = ClusterRuntime::create(dir, cfg, 1, std::move(callbacks), options);
+        runtimeView = runtime.get();
+        runtime->start();
+
+        auto client = ReplicationClient::create("127.0.0.1", 23671, 2, [] { return uint64_t{0}; }, {}, options);
+        client->setApplyCallback([](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t) {});
+        client->setForceDurableCallback([] {});
+        client->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return client->connected(); }));
+        auto read = std::async(std::launch::async, [&] { return client->readKey(bytesOf("blocked"), 0, 5000); });
+        AKK_CLUSTER_CHECK(readEnteredFuture.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+
+        primaryStepDown.trigger();
+        const bool steppedDown = waitUntil([&] { return runtime->role() == NodeRole::REPLICA; }, std::chrono::seconds{2});
+        if (steppedDown) { std::this_thread::sleep_for(std::chrono::milliseconds{50}); }
+        releaseRead.set_value();
+
+        AKK_CLUSTER_CHECK(steppedDown);
+        AKK_CLUSTER_CHECK(roleChangeFinishedFuture.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+        AKK_CLUSTER_CHECK(read.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+        try { (void)read.get(); } catch (const std::runtime_error&) {}
+        client->close();
+        runtime->close();
     }
 
     void testClusterRuntimeStartCanRetryAfterFailure() {
@@ -3489,11 +4479,35 @@ namespace {
 
     void testBlobReadPinDefersGcDeletion() {
         const auto dir = makeTempDir("blob-read-pin");
-        auto manager = blob::BlobManager::create(dir, {});
+        blob::BlobManager::Options blobOptions;
+        blobOptions.codec = blob::BlobCodec::ZSTD;
+        auto manager = blob::BlobManager::create(dir, blobOptions);
         manager->start();
-        manager->write(7, bytesOf("snapshot-blob"));
+        std::vector<uint8_t> expected(2u * 1024u * 1024u + 257u);
+        for (size_t i = 0; i < expected.size(); ++i) { expected[i] = static_cast<uint8_t>((i / 17u) % 31u); }
+        manager->write(7, expected);
         const auto path = manager->blobPath(7);
         AKK_CLUSTER_CHECK(std::filesystem::exists(path));
+
+        std::vector<uint8_t> streamed;
+        streamed.reserve(expected.size());
+        uint64_t expectedOffset = 0;
+        size_t chunks = 0;
+        AKK_CLUSTER_CHECK(manager->streamRead(
+            7,
+            blob::crc32c(expected),
+            64u * 1024u,
+            [&](uint64_t offset, std::span<const uint8_t> chunk) {
+                AKK_CLUSTER_CHECK(offset == expectedOffset);
+                AKK_CLUSTER_CHECK(chunk.size() <= 64u * 1024u);
+                streamed.insert(streamed.end(), chunk.begin(), chunk.end());
+                expectedOffset += chunk.size();
+                ++chunks;
+                return true;
+            }
+        ));
+        AKK_CLUSTER_CHECK(chunks > 1);
+        AKK_CLUSTER_CHECK(streamed == expected);
 
         auto pin = manager->pinReads();
         manager->scheduleDelete(7);
@@ -3933,20 +4947,41 @@ namespace {
 
     void testStripeReadRepairStatistics() {
         const auto dir = makeTempDir("stripe-repair-statistics");
-        const auto key = keyOwnedBy(stripeStorageConfig(), 1, "repair-stats");
-        auto n1 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 1));
-        auto n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
-        AKK_CLUSTER_CHECK(waitUntil([&] {
+        constexpr std::array<uint64_t, 2> placement{1, 2};
+        const auto key = keyPlacedOn(stripeStorageConfig(), placement, "repair-stats");
+        const auto repairOptions = [&](uint64_t nodeId) {
+            auto options = stripeStorageOptions(dir, nodeId);
+            options.cluster.runtime.stripeAutoRebuild = false;
+            options.cluster.runtime.stripeWriteCommitMode = StripeWriteCommitMode::ALL_SHARDS;
+            return options;
+        };
+        auto n1 = akkaradb::engine::AkkEngine::open(repairOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(repairOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(repairOptions(3));
+        std::string lastWriteFailure;
+        const bool writeReady = waitUntil([&] {
             try { n1->put(bytesOf(key), bytesOf("repair-value")); return true; }
-            catch (const std::runtime_error&) { return false; }
-        }));
+            catch (const std::runtime_error& error) { lastWriteFailure = error.what(); return false; }
+        });
+        if (!writeReady) { throw std::runtime_error("STRIPE read-repair setup write did not become ready: " + lastWriteFailure); }
         AKK_CLUSTER_CHECK(n1->stats().stripeReadRepair.attempts == 0);
         n2->close();
         n2.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats();
+            const auto peer = std::ranges::find(stats.cluster.peers, uint64_t{2}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId);
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
         const auto value = engineGet(*n1, key);
         AKK_CLUSTER_CHECK(value && textOf(*value) == "repair-value");
         const auto failed = n1->stats().stripeReadRepair;
-        AKK_CLUSTER_CHECK(failed.attempts == 1 && failed.failed == 1 && failed.succeeded == 0 && failed.lastFailureNodeId == 2);
+        if (failed.attempts != 1 || failed.failed != 1 || failed.succeeded != 0 || failed.lastFailureNodeId != 2) {
+            throw std::runtime_error(
+                "unexpected STRIPE repair counters: attempts=" + std::to_string(failed.attempts) +
+                " failed=" + std::to_string(failed.failed) + " succeeded=" + std::to_string(failed.succeeded) +
+                " lastFailureNodeId=" + std::to_string(failed.lastFailureNodeId)
+            );
+        }
         // Remove the replica's shard through its offline local storage, leaving
         // the owner's published metadata untouched.
         auto offlineOptions = stripeStorageOptions(dir, 2);
@@ -3962,7 +4997,7 @@ namespace {
         AKK_CLUSTER_CHECK(!shardKeys.empty());
         for (const auto& shardKey : shardKeys) { offline->remove(shardKey); }
         offline->close();
-        n2 = akkaradb::engine::AkkEngine::open(stripeStorageOptions(dir, 2));
+        n2 = akkaradb::engine::AkkEngine::open(repairOptions(2));
         AKK_CLUSTER_CHECK(waitUntil([&] {
             const auto repaired = engineGet(*n1, key);
             return repaired && textOf(*repaired) == "repair-value" && n1->stats().stripeReadRepair.succeeded >= 1;
@@ -3973,15 +5008,25 @@ namespace {
         AKK_CLUSTER_CHECK(stripeInternalCounts(*n2).first == 1);
         const auto again = engineGet(*n1, key);
         AKK_CLUSTER_CHECK(again && n1->stats().stripeReadRepair.attempts == repaired.attempts);
+        n3->close();
         AKK_CLUSTER_CHECK(n2->stats().stripeReadRepair.attempts == 0);
         n2->close();
         n1->close();
-        auto disabledOptions = stripeStorageOptions(dir, 1);
+        auto disabledOptions = repairOptions(1);
         disabledOptions.cluster.runtime.stripeReadRepair = false;
         n1 = akkaradb::engine::AkkEngine::open(disabledOptions);
-        const auto withoutRepair = engineGet(*n1, key);
-        AKK_CLUSTER_CHECK(withoutRepair && textOf(*withoutRepair) == "repair-value");
+        n2 = akkaradb::engine::AkkEngine::open(repairOptions(2));
+        n3 = akkaradb::engine::AkkEngine::open(repairOptions(3));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto withoutRepair = engineGet(*n1, key);
+                return withoutRepair && textOf(*withoutRepair) == "repair-value";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }));
         AKK_CLUSTER_CHECK(n1->stats().stripeReadRepair.attempts == 0);
+        n3->close();
+        n2->close();
         n1->close();
     }
 
@@ -4029,7 +5074,12 @@ namespace {
         options.maxReplicaQueueFrames = 2;
         options.maxReplicaQueueBytes = 1024 * 1024;
 
-        const AckPolicy ack{};
+        const AckPolicy ack{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::DURABLE};
+        const ConsistencyOptions consistency{
+            .mode = ConsistencyMode::PRIMARY_ACK,
+            .writeConsistency = WriteConsistency::AVAILABLE_REPLICAS,
+            .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE,
+        };
         ReplicationServer::Snapshot snapshot;
         snapshot.seq = 8;
         auto snapshotEntries = std::make_shared<std::vector<ReplSnapshotEntry>>();
@@ -4039,10 +5089,15 @@ namespace {
                 .value = std::vector<uint8_t>(256, static_cast<uint8_t>(0x50 + i)),
             });
         }
-        snapshot.entryCount = snapshotEntries->size();
         snapshot.forEachEntry = [snapshotEntries](const ReplicationServer::Snapshot::EntryVisitor& visitor) {
             for (const auto& entry : *snapshotEntries) {
-                if (!visitor(entry.key, entry.value)) { return false; }
+                if (!visitor.beginEntry(entry.key, entry.value.size(), snapshotValueCrc(entry.value))) { return false; }
+                for (size_t offset = 0; offset < entry.value.size();) {
+                    const size_t count = std::min<size_t>(31, entry.value.size() - offset);
+                    if (!visitor.appendValueChunk(offset, std::span<const uint8_t>{entry.value}.subspan(offset, count))) { return false; }
+                    offset += count;
+                }
+                if (!visitor.finishEntry()) { return false; }
             }
             return true;
         };
@@ -4052,7 +5107,7 @@ namespace {
             1,
             [] { return uint64_t{8}; },
             ack,
-            {},
+            consistency,
             1,
             {2},
             options,
@@ -4065,7 +5120,7 @@ namespace {
         client->setSnapshotCallbacks(
             [&](uint64_t seq, uint64_t count) {
                 AKK_CLUSTER_CHECK(seq == 8);
-                AKK_CLUSTER_CHECK(count == 8);
+                AKK_CLUSTER_CHECK(count == 0);
             },
             [](std::span<const uint8_t> key, uint64_t valueSize, uint32_t) {
                 AKK_CLUSTER_CHECK(key.size() == 2 && key[0] == 'k');
@@ -4076,7 +5131,10 @@ namespace {
                 AKK_CLUSTER_CHECK(chunk.size() == 256);
             },
             [&] { entryCount.fetch_add(1); },
-            [&](uint64_t seq) { lastSeq.store(seq); }
+            [&](uint64_t seq, uint64_t count) {
+                AKK_CLUSTER_CHECK(count == 8);
+                lastSeq.store(seq);
+            }
         );
 
         server->start();
@@ -4103,9 +5161,9 @@ namespace {
             .key = std::vector<uint8_t>{'k'},
             .value = std::vector<uint8_t>{'v'},
         });
-        snapshot.entryCount = 1;
         snapshot.forEachEntry = [snapshotEntry](const ReplicationServer::Snapshot::EntryVisitor& visitor) {
-            return visitor(snapshotEntry->key, snapshotEntry->value);
+            return visitor.beginEntry(snapshotEntry->key, snapshotEntry->value.size(), snapshotValueCrc(snapshotEntry->value)) &&
+                visitor.appendValueChunk(0, snapshotEntry->value) && visitor.finishEntry();
         };
         auto server = ReplicationServer::create(
             port,
@@ -4314,6 +5372,28 @@ namespace {
             catch (const std::invalid_argument&) {
                 rejected = true;
             }
+            AKK_CLUSTER_CHECK(rejected);
+        }
+
+        {
+            const ClusterConfig raftMirror{
+                {
+                    node(1, 20375, 20475),
+                    node(2, 20376, 20476),
+                    node(3, 20377, 20477),
+                },
+                ReplicationMode::MIRROR,
+                AckPolicy{},
+                ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM},
+            };
+            ClusterRuntimeOptions runtime;
+            runtime.transportMode = TransportMode::PLAIN;
+            runtime.clusterGroupId = 9102;
+            runtime.raftMaxReceiveMemoryBytes = 0;
+
+            bool rejected = false;
+            try { raftMirror.validateRuntime(1, runtime); }
+            catch (const std::invalid_argument&) { rejected = true; }
             AKK_CLUSTER_CHECK(rejected);
         }
 
@@ -4633,6 +5713,125 @@ namespace {
         restarted->runtime->close();
     }
 
+    void testNonRaftMirrorOfflinePromotion() {
+        const auto dir = makeTempDir("non-raft-mirror-promotion");
+        const std::vector<NodeInfo> nodes{
+            node(1, 20581, 20591),
+            node(2, 20582, 20592),
+        };
+        const AckPolicy ack{};
+        const ConsistencyOptions consistency{
+            .mode = ConsistencyMode::PRIMARY_ACK,
+            .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE,
+            .ackTimeoutMs = 2000,
+        };
+        const ClusterConfig original{nodes, ReplicationMode::MIRROR, ack, consistency, {}, {}, 1};
+
+        ClusterRuntimeOptions oldPrimaryOptions;
+        oldPrimaryOptions.startupRole = NodeStartupRole::PRIMARY;
+        ClusterRuntimeOptions oldReplicaOptions;
+        oldReplicaOptions.startupRole = NodeStartupRole::REPLICA;
+        auto oldPrimary = makeRuntime(dir / "n1", original, 1, oldPrimaryOptions);
+        auto candidate = makeRuntime(dir / "n2", original, 2, oldReplicaOptions);
+        oldPrimary->runtime->start();
+        candidate->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = oldPrimary->runtime->raftStats();
+            return std::ranges::any_of(stats.peers, [](const auto& peer) { return peer.nodeId == 2 && peer.connected; });
+        }));
+
+        oldPrimary->setState(7, bytesOf("mirror-key"), bytesOf("before-promotion"));
+        candidate->setState(7, bytesOf("mirror-key"), bytesOf("before-promotion"));
+        const auto originalGroup = readGroupState(dir / "n1" / "cluster.membership");
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupId == originalGroup.groupId);
+        candidate->runtime->close();
+        oldPrimary->runtime->close();
+        candidate.reset();
+        oldPrimary.reset();
+
+        const ClusterConfig promoted{nodes, ReplicationMode::MIRROR, ack, consistency, {}, {}, 2, original.clusterId()};
+        ClusterRuntimeOptions unapproved;
+        unapproved.startupRole = NodeStartupRole::PRIMARY;
+        auto rejected = makeRuntime(dir / "n2", promoted, 2, unapproved);
+        bool rejectedWithoutAuthorization = false;
+        try { rejected->runtime->start(); }
+        catch (const std::runtime_error&) { rejectedWithoutAuthorization = true; }
+        AKK_CLUSTER_CHECK(rejectedWithoutAuthorization);
+        rejected->runtime->close();
+        rejected.reset();
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").primaryNodeId == 1);
+
+        ClusterRuntimeOptions promotion;
+        promotion.startupRole = NodeStartupRole::PRIMARY;
+        promotion.mirrorPromotion = MirrorPromotionOptions{
+            .enabled = true,
+            .previousPrimaryNodeId = 1,
+            .previousGroupEpoch = originalGroup.groupEpoch,
+            .expectedDurableSeq = 6,
+        };
+        auto staleCandidate = makeRuntime(dir / "n2", promoted, 2, promotion);
+        bool rejectedStaleCandidate = false;
+        try { staleCandidate->runtime->start(); }
+        catch (const std::runtime_error&) { rejectedStaleCandidate = true; }
+        AKK_CLUSTER_CHECK(rejectedStaleCandidate);
+        staleCandidate->runtime->close();
+        staleCandidate.reset();
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupEpoch == originalGroup.groupEpoch);
+
+        promotion.mirrorPromotion.expectedDurableSeq = 7;
+        promotion.clusterGroupId = originalGroup.groupId == UINT64_MAX
+            ? originalGroup.groupId - 1
+            : originalGroup.groupId + 1;
+        auto wrongGroupCandidate = makeRuntime(dir / "n2", promoted, 2, promotion);
+        bool rejectedWrongGroup = false;
+        try { wrongGroupCandidate->runtime->start(); }
+        catch (const std::runtime_error&) { rejectedWrongGroup = true; }
+        AKK_CLUSTER_CHECK(rejectedWrongGroup);
+        wrongGroupCandidate->runtime->close();
+        wrongGroupCandidate.reset();
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupEpoch == originalGroup.groupEpoch);
+
+        promotion.clusterGroupId = 0;
+        auto newPrimary = makeRuntime(dir / "n2", promoted, 2, promotion);
+        newPrimary->runtime->start();
+        const auto promotedGroup = readGroupState(dir / "n2" / "cluster.membership");
+        AKK_CLUSTER_CHECK(promotedGroup.groupId == originalGroup.groupId);
+        AKK_CLUSTER_CHECK(promotedGroup.primaryNodeId == 2);
+        AKK_CLUSTER_CHECK(promotedGroup.groupEpoch == originalGroup.groupEpoch + 1);
+
+        ClusterRuntimeOptions demoted;
+        demoted.startupRole = NodeStartupRole::REPLICA;
+        demoted.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        demoted.mirrorPromotion = promotion.mirrorPromotion;
+        auto oldAsReplica = makeRuntime(dir / "n1", promoted, 1, demoted);
+        oldAsReplica->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = newPrimary->runtime->raftStats();
+            return std::ranges::any_of(stats.peers, [](const auto& peer) { return peer.nodeId == 1 && peer.connected; });
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto path = dir / "n1" / "cluster.membership";
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec) || ec || std::filesystem::file_size(path, ec) != 33 || ec) { return false; }
+            try {
+                const auto state = readGroupState(path);
+                return state.primaryNodeId == 2 && state.groupEpoch == promotedGroup.groupEpoch;
+            }
+            catch (const std::runtime_error&) { return false; }
+        }));
+        const auto demotedGroup = readGroupState(dir / "n1" / "cluster.membership");
+        AKK_CLUSTER_CHECK(demotedGroup.primaryNodeId == 2);
+        AKK_CLUSTER_CHECK(demotedGroup.groupEpoch == promotedGroup.groupEpoch);
+
+        newPrimary->setState(8, bytesOf("mirror-key"), bytesOf("after-promotion"));
+        const auto routedRead = oldAsReplica->runtime->readKey(bytesOf("mirror-key"), 8);
+        AKK_CLUSTER_CHECK(routedRead.status == ReadStatus::FOUND);
+        AKK_CLUSTER_CHECK(textOf(routedRead.value) == "after-promotion");
+
+        oldAsReplica->runtime->close();
+        newPrimary->runtime->close();
+    }
+
     void testClusterRuntimeRejectsUnknownReplicaFromAckQuorum() {
         const auto dir = makeTempDir("cluster-runtime-unknown-replica");
         ConsistencyOptions consistency;
@@ -4948,7 +6147,7 @@ namespace {
             },
             ReplicationMode::MIRROR,
             AckPolicy{},
-            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 300},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 3000},
         };
 
         ClusterRuntimeOptions options;
@@ -5037,6 +6236,8 @@ namespace {
         AKK_CLUSTER_CHECK(stored.has_value());
         AKK_CLUSTER_CHECK(textOf(*stored) == value);
         AKK_CLUSTER_CHECK(engine->stats().blobPutsTotal >= 1);
+        AKK_CLUSTER_CHECK(std::filesystem::exists(options.paths.dataDir / "cluster-raft.log"));
+        AKK_CLUSTER_CHECK(!std::filesystem::exists(options.paths.dataDir / "raft.log"));
         engine->close();
     }
 
@@ -5148,7 +6349,7 @@ namespace {
             options.cluster.config = cfg;
             options.cluster.runtime.transportMode = TransportMode::PLAIN;
             options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
-            options.cluster.runtime.raftBlobChunkSizeBytes = 17;
+            options.cluster.runtime.raftBlobChunkSizeBytes = 64u * 1024u;
             options.cluster.runtime.raftSnapshot.minLogEntries = 1;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
@@ -5163,7 +6364,7 @@ namespace {
         AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(liveNodes) != nullptr; }, std::chrono::milliseconds{20000}));
 
         const std::string key = "raft-engine-large-blob-snapshot-key";
-        const std::vector<uint8_t> value = deterministicBytes(257, 0xA44A'5EED'B10B'0001ull);
+        const std::vector<uint8_t> value = deterministicBytes(1024u * 1024u + 257u, 0xA44A'5EED'B10B'0001ull);
         runOnEngineLeader(
             liveNodes,
             [&](akkaradb::engine::AkkEngine& leader) {
@@ -5448,6 +6649,10 @@ int main(int argc, char** argv) {
         if (argc == 4 && std::string_view{argv[1]} == "--raft-log-crash-writer") { return runRaftLogCrashWriter(argv[2], argv[3]); }
         if (argc == 4 && std::string_view{argv[1]} == "--retry-crash-writer") { return runRetryCrashWriter(argv[2], argv[3]); }
         const auto executable = std::filesystem::absolute(argv[0]);
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-crash-recovery") {
+            testStripePublicationCrashRecovery(executable);
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--replication-catchup") {
             // Focused coverage for bounded bootstrap, live cutover, and worker cleanup.
             testReplicationServerStreamsSnapshotCatchupThroughBoundedQueue();
@@ -5479,8 +6684,70 @@ int main(int argc, char** argv) {
             testStripeFailureAndConcurrentReads();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-read-repair") {
+            testStripeReadRepairStatistics();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-degraded-rebuild") {
+            testStripeEngineDegradedWriteAndAutomaticRebuild();
+            testStripeMetadataLeaderAutomaticRebuild();
+            testStripeMetadataRaftLeaderFailover();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid0") {
+            testStripeErasureCodecRecovery();
+            testPartitionedAndStripeRouting();
+            testRaid0PresetStorageAndFailure();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid1") {
+            testRaid1PresetMirroringAndRebuild();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--partitioned-owner-read") {
+            testPartitionedEngineOwnerLinearizableRead();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--lease-renewal") {
+            testClusterManagerContainsLeaseRenewalFailure();
+            testClusterRuntimeReportsLeaseRenewalFailure();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--mirror-promotion") {
+            testReplicaRejectsImplicitNonRaftGroupSwitch();
+            testNonRaftMirrorRejectsSecondPrimary();
+            testNonRaftPrimaryReusesGroupStateAfterRestart();
+            testNonRaftMirrorOfflinePromotion();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--runtime-lifecycle") {
+            testStripeRuntimeStartsActivePlacement();
+            testClusterRuntimeDoesNotSerializePeerReadWithStats();
+            testClusterRuntimeRoleChangeDoesNotJoinEndpointUnderStateLock();
+            testClusterRuntimeStartCanRetryAfterFailure();
+            testClusterRuntimeReportsEndpointStartFailure();
+            testClusterRuntimeReportsPeerReadTimeout();
+            testClusterRuntimeReportsLeaseRenewalFailure();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--stripe-failover") {
             testStripeOwnerFailoverAndHandoff();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-engine-ledger") {
+            testRetrySafeEngineWrites();
+            testRaftLogBlobPolicyReplicatesPayload();
+            testRaftLogBlobPolicyExternalizesEngineValue();
+            testRaftEngineLeaderAppliesMutationOnce();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--file-snapshot-transfer") {
+            testFileBackedSnapshotTransfer();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--memory-only-snapshot") {
+            testRaftOptionsRoundtripAndValidation();
+            testMemoryOnlySnapshotModes();
             return 0;
         }
         if (argc == 1 || (argc == 2 && std::string_view{argv[1]} == "--retry-transfer")) {
@@ -5496,6 +6763,10 @@ int main(int argc, char** argv) {
             testRetryAcrossSnapshotAndLeaderChange();
             std::fprintf(stderr, "[cluster] chunked transfer validation\n");
             testChunkedTransferValidation();
+            std::fprintf(stderr, "[cluster] file-backed snapshot transfer\n");
+            testFileBackedSnapshotTransfer();
+            std::fprintf(stderr, "[cluster] memory-only snapshot modes\n");
+            testMemoryOnlySnapshotModes();
             std::fprintf(stderr, "[cluster] large transfers PLAIN/SECURE\n");
             testLargeReplicationTransfer(false);
             testLargeReplicationTransfer(true);
@@ -5576,8 +6847,16 @@ int main(int argc, char** argv) {
         testStripePublicationCrashRecovery(executable);
         std::fprintf(stderr, "[cluster] testStripeFailureAndConcurrentReads\n");
         testStripeFailureAndConcurrentReads();
+        std::fprintf(stderr, "[cluster] testRaid0PresetStorageAndFailure\n");
+        testRaid0PresetStorageAndFailure();
+        std::fprintf(stderr, "[cluster] testRaid1PresetMirroringAndRebuild\n");
+        testRaid1PresetMirroringAndRebuild();
         std::fprintf(stderr, "[cluster] testStripeOwnerFailoverAndHandoff\n");
         testStripeOwnerFailoverAndHandoff();
+        std::fprintf(stderr, "[cluster] testStripeMetadataLeaderAutomaticRebuild\n");
+        testStripeMetadataLeaderAutomaticRebuild();
+        std::fprintf(stderr, "[cluster] testStripeMetadataRaftLeaderFailover\n");
+        testStripeMetadataRaftLeaderFailover();
         std::fprintf(stderr, "[cluster] testRaftSegmentedLogRecovery\n");
         testRaftSegmentedLogRecovery(executable);
         if (argc == 2 && std::string_view{argv[1]} == "--storage") { return 0; }
@@ -5603,8 +6882,8 @@ int main(int argc, char** argv) {
         testPartitionedEngineOwnerLinearizableRead();
         std::fprintf(stderr, "[cluster] testStripeEngineOwnerOnlyWritesAndCoordinatorReads\n");
         testStripeEngineOwnerOnlyWritesAndCoordinatorReads();
-        std::fprintf(stderr, "[cluster] testStripeEngineRejectsDegradedWriteCommit\n");
-        testStripeEngineRejectsDegradedWriteCommit();
+        std::fprintf(stderr, "[cluster] testStripeEngineDegradedWriteAndAutomaticRebuild\n");
+        testStripeEngineDegradedWriteAndAutomaticRebuild();
         std::fprintf(stderr, "[cluster] testStripeEngineRejectsOnlineReconfiguration\n");
         testStripeEngineRejectsOnlineReconfiguration();
         std::fprintf(stderr, "[cluster] testClusterManagerRecoversPrimaryLeaseFromManifest\n");
@@ -5664,6 +6943,8 @@ int main(int argc, char** argv) {
         testReplicationServerReapsDisconnectedReplicas();
         std::fprintf(stderr, "[cluster] testClusterRuntimeDoesNotSerializePeerReadWithStats\n");
         testClusterRuntimeDoesNotSerializePeerReadWithStats();
+        std::fprintf(stderr, "[cluster] testClusterRuntimeRoleChangeDoesNotJoinEndpointUnderStateLock\n");
+        testClusterRuntimeRoleChangeDoesNotJoinEndpointUnderStateLock();
         std::fprintf(stderr, "[cluster] testClusterRuntimeStartCanRetryAfterFailure\n");
         testClusterRuntimeStartCanRetryAfterFailure();
         std::fprintf(stderr, "[cluster] testClusterRuntimeReportsEndpointStartFailure\n");
@@ -5688,6 +6969,8 @@ int main(int argc, char** argv) {
         testNonRaftPrimaryBacksUpCorruptGroupState();
         std::fprintf(stderr, "[cluster] testNonRaftPrimaryReusesGroupStateAfterRestart\n");
         testNonRaftPrimaryReusesGroupStateAfterRestart();
+        std::fprintf(stderr, "[cluster] testNonRaftMirrorOfflinePromotion\n");
+        testNonRaftMirrorOfflinePromotion();
         std::fprintf(stderr, "[cluster] testClusterRuntimeRejectsUnknownReplicaFromAckQuorum\n");
         testClusterRuntimeRejectsUnknownReplicaFromAckQuorum();
         std::fprintf(stderr, "[cluster] testClusterRuntimeRejectsDuplicateReplicaFromAckQuorum\n");

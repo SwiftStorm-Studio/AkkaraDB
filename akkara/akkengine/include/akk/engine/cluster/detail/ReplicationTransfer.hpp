@@ -72,11 +72,35 @@ namespace akkaradb::engine::cluster::detail {
         uint32_t crc = 0;
         std::span<const uint8_t> payload;
         std::shared_ptr<void> storage;
-        size_t size() const { return ReplFrameHeader::SIZE + payload.size(); }
+        uint64_t externalPayloadSize = 0;
+        std::function<bool(uint64_t offset, std::span<uint8_t> destination)> readExternalPayload;
+        [[nodiscard]] uint64_t payloadSize() const noexcept {
+            return readExternalPayload ? externalPayloadSize : payload.size();
+        }
+        size_t size() const { return ReplFrameHeader::SIZE + static_cast<size_t>(payloadSize()); }
     };
     using MessagePtr = std::shared_ptr<const TransferMessage>;
     using SendFrame = std::function<bool(std::span<const uint8_t>)>;
     using ReceiveFrame = std::function<bool(DecodedFrame&)>;
+
+    class AKKARADB_CLUSTER_RUNTIME_API SnapshotMessageBuilder {
+    public:
+        SnapshotMessageBuilder(
+            std::span<const uint8_t> key,
+            uint64_t valueSize,
+            const std::shared_ptr<TransferBudget>& budget
+        );
+        ~SnapshotMessageBuilder();
+        SnapshotMessageBuilder(const SnapshotMessageBuilder&) = delete;
+        SnapshotMessageBuilder& operator=(const SnapshotMessageBuilder&) = delete;
+
+        void appendValueChunk(uint64_t offset, std::span<const uint8_t> chunk);
+        [[nodiscard]] MessagePtr finish();
+
+    private:
+        class Impl;
+        std::unique_ptr<Impl> impl_;
+    };
 
     AKKARADB_CLUSTER_RUNTIME_API void validateTransferOptions(const ReplicationTransferOptions& options);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr makeMessage(ReplMsgType type, std::span<const std::span<const uint8_t>> parts,
@@ -93,6 +117,13 @@ namespace akkaradb::engine::cluster::detail {
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr snapshotMessage(const ReplSnapshotEntry& entry, const std::shared_ptr<TransferBudget>& budget);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr snapshotMessage(std::span<const uint8_t> key, std::span<const uint8_t> value,
         const std::shared_ptr<TransferBudget>& budget);
+    AKKARADB_CLUSTER_RUNTIME_API MessagePtr snapshotFileMessage(const SnapshotFileEntry& entry,
+        const std::shared_ptr<TransferBudget>& budget);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::unique_ptr<SnapshotMessageBuilder> beginSnapshotMessage(
+        std::span<const uint8_t> key,
+        uint64_t valueSize,
+        const std::shared_ptr<TransferBudget>& budget
+    );
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr readResponseMessage(const ReadResponse& response, const std::shared_ptr<TransferBudget>& budget);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key, const std::shared_ptr<TransferBudget>& budget);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr blobMessage(uint64_t seq, uint64_t id, std::span<const uint8_t> value, const std::shared_ptr<TransferBudget>& budget);

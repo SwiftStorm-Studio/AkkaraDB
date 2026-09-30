@@ -11,6 +11,8 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <span>
 #include <memory>
 #include <vector>
@@ -19,6 +21,31 @@
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 namespace akkaradb::engine::cluster {
+    /** A completed snapshot entry stored contiguously in an owned export file. */
+    struct SnapshotFileEntry {
+        std::filesystem::path path;
+        uint64_t dataOffset = 0;
+        uint32_t keySize = 0;
+        uint64_t valueSize = 0;
+        uint32_t payloadCrc32c = 0;
+        std::shared_ptr<const void> storage;
+    };
+
+    /** Push consumer for one logical snapshot entry at a time. */
+    struct SnapshotEntryVisitor {
+        std::function<bool(std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c)> beginEntry;
+        std::function<bool(uint64_t offset, std::span<const uint8_t> chunk)> appendValueChunk;
+        std::function<bool()> finishEntry;
+        // When supplied, entries larger than this threshold may be delivered as
+        // an owned file range instead of being copied through the chunk callbacks.
+        uint64_t fileEntryThresholdBytes = UINT64_MAX;
+        std::function<bool(const SnapshotFileEntry&)> fileEntry;
+
+        [[nodiscard]] explicit operator bool() const noexcept {
+            return beginEntry && appendValueChunk && finishEntry;
+        }
+    };
+
     /**
      * ReplMsgType - Replication wire message discriminator.
      */
@@ -100,6 +127,7 @@ namespace akkaradb::engine::cluster {
         static constexpr uint32_t MAGIC = 0x35524B41; // "AKR5"
         static constexpr size_t SIZE = 14;
         static constexpr uint32_t MAX_PAYLOAD_SIZE = 128u * 1024u * 1024u;
+        static constexpr uint32_t MAX_RAFT_PAYLOAD_SIZE = 4u * 1024u * 1024u;
 
         ReplMsgType type{}; ///< Message discriminator.
         uint8_t flags = 0; ///< Reserved per-frame flags.
@@ -114,7 +142,7 @@ namespace akkaradb::engine::cluster {
         ReplMsgType type{};
         uint8_t flags = 0;
         std::vector<uint8_t> payload;
-        std::shared_ptr<void> memoryReservation; ///< Internal non-Raft receive-budget lease.
+        std::shared_ptr<void> memoryReservation; ///< Internal transport receive-budget lease.
     };
 
     /** Replica-to-primary handshake payload. */
@@ -126,7 +154,7 @@ namespace akkaradb::engine::cluster {
         uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
     };
 
-    enum class StripeControlAction : uint8_t { ACQUIRE = 0, COMMIT = 1, RELEASE = 2, READ_METADATA = 3 };
+    enum class StripeControlAction : uint8_t { ACQUIRE = 0, COMMIT = 1, RELEASE = 2, READ_METADATA = 3, REPAIR_METADATA = 4 };
     enum class StripeControlStatus : uint8_t {
         GRANTED = 0, COMMITTED = 1, RELEASED = 2, BUSY = 3, REJECTED = 4, ERROR_STATUS = 5, FOUND = 6, NOT_FOUND = 7,
     };
@@ -182,6 +210,7 @@ namespace akkaradb::engine::cluster {
 
     struct AKKARADB_CLUSTER_RUNTIME_API ReplSnapshotBegin {
         uint64_t snapshotSeq = 0;
+        // Zero means the streaming producer has not discovered the final count.
         uint64_t entryCount = 0;
     };
 

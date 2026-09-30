@@ -27,7 +27,6 @@ namespace akkaradb::engine::erasure {
 
         inline void validateRsLayout(const ErasureLayout& layout) {
             if (layout.dataShards == 0) { throw std::invalid_argument("RsErasureCodec: dataShards must be > 0"); }
-            if (layout.parityShards == 0) { throw std::invalid_argument("RsErasureCodec: parityShards must be > 0"); }
             if (layout.totalShards() > 255) { throw std::invalid_argument("RsErasureCodec: totalShards must be <= 255"); }
             if (layout.totalShards() < layout.dataShards) { throw std::invalid_argument("RsErasureCodec: too many shards"); }
         }

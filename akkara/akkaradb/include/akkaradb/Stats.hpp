@@ -34,6 +34,7 @@ namespace akkaradb::engine {
         HEALTHY = 0,
         DEGRADED = 1,
         FAILED = 2,
+        REBUILDING = 3,
     };
 
     enum class ClusterFailureCode : uint32_t {
@@ -186,6 +187,10 @@ namespace akkaradb::engine {
             uint64_t flushesCompleted = 0;
             uint64_t immutableTables = 0;
             uint64_t bytesFlushed = 0;
+            uint64_t memorySnapshotCompactionsCompleted = 0;
+            uint64_t memorySnapshotCompactionFailures = 0;
+            uint64_t memorySnapshotCompactionLastFailureAtUs = 0;
+            bool memorySnapshotCompactionPending = false;
         } memtable;
 
         struct WalStats {
@@ -252,6 +257,7 @@ namespace akkaradb::engine {
                 std::string host;
                 uint16_t dataPort = 0;
                 uint16_t replPort = 0;
+                uint16_t stripeMetadataPort = 0;
                 uint32_t capabilities = 0;
             };
 
@@ -299,6 +305,12 @@ namespace akkaradb::engine {
             uint64_t appliedIndex = 0;
             uint64_t lastLogIndex = 0;
             uint64_t snapshotIndex = 0;
+            bool stripeMetadataRaftEnabled = false;
+            uint64_t stripeMetadataRaftTerm = 0;
+            uint64_t stripeMetadataLeaderNodeId = 0;
+            uint64_t stripeMetadataCommitIndex = 0;
+            uint64_t stripeMetadataAppliedIndex = 0;
+            uint64_t stripeMetadataSnapshotIndex = 0;
             uint64_t outboundConnectionsTotal = 0;
             uint64_t peerWorkers = 0;
             uint64_t proposalBatches = 0;
@@ -338,6 +350,16 @@ namespace akkaradb::engine {
             uint64_t failed = 0;
             uint64_t lastFailureNodeId = 0; ///< Zero until the first failure; no key or value is exposed.
         } stripeReadRepair;
+
+        struct StripeRebuildStats {
+            uint64_t cycles = 0;
+            uint64_t keysScanned = 0;
+            uint64_t attempts = 0;
+            uint64_t succeeded = 0;
+            uint64_t failed = 0;
+            uint64_t lastFailureNodeId = 0;
+            bool active = false;
+        } stripeRebuild;
 
         struct VLogStats {
             bool enabled = false;

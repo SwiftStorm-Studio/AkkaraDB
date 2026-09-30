@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <span>
 
 namespace akkaradb::crypto {
@@ -29,6 +30,13 @@ namespace akkaradb::crypto {
     AKDB_API void secureRandom(std::span<std::uint8_t> out);
     /// BLAKE2b-256 over length-delimited parts.
     AKDB_API std::array<uint8_t, 32> hash256(std::span<const std::span<const uint8_t>> parts);
+    /// BLAKE2b-256 over two length-delimited parts, with the second read in bounded chunks.
+    AKDB_API std::array<uint8_t, 32> hash256StreamedSecondPart(
+        std::span<const uint8_t> first,
+        uint64_t secondSize,
+        const std::function<bool(uint64_t offset, std::span<uint8_t> destination)>& readSecond,
+        size_t chunkSize
+    );
 
     /**
      * @brief Best-effort constant-time wipe for temporary secret material.

@@ -108,6 +108,16 @@ namespace akkaradb::engine::cluster {
             #endif
         }
 
+        [[nodiscard]] bool clearReceiveTimeout(SocketHandle s) noexcept {
+            #ifdef _WIN32
+            constexpr DWORD timeout = 0;
+            return ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout)) == 0;
+            #else
+            constexpr timeval timeout{};
+            return ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0;
+            #endif
+        }
+
         bool setBlocking(SocketHandle s, bool blocking) noexcept {
             #ifdef _WIN32
             u_long mode = blocking ? 0u : 1u;
@@ -763,6 +773,9 @@ namespace akkaradb::engine::cluster {
 
                     try {
                         if (handshake(socket, secure.get(), secureRemotePublicKey)) {
+                            if (!clearReceiveTimeout(socket)) {
+                                throw std::runtime_error("ReplicationClient: failed to clear handshake receive timeout");
+                            }
                             {
                                 std::lock_guard lock{socketMutex_};
                                 if (socket_ == socket) { activeSecure_ = secure.get(); }
@@ -847,7 +860,17 @@ namespace akkaradb::engine::cluster {
                 try {
                     if (const auto existing = loadMembership(runtimeOptions_.clusterMembershipPath, runtimeOptions_.corruptStateAction);
                         existing && !runtimeOptions_.resetClusterMembership && (existing->groupId != incoming.groupId || existing->
-                            primaryNodeId != incoming.primaryNodeId || existing->groupEpoch != incoming.groupEpoch)) { return false; }
+                            primaryNodeId != incoming.primaryNodeId || existing->groupEpoch != incoming.groupEpoch)) {
+                        const bool authorizedMirrorSuccessor = existing->groupId == incoming.groupId &&
+                            existing->primaryNodeId != incoming.primaryNodeId &&
+                            existing->groupEpoch != UINT64_MAX &&
+                            incoming.groupEpoch == existing->groupEpoch + 1 &&
+                            runtimeOptions_.mirrorPromotion.enabled &&
+                            runtimeOptions_.mirrorPromotion.previousPrimaryNodeId == existing->primaryNodeId &&
+                            runtimeOptions_.mirrorPromotion.previousGroupEpoch == existing->groupEpoch &&
+                            runtimeOptions_.secure.expectedPrimaryNodeId == incoming.primaryNodeId;
+                        if (!authorizedMirrorSuccessor) { return false; }
+                    }
                     saveMembership(runtimeOptions_.clusterMembershipPath, incoming);
                 }
                 catch (...) { return false; }
@@ -898,6 +921,7 @@ namespace akkaradb::engine::cluster {
                 uint64_t expectedSeq = getLastSeq_ ? getLastSeq_() + 1 : 1;
                 bool receivingSnapshot = false;
                 uint64_t snapshotSeq = 0;
+                uint64_t snapshotEntryCount = 0;
                 while (running_) {
                     const auto message = detail::receiveMessage(transferBudget_, transferSession_,
                         [&](DecodedFrame& part) { return recvFrameFrom(socket, secure, part); },
@@ -978,6 +1002,7 @@ namespace akkaradb::engine::cluster {
                         callback(begin.snapshotSeq, begin.entryCount);
                         receivingSnapshot = true;
                         snapshotSeq = begin.snapshotSeq;
+                        snapshotEntryCount = 0;
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_ENTRY) {
                         detail::EntryView entry;
@@ -1003,6 +1028,8 @@ namespace akkaradb::engine::cluster {
                             offset += count;
                         }
                         endCallback();
+                        if (snapshotEntryCount == UINT64_MAX) { return; }
+                        ++snapshotEntryCount;
                     }
                     else if (frame.type == ReplMsgType::SNAPSHOT_END) {
                         uint64_t endSeq = 0;
@@ -1013,7 +1040,11 @@ namespace akkaradb::engine::cluster {
                             callback = snapshotEndCallback_;
                         }
                         if (!callback) { return; }
-                        callback(endSeq);
+                        callback(endSeq, snapshotEntryCount);
+                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE &&
+                            !sendAck(socket, secure, endSeq, AckStage::DURABLE)) {
+                            return;
+                        }
                         receivingSnapshot = false;
                         expectedSeq = endSeq + 1;
                     }

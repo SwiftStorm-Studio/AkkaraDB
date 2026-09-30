@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -122,9 +123,11 @@ namespace akkaradb::engine::memtable {
                 std::vector<std::shared_ptr<const IMemTable>> sources,
                 std::vector<uint8_t> start,
                 std::vector<uint8_t> end,
-                uint64_t snapshotSeq
+                uint64_t snapshotSeq,
+                std::shared_ptr<void> lifetime = {}
             )
-                : scanLocks_{std::move(scanLocks)},
+                : lifetime_{std::move(lifetime)},
+                  scanLocks_{std::move(scanLocks)},
                   sources_{std::move(sources)},
                   start_{std::move(start)},
                   end_{std::move(end)},
@@ -212,8 +215,9 @@ namespace akkaradb::engine::memtable {
                 return true;
             }
 
-            // Declare locks first so all source generators are destroyed before
-            // the scan releases its shard read locks.
+            // Declare lifetime first so generators and source ownership are
+            // released before a snapshot-generation release callback runs.
+            std::shared_ptr<void> lifetime_;
             std::vector<std::shared_lock<std::shared_mutex>> scanLocks_;
             std::vector<std::shared_ptr<const IMemTable>> sources_;
             std::vector<uint8_t> start_;
@@ -225,7 +229,7 @@ namespace akkaradb::engine::memtable {
             std::optional<RecordView> pending_;
     };
 
-    class MemTable::Impl {
+    class MemTable::Impl : public std::enable_shared_from_this<MemTable::Impl> {
         public:
             struct Shard {
                 mutable std::shared_mutex mutex;
@@ -251,6 +255,12 @@ namespace akkaradb::engine::memtable {
                 std::atomic<uint64_t> removesApplied{0};
                 size_t activeBytes{0};
                 uint64_t nextImmutableId{1};
+            };
+
+            struct MemorySnapshotLease {
+                std::shared_ptr<Impl> owner;
+                uint64_t bytes = 0;
+                ~MemorySnapshotLease() { if (owner) { owner->releaseMemorySnapshot(bytes); } }
             };
 
             class FlushPool {
@@ -401,6 +411,8 @@ namespace akkaradb::engine::memtable {
                 }
             }
 
+            ~Impl() { stopMemorySnapshotMaintenance(); }
+
             [[nodiscard]] std::unique_ptr<IMemTable> makeBackend() const {
                 if (options_.backendFactoryWithOptions) { return options_.backendFactoryWithOptions(options_.backendOptions); }
                 if (options_.backendFactory) { return options_.backendFactory(); }
@@ -474,12 +486,20 @@ namespace akkaradb::engine::memtable {
                 const auto published = shard.published.load(std::memory_order_acquire);
                 if (!published) { return false; }
 
-                if (published->active && published->active->get(keyView, snapshotSeq, out)) { return true; }
+                bool found = false;
+                RecordView newest;
+                const auto consider = [&](const std::shared_ptr<const IMemTable>& table) {
+                    RecordView candidate;
+                    if (table && table->get(keyView, snapshotSeq, &candidate) && (!found || candidate.seq() > newest.seq())) {
+                        newest = candidate;
+                        found = true;
+                    }
+                };
 
-                for (const auto& immutable : published->immutables) {
-                    if (immutable && immutable->get(keyView, snapshotSeq, out)) { return true; }
-                }
-                return false;
+                consider(published->active);
+                for (const auto& immutable : published->immutables) { consider(immutable); }
+                if (found) { *out = newest; }
+                return found;
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, uint64_t snapshotSeq, std::vector<uint8_t>& out) const {
@@ -614,6 +634,104 @@ namespace akkaradb::engine::memtable {
                 return RangeIterator{std::move(result)};
             }
 
+            [[nodiscard]] std::optional<RangeIterator> sealAndPinMemoryIterator(
+                const KeyRange& range,
+                uint64_t snapshotSeq,
+                bool completionFirst,
+                uint64_t maxPinnedBytes,
+                uint32_t maxPinnedGenerations
+            ) {
+                throwIfFlushFailed();
+                const uint64_t bytes = static_cast<uint64_t>(approxSize());
+                std::unique_lock snapshotLock{memorySnapshotMutex_, std::defer_lock};
+                if (completionFirst) { snapshotLock.lock(); }
+                else if (!snapshotLock.try_lock()) { return std::nullopt; }
+                startMemorySnapshotMaintenanceLocked();
+
+                const auto hasCapacity = [&] {
+                    if (memorySnapshotPins_ >= maxPinnedGenerations) { return false; }
+                    if (maxPinnedBytes == 0) { return true; }
+                    if (bytes > maxPinnedBytes) { return completionFirst && memorySnapshotPins_ == 0; }
+                    return memorySnapshotPinnedBytes_ <= maxPinnedBytes - bytes;
+                };
+                if (completionFirst) { memorySnapshotCv_.wait(snapshotLock, hasCapacity); }
+                else if (!hasCapacity()) { return std::nullopt; }
+
+                ++memorySnapshotPins_;
+                memorySnapshotPinnedBytes_ += bytes;
+                auto lease = std::make_shared<MemorySnapshotLease>();
+                lease->owner = shared_from_this();
+                lease->bytes = bytes;
+                try {
+                    rawActiveGetEnabled_.store(false, std::memory_order_release);
+                    std::vector<std::shared_ptr<IMemTable>> replacements(shards_.size());
+                    std::vector<bool> needsReplacement(shards_.size(), false);
+                    std::vector<std::unique_lock<std::shared_mutex>> locks;
+                    locks.reserve(shards_.size());
+                    std::vector<std::shared_ptr<const IMemTable>> sources;
+                    while (true) {
+                        locks.clear();
+                        for (const auto& shard : shards_) { locks.emplace_back(shard->mutex); }
+
+                        std::fill(needsReplacement.begin(), needsReplacement.end(), false);
+                        bool retry = false;
+                        size_t sourceCount = 0;
+                        for (size_t i = 0; i < shards_.size(); ++i) {
+                            const auto& shard = *shards_[i];
+                            const bool nonEmpty = shard.active->entryCount() != 0;
+                            if (nonEmpty && !replacements[i]) {
+                                needsReplacement[i] = true;
+                                retry = true;
+                            }
+                            sourceCount += shard.immutables.size() + static_cast<size_t>(nonEmpty);
+                        }
+                        if (sources.capacity() < sourceCount) { retry = true; }
+                        if (!retry) { break; }
+
+                        locks.clear();
+                        sources.reserve(sourceCount);
+                        for (size_t i = 0; i < shards_.size(); ++i) {
+                            if (!needsReplacement[i]) { continue; }
+                            auto replacement = makeBackend();
+                            if (!replacement) { throw std::invalid_argument("MemTable backend factory returned null"); }
+                            replacements[i] = std::shared_ptr<IMemTable>{std::move(replacement)};
+                        }
+                    }
+
+                    for (size_t i = 0; i < shards_.size(); ++i) {
+                        auto& shard = *shards_[i];
+                        if (replacements[i]) {
+                            shard.active->freeze();
+                            const auto sealed = shard.active;
+                            const size_t sealedBytes = shard.activeBytes;
+                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes});
+                            shard.active = std::move(replacements[i]);
+                            shard.activeRaw.store(shard.active.get(), std::memory_order_release);
+                            shard.activeBytes = shard.active->sizeBytes();
+                            const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                            shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
+                            publishTablesLocked(shard);
+                        }
+                        for (auto it = shard.immutables.rbegin(); it != shard.immutables.rend(); ++it) {
+                            if (it->table) { sources.push_back(std::const_pointer_cast<const IMemTable>(it->table)); }
+                        }
+                    }
+
+                    snapshotLock.unlock();
+                    auto result = std::make_unique<RangeIterator::Impl>(
+                        std::vector<std::shared_lock<std::shared_mutex>>{}, std::move(sources), range.start, range.end,
+                        snapshotSeq, std::move(lease)
+                    );
+                    locks.clear();
+                    return RangeIterator{std::move(result)};
+                }
+                catch (...) {
+                    if (snapshotLock.owns_lock()) { snapshotLock.unlock(); }
+                    lease.reset();
+                    throw;
+                }
+            }
+
             [[nodiscard]] uint64_t nextSeq() noexcept { return seqGen_.fetch_add(1, std::memory_order_relaxed); }
 
             [[nodiscard]] uint64_t reserveSeq(uint64_t count) {
@@ -702,10 +820,171 @@ namespace akkaradb::engine::memtable {
                     removes,
                     flushesCompleted_.load(std::memory_order_relaxed),
                     immutables,
+                    memorySnapshotCompactionsCompleted_.load(std::memory_order_relaxed),
+                    memorySnapshotCompactionFailures_.load(std::memory_order_relaxed),
+                    memorySnapshotCompactionLastFailureAtUs_.load(std::memory_order_relaxed),
+                    memorySnapshotCompactionPendingStat_.load(std::memory_order_acquire),
                 };
             }
 
         private:
+            static uint64_t maintenanceNowUs() noexcept {
+                return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()
+                ).count());
+            }
+
+            void startMemorySnapshotMaintenanceLocked() {
+                if (memorySnapshotMaintenanceThread_.joinable()) { return; }
+                if (memorySnapshotMaintenanceStopping_) {
+                    throw std::runtime_error("MemTable: memory snapshot maintenance is stopping");
+                }
+                memorySnapshotMaintenanceThread_ = std::thread([this] { memorySnapshotMaintenanceLoop(); });
+            }
+
+            void stopMemorySnapshotMaintenance() noexcept {
+                {
+                    std::lock_guard lock{memorySnapshotMutex_};
+                    memorySnapshotMaintenanceStopping_ = true;
+                }
+                memorySnapshotCv_.notify_all();
+                if (memorySnapshotMaintenanceThread_.joinable()) { memorySnapshotMaintenanceThread_.join(); }
+            }
+
+            void memorySnapshotMaintenanceLoop() noexcept {
+                auto retryDelay = std::chrono::milliseconds{25};
+                std::unique_lock lock{memorySnapshotMutex_};
+                while (true) {
+                    memorySnapshotCv_.wait(lock, [this] {
+                        return memorySnapshotMaintenanceStopping_ ||
+                            (memorySnapshotCompactionPending_ && memorySnapshotPins_ == 0);
+                    });
+                    if (memorySnapshotMaintenanceStopping_) { return; }
+
+                    memorySnapshotCompactionPending_ = false;
+                    lock.unlock();
+                    bool succeeded = false;
+                    try {
+                        compactMemoryOnlyGenerations();
+                        succeeded = true;
+                        memorySnapshotCompactionsCompleted_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    catch (...) {
+                        memorySnapshotCompactionFailures_.fetch_add(1, std::memory_order_relaxed);
+                        memorySnapshotCompactionLastFailureAtUs_.store(maintenanceNowUs(), std::memory_order_relaxed);
+                    }
+                    lock.lock();
+
+                    if (succeeded) {
+                        retryDelay = std::chrono::milliseconds{25};
+                    }
+                    else {
+                        memorySnapshotCompactionPending_ = true;
+                        memorySnapshotCompactionPendingStat_.store(true, std::memory_order_release);
+                        memorySnapshotCv_.wait_for(lock, retryDelay, [this] {
+                            return memorySnapshotMaintenanceStopping_ || memorySnapshotPins_ != 0;
+                        });
+                        retryDelay = std::min(retryDelay * 2, std::chrono::milliseconds{1000});
+                    }
+
+                    if (!memorySnapshotCompactionPending_) {
+                        memorySnapshotCompactionPendingStat_.store(false, std::memory_order_release);
+                    }
+                    memorySnapshotCv_.notify_all();
+                }
+            }
+
+            void releaseMemorySnapshot(uint64_t bytes) noexcept {
+                {
+                    std::lock_guard lock{memorySnapshotMutex_};
+                    if (memorySnapshotPins_ != 0) { --memorySnapshotPins_; }
+                    memorySnapshotPinnedBytes_ = memorySnapshotPinnedBytes_ >= bytes ? memorySnapshotPinnedBytes_ - bytes : 0;
+                    memorySnapshotCompactionPending_ = true;
+                    memorySnapshotCompactionPendingStat_.store(true, std::memory_order_release);
+                }
+                memorySnapshotCv_.notify_all();
+            }
+
+            void compactMemoryOnlyGenerations() {
+                for (const auto& shardPtr : shards_) {
+                    auto& shard = *shardPtr;
+                    std::vector<uint64_t> capturedIds;
+                    std::vector<std::shared_ptr<const IMemTable>> capturedSources;
+                    size_t capturedBytes = 0;
+                    {
+                        auto replacement = makeBackend();
+                        if (!replacement) { throw std::invalid_argument("MemTable backend factory returned null"); }
+                        std::unique_lock shardLock{shard.mutex};
+                        if (shard.active->entryCount() != 0) {
+                            shard.active->freeze();
+                            const auto sealed = shard.active;
+                            const size_t sealedBytes = shard.activeBytes;
+                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes});
+                            shard.active = std::shared_ptr<IMemTable>{std::move(replacement)};
+                            shard.activeRaw.store(shard.active.get(), std::memory_order_release);
+                            shard.activeBytes = shard.active->sizeBytes();
+                            const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                            shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
+                            publishTablesLocked(shard);
+                        }
+                        capturedIds.reserve(shard.immutables.size());
+                        capturedSources.reserve(shard.immutables.size());
+                        for (const auto& item : shard.immutables) {
+                            capturedIds.push_back(item.id);
+                            capturedSources.push_back(std::const_pointer_cast<const IMemTable>(item.table));
+                            capturedBytes += item.bytes;
+                        }
+                    }
+                    if (capturedSources.size() <= 1) { continue; }
+
+                    auto compacted = makeBackend();
+                    if (!compacted) { throw std::invalid_argument("MemTable backend factory returned null"); }
+                    RangeIterator::Impl merged{
+                        {}, std::move(capturedSources), {}, {}, std::numeric_limits<uint64_t>::max()
+                    };
+                    while (merged.hasNext()) {
+                        const auto record = merged.next();
+                        if (!record) { break; }
+                        const auto status = compacted->put(
+                            toByteView(record->key()), toByteView(record->value()), record->seq(), record->flags(),
+                            record->keyFp64(), record->miniKey()
+                        );
+                        if (!status.ok()) { throwStatusError("MemTable memory generation compaction", status); }
+                    }
+                    compacted->freeze();
+                    auto compactedShared = std::shared_ptr<IMemTable>{std::move(compacted)};
+                    const size_t compactedBytes = compactedShared->sizeBytes();
+                    const bool hasCompactedRecords = compactedShared->entryCount() != 0;
+
+                    std::unique_lock shardLock{shard.mutex};
+                    const uint64_t lastCapturedId = capturedIds.empty()
+                                                        ? 0
+                                                        : *std::ranges::max_element(capturedIds);
+                    std::erase_if(shard.immutables, [&](const Shard::Immutable& item) {
+                        return std::ranges::find(capturedIds, item.id) != capturedIds.end();
+                    });
+                    if (hasCompactedRecords) {
+                        // Snapshot sealing can append a newer generation while this
+                        // compaction runs without the shard lock. Keep those newer
+                        // generations after the compacted prefix; point reads and
+                        // future scans must not treat the old compacted values as
+                        // newer than writes made during compaction.
+                        const auto insertAt = std::ranges::find_if(
+                            shard.immutables,
+                            [&](const Shard::Immutable& item) { return item.id > lastCapturedId; }
+                        );
+                        shard.immutables.insert(insertAt, Shard::Immutable{
+                            shard.nextImmutableId++, std::move(compactedShared), compactedBytes
+                        });
+                    }
+                    size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
+                    totalBytes = totalBytes >= capturedBytes ? totalBytes - capturedBytes : 0;
+                    if (hasCompactedRecords) { totalBytes += compactedBytes; }
+                    shard.approxBytes.store(totalBytes, std::memory_order_relaxed);
+                    publishTablesLocked(shard);
+                }
+            }
+
             static void publishTablesLocked(Shard& shard) {
                 auto published = std::make_shared<Shard::PublishedTables>();
                 published->active = std::const_pointer_cast<const IMemTable>(shard.active);
@@ -780,6 +1059,17 @@ namespace akkaradb::engine::memtable {
             std::atomic<uint64_t> seqGen_;
             std::atomic<uint64_t> flushesCompleted_{0};
             std::atomic<bool> rawActiveGetEnabled_{true};
+            std::mutex memorySnapshotMutex_;
+            std::condition_variable memorySnapshotCv_;
+            uint32_t memorySnapshotPins_ = 0;
+            uint64_t memorySnapshotPinnedBytes_ = 0;
+            bool memorySnapshotCompactionPending_ = false;
+            bool memorySnapshotMaintenanceStopping_ = false;
+            std::thread memorySnapshotMaintenanceThread_;
+            std::atomic<bool> memorySnapshotCompactionPendingStat_{false};
+            std::atomic<uint64_t> memorySnapshotCompactionsCompleted_{0};
+            std::atomic<uint64_t> memorySnapshotCompactionFailures_{0};
+            std::atomic<uint64_t> memorySnapshotCompactionLastFailureAtUs_{0};
     };
 
     MemTable::RangeIterator::RangeIterator(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
@@ -801,7 +1091,7 @@ namespace akkaradb::engine::memtable {
 
     std::unique_ptr<MemTable> MemTable::create(const Options& options) { return std::unique_ptr<MemTable>{new MemTable(options)}; }
 
-    MemTable::MemTable(const Options& options) : impl_{std::make_unique<Impl>(options)} {}
+    MemTable::MemTable(const Options& options) : impl_{std::make_shared<Impl>(options)} {}
 
     MemTable::~MemTable() = default;
 
@@ -846,6 +1136,18 @@ namespace akkaradb::engine::memtable {
 
     MemTable::RangeIterator MemTable::sealAndPinIterator(const KeyRange& range, uint64_t snapshotSeq) {
         return impl_->sealAndPinIterator(range, snapshotSeq);
+    }
+
+    std::optional<MemTable::RangeIterator> MemTable::sealAndPinMemoryIterator(
+        const KeyRange& range,
+        uint64_t snapshotSeq,
+        bool completionFirst,
+        uint64_t maxPinnedBytes,
+        uint32_t maxPinnedGenerations
+    ) {
+        return impl_->sealAndPinMemoryIterator(
+            range, snapshotSeq, completionFirst, maxPinnedBytes, maxPinnedGenerations
+        );
     }
 
     uint64_t MemTable::nextSeq() noexcept { return impl_->nextSeq(); }

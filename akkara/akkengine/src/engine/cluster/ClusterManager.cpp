@@ -44,6 +44,11 @@ namespace akkaradb::engine::cluster {
             return value != nullptr && std::string_view{value} == "1";
         }
 
+        bool stepDownPrimaryForTest() noexcept {
+            const char* value = std::getenv("AKKARADB_TEST_STEP_DOWN_PRIMARY");
+            return value != nullptr && std::string_view{value} == "1";
+        }
+
         [[nodiscard]] uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()
@@ -176,6 +181,7 @@ namespace akkaradb::engine::cluster {
                 switch (runtimeOptions_.startupRole) {
                     case NodeStartupRole::PRIMARY: configurePrimarySelf();
                         setRole(NodeRole::PRIMARY);
+                        startLeaseRenewal();
                         return;
                     case NodeStartupRole::REPLICA: configureReplicaPrimary();
                         setRole(NodeRole::REPLICA);
@@ -208,6 +214,7 @@ namespace akkaradb::engine::cluster {
                 if (lease->nodeId == selfNodeId_) {
                     configurePrimarySelf();
                     setRole(NodeRole::PRIMARY);
+                    startLeaseRenewal();
                     return true;
                 }
 
@@ -284,7 +291,6 @@ namespace akkaradb::engine::cluster {
                     primaryReplPort_ = self->replPort;
                 }
                 if (clusterManifest_) { clusterManifest_->primaryLease(self->nodeId, nowUs() + PRIMARY_LEASE_WINDOW_US); }
-                startLeaseRenewal();
             }
 
             void startLeaseRenewal() {
@@ -327,6 +333,11 @@ namespace akkaradb::engine::cluster {
             void renewPrimaryLease() {
                 if (!clusterManifest_ || !running_.load(std::memory_order_acquire) || role_.load() != NodeRole::PRIMARY) { return; }
                 if (failPrimaryLeaseRenewalForTest()) { throw std::runtime_error("injected lease renewal failure"); }
+                if (stepDownPrimaryForTest()) {
+                    running_.store(false, std::memory_order_release);
+                    setRole(NodeRole::REPLICA);
+                    return;
+                }
                 const uint64_t now = nowUs();
                 const auto lease = clusterManifest_->lastPrimaryLease();
                 if (lease.has_value() && lease->nodeId != selfNodeId_ && lease->leaseUntilUs > now && !manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) {

@@ -75,6 +75,10 @@ namespace akkaradb::engine::memtable {
                 uint64_t removesApplied = 0;
                 uint64_t flushesCompleted = 0;
                 uint64_t immutableTables = 0;
+                uint64_t memorySnapshotCompactionsCompleted = 0;
+                uint64_t memorySnapshotCompactionFailures = 0;
+                uint64_t memorySnapshotCompactionLastFailureAtUs = 0;
+                bool memorySnapshotCompactionPending = false;
             };
 
             class AKDB_API RangeIterator {
@@ -135,6 +139,16 @@ namespace akkaradb::engine::memtable {
             // table and returns an iterator that owns those fixed sources.
             // Requires an installed flush callback.
             [[nodiscard]] RangeIterator sealAndPinIterator(const KeyRange& range, uint64_t snapshotSeq);
+            // Rotates active shards without an SST sink and pins an immutable,
+            // point-in-time view. THROUGHPUT_FIRST returns nullopt instead of
+            // waiting for snapshot capacity; COMPLETION_FIRST waits.
+            [[nodiscard]] std::optional<RangeIterator> sealAndPinMemoryIterator(
+                const KeyRange& range,
+                uint64_t snapshotSeq,
+                bool completionFirst,
+                uint64_t maxPinnedBytes,
+                uint32_t maxPinnedGenerations
+            );
 
             [[nodiscard]] uint64_t nextSeq() noexcept;
             [[nodiscard]] uint64_t reserveSeq(uint64_t count);
@@ -153,6 +167,6 @@ namespace akkaradb::engine::memtable {
         private:
             class Impl;
             explicit MemTable(const Options& options);
-            std::unique_ptr<Impl> impl_;
+            std::shared_ptr<Impl> impl_;
     };
 } // namespace akkaradb::engine::memtable

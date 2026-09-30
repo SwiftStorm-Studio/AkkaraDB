@@ -111,12 +111,7 @@ namespace akkaradb::cpu {
             y0 = clmulLo(x0, k);
             k = clmulHi(x0, k);
             y0 = _mm512_xor_si512(y0, k);
-            z0 = _mm_ternarylogic_epi64(
-                _mm512_castsi512_si128(y0),
-                _mm512_extracti32x4_epi32(y0, 1),
-                _mm512_extracti32x4_epi32(y0, 2),
-                0x96
-            );
+            z0 = _mm_ternarylogic_epi64(_mm512_castsi512_si128(y0), _mm512_extracti32x4_epi32(y0, 1), _mm512_extracti32x4_epi32(y0, 2), 0x96);
             z0 = _mm_xor_si128(z0, _mm512_extracti32x4_epi32(x0, 3));
 
             crc = static_cast<uint32_t>(_mm_crc32_u64(0, static_cast<uint64_t>(_mm_cvtsi128_si64(z0))));

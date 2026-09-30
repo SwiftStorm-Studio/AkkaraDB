@@ -38,6 +38,37 @@ namespace akkaradb::crypto {
         return digest;
     }
 
+    std::array<uint8_t, 32> hash256StreamedSecondPart(
+        std::span<const uint8_t> first,
+        uint64_t secondSize,
+        const std::function<bool(uint64_t, std::span<uint8_t>)>& readSecond,
+        size_t chunkSize
+    ) {
+        if (!readSecond || chunkSize == 0) { throw std::invalid_argument("hash256: invalid streamed part reader"); }
+        crypto_blake2b_ctx context;
+        crypto_blake2b_init(&context, 32);
+        const auto beginPart = [&](uint64_t size) {
+            std::array<uint8_t, 8> length{};
+            for (size_t i = 0; i < length.size(); ++i) { length[i] = static_cast<uint8_t>(size >> (i * 8)); }
+            crypto_blake2b_update(&context, length.data(), length.size());
+        };
+        beginPart(first.size());
+        crypto_blake2b_update(&context, first.data(), first.size());
+        beginPart(secondSize);
+        std::vector<uint8_t> buffer(static_cast<size_t>(std::min<uint64_t>(chunkSize, secondSize)));
+        uint64_t offset = 0;
+        while (offset < secondSize) {
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), secondSize - offset));
+            auto chunk = std::span<uint8_t>{buffer}.first(count);
+            if (!readSecond(offset, chunk)) { throw std::runtime_error("hash256: streamed part read failed"); }
+            crypto_blake2b_update(&context, chunk.data(), chunk.size());
+            offset += count;
+        }
+        std::array<uint8_t, 32> digest{};
+        crypto_blake2b_final(&context, digest.data());
+        return digest;
+    }
+
     namespace {
         constexpr std::string_view PROTOCOL_NAME = "AkkaraDB-NoiseStyle-X25519-XChaCha20Poly1305-BLAKE2b-v1";
         constexpr std::string_view SERVER_FINISHED = "server-finished";

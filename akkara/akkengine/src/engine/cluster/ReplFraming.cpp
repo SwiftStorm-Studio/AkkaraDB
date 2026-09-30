@@ -288,7 +288,8 @@ namespace akkaradb::engine::cluster {
         out.requestId = readU64(payload, 0);
         out.action = static_cast<StripeControlAction>(payload[8]);
         if (out.action != StripeControlAction::ACQUIRE && out.action != StripeControlAction::COMMIT &&
-            out.action != StripeControlAction::RELEASE && out.action != StripeControlAction::READ_METADATA) { return false; }
+            out.action != StripeControlAction::RELEASE && out.action != StripeControlAction::READ_METADATA &&
+            out.action != StripeControlAction::REPAIR_METADATA) { return false; }
         out.ownerNodeId = readU64(payload, 9);
         out.fenceToken = readU64(payload, 17);
         const uint32_t keyLen = readU32(payload, 25);

@@ -86,6 +86,14 @@ uint64_t blobId,
 
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId) const;
             [[nodiscard]] std::vector<uint8_t> read(uint64_t blobId, uint32_t expectedCrc32c) const;
+            // Reads and validates the logical (decompressed) value without
+            // materializing the complete Blob. An empty Blob emits one empty chunk.
+            [[nodiscard]] bool streamRead(
+                uint64_t blobId,
+                uint32_t expectedCrc32c,
+                size_t chunkBytes,
+                const std::function<bool(uint64_t offset, std::span<const uint8_t> chunk)>& visitor
+            ) const;
             // Prevents the background collector from unlinking Blob files
             // while a caller resolves a fixed multi-record view.
             [[nodiscard]] ReadPin pinReads() const;

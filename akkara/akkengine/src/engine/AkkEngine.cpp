@@ -302,16 +302,6 @@ namespace akkaradb::engine {
             fs::remove(path, ec);
         }
 
-        void forceDurable(FILE* file) {
-            if (file == nullptr) { return; }
-            if (std::fflush(file) != 0) { throw std::runtime_error("AkkEngine: failed to flush Raft log"); }
-            #ifdef _WIN32
-            if (_commit(_fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
-            #else
-            if (::fsync(::fileno(file)) != 0) { throw std::runtime_error("AkkEngine: failed to sync Raft log"); }
-            #endif
-        }
-
         void writeU32Le(std::ostream& out, uint32_t value) {
             std::array<uint8_t, 4> bytes{};
             for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
@@ -408,55 +398,388 @@ namespace akkaradb::engine {
             return header;
         }
 
-        class ClusterSnapshotExportFile {
+        class ClusterSnapshotExportFile : public std::enable_shared_from_this<ClusterSnapshotExportFile> {
             public:
                 static constexpr std::array<char, 5> MAGIC{'A', 'K', 'S', 'E', '1'};
+                static constexpr uint64_t FOLLOW_PUBLISH_BYTES = 1024ull * 1024ull;
+                static constexpr size_t REPLAY_CHUNK_BYTES = 1024u * 1024u;
+                using EntryVisitor = cluster::ClusterSnapshot::EntryVisitor;
+                using Producer = std::function<bool(const EntryVisitor&)>;
 
-                explicit ClusterSnapshotExportFile(fs::path path) : path_{std::move(path)} {}
+                ClusterSnapshotExportFile(fs::path path, uint64_t seq, Producer producer)
+                    : path_{std::move(path)}, seq_{seq}, producer_{std::move(producer)} {}
                 ~ClusterSnapshotExportFile() { removeFileIfExists(path_); }
 
                 ClusterSnapshotExportFile(const ClusterSnapshotExportFile&) = delete;
                 ClusterSnapshotExportFile& operator=(const ClusterSnapshotExportFile&) = delete;
 
                 [[nodiscard]] uint64_t seq() const noexcept { return seq_; }
-                [[nodiscard]] uint64_t entryCount() const noexcept { return entryCount_; }
                 [[nodiscard]] const fs::path& path() const noexcept { return path_; }
-                void complete(uint64_t seq, uint64_t entryCount) noexcept { seq_ = seq; entryCount_ = entryCount; }
+                [[nodiscard]] bool reusable() const {
+                    std::lock_guard lock{mutex_};
+                    return state_ != State::FAILED;
+                }
 
-                bool forEachEntry(const cluster::ClusterSnapshot::EntryVisitor& visitor) const {
+                bool forEachEntry(const EntryVisitor& visitor) {
                     if (!visitor) { return false; }
-                    std::ifstream in{path_, std::ios::binary};
-                    if (!in) { throw std::runtime_error("AkkEngine: failed to open cluster snapshot export"); }
+                    Producer producer;
+                    uint64_t replayCount = 0;
+                    std::exception_ptr failure;
+                    bool replayReady = false;
+                    bool failed = false;
+                    bool followActiveProducer = false;
+                    {
+                        std::lock_guard lock{mutex_};
+                        if (state_ == State::COMPLETE) {
+                            replayCount = entryCount_;
+                            replayReady = true;
+                        }
+                        else if (state_ == State::FAILED) {
+                            failure = failure_;
+                            failed = true;
+                        }
+                        else if (state_ == State::GENERATING) {
+                            ++followers_;
+                            followActiveProducer = true;
+                        }
+                        else {
+                            state_ = State::GENERATING;
+                            producer = std::move(producer_);
+                        }
+                    }
+                    if (replayReady) { return replay(visitor, replayCount); }
+                    if (failure) { std::rethrow_exception(failure); }
+                    if (failed) { return false; }
+                    if (followActiveProducer) {
+                        try {
+                            const bool followed = follow(visitor);
+                            removeFollower();
+                            return followed;
+                        }
+                        catch (...) {
+                            removeFollower();
+                            throw;
+                        }
+                    }
+                    if (!producer) {
+                        failGeneration(nullptr);
+                        return false;
+                    }
+
+                    try {
+                        uint64_t producedEntries = 0;
+                        bool primaryVisitorComplete = true;
+                        const bool complete = produce(producer, visitor, producedEntries, primaryVisitorComplete);
+                        {
+                            std::lock_guard lock{mutex_};
+                            entryCount_ = complete ? producedEntries : 0;
+                            if (complete) { publishedEntries_ = producedEntries; }
+                            state_ = complete ? State::COMPLETE : State::FAILED;
+                        }
+                        completionCv_.notify_all();
+                        return complete && primaryVisitorComplete;
+                    }
+                    catch (...) {
+                        failGeneration(std::current_exception());
+                        throw;
+                    }
+                }
+
+            private:
+                enum class State : uint8_t { PENDING, GENERATING, COMPLETE, FAILED };
+
+                bool readEntry(std::istream& in, const EntryVisitor& visitor) const {
+                    const auto recordStart = in.tellg();
+                    auto header = readSnapshotStagingEntryHeader(in);
+                    const bool wireSizeValid = header.key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull &&
+                        header.valueSize <= UINT32_MAX &&
+                        header.valueSize <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - header.key.size();
+                    const bool fileBacked = visitor.fileEntry && wireSizeValid &&
+                        8ull + header.key.size() + header.valueSize > visitor.fileEntryThresholdBytes;
+                    Crc32cStream payloadCrc;
+                    if (fileBacked) {
+                        updateCrcU32Le(payloadCrc, static_cast<uint32_t>(header.key.size()));
+                        updateCrcU32Le(payloadCrc, static_cast<uint32_t>(header.valueSize));
+                        payloadCrc.update(header.key);
+                    }
+                    else if (!visitor.beginEntry(header.key, header.valueSize, header.valueCrc32c)) { return false; }
+                    std::vector<uint8_t> buffer(REPLAY_CHUNK_BYTES);
+                    Crc32cStream valueCrc;
+                    uint64_t offset = 0;
+                    while (offset < header.valueSize) {
+                        const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), header.valueSize - offset));
+                        readExact(in, buffer.data(), count, "export entry value");
+                        const auto chunk = std::span<const uint8_t>{buffer}.first(count);
+                        valueCrc.update(chunk);
+                        header.recordCrc.update(chunk);
+                        if (fileBacked) { payloadCrc.update(chunk); }
+                        else if (!visitor.appendValueChunk(offset, chunk)) { return false; }
+                        offset += count;
+                    }
+                    if (!fileBacked && header.valueSize == 0 && !visitor.appendValueChunk(0, {})) { return false; }
+                    const uint32_t recordCrc = readU32Le(in, "export entry crc");
+                    if (valueCrc.finish() != header.valueCrc32c || header.recordCrc.finish() != recordCrc) {
+                        throw std::runtime_error("AkkEngine: corrupt cluster snapshot export entry");
+                    }
+                    if (!fileBacked) { return visitor.finishEntry(); }
+                    if (recordStart < 0) { throw std::runtime_error("AkkEngine: invalid cluster snapshot export offset"); }
+                    return visitor.fileEntry(cluster::SnapshotFileEntry{
+                        .path = path_,
+                        .dataOffset = static_cast<uint64_t>(recordStart) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t),
+                        .keySize = static_cast<uint32_t>(header.key.size()),
+                        .valueSize = header.valueSize,
+                        .payloadCrc32c = payloadCrc.finish(),
+                        .storage = shared_from_this(),
+                    });
+                }
+
+                void readHeader(std::istream& in, std::optional<uint64_t> expectedEntryCount) const {
                     std::array<char, MAGIC.size()> magic{};
                     readExact(in, magic.data(), magic.size(), "export header");
-                    if (magic != MAGIC || readU64Le(in, "export seq") != seq_ || readU64Le(in, "export entry count") != entryCount_) {
+                    const uint64_t fileSeq = readU64Le(in, "export seq");
+                    const uint64_t fileEntryCount = readU64Le(in, "export entry count");
+                    if (magic != MAGIC || fileSeq != seq_ || (expectedEntryCount && fileEntryCount != *expectedEntryCount)) {
                         throw std::runtime_error("AkkEngine: corrupt cluster snapshot export header");
                     }
-                    for (uint64_t index = 0; index < entryCount_; ++index) {
-                        auto header = readSnapshotStagingEntryHeader(in);
-                        if (header.valueSize > static_cast<uint64_t>(SIZE_MAX)) {
-                            throw std::runtime_error("AkkEngine: cluster snapshot export value is too large");
-                        }
-                        std::vector<uint8_t> value(static_cast<size_t>(header.valueSize));
-                        readExact(in, value.data(), value.size(), "export entry value");
-                        Crc32cStream valueCrc;
-                        valueCrc.update(value);
-                        header.recordCrc.update(value);
-                        const uint32_t recordCrc = readU32Le(in, "export entry crc");
-                        if (valueCrc.finish() != header.valueCrc32c || header.recordCrc.finish() != recordCrc) {
-                            throw std::runtime_error("AkkEngine: corrupt cluster snapshot export entry");
-                        }
-                        if (!visitor(header.key, value)) { return false; }
+                }
+
+                bool replay(const EntryVisitor& visitor, uint64_t expectedEntryCount) const {
+                    std::ifstream in{path_, std::ios::binary};
+                    if (!in) { throw std::runtime_error("AkkEngine: failed to open cluster snapshot export"); }
+                    readHeader(in, expectedEntryCount);
+                    for (uint64_t index = 0; index < expectedEntryCount; ++index) {
+                        if (!readEntry(in, visitor)) { return false; }
                     }
                     char trailing = 0;
                     if (in.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in cluster snapshot export"); }
                     return true;
                 }
 
-            private:
+                bool follow(const EntryVisitor& visitor) const {
+                    std::ifstream in;
+                    uint64_t consumedEntries = 0;
+                    while (true) {
+                        uint64_t availableEntries = 0;
+                        uint64_t completedEntryCount = 0;
+                        State state;
+                        std::exception_ptr failure;
+                        {
+                            std::unique_lock lock{mutex_};
+                            completionCv_.wait(lock, [&] {
+                                return publishedEntries_ > consumedEntries || state_ != State::GENERATING;
+                            });
+                            availableEntries = publishedEntries_;
+                            completedEntryCount = entryCount_;
+                            state = state_;
+                            failure = failure_;
+                        }
+
+                        if (!in.is_open() && (availableEntries != 0 || state == State::COMPLETE)) {
+                            in.open(path_, std::ios::binary);
+                            if (!in) { throw std::runtime_error("AkkEngine: failed to follow cluster snapshot export"); }
+                            readHeader(in, std::nullopt);
+                        }
+                        while (consumedEntries < availableEntries) {
+                            if (!readEntry(in, visitor)) { return false; }
+                            ++consumedEntries;
+                        }
+                        if (state == State::COMPLETE) {
+                            if (consumedEntries != completedEntryCount) {
+                                throw std::runtime_error("AkkEngine: cluster snapshot follower entry count mismatch");
+                            }
+                            char trailing = 0;
+                            if (in.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in cluster snapshot export"); }
+                            return true;
+                        }
+                        if (state == State::FAILED) {
+                            if (failure) { std::rethrow_exception(failure); }
+                            return false;
+                        }
+                    }
+                }
+
+                bool produce(
+                    const Producer& producer,
+                    const EntryVisitor& visitor,
+                    uint64_t& producedEntries,
+                    bool& primaryVisitorComplete
+                ) {
+                    std::ofstream out{path_, std::ios::binary | std::ios::trunc};
+                    if (!out) { throw std::runtime_error("AkkEngine: failed to create cluster snapshot export"); }
+                    out.write(MAGIC.data(), MAGIC.size());
+                    writeU64Le(out, seq_);
+                    writeU64Le(out, 0);
+                    uint64_t unpublishedBytes = MAGIC.size() + sizeof(uint64_t) * 2;
+
+                    bool entryActive = false;
+                    bool sawChunk = false;
+                    uint64_t entryValueSize = 0;
+                    uint64_t entryValueOffset = 0;
+                    uint32_t entryValueChecksum = 0;
+                    uint32_t entryKeySize = 0;
+                    uint64_t entryDataOffset = 0;
+                    bool entryFileBacked = false;
+                    Crc32cStream entryValueCrc;
+                    Crc32cStream entryRecordCrc;
+                    Crc32cStream entryPayloadCrc;
+                    const auto addUnpublished = [&](uint64_t bytes) {
+                        unpublishedBytes = bytes > UINT64_MAX - unpublishedBytes ? UINT64_MAX : unpublishedBytes + bytes;
+                    };
+                    const auto hasConsumer = [&] {
+                        if (primaryVisitorComplete) { return true; }
+                        std::lock_guard lock{mutex_};
+                        return followers_ != 0;
+                    };
+                    const EntryVisitor spoolVisitor{
+                        .beginEntry = [&](std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c) {
+                            if (entryActive) { throw std::runtime_error("AkkEngine: nested cluster snapshot entry"); }
+                            if (producedEntries == UINT64_MAX) {
+                                throw std::overflow_error("AkkEngine: cluster snapshot has too many entries");
+                            }
+                            if (key.size() > UINT32_MAX) { throw std::runtime_error("AkkEngine: cluster snapshot key is too large"); }
+                            const uint32_t keySize = static_cast<uint32_t>(key.size());
+                            const bool wireSizeValid = key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull &&
+                                valueSize <= UINT32_MAX &&
+                                valueSize <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - key.size();
+                            const uint64_t wireSize = wireSizeValid ? 8ull + key.size() + valueSize : 0;
+                            entryActive = true;
+                            sawChunk = false;
+                            entryValueSize = valueSize;
+                            entryValueOffset = 0;
+                            entryValueChecksum = valueCrc32c;
+                            entryKeySize = keySize;
+                            entryFileBacked = visitor.fileEntry && wireSizeValid &&
+                                wireSize > visitor.fileEntryThresholdBytes;
+                            entryValueCrc = Crc32cStream{};
+                            entryRecordCrc = Crc32cStream{};
+                            entryPayloadCrc = Crc32cStream{};
+                            updateCrcU32Le(entryRecordCrc, keySize);
+                            updateCrcU64Le(entryRecordCrc, valueSize);
+                            updateCrcU32Le(entryRecordCrc, valueCrc32c);
+                            entryRecordCrc.update(key);
+                            writeU32Le(out, keySize);
+                            writeU64Le(out, valueSize);
+                            writeU32Le(out, valueCrc32c);
+                            const auto dataOffset = out.tellp();
+                            if (dataOffset < 0) { throw std::runtime_error("AkkEngine: invalid cluster snapshot export offset"); }
+                            entryDataOffset = static_cast<uint64_t>(dataOffset);
+                            if (!key.empty()) {
+                                out.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size()));
+                            }
+                            if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot export header"); }
+                            addUnpublished(sizeof(uint32_t) * 2 + sizeof(uint64_t) + key.size());
+                            if (entryFileBacked) {
+                                updateCrcU32Le(entryPayloadCrc, keySize);
+                                updateCrcU32Le(entryPayloadCrc, static_cast<uint32_t>(valueSize));
+                                entryPayloadCrc.update(key);
+                            }
+                            else if (primaryVisitorComplete && !visitor.beginEntry(key, valueSize, valueCrc32c)) {
+                                primaryVisitorComplete = false;
+                            }
+                            return hasConsumer();
+                        },
+                        .appendValueChunk = [&](uint64_t offset, std::span<const uint8_t> chunk) {
+                            if (!entryActive || offset != entryValueOffset || chunk.size() > entryValueSize - entryValueOffset ||
+                                (chunk.empty() && (entryValueSize != 0 || sawChunk))) {
+                                throw std::runtime_error("AkkEngine: invalid cluster snapshot value chunk");
+                            }
+                            sawChunk = true;
+                            if (!chunk.empty()) {
+                                out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                            }
+                            if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot value chunk"); }
+                            entryValueCrc.update(chunk);
+                            entryRecordCrc.update(chunk);
+                            if (entryFileBacked) { entryPayloadCrc.update(chunk); }
+                            addUnpublished(chunk.size());
+                            if (!entryFileBacked && primaryVisitorComplete && !visitor.appendValueChunk(offset, chunk)) {
+                                primaryVisitorComplete = false;
+                            }
+                            entryValueOffset += static_cast<uint64_t>(chunk.size());
+                            return hasConsumer();
+                        },
+                        .finishEntry = [&] {
+                            if (!entryActive || !sawChunk || entryValueOffset != entryValueSize ||
+                                entryValueCrc.finish() != entryValueChecksum) {
+                                throw std::runtime_error("AkkEngine: incomplete cluster snapshot entry");
+                            }
+                            writeU32Le(out, entryRecordCrc.finish());
+                            if (!out) { throw std::runtime_error("AkkEngine: failed to finish cluster snapshot export entry"); }
+                            entryActive = false;
+                            ++producedEntries;
+                            addUnpublished(sizeof(uint32_t));
+                            if (unpublishedBytes >= FOLLOW_PUBLISH_BYTES) {
+                                out.flush();
+                                if (!out) { throw std::runtime_error("AkkEngine: failed to publish cluster snapshot export entries"); }
+                                publishEntries(producedEntries);
+                                unpublishedBytes = 0;
+                            }
+                            if (entryFileBacked && primaryVisitorComplete) {
+                                out.flush();
+                                if (!out) { throw std::runtime_error("AkkEngine: failed to publish cluster snapshot export entry"); }
+                                if (!visitor.fileEntry(cluster::SnapshotFileEntry{
+                                        .path = path_,
+                                        .dataOffset = entryDataOffset,
+                                        .keySize = entryKeySize,
+                                        .valueSize = entryValueSize,
+                                        .payloadCrc32c = entryPayloadCrc.finish(),
+                                        .storage = shared_from_this(),
+                                    })) {
+                                    primaryVisitorComplete = false;
+                                }
+                            }
+                            else if (!entryFileBacked && primaryVisitorComplete && !visitor.finishEntry()) {
+                                primaryVisitorComplete = false;
+                            }
+                            return hasConsumer();
+                        },
+                        .fileEntryThresholdBytes = UINT64_MAX,
+                        .fileEntry = {},
+                    };
+                    const bool complete = producer(spoolVisitor);
+                    if (complete && entryActive) { throw std::runtime_error("AkkEngine: unterminated cluster snapshot entry"); }
+                    if (!complete) { return false; }
+                    out.seekp(static_cast<std::streamoff>(MAGIC.size() + sizeof(uint64_t)));
+                    writeU64Le(out, producedEntries);
+                    out.flush();
+                    if (!out) { throw std::runtime_error("AkkEngine: failed to finish cluster snapshot export"); }
+                    out.close();
+                    publishEntries(producedEntries);
+                    return true;
+                }
+
+                void publishEntries(uint64_t count) {
+                    {
+                        std::lock_guard lock{mutex_};
+                        publishedEntries_ = count;
+                    }
+                    completionCv_.notify_all();
+                }
+
+                void removeFollower() {
+                    std::lock_guard lock{mutex_};
+                    if (followers_ != 0) { --followers_; }
+                }
+
+                void failGeneration(std::exception_ptr failure) {
+                    {
+                        std::lock_guard lock{mutex_};
+                        failure_ = std::move(failure);
+                        state_ = State::FAILED;
+                    }
+                    completionCv_.notify_all();
+                }
+
                 fs::path path_;
-                uint64_t seq_ = 0;
+                uint64_t seq_;
+                mutable std::mutex mutex_;
+                mutable std::condition_variable completionCv_;
+                State state_ = State::PENDING;
                 uint64_t entryCount_ = 0;
+                uint64_t publishedEntries_ = 0;
+                size_t followers_ = 0;
+                Producer producer_;
+                std::exception_ptr failure_;
         };
 
         [[nodiscard]] std::vector<uint8_t> encodeSnapshotCommitValue(uint64_t recordCount) {
@@ -521,11 +844,15 @@ namespace akkaradb::engine {
         return copySpanToArena(std::span<const uint8_t>{out.data(), out.size()}, arena);
     }
 
-    [[nodiscard]] core::ArenaGenerator<AkkEngine::ScanRecordView> scanGenerator(
-        core::BufferArena& arena,
+    struct StoredScanRecordView {
+        std::span<const uint8_t> key;
+        std::span<const uint8_t> value;
+        uint8_t flags = 0;
+    };
+
+    [[nodiscard]] core::ArenaGenerator<StoredScanRecordView> storedScanGenerator(
         memtable::MemTable::RangeIterator memtableIter,
         sst::SSTManager::Iterator sstIter,
-        blob::BlobManager* blobManager,
         std::shared_ptr<void> operationLifetime = {}
     ) {
         // Retains a public operation guard for the lifetime of a returned scan.
@@ -543,22 +870,31 @@ namespace akkaradb::engine {
             if (cmp <= 0) {
                 const auto record = *memtableCur;
                 const bool tombstone = record.isTombstone();
-                if (!tombstone) {
-                    auto value = resolveScanValue(record.flags(), record.value(), blobManager, arena);
-                    if (value) { co_yield AkkEngine::ScanRecordView{record.key(), *value}; }
-                }
+                if (!tombstone) { co_yield StoredScanRecordView{record.key(), record.value(), record.flags()}; }
                 memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
                 if (cmp == 0) { sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{}; }
             }
             else {
                 const auto record = std::move(*sstCur);
                 const bool tombstone = record.isTombstone();
-                if (!tombstone) {
-                    auto value = resolveScanValue(record.flags, record.value, blobManager, arena);
-                    if (value) { co_yield AkkEngine::ScanRecordView{record.key, *value}; }
-                }
+                if (!tombstone) { co_yield StoredScanRecordView{record.key, record.value, record.flags}; }
                 sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{};
             }
+        }
+    }
+
+    [[nodiscard]] core::ArenaGenerator<AkkEngine::ScanRecordView> scanGenerator(
+        core::BufferArena& arena,
+        memtable::MemTable::RangeIterator memtableIter,
+        sst::SSTManager::Iterator sstIter,
+        blob::BlobManager* blobManager,
+        std::shared_ptr<void> operationLifetime = {}
+    ) {
+        for (const auto& record : storedScanGenerator(
+                 std::move(memtableIter), std::move(sstIter), std::move(operationLifetime)
+             )) {
+            auto value = resolveScanValue(record.flags, record.value, blobManager, arena);
+            if (value) { co_yield AkkEngine::ScanRecordView{record.key, *value}; }
         }
     }
 
@@ -594,8 +930,6 @@ namespace akkaradb::engine {
                 std::unique_ptr<blob::BlobManager> blobManager;
                 std::unique_ptr<vlog::VersionLog> versionLog;
             };
-
-            class RaftLog;
 
             class OperationGuard {
                 public:
@@ -658,7 +992,6 @@ namespace akkaradb::engine {
             StorageSlot<vlog::VersionLog> versionLog;
             std::unique_ptr<cluster::IClusterRuntime> clusterRuntime;
             std::unique_ptr<server::IAkkApiServer> apiServer;
-            std::unique_ptr<RaftLog> raftLog;
             cluster::ClusterConfig clusterConfig;
             cluster::ReplicationMode clusterReplicationMode = cluster::ReplicationMode::STANDALONE;
             uint64_t clusterConfiguredNodeCount = 0;
@@ -666,10 +999,13 @@ namespace akkaradb::engine {
             std::recursive_mutex stripeMu;
             mutable std::mutex stripeRepairStatsMu;
             EngineStats::StripeReadRepairStats stripeRepairStats;
+            mutable std::mutex stripeRebuildStatsMu;
+            EngineStats::StripeRebuildStats stripeRebuildStats;
             std::exception_ptr stripeFailure;
             std::jthread stripeGcThread;
             std::map<std::vector<uint8_t>, std::vector<uint8_t>> stripePending;
             bool stripeGcLoaded = false;
+            std::vector<uint8_t> stripeRebuildCursor;
 
             mutable std::mutex writeMu;
             std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
@@ -728,195 +1064,6 @@ namespace akkaradb::engine {
                 uint8_t flags = MemHdr16::FLAG_NORMAL;
                 cluster::ReplOpType op = cluster::ReplOpType::PUT;
                 uint64_t sourceNodeId = 0;
-            };
-
-            struct RaftProposal {
-                uint64_t term = 1;
-                uint64_t index = 0;
-                std::vector<uint8_t> key;
-                std::vector<uint8_t> value;
-                uint8_t flags = MemHdr16::FLAG_NORMAL;
-                cluster::ReplOpType op = cluster::ReplOpType::PUT;
-                uint64_t sourceNodeId = 0;
-                uint64_t fp64 = 0;
-                uint64_t miniKey = 0;
-            };
-
-            class RaftLog {
-                public:
-                    enum class RecordType : uint8_t {
-                        PROPOSAL = 1, COMMIT = 2,
-                    };
-
-                    [[nodiscard]] static std::unique_ptr<RaftLog> open(const fs::path& path) {
-                        if (path.empty()) { throw std::invalid_argument("AkkEngine: Raft log path is required"); }
-                        ensureDir(path.parent_path());
-                        auto log = std::unique_ptr<RaftLog>{new RaftLog(path)};
-                        log->recover();
-                        log->file_ = std::fopen(path.string().c_str(), "ab");
-                        if (log->file_ == nullptr) { throw std::runtime_error("AkkEngine: failed to open Raft log: " + path.string()); }
-                        return log;
-                    }
-
-                    ~RaftLog() {
-                        if (file_ != nullptr) {
-                            try { forceDurable(file_); }
-                            catch (...) {}
-                            std::fclose(file_);
-                        }
-                    }
-
-                    RaftLog(const RaftLog&) = delete;
-                    RaftLog& operator=(const RaftLog&) = delete;
-
-                    [[nodiscard]] RaftProposal appendProposal(
-                        cluster::ReplOpType op,
-                        std::span<const uint8_t> key,
-                        std::span<const uint8_t> value,
-                        uint8_t flags,
-                        uint64_t sourceNodeId,
-                        uint64_t fp64 = 0,
-                        uint64_t miniKey = 0
-                    ) {
-                        std::lock_guard lock{mutex_};
-                        RaftProposal proposal;
-                        proposal.term = currentTerm_;
-                        proposal.index = ++lastIndex_;
-                        proposal.key.assign(key.begin(), key.end());
-                        proposal.value.assign(value.begin(), value.end());
-                        proposal.flags = flags;
-                        proposal.op = op;
-                        proposal.sourceNodeId = sourceNodeId;
-                        proposal.fp64 = fp64;
-                        proposal.miniKey = miniKey;
-                        appendRecord(RecordType::PROPOSAL, proposal);
-                        return proposal;
-                    }
-
-                    [[nodiscard]] RaftProposal appendPreparedProposal(
-                        cluster::ReplOpType op,
-                        std::span<const uint8_t> key,
-                        uint8_t flags,
-                        uint64_t sourceNodeId,
-                        const std::function<std::vector<uint8_t>(uint64_t proposalIndex, uint8_t & proposalFlags)>& prepareValue,
-                        uint64_t fp64 = 0,
-                        uint64_t miniKey = 0
-                    ) {
-                        uint64_t proposalIndex = 0;
-                        {
-                            std::lock_guard lock{mutex_};
-                            proposalIndex = ++lastIndex_;
-                        }
-                        uint8_t proposalFlags = flags;
-                        std::vector<uint8_t> preparedValue = prepareValue(proposalIndex, proposalFlags);
-
-                        std::lock_guard lock{mutex_};
-                        RaftProposal proposal;
-                        proposal.term = currentTerm_;
-                        proposal.index = proposalIndex;
-                        proposal.key.assign(key.begin(), key.end());
-                        proposal.value = std::move(preparedValue);
-                        proposal.flags = proposalFlags;
-                        proposal.op = op;
-                        proposal.sourceNodeId = sourceNodeId;
-                        proposal.fp64 = fp64;
-                        proposal.miniKey = miniKey;
-                        appendRecord(RecordType::PROPOSAL, proposal);
-                        return proposal;
-                    }
-
-                    void markCommitted(uint64_t term, uint64_t index) {
-                        std::lock_guard lock{mutex_};
-                        RaftProposal marker;
-                        marker.term = term;
-                        marker.index = index;
-                        appendRecord(RecordType::COMMIT, marker);
-                        if (index > commitIndex_) { commitIndex_ = index; }
-                    }
-
-                    void observeCommitted(uint64_t index) {
-                        std::lock_guard lock{mutex_};
-                        if (index > lastIndex_) { lastIndex_ = index; }
-                        if (index > commitIndex_) { commitIndex_ = index; }
-                    }
-
-                    [[nodiscard]] uint64_t lastIndex() const noexcept { return lastIndex_; }
-                    [[nodiscard]] uint64_t commitIndex() const noexcept { return commitIndex_; }
-
-                private:
-                    explicit RaftLog(fs::path path) : path_{std::move(path)} {}
-
-                    static constexpr uint32_t MAGIC = 0x31465241; // "ARF1" little-endian.
-                    static constexpr uint8_t VERSION = 1;
-
-                    struct Header {
-                        uint32_t magic = MAGIC;
-                        uint8_t version = VERSION;
-                        uint8_t type = 0;
-                        uint16_t reserved = 0;
-                        uint64_t term = 0;
-                        uint64_t index = 0;
-                        uint64_t sourceNodeId = 0;
-                        uint8_t op = 0;
-                        uint8_t flags = 0;
-                        uint16_t reserved2 = 0;
-                        uint32_t keyLen = 0;
-                        uint32_t valueLen = 0;
-                    };
-
-                    static bool readExact(FILE* file, void* out, size_t bytes) { return std::fread(out, 1, bytes, file) == bytes; }
-
-                    static void writeExact(FILE* file, const void* data, size_t bytes) {
-                        if (bytes == 0) { return; }
-                        if (std::fwrite(data, 1, bytes, file) != bytes) { throw std::runtime_error("AkkEngine: failed to write Raft log"); }
-                    }
-
-                    void recover() {
-                        FILE* rf = std::fopen(path_.string().c_str(), "rb");
-                        if (rf == nullptr) { return; }
-                        while (true) {
-                            Header header{};
-                            if (!readExact(rf, &header, sizeof(header))) { break; }
-                            if (header.magic != MAGIC || header.version != VERSION) { break; }
-                            if (header.type != static_cast<uint8_t>(RecordType::PROPOSAL) && header.type != static_cast<uint8_t>(
-                                RecordType::COMMIT)) { break; }
-                            if (header.keyLen > 0 && std::fseek(rf, static_cast<long>(header.keyLen), SEEK_CUR) != 0) { break; }
-                            if (header.valueLen > 0 && std::fseek(rf, static_cast<long>(header.valueLen), SEEK_CUR) != 0) { break; }
-                            if (header.index > lastIndex_) { lastIndex_ = header.index; }
-                            if (header.term > currentTerm_) { currentTerm_ = header.term; }
-                            if (header.type == static_cast<uint8_t>(RecordType::COMMIT) && header.index > commitIndex_) {
-                                commitIndex_ = header.index;
-                            }
-                        }
-                        std::fclose(rf);
-                    }
-
-                    void appendRecord(RecordType type, const RaftProposal& proposal) {
-                        if (file_ == nullptr) { throw std::runtime_error("AkkEngine: Raft log is closed"); }
-                        if (proposal.key.size() > UINT32_MAX || proposal.value.size() > UINT32_MAX) {
-                            throw std::invalid_argument("AkkEngine: Raft log entry is too large");
-                        }
-                        Header header;
-                        header.type = static_cast<uint8_t>(type);
-                        header.term = proposal.term;
-                        header.index = proposal.index;
-                        header.sourceNodeId = proposal.sourceNodeId;
-                        header.op = static_cast<uint8_t>(proposal.op);
-                        header.flags = proposal.flags;
-                        header.keyLen = static_cast<uint32_t>(proposal.key.size());
-                        header.valueLen = static_cast<uint32_t>(proposal.value.size());
-                        writeExact(file_, &header, sizeof(header));
-                        writeExact(file_, proposal.key.data(), proposal.key.size());
-                        writeExact(file_, proposal.value.data(), proposal.value.size());
-                        forceDurable(file_);
-                    }
-
-                    fs::path path_;
-                    FILE* file_ = nullptr;
-                    mutable std::mutex mutex_;
-                    uint64_t currentTerm_ = 1;
-                    uint64_t lastIndex_ = 0;
-                    uint64_t commitIndex_ = 0;
             };
 
             [[nodiscard]] uint64_t snapshotSeq() const noexcept {
@@ -1206,8 +1353,15 @@ namespace akkaradb::engine {
                 return record;
             }
 
-            [[nodiscard]] std::vector<uint8_t> maybeExternalizeRaft(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
-                if (!blobManager || value.size() < blobManager->threshold()) { return {value.begin(), value.end()}; }
+            struct PreparedRaftValue {
+                std::vector<uint8_t> stored;
+                std::optional<cluster::ClusterBlobPayload> blob;
+            };
+
+            [[nodiscard]] PreparedRaftValue prepareRaftValue(uint64_t seq, std::span<const uint8_t> value, uint8_t& flags) {
+                if (!blobManager || value.size() < blobManager->threshold()) {
+                    return PreparedRaftValue{.stored = {value.begin(), value.end()}, .blob = std::nullopt};
+                }
 
                 const uint64_t blobId = opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG
                                             ? raftLogBlobId(nodeId, seq)
@@ -1217,14 +1371,14 @@ namespace akkaradb::engine {
                 flags |= MemHdr16::FLAG_BLOB;
 
                 if (opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG) {
-                    if (!clusterRuntime) { throw std::runtime_error("AkkEngine: RAFT_LOG Blob policy requires cluster runtime"); }
-                    clusterRuntime->shipBlob(seq, blobId, value);
-                    return ref;
+                    return PreparedRaftValue{
+                        .stored = std::move(ref),
+                        .blob = cluster::ClusterBlobPayload{.blobId = blobId, .content = {value.begin(), value.end()}},
+                    };
                 }
 
                 blobManager->write(blobId, value);
-                if (clusterRuntime) { clusterRuntime->shipBlob(seq, blobId, value); }
-                return ref;
+                return PreparedRaftValue{.stored = std::move(ref), .blob = std::nullopt};
             }
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> resolveValue(uint8_t flags, std::span<const uint8_t> value) const {
@@ -1245,6 +1399,7 @@ namespace akkaradb::engine {
                 uint64_t originalSize = 0;
                 erasure::ErasureLayout layout;
                 std::vector<uint64_t> nodeIds;
+                std::vector<uint8_t> shardPresent;
             };
 
             static void pushU16(std::vector<uint8_t>& out, uint16_t value) {
@@ -1325,7 +1480,7 @@ namespace akkaradb::engine {
             }
 
             static std::vector<uint8_t> encodeStripeMetadata(const StripeMetadata& metadata) {
-                std::vector<uint8_t> out{'A', 'K', 'S', 'M', '3'};
+                std::vector<uint8_t> out{'A', 'K', 'S', 'M', '1'};
                 out.push_back(metadata.tombstone ? 1 : 0);
                 pushU64(out, metadata.version);
                 pushU64(out, metadata.ownerNodeId);
@@ -1336,11 +1491,13 @@ namespace akkaradb::engine {
                 pushU16(out, metadata.layout.parityShards);
                 pushU16(out, static_cast<uint16_t>(metadata.nodeIds.size()));
                 for (const auto nodeId : metadata.nodeIds) { pushU64(out, nodeId); }
+                pushU16(out, static_cast<uint16_t>(metadata.shardPresent.size()));
+                out.insert(out.end(), metadata.shardPresent.begin(), metadata.shardPresent.end());
                 return out;
             }
 
             static std::optional<StripeMetadata> decodeStripeMetadata(std::span<const uint8_t> bytes) {
-                if (bytes.size() < 52 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'M' || bytes[4] != '3') {
+                if (bytes.size() < 54 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'M' || bytes[4] != '1') {
                     return std::nullopt;
                 }
                 size_t cursor = 5;
@@ -1360,6 +1517,16 @@ namespace akkaradb::engine {
                     if (!pullU64(bytes, cursor, nodeId)) { return std::nullopt; }
                     metadata.nodeIds.push_back(nodeId);
                 }
+                uint16_t presenceCount = 0;
+                if (!pullU16(bytes, cursor, presenceCount) || presenceCount != nodeCount || presenceCount > bytes.size() - cursor) {
+                    return std::nullopt;
+                }
+                metadata.shardPresent.assign(
+                    bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+                    bytes.begin() + static_cast<std::ptrdiff_t>(cursor + presenceCount)
+                );
+                if (std::ranges::any_of(metadata.shardPresent, [](uint8_t present) { return present > 1; })) { return std::nullopt; }
+                cursor += presenceCount;
                 return cursor == bytes.size() ? std::optional<StripeMetadata>{std::move(metadata)} : std::nullopt;
             }
 
@@ -1552,18 +1719,13 @@ namespace akkaradb::engine {
             [[nodiscard]] std::optional<StripeMetadata> readStripeMetadata(std::span<const uint8_t> publicKey) {
                 checkStripeHealthy();
                 const auto owner = stripeOwnerFor(clusterConfig, publicKey);
-                // Replica metadata must never be treated as an authority.
-                const uint64_t authorityNode = clusterRuntime && clusterRuntime->stripeFailoverNodeId() != 0
-                                                   ? clusterRuntime->stripeFailoverNodeId()
-                                                   : owner;
-                const auto value = clusterRuntime && clusterRuntime->stripeFailoverNodeId() != 0
-                                       ? clusterRuntime->readStripeMetadata(publicKey, owner)
-                                       : readStripeRecordFromNode(authorityNode, stripeMetaKey(publicKey));
+                if (!clusterRuntime) { throw std::runtime_error("AkkEngine: STRIPE metadata Raft runtime is unavailable"); }
+                const auto value = clusterRuntime->readStripeMetadata(publicKey, owner);
                 if (!value) { return std::nullopt; }
                 auto metadata = decodeStripeMetadata(*value);
                 const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
                 if (!metadata || metadata->version == 0 || metadata->ownerNodeId != owner || metadata->authorityNodeId == 0 ||
-                    metadata->fenceToken == 0 || metadata->nodeIds.empty() ||
+                    metadata->fenceToken == 0 || metadata->nodeIds.empty() || metadata->shardPresent.size() != metadata->nodeIds.size() ||
                     (metadata->authorityNodeId != owner && metadata->authorityNodeId != failoverNode)) {
                     throw std::runtime_error("AkkEngine: corrupt STRIPE metadata");
                 }
@@ -1578,7 +1740,8 @@ namespace akkaradb::engine {
                 std::span<const uint8_t> publicKey, const StripeMetadata& metadata,
                 const std::vector<erasure::ErasureShard>& available, const std::vector<bool>& present
             ) {
-                if (!opts.cluster.runtime.stripeReadRepair || metadata.tombstone || metadata.authorityNodeId != nodeId) { return; }
+                if (!opts.cluster.runtime.stripeReadRepair || metadata.layout.parityShards == 0 ||
+                    metadata.tombstone || metadata.authorityNodeId != nodeId) { return; }
                 // Only the owner repairs, under stripeMu, so repair cannot
                 // resurrect a retired generation after the owner's GC.
                 for (uint16_t i = 0; i < metadata.layout.totalShards(); ++i) {
@@ -1604,13 +1767,16 @@ namespace akkaradb::engine {
                 }
             }
 
-            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeValueFromMetadata(
-                std::span<const uint8_t> publicKey, const StripeMetadata& metadata, bool repair
-            ) {
-                if (metadata.tombstone) { return std::nullopt; }
-                if (metadata.nodeIds.size() != metadata.layout.totalShards()) { throw std::runtime_error("AkkEngine: corrupt STRIPE metadata"); }
+            struct StripeShardSet {
                 std::vector<erasure::ErasureShard> available;
-                std::vector<bool> present(metadata.layout.totalShards(), false);
+                std::vector<bool> present;
+            };
+
+            [[nodiscard]] StripeShardSet readStripeShards(
+                std::span<const uint8_t> publicKey, const StripeMetadata& metadata
+            ) {
+                StripeShardSet out;
+                out.present.assign(metadata.layout.totalShards(), false);
                 for (uint16_t i = 0; i < metadata.layout.totalShards(); ++i) {
                     std::optional<std::vector<uint8_t>> stored;
                     try { stored = readStripeRecordFromNode(metadata.nodeIds[i], stripeShardKey(publicKey, metadata.version, i)); }
@@ -1618,12 +1784,23 @@ namespace akkaradb::engine {
                     if (!stored) { continue; }
                     auto shard = decodeStripeShard(*stored, metadata.version, metadata.layout);
                     if (!shard || shard->index != i || shard->originalSize != metadata.originalSize) { continue; }
-                    available.push_back(std::move(*shard));
-                    present[i] = true;
+                    out.available.push_back(std::move(*shard));
+                    out.present[i] = true;
                 }
-                if (available.size() < metadata.layout.dataShards) { throw std::runtime_error("AkkEngine: not enough STRIPE shards to reconstruct value"); }
-                auto value = erasure::RsErasureCodec::decode(available, metadata.layout);
-                if (repair) { repairStripeShards(publicKey, metadata, available, present); }
+                return out;
+            }
+
+            [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeValueFromMetadata(
+                std::span<const uint8_t> publicKey, const StripeMetadata& metadata, bool repair
+            ) {
+                if (metadata.tombstone) { return std::nullopt; }
+                if (metadata.nodeIds.size() != metadata.layout.totalShards()) { throw std::runtime_error("AkkEngine: corrupt STRIPE metadata"); }
+                auto shards = readStripeShards(publicKey, metadata);
+                if (shards.available.size() < metadata.layout.dataShards) {
+                    throw std::runtime_error("AkkEngine: not enough STRIPE shards to reconstruct value");
+                }
+                auto value = erasure::RsErasureCodec::decode(shards.available, metadata.layout);
+                if (repair) { repairStripeShards(publicKey, metadata, shards.available, shards.present); }
                 return value;
             }
 
@@ -1646,7 +1823,7 @@ namespace akkaradb::engine {
                         if (!metadata || metadata->tombstone) { return std::nullopt; }
                         std::optional<std::vector<uint8_t>> value;
                         std::exception_ptr failure;
-                        try { value = readStripeValueFromMetadata(publicKey, *metadata, false); }
+                        try { value = readStripeValueFromMetadata(publicKey, *metadata, metadata->authorityNodeId == nodeId); }
                         catch (...) { failure = std::current_exception(); }
                         const auto current = readStripeMetadata(publicKey);
                         if (!current || current->version != metadata->version) { continue; }
@@ -1719,6 +1896,7 @@ namespace akkaradb::engine {
                     next.layout = stripeLayoutFor(clusterConfig);
                     const uint64_t excludedOwner = lease.authorityNodeId == originalOwner ? 0 : originalOwner;
                     next.nodeIds = stripeNodeIdsFor(clusterConfig, publicKey, excludedOwner);
+                    next.shardPresent.assign(next.nodeIds.size(), 0);
                     // The fencing token is also the immutable generation id.
                     // Local WAL ordering continues to use a local storage seq.
                     {
@@ -1736,12 +1914,37 @@ namespace akkaradb::engine {
                     }
                     crashAtTestPoint("stripe.after_intent");
                     if (!tombstone) {
+                        uint16_t durableShards = 0;
                         for (const auto& shard : erasure::RsErasureCodec::encode(value, next.layout)) {
-                            writeStripeRecordToNode(
-                                next.nodeIds[shard.index], stripeShardKey(publicKey, next.version, shard.index),
-                                encodeStripeShard(next.version, shard, next.layout), next.version
+                            const uint64_t targetNodeId = next.nodeIds[shard.index];
+                            const auto encodedShard = encodeStripeShard(next.version, shard, next.layout);
+                            try {
+                                if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) {
+                                    continue;
+                                }
+                                writeStripeRecordToNode(
+                                    targetNodeId, stripeShardKey(publicKey, next.version, shard.index),
+                                    encodedShard, next.version
+                                );
+                                next.shardPresent[shard.index] = 1;
+                                ++durableShards;
+                                crashAtTestPoint("stripe.after_shard");
+                            }
+                            catch (const std::runtime_error&) {}
+                        }
+                        const uint16_t requiredShards = opts.cluster.runtime.stripeWriteCommitMode ==
+                            cluster::StripeWriteCommitMode::DATA_SHARDS && next.layout.parityShards != 0
+                                                            ? next.layout.dataShards
+                                                            : next.layout.totalShards();
+                        if (durableShards < requiredShards) {
+                            throw std::runtime_error(
+                                "AkkEngine: insufficient durable STRIPE shards (durable=" + std::to_string(durableShards) +
+                                ", required=" + std::to_string(requiredShards) + ")"
                             );
-                            crashAtTestPoint("stripe.after_shard");
+                        }
+                        if (durableShards < next.layout.totalShards()) {
+                            std::lock_guard statsLock{stripeRebuildStatsMu};
+                            stripeRebuildStats.active = true;
                         }
                     }
                     crashAtTestPoint("stripe.before_publish");
@@ -1837,17 +2040,142 @@ namespace akkaradb::engine {
                 }
             }
 
+            void rebuildStripeShardsBatch() {
+                if (!opts.cluster.runtime.stripeAutoRebuild || clusterConfig.stripe().parityShards == 0) { return; }
+                struct Candidate {
+                    std::vector<uint8_t> key;
+                    StripeMetadata metadata;
+                };
+                std::vector<Candidate> candidates;
+                candidates.reserve(opts.cluster.runtime.stripeRebuildBatchKeys);
+                {
+                    std::lock_guard stripeLock{stripeMu};
+                    checkStripeHealthy();
+                    {
+                        std::lock_guard statsLock{stripeRebuildStatsMu};
+                        ++stripeRebuildStats.cycles;
+                        if (stripeRebuildCursor.empty()) { stripeRebuildStats.active = false; }
+                    }
+                    core::BufferArena arena;
+                    memtable::MemTable::KeyRange range;
+                    range.start = stripeRebuildCursor;
+                    const uint64_t visibleSeq = snapshotSeq();
+                    auto mt = memtable->iterator(range, visibleSeq);
+                    sst::SSTManager::Iterator sst;
+                    if (sstManager) { sst = sstManager->scanIter(range.start, {}, visibleSeq); }
+                    std::vector<uint8_t> lastMetadataKey;
+                    uint32_t metadataKeysVisited = 0;
+                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                        std::vector<uint8_t> internalKey{record.key.begin(), record.key.end()};
+                        if (!stripeRebuildCursor.empty() && internalKey <= stripeRebuildCursor) { continue; }
+                        auto publicKey = publicKeyFromStripeMetaKey(record.key);
+                        if (!publicKey) { continue; }
+                        lastMetadataKey = std::move(internalKey);
+                        ++metadataKeysVisited;
+                        auto metadata = decodeStripeMetadata(record.value);
+                        if (!metadata) { throw std::runtime_error("AkkEngine: corrupt STRIPE rebuild metadata"); }
+                        const bool localMetadataStore = clusterRuntime &&
+                            clusterRuntime->stripeMetadataLeaderNodeId() == nodeId;
+                        if (!metadata->tombstone && metadata->layout.parityShards != 0 && localMetadataStore) {
+                            candidates.push_back(Candidate{.key = std::move(*publicKey), .metadata = std::move(*metadata)});
+                        }
+                        if (metadataKeysVisited >= opts.cluster.runtime.stripeRebuildBatchKeys) { break; }
+                    }
+                    stripeRebuildCursor = metadataKeysVisited >= opts.cluster.runtime.stripeRebuildBatchKeys
+                                              ? std::move(lastMetadataKey)
+                                              : std::vector<uint8_t>{};
+                    std::lock_guard statsLock{stripeRebuildStatsMu};
+                    stripeRebuildStats.keysScanned += metadataKeysVisited;
+                }
+
+                for (auto& candidate : candidates) {
+                    auto shards = readStripeShards(candidate.key, candidate.metadata);
+                    bool missing = false;
+                    std::vector<uint8_t> observed(candidate.metadata.layout.totalShards(), 0);
+                    for (uint16_t i = 0; i < observed.size(); ++i) {
+                        if (i < shards.present.size() && shards.present[i]) { observed[i] = 1; }
+                        else { missing = true; }
+                    }
+                    if (missing) {
+                        std::lock_guard statsLock{stripeRebuildStatsMu};
+                        stripeRebuildStats.active = true;
+                    }
+                    for (uint16_t i = 0; i < observed.size(); ++i) {
+                        if (observed[i] != 0) { continue; }
+                        const uint64_t targetNodeId = candidate.metadata.nodeIds[i];
+                        if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) { continue; }
+                        {
+                            std::lock_guard statsLock{stripeRebuildStatsMu};
+                            ++stripeRebuildStats.attempts;
+                        }
+                        try {
+                            if (shards.available.size() < candidate.metadata.layout.dataShards) {
+                                throw std::runtime_error("AkkEngine: insufficient STRIPE shards for rebuild");
+                            }
+                            auto repaired = erasure::RsErasureCodec::repairOne(i, shards.available, candidate.metadata.layout);
+                            writeStripeRecordToNode(
+                                targetNodeId, stripeShardKey(candidate.key, candidate.metadata.version, i),
+                                encodeStripeShard(candidate.metadata.version, repaired, candidate.metadata.layout),
+                                candidate.metadata.version
+                            );
+                            observed[i] = 1;
+                            shards.present[i] = true;
+                            shards.available.push_back(std::move(repaired));
+                            std::lock_guard statsLock{stripeRebuildStatsMu};
+                            ++stripeRebuildStats.succeeded;
+                        }
+                        catch (...) {
+                            std::lock_guard statsLock{stripeRebuildStatsMu};
+                            ++stripeRebuildStats.failed;
+                            stripeRebuildStats.lastFailureNodeId = targetNodeId;
+                        }
+                    }
+
+                    if (observed == candidate.metadata.shardPresent) { continue; }
+                    std::lock_guard stripeLock{stripeMu};
+                    checkStripeHealthy();
+                    const auto currentBytes = getValueInternal(stripeMetaKey(candidate.key), false);
+                    const auto current = currentBytes ? decodeStripeMetadata(*currentBytes) : std::nullopt;
+                    if (!current || current->version != candidate.metadata.version ||
+                        current->authorityNodeId != candidate.metadata.authorityNodeId) { continue; }
+                    candidate.metadata.shardPresent = std::move(observed);
+                    const auto encoded = encodeStripeMetadata(candidate.metadata);
+                    (void)clusterRuntime->repairStripeMetadata(candidate.key, candidate.metadata.version, encoded);
+                }
+            }
+
             void startStripeGarbageCollector() {
                 if (clusterReplicationMode != cluster::ReplicationMode::STRIPE) { return; }
                 stripeGcThread = std::jthread([this](std::stop_token stop) {
+                    auto nextGarbageCollection = std::chrono::steady_clock::now();
+                    auto nextRebuild = std::chrono::steady_clock::now();
                     while (!stop.stop_requested()) {
                         try { collectStripeGarbage(); }
+                        catch (const cluster::StripeMetadataUnavailable&) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                            continue;
+                        }
                         catch (...) {
                             std::lock_guard lock{stripeMu};
                             stripeFailure = std::current_exception();
                             return;
                         }
-                        for (int i = 0; i < 10 && !stop.stop_requested(); ++i) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (now >= nextRebuild) {
+                            try { rebuildStripeShardsBatch(); }
+                            catch (const cluster::StripeMetadataUnavailable&) {
+                                nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
+                                continue;
+                            }
+                            catch (...) {
+                                std::lock_guard lock{stripeMu};
+                                stripeFailure = std::current_exception();
+                                return;
+                            }
+                            nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
+                        }
+                        nextGarbageCollection = now + std::chrono::milliseconds{500};
+                        while (!stop.stop_requested() && std::chrono::steady_clock::now() < nextGarbageCollection) {
                             std::this_thread::sleep_for(std::chrono::milliseconds{50});
                         }
                     }
@@ -1900,9 +2228,7 @@ namespace akkaradb::engine {
                     stripeLock.lock();
                     checkStripeHealthy();
                     const auto publicKey = publicKeyFromStripeMetaKey(key);
-                    const uint64_t metadataAuthority = clusterRuntime && clusterRuntime->stripeFailoverNodeId() != 0
-                                                           ? clusterRuntime->stripeFailoverNodeId()
-                                                           : (publicKey ? stripeOwnerFor(clusterConfig, *publicKey) : 0);
+                    const uint64_t metadataAuthority = clusterRuntime ? clusterRuntime->stripeMetadataLeaderNodeId() : 0;
                     if (!publicKey || metadataAuthority != nodeId) {
                         throw std::runtime_error("AkkEngine: STRIPE metadata must be read from its authority node");
                     }
@@ -2592,11 +2918,11 @@ namespace akkaradb::engine {
                 return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE;
             }
 
-            void recordCommittedRaftProposalStats(const RaftProposal& proposal) {
-                const uint8_t flags = proposal.op == cluster::ReplOpType::REMOVE
-                                          ? static_cast<uint8_t>(proposal.flags | MemHdr16::FLAG_TOMBSTONE)
-                                          : proposal.flags;
-                if (proposal.op == cluster::ReplOpType::REMOVE) {
+            void recordCommittedRaftMutationStats(cluster::ReplOpType op, uint8_t recordFlags) {
+                const uint8_t flags = op == cluster::ReplOpType::REMOVE
+                                          ? static_cast<uint8_t>(recordFlags | MemHdr16::FLAG_TOMBSTONE)
+                                          : recordFlags;
+                if (op == cluster::ReplOpType::REMOVE) {
                     removesTotal.fetch_add(1, std::memory_order_relaxed);
                 }
                 else {
@@ -2639,8 +2965,15 @@ namespace akkaradb::engine {
                     const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
                     const bool fromOwner = sourceNodeId == originalOwner;
                     const bool fromFailover = failoverNode != 0 && sourceNodeId == failoverNode;
-                    const auto ids = stripeNodeIdsFor(clusterConfig, key.subspan(cursor), fromFailover && !fromOwner ? originalOwner : 0);
-                    if ((!fromOwner && !fromFailover) || index >= ids.size() || ids[index] != nodeId) {
+                    const auto ownerIds = stripeNodeIdsFor(clusterConfig, key.subspan(cursor));
+                    const bool ownerTarget = index < ownerIds.size() && ownerIds[index] == nodeId;
+                    bool failoverTarget = false;
+                    if (fromFailover && !fromOwner) {
+                        const auto failoverIds = stripeNodeIdsFor(clusterConfig, key.subspan(cursor), originalOwner);
+                        failoverTarget = index < failoverIds.size() && failoverIds[index] == nodeId;
+                    }
+                    if ((!fromOwner && !fromFailover) || (fromOwner && !ownerTarget) ||
+                        (fromFailover && !ownerTarget && !failoverTarget)) {
                         throw std::runtime_error("AkkEngine: remote STRIPE write is not from its owner or targets the wrong shard");
                     }
                 }
@@ -2648,7 +2981,6 @@ namespace akkaradb::engine {
                     ? (clusterReplicationMode == cluster::ReplicationMode::STRIPE ? memtable->reserveSeq(1) : reserveWriteSeq(1)) : seq;
                 appendAll(storageSeq, key, value, flags, sourceNodeId, 0, 0, vlogFlags);
                 memtable->advanceSeq(storageSeq);
-                if (raftLog && !partitionedRemote) { raftLog->observeCommitted(seq); }
             }
 
             [[nodiscard]] fs::path replicaSnapshotStagingPath() const {
@@ -2741,7 +3073,7 @@ namespace akkaradb::engine {
                 pendingSnapshotEntryValueCrc = Crc32cStream{};
             }
 
-            void beginReplicaSnapshot(uint64_t seq, uint64_t entryCount) {
+            void beginReplicaSnapshot(uint64_t seq, uint64_t) {
                 std::lock_guard lock(writeMu);
                 resetReplicaSnapshotStagingLocked();
                 const auto path = replicaSnapshotStagingPath();
@@ -2752,11 +3084,11 @@ namespace akkaradb::engine {
                 static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
                 pendingSnapshotOut.write(SNAPSHOT_STAGING_MAGIC, sizeof(SNAPSHOT_STAGING_MAGIC));
                 writeU64Le(pendingSnapshotOut, seq);
-                writeU64Le(pendingSnapshotOut, entryCount);
+                writeU64Le(pendingSnapshotOut, 0); // Patched with the final count on completion.
 
                 snapshotInProgress = true;
                 pendingSnapshotSeq = seq;
-                pendingSnapshotEntryCount = entryCount;
+                pendingSnapshotEntryCount = UINT64_MAX;
                 pendingSnapshotAppliedEntries = 0;
             }
 
@@ -2766,9 +3098,7 @@ namespace akkaradb::engine {
                     throw std::runtime_error("AkkEngine: received replication snapshot entry without begin");
                 }
                 if (pendingSnapshotEntryInProgress) { throw std::runtime_error("AkkEngine: replication snapshot entry is already active"); }
-                if (pendingSnapshotAppliedEntries >= pendingSnapshotEntryCount) {
-                    throw std::runtime_error("AkkEngine: replication snapshot has too many entries");
-                }
+                if (pendingSnapshotAppliedEntries == UINT64_MAX) { throw std::runtime_error("AkkEngine: replication snapshot has too many entries"); }
                 if (key.size() > UINT32_MAX) { throw std::invalid_argument("AkkEngine: replication snapshot key is too large"); }
 
                 const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(key.data()), key.size());
@@ -2830,11 +3160,15 @@ namespace akkaradb::engine {
                 pendingSnapshotEntryValueCrc = Crc32cStream{};
             }
 
-            void finishReplicaSnapshotLocked(uint64_t seq) {
-                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotAppliedEntries != pendingSnapshotEntryCount) {
+            void finishReplicaSnapshotLocked(uint64_t seq, uint64_t entryCount) {
+                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotEntryInProgress ||
+                    pendingSnapshotAppliedEntries != entryCount) {
                     throw std::runtime_error("AkkEngine: invalid replication snapshot completion");
                 }
+                pendingSnapshotEntryCount = entryCount;
                 if (pendingSnapshotOut.is_open()) {
+                    pendingSnapshotOut.seekp(static_cast<std::streamoff>(5 + sizeof(uint64_t)));
+                    writeU64Le(pendingSnapshotOut, entryCount);
                     pendingSnapshotOut.flush();
                     if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to flush replication snapshot staging file"); }
                     pendingSnapshotOut.close();
@@ -2915,14 +3249,13 @@ namespace akkaradb::engine {
                 // that this node never applied individually.
                 resetCommittedSeq(std::max(committedSeq.load(std::memory_order_acquire), seq));
                 commitCv.notify_all();
-                if (raftLog) { raftLog->observeCommitted(seq); }
                 applyStaged.close();
                 resetReplicaSnapshotStagingLocked();
             }
 
-            void finishReplicaSnapshot(uint64_t seq) {
+            void finishReplicaSnapshot(uint64_t seq, uint64_t entryCount) {
                 std::lock_guard lock(writeMu);
-                finishReplicaSnapshotLocked(seq);
+                finishReplicaSnapshotLocked(seq, entryCount);
             }
 
             void recoverReplicaSnapshot(uint64_t seq) {
@@ -2933,7 +3266,7 @@ namespace akkaradb::engine {
                     return;
                 }
                 loadReplicaSnapshotStagingForRecoveryLocked(seq);
-                finishReplicaSnapshotLocked(seq);
+                finishReplicaSnapshotLocked(seq, pendingSnapshotEntryCount);
             }
 
             [[nodiscard]] bool isReplicaSnapshotDurable(uint64_t seq) {
@@ -3095,20 +3428,18 @@ namespace akkaradb::engine {
                         const uint8_t operation = static_cast<uint8_t>(op);
                         const std::array<std::span<const uint8_t>, 3> parts{std::span<const uint8_t>{&operation, 1}, key, value};
                         const auto fingerprint = crypto::hash256(parts);
-                        std::optional<RaftProposal> proposal;
-                        std::shared_future<cluster::ClusterRequestResult> completion;
-                        {
-                            std::lock_guard admission{admissionMutex_};
-                            completion = engine_.clusterRuntime->submitRequest(id, fingerprint, [&] {
-                                proposal = propose(op, key, value, op == cluster::ReplOpType::PUT ? MemHdr16::FLAG_NORMAL : MemHdr16::FLAG_TOMBSTONE);
-                                return cluster::ClusterHistoryEntry{proposal->index, proposal->sourceNodeId,
-                                    static_cast<uint8_t>(proposal->op), proposal->flags, proposal->key, proposal->value};
-                            });
-                        }
+                        std::optional<uint8_t> preparedFlags;
+                        auto completion = engine_.clusterRuntime->submitRequest(id, fingerprint, [&](uint64_t sequence) {
+                            auto mutation = prepareMutation(
+                                sequence, op, key, value,
+                                op == cluster::ReplOpType::PUT ? MemHdr16::FLAG_NORMAL : MemHdr16::FLAG_TOMBSTONE
+                            );
+                            preparedFlags = mutation.recordFlags;
+                            return mutation;
+                        });
                         const auto result = completion.get();
-                        if (proposal && result.status == cluster::ClusterRequestStatus::APPLIED) {
-                            engine_.raftLog->markCommitted(proposal->term, proposal->index);
-                            engine_.recordCommittedRaftProposalStats(*proposal);
+                        if (preparedFlags && result.status == cluster::ClusterRequestStatus::APPLIED) {
+                            engine_.recordCommittedRaftMutationStats(op, *preparedFlags);
                         }
                         return result;
                     }
@@ -3118,7 +3449,9 @@ namespace akkaradb::engine {
                     }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
-                        finish(submit(cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL, fp64, miniKey));
+                        (void)fp64;
+                        (void)miniKey;
+                        finish(submit(cluster::ReplOpType::PUT, key, value, MemHdr16::FLAG_NORMAL));
                     }
 
                     void putBatch(std::span<const BatchPutEntry> entries) override {
@@ -3146,53 +3479,57 @@ namespace akkaradb::engine {
                     }
 
                     void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
-                        finish(submit(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE, fp64, miniKey));
+                        (void)fp64;
+                        (void)miniKey;
+                        finish(submit(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE));
                     }
 
                 private:
-                    struct Pending { RaftProposal proposal; std::future<void> completion; };
-                    std::mutex admissionMutex_;
+                    struct Pending {
+                        cluster::ReplOpType op = cluster::ReplOpType::PUT;
+                        uint8_t recordFlags = MemHdr16::FLAG_NORMAL;
+                        std::future<void> completion;
+                    };
 
                     Pending submit(cluster::ReplOpType op, std::span<const uint8_t> key,
-                        std::span<const uint8_t> value, uint8_t flags, uint64_t fp64 = 0, uint64_t miniKey = 0) {
+                        std::span<const uint8_t> value, uint8_t flags) {
                         engine_.requireOwnsWriteKey(key);
                         engine_.applyWriteBackpressure();
-                        std::lock_guard admission{admissionMutex_};
-                        auto proposal = propose(op, key, value, flags, fp64, miniKey);
-                        auto completion = engine_.clusterRuntime->submitEntry(
-                            proposal.index, proposal.op, proposal.key, proposal.value, proposal.flags, proposal.sourceNodeId);
-                        return Pending{std::move(proposal), std::move(completion)};
+                        uint8_t preparedFlags = flags;
+                        auto submission = engine_.clusterRuntime->submitMutation([&](uint64_t sequence) {
+                            auto mutation = prepareMutation(sequence, op, key, value, flags);
+                            preparedFlags = mutation.recordFlags;
+                            return mutation;
+                        });
+                        return Pending{.op = op, .recordFlags = preparedFlags, .completion = std::move(submission.completion)};
                     }
 
                     void finish(Pending pending) {
                         pending.completion.get();
-                        engine_.raftLog->markCommitted(pending.proposal.term, pending.proposal.index);
-                        engine_.recordCommittedRaftProposalStats(pending.proposal);
+                        engine_.recordCommittedRaftMutationStats(pending.op, pending.recordFlags);
                     }
 
-                    [[nodiscard]] RaftProposal propose(
+                    [[nodiscard]] cluster::ClusterMutation prepareMutation(
+                        uint64_t sequence,
                         cluster::ReplOpType op,
                         std::span<const uint8_t> key,
                         std::span<const uint8_t> value,
-                        uint8_t flags,
-                        uint64_t fp64 = 0,
-                        uint64_t miniKey = 0
+                        uint8_t flags
                     ) {
-                        if (!engine_.raftLog) { throw std::runtime_error("AkkEngine: RAFT_QUORUM requires a Raft log"); }
+                        cluster::ClusterMutation mutation{
+                            .sourceNodeId = engine_.nodeId,
+                            .op = op,
+                            .recordFlags = flags,
+                            .key = {key.begin(), key.end()},
+                            .value = {value.begin(), value.end()},
+                            .blob = std::nullopt,
+                        };
                         if (op == cluster::ReplOpType::PUT) {
-                            return engine_.raftLog->appendPreparedProposal(
-                                op,
-                                key,
-                                flags,
-                                engine_.nodeId,
-                                [this, value](uint64_t proposalIndex, uint8_t& proposalFlags) {
-                                    return engine_.maybeExternalizeRaft(proposalIndex, value, proposalFlags);
-                                },
-                                fp64,
-                                miniKey
-                            );
+                            auto prepared = engine_.prepareRaftValue(sequence, value, mutation.recordFlags);
+                            mutation.value = std::move(prepared.stored);
+                            mutation.blob = std::move(prepared.blob);
                         }
-                        return engine_.raftLog->appendProposal(op, key, value, flags, engine_.nodeId, fp64, miniKey);
+                        return mutation;
                     }
             };
 
@@ -3431,6 +3768,9 @@ namespace akkaradb::engine {
             impl.clusterConfig = cfg;
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
             impl.clusterReplicationMode = cfg.mode();
+            if (cfg.raidPreset() == cluster::RaidPreset::RAID1 && !impl.walWriter) {
+                throw std::invalid_argument("AkkEngine: RAID.1 requires WAL durability");
+            }
             if ((cfg.mode() == cluster::ReplicationMode::PARTITIONED || cfg.mode() == cluster::ReplicationMode::STRIPE) && !impl.walWriter) {
                 throw std::invalid_argument("AkkEngine: PARTITIONED and STRIPE require WAL durability");
             }
@@ -3448,9 +3788,6 @@ namespace akkaradb::engine {
                 if (impl.opts.components.blobEnabled && raftBlobPolicy == cluster::RaftBlobPolicy::REJECT) {
                     throw std::invalid_argument("AkkEngine: RAFT_QUORUM does not support Blob payload replication");
                 }
-                const fs::path raftLogPath = impl.opts.paths.dataDir.empty() ? fs::path{"raft.log"} : impl.opts.paths.dataDir / "raft.log";
-                impl.raftLog = Impl::RaftLog::open(raftLogPath);
-                if (recoveredSeq > 0) { impl.raftLog->observeCommitted(recoveredSeq); }
             }
             cluster::ClusterEngineCallbacks callbacks;
             callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
@@ -3504,80 +3841,84 @@ namespace akkaradb::engine {
                 const auto makeSnapshot = [](const std::shared_ptr<ClusterSnapshotExportFile>& exported) {
                     cluster::ClusterSnapshot snapshot;
                     snapshot.seq = exported->seq();
-                    snapshot.entryCount = exported->entryCount();
                     snapshot.forEachEntry = [exported](const cluster::ClusterSnapshot::EntryVisitor& visitor) {
                         return exported->forEachEntry(visitor);
                     };
                     return snapshot;
                 };
-                if (auto cached = impl.clusterSnapshotExportCache.lock(); cached && cached->seq() == seq) {
+                if (auto cached = impl.clusterSnapshotExportCache.lock(); cached && cached->seq() == seq && cached->reusable()) {
                     return makeSnapshot(cached);
                 }
                 // Blob deletion is pinned from fixed-view capture through the
                 // final Blob read, but does not participate in write admission.
                 auto blobReadPin = impl.blobManager ? impl.blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 memtable::MemTable::KeyRange range;
-                auto mt = impl.sstManager
-                              ? impl.memtable->sealAndPinIterator(range, seq)
-                              : impl.memtable->iterator(range, seq);
+                std::optional<memtable::MemTable::RangeIterator> mt;
+                if (impl.sstManager) { mt.emplace(impl.memtable->sealAndPinIterator(range, seq)); }
+                else {
+                    const auto& policy = impl.opts.cluster.runtime.memoryOnlySnapshot;
+                    mt = impl.memtable->sealAndPinMemoryIterator(
+                        range,
+                        seq,
+                        policy.mode == cluster::MemoryOnlySnapshotMode::COMPLETION_FIRST,
+                        policy.maxPinnedBytes,
+                        policy.maxPinnedGenerations
+                    );
+                    if (!mt) { return std::nullopt; }
+                }
                 sst::SSTManager::Iterator sst;
                 if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, seq); }
 
-                // With an SST flush sink, sealAndPinIterator owns immutable
-                // sources and SST Iterator owns its readers. Writes can resume
-                // before the database-sized scan begins. Memory-only engines
-                // retain the old locked path because they have nowhere to
-                // publish sealed tables.
-                if (impl.sstManager) { writeLock.unlock(); }
-
+                // Both paths own immutable sources. Memory-only snapshots retain
+                // in-memory generations and compact them after the final pin.
                 ensureDir(impl.clusterSnapshotExportDirectory());
-                auto exported = std::make_shared<ClusterSnapshotExportFile>(impl.newClusterSnapshotExportPath());
-                std::ofstream out{exported->path(), std::ios::binary | std::ios::trunc};
-                if (!out) { throw std::runtime_error("AkkEngine: failed to create cluster snapshot export"); }
-                out.write(ClusterSnapshotExportFile::MAGIC.data(), ClusterSnapshotExportFile::MAGIC.size());
-                writeU64Le(out, seq);
-                writeU64Le(out, 0); // Patched after the bounded scan completes.
 
-                uint64_t entryCount = 0;
-                core::BufferArena arena;
-                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), impl.blobManager.get())) {
-                    if (record.key.size() > UINT32_MAX) { throw std::runtime_error("AkkEngine: cluster snapshot key is too large"); }
-                    const uint32_t keySize = static_cast<uint32_t>(record.key.size());
-                    const uint64_t valueSize = static_cast<uint64_t>(record.value.size());
-                    Crc32cStream valueCrc;
-                    valueCrc.update(record.value);
-                    const uint32_t valueChecksum = valueCrc.finish();
-                    Crc32cStream recordCrc;
-                    updateCrcU32Le(recordCrc, keySize);
-                    updateCrcU64Le(recordCrc, valueSize);
-                    updateCrcU32Le(recordCrc, valueChecksum);
-                    recordCrc.update(record.key);
-                    recordCrc.update(record.value);
-                    writeU32Le(out, keySize);
-                    writeU64Le(out, valueSize);
-                    writeU32Le(out, valueChecksum);
-                    if (!record.key.empty()) {
-                        out.write(reinterpret_cast<const char*>(record.key.data()), static_cast<std::streamsize>(record.key.size()));
+                struct SnapshotSource {
+                    memtable::MemTable::RangeIterator memtable;
+                    sst::SSTManager::Iterator sst;
+                    blob::BlobManager::ReadPin blobReadPin;
+                    blob::BlobManager* blobManager = nullptr;
+                };
+                writeLock.unlock();
+                auto source = std::make_shared<SnapshotSource>(SnapshotSource{
+                    .memtable = std::move(*mt),
+                    .sst = std::move(sst),
+                    .blobReadPin = std::move(blobReadPin),
+                    .blobManager = impl.blobManager.get(),
+                });
+                auto producer = [source](const cluster::ClusterSnapshot::EntryVisitor& visitor) mutable {
+                    for (const auto& record : storedScanGenerator(std::move(source->memtable), std::move(source->sst))) {
+                        if ((record.flags & MemHdr16::FLAG_BLOB) != 0) {
+                            if (!source->blobManager || record.value.size() < blob::BLOB_REF_SIZE) { continue; }
+                            const auto ref = blob::decodeBlobRef(record.value.data());
+                            if (!visitor.beginEntry(record.key, ref.totalSize, ref.contentCrc32c)) { return false; }
+                            if (!source->blobManager->streamRead(
+                                    ref.blobId,
+                                    ref.contentCrc32c,
+                                    ClusterSnapshotExportFile::REPLAY_CHUNK_BYTES,
+                                    [&](uint64_t offset, std::span<const uint8_t> chunk) {
+                                        return visitor.appendValueChunk(offset, chunk);
+                                    }
+                                )) {
+                                return false;
+                            }
+                            if (!visitor.finishEntry()) { return false; }
+                            continue;
+                        }
+
+                        Crc32cStream valueCrc;
+                        valueCrc.update(record.value);
+                        if (!visitor.beginEntry(record.key, record.value.size(), valueCrc.finish()) ||
+                            !visitor.appendValueChunk(0, record.value) || !visitor.finishEntry()) {
+                            return false;
+                        }
                     }
-                    if (!record.value.empty()) {
-                        out.write(reinterpret_cast<const char*>(record.value.data()), static_cast<std::streamsize>(record.value.size()));
-                    }
-                    writeU32Le(out, recordCrc.finish());
-                    if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot export entry"); }
-                    ++entryCount;
-                    // Blob resolution uses the arena. The yielded spans have
-                    // been persisted and are not retained across entries.
-                    arena.reset();
-                }
-                out.seekp(static_cast<std::streamoff>(ClusterSnapshotExportFile::MAGIC.size() + sizeof(uint64_t)));
-                writeU64Le(out, entryCount);
-                out.flush();
-                if (!out) { throw std::runtime_error("AkkEngine: failed to finish cluster snapshot export"); }
-                out.close();
-                exported->complete(seq, entryCount);
-                blobReadPin = {};
-                if (!writeLock.owns_lock()) { writeLock.lock(); }
-                if (impl.snapshotSeq() == seq) { impl.clusterSnapshotExportCache = exported; }
+                    return true;
+                };
+                auto exported = std::make_shared<ClusterSnapshotExportFile>(
+                    impl.newClusterSnapshotExportPath(), seq, std::move(producer)
+                );
+                impl.clusterSnapshotExportCache = exported;
                 return makeSnapshot(exported);
             };
             callbacks.beginSnapshot = [&impl](uint64_t seq, uint64_t entryCount) { impl.beginReplicaSnapshot(seq, entryCount); };
@@ -3588,7 +3929,7 @@ namespace akkaradb::engine {
                 impl.appendReplicaSnapshotEntryChunk(offset, chunk);
             };
             callbacks.finishSnapshotEntry = [&impl] { impl.finishReplicaSnapshotEntry(); };
-            callbacks.finishSnapshot = [&impl](uint64_t seq) { impl.finishReplicaSnapshot(seq); };
+            callbacks.finishSnapshot = [&impl](uint64_t seq, uint64_t entryCount) { impl.finishReplicaSnapshot(seq, entryCount); };
             callbacks.recoverSnapshot = [&impl](uint64_t seq) { impl.recoverReplicaSnapshot(seq); };
             callbacks.isSnapshotDurable = [&impl](uint64_t seq) { return impl.isReplicaSnapshotDurable(seq); };
             callbacks.forceDurable = [&impl] {
@@ -3613,6 +3954,45 @@ namespace akkaradb::engine {
             };
             callbacks.readStripeMetadata = [&impl](std::span<const uint8_t> publicKey) {
                 return impl.getValueInternal(Impl::stripeMetaKey(publicKey), false);
+            };
+            callbacks.exportStripeMetadataSnapshot = [&impl](uint64_t metadataSequence)
+                -> std::optional<cluster::ClusterSnapshot> {
+                if (metadataSequence == 0 || !impl.memtable) { return std::nullopt; }
+                struct MetadataEntry {
+                    std::vector<uint8_t> key;
+                    std::vector<uint8_t> value;
+                    uint32_t valueCrc32c = 0;
+                };
+                auto entries = std::make_shared<std::vector<MetadataEntry>>();
+                const uint64_t visibleSeq = impl.snapshotSeq();
+                memtable::MemTable::KeyRange range;
+                auto mt = impl.memtable->iterator(range, visibleSeq);
+                sst::SSTManager::Iterator sst;
+                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, visibleSeq); }
+                core::BufferArena arena;
+                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), impl.blobManager.get())) {
+                    auto publicKey = Impl::publicKeyFromStripeMetaKey(record.key);
+                    if (!publicKey) { continue; }
+                    Crc32cStream crc;
+                    crc.update(record.value);
+                    entries->push_back(MetadataEntry{
+                        .key = std::move(*publicKey),
+                        .value = std::vector<uint8_t>{record.value.begin(), record.value.end()},
+                        .valueCrc32c = crc.finish(),
+                    });
+                }
+                cluster::ClusterSnapshot snapshot;
+                snapshot.seq = metadataSequence;
+                snapshot.forEachEntry = [entries](const cluster::ClusterSnapshot::EntryVisitor& visitor) {
+                    for (const auto& entry : *entries) {
+                        if (!visitor.beginEntry(entry.key, entry.value.size(), entry.valueCrc32c) ||
+                            !visitor.appendValueChunk(0, entry.value) || !visitor.finishEntry()) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+                return snapshot;
             };
             callbacks.beginBlob = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
                 if (impl.blobManager) {
@@ -3647,12 +4027,6 @@ namespace akkaradb::engine {
             );
             impl.clusterRuntime->start();
             impl.startStripeGarbageCollector();
-        }
-
-        if (writeCoordinatorMode == cluster::ConsistencyMode::RAFT_QUORUM && !impl.raftLog) {
-            const fs::path raftLogPath = impl.opts.paths.dataDir.empty() ? fs::path{"raft.log"} : impl.opts.paths.dataDir / "raft.log";
-            impl.raftLog = Impl::RaftLog::open(raftLogPath);
-            if (recoveredSeq > 0) { impl.raftLog->observeCommitted(recoveredSeq); }
         }
 
         impl.writeCoordinator = impl.createWriteCoordinator(writeCoordinatorMode);
@@ -4020,6 +4394,10 @@ namespace akkaradb::engine {
             std::lock_guard lock{impl_->stripeRepairStatsMu};
             out.stripeReadRepair = impl_->stripeRepairStats;
         }
+        {
+            std::lock_guard lock{impl_->stripeRebuildStatsMu};
+            out.stripeRebuild = impl_->stripeRebuildStats;
+        }
 
         out.putsTotal = impl_->putsTotal.load(std::memory_order_relaxed);
         out.removesTotal = impl_->removesTotal.load(std::memory_order_relaxed);
@@ -4067,6 +4445,10 @@ namespace akkaradb::engine {
             out.memtable.removesApplied = snap.removesApplied;
             out.memtable.flushesCompleted = snap.flushesCompleted;
             out.memtable.immutableTables = snap.immutableTables;
+            out.memtable.memorySnapshotCompactionsCompleted = snap.memorySnapshotCompactionsCompleted;
+            out.memtable.memorySnapshotCompactionFailures = snap.memorySnapshotCompactionFailures;
+            out.memtable.memorySnapshotCompactionLastFailureAtUs = snap.memorySnapshotCompactionLastFailureAtUs;
+            out.memtable.memorySnapshotCompactionPending = snap.memorySnapshotCompactionPending;
         }
 
         out.wal.enabled = impl_->opts.components.walEnabled;
@@ -4154,6 +4536,7 @@ namespace akkaradb::engine {
                     .host = node.host,
                     .dataPort = node.dataPort,
                     .replPort = node.replPort,
+                    .stripeMetadataPort = node.stripeMetadataPort,
                     .capabilities = node.capabilities,
                 });
             }
@@ -4162,11 +4545,15 @@ namespace akkaradb::engine {
             out.cluster.role = static_cast<uint32_t>(impl_->clusterRuntime->role());
             out.cluster.activeNodeCount = impl_->clusterRuntime->activeNodes().size();
             const auto runtime = impl_->clusterRuntime->raftStats();
+            const auto metadataRuntime = impl_->clusterRuntime->stripeMetadataRaftStats();
             out.cluster.sampledAtUs = runtime.sampledAtUs;
             out.cluster.runtimeStartedAtUs = runtime.runtimeStartedAtUs;
             out.cluster.clusterGroupId = runtime.clusterGroupId;
             out.cluster.clusterGroupEpoch = runtime.clusterGroupEpoch;
             out.cluster.health = runtime.health;
+            if (out.cluster.health != ClusterHealthState::FAILED && out.stripeRebuild.active) {
+                out.cluster.health = ClusterHealthState::REBUILDING;
+            }
             out.cluster.lastFailure = runtime.lastFailure;
             out.cluster.lastFailureAtUs = runtime.lastFailureAtUs;
             out.cluster.raftEnabled = runtime.enabled;
@@ -4180,6 +4567,12 @@ namespace akkaradb::engine {
             out.cluster.appliedIndex = runtime.appliedIndex;
             out.cluster.lastLogIndex = runtime.lastLogIndex;
             out.cluster.snapshotIndex = runtime.snapshotIndex;
+            out.cluster.stripeMetadataRaftEnabled = metadataRuntime.enabled;
+            out.cluster.stripeMetadataRaftTerm = metadataRuntime.currentTerm;
+            out.cluster.stripeMetadataLeaderNodeId = metadataRuntime.leaderNodeId;
+            out.cluster.stripeMetadataCommitIndex = metadataRuntime.commitIndex;
+            out.cluster.stripeMetadataAppliedIndex = metadataRuntime.appliedIndex;
+            out.cluster.stripeMetadataSnapshotIndex = metadataRuntime.snapshotIndex;
             out.cluster.outboundConnectionsTotal = runtime.outboundConnections;
             out.cluster.peerWorkers = runtime.peerWorkers;
             out.cluster.proposalBatches = runtime.proposalBatches;

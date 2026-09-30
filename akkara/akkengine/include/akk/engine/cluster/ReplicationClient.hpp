@@ -45,11 +45,13 @@ uint64_t seq,
             using BlobBeginCallback = std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)>;
             using BlobChunkCallback = std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)>;
             using BlobEndCallback = std::function<void(uint64_t seq, uint64_t blobId)>;
+            // entryCount is zero until the sender completes its lazy stream.
             using SnapshotBeginCallback = std::function<void(uint64_t snapshotSeq, uint64_t entryCount)>;
             using SnapshotEntryBeginCallback = std::function<void(std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c)>;
             using SnapshotEntryChunkCallback = std::function<void(uint64_t offset, std::span<const uint8_t> chunk)>;
             using SnapshotEntryEndCallback = std::function<void()>;
-            using SnapshotEndCallback = std::function<void(uint64_t snapshotSeq)>;
+            // entryCount is the exact number of accepted snapshot entries.
+            using SnapshotEndCallback = std::function<void(uint64_t snapshotSeq, uint64_t entryCount)>;
             [[nodiscard]] static std::unique_ptr<ReplicationClient> create(
                 std::string primaryHost,
                 uint16_t primaryReplPort,

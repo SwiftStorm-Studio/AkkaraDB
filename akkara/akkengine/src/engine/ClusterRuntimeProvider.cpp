@@ -30,12 +30,11 @@ namespace akkaradb::engine::cluster {
 
         [[nodiscard]] std::filesystem::path currentModuleDirectory() {
             #ifdef _WIN32
-            HMODULE module = nullptr; constexpr auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT; if (!::GetModuleHandleExW(
-                flags,
-                reinterpret_cast<LPCWSTR>(&currentModuleDirectory),
-                &module
-            )) { return {}; } std::wstring buffer(MAX_PATH, L'\0'); for (;;) {
+            HMODULE module = nullptr;
+            constexpr auto flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+            if (!::GetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(&currentModuleDirectory), &module)) { return {}; }
+            std::wstring buffer(MAX_PATH, L'\0');
+            for (;;) {
                 const DWORD len = GetModuleFileNameW(module, buffer.data(), static_cast<DWORD>(buffer.size()));
                 if (len == 0) { return {}; }
                 if (len < buffer.size() - 1) {
@@ -45,9 +44,8 @@ namespace akkaradb::engine::cluster {
                 buffer.resize(buffer.size() * 2);
             }
             #else
-            Dl_info info{};
-            if (::dladdr(reinterpret_cast<void*>(&currentModuleDirectory), &info) == 0 || info.dli_fname == nullptr) { return {}; }
-            return std::filesystem::path{info.dli_fname}.parent_path();
+            Dl_info info{}; if (::dladdr(reinterpret_cast<void*>(&currentModuleDirectory), &info) == 0 || info.dli_fname == nullptr) { return {}; } return
+                std::filesystem::path{info.dli_fname}.parent_path();
             #endif
         }
 

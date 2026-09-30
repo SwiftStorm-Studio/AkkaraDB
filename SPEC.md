@@ -1099,13 +1099,14 @@ migration from legacy flat directories.
 ## 15. Cluster and Replication
 
 Cluster configuration is persisted separately from runtime transport options.
-The config file uses `AKC5` magic and version 5.
+The config file uses `AKC6` magic and version 6.
 
 ### 15.1 Persistent Cluster Config
 
 `ClusterConfig` stores:
 
-- node ids and advertised host/data/repl ports,
+- node ids and advertised host/data/repl ports plus the dedicated STRIPE
+  metadata-Raft port,
 - node capability flags,
 - replication/placement mode,
 - acknowledgement policy,
@@ -1132,10 +1133,12 @@ Runtime-only values such as bind host, replica-side primary endpoint overrides,
 identity seed path, and peer key pins are not serialized into `ClusterConfig`.
 
 Configuration validation rejects zero replication ports in clustered placement
-or Raft mode and duplicate advertised replication endpoints. Endpoint comparison
-folds ASCII host-name case and a trailing DNS dot; it does not resolve DNS aliases.
-Hosts cannot contain whitespace or control characters. Non-Raft STANDALONE may
-leave its unused replication port zero.
+or Raft mode and duplicate advertised replication endpoints. Every data-bearing
+STRIPE node additionally requires a nonzero `stripeMetadataPort`; metadata-Raft
+endpoints must be unique and cannot alias a normal replication endpoint.
+Endpoint comparison folds ASCII host-name case and a trailing DNS dot; it does
+not resolve DNS aliases. Hosts cannot contain whitespace or control characters.
+Non-Raft STANDALONE may leave its unused replication port zero.
 
 `ClusterConfig::validateRuntime(selfNodeId, options)` additionally validates
 transport selection, membership of the local node, and SECURE peer pins before
@@ -1156,7 +1159,31 @@ peer pins before creating an identity or starting connection retries.
 | `STANDALONE` | No replication runtime |
 | `MIRROR` | Ship writes to every data-bearing node |
 | `PARTITIONED` | Assign each key to one owner using rendezvous-style placement |
-| `STRIPE` | Split data and parity shards across distinct data-bearing nodes |
+| `STRIPE` | Split data and optional parity shards across distinct data-bearing nodes |
+
+`RaidOptions{.preset = RaidPreset::RAID0, .dataShards = k}` is the public
+`RAID.0` preset. Construction immediately normalizes it to `STRIPE` with `k`
+data shards and zero parity shards; only those canonical fields are persisted.
+`k` must be at least two. Loading the canonical fields derives `RAID.0` again
+through `ClusterConfig::raidPreset()` without storing parallel preset state.
+
+`RaidOptions{.preset = RaidPreset::RAID1, .primaryNodeId = id}` is the public
+`RAID.1` preset. It normalizes to fixed-Primary `MIRROR`, durable
+`ALL_TARGETS` acknowledgements, `AVAILABLE_REPLICAS` write consistency,
+`FAIL_WRITE`, and asynchronous replica resynchronization. Every configured node
+must be data-bearing and at least two nodes are required. A zero Primary id
+selects the first coordinator-eligible data node. RAID.1 requires WAL storage.
+While every replica is connected, a write completes only after every replica
+has applied and forced the record durable. With one or more replicas offline,
+the Primary records and syncs the write locally and remains writable in
+`DEGRADED`; the write is not reported as redundantly stored. A returning replica
+is excluded from live acknowledgements until WAL catch-up or snapshot rebuild
+finishes. A live replica that misses the acknowledgement deadline is stopped and
+removed from that live set, allowing the already durable Primary-local write to
+complete. The Primary reports `REBUILDING` during catch-up and returns to
+`HEALTHY` only after every configured replica is live. Primary replacement is
+never automatic and uses the same explicit offline MIRROR promotion contract.
+Loading these canonical fields derives `RAID.1` without a parallel preset flag.
 
 The active native cluster runtime accepts `MIRROR`, `PARTITIONED`, and
 `STRIPE`. Non-Raft `MIRROR` has exactly one Primary selected by the persistent
@@ -1190,18 +1217,33 @@ confirmation and local application through the captured commit index:
 | `OWNER_ONLY` | Serve only keys owned by the local node; remote-owner reads fail |
 | `OWNER_LINEARIZABLE` | Non-Raft routes each key to its current owner; Raft leaders confirm a fresh quorum ReadIndex before reading locally |
 
-`STRIPE` stores public values as internal metadata plus Reed-Solomon data/parity
-shard records. The first shard target is the key owner. Non-owner public writes
-are rejected rather than forwarded, except that the configured STRIPE failover
-candidate may accept them while that key's owner is unreachable. Reads reconstruct
+`STRIPE` stores public values as internal metadata plus Reed-Solomon data shards
+and optional parity shard records. The first shard target is the key owner.
+Non-owner public writes are rejected rather than forwarded, except that the
+configured STRIPE failover candidate may accept them while that key's owner is
+unreachable. Reads reconstruct
 the value from the latest authoritative metadata and at least `dataShards`
 available shards.
+For `RAID.0`, every data shard is required: one missing or corrupt shard makes
+the value unavailable, and read repair is disabled because no reconstruction
+information exists. Writes still use the normal all-shard durable publication
+protocol even when `DATA_SHARDS` is selected, so a generation is never
+published after placing only a subset.
 
 `ClusterRuntimeOptions::stripeWriteCommitMode` controls STRIPE write completion:
 
 | Value | Meaning |
 |---|---|
 | `ALL_SHARDS` | Durably place every data/parity shard, then atomically publish durable owner metadata |
+| `DATA_SHARDS` | With parity, publish after any `dataShards` shards are durable and record missing positions for rebuild |
+
+`DATA_SHARDS` is the default. It permits degraded writes through as many node
+failures as `parityShards`: RAID5-style layouts continue with one missing node
+and RAID6-style layouts continue with up to two. Publication is rejected when
+fewer than `dataShards` new-generation shards are durable. A successful degraded
+write sets engine health to `REBUILDING`; disconnected peers remain
+`DEGRADED` at the transport layer. `ALL_SHARDS` remains available for
+deployments which prefer rejecting every incomplete generation.
 
 `ClusterRuntimeOptions::stripeReadCoordinatorMode` controls where STRIPE reads
 are assembled:
@@ -1218,14 +1260,28 @@ Only after that intent is durable may immutable generation-qualified shards be
 sent. Targeted shard operations always require `ALL_TARGETS`/`DURABLE`
 acknowledgement with `FAIL_WRITE` on timeout, including when the configured
 general replication policy is `ASYNC` or `NONE`.
-Without a failover candidate the owner then publishes one WAL-backed metadata
-record and forces it durable. With a failover candidate, that node is the sole
-metadata sequencer: it validates the operation's fencing token and durably
-publishes the metadata. This is the sole commit point. Replica metadata is not a
-source of authority.
+The authority then asks the current STRIPE metadata-Raft leader to publish one
+WAL-backed `AKSM1` record. Publication succeeds only after the metadata entry is
+durably committed by a majority of the configured data-bearing voters and
+applied locally. This quorum commit is the sole metadata commit point; an
+uncommitted local record is never a source of authority. Metadata reads use a
+Raft read barrier and therefore also require a live majority.
 Deletes use the same intent/publication protocol with tombstone metadata.
 An ambiguous owner-local persistence failure stops STRIPE reads/writes until
 the engine is reopened.
+
+STRIPE metadata Raft is a second logical Raft group which reuses the native Raft
+implementation but has its own listener (`NodeInfo::stripeMetadataPort`), hard
+state, segmented log, snapshot stream, and `stripe-metadata-raft` directory.
+Only public-key/`AKSM1` metadata enters this group; value shards remain on the
+normal STRIPE transport. Every data-bearing STRIPE node is a static voter. The
+majority rule is therefore the same as ordinary Raft: a three-node group
+continues after one voter fails and a five-node group after two; a two-node
+group cannot continue after either voter fails. The current leader is elected
+automatically and may run on any data-bearing node. A metadata request waits
+through the election window independently of the shorter shard-acknowledgement
+timeout. `EngineStats::ClusterStats` exposes the metadata term, leader,
+commit/applied indexes, and snapshot index.
 
 Targeted STRIPE operations use per-target request ids allocated before sending;
 a failed attempt does not allow its id to be reused for a different operation
@@ -1242,32 +1298,55 @@ retry. A local coordinator racing generation retirement revalidates against the
 owner and retries rather than returning a partially reconstructed generation.
 The current published generation is never collected.
 
+Published STRIPE metadata uses `AKSM1` and durably records the placement and
+observed presence of every generation-qualified shard. The current metadata-Raft
+leader runs a bounded background scrub/rebuild loop. It may write a repaired
+shard on behalf of the logical owner, but the receiver still validates its shard
+index against the normal or owner-excluded placement. Presence updates are
+compare-and-set metadata mutations committed through the same Raft group. The
+loop scans at most
+`stripeRebuildBatchKeys` metadata records every `stripeRebuildIntervalMs`,
+verifies actual shard records, reconstructs missing shards once their target
+nodes are reachable, and durably updates the presence record. This requires no
+foreground read and resumes from published metadata after process restart.
+`stripeAutoRebuild` may disable the worker without disabling read repair.
+`EngineStats::stripeRebuild` exposes cycles, scanned keys, attempts, successes,
+failures, last failed node, and current rebuild activity. RAID.0 never enters
+this reconstruction path.
+
 `STRIPE_FAILOVER_ELIGIBLE` enables owner failover. At most one configured node
 may have this capability; it must also be `COORDINATOR_ELIGIBLE` and
 `DATA_BEARING`. Enabling it requires at least one data-bearing node more than
 `dataShards + parityShards`, because a failover generation excludes the failed
-owner and preserves `ALL_SHARDS` durability by placing its shard on a spare.
+owner and places its shard on a spare.
 
 Every owner/failover read or write first acquires a per-key authority lease from
-the failover candidate. The lease carries an unpredictable nonzero fencing token,
-which is also the immutable generation id. Only the holder may publish metadata
-with that token. If an owner connection disappears, its outstanding token is
-revoked before the candidate may acquire the key; shards written with a revoked
-token remain unreferenced and cannot become visible. This uses the Raft concepts
-of a single committed authority and term-style fencing, but is not a second Raft
-replicated log: the one failover candidate is the STRIPE control-plane sequencer.
-Loss of that node therefore blocks coordinated STRIPE metadata reads and writes.
-The existing peer connection carries `STRIPE_CONTROL_REQUEST` (`0x22`) and
-`STRIPE_CONTROL_RESPONSE` (`0x23`); mixed-version rolling operation is not
-supported.
+the current metadata-Raft leader. The lease carries an unpredictable nonzero
+fencing token, which is also the immutable generation id. Only the holder may
+publish metadata with that token. Leases are leader-term-local: a term change
+clears them, the old leader cannot commit without a majority, and the new leader
+rejects every token issued in an earlier term. Shards written with a rejected
+token remain unreferenced and cannot become visible.
 
-On owner return, the sequencer stops granting new failover leases. The returning
+`STRIPE_FAILOVER_ELIGIBLE` does not select the metadata leader. It selects only
+the one optional data-operation authority that may replace an unreachable key
+owner. If an owner connection disappears, its outstanding lease is revoked
+before that candidate may acquire the key. Loss of the failover candidate blocks
+owner replacement, but does not block ordinary owner operations while the
+metadata-Raft majority remains available. Loss of the metadata majority blocks
+authoritative metadata reads and writes. The normal peer connection carries
+`STRIPE_CONTROL_REQUEST` (`0x22`) and `STRIPE_CONTROL_RESPONSE` (`0x23`);
+Raft replication itself uses the dedicated metadata endpoints. Mixed-version
+rolling operation is not supported.
+
+On owner return, the metadata leader stops granting new failover leases. The returning
 owner receives `BUSY` while a failover read/write still holds the key lease and
 waits until that operation commits or releases it; the next lease is then granted
 to the original owner with a new fencing token. The candidate behaves as an
-ordinary data-bearing node when it does not hold a failover lease. These
-pre-release metadata changes (`AKSM3`) have no migration path; development
-STRIPE data must be recreated.
+ordinary data-bearing node when it does not hold a failover lease.
+`AKSM1` is the initial pre-release metadata format. Intermediate development
+formats have no migration path; STRIPE data created by those builds must be
+recreated.
 
 `ClusterRuntimeOptions::stripeReadRepair` enables owner-side best-effort repair
 of missing shards when an owner read can reconstruct the value.
@@ -1296,7 +1375,7 @@ Capabilities are bit flags:
 |---|---|
 | `COORDINATOR_ELIGIBLE` | Node may be selected as primary |
 | `DATA_BEARING` | Node can store KV data and receive routed writes |
-| `STRIPE_FAILOVER_ELIGIBLE` | Sole optional STRIPE metadata sequencer and owner-failover candidate |
+| `STRIPE_FAILOVER_ELIGIBLE` | Sole optional owner-failover candidate; unrelated to metadata-Raft leadership |
 
 Node id zero is reserved and invalid for configured nodes.
 
@@ -1318,6 +1397,7 @@ Write consistency:
 | `ONE_REPLICA` | Require one replica acknowledgement |
 | `QUORUM` | Require quorum |
 | `ALL_CONFIGURED` | Require all configured targets |
+| `AVAILABLE_REPLICAS` | RAID.1 only: require every replica currently in the live acknowledgement set; an empty set permits a durable Primary-local write |
 
 Consistency mode:
 
@@ -1341,8 +1421,28 @@ self-promote a primary and require explicit startup-role selection. A replica
 uses the configured Primary id unless a matching runtime assertion is supplied.
 The Primary renews its local manifest lease every 10 seconds for a 30-second
 window. This lease is not distributed fencing. Changing the Primary requires
-stopping the old writer and replacing the shared config offline; a node still
-running with a different or obsolete config cannot be fenced by this mechanism.
+stopping or externally fencing the old writer and replacing the shared config
+offline; a node still running with a different or obsolete config cannot be
+fenced by this mechanism. Merely changing `ClusterConfig::primaryNodeId()` is
+not sufficient: an existing `AKCG2` membership naming another Primary rejects
+startup.
+
+An offline promotion must set `mirrorPromotion.enabled` on every node for the
+one authorized transition. The authorization names the previous Primary, its
+exact persisted group epoch, and the candidate's expected durable storage
+sequence. The configured new Primary forces local storage durable, requires its
+sequence to equal that authorization, atomically preserves the group id, changes
+the Primary id, and increments the group epoch by exactly one. A candidate with
+no prior membership, a stale sequence, a different previous Primary/epoch, or a
+skipped epoch is rejected. Replicas accept the successor only when their existing
+membership has the same group id, the same authorized previous Primary/epoch,
+the incoming Primary matches their configured endpoint, and the incoming epoch
+is exactly the next epoch. The operation is retryable after membership was
+published but endpoint startup failed. It does not contact or fence the old
+Primary and therefore is not an online failover protocol. Promotion requires
+explicit `PRIMARY`/`REPLICA` startup roles; `AUTO`, membership reset, Raft, and
+non-MIRROR placement are rejected.
+
 Explicit `PRIMARY` startup is rejected on every other node under the same config.
 An unexpected lease-renewal failure is contained by the background worker: it
 stores the failure, demotes the manager to `REPLICA`, and causes the owning
@@ -1387,7 +1487,9 @@ that assumption does not hold.
 The native erasure codec API supports Reed-Solomon-style and external codec
 selection contracts. Stripe configuration records data and parity shard counts,
 defaulting to 4 data and 2 parity shards. Active native STRIPE uses the RS codec
-for data/parity placement, degraded reads, and best-effort read repair.
+for data/parity placement, degraded reads, and best-effort read repair. Its
+systematic data-splitting path also accepts zero parity for canonical `RAID.0`;
+decode then requires all data shards and repair of a missing shard fails.
 
 ### 15.7 Replication Connection Lifecycle
 
@@ -1457,21 +1559,52 @@ are retired after membership removal. Inbound connections serve multiple RPCs;
 the existing 128-handler limit bounds accepted connections. Close interrupts
 sockets and drains workers and handlers.
 
-Before serving Raft RPCs, protocol-v2 peer hello exchanges the persistent
+`raftMaxReceiveMemoryBytes` bounds aggregate Raft frame receive/decode
+reservations across inbound and outbound peer connections. Raft protocol v1
+limits each Raft payload to 4 MiB and the aggregate budget defaults to 64 MiB.
+The general replication framing and non-Raft chunk-transfer limit remains 128
+MiB. AppendEntries batching and snapshot/Blob chunking split work before the
+Raft limit. The configured budget must accommodate at least one maximum-size
+SECURE Raft frame and its receive/decode copies. Budget exhaustion rejects the
+affected connection; it does not weaken frame validation or commit rules.
+Current use is reported as
+`transferMemoryBytes` in the native cluster statistics snapshot.
+
+The Raft leader heartbeat interval is a runtime-only startup option,
+`raftHeartbeatIntervalMs`, defaulting to 100 ms with a valid range of 10-1000
+ms. It is intentionally excluded from the compatibility fingerprint because
+each term's leader alone controls its send interval. Increasing it reduces idle
+traffic but delays commit-index propagation and leaves less margin before the
+3-second minimum election timeout.
+
+Before serving Raft RPCs, protocol-v1 peer hello exchanges the persistent
 128-bit cluster id, a BLAKE2b-256 compatibility fingerprint, the Blob policy,
 and retry-request policy. A different cluster id is rejected as a foreign
 cluster. A different protocol-affecting config, Blob policy, or request policy
 is rejected as a policy mismatch before voting or log replication. The
 fingerprint covers Raft/consistency behavior but deliberately excludes the
 current node list so joint-consensus membership changes can introduce a node
-that already carries the same cluster id and policy.
+that already carries the same cluster id and policy. A Raft configuration may
+contain at most 512 data-bearing voters; together with the 32768-entry retry
+request-state limit, this keeps final snapshot metadata within one 4 MiB Raft
+frame even for maximum-length configured host names.
 
-`IClusterRuntime::submitEntry()` supports Raft asynchronous admission: it copies
-the mutation and returns a future. `shipEntry()` waits for the same completion.
-Success requires current-term quorum commit and durable local application, not
-merely queue admission or log append. Storage sequences supplied to this
-low-level interface must preserve log order; the engine serializes sequence
-allocation and submission, then releases admission before waiting for completion.
+The engine admits writes through `IClusterRuntime::submitMutation()`. The Raft
+runtime serializes admission, assigns the next state-machine sequence from its
+snapshot, committed state machine, and retained consensus log, then invokes the
+mutation factory synchronously. Success requires current-term quorum commit and
+durable local application, not merely queue admission or log append. The older
+`submitEntry()`/`shipEntry()` entry points remain low-level embedding interfaces;
+their caller-supplied sequences must preserve log order.
+
+`cluster-raft.log` and its segments are the only engine Raft proposal ledger;
+the engine does not create or append a separate `raft.log`. A pre-release data
+directory may still contain an obsolete `raft.log`; it is ignored and is not
+deleted automatically. With `raftBlobPolicy=RAFT_LOG`, all Blob chunks and the
+final Blob-reference mutation share one state-machine sequence and one proposal,
+and only the proposal-final entry is a commit boundary. Admission, replication,
+quorum commit, state-machine application, and retry-safe request identity
+therefore cover the complete logical write atomically.
 
 Admission is bounded to 4096 outstanding proposals and 256 MiB of queued or
 not-yet-applied entry data/overhead; timed-out retained entries still count toward
@@ -1492,29 +1625,61 @@ Raft log compaction exports a full state-machine snapshot only after at least
 rate-limited to once per second. This keeps ordinary proposal batches from
 scanning the full database while still bounding log growth.
 
-Snapshot export captures one visibility sequence and writes the scan directly
-to a CRC-protected local file under `cluster-snapshot-exports`. It does not
-materialize the database as an in-memory vector. The exported handle exposes a
-re-readable entry-visitor stream and retains at most the currently visited key/value in
-heap memory; concurrent consumers of the same sequence share the immutable
-export file. The file is deleted when its final handle is released, and stale
-exports left by process failure are removed at engine startup.
+Snapshot export captures one visibility sequence and immediately returns a
+lazy entry stream. Its first consumer drives one scan that writes each record to
+a CRC-protected local file under `cluster-snapshot-exports` and passes the same
+record to transport before advancing. Transport therefore starts before the
+database-sized export file is complete. The database is not materialized as an
+in-memory vector. Snapshot entries use begin/chunk/finish delivery; external
+Blob values are read and, when necessary, Zstd-decoded incrementally, so heap
+retention is bounded by the current inline record or configured value chunk
+rather than the largest Blob. The declared value size and CRC are verified
+while the export file and transport consume the same chunks. A completed
+export is re-readable in bounded chunks for retry and consumers of the
+same sequence share it; a concurrent consumer follows flushed prefixes of the
+active export and validates the completed file before accepting the snapshot.
+For non-Raft bootstrap, entries above `transfer.thresholdBytes` are sent from
+their completed `key + value` range in that export file. Transfer hashing and
+resumed reads are bounded and seek directly into the range; they do not create
+a second sender-side transfer spool. Small entries retain the in-memory path.
+The wire format, content-addressed transfer id, whole-payload CRC, exact retry,
+and concurrent-consumer behavior are unchanged. The file is deleted when its final handle is
+released, and stale exports left by process failure are removed at engine
+startup.
 
-For an SST-backed engine, snapshot capture holds write admission only for a
-short barrier: every non-empty active MemTable shard is sealed, replaced, and
-pinned together with the current SST readers. The database-sized scan and local
-export-file write run after that barrier, so normal writes continue while the
-snapshot is materialized. Immutable-table flush and SST compaction may also
-continue because the snapshot iterator owns its exact sources. Blob-file
-deletion is pinned until the fixed view has resolved all referenced values.
-An engine with SST storage disabled retains write admission for the export,
-because it has no durable flush sink in which to preserve sealed tables.
+Snapshot capture holds write admission only for a short barrier: every non-empty
+active MemTable shard is sealed and replaced. SST-backed engines pin those
+tables together with the current SST readers. Memory-only engines publish the
+sealed tables as immutable in-memory generations, so normal point reads and
+scans merge the new active generation with the pinned generations by key and
+sequence. The database-sized scan and local export-file write run after the
+barrier, so normal writes continue while the snapshot is materialized. After
+the final memory-only snapshot pin is released, a maintenance worker consolidates
+generations one shard at a time while writes continue into a replacement active
+table. A failed consolidation remains pending and is retried with bounded
+exponential backoff; it never discards the published generations. `EngineStats`
+reports completed consolidations, failures, the monotonic timestamp of the last
+failure, and whether work remains pending. Tombstones remain in the consolidated
+base. Blob-file deletion is pinned until the fixed view has resolved all
+referenced values.
+
+Memory-only snapshot admission has two policies. `THROUGHPUT_FIRST` never waits
+behind another snapshot-generation transition and rejects a snapshot whose
+configured generation or byte budget is unavailable; cluster recovery retries
+later. `COMPLETION_FIRST` waits for capacity and permits one individually
+oversized generation, prioritizing snapshot completion. Waiting may apply write
+backpressure because capture owns write admission, but the full export never
+does. Both policies use the same fixed-sequence view and reject rather than
+publish a partial or inconsistent snapshot.
 
 Raft snapshot installation consumes that callback and sends each bounded RPC
 as soon as it fills instead of first building all snapshot RPCs in memory.
 Non-Raft snapshot fallback feeds the same callback into its bounded bootstrap
-queue. Both paths verify the declared entry count, and an interrupted consumer
-aborts the snapshot rather than publishing a partial result.
+queue. Snapshot begin uses an unknown count; the producer's observed entry
+count is finalized and verified only by the completion request. An interrupted
+last consumer aborts generation and never publishes its partial export as
+reusable. If another consumer is already following the active export, generation
+continues for that follower.
 
 Proposal deadlines use `ackTimeoutMs` from admission. Timeout, shutdown, or
 leadership loss completes affected futures with an error; a timeout is not a
@@ -1540,7 +1705,8 @@ retry-result capacity/use/rejections, request-journal activity, policy-handshake
 rejections, and transport queue/budget use. Non-Raft runtimes leave Raft fields
 zero while reporting their replication queue and shared transfer budgets.
 
-The same snapshot exposes cluster health as `HEALTHY`, `DEGRADED`, or `FAILED`,
+The same snapshot exposes cluster health as `HEALTHY`, `DEGRADED`, `REBUILDING`,
+or `FAILED`,
 plus the most recently observed failure code and its Unix timestamp in
 microseconds. Foreign-cluster and policy-mismatch rejections, lease-renewal
 failures, endpoint-start failures, and peer-read timeouts are monotonically
@@ -1549,7 +1715,9 @@ restart or recovered peer read may restore current health without erasing the
 last-failure record or counters. `DEGRADED` means the runtime remains usable but
 has observed a rejected peer, a peer-read timeout, or a required non-Raft peer
 connection is currently unavailable. `FAILED` means a local lease, endpoint, or
-Raft persistence failure prevents safe normal service.
+Raft persistence failure prevents safe normal service. `REBUILDING` is emitted
+by a RAID.1 Primary while a returning replica is catching up and is not yet an
+acknowledgement target.
 
 Every configured peer has a current connection flag and the Unix-microsecond
 time of its last accepted handshake, valid replication frame, or successful
@@ -1626,9 +1794,10 @@ transfer processing. Thus a mismatched node cannot vote or contribute to quorum.
 Disabling admission does not discard replicated receipts.
 
 The pre-release Raft log/metadata and snapshot RPC layouts now include request
-metadata in place, without a version bump, legacy reader, or migration. Existing
-Raft data directories from the previous layout must be recreated; upgrade all
-participating nodes together. No user data is automatically deleted.
+metadata and explicit proposal-final boundaries in place, without a version
+bump, legacy reader, or migration. Existing Raft data directories from the
+previous layout must be recreated; upgrade all participating nodes together. No
+user data is automatically deleted.
 
 ### 15.10 Bounded Non-Raft Payload Transfer
 
@@ -2020,10 +2189,15 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `transportMode` | `SECURE` | Replication transport mode |
 | `requests.enabled` | `false` | Opt in to retry-safe native request APIs; only valid with `RAFT_QUORUM` |
 | `requests.maxRetentionMs` | 86400000 | Maximum request lifetime in milliseconds; positive, at most 365 days |
-| `requests.maxTrackedRequests` | 4096 | Unexpired applied/in-flight request capacity; 1–65536; reject rather than evict |
+| `requests.maxTrackedRequests` | 4096 | Unexpired applied/in-flight request capacity; 1–32768 so snapshot request state fits one protocol-v1 Raft frame; reject rather than evict |
 | `raftSnapshot.minLogEntries` | 4096 | Committed entries since the prior snapshot that trigger Raft log compaction; 1–1000000000 |
 | `raftSnapshot.minLogBytes` | 67108864 | Approximate committed Raft-log bytes that trigger compaction; positive, at most 1 TiB |
 | `raftSnapshot.maxIntervalMs` | 300000 | Maximum interval before compacting nonempty committed log state; positive, at most 7 days |
+| `raftHeartbeatIntervalMs` | 100 | Raft leader heartbeat interval in milliseconds; 10-1000. Larger values reduce idle traffic but approach the 3-second minimum election timeout |
+| `raftMaxReceiveMemoryBytes` | 67108864 | Aggregate inbound/outbound Raft frame receive/decode reservation; from three maximum 4 MiB frame buffers (`3 * (14 + 4194304)` bytes) through 64 GiB |
+| `memoryOnlySnapshot.mode` | `COMPLETION_FIRST` | SST-disabled snapshot admission: `THROUGHPUT_FIRST` rejects instead of waiting for unavailable capacity; `COMPLETION_FIRST` waits and prioritizes completion |
+| `memoryOnlySnapshot.maxPinnedBytes` | 536870912 | Conservative sum of memory-only generations admitted to concurrent snapshots; 1 MiB-1 TiB. `COMPLETION_FIRST` permits one snapshot larger than this limit |
+| `memoryOnlySnapshot.maxPinnedGenerations` | 2 | Maximum concurrent memory-only snapshot pins; 1-64 |
 | `transfer.thresholdBytes` | 32768 | Non-Raft logical payload staging/chunk threshold; 1–65536 bytes |
 | `transfer.chunkBytes` | 32768 | Non-Raft chunk data size; 1–65528 bytes |
 | `transfer.maxConcurrentTransfers` | 8 | Shared active large send/receive limit; 1–1024 |
@@ -2042,9 +2216,11 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `clusterGroupId`, `clusterGroupEpoch` | 0 | Non-Raft group identity override. MIRROR creates persisted Primary defaults when zero; PARTITIONED/STRIPE require the same explicit nonzero group id on every node |
 | `clusterMembershipPath` | empty | Non-Raft primary group state / replica membership state path |
 | `resetClusterMembership` | `false` | Explicitly allow a valid replica membership switch |
+| `mirrorPromotion.enabled` | `false` | Explicitly authorize one offline non-Raft MIRROR Primary transition; must be supplied to the candidate and replicas for that transition |
+| `mirrorPromotion.previousPrimaryNodeId`, `previousGroupEpoch`, `expectedDurableSeq` | 0 | Expected prior membership and exact candidate durable sequence. The new Primary advances the epoch by one; replicas verify the same transition. |
 | `corruptStateAction` | `FAIL_STARTUP` | Corrupt small non-Raft cluster state files fail startup unless explicitly backed up/deleted and recreated. Raft hard state is always fail-fast and never resets persisted term/vote |
 | `raftLogRecoveryAction` | `FAIL_STARTUP` | `TRUNCATE_UNCOMMITTED_TAIL` may discard corrupt segment entries only beyond an intact committed prefix; corrupt log metadata or committed entries always fail startup |
-| `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` stores Blob payload entries in the Raft log before committing Blob-reference mutations and uses reserved Blob-id namespaces so Raft-log Blob ids encode a 16-bit node id plus 46-bit seq, while snapshot Blob ids encode a 40-bit seq plus 22-bit snapshot-entry ordinal |
+| `raftBlobPolicy` | `REJECT` | `RAFT_QUORUM` rejects Blob payload replication by default; `PRIMARY_SIDE_ONLY` explicitly allows primary-local Blob payloads outside Raft quorum; `RAFT_LOG` commits Blob chunks and the Blob-reference mutation as one Raft proposal and uses reserved Blob-id namespaces so Raft-log Blob ids encode a 16-bit node id plus 46-bit seq, while snapshot Blob ids encode a 40-bit seq plus 22-bit snapshot-entry ordinal |
 | `raftBlobChunkSizeBytes` | 1048576 | Maximum payload bytes per automatic `RAFT_LOG` Blob and Raft snapshot chunk; must fit one Raft frame. Snapshot install streams entries into receiver staging instead of buffering the full snapshot in memory, records CRC32C per staged entry, externalizes large staged values to Blob refs before WAL finish, and finish recovery is WAL-transactional via snapshot record/commit markers |
 | `maxReplicaQueueFrames` | 16384 | Per-replica outbound frame queue limit for non-Raft live and bootstrap replication; bootstrap waits for capacity; 0 disables the frame-count limit |
 | `maxReplicaQueueBytes` | 268435456 | Per-replica outbound queued wire-byte limit for non-Raft live and bootstrap replication; one bootstrap message larger than this requires resynchronization; 0 disables the byte limit |
@@ -2066,9 +2242,13 @@ Top-level stats include:
 - Blob put counter,
 - resolved configuration enum values,
 - backpressure counters,
+- memory-only snapshot-generation consolidation completions/failures, the
+  monotonic-microsecond timestamp of the last failure, and whether consolidation
+  remains pending,
 - API server counters,
-- cluster health/last failure, term/index/leader, per-peer lag/connection/last
-  successful contact, proposal/replication queues, retry-result/journal,
+- cluster health/last failure, data-Raft term/index/leader, STRIPE metadata-Raft
+  term/index/leader/snapshot, per-peer lag/connection/last successful contact,
+  proposal/replication queues, retry-result/journal,
   foreign-cluster and policy rejection, lease/endpoint/read-timeout, and
   transfer-budget counters,
 - MemTable snapshot,
@@ -2130,6 +2310,7 @@ Depending on configuration, background work can include:
 
 - WAL async flushers,
 - MemTable immutable flush workers,
+- memory-only snapshot-generation consolidation and bounded-backoff retry,
 - SST compaction workers,
 - Manifest fast-mode flusher,
 - VersionLog async/batched flusher, `PARALLEL` lane writers, and optional
@@ -2254,7 +2435,7 @@ dispatch where available.
 | VersionLog segment | `AKV5` | 1 | File-header and entry CRCs |
 | VersionLog sidecar index | `AKVI` | 2 | Header CRC and payload CRC |
 | VersionLog durable tail | `AKVT` | 1 | Tail-header CRC |
-| Cluster config | `AKC5` | 5 | Config CRC |
+| Cluster config | `AKC6` | 6 | Config CRC |
 | Raft hard state | `AKRS3` | Encoded in magic | Whole-file CRC32C |
 | Raft log metadata | `AKRL1` | No separate version field | Whole-metadata CRC32C |
 | Raft log segment | No file magic | No separate version field | Per-entry payload CRC32C |
@@ -2411,16 +2592,21 @@ stored error instead.
 
 ### 24.8 Cluster Config
 
-Cluster config is a CRC-protected `AKC5` v5 binary file. It stores persistent
+Cluster config is a CRC-protected `AKC6` v6 binary file. It stores persistent
 membership, placement, acknowledgement, consistency, Raft, stripe, and the
 fixed non-Raft `MIRROR` Primary settings. The fixed header is 72 bytes, with the
 little-endian `uint64_t primaryNodeId` at byte offset 48 and the 16-byte cluster
-id at byte offset 56. Runtime transport settings remain out-of-band. `AKC5`
-readers reject CRC mismatches, oversized host names, truncation, and trailing
-bytes.
+id at byte offset 56. Each node has a 20-byte fixed prefix containing node id,
+capabilities, data port, normal replication port, STRIPE metadata-Raft port, and
+host length, followed by the host bytes. Runtime transport settings remain
+out-of-band. `AKC6` readers reject CRC mismatches, oversized host names,
+truncation, and trailing bytes.
 
 Non-Raft primary group state and replica membership state use CRC-protected
-`AKCG2` little-endian binary files. Raft persisted term/vote hard state uses the
+`AKCG2` little-endian binary files containing group id, Primary node id, and
+group epoch. Ordinary startup cannot change the persisted Primary. Explicit
+offline MIRROR promotion preserves the group id and advances the other two
+fields atomically. Raft persisted term/vote hard state uses the
 41-byte CRC-protected `AKRS3` layout: magic, 16-byte cluster id, term, voted-for
 node id, and CRC32C. A valid hard-state file carrying another cluster id fails
 startup. Raft's `cluster-raft.log` is an `AKRL1` CRC32C-protected
@@ -2452,10 +2638,15 @@ committed prefix. Uncertain persistence errors stop the runtime until reopen.
 This layout replaces the development-only monolithic AKRL1 file without changing
 its pre-release version or providing migration; old Raft data must be recreated.
 
-`AKC5` v4 configs, `AKRS2` hard state, and Raft peer-hello v1 are intentionally
-incompatible with this pre-release identity change. Upgrade every node together,
-recreate and redistribute one v5 config, and recreate existing Raft data
-directories. No dual-format reader or rolling-upgrade bridge is provided.
+`AKC5` configs and `AKRS2` hard state are intentionally incompatible with this
+pre-release change. `AKC6` adds the dedicated STRIPE metadata-Raft port and has
+no dual-format reader. The current Raft peer hello is version 1 and
+uses the `AKRP1` compatibility-fingerprint domain. Earlier peer-hello/log
+layouts, including development builds that used version 1 or 2, have no
+compatibility bridge because request metadata and proposal-final boundaries were
+changed in place. Upgrade every node together, recreate and redistribute one v6
+config, and recreate existing Raft data directories. No dual-format reader or
+rolling-upgrade bridge is provided.
 
 ### 24.9 Endianness Exceptions
 
@@ -2494,10 +2685,24 @@ Native cluster smoke coverage includes:
 
 - repeated replica disconnect/reconnect cycles followed by successful replication,
 - fixed MIRROR Primary config round trips, capability validation, and rejection
-  of a second Primary under the same config,
+  of a second Primary under the same config; offline MIRROR promotion additionally
+  covers rejection without authorization, stale-candidate rejection, atomic
+  Primary/epoch transition, successor acceptance, and routed reads after demotion,
 - STRIPE crash/reopen before and after metadata publication, recovery of pending
   intents, abandoned/superseded shard cleanup, durable-ACK enforcement under
   ASYNC/NONE, concurrent reads/overwrites, tombstone cleanup, and owner outage,
+- `RAID.0` preset normalization and config round trip, data-only codec round
+  trip, distributed engine storage, mandatory all-shard reads, failure on one
+  unavailable node, and recovery after that node rejoins,
+- `RAID.1` preset normalization and config round trip, WAL enforcement, durable
+  full-copy replication, degraded Primary-local writes, reconnect rebuild and
+  health transitions, plus rejection of replica writes without explicit Primary
+  promotion,
+- 4 MiB Raft frame enforcement, aggregate receive-memory and heartbeat bounds,
+  retry-result capacity bounds, lazy/file-backed snapshot transfer, and
+  memory-only snapshot admission, consolidation, failure reporting, and retry,
+- endpoint role changes and shutdown without joining callback workers while the
+  runtime state lock is held, plus retry after endpoint startup failure,
 - Raft crashes at segment-sync and metadata-publication boundaries, uncommitted
   versus committed corruption, metadata-corruption rejection, segment rotation,
   and preservation of existing segment contents during later appends.
@@ -2569,6 +2774,9 @@ database behavior.
 - L0 blocking backpressure requires a compaction path that can make progress.
 - STRIPE degraded reads require at least `dataShards` readable shards and
   reachable owner metadata; they are not consensus reads.
+- `RAID.0` has no shard redundancy: every data shard must remain readable, and
+  authoritative metadata operations still require a metadata-Raft majority;
+  losing one participating shard node can make affected values unavailable.
 - Server backend availability depends on build flags and runtime library
   loading.
 - Low-level C++ object layout is not an external ABI.

@@ -654,6 +654,111 @@ namespace akkaradb::engine::blob {
         return content;
     }
 
+    bool BlobManager::streamRead(
+        uint64_t blobId,
+        uint32_t expectedCrc32c,
+        size_t chunkBytes,
+        const std::function<bool(uint64_t, std::span<const uint8_t>)>& visitor
+    ) const {
+        if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
+        if (!visitor || chunkBytes == 0) { throw std::invalid_argument("BlobManager: invalid streaming read visitor"); }
+        const auto path = impl_->pathFor(blobId);
+        FILE* file = openFileRead(path);
+        if (!file) { throw std::runtime_error("BlobManager: cannot open file: " + path.string()); }
+
+        try {
+            uint8_t headerBytes[AKBLOB_HEADER_SIZE_V5]{};
+            if (fread(headerBytes, 1, sizeof(headerBytes), file) != sizeof(headerBytes)) {
+                throw std::runtime_error("BlobManager: cannot read header: " + path.string());
+            }
+            const auto header = deserializeBlobHeader(headerBytes);
+            if (!verifyBlobHeader(header)) { throw std::runtime_error("BlobManager: header corrupt: " + path.string()); }
+            if (header.blobId != blobId) { throw std::runtime_error("BlobManager: blobId mismatch: " + path.string()); }
+            if (header.contentCrc32c != expectedCrc32c) { throw std::runtime_error("BlobManager: expected crc mismatch"); }
+
+            Crc32cStream crc;
+            uint64_t outputOffset = 0;
+            const auto emit = [&](std::span<const uint8_t> bytes) {
+                if (outputOffset > header.totalSize || bytes.size() > header.totalSize - outputOffset) {
+                    throw std::runtime_error("BlobManager: decompressed size overflow: " + path.string());
+                }
+                crc.update(bytes);
+                if (!visitor(outputOffset, bytes)) { return false; }
+                outputOffset += static_cast<uint64_t>(bytes.size());
+                return true;
+            };
+            const auto readExactChunk = [&](std::span<uint8_t> bytes) {
+                size_t offset = 0;
+                while (offset < bytes.size()) {
+                    const size_t count = fread(bytes.data() + offset, 1, bytes.size() - offset, file);
+                    if (count == 0) { throw std::runtime_error("BlobManager: payload truncated: " + path.string()); }
+                    offset += count;
+                }
+            };
+
+            if (header.codec == static_cast<uint32_t>(BlobCodec::NONE)) {
+                if (header.storedSize != header.totalSize) {
+                    throw std::runtime_error("BlobManager: uncompressed size mismatch: " + path.string());
+                }
+                std::vector<uint8_t> buffer(std::max<size_t>(1, chunkBytes));
+                uint64_t remaining = header.storedSize;
+                while (remaining != 0) {
+                    const size_t count = static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
+                    readExactChunk(std::span<uint8_t>{buffer}.first(count));
+                    if (!emit(std::span<const uint8_t>{buffer}.first(count))) { fclose(file); return false; }
+                    remaining -= count;
+                }
+            }
+            else if (header.codec == static_cast<uint32_t>(BlobCodec::ZSTD)) {
+                std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> stream{ZSTD_createDStream(), &ZSTD_freeDStream};
+                if (!stream) { throw std::runtime_error("BlobManager: cannot create Zstd stream"); }
+                const size_t initialized = ZSTD_initDStream(stream.get());
+                if (ZSTD_isError(initialized)) { throw std::runtime_error("BlobManager: cannot initialize Zstd stream"); }
+                std::vector<uint8_t> input(std::max<size_t>(1, std::min<size_t>(chunkBytes, 1024u * 1024u)));
+                std::vector<uint8_t> output(std::max<size_t>(1, chunkBytes));
+                uint64_t remaining = header.storedSize;
+                size_t nextRequired = 1;
+                while (remaining != 0) {
+                    const size_t count = static_cast<size_t>(std::min<uint64_t>(remaining, input.size()));
+                    readExactChunk(std::span<uint8_t>{input}.first(count));
+                    remaining -= count;
+                    ZSTD_inBuffer in{input.data(), count, 0};
+                    while (in.pos < in.size) {
+                        const size_t previousInput = in.pos;
+                        ZSTD_outBuffer out{output.data(), output.size(), 0};
+                        nextRequired = ZSTD_decompressStream(stream.get(), &out, &in);
+                        if (ZSTD_isError(nextRequired)) {
+                            throw std::runtime_error("BlobManager: Zstd decompress failed: " + path.string());
+                        }
+                        if (out.pos != 0 && !emit(std::span<const uint8_t>{output}.first(out.pos))) {
+                            fclose(file);
+                            return false;
+                        }
+                        if (nextRequired == 0 && (in.pos != in.size || remaining != 0)) {
+                            throw std::runtime_error("BlobManager: trailing Zstd payload: " + path.string());
+                        }
+                        if (in.pos == previousInput && out.pos == 0) {
+                            throw std::runtime_error("BlobManager: stalled Zstd decoder: " + path.string());
+                        }
+                    }
+                }
+                if (nextRequired != 0) { throw std::runtime_error("BlobManager: truncated Zstd payload: " + path.string()); }
+            }
+            else { throw std::runtime_error("BlobManager: unsupported codec: " + path.string()); }
+
+            if (outputOffset == 0 && !visitor(0, {})) { fclose(file); return false; }
+            if (outputOffset != header.totalSize || crc.finish() != header.contentCrc32c) {
+                throw std::runtime_error("BlobManager: content crc mismatch: " + path.string());
+            }
+            fclose(file);
+            return true;
+        }
+        catch (...) {
+            fclose(file);
+            throw;
+        }
+    }
+
     BlobManager::ReadPin BlobManager::pinReads() const {
         if (!impl_) { return {}; }
         return ReadPin{impl_->readPinMu};

@@ -135,11 +135,13 @@ namespace {
     }
 
     NodeInfo makeNode(uint64_t nodeId) {
+        const uint16_t replPort = unusedLoopbackPort();
         return NodeInfo{
             .nodeId = nodeId,
             .host = "127.0.0.1",
             .dataPort = unusedLoopbackPort(),
-            .replPort = unusedLoopbackPort(),
+            .replPort = replPort,
+            .stripeMetadataPort = unusedLoopbackPort(),
             .capabilities = DATA_AND_COORDINATOR,
         };
     }

@@ -64,6 +64,43 @@ namespace akkaradb::engine::cluster {
         using Clock = std::chrono::steady_clock;
         constexpr size_t MAX_RAFT_CLIENT_HANDLERS = 128;
 
+        class RaftReceiveBudget : public std::enable_shared_from_this<RaftReceiveBudget> {
+            struct Lease {
+                Lease(std::shared_ptr<RaftReceiveBudget> ownerValue, uint64_t amountValue)
+                    : owner{std::move(ownerValue)}, amount{amountValue} {}
+                std::shared_ptr<RaftReceiveBudget> owner;
+                uint64_t amount = 0;
+                ~Lease() { owner->used_.fetch_sub(amount, std::memory_order_acq_rel); }
+            };
+
+        public:
+            explicit RaftReceiveBudget(uint64_t limit) : limit_{limit} {}
+
+            [[nodiscard]] std::shared_ptr<void> reserve(uint64_t amount) {
+                uint64_t current = used_.load(std::memory_order_relaxed);
+                while (true) {
+                    if (amount > limit_ || current > limit_ - amount) {
+                        throw std::runtime_error("Raft transport receive-memory budget exhausted");
+                    }
+                    if (used_.compare_exchange_weak(current, current + amount, std::memory_order_acq_rel,
+                                                    std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+                try { return std::make_shared<Lease>(shared_from_this(), amount); }
+                catch (...) {
+                    used_.fetch_sub(amount, std::memory_order_acq_rel);
+                    throw;
+                }
+            }
+
+            [[nodiscard]] uint64_t used() const noexcept { return used_.load(std::memory_order_relaxed); }
+
+        private:
+            uint64_t limit_ = 0;
+            std::atomic<uint64_t> used_{0};
+        };
+
         uint64_t observationNowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
@@ -431,16 +468,19 @@ namespace akkaradb::engine::cluster {
             return out;
         }
 
-        bool recvFrame(SocketHandle s, DecodedFrame& out) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<RaftReceiveBudget>& budget) {
             uint8_t header[ReplFrameHeader::SIZE];
             if (!recvAll(s, header, sizeof(header))) { return false; }
             const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(header[8]) << 16) |
                 (static_cast<uint32_t>(header[9]) << 24);
-            if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
+            if (payloadLen > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) { return false; }
+            auto reservation = budget->reserve(ReplFrameHeader::SIZE + static_cast<uint64_t>(payloadLen) * 2);
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
             if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen)) { return false; }
-            return decodeFrame(wire, out);
+            if (!decodeFrame(wire, out)) { return false; }
+            out.memoryReservation = std::move(reservation);
+            return true;
         }
 
         bool sendFrame(SocketHandle s, const std::vector<uint8_t>& wire) { return sendAll(s, wire.data(), wire.size()); }
@@ -454,7 +494,7 @@ namespace akkaradb::engine::cluster {
         constexpr size_t SECURE_CLIENT_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 64;
         constexpr size_t SECURE_SERVER_HELLO_SIZE = SECURE_HELLO_HEADER_SIZE + 80;
         constexpr size_t SECURE_FRAME_HEADER_SIZE = 34;
-        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_PAYLOAD_SIZE;
+        constexpr uint32_t SECURE_MAX_CIPHERTEXT_SIZE = ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE;
 
         void writeU32Le(uint8_t* out, uint32_t value) noexcept { for (size_t i = 0; i < 4; ++i) { out[i] = static_cast<uint8_t>(value >> (i * 8)); } }
 
@@ -565,7 +605,8 @@ namespace akkaradb::engine::cluster {
             ));
         }
 
-        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out) {
+        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out,
+                             const std::shared_ptr<RaftReceiveBudget>& budget) {
             std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
             if (!recvAll(socket, header.data(), header.size())) { return false; }
             if (readU32Le(header.data()) != SECURE_FRAME_MAGIC || header[4] != SECURE_VERSION) { return false; }
@@ -574,13 +615,16 @@ namespace akkaradb::engine::cluster {
             encrypted.counter = readU64Le(header.data() + 6);
             const uint32_t ciphertextSize = readU32Le(header.data() + 14);
             if (ciphertextSize > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
+            auto reservation = budget->reserve(static_cast<uint64_t>(ciphertextSize) * 3);
             std::memcpy(encrypted.tag.data(), header.data() + 18, encrypted.tag.size());
             encrypted.ciphertext.resize(ciphertextSize);
             if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize)) { return false; }
 
             std::vector<uint8_t> plaintext;
             if (!session.open(encrypted, plaintext)) { return false; }
-            return decodeFrame(plaintext, out);
+            if (!decodeFrame(plaintext, out)) { return false; }
+            out.memoryReservation = std::move(reservation);
+            return true;
         }
 
         bool sendFrame(SocketHandle s, crypto::SecureSession* secure, const std::vector<uint8_t>& wire) {
@@ -588,9 +632,10 @@ namespace akkaradb::engine::cluster {
             return sendFrame(s, wire);
         }
 
-        bool recvFrame(SocketHandle s, crypto::SecureSession* secure, DecodedFrame& out) {
-            if (secure != nullptr) { return recvSecureFrame(s, *secure, out); }
-            return recvFrame(s, out);
+        bool recvFrame(SocketHandle s, crypto::SecureSession* secure, DecodedFrame& out,
+                       const std::shared_ptr<RaftReceiveBudget>& budget) {
+            if (secure != nullptr) { return recvSecureFrame(s, *secure, out, budget); }
+            return recvFrame(s, out, budget);
         }
 
         enum class RaftRole : uint8_t {
@@ -612,7 +657,7 @@ namespace akkaradb::engine::cluster {
             std::map<ClusterRequestId, RequestRecord> results;
             bool operator==(const RequestState&) const = default;
         };
-        constexpr uint32_t MAX_REQUEST_RECORDS = 65'536;
+        constexpr uint32_t MAX_REQUEST_RECORDS = 32'768;
 
         void writeRequestId(std::vector<uint8_t>& out, const ClusterRequestId& id) {
             out.insert(out.end(), id.nonce.begin(), id.nonce.end());
@@ -667,6 +712,7 @@ namespace akkaradb::engine::cluster {
             RaftEntryKind kind = RaftEntryKind::MUTATION;
             ReplOpType op = ReplOpType::PUT;
             uint8_t flags = 0;
+            bool proposalFinal = true;
             uint64_t sourceNodeId = 0;
             std::vector<uint8_t> key;
             std::vector<uint8_t> value;
@@ -680,7 +726,7 @@ namespace akkaradb::engine::cluster {
         };
 
         struct RaftPeerHello {
-            static constexpr uint32_t VERSION = 2;
+            static constexpr uint32_t VERSION = 1;
             uint64_t nodeId = 0;
             ClusterId clusterId{};
             std::array<uint8_t, 32> compatibilityFingerprint{};
@@ -865,6 +911,7 @@ namespace akkaradb::engine::cluster {
             writeU8(out, static_cast<uint8_t>(entry.kind));
             writeU8(out, static_cast<uint8_t>(entry.op));
             writeU8(out, entry.flags);
+            writeU8(out, entry.proposalFinal ? 1 : 0);
             writeU64(out, entry.sourceNodeId);
             writeU32(out, static_cast<uint32_t>(entry.key.size()));
             writeU32(out, static_cast<uint32_t>(entry.value.size()));
@@ -880,7 +927,7 @@ namespace akkaradb::engine::cluster {
         }
 
         bool decodeEntryPayload(std::span<const uint8_t> in, size_t& cursor, RaftLogEntry& out) {
-            if (cursor + 44 > in.size()) { return false; }
+            if (cursor + 45 > in.size()) { return false; }
             out.term = readU64(in, cursor);
             cursor += 8;
             out.index = readU64(in, cursor);
@@ -890,6 +937,9 @@ namespace akkaradb::engine::cluster {
             out.kind = static_cast<RaftEntryKind>(in[cursor++]);
             out.op = static_cast<ReplOpType>(in[cursor++]);
             out.flags = in[cursor++];
+            const uint8_t proposalFinal = in[cursor++];
+            if (proposalFinal > 1) { return false; }
+            out.proposalFinal = proposalFinal != 0;
             out.sourceNodeId = readU64(in, cursor);
             cursor += 8;
             const uint32_t keyLen = readU32(in, cursor);
@@ -910,13 +960,18 @@ namespace akkaradb::engine::cluster {
             return readBytes(in, cursor, keyLen, out.key) && readBytes(in, cursor, valueLen, out.value);
         }
 
+        std::vector<uint8_t> encodeRaftFrame(ReplMsgType type, std::span<const uint8_t> payload) {
+            if (payload.size() > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) { return {}; }
+            return encodeFrame(type, payload);
+        }
+
         std::vector<uint8_t> encodeRequestVote(const RequestVote& rpc) {
             std::vector<uint8_t> out;
             writeU64(out, rpc.term);
             writeU64(out, rpc.candidateId);
             writeU64(out, rpc.lastLogIndex);
             writeU64(out, rpc.lastLogTerm);
-            return encodeFrame(ReplMsgType::RAFT_REQUEST_VOTE, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_REQUEST_VOTE, out);
         }
 
         std::vector<uint8_t> encodeRaftPeerHello(const RaftPeerHello& hello) {
@@ -929,7 +984,7 @@ namespace akkaradb::engine::cluster {
             writeU8(out, hello.requestsEnabled ? 1 : 0);
             writeU64(out, hello.requestMaxRetentionMs);
             writeU32(out, hello.requestCapacity);
-            return encodeFrame(ReplMsgType::RAFT_PEER_HELLO, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_PEER_HELLO, out);
         }
 
         bool decodeRaftPeerHello(std::span<const uint8_t> in, RaftPeerHello& out) {
@@ -948,7 +1003,7 @@ namespace akkaradb::engine::cluster {
 
         std::vector<uint8_t> encodeRaftPeerHelloResponse(const RaftPeerHelloResponse& response) {
             const std::array<uint8_t, 1> payload{static_cast<uint8_t>(response.status)};
-            return encodeFrame(ReplMsgType::RAFT_PEER_HELLO_RESPONSE, payload);
+            return encodeRaftFrame(ReplMsgType::RAFT_PEER_HELLO_RESPONSE, payload);
         }
 
         bool decodeRaftPeerHelloResponse(std::span<const uint8_t> in, RaftPeerHelloResponse& out) {
@@ -961,7 +1016,7 @@ namespace akkaradb::engine::cluster {
             const ClusterConfig& config,
             const ClusterRuntimeOptions& runtimeOptions
         ) {
-            std::vector<uint8_t> bytes{'A', 'K', 'R', 'P', '2'};
+            std::vector<uint8_t> bytes{'A', 'K', 'R', 'P', '1'};
             const auto consistency = config.consistency();
             const auto raft = config.raft();
             writeU8(bytes, static_cast<uint8_t>(config.mode()));
@@ -990,7 +1045,7 @@ namespace akkaradb::engine::cluster {
             std::vector<uint8_t> out;
             writeU64(out, rpc.term);
             writeU8(out, rpc.voteGranted ? 1 : 0);
-            return encodeFrame(ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE, out);
         }
 
         bool decodeRequestVoteResponse(std::span<const uint8_t> in, RequestVoteResponse& out) {
@@ -1013,7 +1068,7 @@ namespace akkaradb::engine::cluster {
                 writeU32(out, static_cast<uint32_t>(payload.size()));
                 out.insert(out.end(), payload.begin(), payload.end());
             }
-            return encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_APPEND_ENTRIES, out);
         }
 
         bool decodeAppendEntries(std::span<const uint8_t> in, AppendEntries& out) {
@@ -1049,7 +1104,7 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.matchIndex);
             writeU64(out, rpc.conflictIndex);
             writeU64(out, rpc.conflictTerm);
-            return encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE, out);
         }
 
         bool decodeAppendEntriesResponse(std::span<const uint8_t> in, AppendEntriesResponse& out) {
@@ -1086,7 +1141,7 @@ namespace akkaradb::engine::cluster {
                 out.insert(out.end(), chunk.key.begin(), chunk.key.end());
                 out.insert(out.end(), chunk.value.begin(), chunk.value.end());
             }
-            return encodeFrame(ReplMsgType::RAFT_INSTALL_SNAPSHOT, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_INSTALL_SNAPSHOT, out);
         }
 
         bool decodeInstallSnapshot(std::span<const uint8_t> in, InstallSnapshot& out) {
@@ -1141,7 +1196,7 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.term);
             writeU8(out, rpc.success ? 1 : 0);
             writeU64(out, rpc.lastIncludedIndex);
-            return encodeFrame(ReplMsgType::RAFT_INSTALL_SNAPSHOT_RESPONSE, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_INSTALL_SNAPSHOT_RESPONSE, out);
         }
 
         bool decodeInstallSnapshotResponse(std::span<const uint8_t> in, InstallSnapshotResponse& out) {
@@ -1157,7 +1212,7 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.term);
             writeU64(out, rpc.leaderId);
             writeU64(out, rpc.targetId);
-            return encodeFrame(ReplMsgType::RAFT_TIMEOUT_NOW, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_TIMEOUT_NOW, out);
         }
 
         bool decodeTimeoutNow(std::span<const uint8_t> in, TimeoutNow& out) {
@@ -1172,7 +1227,7 @@ namespace akkaradb::engine::cluster {
             std::vector<uint8_t> out;
             writeU64(out, rpc.term);
             writeU8(out, rpc.accepted ? 1 : 0);
-            return encodeFrame(ReplMsgType::RAFT_TIMEOUT_NOW_RESPONSE, out);
+            return encodeRaftFrame(ReplMsgType::RAFT_TIMEOUT_NOW_RESPONSE, out);
         }
 
         bool decodeTimeoutNowResponse(std::span<const uint8_t> in, TimeoutNowResponse& out) {
@@ -1184,7 +1239,7 @@ namespace akkaradb::engine::cluster {
 
         bool sameEntry(const RaftLogEntry& lhs, const RaftLogEntry& rhs) {
             return lhs.term == rhs.term && lhs.index == rhs.index && lhs.clientSeq == rhs.clientSeq && lhs.kind == rhs.kind && lhs.op == rhs.op && lhs.flags ==
-                rhs.flags && lhs.sourceNodeId == rhs.sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value &&
+                rhs.flags && lhs.proposalFinal == rhs.proposalFinal && lhs.sourceNodeId == rhs.sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value &&
                 lhs.requestId == rhs.requestId && lhs.requestFingerprint == rhs.requestFingerprint && lhs.requestTime == rhs.requestTime;
         }
 
@@ -1223,11 +1278,11 @@ namespace akkaradb::engine::cluster {
 
         static constexpr size_t RAFT_APPEND_ENTRIES_BASE_SIZE = 44;
         static constexpr size_t RAFT_ENTRY_LENGTH_PREFIX_SIZE = 4;
-        static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 43;
+        static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 45;
         static constexpr size_t RAFT_BLOB_CHUNK_KEY_SIZE = 28;
 
         uint32_t maxRaftBlobChunkSizeBytes() {
-            return ReplFrameHeader::MAX_PAYLOAD_SIZE - static_cast<uint32_t>(RAFT_APPEND_ENTRIES_BASE_SIZE + RAFT_ENTRY_LENGTH_PREFIX_SIZE +
+            return ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE - static_cast<uint32_t>(RAFT_APPEND_ENTRIES_BASE_SIZE + RAFT_ENTRY_LENGTH_PREFIX_SIZE +
                 RAFT_ENTRY_PAYLOAD_BASE_SIZE + RAFT_BLOB_CHUNK_KEY_SIZE);
         }
 
@@ -1254,6 +1309,11 @@ namespace akkaradb::engine::cluster {
             if (!isKnownRaftEntryKind(entry.kind)) { return false; }
             if (entry.requestId && (entry.kind != RaftEntryKind::MUTATION || entry.requestTime == 0 ||
                 entry.requestTime >= entry.requestId->expiresAtUnixMs)) { return false; }
+            constexpr size_t maxEntryPayload = ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE -
+                                               RAFT_APPEND_ENTRIES_BASE_SIZE - RAFT_ENTRY_LENGTH_PREFIX_SIZE;
+            const size_t entryMetadata = RAFT_ENTRY_PAYLOAD_BASE_SIZE + (entry.requestId ? 40u : 0u);
+            if (entryMetadata > maxEntryPayload || entry.key.size() > maxEntryPayload - entryMetadata ||
+                entry.value.size() > maxEntryPayload - entryMetadata - entry.key.size()) { return false; }
             if (entry.kind == RaftEntryKind::BLOB) {
                 RaftBlobChunk chunk;
                 return entry.op == ReplOpType::PUT && entry.flags == 0 && decodeBlobChunkKey(entry.key, chunk) && entry.value.size() <= chunk.totalSize -
@@ -1338,7 +1398,7 @@ namespace akkaradb::engine::cluster {
             };
 
             RequestState requestState_;
-            std::mutex requestAdmissionMutex_;
+            std::mutex mutationAdmissionMutex_;
             std::filesystem::path dbDir_;
             std::filesystem::path statePath_;
             std::filesystem::path logPath_;
@@ -1350,6 +1410,7 @@ namespace akkaradb::engine::cluster {
             std::vector<NodeInfo> peers_;
             ClusterEngineCallbacks callbacks_;
             ClusterRuntimeOptions runtimeOptions_;
+            std::shared_ptr<RaftReceiveBudget> receiveBudget_;
             std::array<uint8_t, 32> compatibilityFingerprint_{};
             crypto::NodeIdentity localIdentity_{};
 
@@ -1364,6 +1425,7 @@ namespace akkaradb::engine::cluster {
             uint64_t lastIncludedIndex_ = 0;
             uint64_t lastIncludedTerm_ = 0;
             uint64_t lastIncludedStateMachineSeq_ = 0;
+            uint64_t lastAssignedStateMachineSeq_ = 0;
             std::vector<RaftLogEntry> log_;
             struct LogLocation {
                 uint64_t index;
@@ -1636,7 +1698,7 @@ namespace akkaradb::engine::cluster {
                     DecodedFrame helloFrame;
                     RaftPeerHelloResponse helloResponse;
                     if (!sendFrame(socket, worker->secure.get(), encodeRaftPeerHello(hello)) ||
-                        !recvFrame(socket, worker->secure.get(), helloFrame) || helloFrame.type != ReplMsgType::RAFT_PEER_HELLO_RESPONSE ||
+                        !recvFrame(socket, worker->secure.get(), helloFrame, receiveBudget_) || helloFrame.type != ReplMsgType::RAFT_PEER_HELLO_RESPONSE ||
                         !decodeRaftPeerHelloResponse(helloFrame.payload, helloResponse) || helloResponse.status != RaftPeerHelloStatus::ACCEPTED) {
                         if (helloResponse.status == RaftPeerHelloStatus::CLUSTER_MISMATCH) {
                             ++foreignClusterRejects_;
@@ -1652,7 +1714,7 @@ namespace akkaradb::engine::cluster {
                 }
                 setTimeouts(worker->socket, timeoutMs);
                 if (!sendFrame(worker->socket, worker->secure.get(), wire) ||
-                    !recvFrame(worker->socket, worker->secure.get(), frame) || frame.type != expected) {
+                    !recvFrame(worker->socket, worker->secure.get(), frame, receiveBudget_) || frame.type != expected) {
                     reset();
                     return false;
                 }
@@ -1662,6 +1724,9 @@ namespace akkaradb::engine::cluster {
             }
 
             std::future<void> submitProposal(std::vector<RaftLogEntry> entries, std::shared_ptr<Proposal> proposal = {}) {
+                if (entries.empty()) { throw std::invalid_argument("RaftConsensusRuntime: proposal must contain at least one entry"); }
+                for (auto& entry : entries) { entry.proposalFinal = false; }
+                entries.back().proposalFinal = true;
                 if (!proposal) { proposal = std::make_shared<Proposal>(); }
                 proposal->entries = std::move(entries);
                 for (const auto& entry : proposal->entries) { proposal->bytes += entry.key.size() + entry.value.size() + sizeof(RaftLogEntry); }
@@ -1916,7 +1981,9 @@ namespace akkaradb::engine::cluster {
                 return replicatedByMajorityLocked(committedVoters_, index);
             }
 
-            bool canCommitEntryLocked(const RaftLogEntry& entry) { return entry.term == currentTerm_ && hasCommitQuorumLocked(entry.index, &entry); }
+            bool canCommitEntryLocked(const RaftLogEntry& entry) {
+                return entry.proposalFinal && entry.term == currentTerm_ && hasCommitQuorumLocked(entry.index, &entry);
+            }
 
             static bool sameNodeSet(const std::vector<NodeInfo>& lhs, const std::vector<NodeInfo>& rhs) { return encodeNodeSet(lhs) == encodeNodeSet(rhs); }
 
@@ -1987,7 +2054,7 @@ namespace akkaradb::engine::cluster {
                     if (entry.index < nextIndex) { continue; }
                     const auto entryPayload = encodeEntryPayload(entry);
                     const size_t entrySize = RAFT_ENTRY_LENGTH_PREFIX_SIZE + entryPayload.size();
-                    if (payloadSize + entrySize > ReplFrameHeader::MAX_PAYLOAD_SIZE) {
+                    if (payloadSize + entrySize > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) {
                         if (entries.empty()) { return {}; }
                         break;
                     }
@@ -2645,7 +2712,7 @@ namespace akkaradb::engine::cluster {
                         const uint64_t len = readU64(segmentBytes, static_cast<size_t>(offset));
                         const uint32_t crc = readU32(segmentBytes, static_cast<size_t>(offset + 8));
                         offset += 12;
-                        if (len > ReplFrameHeader::MAX_PAYLOAD_SIZE || len > segmentBytes.size() - offset || len > extent.end - offset) {
+                        if (len > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE || len > segmentBytes.size() - offset || len > extent.end - offset) {
                             failOrTruncate("truncated log entry payload");
                             break;
                         }
@@ -2705,7 +2772,7 @@ namespace akkaradb::engine::cluster {
 
                 std::lock_guard applyLock{applyMutex_};
                 if (callbacks_.recoverSnapshot) { callbacks_.recoverSnapshot(transaction->snapshotSeq); }
-                else if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(transaction->snapshotSeq); }
+                else if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(transaction->snapshotSeq, transaction->entryCount); }
                 if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
 
                 std::lock_guard lock{mutex_};
@@ -2919,7 +2986,7 @@ namespace akkaradb::engine::cluster {
                             sendHeartbeats();
                             maybeCompactLog();
                             lock.lock();
-                            cv_.wait_for(lock, std::chrono::milliseconds{100}, [&] { return !running_; });
+                            cv_.wait_for(lock, std::chrono::milliseconds{runtimeOptions_.raftHeartbeatIntervalMs}, [&] { return !running_; });
                             continue;
                         }
                         if (!forceElection_ && Clock::now() < electionDeadline_) {
@@ -3094,7 +3161,6 @@ namespace akkaradb::engine::cluster {
                     request.lastIncludedIndex = logIndexValue;
                     request.lastIncludedTerm = logTermValue;
                     request.snapshotSeq = snapshot->seq;
-                    request.entryCount = snapshot->entryCount;
                     request.committedVoters = committedVoters;
                     request.jointOldVoters = jointOldVoters;
                     request.jointNewVoters = jointNewVoters;
@@ -3106,25 +3172,30 @@ namespace akkaradb::engine::cluster {
                     return installSnapshot(peer, request, response) && response.term <= term && response.success;
                 };
                 const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
+                if (chunkSize == 0) { return false; }
                 uint64_t entryIndex = 0;
-                const bool streamed = snapshot->forEachEntry([&](std::span<const uint8_t> key, std::span<const uint8_t> value) {
-                    if (entryIndex >= snapshot->entryCount) { return false; }
-                    const uint32_t valueCrc32c = crcBytes(value);
-                    size_t offset = 0;
-                    bool emittedEntryChunk = false;
+                bool entryActive = false;
+                bool emittedEntryChunk = false;
+                uint64_t entryValueSize = 0;
+                uint64_t entryValueOffset = 0;
+                uint32_t entryValueCrc32c = 0;
+                std::vector<uint8_t> entryKey;
+                const auto appendChunk = [&](uint64_t valueOffset, std::span<const uint8_t> value) {
+                    size_t chunkOffset = 0;
+                    bool emittedInputChunk = false;
                     do {
-                        const size_t remaining = value.size() - offset;
+                        const size_t remaining = value.size() - chunkOffset;
                         size_t currentChunkSize = std::min(chunkSize, remaining);
                         auto makeChunk = [&](size_t valueBytes) {
                             SnapshotKvChunk chunk;
                             chunk.entryIndex = entryIndex;
-                            chunk.valueOffset = offset;
-                            chunk.valueSize = value.size();
-                            chunk.valueCrc32c = valueCrc32c;
-                            if (offset == 0) { chunk.key.assign(key.begin(), key.end()); }
+                            chunk.valueOffset = valueOffset + chunkOffset;
+                            chunk.valueSize = entryValueSize;
+                            chunk.valueCrc32c = entryValueCrc32c;
+                            if (chunk.valueOffset == 0) { chunk.key = entryKey; }
                             chunk.value.assign(
-                                value.begin() + static_cast<std::ptrdiff_t>(offset),
-                                value.begin() + static_cast<std::ptrdiff_t>(offset + valueBytes)
+                                value.begin() + static_cast<std::ptrdiff_t>(chunkOffset),
+                                value.begin() + static_cast<std::ptrdiff_t>(chunkOffset + valueBytes)
                             );
                             return chunk;
                         };
@@ -3160,22 +3231,56 @@ namespace akkaradb::engine::cluster {
                             candidate.chunks.push_back(std::move(chunk));
                         }
                         current = std::move(candidate);
-                        offset += currentChunkSize;
+                        chunkOffset += currentChunkSize;
+                        emittedInputChunk = true;
                         emittedEntryChunk = true;
                     }
-                    while (offset < value.size() || !emittedEntryChunk);
-                    ++entryIndex;
+                    while (chunkOffset < value.size() || !emittedInputChunk);
                     return true;
-                });
-                if (!streamed || entryIndex != snapshot->entryCount) { return false; }
+                };
+                const ClusterSnapshot::EntryVisitor snapshotVisitor{
+                    .beginEntry = [&](std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c) {
+                        if (entryActive || entryIndex == UINT64_MAX) { return false; }
+                        entryActive = true;
+                        emittedEntryChunk = false;
+                        entryValueSize = valueSize;
+                        entryValueOffset = 0;
+                        entryValueCrc32c = valueCrc32c;
+                        entryKey.assign(key.begin(), key.end());
+                        return true;
+                    },
+                    .appendValueChunk = [&](uint64_t offset, std::span<const uint8_t> chunk) {
+                        if (!entryActive || offset != entryValueOffset || chunk.size() > entryValueSize - entryValueOffset ||
+                            (chunk.empty() && (entryValueSize != 0 || emittedEntryChunk))) {
+                            return false;
+                        }
+                        if (!appendChunk(offset, chunk)) { return false; }
+                        entryValueOffset += static_cast<uint64_t>(chunk.size());
+                        return true;
+                    },
+                    .finishEntry = [&] {
+                        if (!entryActive || !emittedEntryChunk || entryValueOffset != entryValueSize) { return false; }
+                        entryActive = false;
+                        entryKey.clear();
+                        ++entryIndex;
+                        return true;
+                    },
+                    .fileEntryThresholdBytes = UINT64_MAX,
+                    .fileEntry = {},
+                };
+                const bool streamed = snapshot->forEachEntry(snapshotVisitor);
+                if (!streamed || entryActive) { return false; }
 
                 current.requestState = std::move(snapshotRequests);
+                current.entryCount = entryIndex;
                 current.done = true;
                 if (encodeInstallSnapshot(current).empty()) {
                     auto final = makeRequest();
                     final.requestState = std::move(current.requestState);
+                    final.entryCount = entryIndex;
                     final.done = true;
                     current.done = false;
+                    current.entryCount = 0;
                     if (!current.chunks.empty() && !sendRequest(current)) { return false; }
                     if (encodeInstallSnapshot(final).empty()) { return false; }
                     return sendRequest(final);
@@ -3660,7 +3765,7 @@ namespace akkaradb::engine::cluster {
                 DecodedFrame helloFrame;
                 RaftPeerHello hello;
                 RaftPeerHelloResponse helloResponse;
-                if (recvFrame(client, secure.get(), helloFrame) && helloFrame.type == ReplMsgType::RAFT_PEER_HELLO &&
+                if (recvFrame(client, secure.get(), helloFrame, receiveBudget_) && helloFrame.type == ReplMsgType::RAFT_PEER_HELLO &&
                     decodeRaftPeerHello(helloFrame.payload, hello)) {
                     bool knownNode = false;
                     {
@@ -3706,7 +3811,7 @@ namespace akkaradb::engine::cluster {
                     if (ready == 0) { continue; }
                     if (ready < 0) { return; }
                     DecodedFrame frame;
-                    if (!recvFrame(client, secure.get(), frame)) { return; }
+                    if (!recvFrame(client, secure.get(), frame, receiveBudget_)) { return; }
                     if (frame.type == ReplMsgType::RAFT_REQUEST_VOTE) {
                         RequestVote request;
                         RequestVoteResponse response;
@@ -3822,11 +3927,12 @@ namespace akkaradb::engine::cluster {
 
             bool applySnapshotChunkRequestLocked(const InstallSnapshot& request) {
                 if (request.chunks.empty() && !request.done) { return false; }
+                if (!request.done && request.entryCount != 0) { return false; }
                 if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) { return false; }
                 if (request.jointOldVoters && (request.jointOldVoters->empty() || request.jointNewVoters->empty())) { return false; }
                 const bool sameSnapshot = pendingSnapshotInstall_.active && pendingSnapshotInstall_.snapshotSeq == request.snapshotSeq &&
                     pendingSnapshotInstall_.lastIncludedIndex == request.lastIncludedIndex && pendingSnapshotInstall_.lastIncludedTerm == request.
-                    lastIncludedTerm && pendingSnapshotInstall_.entryCount == request.entryCount && sameNodeSet(
+                    lastIncludedTerm && sameNodeSet(
                         pendingSnapshotInstall_.committedVoters,
                         request.committedVoters
                     ) && sameOptionalNodeSet(pendingSnapshotInstall_.jointOldVoters, request.jointOldVoters) && sameOptionalNodeSet(
@@ -3842,7 +3948,6 @@ namespace akkaradb::engine::cluster {
                     pendingSnapshotInstall_.snapshotSeq = request.snapshotSeq;
                     pendingSnapshotInstall_.lastIncludedIndex = request.lastIncludedIndex;
                     pendingSnapshotInstall_.lastIncludedTerm = request.lastIncludedTerm;
-                    pendingSnapshotInstall_.entryCount = request.entryCount;
                     pendingSnapshotInstall_.committedVoters = request.committedVoters;
                     pendingSnapshotInstall_.jointOldVoters = request.jointOldVoters;
                     pendingSnapshotInstall_.jointNewVoters = request.jointNewVoters;
@@ -3850,7 +3955,7 @@ namespace akkaradb::engine::cluster {
                 }
 
                 for (const auto& chunk : request.chunks) {
-                    if (chunk.entryIndex >= pendingSnapshotInstall_.entryCount || chunk.valueOffset > chunk.valueSize || chunk.value.size() > chunk.valueSize -
+                    if ((request.done && chunk.entryIndex >= request.entryCount) || chunk.valueOffset > chunk.valueSize || chunk.value.size() > chunk.valueSize -
                         chunk.valueOffset) { return false; }
                     if (!pendingSnapshotInstall_.hasCurrentEntry) {
                         if (chunk.entryIndex != pendingSnapshotInstall_.nextEntryIndex || chunk.valueOffset != 0) { return false; }
@@ -3879,6 +3984,7 @@ namespace akkaradb::engine::cluster {
                     if (pendingSnapshotInstall_.currentValueOffset == pendingSnapshotInstall_.currentValueSize) {
                         if (pendingSnapshotInstall_.currentValueCrc.finish() != pendingSnapshotInstall_.currentValueCrc32c) { return false; }
                         if (callbacks_.finishSnapshotEntry) { callbacks_.finishSnapshotEntry(); }
+                        if (pendingSnapshotInstall_.nextEntryIndex == UINT64_MAX) { return false; }
                         ++pendingSnapshotInstall_.nextEntryIndex;
                         pendingSnapshotInstall_.currentKey.clear();
                         pendingSnapshotInstall_.currentValueCrc = Crc32cStream{};
@@ -3887,7 +3993,8 @@ namespace akkaradb::engine::cluster {
                 }
 
                 if (!request.done) { return true; }
-                if (pendingSnapshotInstall_.hasCurrentEntry || pendingSnapshotInstall_.nextEntryIndex != pendingSnapshotInstall_.entryCount) { return false; }
+                if (pendingSnapshotInstall_.hasCurrentEntry || pendingSnapshotInstall_.nextEntryIndex != request.entryCount) { return false; }
+                pendingSnapshotInstall_.entryCount = request.entryCount;
                 return true;
             }
 
@@ -3955,7 +4062,7 @@ namespace akkaradb::engine::cluster {
                         }
                         snapshotInstallIntentDurable = true;
                     }
-                    if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq); }
+                    if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq, request.entryCount); }
                     stateMachineSnapshotFinished = true;
                     if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
                     {
@@ -4235,11 +4342,21 @@ namespace akkaradb::engine::cluster {
                   router_{config_},
                   selfNodeId_{selfNodeId},
                   callbacks_{std::move(callbacks)},
-                  runtimeOptions_{std::move(runtimeOptions)} {
+                  runtimeOptions_{std::move(runtimeOptions)},
+                  receiveBudget_{std::make_shared<RaftReceiveBudget>(runtimeOptions_.raftMaxReceiveMemoryBytes)} {
                 config_.validate();
                 compatibilityFingerprint_ = raftCompatibilityFingerprint(config_, runtimeOptions_);
                 if (runtimeOptions_.raftBlobChunkSizeBytes == 0 || runtimeOptions_.raftBlobChunkSizeBytes > maxRaftBlobChunkSizeBytes()) {
                     throw std::invalid_argument("RaftConsensusRuntime: invalid Raft Blob chunk size");
+                }
+                if (runtimeOptions_.raftHeartbeatIntervalMs < 10 || runtimeOptions_.raftHeartbeatIntervalMs > 1'000) {
+                    throw std::invalid_argument("RaftConsensusRuntime: Raft heartbeat interval must be in [10, 1000] ms");
+                }
+                constexpr uint64_t minReceiveMemoryBytes =
+                    3ull * (ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE);
+                if (runtimeOptions_.raftMaxReceiveMemoryBytes < minReceiveMemoryBytes ||
+                    runtimeOptions_.raftMaxReceiveMemoryBytes > 64ull * 1024 * 1024 * 1024) {
+                    throw std::invalid_argument("RaftConsensusRuntime: invalid receive-memory limit");
                 }
                 self_ = config_.findById(selfNodeId_);
                 if (self_ == nullptr || !self_->dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: local node must be data-bearing"); }
@@ -4250,6 +4367,15 @@ namespace akkaradb::engine::cluster {
                 recoverState();
                 recoverLog();
                 recoverAppliedProgressFromStateMachine();
+                lastAssignedStateMachineSeq_ = lastIncludedStateMachineSeq_;
+                for (const auto& entry : log_) {
+                    if (isStateMachineEntry(entry.kind)) {
+                        lastAssignedStateMachineSeq_ = std::max(lastAssignedStateMachineSeq_, entry.clientSeq);
+                    }
+                }
+                if (callbacks_.getLastSeq) {
+                    lastAssignedStateMachineSeq_ = std::max(lastAssignedStateMachineSeq_, callbacks_.getLastSeq());
+                }
                 this->replayCommittedMembership();
                 rebuildRequestResultsLocked();
                 validatePeerConfiguration(replicationTargetsLocked());
@@ -4374,6 +4500,7 @@ namespace akkaradb::engine::cluster {
                 out.endpointStartFailures = endpointStartFailures_.load(std::memory_order_relaxed);
                 out.requestJournalBytesWritten = requestJournalBytesWritten_.load(std::memory_order_relaxed);
                 out.requestJournalCompactions = requestJournalCompactions_.load(std::memory_order_relaxed);
+                out.transferMemoryBytes = receiveBudget_->used();
                 {
                     std::lock_guard lock{mutex_};
                     out.currentTerm = currentTerm_;
@@ -4381,6 +4508,13 @@ namespace akkaradb::engine::cluster {
                         (observedLeaderTerm_ == currentTerm_ ? observedLeaderId_ : 0);
                     out.commitIndex = commitIndex_;
                     out.appliedIndex = lastApplied_;
+                    out.appliedStateMachineSeq = lastIncludedStateMachineSeq_;
+                    for (const auto& entry : log_) {
+                        if (entry.index > lastApplied_) { break; }
+                        if (isStateMachineEntry(entry.kind)) {
+                            out.appliedStateMachineSeq = std::max(out.appliedStateMachineSeq, entry.clientSeq);
+                        }
+                    }
                     out.lastLogIndex = lastLogIndex();
                     out.snapshotIndex = lastIncludedIndex_;
                     out.proposalQueueDepth = proposalQueue_.size();
@@ -4473,6 +4607,67 @@ namespace akkaradb::engine::cluster {
                 return promise.get_future().share();
             }
 
+            uint64_t reserveStateMachineSequenceLocked() {
+                uint64_t highest = std::max(lastAssignedStateMachineSeq_, lastIncludedStateMachineSeq_);
+                for (const auto& entry : log_) {
+                    if (isStateMachineEntry(entry.kind)) { highest = std::max(highest, entry.clientSeq); }
+                }
+                if (highest == UINT64_MAX) { throw std::overflow_error("RaftConsensusRuntime: state-machine sequence exhausted"); }
+                lastAssignedStateMachineSeq_ = highest + 1;
+                return lastAssignedStateMachineSeq_;
+            }
+
+            std::vector<RaftLogEntry> mutationEntries(uint64_t sequence, ClusterMutation mutation) const {
+                if (sequence == 0) { throw std::invalid_argument("RaftConsensusRuntime: state-machine sequence must be non-zero"); }
+                std::vector<RaftLogEntry> entries;
+                if (mutation.blob) {
+                    if (runtimeOptions_.raftBlobPolicy != RaftBlobPolicy::RAFT_LOG) {
+                        throw std::invalid_argument("RaftConsensusRuntime: atomic Blob payload requires RAFT_LOG policy");
+                    }
+                    const auto& content = mutation.blob->content;
+                    const uint32_t contentCrc32c = crcBytes(content);
+                    const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
+                    size_t offset = 0;
+                    do {
+                        const size_t count = std::min(chunkSize, content.size() - offset);
+                        RaftLogEntry blob;
+                        blob.clientSeq = sequence;
+                        blob.kind = RaftEntryKind::BLOB;
+                        blob.op = ReplOpType::PUT;
+                        blob.sourceNodeId = mutation.sourceNodeId;
+                        blob.key = encodeBlobChunkKey(
+                            RaftBlobChunk{
+                                .blobId = mutation.blob->blobId,
+                                .offset = static_cast<uint64_t>(offset),
+                                .totalSize = static_cast<uint64_t>(content.size()),
+                                .contentCrc32c = contentCrc32c,
+                            }
+                        );
+                        blob.value.assign(
+                            content.begin() + static_cast<std::ptrdiff_t>(offset),
+                            content.begin() + static_cast<std::ptrdiff_t>(offset + count)
+                        );
+                        entries.push_back(std::move(blob));
+                        offset += count;
+                    }
+                    while (offset < content.size());
+                }
+
+                RaftLogEntry entry;
+                entry.clientSeq = sequence;
+                entry.kind = RaftEntryKind::MUTATION;
+                entry.op = mutation.op;
+                entry.flags = mutation.recordFlags;
+                entry.sourceNodeId = mutation.sourceNodeId;
+                entry.key = std::move(mutation.key);
+                entry.value = std::move(mutation.value);
+                if (!isValidRaftLogEntryShape(entry)) {
+                    throw std::invalid_argument("RaftConsensusRuntime: invalid prepared mutation");
+                }
+                entries.push_back(std::move(entry));
+                return entries;
+            }
+
             uint64_t validateRequestLocked(const ClusterRequestId& id) {
                 if (!runtimeOptions_.requests.enabled) {
                     rejectedRequests_.fetch_add(1, std::memory_order_relaxed);
@@ -4492,14 +4687,15 @@ namespace akkaradb::engine::cluster {
 
             std::shared_future<ClusterRequestResult> submitRequest(
                 const ClusterRequestId& id, const std::array<uint8_t, 32>& fingerprint,
-                std::function<ClusterHistoryEntry()> prepare
+                ClusterMutationFactory prepare
             ) {
-                std::lock_guard admission{requestAdmissionMutex_};
+                if (!prepare) { throw std::invalid_argument("Raft: retry-safe mutation factory is required"); }
+                std::lock_guard admission{mutationAdmissionMutex_};
                 auto proposal = std::make_shared<Proposal>();
                 proposal->request = std::make_shared<RequestCompletion>();
                 proposal->request->id = id;
                 proposal->request->fingerprint = fingerprint;
-                uint64_t now = 0, term = 0;
+                uint64_t now = 0, term = 0, sequence = 0;
                 {
                     std::lock_guard lock{mutex_};
                     if (!running_ || role_.load() != RaftRole::LEADER || administrativeChange_) {
@@ -4541,19 +4737,14 @@ namespace akkaradb::engine::cluster {
                         throw std::runtime_error("Raft: request result capacity exhausted; unexpired results are never evicted");
                     }
                     term = currentTerm_;
+                    sequence = reserveStateMachineSequenceLocked();
                 }
-                const auto mutation = prepare();
-                RaftLogEntry entry;
-                entry.requestId = id;
-                entry.requestFingerprint = fingerprint;
-                entry.requestTime = now;
-                entry.clientSeq = mutation.seq;
-                entry.op = static_cast<ReplOpType>(mutation.op);
-                entry.flags = mutation.recordFlags;
-                entry.sourceNodeId = mutation.sourceNodeId;
-                entry.key = mutation.key;
-                entry.value = mutation.value;
-                proposal->request->sequence = mutation.seq;
+                auto entries = mutationEntries(sequence, prepare(sequence));
+                auto& mutationEntry = entries.back();
+                mutationEntry.requestId = id;
+                mutationEntry.requestFingerprint = fingerprint;
+                mutationEntry.requestTime = now;
+                proposal->request->sequence = sequence;
                 // Preparation can include Blob I/O. Never admit its mutation in a
                 // different leadership term than the deduplication check.
                 {
@@ -4563,7 +4754,7 @@ namespace akkaradb::engine::cluster {
                     }
                 }
                 proposal->term = term;
-                (void)submitProposal({std::move(entry)}, proposal);
+                (void)submitProposal(std::move(entries), proposal);
                 return proposal->request->future;
             }
 
@@ -4582,11 +4773,32 @@ namespace akkaradb::engine::cluster {
                 return {ClusterRequestStatus::NOT_FOUND};
             }
 
+            ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare) {
+                if (!prepare) { throw std::invalid_argument("RaftConsensusRuntime: mutation factory is required"); }
+                std::lock_guard admission{mutationAdmissionMutex_};
+                uint64_t sequence = 0;
+                uint64_t term = 0;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (!running_ || role_.load() != RaftRole::LEADER || administrativeChange_) {
+                        throw std::runtime_error("RaftConsensusRuntime: mutation requires an active leader");
+                    }
+                    sequence = reserveStateMachineSequenceLocked();
+                    term = currentTerm_;
+                }
+                auto entries = mutationEntries(sequence, prepare(sequence));
+                auto proposal = std::make_shared<Proposal>();
+                proposal->term = term;
+                auto completion = submitProposal(std::move(entries), proposal);
+                return ClusterMutationSubmission{.sequence = sequence, .completion = std::move(completion)};
+            }
+
             std::future<void> submitEntry(
                 uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
                 std::span<const uint8_t> value, uint8_t flags, uint64_t source
             ) {
                 if (seq == 0) { throw std::invalid_argument("RaftConsensusRuntime: state-machine sequence must be non-zero"); }
+                std::lock_guard admission{mutationAdmissionMutex_};
                 RaftLogEntry entry;
                 entry.clientSeq = seq;
                 entry.kind = RaftEntryKind::MUTATION;
@@ -4595,6 +4807,13 @@ namespace akkaradb::engine::cluster {
                 entry.sourceNodeId = source;
                 entry.key.assign(key.begin(), key.end());
                 entry.value.assign(value.begin(), value.end());
+                if (!isValidRaftLogEntryShape(entry)) {
+                    throw std::invalid_argument("RaftConsensusRuntime: entry does not fit one Raft frame");
+                }
+                {
+                    std::lock_guard lock{mutex_};
+                    lastAssignedStateMachineSeq_ = std::max(lastAssignedStateMachineSeq_, seq);
+                }
                 return submitProposal({std::move(entry)});
             }
 
@@ -4840,7 +5059,7 @@ namespace akkaradb::engine::cluster {
     RaftConsensusRuntime::RaftConsensusRuntime(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
     RaftConsensusRuntime::~RaftConsensusRuntime() = default;
     std::shared_future<ClusterRequestResult> RaftConsensusRuntime::submitRequest(
-        const ClusterRequestId& id, const std::array<uint8_t, 32>& fingerprint, std::function<ClusterHistoryEntry()> prepare
+        const ClusterRequestId& id, const std::array<uint8_t, 32>& fingerprint, ClusterMutationFactory prepare
     ) { return impl_->submitRequest(id, fingerprint, std::move(prepare)); }
     ClusterRequestResult RaftConsensusRuntime::queryRequest(const ClusterRequestId& id) { return impl_->queryRequest(id); }
 
@@ -4863,6 +5082,10 @@ namespace akkaradb::engine::cluster {
         uint8_t recordFlags,
         uint64_t sourceNodeId
     ) { impl_->shipEntry(seq, op, key, value, recordFlags, sourceNodeId); }
+
+    ClusterMutationSubmission RaftConsensusRuntime::submitMutation(ClusterMutationFactory prepare) {
+        return impl_->submitMutation(std::move(prepare));
+    }
 
     std::future<void> RaftConsensusRuntime::submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
         std::span<const uint8_t> value, uint8_t flags, uint64_t source) {

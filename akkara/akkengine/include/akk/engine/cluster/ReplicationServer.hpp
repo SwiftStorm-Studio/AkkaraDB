@@ -54,6 +54,7 @@ namespace akkaradb::engine::cluster {
                     uint64_t lastSuccessfulContactAtUs = 0;
                 };
                 uint64_t connectedReplicas = 0;
+                uint64_t rebuildingReplicas = 0;
                 uint64_t queuedFrames = 0;
                 uint64_t queuedBytes = 0;
                 std::vector<Peer> peers;
@@ -61,10 +62,9 @@ namespace akkaradb::engine::cluster {
             using HistoryProvider = std::function<std::optional<std::vector<ReplEntry>>(uint64_t afterSeq, uint64_t throughSeq)>;
 
             struct Snapshot {
-                using EntryVisitor = std::function<bool(std::span<const uint8_t> key, std::span<const uint8_t> value)>;
+                using EntryVisitor = SnapshotEntryVisitor;
 
                 uint64_t seq = 0;
-                uint64_t entryCount = 0;
                 std::function<bool(const EntryVisitor&)> forEachEntry;
             };
 

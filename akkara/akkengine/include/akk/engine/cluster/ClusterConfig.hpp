@@ -30,8 +30,8 @@ namespace akkaradb::engine::cluster {
      *
      * Standalone keeps all traffic local.  Mirror sends writes to every
      * data-bearing node.  Partitioned assigns each key to one owner node
-     * using rendezvous hashing.  Stripe splits values into data and parity
-     * shards placed across distinct data-bearing nodes.
+     * using rendezvous hashing. Stripe splits values into data and optional
+     * parity shards placed across distinct data-bearing nodes.
      */
     enum class ReplicationMode : uint8_t {
         STANDALONE = 0, MIRROR = 1, PARTITIONED = 2, STRIPE = 3,
@@ -112,6 +112,8 @@ namespace akkaradb::engine::cluster {
         ONE_REPLICA = 2,
         QUORUM = 3,
         ALL_CONFIGURED = 4,
+        AVAILABLE_REPLICAS = 5,
+        ///< Wait for every currently connected replica; zero connected replicas still permits a local durable write.
     };
 
     /** Replication algorithm selected for this cluster. */
@@ -162,6 +164,8 @@ namespace akkaradb::engine::cluster {
     enum class StripeWriteCommitMode : uint8_t {
         ALL_SHARDS = 0,
         ///< Commit owner metadata only after all data/parity shards are durably acknowledged.
+        DATA_SHARDS = 1,
+        ///< With parity, commit after any dataShards shards are durable and rebuild the missing shards later.
     };
 
     enum class StripeReadCoordinatorMode : uint8_t {
@@ -194,6 +198,23 @@ namespace akkaradb::engine::cluster {
         }
     };
 
+    /** User-facing RAID presets resolved to the canonical placement fields. */
+    enum class RaidPreset : uint8_t {
+        RAID0 = 0,
+        ///< `RAID.0`: split each value across data shards without parity or redundancy.
+        RAID1 = 1,
+        ///< `RAID.1`: keep a complete durable copy on every available data node.
+    };
+
+    /** Parameters which remain configurable within a RAID preset. */
+    struct AKDB_API RaidOptions {
+        RaidPreset preset = RaidPreset::RAID0;
+        ///< RAID.0 data-shard count. Ignored by RAID.1.
+        uint8_t dataShards = 4;
+        ///< Fixed RAID.1 Primary. Zero selects the first eligible data node.
+        uint64_t primaryNodeId = 0;
+    };
+
     /**
      * Consistency controls persisted with the cluster configuration.
      *
@@ -219,6 +240,7 @@ namespace akkaradb::engine::cluster {
         std::string host; ///< Hostname or address used by peer nodes.
         uint16_t dataPort = 0; ///< Public data API port.
         uint16_t replPort = 0; ///< Replication listener port.
+        uint16_t stripeMetadataPort = 0; ///< STRIPE metadata Raft listener port; required for STRIPE data nodes.
         uint32_t capabilities = DATA_BEARING; ///< OR-ed NodeCapability flags.
 
         /** Returns true if this node may become primary. */
@@ -274,6 +296,18 @@ namespace akkaradb::engine::cluster {
         uint64_t maxIntervalMs = 5ull * 60 * 1000; ///< Maximum time between snapshots while committed entries remain uncompacted.
     };
 
+    enum class MemoryOnlySnapshotMode : uint8_t {
+        THROUGHPUT_FIRST = 0,
+        COMPLETION_FIRST = 1,
+    };
+
+    /** Snapshot admission policy used when SST storage is disabled. */
+    struct MemoryOnlySnapshotOptions {
+        MemoryOnlySnapshotMode mode = MemoryOnlySnapshotMode::COMPLETION_FIRST;
+        uint64_t maxPinnedBytes = 512ull * 1024 * 1024;
+        uint32_t maxPinnedGenerations = 2;
+    };
+
     struct AKDB_API ReplicationTransferOptions {
         void validate() const;
         uint32_t thresholdBytes = 32u * 1024u; ///< Above this payload size, use bounded chunks and temporary-file staging.
@@ -286,6 +320,23 @@ namespace akkaradb::engine::cluster {
         uint64_t resumeRetentionMs = 15ull * 60 * 1000; ///< Maximum age of an unclaimed partial payload.
         uint32_t maxResumeTransfers = 64; ///< Maximum retained partial payload count per spool directory.
         uint32_t resumeHandshakeTimeoutMs = 5'000; ///< Maximum wait for the receiver's durable resume offset.
+    };
+
+    /**
+     * Explicit authorization for one offline non-Raft MIRROR Primary promotion.
+     *
+     * Promotion is accepted only when the candidate's persisted membership still
+     * names previousPrimaryNodeId at previousGroupEpoch and its durable sequence
+     * exactly matches expectedDurableSeq. The runtime then atomically advances the
+     * group epoch and records the configured local node as Primary. Leaving this
+     * disabled makes an existing membership file immutable with respect to the
+     * Primary identity.
+     */
+    struct AKDB_API MirrorPromotionOptions {
+        bool enabled = false;
+        uint64_t previousPrimaryNodeId = 0;
+        uint64_t previousGroupEpoch = 0;
+        uint64_t expectedDurableSeq = 0;
     };
 
     /** Runtime-only cluster policy and network options. */
@@ -302,18 +353,25 @@ namespace akkaradb::engine::cluster {
         uint64_t clusterGroupEpoch = 0; ///< Non-Raft group epoch; primary defaults zero to epoch 1.
         std::filesystem::path clusterMembershipPath; ///< Persisted non-Raft group state for primary, membership for replica.
         bool resetClusterMembership = false; ///< Allows a replica to intentionally join a different non-Raft group.
+        MirrorPromotionOptions mirrorPromotion; ///< One explicitly authorized offline MIRROR Primary promotion.
         CorruptClusterStateAction corruptStateAction = CorruptClusterStateAction::FAIL_STARTUP;
         RaftLogRecoveryAction raftLogRecoveryAction = RaftLogRecoveryAction::FAIL_STARTUP;
         RaftBlobPolicy raftBlobPolicy = RaftBlobPolicy::REJECT;
         uint32_t raftBlobChunkSizeBytes = 1024u * 1024u;
+        uint32_t raftHeartbeatIntervalMs = 100; ///< Leader heartbeat interval; valid range is 10-1000 ms.
+        uint64_t raftMaxReceiveMemoryBytes = 64ull * 1024 * 1024; ///< Aggregate Raft frame receive/decode reservations across connections.
         ClusterReadMode readMode = ClusterReadMode::LOCAL_STALE_OK;
-        StripeWriteCommitMode stripeWriteCommitMode = StripeWriteCommitMode::ALL_SHARDS;
+        StripeWriteCommitMode stripeWriteCommitMode = StripeWriteCommitMode::DATA_SHARDS;
         StripeReadCoordinatorMode stripeReadCoordinatorMode = StripeReadCoordinatorMode::OWNER;
         bool stripeReadRepair = true;
+        bool stripeAutoRebuild = true;
+        uint32_t stripeRebuildIntervalMs = 1000;
+        uint32_t stripeRebuildBatchKeys = 64;
         uint32_t maxReplicaQueueFrames = 16u * 1024u; ///< Per-replica live/bootstrap outbound frame queue limit; 0 disables it.
         uint64_t maxReplicaQueueBytes = 256ull * 1024ull * 1024ull; ///< Per-replica live/bootstrap queued wire bytes; 0 disables it.
         ClusterSecureOptions secure;
         RaftSnapshotOptions raftSnapshot;
+        MemoryOnlySnapshotOptions memoryOnlySnapshot;
     };
 
     /**
@@ -326,8 +384,8 @@ namespace akkaradb::engine::cluster {
      */
     class AKDB_API ClusterConfig {
         public:
-            static constexpr uint32_t MAGIC = 0x35434B41; // "AKC5"
-            static constexpr uint16_t VERSION = 5;
+            static constexpr uint32_t MAGIC = 0x36434B41; // "AKC6"
+            static constexpr uint16_t VERSION = 6;
 
             ClusterConfig();
 
@@ -345,6 +403,19 @@ namespace akkaradb::engine::cluster {
                 RaftOptions raft = {},
                 StripeOptions stripe = {},
                 uint64_t primaryNodeId = 0,
+                ClusterId clusterId = {}
+            );
+
+            /**
+             * Creates a config from a user-facing RAID preset. The preset is
+             * immediately normalized to the same durable fields used by the
+             * native placement runtime; no parallel preset state is persisted.
+             */
+            ClusterConfig(
+                std::vector<NodeInfo> nodes,
+                RaidOptions raid,
+                AckPolicy ackPolicy,
+                ConsistencyOptions consistency = {},
                 ClusterId clusterId = {}
             );
 
@@ -382,6 +453,9 @@ namespace akkaradb::engine::cluster {
 
             /** Returns erasure-stripe layout options. */
             [[nodiscard]] StripeOptions stripe() const noexcept { return stripe_; }
+
+            /** Returns the RAID preset represented by the normalized fields, when one is recognized. */
+            [[nodiscard]] std::optional<RaidPreset> raidPreset() const noexcept;
 
             /** Returns the single configured Primary for non-Raft MIRROR, or zero for other modes. */
             [[nodiscard]] uint64_t primaryNodeId() const noexcept { return primaryNodeId_; }

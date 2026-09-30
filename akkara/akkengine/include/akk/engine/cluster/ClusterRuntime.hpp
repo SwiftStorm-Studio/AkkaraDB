@@ -34,8 +34,10 @@ namespace akkaradb::engine::cluster {
      * Replica.  Role changes tear down the old replication side before starting
      * the new one.
      *
-     * Thread-safety: start(), close(), shipEntry(), and shipBlob() serialize
-     * access to the active replication endpoint.
+     * Thread-safety: replication endpoint transitions are serialized. Active
+     * endpoint ownership is published under the runtime state lock, while
+     * endpoint startup, shutdown, and worker joins run without that lock so
+     * endpoint callbacks may safely re-enter the runtime.
      */
     class AKKARADB_CLUSTER_RUNTIME_API ClusterRuntime final : public IClusterRuntime {
         public:
@@ -69,6 +71,7 @@ namespace akkaradb::engine::cluster {
             /** Stops the active replication endpoint and cluster manager. */
             void close() override;
             [[nodiscard]] RaftRuntimeStats raftStats() const override;
+            [[nodiscard]] RaftRuntimeStats stripeMetadataRaftStats() const override;
 
             /** Returns the current local cluster role. */
             [[nodiscard]] NodeRole role() const noexcept override;
@@ -87,9 +90,12 @@ namespace akkaradb::engine::cluster {
                 std::span<const uint8_t> metadata) override;
             void releaseStripeOperation(const StripeOperationLease& lease, std::span<const uint8_t> key) noexcept override;
             [[nodiscard]] uint64_t stripeFailoverNodeId() const noexcept override;
+            [[nodiscard]] uint64_t stripeMetadataLeaderNodeId() const noexcept override;
             [[nodiscard]] bool stripeNodeReachable(uint64_t nodeId) const noexcept override;
             [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeMetadata(std::span<const uint8_t> key,
                 uint64_t ownerNodeId) override;
+            bool repairStripeMetadata(std::span<const uint8_t> key, uint64_t expectedVersion,
+                std::span<const uint8_t> metadata) override;
 
             /** Returns the immutable key router for this config. */
             [[nodiscard]] const ClusterRouter& router() const noexcept;
@@ -109,8 +115,9 @@ namespace akkaradb::engine::cluster {
             ) override;
             std::future<void> submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
                 std::span<const uint8_t> value, uint8_t flags, uint64_t source) override;
+            ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare) override;
             std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
-                std::function<ClusterHistoryEntry()>) override;
+                ClusterMutationFactory) override;
             ClusterRequestResult queryRequest(const ClusterRequestId&) override;
             void shipEntryTo(
                 uint64_t targetNodeId,

@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -88,14 +89,29 @@ namespace akkaradb::engine::cluster::detail {
             }
             return count;
         }
-        TransferId makeTransferId(const TransferMessage& message) {
+        bool readPayload(const TransferMessage& message, uint64_t offset, std::span<uint8_t> destination) {
+            if (offset > message.payloadSize() || destination.size() > message.payloadSize() - offset) { return false; }
+            if (message.readExternalPayload) { return message.readExternalPayload(offset, destination); }
+            std::memcpy(destination.data(), message.payload.data() + static_cast<size_t>(offset), destination.size());
+            return true;
+        }
+        TransferId makeTransferId(const TransferMessage& message, const std::shared_ptr<TransferBudget>& budget) {
             std::array<uint8_t, 14> metadata{};
             metadata[0] = static_cast<uint8_t>(message.type);
             metadata[1] = message.flags;
-            for (size_t i = 0; i < 8; ++i) { metadata[2 + i] = static_cast<uint8_t>(message.payload.size() >> (i * 8)); }
+            for (size_t i = 0; i < 8; ++i) { metadata[2 + i] = static_cast<uint8_t>(message.payloadSize() >> (i * 8)); }
             for (size_t i = 0; i < 4; ++i) { metadata[10 + i] = static_cast<uint8_t>(message.crc >> (i * 8)); }
-            const std::array<std::span<const uint8_t>, 2> parts{metadata, message.payload};
-            return crypto::hash256(parts);
+            if (!message.readExternalPayload) {
+                const std::array<std::span<const uint8_t>, 2> parts{metadata, message.payload};
+                return crypto::hash256(parts);
+            }
+
+            const size_t bufferSize = static_cast<size_t>(std::min<uint64_t>(1024u * 1024u, message.payloadSize()));
+            auto memory = budget->reserve(TransferBudget::Resource::MEMORY, bufferSize);
+            return crypto::hash256StreamedSecondPart(metadata, message.payloadSize(),
+                [&](uint64_t offset, std::span<uint8_t> destination) {
+                    return readPayload(message, offset, destination);
+                }, bufferSize);
         }
         bool decodeReady(const DecodedFrame& frame, TransferId& id, uint64_t& offset) {
             if (frame.type != ReplMsgType::TRANSFER_READY || frame.flags != 0 || frame.payload.size() != TRANSFER_READY_SIZE) { return false; }
@@ -198,6 +214,137 @@ namespace akkaradb::engine::cluster::detail {
             std::vector<uint8_t> bytes;
             std::shared_ptr<void> reservation;
         };
+
+        class FilePayload {
+        public:
+            FilePayload(const SnapshotFileEntry& entry, std::array<uint8_t, 8> prefix)
+                : prefix_{prefix}, dataOffset_{entry.dataOffset}, dataSize_{uint64_t{entry.keySize} + entry.valueSize},
+                  sourceStorage_{entry.storage}, in_{entry.path, std::ios::binary} {
+                if (!in_) { throw std::runtime_error("replication: cannot open snapshot export"); }
+            }
+
+            bool read(uint64_t offset, std::span<uint8_t> destination) {
+                if (offset > 8 + dataSize_ || destination.size() > 8 + dataSize_ - offset) { return false; }
+                size_t copied = 0;
+                if (offset < prefix_.size()) {
+                    const size_t count = std::min(destination.size(), prefix_.size() - static_cast<size_t>(offset));
+                    std::memcpy(destination.data(), prefix_.data() + static_cast<size_t>(offset), count);
+                    copied = count;
+                    offset += count;
+                }
+                if (copied == destination.size()) { return true; }
+                const uint64_t fileOffset = dataOffset_ + offset - prefix_.size();
+                std::lock_guard lock{mutex_};
+                in_.clear();
+                in_.seekg(static_cast<std::streamoff>(fileOffset));
+                in_.read(reinterpret_cast<char*>(destination.data() + copied),
+                    static_cast<std::streamsize>(destination.size() - copied));
+                return static_cast<size_t>(in_.gcount()) == destination.size() - copied;
+            }
+
+        private:
+            std::array<uint8_t, 8> prefix_{};
+            uint64_t dataOffset_ = 0;
+            uint64_t dataSize_ = 0;
+            std::shared_ptr<const void> sourceStorage_;
+            std::ifstream in_;
+            std::mutex mutex_;
+        };
+    }
+
+    class SnapshotMessageBuilder::Impl {
+    public:
+        Impl(std::span<const uint8_t> key, uint64_t valueSize, const std::shared_ptr<TransferBudget>& budget)
+            : valueSize_{valueSize} {
+            if (!budget) { throw std::invalid_argument("replication: transfer budget is required"); }
+            if (key.size() > UINT32_MAX || valueSize > UINT32_MAX) {
+                throw std::length_error("replication: oversized snapshot entry");
+            }
+            const uint64_t total64 = 8ull + key.size() + valueSize;
+            if (total64 > ReplFrameHeader::MAX_PAYLOAD_SIZE || total64 > SIZE_MAX) {
+                throw std::length_error("replication: logical frame too large");
+            }
+            totalSize_ = static_cast<size_t>(total64);
+            if (totalSize_ > budget->options.thresholdBytes) { spool_ = std::make_shared<EphemeralSpool>(totalSize_, budget); }
+            else {
+                heap_ = std::make_shared<HeapPayload>();
+                heap_->reservation = budget->reserve(TransferBudget::Resource::MEMORY, totalSize_);
+                heap_->bytes.reserve(totalSize_);
+            }
+
+            std::vector<uint8_t> prefix;
+            prefix.reserve(8);
+            appendLe(prefix, key.size(), 4);
+            appendLe(prefix, valueSize, 4);
+            append(prefix);
+            append(key);
+        }
+
+        void appendValueChunk(uint64_t offset, std::span<const uint8_t> chunk) {
+            if (finished_ || valueOffset_ > valueSize_ || offset != valueOffset_ || chunk.size() > valueSize_ - valueOffset_) {
+                throw std::runtime_error("replication: invalid snapshot value chunk");
+            }
+            append(chunk);
+            valueOffset_ += static_cast<uint64_t>(chunk.size());
+        }
+
+        MessagePtr finish() {
+            if (finished_ || valueOffset_ != valueSize_) { throw std::runtime_error("replication: incomplete snapshot entry"); }
+            finished_ = true;
+            auto message = std::make_shared<TransferMessage>();
+            message->type = ReplMsgType::SNAPSHOT_ENTRY;
+            if (spool_) {
+                message->payload = spool_->finish();
+                message->storage = spool_;
+            }
+            else {
+                message->payload = heap_->bytes;
+                message->storage = heap_;
+            }
+            message->crc = checksum(message->payload);
+            return message;
+        }
+
+    private:
+        void append(std::span<const uint8_t> bytes) {
+            if (spool_) { spool_->append(bytes); }
+            else { heap_->bytes.insert(heap_->bytes.end(), bytes.begin(), bytes.end()); }
+        }
+
+        uint64_t valueSize_ = 0;
+        uint64_t valueOffset_ = 0;
+        size_t totalSize_ = 0;
+        bool finished_ = false;
+        std::shared_ptr<EphemeralSpool> spool_;
+        std::shared_ptr<HeapPayload> heap_;
+    };
+
+    SnapshotMessageBuilder::SnapshotMessageBuilder(
+        std::span<const uint8_t> key,
+        uint64_t valueSize,
+        const std::shared_ptr<TransferBudget>& budget
+    ) : impl_{std::make_unique<Impl>(key, valueSize, budget)} {}
+
+    SnapshotMessageBuilder::~SnapshotMessageBuilder() = default;
+
+    void SnapshotMessageBuilder::appendValueChunk(uint64_t offset, std::span<const uint8_t> chunk) {
+        if (!impl_) { throw std::runtime_error("replication: snapshot message builder is closed"); }
+        impl_->appendValueChunk(offset, chunk);
+    }
+
+    MessagePtr SnapshotMessageBuilder::finish() {
+        if (!impl_) { throw std::runtime_error("replication: snapshot message builder is closed"); }
+        auto message = impl_->finish();
+        impl_.reset();
+        return message;
+    }
+
+    std::unique_ptr<SnapshotMessageBuilder> beginSnapshotMessage(
+        std::span<const uint8_t> key,
+        uint64_t valueSize,
+        const std::shared_ptr<TransferBudget>& budget
+    ) {
+        return std::unique_ptr<SnapshotMessageBuilder>{new SnapshotMessageBuilder(key, valueSize, budget)};
     }
 
     class PersistentSpool final : public SpoolBase {
@@ -501,39 +648,44 @@ namespace akkaradb::engine::cluster::detail {
     }
     bool sendMessage(const TransferMessage& message, const std::shared_ptr<TransferBudget>& budget,
         const std::shared_ptr<TransferSession>& session, const SendFrame& send) {
-        if (!transferable(message.type) || message.payload.size() <= budget->options.thresholdBytes) {
-            if (message.payload.size() > TRANSFER_FRAME_LIMIT) { throw std::length_error("replication: physical frame too large"); }
-            return sendEncoded(message.type, message.payload, budget, send);
+        const uint64_t payloadSize = message.payloadSize();
+        if (!transferable(message.type) || payloadSize <= budget->options.thresholdBytes) {
+            if (payloadSize > TRANSFER_FRAME_LIMIT) { throw std::length_error("replication: physical frame too large"); }
+            if (!message.readExternalPayload) { return sendEncoded(message.type, message.payload, budget, send); }
+            auto memory = budget->reserve(TransferBudget::Resource::MEMORY, payloadSize);
+            std::vector<uint8_t> payload(static_cast<size_t>(payloadSize));
+            if (!readPayload(message, 0, payload)) { return false; }
+            return sendEncoded(message.type, payload, budget, send);
         }
         auto active = budget->reserve(TransferBudget::Resource::ACTIVE, 1);
-        const auto id = makeTransferId(message);
+        const auto id = makeTransferId(message, budget);
         auto beginMemory = budget->reserve(TransferBudget::Resource::MEMORY, TRANSFER_BEGIN_SIZE);
         std::vector<uint8_t> begin;
         begin.reserve(TRANSFER_BEGIN_SIZE);
         begin.push_back(static_cast<uint8_t>(message.type)); begin.push_back(message.flags);
-        appendLe(begin, message.payload.size(), 8); appendLe(begin, message.crc, 4);
+        appendLe(begin, payloadSize, 8); appendLe(begin, message.crc, 4);
         begin.insert(begin.end(), id.begin(), id.end());
         if (session) { session->prepare(id); }
         if (!sendEncoded(ReplMsgType::TRANSFER_BEGIN, begin, budget, send)) { return false; }
         uint64_t offset = 0;
         if (session) {
             const auto ready = session->waitReady(id, budget->options.resumeHandshakeTimeoutMs);
-            if (!ready || *ready > message.payload.size()) { return false; }
+            if (!ready || *ready > payloadSize) { return false; }
             offset = *ready;
         }
-        while (offset < message.payload.size()) {
-            const auto count = std::min<size_t>(budget->options.chunkBytes, message.payload.size() - static_cast<size_t>(offset));
+        while (offset < payloadSize) {
+            const auto count = static_cast<size_t>(std::min<uint64_t>(budget->options.chunkBytes, payloadSize - offset));
             auto chunkMemory = budget->reserve(TransferBudget::Resource::MEMORY, 8 + count);
             std::vector<uint8_t> chunk;
-            chunk.reserve(8 + count); appendLe(chunk, offset, 8);
-            chunk.insert(chunk.end(), message.payload.begin() + static_cast<size_t>(offset),
-                message.payload.begin() + static_cast<size_t>(offset) + count);
+            chunk.resize(8 + count);
+            for (size_t i = 0; i < 8; ++i) { chunk[i] = static_cast<uint8_t>(offset >> (i * 8)); }
+            if (!readPayload(message, offset, std::span<uint8_t>{chunk}.subspan(8))) { return false; }
             if (!sendEncoded(ReplMsgType::TRANSFER_CHUNK, chunk, budget, send)) { return false; }
             offset += count;
         }
         auto endMemory = budget->reserve(TransferBudget::Resource::MEMORY, 8);
         std::vector<uint8_t> end;
-        appendLe(end, message.payload.size(), 8);
+        appendLe(end, payloadSize, 8);
         return sendEncoded(ReplMsgType::TRANSFER_END, end, budget, send);
     }
     MessagePtr receiveMessage(const std::shared_ptr<TransferBudget>& budget, const ReceiveFrame& receive) {
@@ -604,7 +756,7 @@ namespace akkaradb::engine::cluster::detail {
         identity.flags = result->flags;
         identity.crc = expectedCrc;
         identity.payload = result->payload;
-        if (makeTransferId(identity) != id) { spool->discard(); return {}; }
+        if (makeTransferId(identity, budget) != id) { spool->discard(); return {}; }
         spool->commit();
         result->crc = expectedCrc; result->storage = std::move(spool);
         return result;
@@ -628,6 +780,34 @@ namespace akkaradb::engine::cluster::detail {
         std::vector<uint8_t> prefix; appendLe(prefix, key.size(), 4); appendLe(prefix, value.size(), 4);
         const std::array<std::span<const uint8_t>, 3> parts{prefix, key, value};
         return makeMessage(ReplMsgType::SNAPSHOT_ENTRY, parts, budget);
+    }
+    MessagePtr snapshotFileMessage(const SnapshotFileEntry& entry, const std::shared_ptr<TransferBudget>& budget) {
+        if (!budget || entry.keySize > ReplFrameHeader::MAX_PAYLOAD_SIZE - 8u || entry.valueSize > UINT32_MAX ||
+            entry.valueSize > ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - entry.keySize) {
+            throw std::length_error("replication: oversized snapshot entry");
+        }
+        std::array<uint8_t, 8> prefix{};
+        for (size_t i = 0; i < 4; ++i) {
+            prefix[i] = static_cast<uint8_t>(entry.keySize >> (i * 8));
+            prefix[4 + i] = static_cast<uint8_t>(entry.valueSize >> (i * 8));
+        }
+        const uint64_t payloadSize = 8ull + entry.keySize + entry.valueSize;
+        auto file = std::make_shared<FilePayload>(entry, prefix);
+        if (payloadSize <= budget->options.thresholdBytes) {
+            std::vector<uint8_t> payload(static_cast<size_t>(payloadSize));
+            if (!file->read(0, payload)) { throw std::runtime_error("replication: snapshot export read failed"); }
+            const std::array parts{std::span<const uint8_t>{payload}};
+            return makeMessage(ReplMsgType::SNAPSHOT_ENTRY, parts, budget);
+        }
+        auto message = std::make_shared<TransferMessage>();
+        message->type = ReplMsgType::SNAPSHOT_ENTRY;
+        message->crc = entry.payloadCrc32c;
+        message->externalPayloadSize = payloadSize;
+        message->readExternalPayload = [file](uint64_t offset, std::span<uint8_t> destination) {
+            return file->read(offset, destination);
+        };
+        message->storage = std::move(file);
+        return message;
     }
     MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key, const std::shared_ptr<TransferBudget>& budget) {
         if (key.size() > UINT32_MAX) { throw std::length_error("replication: oversized read key"); }

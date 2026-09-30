@@ -107,9 +107,7 @@ namespace akkaradb::core {
             size <<= 1;
         }
 
-        if (classCount_ == 0 || classCount_ > TLS_MAX_CLASSES) {
-            throw std::invalid_argument("BufferPool: invalid size class configuration");
-        }
+        if (classCount_ == 0 || classCount_ > TLS_MAX_CLASSES) { throw std::invalid_argument("BufferPool: invalid size class configuration"); }
 
         classes_ = std::make_unique<SizeClass[]>(classCount_);
     }
