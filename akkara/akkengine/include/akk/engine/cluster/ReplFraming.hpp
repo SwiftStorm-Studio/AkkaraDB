@@ -10,7 +10,10 @@
 // akkengine/include/akk/engine/cluster/ReplFraming.hpp
 #pragma once
 
+#include "akk/engine/cluster/ClusterRouting.hpp"
+
 #include <cstdint>
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <span>
@@ -21,6 +24,7 @@
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 namespace akkaradb::engine::cluster {
+    inline constexpr uint64_t ROLLBACK_SOURCE_NODE_ID = UINT64_MAX;
     /** A completed snapshot entry stored contiguously in an owned export file. */
     struct SnapshotFileEntry {
         std::filesystem::path path;
@@ -74,6 +78,8 @@ namespace akkaradb::engine::cluster {
         ///< Reserved point-in-time read request.
         READ_RESPONSE = 0x21,
         ///< Reserved point-in-time read response.
+        FORWARD_REQUEST = 0x24,
+        FORWARD_RESPONSE = 0x25,
         STRIPE_CONTROL_REQUEST = 0x22,
         ///< STRIPE authority lease/metadata commit request.
         STRIPE_CONTROL_RESPONSE = 0x23,
@@ -98,6 +104,10 @@ namespace akkaradb::engine::cluster {
         ///< Raft transport contract sent before the first RPC on a connection.
         RAFT_PEER_HELLO_RESPONSE = 0x39,
         ///< Accepts or rejects the Raft transport contract.
+        RAFT_PRE_VOTE = 0x3A,
+        ///< Non-binding election probe; does not advance the receiver's term.
+        RAFT_PRE_VOTE_RESPONSE = 0x3B,
+        ///< Reports the receiver's actual term, not the proposed future term.
     };
 
     /**
@@ -124,7 +134,7 @@ namespace akkaradb::engine::cluster {
      * payload, not the header.
      */
     struct AKKARADB_CLUSTER_RUNTIME_API ReplFrameHeader {
-        static constexpr uint32_t MAGIC = 0x35524B41; // "AKR5"
+        static constexpr uint32_t MAGIC = 0x31524B41; // "AKR1"
         static constexpr size_t SIZE = 14;
         static constexpr uint32_t MAX_PAYLOAD_SIZE = 128u * 1024u * 1024u;
         static constexpr uint32_t MAX_RAFT_PAYLOAD_SIZE = 4u * 1024u * 1024u;
@@ -152,11 +162,25 @@ namespace akkaradb::engine::cluster {
         NodeRole role = NodeRole::REPLICA; ///< Expected to be NodeRole::REPLICA.
         uint64_t groupId = 0; ///< Non-Raft cluster group identity.
         uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
+        MirrorFencingMode mirrorFencingMode = MirrorFencingMode::STATIC;
+        bool forceSnapshot = false;
+        ClusterId clusterId{};
+        std::array<uint8_t, 32> configFingerprint{};
     };
 
-    enum class StripeControlAction : uint8_t { ACQUIRE = 0, COMMIT = 1, RELEASE = 2, READ_METADATA = 3, REPAIR_METADATA = 4 };
+    enum class StripeControlAction : uint8_t {
+        ACQUIRE = 0,
+        COMMIT = 1,
+        RELEASE = 2,
+        READ_METADATA = 3,
+        REPAIR_METADATA = 4,
+        ROLLBACK_WATERMARK = 5,
+        ROLLBACK_KEY = 6,
+        ROLLBACK_STREAM = 7,
+        ROLLBACK_APPLY = 8,
+    };
     enum class StripeControlStatus : uint8_t {
-        GRANTED = 0, COMMITTED = 1, RELEASED = 2, BUSY = 3, REJECTED = 4, ERROR_STATUS = 5, FOUND = 6, NOT_FOUND = 7,
+        GRANTED = 0, COMMITTED = 1, RELEASED = 2, BUSY = 3, REJECTED = 4, ERROR_STATUS = 5, FOUND = 6, NOT_FOUND = 7, RECONFIGURING = 8,
     };
 
     struct StripeControlRequest {
@@ -183,6 +207,9 @@ namespace akkaradb::engine::cluster {
         NodeRole role = NodeRole::PRIMARY; ///< Expected to be NodeRole::PRIMARY.
         uint64_t groupId = 0; ///< Non-Raft cluster group identity.
         uint64_t groupEpoch = 1; ///< Non-Raft cluster group epoch.
+        MirrorFencingMode mirrorFencingMode = MirrorFencingMode::STATIC;
+        ClusterId clusterId{};
+        std::array<uint8_t, 32> configFingerprint{};
     };
 
     /** Replicated key/value mutation payload. */
@@ -234,6 +261,39 @@ namespace akkaradb::engine::cluster {
         uint64_t seq = 0;
         std::vector<uint8_t> value;
     };
+
+    inline constexpr size_t MAX_FORWARD_PAYLOAD = ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE;
+    inline constexpr size_t FORWARD_REQUEST_BASE_SIZE = 41;
+    enum class ForwardOperation : uint8_t { PUT, REMOVE, PUT_BATCH, GET, PUT_REQUEST, REMOVE_REQUEST, QUERY_REQUEST, READ_QUERY, CLUSTER_ADMIN };
+    struct ForwardEntry { std::vector<uint8_t> key, value; };
+    inline uint64_t forwardRequestMemoryBytes(std::span<const uint8_t> payload) noexcept {
+        if (payload.size() < FORWARD_REQUEST_BASE_SIZE) { return payload.size(); }
+        uint32_t count = 0;
+        for (size_t i = 0; i < 4; ++i) { count |= uint32_t{payload[FORWARD_REQUEST_BASE_SIZE - 4 + i]} << (8 * i); }
+        return payload.size() + static_cast<uint64_t>(std::min<uint32_t>(count, 65536)) * sizeof(ForwardEntry);
+    }
+    struct ForwardRequest {
+        uint64_t requestId = 0;
+        ForwardOperation operation = ForwardOperation::GET;
+        uint32_t timeoutMs = 0;
+        ClusterRequestId deduplicationId;
+        std::vector<ForwardEntry> entries;
+    };
+    struct ForwardResponse {
+        std::shared_ptr<void> memoryReservation; // Keeps decoded in-flight responses within the transport budget.
+        uint64_t requestId = 0;
+        bool success = false;
+        bool found = false;
+        ClusterRequestResult requestResult;
+        std::vector<uint8_t> value;
+        ClusterRoutingCode errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN;
+        ClusterRouteTarget target;
+        std::string message;
+    };
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeForwardRequest(const ForwardRequest&);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeForwardResponse(const ForwardResponse&);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeForwardRequest(std::span<const uint8_t>, ForwardRequest&);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeForwardResponse(std::span<const uint8_t>, ForwardResponse&);
 
     /**
      * Encodes a complete frame with header, payload, and payload CRC32C.

@@ -8,7 +8,10 @@
  */
 
 // akkengine/src/engine/cluster/RaftConsensusRuntime.cpp
+#include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include "akk/engine/cluster/detail/RaftConsensusRuntime.hpp"
+#include "akk/engine/cluster/detail/RaftLogIndex.hpp"
+#include "akk/engine/cluster/detail/ForwardDeadline.hpp"
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/Random.hpp"
@@ -714,6 +717,7 @@ namespace akkaradb::engine::cluster {
             uint8_t flags = 0;
             bool proposalFinal = true;
             uint64_t sourceNodeId = 0;
+            uint64_t timestampNs = 0;
             std::vector<uint8_t> key;
             std::vector<uint8_t> value;
         };
@@ -726,7 +730,7 @@ namespace akkaradb::engine::cluster {
         };
 
         struct RaftPeerHello {
-            static constexpr uint32_t VERSION = 1;
+            static constexpr uint32_t VERSION = 2;
             uint64_t nodeId = 0;
             ClusterId clusterId{};
             std::array<uint8_t, 32> compatibilityFingerprint{};
@@ -786,9 +790,10 @@ namespace akkaradb::engine::cluster {
             uint64_t lastIncludedTerm = 0;
             uint64_t snapshotSeq = 0;
             uint64_t entryCount = 0;
-            std::vector<NodeInfo> committedVoters;
-            std::optional<std::vector<NodeInfo>> jointOldVoters;
-            std::optional<std::vector<NodeInfo>> jointNewVoters;
+            uint64_t configurationGeneration = 0;
+            std::vector<NodeInfo> committedMembers;
+            std::optional<std::vector<NodeInfo>> jointOldMembers;
+            std::optional<std::vector<NodeInfo>> jointNewMembers;
             RequestState requestState;
             bool done = false;
             std::vector<SnapshotKvChunk> chunks;
@@ -858,15 +863,22 @@ namespace akkaradb::engine::cluster {
             const uint32_t count = readU32(in, 0);
             size_t cursor = 4;
             constexpr size_t MIN_NODE_INFO_SIZE = 24;
-            if (count > (in.size() - cursor) / MIN_NODE_INFO_SIZE) { return false; }
+            if (count > 512 || count > (in.size() - cursor) / MIN_NODE_INFO_SIZE) { return false; }
             nodes.clear();
             nodes.reserve(count);
+            std::unordered_set<uint64_t> ids;
             for (uint32_t i = 0; i < count; ++i) {
                 NodeInfo node;
                 if (!readNodeInfo(in, cursor, node)) { return false; }
+                if (node.nodeId == 0 || !ids.insert(node.nodeId).second || !node.dataBearing() ||
+                    (node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING | RAFT_LEARNER)) != 0) { return false; }
                 nodes.push_back(std::move(node));
             }
             return cursor == in.size();
+        }
+
+        bool hasVoter(const std::vector<NodeInfo>& members) {
+            return std::ranges::any_of(members, [](const NodeInfo& node) { return node.dataBearing() && !node.raftLearner(); });
         }
 
         void writeNodeSetField(std::vector<uint8_t>& out, const std::vector<NodeInfo>& nodes) {
@@ -913,6 +925,7 @@ namespace akkaradb::engine::cluster {
             writeU8(out, entry.flags);
             writeU8(out, entry.proposalFinal ? 1 : 0);
             writeU64(out, entry.sourceNodeId);
+            writeU64(out, entry.timestampNs);
             writeU32(out, static_cast<uint32_t>(entry.key.size()));
             writeU32(out, static_cast<uint32_t>(entry.value.size()));
             writeU8(out, entry.requestId ? 1 : 0);
@@ -927,7 +940,7 @@ namespace akkaradb::engine::cluster {
         }
 
         bool decodeEntryPayload(std::span<const uint8_t> in, size_t& cursor, RaftLogEntry& out) {
-            if (cursor + 45 > in.size()) { return false; }
+            if (cursor + 53 > in.size()) { return false; }
             out.term = readU64(in, cursor);
             cursor += 8;
             out.index = readU64(in, cursor);
@@ -941,6 +954,8 @@ namespace akkaradb::engine::cluster {
             if (proposalFinal > 1) { return false; }
             out.proposalFinal = proposalFinal != 0;
             out.sourceNodeId = readU64(in, cursor);
+            cursor += 8;
+            out.timestampNs = readU64(in, cursor);
             cursor += 8;
             const uint32_t keyLen = readU32(in, cursor);
             cursor += 4;
@@ -965,13 +980,13 @@ namespace akkaradb::engine::cluster {
             return encodeFrame(type, payload);
         }
 
-        std::vector<uint8_t> encodeRequestVote(const RequestVote& rpc) {
+        std::vector<uint8_t> encodeRequestVote(const RequestVote& rpc, ReplMsgType type = ReplMsgType::RAFT_REQUEST_VOTE) {
             std::vector<uint8_t> out;
             writeU64(out, rpc.term);
             writeU64(out, rpc.candidateId);
             writeU64(out, rpc.lastLogIndex);
             writeU64(out, rpc.lastLogTerm);
-            return encodeRaftFrame(ReplMsgType::RAFT_REQUEST_VOTE, out);
+            return encodeRaftFrame(type, out);
         }
 
         std::vector<uint8_t> encodeRaftPeerHello(const RaftPeerHello& hello) {
@@ -1016,11 +1031,12 @@ namespace akkaradb::engine::cluster {
             const ClusterConfig& config,
             const ClusterRuntimeOptions& runtimeOptions
         ) {
-            std::vector<uint8_t> bytes{'A', 'K', 'R', 'P', '1'};
+            std::vector<uint8_t> bytes{'A', 'K', 'R', 'P', '2'};
             const auto consistency = config.consistency();
             const auto raft = config.raft();
             writeU8(bytes, static_cast<uint8_t>(config.mode()));
             writeU8(bytes, static_cast<uint8_t>(consistency.mode));
+            writeU8(bytes, static_cast<uint8_t>(config.failover()));
             writeU8(bytes, static_cast<uint8_t>(consistency.writeConsistency));
             writeU8(bytes, static_cast<uint8_t>(consistency.ackTimeoutAction));
             writeU8(bytes, static_cast<uint8_t>(consistency.replicaLagAction));
@@ -1028,6 +1044,7 @@ namespace akkaradb::engine::cluster {
             writeU8(bytes, raft.membership.allowOnlineVoterChanges ? 1 : 0);
             writeU8(bytes, raft.membership.allowLearners ? 1 : 0);
             writeU8(bytes, static_cast<uint8_t>(runtimeOptions.raftBlobPolicy));
+            writeU8(bytes, runtimeOptions.raftSnapshot.enabled ? 1 : 0);
             const std::array parts{std::span<const uint8_t>{bytes}};
             return crypto::hash256(parts);
         }
@@ -1041,15 +1058,15 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        std::vector<uint8_t> encodeRequestVoteResponse(const RequestVoteResponse& rpc) {
+        std::vector<uint8_t> encodeRequestVoteResponse(const RequestVoteResponse& rpc, ReplMsgType type = ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE) {
             std::vector<uint8_t> out;
             writeU64(out, rpc.term);
             writeU8(out, rpc.voteGranted ? 1 : 0);
-            return encodeRaftFrame(ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE, out);
+            return encodeRaftFrame(type, out);
         }
 
         bool decodeRequestVoteResponse(std::span<const uint8_t> in, RequestVoteResponse& out) {
-            if (in.size() != 9) { return false; }
+            if (in.size() != 9 || in[8] > 1) { return false; }
             out.term = readU64(in, 0);
             out.voteGranted = in[8] != 0;
             return true;
@@ -1125,9 +1142,10 @@ namespace akkaradb::engine::cluster {
             writeU64(out, rpc.lastIncludedTerm);
             writeU64(out, rpc.snapshotSeq);
             writeU64(out, rpc.entryCount);
-            writeNodeSetField(out, rpc.committedVoters);
-            writeOptionalNodeSetField(out, rpc.jointOldVoters);
-            writeOptionalNodeSetField(out, rpc.jointNewVoters);
+            writeU64(out, rpc.configurationGeneration);
+            writeNodeSetField(out, rpc.committedMembers);
+            writeOptionalNodeSetField(out, rpc.jointOldMembers);
+            writeOptionalNodeSetField(out, rpc.jointNewMembers);
             writeRequestState(out, rpc.requestState);
             writeU8(out, rpc.done ? 1 : 0);
             writeU32(out, static_cast<uint32_t>(rpc.chunks.size()));
@@ -1145,18 +1163,19 @@ namespace akkaradb::engine::cluster {
         }
 
         bool decodeInstallSnapshot(std::span<const uint8_t> in, InstallSnapshot& out) {
-            if (in.size() < 53) { return false; }
+            if (in.size() < 61) { return false; }
             out.term = readU64(in, 0);
             out.leaderId = readU64(in, 8);
             out.lastIncludedIndex = readU64(in, 16);
             out.lastIncludedTerm = readU64(in, 24);
             out.snapshotSeq = readU64(in, 32);
             out.entryCount = readU64(in, 40);
-            size_t cursor = 48;
-            if (!readNodeSetField(in, cursor, out.committedVoters) || !readOptionalNodeSetField(in, cursor, out.jointOldVoters) || !readOptionalNodeSetField(
+            out.configurationGeneration = readU64(in, 48);
+            size_t cursor = 56;
+            if (!readNodeSetField(in, cursor, out.committedMembers) || !readOptionalNodeSetField(in, cursor, out.jointOldMembers) || !readOptionalNodeSetField(
                 in,
                 cursor,
-                out.jointNewVoters
+                out.jointNewMembers
             )) { return false; }
             if (!readRequestState(in, cursor, out.requestState) || cursor + 5 > in.size()) { return false; }
             out.done = in[cursor++] != 0;
@@ -1239,7 +1258,7 @@ namespace akkaradb::engine::cluster {
 
         bool sameEntry(const RaftLogEntry& lhs, const RaftLogEntry& rhs) {
             return lhs.term == rhs.term && lhs.index == rhs.index && lhs.clientSeq == rhs.clientSeq && lhs.kind == rhs.kind && lhs.op == rhs.op && lhs.flags ==
-                rhs.flags && lhs.proposalFinal == rhs.proposalFinal && lhs.sourceNodeId == rhs.sourceNodeId && lhs.key == rhs.key && lhs.value == rhs.value &&
+                rhs.flags && lhs.proposalFinal == rhs.proposalFinal && lhs.sourceNodeId == rhs.sourceNodeId && lhs.timestampNs == rhs.timestampNs && lhs.key == rhs.key && lhs.value == rhs.value &&
                 lhs.requestId == rhs.requestId && lhs.requestFingerprint == rhs.requestFingerprint && lhs.requestTime == rhs.requestTime;
         }
 
@@ -1278,7 +1297,7 @@ namespace akkaradb::engine::cluster {
 
         static constexpr size_t RAFT_APPEND_ENTRIES_BASE_SIZE = 44;
         static constexpr size_t RAFT_ENTRY_LENGTH_PREFIX_SIZE = 4;
-        static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 45;
+        static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 53;
         static constexpr size_t RAFT_BLOB_CHUNK_KEY_SIZE = 28;
 
         uint32_t maxRaftBlobChunkSizeBytes() {
@@ -1311,7 +1330,7 @@ namespace akkaradb::engine::cluster {
                 entry.requestTime >= entry.requestId->expiresAtUnixMs)) { return false; }
             constexpr size_t maxEntryPayload = ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE -
                                                RAFT_APPEND_ENTRIES_BASE_SIZE - RAFT_ENTRY_LENGTH_PREFIX_SIZE;
-            const size_t entryMetadata = RAFT_ENTRY_PAYLOAD_BASE_SIZE + (entry.requestId ? 40u : 0u);
+            const size_t entryMetadata = RAFT_ENTRY_PAYLOAD_BASE_SIZE + (entry.requestId ? 64u : 0u);
             if (entryMetadata > maxEntryPayload || entry.key.size() > maxEntryPayload - entryMetadata ||
                 entry.value.size() > maxEntryPayload - entryMetadata - entry.key.size()) { return false; }
             if (entry.kind == RaftEntryKind::BLOB) {
@@ -1320,18 +1339,18 @@ namespace akkaradb::engine::cluster {
                     chunk.offset;
             }
             if (entry.kind == RaftEntryKind::CONFIG_JOINT) {
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
-                return entry.clientSeq == 0 && entry.op == ReplOpType::PUT && entry.flags == 0 && decodeNodeSet(entry.key, oldVoters) && decodeNodeSet(
+                std::vector<NodeInfo> oldMembers;
+                std::vector<NodeInfo> newMembers;
+                return entry.clientSeq == 0 && entry.op == ReplOpType::PUT && entry.flags == 0 && decodeNodeSet(entry.key, oldMembers) && decodeNodeSet(
                     entry.value,
-                    newVoters
-                ) && !oldVoters.empty() && !newVoters.empty();
+                    newMembers
+                ) && hasVoter(oldMembers) && hasVoter(newMembers);
             }
             if (entry.kind == RaftEntryKind::CONFIG_FINAL) {
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
-                return entry.clientSeq == 0 && entry.op == ReplOpType::PUT && entry.flags == 0 && (entry.key.empty() || decodeNodeSet(entry.key, oldVoters))
-                    && decodeNodeSet(entry.value, newVoters) && !newVoters.empty();
+                std::vector<NodeInfo> oldMembers;
+                std::vector<NodeInfo> newMembers;
+                return entry.clientSeq == 0 && entry.op == ReplOpType::PUT && entry.flags == 0 && (entry.key.empty() || decodeNodeSet(entry.key, oldMembers))
+                    && decodeNodeSet(entry.value, newMembers) && hasVoter(newMembers) && (entry.key.empty() || hasVoter(oldMembers));
             }
             if (entry.kind == RaftEntryKind::NOOP) {
                 return entry.clientSeq == 0 && entry.op == ReplOpType::PUT && entry.flags == 0 && entry.key.empty() && entry.value.empty();
@@ -1348,9 +1367,10 @@ namespace akkaradb::engine::cluster {
                 uint64_t lastIncludedIndex = 0;
                 uint64_t lastIncludedTerm = 0;
                 uint64_t entryCount = 0;
-                std::vector<NodeInfo> committedVoters;
-                std::optional<std::vector<NodeInfo>> jointOldVoters;
-                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                uint64_t configurationGeneration = 0;
+                std::vector<NodeInfo> committedMembers;
+                std::optional<std::vector<NodeInfo>> jointOldMembers;
+                std::optional<std::vector<NodeInfo>> jointNewMembers;
                 uint64_t nextEntryIndex = 0;
                 bool hasCurrentEntry = false;
                 uint64_t currentEntryIndex = 0;
@@ -1367,9 +1387,10 @@ namespace akkaradb::engine::cluster {
                 uint64_t lastIncludedIndex = 0;
                 uint64_t lastIncludedTerm = 0;
                 uint64_t entryCount = 0;
-                std::vector<NodeInfo> committedVoters;
-                std::optional<std::vector<NodeInfo>> jointOldVoters;
-                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                uint64_t configurationGeneration = 0;
+                std::vector<NodeInfo> committedMembers;
+                std::optional<std::vector<NodeInfo>> jointOldMembers;
+                std::optional<std::vector<NodeInfo>> jointNewMembers;
             };
 
             struct DurableLogState {
@@ -1383,10 +1404,13 @@ namespace akkaradb::engine::cluster {
                 uint64_t lastIncludedIndex = 0;
                 uint64_t lastIncludedTerm = 0;
                 uint64_t lastIncludedStateMachineSeq = 0;
+                uint64_t configurationGeneration = 0;
+                size_t logPrefixSize = 0;
+                bool learnerBootstrapPending = false;
                 std::vector<RaftLogEntry> log;
-                std::vector<NodeInfo> committedVoters;
-                std::optional<std::vector<NodeInfo>> jointOldVoters;
-                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                std::vector<NodeInfo> committedMembers;
+                std::optional<std::vector<NodeInfo>> jointOldMembers;
+                std::optional<std::vector<NodeInfo>> jointNewMembers;
                 std::vector<NodeInfo> peers;
                 std::vector<PeerReplicationState> peerReplication;
                 std::optional<SnapshotInstallTransaction> durableSnapshotInstall;
@@ -1398,7 +1422,7 @@ namespace akkaradb::engine::cluster {
             };
 
             RequestState requestState_;
-            std::mutex mutationAdmissionMutex_;
+            std::timed_mutex mutationAdmissionMutex_;
             std::filesystem::path dbDir_;
             std::filesystem::path statePath_;
             std::filesystem::path logPath_;
@@ -1407,6 +1431,7 @@ namespace akkaradb::engine::cluster {
             ClusterRouter router_;
             uint64_t selfNodeId_ = 0;
             const NodeInfo* self_ = nullptr;
+            bool learnerBootstrapPending_ = false;
             std::vector<NodeInfo> peers_;
             ClusterEngineCallbacks callbacks_;
             ClusterRuntimeOptions runtimeOptions_;
@@ -1427,19 +1452,12 @@ namespace akkaradb::engine::cluster {
             uint64_t lastIncludedStateMachineSeq_ = 0;
             uint64_t lastAssignedStateMachineSeq_ = 0;
             std::vector<RaftLogEntry> log_;
-            struct LogLocation {
-                uint64_t index;
-                uint64_t term;
-                uint64_t segment;
-                uint64_t begin;
-                uint64_t end;
-            };
-            struct LogExtent {
-                uint64_t segment;
-                uint64_t begin;
-                uint64_t end;
-            };
-            std::vector<LogLocation> persistedLogLocations_;
+            using LogLocation = detail::RaftLogIndex::Location;
+            using LogExtent = detail::RaftLogIndex::Extent;
+            detail::RaftLogIndex persistedLogLocations_;
+            uint64_t changedLogFrom_ = UINT64_MAX;
+            struct SequenceState { uint64_t sequence; bool hasMutation; };
+            std::vector<SequenceState> validatedLog_;
             uint64_t nextLogSegment_ = 1;
             RequestState journalState_;
             uint64_t requestJournalGeneration_ = 0;
@@ -1448,12 +1466,15 @@ namespace akkaradb::engine::cluster {
             bool logIoFailed_ = false;
             static constexpr uint64_t LOG_SEGMENT_BYTES = 16ull * 1024ull * 1024ull;
             static constexpr uint64_t REQUEST_JOURNAL_COMPACT_BYTES = 1024ull * 1024ull;
-            std::vector<NodeInfo> committedVoters_;
-            std::optional<std::vector<NodeInfo>> jointOldVoters_;
-            std::optional<std::vector<NodeInfo>> jointNewVoters_;
+            std::vector<NodeInfo> committedMembers_;
+            uint64_t lastConfigurationGeneration_ = 0;
+            std::optional<std::vector<NodeInfo>> jointOldMembers_;
+            std::optional<std::vector<NodeInfo>> jointNewMembers_;
             std::vector<PeerReplicationState> peerReplication_;
             std::condition_variable peerReplicationCv_;
             Clock::time_point electionDeadline_{};
+            std::optional<Clock::time_point> lastLeaderContact_;
+            uint64_t leaderContactGeneration_ = 0;
             bool forceElection_ = false;
             std::atomic<RaftRole> role_{RaftRole::FOLLOWER};
             std::mutex applyMutex_;
@@ -1482,7 +1503,7 @@ namespace akkaradb::engine::cluster {
                 uint64_t readRound = 0;
                 std::deque<std::function<void()>> tasks;
                 std::thread thread;
-                std::mutex ioMutex;
+                std::timed_mutex ioMutex;
                 std::mutex socketMutex;
                 SocketHandle socket = BAD_SOCKET;
                 NodeInfo endpoint;
@@ -1529,6 +1550,9 @@ namespace akkaradb::engine::cluster {
             std::atomic<uint64_t> runtimeStartedAtUs_{0};
             bool workersStopping_ = false;
             std::unordered_map<uint64_t, std::shared_ptr<PeerWorker>> workers_;
+            std::vector<std::weak_ptr<PeerWorker>> forwardChannels_;
+            std::vector<std::weak_ptr<PeerWorker>> placementReadChannels_;
+            std::condition_variable forwardChannelsCv_;
             uint64_t nextReadRound_ = 0;
             std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> readAcks_;
 
@@ -1553,6 +1577,7 @@ namespace akkaradb::engine::cluster {
                 std::vector<RaftLogEntry> entries;
                 uint64_t term = 0;
                 uint64_t index = 0;
+                bool localDurable = false;
                 Clock::time_point deadline;
                 std::promise<void> completion;
                 size_t bytes = 0;
@@ -1562,7 +1587,7 @@ namespace akkaradb::engine::cluster {
             std::vector<std::shared_ptr<Proposal>> proposals_;
             std::thread proposalThread_;
             bool administrativeChange_ = false;
-            std::mutex administrationMutex_;
+            std::timed_mutex administrationMutex_;
 
             std::shared_ptr<PeerWorker> peerWorker(uint64_t peerId) {
                 std::lock_guard lock{workersMutex_};
@@ -1659,9 +1684,46 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
-            bool exchangeRpc(const NodeInfo& peer, const std::vector<uint8_t>& wire, ReplMsgType expected, DecodedFrame& frame, int timeoutMs) {
-                auto worker = peerWorker(peer.nodeId);
-                std::lock_guard ioLock{worker->ioMutex};
+            bool exchangeRpc(const NodeInfo& peer, const std::vector<uint8_t>& wire, ReplMsgType expected, DecodedFrame& frame, int timeoutMs,
+                bool* submitted = nullptr, ForwardRequest* forwardRequest = nullptr) {
+                const auto deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds(timeoutMs));
+                auto worker = forwardRequest ? std::make_shared<PeerWorker>() : peerWorker(peer.nodeId);
+                struct ForwardChannelGuard {
+                    Impl* owner = nullptr;
+                    std::shared_ptr<PeerWorker> channel;
+                    bool placementRead = false;
+                    ~ForwardChannelGuard() {
+                        if (!owner) { return; }
+                        std::lock_guard lock{owner->workersMutex_};
+                        auto& channels = placementRead ? owner->placementReadChannels_ : owner->forwardChannels_;
+                        std::erase_if(channels, [&](const auto& weak) { return weak.expired() || weak.lock() == channel; });
+                        owner->forwardChannelsCv_.notify_all();
+                    }
+                } forwardGuard;
+                if (forwardRequest) {
+                    // A long management call can trigger a callback which itself
+                    // reads the authority. Keep RPC channels separate from consensus
+                    // and from each other so those cycles do not share one socket lock.
+                    std::unique_lock lock{workersMutex_};
+                    // A placement-state read is a leaf RPC used by callbacks of
+                    // an already forwarded operation. Reserve one bounded channel
+                    // so saturated forwarding admission cannot deadlock that cycle.
+                    forwardGuard.placementRead = forwardRequest->operation == ForwardOperation::CLUSTER_ADMIN &&
+                        forwardRequest->entries.size() == 1 && forwardRequest->entries[0].key.empty() && forwardRequest->entries[0].value.empty();
+                    auto& channels = forwardGuard.placementRead ? placementReadChannels_ : forwardChannels_;
+                    const size_t limit = forwardGuard.placementRead ? 1 : runtimeOptions_.raftMaxForwardRequests;
+                    if (!forwardChannelsCv_.wait_until(lock, deadline, [&] { return workersStopping_ || channels.size() < limit; }) || workersStopping_) { return false; }
+                    channels.push_back(worker);
+                    forwardGuard.owner = this; forwardGuard.channel = worker;
+                }
+                std::unique_lock ioLock{worker->ioMutex, std::defer_lock};
+                if (!ioLock.try_lock_until(deadline)) { return false; }
+                std::unique_ptr<detail::ForwardDeadline> forwardDeadline;
+                if (submitted || detail::ReconfigurationDeadline::current().deadline != Clock::time_point::max()) {
+                    forwardDeadline = std::make_unique<detail::ForwardDeadline>(deadline, [worker] {
+                        std::lock_guard lock{worker->socketMutex}; shutdownSocket(worker->socket);
+                    });
+                }
                 const auto reset = [&] {
                     std::lock_guard socketLock{worker->socketMutex};
                     closeSocket(worker->socket);
@@ -1672,7 +1734,9 @@ namespace akkaradb::engine::cluster {
                 PeerRoundTripObservation observation{worker};
                 if (worker->endpoint.host != peer.host || worker->endpoint.replPort != peer.replPort) { reset(); }
                 if (!socketOk(worker->socket)) {
-                    auto socket = connectTo(peer.host, peer.replPort, timeoutMs);
+                    const auto connectBudget = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                    if (connectBudget <= 0) { return false; }
+                    auto socket = connectTo(peer.host, peer.replPort, static_cast<int>(connectBudget));
                     if (!socketOk(socket)) { return false; }
                     ++outboundConnections_;
                     {
@@ -1712,8 +1776,19 @@ namespace akkaradb::engine::cluster {
                         return false;
                     }
                 }
-                setTimeouts(worker->socket, timeoutMs);
-                if (!sendFrame(worker->socket, worker->secure.get(), wire) ||
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                if (remaining <= 0) { return false; }
+                std::vector<uint8_t> forwardWire;
+                if (forwardRequest) {
+                    // Admission and connection setup consume the caller's
+                    // budget, not a second full budget at the destination.
+                    forwardRequest->timeoutMs = static_cast<uint32_t>(remaining);
+                    forwardWire = encodeForwardRequest(*forwardRequest);
+                    if (forwardWire.empty() || Clock::now() >= deadline) { return false; }
+                }
+                setTimeouts(worker->socket, static_cast<int>(remaining));
+                if (submitted) { *submitted = true; }
+                if (!sendFrame(worker->socket, worker->secure.get(), forwardRequest ? forwardWire : wire) ||
                     !recvFrame(worker->socket, worker->secure.get(), frame, receiveBudget_) || frame.type != expected) {
                     reset();
                     return false;
@@ -1731,7 +1806,8 @@ namespace akkaradb::engine::cluster {
                 proposal->entries = std::move(entries);
                 for (const auto& entry : proposal->entries) { proposal->bytes += entry.key.size() + entry.value.size() + sizeof(RaftLogEntry); }
                 auto future = proposal->completion.get_future();
-                std::lock_guard lock{mutex_};
+                std::unique_lock lock{mutex_};
+                waitForAdministrationLocked(lock);
                 if (!running_ || role_.load() != RaftRole::LEADER || administrativeChange_ ||
                     (proposal->term != 0 && proposal->term != currentTerm_)) {
                     throw std::runtime_error("RaftConsensusRuntime: proposal requires an active leader without a membership/transfer operation");
@@ -1748,7 +1824,7 @@ namespace akkaradb::engine::cluster {
                     throw std::runtime_error("RaftConsensusRuntime: proposal queue is full");
                 }
                 proposal->term = currentTerm_;
-                proposal->deadline = Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs};
+                proposal->deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs});
                 proposals_.push_back(proposal);
                 proposalQueue_.push_back(proposal);
                 cv_.notify_all();
@@ -1773,6 +1849,7 @@ namespace akkaradb::engine::cluster {
                     }
                     return true;
                 });
+                cv_.notify_all();
             }
 
             void advanceLeaderCommit() {
@@ -1833,10 +1910,20 @@ namespace akkaradb::engine::cluster {
                                     appended = true;
                                     batchBytes += proposal->bytes;
                                 }
-                                catch (...) { log_.resize(previousSize); proposal->error = std::current_exception(); }
+                                catch (...) {
+                                    invalidateLogSuffixLocked(lastIncludedIndex_ + previousSize + 1);
+                                    log_.resize(previousSize);
+                                    proposal->error = std::current_exception();
+                                }
                                 if (batchBytes >= 4 * 1024 * 1024) { break; }
                             }
-                            if (appended) { persistLog(); ++proposalBatches_; }
+                            if (appended) {
+                                persistLog(); ++proposalBatches_;
+                                for (const auto& proposal : proposals_) {
+                                    if (proposal->index != 0 && !proposal->error) { proposal->localDurable = true; }
+                                }
+                                cv_.notify_all();
+                            }
                             finishProposalsLocked();
                         }
                         if (appended) { sendHeartbeats(); }
@@ -1855,21 +1942,46 @@ namespace akkaradb::engine::cluster {
 
             struct AdministrativeGuard {
                 Impl& runtime;
-                std::unique_lock<std::mutex> serialization;
-                explicit AdministrativeGuard(Impl& owner) : runtime{owner}, serialization{owner.administrationMutex_} {
-                    std::lock_guard lock{runtime.mutex_};
-                    if (!runtime.proposals_.empty()) { throw std::runtime_error("RaftConsensusRuntime: proposals are in flight; retry administrative change"); }
+                std::unique_lock<std::timed_mutex> serialization;
+                bool paused = false;
+                explicit AdministrativeGuard(Impl& owner, bool pause = true) : runtime{owner}, serialization{detail::ReconfigurationDeadline::lock(owner.administrationMutex_)} {
+                    if (pause) { pauseWrites(); }
+                }
+                void pauseWrites() {
+                    std::unique_lock lock{runtime.mutex_};
                     runtime.administrativeChange_ = true;
+                    if (!runtime.cv_.wait_until(lock, detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{runtime.runtimeOptions_.reconfiguration.timeoutMs}),
+                        [this] { return runtime.proposals_.empty() || !runtime.running_; }) || !runtime.running_) {
+                        runtime.administrativeChange_ = false;
+                        runtime.cv_.notify_all();
+                        throw std::runtime_error("RaftConsensusRuntime: outstanding writes did not drain before administrative change");
+                    }
+                    paused = true;
                 }
                 ~AdministrativeGuard() {
+                    if (!paused) { return; }
                     std::lock_guard lock{runtime.mutex_};
                     runtime.administrativeChange_ = false;
+                    runtime.cv_.notify_all();
                 }
             };
 
-            Clock::time_point nextElectionDeadline() {
+            void waitForAdministrationLocked(std::unique_lock<std::mutex>& lock) {
+                if (!administrativeChange_) { return; }
+                if (runtimeOptions_.reconfiguration.writePolicy == ReconfigurationWritePolicy::REJECT ||
+                    !cv_.wait_until(lock, detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{runtimeOptions_.reconfiguration.timeoutMs}),
+                        [this] { return !administrativeChange_ || !running_; })) {
+                    throw std::runtime_error("Raft: write admission paused by membership change");
+                }
+            }
+
+            uint32_t baselineElectionTimeoutMs() const noexcept {
                 const auto configuredAckTimeoutMs = config_.consistency().ackTimeoutMs;
-                const auto baseTimeoutMs = std::clamp<uint32_t>(std::max<uint32_t>(3000u, configuredAckTimeoutMs * 2u), 3000u, 6000u);
+                return static_cast<uint32_t>(std::clamp<uint64_t>(uint64_t{configuredAckTimeoutMs} * 2u, 3000u, 6000u));
+            }
+
+            Clock::time_point nextElectionDeadline() {
+                const auto baseTimeoutMs = baselineElectionTimeoutMs();
                 // Test hook: keep production Raft randomized, but let smoke tests make leadership reproducible.
                 if (const char* deterministic = std::getenv("AKKARADB_TEST_DETERMINISTIC_RAFT_ELECTION"); deterministic != nullptr && std::string_view{
                     deterministic
@@ -1893,16 +2005,35 @@ namespace akkaradb::engine::cluster {
                 return false;
             }
 
-            static std::vector<NodeInfo> sortedUniqueVoters(std::vector<NodeInfo> nodes) {
-                std::ranges::sort(nodes, [](const NodeInfo& lhs, const NodeInfo& rhs) { return lhs.nodeId < rhs.nodeId; });
+            static std::vector<NodeInfo> sortedUniqueMembers(std::vector<NodeInfo> nodes) {
+                std::ranges::sort(nodes, [](const NodeInfo& lhs, const NodeInfo& rhs) {
+                    if (lhs.nodeId != rhs.nodeId) { return lhs.nodeId < rhs.nodeId; }
+                    return lhs.raftLearner() < rhs.raftLearner();
+                });
                 nodes.erase(std::ranges::unique(nodes, [](const NodeInfo& lhs, const NodeInfo& rhs) { return lhs.nodeId == rhs.nodeId; }).begin(), nodes.end());
                 return nodes;
             }
 
+            std::optional<std::pair<std::vector<NodeInfo>, std::vector<NodeInfo>>> pendingJointMembershipLocked() const {
+                for (auto entry = log_.rbegin(); entry != log_.rend() && entry->index > commitIndex_; ++entry) {
+                    if (entry->kind != RaftEntryKind::CONFIG_JOINT) { continue; }
+                    std::pair<std::vector<NodeInfo>, std::vector<NodeInfo>> members;
+                    if (!decodeNodeSet(entry->key, members.first) || !decodeNodeSet(entry->value, members.second)) {
+                        throw std::runtime_error("RaftConsensusRuntime: corrupt pending joint membership");
+                    }
+                    return members;
+                }
+                return std::nullopt;
+            }
+
             std::vector<NodeInfo> replicationTargetsLocked() const {
-                std::vector<NodeInfo> out = committedVoters_;
-                if (jointNewVoters_) { out.insert(out.end(), jointNewVoters_->begin(), jointNewVoters_->end()); }
-                out = sortedUniqueVoters(std::move(out));
+                std::vector<NodeInfo> out = committedMembers_;
+                if (jointNewMembers_) { out.insert(out.end(), jointNewMembers_->begin(), jointNewMembers_->end()); }
+                if (const auto pending = pendingJointMembershipLocked()) {
+                    out.insert(out.end(), pending->first.begin(), pending->first.end());
+                    out.insert(out.end(), pending->second.begin(), pending->second.end());
+                }
+                out = sortedUniqueMembers(std::move(out));
                 return out;
             }
 
@@ -1927,58 +2058,72 @@ namespace akkaradb::engine::cluster {
 
             bool replicatedByMajorityLocked(const std::vector<NodeInfo>& voters, uint64_t index) {
                 size_t replicated = 0;
+                size_t voterCount = 0;
                 for (const auto& voter : voters) {
+                    if (voter.raftLearner()) { continue; }
+                    ++voterCount;
                     if (voter.nodeId == selfNodeId_) { if (index <= this->lastLogIndex()) { ++replicated; } }
                     else if (const auto* state = this->peerState(voter.nodeId); state != nullptr && state->matchIndex >= index) { ++replicated; }
                 }
-                return replicated >= (voters.size() / 2) + 1;
+                return voterCount != 0 && replicated >= (voterCount / 2) + 1;
             }
 
             static bool votedByMajority(const std::vector<NodeInfo>& voters, const std::vector<uint64_t>& grantedVotes) {
                 size_t granted = 0;
-                for (const auto& voter : voters) { if (std::ranges::find(grantedVotes, voter.nodeId) != grantedVotes.end()) { ++granted; } }
-                return granted >= (voters.size() / 2) + 1;
+                size_t voterCount = 0;
+                for (const auto& voter : voters) {
+                    if (voter.raftLearner()) { continue; }
+                    ++voterCount;
+                    if (std::ranges::find(grantedVotes, voter.nodeId) != grantedVotes.end()) { ++granted; }
+                }
+                return voterCount != 0 && granted >= (voterCount / 2) + 1;
             }
 
             bool hasElectionQuorumLocked(const std::vector<uint64_t>& grantedVotes) const {
-                if (jointOldVoters_ && jointNewVoters_) {
-                    return votedByMajority(*jointOldVoters_, grantedVotes) && votedByMajority(*jointNewVoters_, grantedVotes);
+                // A promoted learner may only have the joint entry, not its
+                // commit notification, when the leader dies. The appended
+                // joint configuration must govern that recovery election.
+                if (const auto pending = pendingJointMembershipLocked()) {
+                    return votedByMajority(pending->first, grantedVotes) && votedByMajority(pending->second, grantedVotes);
                 }
-                return votedByMajority(committedVoters_, grantedVotes);
+                if (jointOldMembers_ && jointNewMembers_) {
+                    return votedByMajority(*jointOldMembers_, grantedVotes) && votedByMajority(*jointNewMembers_, grantedVotes);
+                }
+                return votedByMajority(committedMembers_, grantedVotes);
             }
 
             bool hasCommitQuorumLocked(uint64_t index, const RaftLogEntry* entry = nullptr) {
                 if (entry != nullptr && entry->kind == RaftEntryKind::CONFIG_JOINT) {
-                    std::vector<NodeInfo> oldVoters;
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry->key, oldVoters) || !decodeNodeSet(entry->value, newVoters)) { return false; }
-                    return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                    std::vector<NodeInfo> oldMembers;
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry->key, oldMembers) || !decodeNodeSet(entry->value, newMembers)) { return false; }
+                    return replicatedByMajorityLocked(oldMembers, index) && replicatedByMajorityLocked(newMembers, index);
                 }
                 if (entry != nullptr && entry->kind == RaftEntryKind::CONFIG_FINAL && !entry->key.empty()) {
-                    std::vector<NodeInfo> oldVoters;
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry->key, oldVoters) || !decodeNodeSet(entry->value, newVoters)) { return false; }
-                    return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                    std::vector<NodeInfo> oldMembers;
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry->key, oldMembers) || !decodeNodeSet(entry->value, newMembers)) { return false; }
+                    return replicatedByMajorityLocked(oldMembers, index) && replicatedByMajorityLocked(newMembers, index);
                 }
-                if (jointOldVoters_ && jointNewVoters_) {
-                    return replicatedByMajorityLocked(*jointOldVoters_, index) && replicatedByMajorityLocked(*jointNewVoters_, index);
+                if (jointOldMembers_ && jointNewMembers_) {
+                    return replicatedByMajorityLocked(*jointOldMembers_, index) && replicatedByMajorityLocked(*jointNewMembers_, index);
                 }
                 for (const auto& pending : log_) {
                     if (pending.index <= commitIndex_ || pending.index > index) { continue; }
                     if (pending.kind == RaftEntryKind::CONFIG_JOINT) {
-                        std::vector<NodeInfo> oldVoters;
-                        std::vector<NodeInfo> newVoters;
-                        if (!decodeNodeSet(pending.key, oldVoters) || !decodeNodeSet(pending.value, newVoters)) { return false; }
-                        return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                        std::vector<NodeInfo> oldMembers;
+                        std::vector<NodeInfo> newMembers;
+                        if (!decodeNodeSet(pending.key, oldMembers) || !decodeNodeSet(pending.value, newMembers)) { return false; }
+                        return replicatedByMajorityLocked(oldMembers, index) && replicatedByMajorityLocked(newMembers, index);
                     }
                     if (pending.kind == RaftEntryKind::CONFIG_FINAL && !pending.key.empty()) {
-                        std::vector<NodeInfo> oldVoters;
-                        std::vector<NodeInfo> newVoters;
-                        if (!decodeNodeSet(pending.key, oldVoters) || !decodeNodeSet(pending.value, newVoters)) { return false; }
-                        return replicatedByMajorityLocked(oldVoters, index) && replicatedByMajorityLocked(newVoters, index);
+                        std::vector<NodeInfo> oldMembers;
+                        std::vector<NodeInfo> newMembers;
+                        if (!decodeNodeSet(pending.key, oldMembers) || !decodeNodeSet(pending.value, newMembers)) { return false; }
+                        return replicatedByMajorityLocked(oldMembers, index) && replicatedByMajorityLocked(newMembers, index);
                     }
                 }
-                return replicatedByMajorityLocked(committedVoters_, index);
+                return replicatedByMajorityLocked(committedMembers_, index);
             }
 
             bool canCommitEntryLocked(const RaftLogEntry& entry) {
@@ -1994,30 +2139,52 @@ namespace akkaradb::engine::cluster {
 
             std::optional<std::vector<NodeInfo>> replicationTargetsForEntry(const RaftLogEntry& entry) const {
                 if (entry.kind == RaftEntryKind::CONFIG_JOINT) {
-                    std::vector<NodeInfo> oldVoters;
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry.key, oldVoters) || !decodeNodeSet(entry.value, newVoters)) { return std::nullopt; }
-                    oldVoters.insert(oldVoters.end(), newVoters.begin(), newVoters.end());
-                    return sortedUniqueVoters(std::move(oldVoters));
+                    std::vector<NodeInfo> oldMembers;
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry.key, oldMembers) || !decodeNodeSet(entry.value, newMembers)) { return std::nullopt; }
+                    oldMembers.insert(oldMembers.end(), newMembers.begin(), newMembers.end());
+                    return sortedUniqueMembers(std::move(oldMembers));
                 }
                 if (entry.kind == RaftEntryKind::CONFIG_FINAL) {
-                    std::vector<NodeInfo> oldVoters;
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry.value, newVoters)) { return std::nullopt; }
+                    std::vector<NodeInfo> oldMembers;
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry.value, newMembers)) { return std::nullopt; }
                     if (!entry.key.empty()) {
-                        if (!decodeNodeSet(entry.key, oldVoters)) { return std::nullopt; }
-                        oldVoters.insert(oldVoters.end(), newVoters.begin(), newVoters.end());
-                        return sortedUniqueVoters(std::move(oldVoters));
+                        if (!decodeNodeSet(entry.key, oldMembers)) { return std::nullopt; }
+                        oldMembers.insert(oldMembers.end(), newMembers.begin(), newMembers.end());
+                        return sortedUniqueMembers(std::move(oldMembers));
                     }
-                    return sortedUniqueVoters(std::move(newVoters));
+                    return sortedUniqueMembers(std::move(newMembers));
                 }
                 return std::nullopt;
             }
 
             bool isVotingMemberLocked(uint64_t nodeId) const {
-                if (containsNode(committedVoters_, nodeId)) { return true; }
-                if (jointOldVoters_ && containsNode(*jointOldVoters_, nodeId)) { return true; }
-                if (jointNewVoters_ && containsNode(*jointNewVoters_, nodeId)) { return true; }
+                const auto voting = [nodeId](const std::vector<NodeInfo>& members) {
+                    return std::ranges::any_of(members, [nodeId](const NodeInfo& node) {
+                        return node.nodeId == nodeId && !node.raftLearner();
+                    });
+                };
+                if (voting(committedMembers_)) { return true; }
+                if (jointOldMembers_ && voting(*jointOldMembers_)) { return true; }
+                if (jointNewMembers_ && voting(*jointNewMembers_)) { return true; }
+                if (const auto pending = pendingJointMembershipLocked()) {
+                    return voting(pending->first) || voting(pending->second);
+                }
+                return false;
+            }
+
+            bool isReplicationMemberLocked(uint64_t nodeId) const {
+                // A configured joining learner can receive the authoritative
+                // pre-admission snapshot, whose membership does not yet include
+                // it. This grants no vote and ends at committed admission.
+                if (nodeId == selfNodeId_ && learnerBootstrapPending_) { return true; }
+                if (containsNode(committedMembers_, nodeId) ||
+                    (jointOldMembers_ && containsNode(*jointOldMembers_, nodeId)) ||
+                    (jointNewMembers_ && containsNode(*jointNewMembers_, nodeId))) { return true; }
+                if (const auto pending = pendingJointMembershipLocked()) {
+                    return containsNode(pending->first, nodeId) || containsNode(pending->second, nodeId);
+                }
                 return false;
             }
 
@@ -2043,15 +2210,17 @@ namespace akkaradb::engine::cluster {
                 if (index == 0) { return 0; }
                 if (index == lastIncludedIndex_) { return lastIncludedTerm_; }
                 if (index < lastIncludedIndex_) { return 0; }
-                const auto entry = entryAt(index);
-                return entry ? entry->term : 0;
+                const uint64_t offset = index - lastIncludedIndex_ - 1;
+                return offset < log_.size() && log_[static_cast<size_t>(offset)].index == index
+                    ? log_[static_cast<size_t>(offset)].term : 0;
             }
 
             std::vector<RaftLogEntry> entriesFrom(uint64_t nextIndex) const {
                 std::vector<RaftLogEntry> entries;
                 size_t payloadSize = RAFT_APPEND_ENTRIES_BASE_SIZE;
-                for (const auto& entry : log_) {
-                    if (entry.index < nextIndex) { continue; }
+                const uint64_t offset = nextIndex <= lastIncludedIndex_ ? 0 : nextIndex - lastIncludedIndex_ - 1;
+                for (size_t i = static_cast<size_t>(std::min<uint64_t>(offset, log_.size())); i < log_.size(); ++i) {
+                    const auto& entry = log_[i];
                     const auto entryPayload = encodeEntryPayload(entry);
                     const size_t entrySize = RAFT_ENTRY_LENGTH_PREFIX_SIZE + entryPayload.size();
                     if (payloadSize + entrySize > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) {
@@ -2064,20 +2233,40 @@ namespace akkaradb::engine::cluster {
                 return entries;
             }
 
-            bool entryPreservesStateMachineSequenceLocked(const RaftLogEntry& incoming) const {
-                if (isStateMachineEntry(incoming.kind) && incoming.clientSeq <= lastIncludedStateMachineSeq_) { return false; }
-                uint64_t lastStateMachineSeq = lastIncludedStateMachineSeq_;
-                bool seqHasMutation = false;
-                for (const auto& entry : log_) {
-                    if (entry.index >= incoming.index) { break; }
-                    if (!advanceStateMachineSequenceTracker(entry, lastStateMachineSeq, seqHasMutation)) { return false; }
+            void invalidateLogSuffixLocked(uint64_t index) {
+                changedLogFrom_ = std::min(changedLogFrom_, index);
+                const auto offset = index <= lastIncludedIndex_ ? 0 : index - lastIncludedIndex_ - 1;
+                validatedLog_.resize(static_cast<size_t>(std::min<uint64_t>(offset, validatedLog_.size())));
+            }
+
+            void validateLogPrefixLocked(size_t count) {
+                if (validatedLog_.size() > log_.size()) { validatedLog_.resize(log_.size()); }
+                for (size_t i = validatedLog_.size(); i < count; ++i) {
+                    const auto& entry = log_[i];
+                    auto state = validatedLog_.empty() ? SequenceState{lastIncludedStateMachineSeq_, false} : validatedLog_.back();
+                    if (entry.index != lastIncludedIndex_ + i + 1 || !isValidRaftLogEntryShape(entry) ||
+                        (isStateMachineEntry(entry.kind) && entry.clientSeq <= lastIncludedStateMachineSeq_) ||
+                        !advanceStateMachineSequenceTracker(entry, state.sequence, state.hasMutation)) {
+                        throw std::runtime_error("RaftConsensusRuntime: invalid log index or state-machine sequence");
+                    }
+                    validatedLog_.push_back(state);
                 }
-                return advanceStateMachineSequenceTracker(incoming, lastStateMachineSeq, seqHasMutation);
+            }
+
+            bool entryPreservesStateMachineSequenceLocked(const RaftLogEntry& incoming) {
+                if (incoming.index <= lastIncludedIndex_ ||
+                    (isStateMachineEntry(incoming.kind) && incoming.clientSeq <= lastIncludedStateMachineSeq_)) { return false; }
+                const auto offset = incoming.index - lastIncludedIndex_ - 1;
+                if (offset > log_.size()) { return false; }
+                validateLogPrefixLocked(static_cast<size_t>(offset));
+                auto state = offset == 0 ? SequenceState{lastIncludedStateMachineSeq_, false} : validatedLog_[static_cast<size_t>(offset - 1)];
+                return advanceStateMachineSequenceTracker(incoming, state.sequence, state.hasMutation);
             }
 
             std::optional<uint64_t> compactableLogIndexForSnapshotSeq(uint64_t snapshotSeq) const {
                 std::optional<uint64_t> target;
                 for (const auto& entry : log_) {
+                    if (entry.index > lastApplied_) { break; }
                     if ((entry.kind == RaftEntryKind::MUTATION || entry.kind == RaftEntryKind::BLOB) && entry.clientSeq <= snapshotSeq) {
                         target = entry.index;
                         continue;
@@ -2158,6 +2347,16 @@ namespace akkaradb::engine::cluster {
             }
 
             void updateNextIndexAfterConflictLocked(PeerReplicationState& state, const AppendEntriesResponse& response) const {
+                // A follower may have compacted farther than this peer worker's
+                // acknowledgement. Verify its boundary against our committed
+                // prefix before advancing rather than backing up forever.
+                if (response.conflictTerm != 0 && response.matchIndex >= state.nextIndex &&
+                    response.matchIndex <= commitIndex_ && response.conflictIndex == response.matchIndex + 1 &&
+                    termAt(response.matchIndex) == response.conflictTerm) {
+                    state.matchIndex = std::max(state.matchIndex, response.matchIndex);
+                    state.nextIndex = response.matchIndex + 1;
+                    return;
+                }
                 uint64_t nextIndex = 1;
                 if (response.conflictTerm != 0) {
                     if (const uint64_t leaderLastIndexForTerm = lastIndexOfTermLocked(response.conflictTerm); leaderLastIndexForTerm != 0) {
@@ -2185,7 +2384,7 @@ namespace akkaradb::engine::cluster {
 
             void persistState() {
                 std::vector<uint8_t> bytes;
-                bytes.insert(bytes.end(), {'A', 'K', 'R', 'S', '3'});
+                bytes.insert(bytes.end(), {'A', 'K', 'R', 'S', '1'});
                 bytes.insert(bytes.end(), config_.clusterId().begin(), config_.clusterId().end());
                 writeU64(bytes, currentTerm_);
                 writeU64(bytes, votedFor_);
@@ -2195,8 +2394,11 @@ namespace akkaradb::engine::cluster {
                 writeFileAtomically(statePath_, bytes, "RaftConsensusRuntime state");
             }
 
-            void enforceLogInvariantsLocked(const char* context) const {
-                if (committedVoters_.empty()) { throw std::runtime_error(std::string{context} + ": empty committed voter set"); }
+            void enforceLogInvariantsLocked(const char* context) {
+                if (!hasVoter(committedMembers_)) { throw std::runtime_error(std::string{context} + ": empty committed voter set"); }
+                if ((jointOldMembers_ && !hasVoter(*jointOldMembers_)) || (jointNewMembers_ && !hasVoter(*jointNewMembers_))) {
+                    throw std::runtime_error(std::string{context} + ": empty joint voter set");
+                }
                 if (lastIncludedIndex_ > commitIndex_) { throw std::runtime_error(std::string{context} + ": lastIncludedIndex is ahead of commitIndex"); }
                 if (lastApplied_ < lastIncludedIndex_) { throw std::runtime_error(std::string{context} + ": lastApplied is behind lastIncludedIndex"); }
                 if (lastApplied_ > commitIndex_) { throw std::runtime_error(std::string{context} + ": lastApplied is ahead of commitIndex"); }
@@ -2204,25 +2406,10 @@ namespace akkaradb::engine::cluster {
                 for (const auto& [id, result] : requestState_.results) {
                     if (result.index > lastApplied_) { throw std::runtime_error(std::string{context} + ": request result is ahead of applied log"); }
                 }
-                uint64_t expectedIndex = lastIncludedIndex_ + 1;
-                for (const auto& entry : log_) {
-                    if (entry.index != expectedIndex) { throw std::runtime_error(std::string{context} + ": non-contiguous log"); }
-                    ++expectedIndex;
-                }
-                if (jointOldVoters_.has_value() != jointNewVoters_.has_value()) {
+                if (jointOldMembers_.has_value() != jointNewMembers_.has_value()) {
                     throw std::runtime_error(std::string{context} + ": incomplete joint voter set");
                 }
-                uint64_t lastStateMachineSeq = lastIncludedStateMachineSeq_;
-                bool seqHasMutation = false;
-                for (const auto& entry : log_) {
-                    if (!isValidRaftLogEntryShape(entry)) { throw std::runtime_error(std::string{context} + ": invalid log entry shape"); }
-                    if (isStateMachineEntry(entry.kind) && entry.clientSeq <= lastIncludedStateMachineSeq_) {
-                        throw std::runtime_error(std::string{context} + ": state-machine sequence is behind compacted snapshot");
-                    }
-                    if (!advanceStateMachineSequenceTracker(entry, lastStateMachineSeq, seqHasMutation)) {
-                        throw std::runtime_error(std::string{context} + ": invalid state-machine sequence metadata");
-                    }
-                }
+                validateLogPrefixLocked(log_.size());
             }
 
             void recoverState() {
@@ -2232,7 +2419,7 @@ namespace akkaradb::engine::cluster {
                     constexpr size_t expectedSize = 5 + 16 + 8 + 8 + 4;
                     constexpr size_t crcOffset = expectedSize - 4;
                     if (bytes.size() != expectedSize) { throw std::runtime_error("invalid state file size"); }
-                    if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRS3") { throw std::runtime_error("bad state file magic"); }
+                    if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKRS1") { throw std::runtime_error("bad state file magic"); }
                     if (readU32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) { throw std::runtime_error("state file CRC mismatch"); }
                     if (!std::equal(config_.clusterId().begin(), config_.clusterId().end(), bytes.begin() + 5)) {
                         throw std::runtime_error("hard state belongs to a different cluster");
@@ -2250,9 +2437,10 @@ namespace akkaradb::engine::cluster {
                 writeU64(out, durableSnapshotInstall_->lastIncludedIndex);
                 writeU64(out, durableSnapshotInstall_->lastIncludedTerm);
                 writeU64(out, durableSnapshotInstall_->entryCount);
-                writeNodeSetField(out, durableSnapshotInstall_->committedVoters);
-                writeOptionalNodeSetField(out, durableSnapshotInstall_->jointOldVoters);
-                writeOptionalNodeSetField(out, durableSnapshotInstall_->jointNewVoters);
+                writeU64(out, durableSnapshotInstall_->configurationGeneration);
+                writeNodeSetField(out, durableSnapshotInstall_->committedMembers);
+                writeOptionalNodeSetField(out, durableSnapshotInstall_->jointOldMembers);
+                writeOptionalNodeSetField(out, durableSnapshotInstall_->jointNewMembers);
                 writeRequestState(out, durableSnapshotInstall_->requestState);
             }
 
@@ -2267,7 +2455,7 @@ namespace akkaradb::engine::cluster {
                     transaction.reset();
                     return true;
                 }
-                if (cursor + 32 > in.size()) { return false; }
+                if (cursor + 40 > in.size()) { return false; }
                 SnapshotInstallTransaction decoded;
                 decoded.snapshotSeq = readU64(in, cursor);
                 cursor += 8;
@@ -2277,13 +2465,15 @@ namespace akkaradb::engine::cluster {
                 cursor += 8;
                 decoded.entryCount = readU64(in, cursor);
                 cursor += 8;
-                if (!readNodeSetField(in, cursor, decoded.committedVoters) || !readOptionalNodeSetField(in, cursor, decoded.jointOldVoters) || !
-                    readOptionalNodeSetField(in, cursor, decoded.jointNewVoters)) {
+                decoded.configurationGeneration = readU64(in, cursor);
+                cursor += 8;
+                if (!readNodeSetField(in, cursor, decoded.committedMembers) || !readOptionalNodeSetField(in, cursor, decoded.jointOldMembers) || !
+                    readOptionalNodeSetField(in, cursor, decoded.jointNewMembers)) {
                     return false;
                 }
                 if (!readRequestState(in, cursor, decoded.requestState)) { return false; }
-                if (decoded.committedVoters.empty() || decoded.jointOldVoters.has_value() != decoded.jointNewVoters.has_value()) { return false; }
-                if (decoded.jointOldVoters && (decoded.jointOldVoters->empty() || decoded.jointNewVoters->empty())) { return false; }
+                if (decoded.committedMembers.empty() || decoded.jointOldMembers.has_value() != decoded.jointNewMembers.has_value()) { return false; }
+                if (decoded.jointOldMembers && (decoded.jointOldMembers->empty() || decoded.jointNewMembers->empty())) { return false; }
                 transaction = std::move(decoded);
                 return true;
             }
@@ -2514,8 +2704,8 @@ namespace akkaradb::engine::cluster {
                 // tails left by interrupted writes, are never part of recovery.
                 try {
                     std::unordered_set<std::string> live;
-                    for (const auto& entry : persistedLogLocations_) {
-                        live.insert(logSegmentPath(entry.segment).filename().string());
+                    for (const auto& extent : persistedLogLocations_.extents()) {
+                        live.insert(logSegmentPath(extent.segment).filename().string());
                     }
                     if (!std::filesystem::exists(logSegmentDir())) { return; }
                     for (const auto& file : std::filesystem::directory_iterator(logSegmentDir())) {
@@ -2532,29 +2722,15 @@ namespace akkaradb::engine::cluster {
 
             void persistLog() {
                 enforceLogInvariantsLocked("RaftConsensusRuntime log");
-                std::vector<LogLocation> locations;
-                locations.reserve(log_.size());
-                size_t common = 0;
-                if (!log_.empty()) {
-                    auto previous = std::lower_bound(
-                        persistedLogLocations_.begin(), persistedLogLocations_.end(), log_.front().index,
-                        [](const LogLocation& location, uint64_t index) { return location.index < index; }
-                    );
-                    // Raft entries are immutable within an (index, term) pair.
-                    while (common < log_.size() && previous != persistedLogLocations_.end() &&
-                           previous->index == log_[common].index && previous->term == log_[common].term) {
-                        locations.push_back(*previous++);
-                        ++common;
-                    }
-                }
-
+                const bool removed = persistedLogLocations_.reconcile(lastIncludedIndex_ + 1, lastLogIndex() + 1, changedLogFrom_);
+                const size_t common = persistedLogLocations_.size();
+                auto& locations = persistedLogLocations_;
                 try {
                     if (common < log_.size()) {
                         std::filesystem::create_directories(logSegmentDir());
                         uint64_t segment = 0;
                         uint64_t offset = 0;
-                        if (!locations.empty() && !persistedLogLocations_.empty() &&
-                            locations.back().index == persistedLogLocations_.back().index &&
+                        if (!locations.empty() &&
                             std::filesystem::file_size(logSegmentPath(locations.back().segment)) == locations.back().end) {
                             segment = locations.back().segment;
                             offset = locations.back().end;
@@ -2590,7 +2766,7 @@ namespace akkaradb::engine::cluster {
                                 if (!out) { throw std::runtime_error("Raft log: cannot append segment"); }
                             }
                             out.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
-                            locations.push_back(LogLocation{log_[i].index, log_[i].term, segment, offset, offset + record.size()});
+                            locations.append(LogLocation{log_[i].index, log_[i].term, segment, offset, offset + record.size()});
                             offset += record.size();
                         }
                         finishSegment();
@@ -2600,13 +2776,7 @@ namespace akkaradb::engine::cluster {
                         crashAtLogTestPoint("raft.after_segment_sync");
                     }
 
-                    std::vector<LogExtent> extents;
-                    for (const auto& entry : locations) {
-                        if (!extents.empty() && extents.back().segment == entry.segment && extents.back().end == entry.begin) {
-                            extents.back().end = entry.end;
-                        }
-                        else { extents.push_back(LogExtent{entry.segment, entry.begin, entry.end}); }
-                    }
+                    const auto& extents = locations.extents();
                     prepareRequestJournalLocked();
                     std::vector<uint8_t> bytes{'A', 'K', 'R', 'L', '1'};
                     writeU64(bytes, commitIndex_);
@@ -2615,9 +2785,11 @@ namespace akkaradb::engine::cluster {
                     writeU64(bytes, lastIncludedTerm_);
                     writeU64(bytes, lastIncludedStateMachineSeq_);
                     writeU64(bytes, static_cast<uint64_t>(log_.size()));
-                    writeNodeSetField(bytes, committedVoters_);
-                    writeOptionalNodeSetField(bytes, jointOldVoters_);
-                    writeOptionalNodeSetField(bytes, jointNewVoters_);
+                    writeNodeSetField(bytes, committedMembers_);
+                    writeOptionalNodeSetField(bytes, jointOldMembers_);
+                    writeOptionalNodeSetField(bytes, jointNewMembers_);
+                    writeU64(bytes, lastConfigurationGeneration_);
+                    writeU8(bytes, learnerBootstrapPending_ ? 1 : 0);
                     writeSnapshotInstallTransactionField(bytes);
                     writeU64(bytes, requestJournalGeneration_);
                     writeU64(bytes, requestJournalBytes_);
@@ -2632,7 +2804,7 @@ namespace akkaradb::engine::cluster {
                     // Publish only after every referenced segment has reached disk.
                     writeFileAtomically(logPath_, bytes, "RaftConsensusRuntime log metadata");
                     crashAtLogTestPoint("raft.after_log_metadata");
-                    persistedLogLocations_ = std::move(locations);
+                    changedLogFrom_ = UINT64_MAX;
                 }
                 catch (...) {
                     // An atomic replacement can have succeeded before a sync error.
@@ -2642,7 +2814,7 @@ namespace akkaradb::engine::cluster {
                     stopRuntimeLocked();
                     throw;
                 }
-                collectUnusedLogSegments();
+                if (removed) { collectUnusedLogSegments(); }
                 collectUnusedRequestJournals();
             }
 
@@ -2662,11 +2834,16 @@ namespace akkaradb::engine::cluster {
                 lastIncludedStateMachineSeq_ = readU64(bytes, 37);
                 const uint64_t count = readU64(bytes, 45);
                 size_t cursor = fixedHeaderSize;
-                if (!readNodeSetField(bytes, cursor, committedVoters_) || !readOptionalNodeSetField(bytes, cursor, jointOldVoters_) ||
-                    !readOptionalNodeSetField(bytes, cursor, jointNewVoters_) ||
-                    !readSnapshotInstallTransactionField(bytes, cursor, durableSnapshotInstall_) ||
-                    committedVoters_.empty() || cursor + 32 > bytes.size() - 4) {
+                if (!readNodeSetField(bytes, cursor, committedMembers_) || !readOptionalNodeSetField(bytes, cursor, jointOldMembers_) ||
+                    !readOptionalNodeSetField(bytes, cursor, jointNewMembers_) ||
+                    committedMembers_.empty() || cursor + 8 > bytes.size() - 4) {
                     throw std::runtime_error("RaftConsensusRuntime: corrupt log membership metadata");
+                }
+                lastConfigurationGeneration_ = readU64(bytes, cursor); cursor += 8;
+                if (cursor >= bytes.size() - 4 || bytes[cursor] > 1) { throw std::runtime_error("RaftConsensusRuntime: invalid learner bootstrap state"); }
+                learnerBootstrapPending_ = bytes[cursor++] != 0;
+                if (!readSnapshotInstallTransactionField(bytes, cursor, durableSnapshotInstall_) || cursor + 32 > bytes.size() - 4) {
+                    throw std::runtime_error("RaftConsensusRuntime: corrupt snapshot transaction metadata");
                 }
                 requestJournalGeneration_ = readU64(bytes, cursor);
                 requestJournalBytes_ = readU64(bytes, cursor + 8);
@@ -2728,7 +2905,7 @@ namespace akkaradb::engine::cluster {
                             break;
                         }
                         lastGoodIndex = entry.index;
-                        persistedLogLocations_.push_back(LogLocation{entry.index, entry.term, extent.segment, begin, offset});
+                        persistedLogLocations_.append(LogLocation{entry.index, entry.term, extent.segment, begin, offset});
                         log_.push_back(std::move(entry));
                     }
                 }
@@ -2802,32 +2979,30 @@ namespace akkaradb::engine::cluster {
 
             void notifyRoleChange(std::optional<NodeRole> role) { if (role && callbacks_.roleChange) { callbacks_.roleChange(*role); } }
 
-            void setRoleAndNotify(RaftRole role) { notifyRoleChange(setRole(role)); }
-
             void becomeFollower(uint64_t term) {
-                bool changed = false;
+                std::optional<NodeRole> roleChange;
                 {
                     std::lock_guard lock{mutex_};
-                    if (term > currentTerm_) {
-                        const auto hardBackup = captureDurableHardStateLocked();
-                        currentTerm_ = term;
-                        votedFor_ = 0;
-                        clearObservedLeaderLocked();
-                        try { persistState(); }
-                        catch (...) {
-                            restoreDurableHardStateLocked(hardBackup);
-                            stopRuntimeLocked();
-                            throw;
-                        }
-                        changed = true;
+                    // RPCs run concurrently; an old reply must not demote a newer leader.
+                    if (!running_ || term <= currentTerm_) { return; }
+                    const auto hardBackup = captureDurableHardStateLocked();
+                    currentTerm_ = term;
+                    votedFor_ = 0;
+                    clearObservedLeaderLocked();
+                    try { persistState(); }
+                    catch (...) {
+                        restoreDurableHardStateLocked(hardBackup);
+                        stopRuntimeLocked();
+                        throw;
                     }
                     electionDeadline_ = nextElectionDeadline();
+                    roleChange = setRole(RaftRole::FOLLOWER);
                 }
-                setRoleAndNotify(RaftRole::FOLLOWER);
-                (void)changed;
+                notifyRoleChange(roleChange);
             }
 
             void becomeLeader(uint64_t term) {
+                std::optional<NodeRole> roleChange;
                 {
                     std::lock_guard lock{mutex_};
                     const auto role = role_.load();
@@ -2857,8 +3032,9 @@ namespace akkaradb::engine::cluster {
                         throw;
                     }
                     electionDeadline_ = Clock::now() + std::chrono::hours(24);
+                    roleChange = setRole(RaftRole::LEADER);
                 }
-                setRoleAndNotify(RaftRole::LEADER);
+                notifyRoleChange(roleChange);
                 (void)commitOutstandingEntry(std::chrono::milliseconds{0});
             }
 
@@ -2877,7 +3053,9 @@ namespace akkaradb::engine::cluster {
                 return nullptr;
             }
 
-            DurableLogState captureDurableLogStateLocked() const {
+            DurableLogState captureDurableLogStateLocked(uint64_t fromLogIndex = 0) const {
+                const size_t prefix = fromLogIndex <= lastIncludedIndex_ ? 0 :
+                    static_cast<size_t>(std::min<uint64_t>(fromLogIndex - lastIncludedIndex_ - 1, log_.size()));
                 return DurableLogState{
                     .requestState = requestState_,
                     .journalState = journalState_,
@@ -2889,10 +3067,13 @@ namespace akkaradb::engine::cluster {
                     .lastIncludedIndex = lastIncludedIndex_,
                     .lastIncludedTerm = lastIncludedTerm_,
                     .lastIncludedStateMachineSeq = lastIncludedStateMachineSeq_,
-                    .log = log_,
-                    .committedVoters = committedVoters_,
-                    .jointOldVoters = jointOldVoters_,
-                    .jointNewVoters = jointNewVoters_,
+                    .configurationGeneration = lastConfigurationGeneration_,
+                    .logPrefixSize = prefix,
+                    .learnerBootstrapPending = learnerBootstrapPending_,
+                    .log = std::vector<RaftLogEntry>{log_.begin() + prefix, log_.end()},
+                    .committedMembers = committedMembers_,
+                    .jointOldMembers = jointOldMembers_,
+                    .jointNewMembers = jointNewMembers_,
                     .peers = peers_,
                     .peerReplication = peerReplication_,
                     .durableSnapshotInstall = durableSnapshotInstall_
@@ -2910,10 +3091,14 @@ namespace akkaradb::engine::cluster {
                 lastIncludedIndex_ = state.lastIncludedIndex;
                 lastIncludedTerm_ = state.lastIncludedTerm;
                 lastIncludedStateMachineSeq_ = state.lastIncludedStateMachineSeq;
-                log_ = std::move(state.log);
-                committedVoters_ = std::move(state.committedVoters);
-                jointOldVoters_ = std::move(state.jointOldVoters);
-                jointNewVoters_ = std::move(state.jointNewVoters);
+                lastConfigurationGeneration_ = state.configurationGeneration;
+                learnerBootstrapPending_ = state.learnerBootstrapPending;
+                log_.resize(state.logPrefixSize);
+                log_.insert(log_.end(), std::make_move_iterator(state.log.begin()), std::make_move_iterator(state.log.end()));
+                invalidateLogSuffixLocked(lastIncludedIndex_ + state.logPrefixSize + 1);
+                committedMembers_ = std::move(state.committedMembers);
+                jointOldMembers_ = std::move(state.jointOldMembers);
+                jointNewMembers_ = std::move(state.jointNewMembers);
                 peers_ = std::move(state.peers);
                 peerReplication_ = std::move(state.peerReplication);
                 durableSnapshotInstall_ = std::move(state.durableSnapshotInstall);
@@ -2951,15 +3136,27 @@ namespace akkaradb::engine::cluster {
                 return observedLeaderTerm_ == term && observedLeaderId_ == leaderId;
             }
 
+            void recordLeaderContactLocked() {
+                lastLeaderContact_ = Clock::now();
+                ++leaderContactGeneration_;
+                electionDeadline_ = nextElectionDeadline();
+            }
+
             bool claimPeerReplication(uint64_t peerId) {
                 std::unique_lock lock{mutex_};
-                peerReplicationCv_.wait(
-                    lock,
-                    [&] {
-                        const auto* state = peerState(peerId);
-                        return !running_ || role_.load() != RaftRole::LEADER || state == nullptr || !state->inFlight;
+                const auto available = [&] {
+                    const auto* state = peerState(peerId);
+                    return !running_ || role_.load() != RaftRole::LEADER || state == nullptr || !state->inFlight;
+                };
+                const auto deadline = detail::ReconfigurationDeadline::current().deadline;
+                if (deadline == Clock::time_point::max()) { peerReplicationCv_.wait(lock, available); }
+                else {
+                    while (!available()) {
+                        detail::ReconfigurationDeadline::check();
+                        peerReplicationCv_.wait_until(lock, std::min(deadline, Clock::now() + std::chrono::milliseconds{25}));
                     }
-                );
+                    detail::ReconfigurationDeadline::check();
+                }
                 if (!running_ || role_.load() != RaftRole::LEADER) { return false; }
                 auto* state = peerState(peerId);
                 if (state == nullptr) { return false; }
@@ -2979,6 +3176,7 @@ namespace akkaradb::engine::cluster {
                 try {
                     for (;;) {
                         retirePeerWorkers();
+                        maybeCompactLog();
                         std::unique_lock lock{mutex_};
                         if (!running_) { return; }
                         if (role_.load() == RaftRole::LEADER) {
@@ -2987,6 +3185,10 @@ namespace akkaradb::engine::cluster {
                             maybeCompactLog();
                             lock.lock();
                             cv_.wait_for(lock, std::chrono::milliseconds{runtimeOptions_.raftHeartbeatIntervalMs}, [&] { return !running_; });
+                            continue;
+                        }
+                        if (!forceElection_ && config_.failover() == FailoverPolicy::NONE) {
+                            cv_.wait_for(lock, std::chrono::milliseconds{100});
                             continue;
                         }
                         if (!forceElection_ && Clock::now() < electionDeadline_) {
@@ -3005,30 +3207,73 @@ namespace akkaradb::engine::cluster {
 
             void startElection() {
                 uint64_t term = 0;
+                uint64_t baseTerm = 0;
+                uint64_t contactGeneration = 0;
                 uint64_t lastIndex = 0;
                 uint64_t lastTerm = 0;
+                bool forced = false;
                 std::vector<NodeInfo> electionPeers;
+                std::vector<NodeInfo> electionMembers;
+                std::optional<std::vector<NodeInfo>> electionOldMembers, electionNewMembers;
+                std::optional<std::pair<std::vector<NodeInfo>, std::vector<NodeInfo>>> pendingJoint;
                 {
                     std::lock_guard lock{mutex_};
-                    if (!running_) { return; }
+                    if (!running_ || role_.load() == RaftRole::LEADER) { return; }
                     if (!self_->coordinatorEligible() || !isVotingMemberLocked(selfNodeId_)) {
                         forceElection_ = false;
                         electionDeadline_ = nextElectionDeadline();
                         return;
                     }
-                    forceElection_ = false;
-                    const auto hardBackup = captureDurableHardStateLocked();
-                    role_.store(RaftRole::CANDIDATE);
-                    peerReplicationCv_.notify_all();
-                    ++currentTerm_;
-                    term = currentTerm_;
-                    votedFor_ = selfNodeId_;
-                    clearObservedLeaderLocked();
+                    if (!forceElection_ && (config_.failover() == FailoverPolicy::NONE || Clock::now() < electionDeadline_)) { return; }
+                    if (currentTerm_ == UINT64_MAX) { throw std::runtime_error("RaftConsensusRuntime: election term exhausted"); }
+                    forced = forceElection_;
+                    baseTerm = currentTerm_;
+                    term = baseTerm + 1;
+                    contactGeneration = leaderContactGeneration_;
                     lastIndex = lastLogIndex();
                     lastTerm = lastLogTerm();
                     electionDeadline_ = nextElectionDeadline();
                     refreshPeersFromMembershipLocked();
                     electionPeers = peers_;
+                    std::erase_if(electionPeers, [this](const NodeInfo& node) { return !isVotingMemberLocked(node.nodeId); });
+                    electionMembers = committedMembers_;
+                    electionOldMembers = jointOldMembers_;
+                    electionNewMembers = jointNewMembers_;
+                    pendingJoint = pendingJointMembershipLocked();
+                }
+
+                std::vector<uint64_t> granted{selfNodeId_};
+                // TimeoutNow is an authenticated, explicit transfer from the observed
+                // leader. Ordinary campaigns must first obtain a non-binding quorum.
+                if (!forced) {
+                    granted = collectElectionVotes(electionPeers, RequestVote{term, selfNodeId_, lastIndex, lastTerm}, true);
+                }
+
+                {
+                    std::lock_guard lock{mutex_};
+                    const auto currentPendingJoint = pendingJointMembershipLocked();
+                    const bool samePendingJoint = pendingJoint.has_value() == currentPendingJoint.has_value() &&
+                        (!pendingJoint || (sameNodeSet(pendingJoint->first, currentPendingJoint->first) &&
+                                           sameNodeSet(pendingJoint->second, currentPendingJoint->second)));
+                    if (!running_ || currentTerm_ != baseTerm || role_.load() == RaftRole::LEADER ||
+                        !self_->coordinatorEligible() || !isVotingMemberLocked(selfNodeId_) ||
+                        !sameNodeSet(electionMembers, committedMembers_) ||
+                        !sameOptionalNodeSet(electionOldMembers, jointOldMembers_) ||
+                        !sameOptionalNodeSet(electionNewMembers, jointNewMembers_) || !samePendingJoint ||
+                        (!forced && (leaderContactGeneration_ != contactGeneration || !hasElectionQuorumLocked(granted)))) {
+                        return;
+                    }
+                    if (!forced && forceElection_) { return; } // Let the next loop honor a concurrent TimeoutNow.
+                    forceElection_ = false;
+                    const auto hardBackup = captureDurableHardStateLocked();
+                    role_.store(RaftRole::CANDIDATE);
+                    peerReplicationCv_.notify_all();
+                    currentTerm_ = term;
+                    votedFor_ = selfNodeId_;
+                    clearObservedLeaderLocked();
+                    lastIndex = lastLogIndex();
+                    lastTerm = lastLogTerm();
+                    electionDeadline_ = nextElectionDeadline();
                     try { persistState(); }
                     catch (...) {
                         restoreDurableHardStateLocked(hardBackup);
@@ -3038,43 +3283,49 @@ namespace akkaradb::engine::cluster {
                     }
                 }
 
-                struct Votes { std::mutex mutex; std::vector<uint64_t> granted; };
-                auto votes = std::make_shared<Votes>();
-                votes->granted.push_back(selfNodeId_);
-                std::vector<std::future<void>> workers;
-                for (const auto& peer : electionPeers) {
-                    workers.push_back(schedulePeerTask(peer.nodeId,
-                        [this, peer, term, lastIndex, lastTerm, votes] {
-                            RequestVoteResponse response;
-                            if (requestVote(peer, RequestVote{term, selfNodeId_, lastIndex, lastTerm}, response)) {
-                                if (response.term > term) {
-                                    becomeFollower(response.term);
-                                    return;
-                                }
-                                if (response.voteGranted) {
-                                    std::lock_guard lock{votes->mutex};
-                                    votes->granted.push_back(peer.nodeId);
-                                }
-                            }
-                        }
-                    ));
-                }
-                for (auto& worker : workers) { worker.wait(); }
-                for (auto& worker : workers) { worker.get(); }
+                granted = collectElectionVotes(electionPeers, RequestVote{term, selfNodeId_, lastIndex, lastTerm}, false);
 
                 bool won = false;
                 {
                     std::lock_guard lock{mutex_};
-                    std::lock_guard votesLock{votes->mutex};
-                    won = running_ && currentTerm_ == term && role_.load() == RaftRole::CANDIDATE && hasElectionQuorumLocked(votes->granted);
+                    won = running_ && currentTerm_ == term && role_.load() == RaftRole::CANDIDATE && hasElectionQuorumLocked(granted);
                 }
                 if (won) { becomeLeader(term); }
+            }
+
+            std::vector<uint64_t> collectElectionVotes(const std::vector<NodeInfo>& peers, RequestVote request, bool probe) {
+                struct Votes { std::mutex mutex; std::vector<uint64_t> granted; };
+                auto votes = std::make_shared<Votes>();
+                votes->granted.push_back(selfNodeId_);
+                std::vector<std::future<void>> workers;
+                for (const auto& peer : peers) {
+                    workers.push_back(schedulePeerTask(peer.nodeId, [this, peer, request, probe, votes] {
+                        RequestVoteResponse response;
+                        if (!(probe ? preVote(peer, request, response) : requestVote(peer, request, response))) { return; }
+                        // Probes report actual hard state, not the prospective term.
+                        const uint64_t actualTerm = probe ? request.term - 1 : request.term;
+                        if (response.term > actualTerm) { becomeFollower(response.term); return; }
+                        if (response.voteGranted && (probe || response.term == request.term)) {
+                            std::lock_guard lock{votes->mutex};
+                            votes->granted.push_back(peer.nodeId);
+                        }
+                    }));
+                }
+                for (auto& worker : workers) { worker.wait(); }
+                for (auto& worker : workers) { worker.get(); }
+                return std::move(votes->granted);
             }
 
             bool requestVote(const NodeInfo& peer, const RequestVote& request, RequestVoteResponse& response) {
                 DecodedFrame frame;
                 return exchangeRpc(peer, encodeRequestVote(request), ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE, frame, rpcTimeoutMs(500)) &&
                     decodeRequestVoteResponse(frame.payload, response);
+            }
+
+            bool preVote(const NodeInfo& peer, const RequestVote& request, RequestVoteResponse& response) {
+                DecodedFrame frame;
+                return exchangeRpc(peer, encodeRequestVote(request, ReplMsgType::RAFT_PRE_VOTE), ReplMsgType::RAFT_PRE_VOTE_RESPONSE,
+                    frame, rpcTimeoutMs(500)) && decodeRequestVoteResponse(frame.payload, response);
             }
 
             bool appendEntries(const NodeInfo& peer, const AppendEntries& request, AppendEntriesResponse& response) {
@@ -3133,13 +3384,14 @@ namespace akkaradb::engine::cluster {
                 RequestState snapshotRequests;
                 uint64_t logIndexValue = 0;
                 uint64_t logTermValue = 0;
-                std::vector<NodeInfo> committedVoters;
-                std::optional<std::vector<NodeInfo>> jointOldVoters;
-                std::optional<std::vector<NodeInfo>> jointNewVoters;
+                uint64_t configurationGeneration = 0;
+                std::vector<NodeInfo> committedMembers;
+                std::optional<std::vector<NodeInfo>> jointOldMembers;
+                std::optional<std::vector<NodeInfo>> jointNewMembers;
                 {
                     std::lock_guard applyLock{applyMutex_};
                     snapshot = callbacks_.exportSnapshot();
-                    if (!snapshot || snapshot->seq == 0 || !snapshot->forEachEntry) { return false; }
+                    if (!snapshot || !snapshot->forEachEntry) { return false; }
                     std::lock_guard lock{mutex_};
                     auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
                     if (!logIndex && lastIncludedIndex_ > 0) { logIndex = lastIncludedIndex_; }
@@ -3148,9 +3400,10 @@ namespace akkaradb::engine::cluster {
                     snapshotRequests = requestState_;
                     std::erase_if(snapshotRequests.results, [&](const auto& item) { return item.second.index > logIndexValue; });
                     logTermValue = termAt(logIndexValue);
-                    committedVoters = committedVoters_;
-                    jointOldVoters = jointOldVoters_;
-                    jointNewVoters = jointNewVoters_;
+                    configurationGeneration = lastConfigurationGeneration_;
+                    committedMembers = committedMembers_;
+                    jointOldMembers = jointOldMembers_;
+                    jointNewMembers = jointNewMembers_;
                 }
                 if (logTermValue == 0) { return false; }
 
@@ -3161,14 +3414,16 @@ namespace akkaradb::engine::cluster {
                     request.lastIncludedIndex = logIndexValue;
                     request.lastIncludedTerm = logTermValue;
                     request.snapshotSeq = snapshot->seq;
-                    request.committedVoters = committedVoters;
-                    request.jointOldVoters = jointOldVoters;
-                    request.jointNewVoters = jointNewVoters;
+                    request.configurationGeneration = configurationGeneration;
+                    request.committedMembers = committedMembers;
+                    request.jointOldMembers = jointOldMembers;
+                    request.jointNewMembers = jointNewMembers;
                     return request;
                 };
 
                 InstallSnapshot current = makeRequest();
                 const auto sendRequest = [&](const InstallSnapshot& request) {
+                    detail::ReconfigurationDeadline::check();
                     return installSnapshot(peer, request, response) && response.term <= term && response.success;
                 };
                 const size_t chunkSize = runtimeOptions_.raftBlobChunkSizeBytes;
@@ -3308,10 +3563,10 @@ namespace akkaradb::engine::cluster {
             }
 
             void maybeCompactLog(bool force = false) {
-                if (!callbacks_.exportSnapshot) { return; }
+                if (!runtimeOptions_.raftSnapshot.enabled || !callbacks_.exportSnapshot) { return; }
                 {
                     std::lock_guard lock{mutex_};
-                    if (!running_ || role_.load() != RaftRole::LEADER) { return; }
+                    if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
                     const auto now = Clock::now();
                     if (!force && now < nextCompactionCheck_) { return; }
                     nextCompactionCheck_ = now + std::chrono::seconds{1};
@@ -3320,13 +3575,13 @@ namespace akkaradb::engine::cluster {
                 std::lock_guard applyLock{applyMutex_};
                 {
                     std::lock_guard lock{mutex_};
-                    if (!running_ || role_.load() != RaftRole::LEADER) { return; }
+                    if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
                     if (!force && !shouldCompactLogLocked(Clock::now())) { return; }
                 }
                 const auto snapshot = callbacks_.exportSnapshot();
-                if (!snapshot || snapshot->seq == 0) { return; }
+                if (!snapshot) { return; }
                 std::lock_guard lock{mutex_};
-                if (!running_ || role_.load() != RaftRole::LEADER) { return; }
+                if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
                 const auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
                 if (!logIndex || *logIndex <= lastIncludedIndex_ || *logIndex > commitIndex_) { return; }
                 const uint64_t includedTerm = termAt(*logIndex);
@@ -3344,6 +3599,9 @@ namespace akkaradb::engine::cluster {
             void compactLogThrough(uint64_t index, uint64_t term, uint64_t stateMachineSeq) {
                 if (index <= lastIncludedIndex_) { return; }
                 log_.erase(std::ranges::remove_if(log_, [&](const RaftLogEntry& entry) { return entry.index <= index; }).begin(), log_.end());
+                if (log_.capacity() > 2 * log_.size() + runtimeOptions_.raftSnapshot.minLogEntries) { log_.shrink_to_fit(); }
+                validatedLog_.clear();
+                if (validatedLog_.capacity() > runtimeOptions_.raftSnapshot.minLogEntries * 2) { validatedLog_.shrink_to_fit(); }
                 lastIncludedIndex_ = index;
                 lastIncludedTerm_ = term;
                 lastIncludedStateMachineSeq_ = std::max(lastIncludedStateMachineSeq_, stateMachineSeq);
@@ -3351,14 +3609,15 @@ namespace akkaradb::engine::cluster {
                 if (lastApplied_ < lastIncludedIndex_) { lastApplied_ = lastIncludedIndex_; }
             }
 
-            void proposeMembershipChange(const std::vector<NodeInfo>& oldVoters, const std::vector<NodeInfo>& newVoters) {
-                RaftLogEntry joint = makeConfigEntry(RaftEntryKind::CONFIG_JOINT, oldVoters, newVoters);
+            void proposeMembershipChange(const std::vector<NodeInfo>& oldMembers, const std::vector<NodeInfo>& newMembers, uint64_t generation = 0) {
+                RaftLogEntry joint = makeConfigEntry(RaftEntryKind::CONFIG_JOINT, oldMembers, newMembers, generation);
                 appendReplicateAndCommitConfig(joint);
-                RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
+                crashAtLogTestPoint("raft.learner.after_joint_commit");
+                RaftLogEntry final = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldMembers, newMembers, generation);
                 appendReplicateAndCommitConfig(final);
             }
 
-            RaftLogEntry makeConfigEntry(RaftEntryKind kind, const std::vector<NodeInfo>& oldVoters, const std::vector<NodeInfo>& newVoters) {
+            RaftLogEntry makeConfigEntry(RaftEntryKind kind, const std::vector<NodeInfo>& oldMembers, const std::vector<NodeInfo>& newMembers, uint64_t generation = 0) {
                 std::lock_guard lock{mutex_};
                 if (commitIndex_ != lastLogIndex()) {
                     throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
@@ -3368,13 +3627,15 @@ namespace akkaradb::engine::cluster {
                 entry.index = lastLogIndex() + 1;
                 entry.clientSeq = 0;
                 entry.kind = kind;
-                entry.key = encodeNodeSet(oldVoters);
-                entry.value = encodeNodeSet(newVoters);
+                entry.sourceNodeId = generation;
+                entry.key = encodeNodeSet(oldMembers);
+                entry.value = encodeNodeSet(newMembers);
                 if (!isValidRaftLogEntryShape(entry)) { throw std::runtime_error("RaftConsensusRuntime: invalid membership log entry"); }
                 return entry;
             }
 
             void appendReplicateAndCommitConfig(const RaftLogEntry& entry, bool appendEntry = true) {
+                detail::ReconfigurationDeadline::check();
                 uint64_t term = 0;
                 {
                     std::lock_guard lock{mutex_};
@@ -3385,14 +3646,14 @@ namespace akkaradb::engine::cluster {
                     try {
                         if (appendEntry) { log_.push_back(entry); }
                         if (entry.kind == RaftEntryKind::CONFIG_JOINT) {
-                            std::vector<NodeInfo> oldVoters;
-                            std::vector<NodeInfo> newVoters;
-                            if (!decodeNodeSet(entry.key, oldVoters) || !decodeNodeSet(entry.value, newVoters)) {
+                            std::vector<NodeInfo> oldMembers;
+                            std::vector<NodeInfo> newMembers;
+                            if (!decodeNodeSet(entry.key, oldMembers) || !decodeNodeSet(entry.value, newMembers)) {
                                 throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
                             }
-                            auto targets = oldVoters;
-                            targets.insert(targets.end(), newVoters.begin(), newVoters.end());
-                            targets = sortedUniqueVoters(std::move(targets));
+                            auto targets = oldMembers;
+                            targets.insert(targets.end(), newMembers.begin(), newMembers.end());
+                            targets = sortedUniqueMembers(std::move(targets));
                             for (const auto& node : targets) {
                                 if (node.nodeId != selfNodeId_ && peerState(node.nodeId) == nullptr) {
                                     peerReplication_.push_back(PeerReplicationState{.node = node, .nextIndex = 1, .matchIndex = 0, .inFlight = false});
@@ -3411,6 +3672,7 @@ namespace akkaradb::engine::cluster {
                 if (!replicateEntryToMajority(entry, std::chrono::milliseconds{20000})) {
                     throw std::runtime_error("RaftConsensusRuntime: failed to replicate membership change to Raft quorum");
                 }
+                if (entry.kind == RaftEntryKind::CONFIG_JOINT) { crashAtLogTestPoint("raft.learner.after_joint_replication"); }
                 {
                     std::lock_guard lock{mutex_};
                     if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
@@ -3431,37 +3693,44 @@ namespace akkaradb::engine::cluster {
             }
 
             void applyConfigEntryLocked(const RaftLogEntry& entry) {
+                lastConfigurationGeneration_ = std::max(lastConfigurationGeneration_, entry.sourceNodeId);
                 if (entry.kind == RaftEntryKind::CONFIG_JOINT) {
-                    std::vector<NodeInfo> oldVoters;
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry.key, oldVoters) || !decodeNodeSet(entry.value, newVoters)) {
+                    std::vector<NodeInfo> oldMembers;
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry.key, oldMembers) || !decodeNodeSet(entry.value, newMembers)) {
                         throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
                     }
-                    jointOldVoters_ = sortedUniqueVoters(std::move(oldVoters));
-                    jointNewVoters_ = sortedUniqueVoters(std::move(newVoters));
+                    jointOldMembers_ = sortedUniqueMembers(std::move(oldMembers));
+                    jointNewMembers_ = sortedUniqueMembers(std::move(newMembers));
                 }
                 else if (entry.kind == RaftEntryKind::CONFIG_FINAL) {
-                    std::vector<NodeInfo> newVoters;
-                    if (!decodeNodeSet(entry.value, newVoters)) { throw std::runtime_error("RaftConsensusRuntime: corrupt final membership entry"); }
-                    committedVoters_ = sortedUniqueVoters(std::move(newVoters));
-                    jointOldVoters_.reset();
-                    jointNewVoters_.reset();
+                    std::vector<NodeInfo> newMembers;
+                    if (!decodeNodeSet(entry.value, newMembers)) { throw std::runtime_error("RaftConsensusRuntime: corrupt final membership entry"); }
+                    committedMembers_ = sortedUniqueMembers(std::move(newMembers));
+                    jointOldMembers_.reset();
+                    jointNewMembers_.reset();
+                }
+                if (containsNode(committedMembers_, selfNodeId_) || (jointNewMembers_ && containsNode(*jointNewMembers_, selfNodeId_))) {
+                    learnerBootstrapPending_ = false;
                 }
                 refreshPeersFromMembershipLocked();
                 ensurePeerReplicationTargetsLocked();
             }
 
             bool applySnapshotMembershipLocked(const InstallSnapshot& request) {
-                if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) { return false; }
-                committedVoters_ = sortedUniqueVoters(request.committedVoters);
-                if (request.jointOldVoters && request.jointNewVoters) {
-                    jointOldVoters_ = sortedUniqueVoters(*request.jointOldVoters);
-                    jointNewVoters_ = sortedUniqueVoters(*request.jointNewVoters);
-                    if (jointOldVoters_->empty() || jointNewVoters_->empty()) { return false; }
+                if (!hasVoter(request.committedMembers) || request.jointOldMembers.has_value() != request.jointNewMembers.has_value()) { return false; }
+                committedMembers_ = sortedUniqueMembers(request.committedMembers);
+                if (request.jointOldMembers && request.jointNewMembers) {
+                    jointOldMembers_ = sortedUniqueMembers(*request.jointOldMembers);
+                    jointNewMembers_ = sortedUniqueMembers(*request.jointNewMembers);
+                    if (jointOldMembers_->empty() || jointNewMembers_->empty()) { return false; }
                 }
                 else {
-                    jointOldVoters_.reset();
-                    jointNewVoters_.reset();
+                    jointOldMembers_.reset();
+                    jointNewMembers_.reset();
+                }
+                if (containsNode(committedMembers_, selfNodeId_) || (jointNewMembers_ && containsNode(*jointNewMembers_, selfNodeId_))) {
+                    learnerBootstrapPending_ = false;
                 }
                 refreshPeersFromMembershipLocked();
                 ensurePeerReplicationTargetsLocked();
@@ -3469,16 +3738,19 @@ namespace akkaradb::engine::cluster {
             }
 
             bool applySnapshotMembershipLocked(const SnapshotInstallTransaction& transaction) {
-                if (transaction.committedVoters.empty() || transaction.jointOldVoters.has_value() != transaction.jointNewVoters.has_value()) { return false; }
-                committedVoters_ = sortedUniqueVoters(transaction.committedVoters);
-                if (transaction.jointOldVoters && transaction.jointNewVoters) {
-                    jointOldVoters_ = sortedUniqueVoters(*transaction.jointOldVoters);
-                    jointNewVoters_ = sortedUniqueVoters(*transaction.jointNewVoters);
-                    if (jointOldVoters_->empty() || jointNewVoters_->empty()) { return false; }
+                if (!hasVoter(transaction.committedMembers) || transaction.jointOldMembers.has_value() != transaction.jointNewMembers.has_value()) { return false; }
+                committedMembers_ = sortedUniqueMembers(transaction.committedMembers);
+                if (transaction.jointOldMembers && transaction.jointNewMembers) {
+                    jointOldMembers_ = sortedUniqueMembers(*transaction.jointOldMembers);
+                    jointNewMembers_ = sortedUniqueMembers(*transaction.jointNewMembers);
+                    if (jointOldMembers_->empty() || jointNewMembers_->empty()) { return false; }
                 }
                 else {
-                    jointOldVoters_.reset();
-                    jointNewVoters_.reset();
+                    jointOldMembers_.reset();
+                    jointNewMembers_.reset();
+                }
+                if (containsNode(committedMembers_, selfNodeId_) || (jointNewMembers_ && containsNode(*jointNewMembers_, selfNodeId_))) {
+                    learnerBootstrapPending_ = false;
                 }
                 refreshPeersFromMembershipLocked();
                 ensurePeerReplicationTargetsLocked();
@@ -3487,6 +3759,7 @@ namespace akkaradb::engine::cluster {
 
             bool finalizeSnapshotInstallMetadataLocked(const SnapshotInstallTransaction& transaction) {
                 if (!applySnapshotMembershipLocked(transaction)) { return false; }
+                lastConfigurationGeneration_ = transaction.configurationGeneration;
                 for (const auto& [id, record] : transaction.requestState.results) {
                     if (record.index > transaction.lastIncludedIndex) { return false; }
                 }
@@ -3505,9 +3778,10 @@ namespace akkaradb::engine::cluster {
             }
 
             bool replicateEntryToMajority(const RaftLogEntry& entry, std::chrono::milliseconds retryWindow = std::chrono::milliseconds{0}) {
-                const auto deadline = Clock::now() + (retryWindow.count() == 0 ? std::chrono::milliseconds{config_.consistency().ackTimeoutMs} : retryWindow);
+                const auto deadline = detail::ReconfigurationDeadline::cap(Clock::now() + (retryWindow.count() == 0 ? std::chrono::milliseconds{config_.consistency().ackTimeoutMs} : retryWindow));
                 const auto entryTargets = replicationTargetsForEntry(entry);
                 do {
+                    detail::ReconfigurationDeadline::check();
                     std::vector<NodeInfo> targets;
                     {
                         std::lock_guard lock{mutex_};
@@ -3543,7 +3817,7 @@ namespace akkaradb::engine::cluster {
                     std::lock_guard lock{mutex_};
                     if (role_.load() != RaftRole::LEADER || currentTerm_ != term) { return false; }
                     if (entry.index > commitIndex_ && canCommitEntryLocked(entry)) {
-                        const auto backup = captureDurableLogStateLocked();
+                        const auto backup = captureDurableLogStateLocked(lastLogIndex() + 1);
                         try {
                             commitIndex_ = entry.index;
                             persistLog();
@@ -3563,7 +3837,7 @@ namespace akkaradb::engine::cluster {
             void linearizableReadBarrier() {
                 uint64_t term = 0, readIndex = 0, round = 0;
                 std::vector<NodeInfo> targets, voters;
-                std::optional<std::vector<NodeInfo>> oldVoters, newVoters;
+                std::optional<std::vector<NodeInfo>> oldMembers, newMembers;
                 // A newly elected leader must commit its current-term NOOP once.
                 bool established = false;
                 {
@@ -3578,32 +3852,37 @@ namespace akkaradb::engine::cluster {
                     if (!running_ || role_.load() != RaftRole::LEADER || termAt(commitIndex_) != currentTerm_) {
                         throw std::runtime_error("RaftConsensusRuntime: local node has no established leadership");
                     }
+                    if (pendingJointMembershipLocked()) {
+                        throw std::runtime_error("RaftConsensusRuntime: membership change already in progress during ReadIndex");
+                    }
                     term = currentTerm_;
                     readIndex = commitIndex_;
                     if (nextReadRound_ == UINT64_MAX) { throw std::runtime_error("Raft read rounds exhausted"); }
                     round = ++nextReadRound_;
                     targets = peers_;
-                    voters = committedVoters_;
-                    oldVoters = jointOldVoters_;
-                    newVoters = jointNewVoters_;
+                    voters = committedMembers_;
+                    oldMembers = jointOldMembers_;
+                    newMembers = jointNewMembers_;
                 }
-                const auto deadline = Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs};
+                const auto deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs});
                 for (;;) {
+                    detail::ReconfigurationDeadline::check();
                     for (const auto& peer : targets) { scheduleReplication(peer, readIndex, true, round); }
                     std::unique_lock lock{mutex_};
                     const auto confirmed = [&] {
                         std::vector<uint64_t> acknowledgers{selfNodeId_};
                         for (const auto& [id, ack] : readAcks_) { if (ack.first == term && ack.second >= round) { acknowledgers.push_back(id); } }
-                        return oldVoters && newVoters
-                            ? votedByMajority(*oldVoters, acknowledgers) && votedByMajority(*newVoters, acknowledgers)
+                        return oldMembers && newMembers
+                            ? votedByMajority(*oldMembers, acknowledgers) && votedByMajority(*newMembers, acknowledgers)
                             : votedByMajority(voters, acknowledgers);
                     };
                     peerReplicationCv_.wait_until(lock, std::min(deadline, Clock::now() + std::chrono::milliseconds{50}), [&] {
                         return !running_ || currentTerm_ != term || role_.load() != RaftRole::LEADER || confirmed();
                     });
                     if (!running_ || currentTerm_ != term || role_.load() != RaftRole::LEADER ||
-                        !sameNodeSet(voters, committedVoters_) || !sameOptionalNodeSet(oldVoters, jointOldVoters_) ||
-                        !sameOptionalNodeSet(newVoters, jointNewVoters_)) {
+                        pendingJointMembershipLocked() ||
+                        !sameNodeSet(voters, committedMembers_) || !sameOptionalNodeSet(oldMembers, jointOldMembers_) ||
+                        !sameOptionalNodeSet(newMembers, jointNewMembers_)) {
                         throw std::runtime_error("RaftConsensusRuntime: leadership or membership changed during ReadIndex");
                     }
                     if (confirmed()) { break; }
@@ -3617,7 +3896,11 @@ namespace akkaradb::engine::cluster {
             }
 
         private:
-            bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat = false, uint64_t readRound = 0) {
+            bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat = false, uint64_t readRound = 0,
+                bool migration = false) {
+                const auto transferStarted = Clock::now();
+                const auto transferDeadline = detail::ReconfigurationDeadline::cap(transferStarted + std::chrono::milliseconds{runtimeOptions_.reconfiguration.timeoutMs});
+                uint64_t transferred = 0;
                 if (!claimPeerReplication(peerId)) { return false; }
                 struct PeerReplicationGuard {
                     Impl* runtime;
@@ -3628,6 +3911,8 @@ namespace akkaradb::engine::cluster {
                 } guard{this, peerId};
 
                 while (true) {
+                    detail::ReconfigurationDeadline::check();
+                    if (migration && Clock::now() >= transferDeadline) { return false; }
                     NodeInfo peer;
                     uint64_t requestTerm = 0;
                     auto needsSnapshot = false;
@@ -3635,6 +3920,7 @@ namespace akkaradb::engine::cluster {
                     {
                         std::lock_guard lock{mutex_};
                         if (!running_ || role_.load() != RaftRole::LEADER) { return false; }
+                        if (!containsNode(committedMembers_, peerId)) { migration = true; }
                         auto* state = peerState(peerId);
                         if (state == nullptr) { return false; }
                         if (state->matchIndex >= targetIndex && !forceHeartbeat) { return true; }
@@ -3670,6 +3956,19 @@ namespace akkaradb::engine::cluster {
                     }
 
                     AppendEntriesResponse response;
+                    if (migration && runtimeOptions_.reconfiguration.maxTransferBytesPerSecond != 0 && !appendRequest.entries.empty()) {
+                        transferred += encodeAppendEntries(appendRequest).size();
+                        const auto seconds = std::chrono::duration<double>{static_cast<double>(transferred) /
+                            static_cast<double>(runtimeOptions_.reconfiguration.maxTransferBytesPerSecond)};
+                        const auto scheduled = transferStarted + std::chrono::duration_cast<Clock::duration>(seconds);
+                        std::unique_lock lock{mutex_};
+                        while (Clock::now() < scheduled) {
+                            if (!running_ || Clock::now() >= transferDeadline ||
+                                (runtimeOptions_.reconfiguration.cancelled && runtimeOptions_.reconfiguration.cancelled())) { return false; }
+                            detail::ReconfigurationDeadline::check();
+                            cv_.wait_until(lock, std::min(transferDeadline, Clock::now() + std::chrono::milliseconds{25}));
+                        }
+                    }
                     if (!appendEntries(peer, appendRequest, response)) { return false; }
                     if (response.term > appendRequest.term) {
                         becomeFollower(response.term);
@@ -3688,7 +3987,13 @@ namespace akkaradb::engine::cluster {
                         else { ack.second = std::max(ack.second, readRound); }
                         peerReplicationCv_.notify_all();
                     }
-                    else { updateNextIndexAfterConflictLocked(*state, response); }
+                    else {
+                        const auto before = state->nextIndex;
+                        updateNextIndexAfterConflictLocked(*state, response);
+                        // A peer which repeatedly refuses the same prefix must
+                        // release its worker so heartbeats and fencing can proceed.
+                        if (state->nextIndex == before) { return false; }
+                    }
                 }
             }
 
@@ -3770,7 +4075,7 @@ namespace akkaradb::engine::cluster {
                     bool knownNode = false;
                     {
                         std::lock_guard lock{mutex_};
-                        knownNode = isVotingMemberLocked(hello.nodeId);
+                        knownNode = isReplicationMemberLocked(hello.nodeId);
                     }
                     if (!knownNode || !verifySecurePeer(hello.nodeId, remotePublicKey)) {
                         helloResponse.status = RaftPeerHelloStatus::UNKNOWN_NODE;
@@ -3812,7 +4117,16 @@ namespace akkaradb::engine::cluster {
                     if (ready < 0) { return; }
                     DecodedFrame frame;
                     if (!recvFrame(client, secure.get(), frame, receiveBudget_)) { return; }
-                    if (frame.type == ReplMsgType::RAFT_REQUEST_VOTE) {
+                    if (frame.type == ReplMsgType::RAFT_PRE_VOTE) {
+                        RequestVote request;
+                        RequestVoteResponse response;
+                        if (decodeRequestVote(frame.payload, request) && request.candidateId == hello.nodeId &&
+                            verifySecurePeer(request.candidateId, remotePublicKey)) {
+                            response = handlePreVote(request);
+                        }
+                        if (!sendFrame(client, secure.get(), encodeRequestVoteResponse(response, ReplMsgType::RAFT_PRE_VOTE_RESPONSE))) { return; }
+                    }
+                    else if (frame.type == ReplMsgType::RAFT_REQUEST_VOTE) {
                         RequestVote request;
                         RequestVoteResponse response;
                         if (decodeRequestVote(frame.payload, request) && verifySecurePeer(request.candidateId, remotePublicKey)) {
@@ -3844,8 +4158,47 @@ namespace akkaradb::engine::cluster {
                         }
                         if (!sendFrame(client, secure.get(), encodeTimeoutNowResponse(response))) { return; }
                     }
+                    else if (frame.type == ReplMsgType::FORWARD_REQUEST) {
+                        {
+                            std::lock_guard lock{mutex_};
+                            if (!isReplicationMemberLocked(hello.nodeId)) { return; }
+                        }
+                        ForwardRequest request;
+                        auto requestReservation = receiveBudget_->reserve(forwardRequestMemoryBytes(frame.payload));
+                        if (!decodeForwardRequest(frame.payload, request)) { return; }
+                        ForwardResponse response;
+                        response.errorCode = ClusterRoutingCode::FORWARD_UNAVAILABLE;
+                        if (callbacks_.forward) {
+                            try { response = callbacks_.forward(request); }
+                            catch (const ClusterRoutingError& error) {
+                                response.errorCode = error.code; response.target = error.target; response.message = error.what();
+                            }
+                            catch (const std::exception& error) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; response.message = error.what(); }
+                            catch (...) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; }
+                        }
+                        response.requestId = request.requestId;
+                        response.message.resize(std::min<size_t>(response.message.size(), 4096));
+                        auto wire = encodeForwardResponse(response);
+                        if (wire.empty()) {
+                            response = {}; response.requestId = request.requestId;
+                            response.errorCode = ClusterRoutingCode::PAYLOAD_TOO_LARGE;
+                            wire = encodeForwardResponse(response);
+                        }
+                        if (!sendFrame(client, secure.get(), wire)) { return; }
+                    }
                     else { return; }
                 }
+            }
+
+            RequestVoteResponse handlePreVote(const RequestVote& request) {
+                std::lock_guard lock{mutex_};
+                const bool recentLeader = lastLeaderContact_ &&
+                    Clock::now() - *lastLeaderContact_ < std::chrono::milliseconds{baselineElectionTimeoutMs()};
+                const bool upToDate = request.lastLogTerm > lastLogTerm() ||
+                    (request.lastLogTerm == lastLogTerm() && request.lastLogIndex >= lastLogIndex());
+                const bool granted = running_ && isVotingMemberLocked(selfNodeId_) && isVotingMemberLocked(request.candidateId) &&
+                    request.term > currentTerm_ && role_.load() != RaftRole::LEADER && !recentLeader && upToDate;
+                return RequestVoteResponse{.term = currentTerm_, .voteGranted = granted};
             }
 
             RequestVoteResponse handleRequestVote(const RequestVote& request) {
@@ -3928,29 +4281,37 @@ namespace akkaradb::engine::cluster {
             bool applySnapshotChunkRequestLocked(const InstallSnapshot& request) {
                 if (request.chunks.empty() && !request.done) { return false; }
                 if (!request.done && request.entryCount != 0) { return false; }
-                if (request.committedVoters.empty() || request.jointOldVoters.has_value() != request.jointNewVoters.has_value()) { return false; }
-                if (request.jointOldVoters && (request.jointOldVoters->empty() || request.jointNewVoters->empty())) { return false; }
+                if (request.committedMembers.empty() || request.jointOldMembers.has_value() != request.jointNewMembers.has_value()) { return false; }
+                if (request.jointOldMembers && (request.jointOldMembers->empty() || request.jointNewMembers->empty())) { return false; }
                 const bool sameSnapshot = pendingSnapshotInstall_.active && pendingSnapshotInstall_.snapshotSeq == request.snapshotSeq &&
+                    pendingSnapshotInstall_.configurationGeneration == request.configurationGeneration &&
                     pendingSnapshotInstall_.lastIncludedIndex == request.lastIncludedIndex && pendingSnapshotInstall_.lastIncludedTerm == request.
                     lastIncludedTerm && sameNodeSet(
-                        pendingSnapshotInstall_.committedVoters,
-                        request.committedVoters
-                    ) && sameOptionalNodeSet(pendingSnapshotInstall_.jointOldVoters, request.jointOldVoters) && sameOptionalNodeSet(
-                        pendingSnapshotInstall_.jointNewVoters,
-                        request.jointNewVoters
+                        pendingSnapshotInstall_.committedMembers,
+                        request.committedMembers
+                    ) && sameOptionalNodeSet(pendingSnapshotInstall_.jointOldMembers, request.jointOldMembers) && sameOptionalNodeSet(
+                        pendingSnapshotInstall_.jointNewMembers,
+                        request.jointNewMembers
                     );
                 if (pendingSnapshotInstall_.active && !sameSnapshot) { return false; }
                 const bool restartsSnapshot = sameSnapshot && !request.chunks.empty() && request.chunks.front().entryIndex == 0 && request.chunks.front().
                     valueOffset == 0 && (pendingSnapshotInstall_.nextEntryIndex != 0 || pendingSnapshotInstall_.hasCurrentEntry);
                 if (!sameSnapshot || restartsSnapshot) {
+                    try {
+                        validatePeerConfiguration(request.committedMembers);
+                        if (request.jointOldMembers) { validatePeerConfiguration(*request.jointOldMembers); }
+                        if (request.jointNewMembers) { validatePeerConfiguration(*request.jointNewMembers); }
+                    }
+                    catch (...) { return false; }
                     pendingSnapshotInstall_ = PendingSnapshotInstall{};
                     pendingSnapshotInstall_.active = true;
                     pendingSnapshotInstall_.snapshotSeq = request.snapshotSeq;
                     pendingSnapshotInstall_.lastIncludedIndex = request.lastIncludedIndex;
                     pendingSnapshotInstall_.lastIncludedTerm = request.lastIncludedTerm;
-                    pendingSnapshotInstall_.committedVoters = request.committedVoters;
-                    pendingSnapshotInstall_.jointOldVoters = request.jointOldVoters;
-                    pendingSnapshotInstall_.jointNewVoters = request.jointNewVoters;
+                    pendingSnapshotInstall_.committedMembers = request.committedMembers;
+                    pendingSnapshotInstall_.jointOldMembers = request.jointOldMembers;
+                    pendingSnapshotInstall_.jointNewMembers = request.jointNewMembers;
+                    pendingSnapshotInstall_.configurationGeneration = request.configurationGeneration;
                     if (callbacks_.beginSnapshot) { callbacks_.beginSnapshot(request.snapshotSeq, request.entryCount); }
                 }
 
@@ -4003,7 +4364,7 @@ namespace akkaradb::engine::cluster {
                 std::optional<InstallSnapshotResponse> earlyResponse;
                 {
                     std::lock_guard lock{mutex_};
-                    if (!isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
+                    if (!isReplicationMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
                         return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
                     }
                     if (request.term < currentTerm_) {
@@ -4021,7 +4382,7 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     roleChange = setRole(RaftRole::FOLLOWER);
-                    electionDeadline_ = nextElectionDeadline();
+                    recordLeaderContactLocked();
                     if (request.lastIncludedIndex <= lastIncludedIndex_) {
                         earlyResponse = InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
                     }
@@ -4047,10 +4408,12 @@ namespace akkaradb::engine::cluster {
                         .lastIncludedIndex = request.lastIncludedIndex,
                         .lastIncludedTerm = request.lastIncludedTerm,
                         .entryCount = request.entryCount,
-                        .committedVoters = request.committedVoters,
-                        .jointOldVoters = request.jointOldVoters,
-                        .jointNewVoters = request.jointNewVoters
+                        .configurationGeneration = request.configurationGeneration,
+                        .committedMembers = request.committedMembers,
+                        .jointOldMembers = request.jointOldMembers,
+                        .jointNewMembers = request.jointNewMembers
                     };
+                    if (callbacks_.prepareSnapshot) { callbacks_.prepareSnapshot(request.snapshotSeq, request.entryCount); }
                     {
                         std::lock_guard lock{mutex_};
                         const auto backup = captureDurableLogStateLocked();
@@ -4110,7 +4473,7 @@ namespace akkaradb::engine::cluster {
                 std::optional<AppendEntriesResponse> earlyResponse;
                 {
                     std::lock_guard lock{mutex_};
-                    if (!isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
+                    if (!isReplicationMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
                         return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
                     }
                     if (request.term < currentTerm_) { return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()}; }
@@ -4126,14 +4489,14 @@ namespace akkaradb::engine::cluster {
                         }
                     }
                     roleChange = setRole(RaftRole::FOLLOWER);
-                    electionDeadline_ = nextElectionDeadline();
+                    recordLeaderContactLocked();
 
                     if (request.prevLogIndex < lastIncludedIndex_) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
                     else if (request.prevLogIndex > lastLogIndex()) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
                     else if (termAt(request.prevLogIndex) != request.prevLogTerm) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
                     if (earlyResponse) { response = *earlyResponse; }
                     else {
-                        const auto backup = captureDurableLogStateLocked();
+                        const auto backup = captureDurableLogStateLocked(request.prevLogIndex + 1);
                         bool mutatedLogState = false;
                         uint64_t expectedIndex = request.prevLogIndex + 1;
                         uint64_t acceptedMatchIndex = request.prevLogIndex;
@@ -4162,7 +4525,8 @@ namespace akkaradb::engine::cluster {
                                         response = *earlyResponse;
                                         break;
                                     }
-                                    std::erase_if(log_, [&](const RaftLogEntry& item) { return item.index >= entry.index; });
+                                    invalidateLogSuffixLocked(entry.index);
+                                    log_.resize(static_cast<size_t>(entry.index - lastIncludedIndex_ - 1));
                                     log_.push_back(entry);
                                     mutatedLogState = true;
                                 }
@@ -4271,7 +4635,8 @@ namespace akkaradb::engine::cluster {
                 std::vector<RaftLogEntry> toApply;
                 {
                     std::lock_guard lock{mutex_};
-                    for (const auto& entry : log_) { if (entry.index > lastApplied_ && entry.index <= commitIndex_) { toApply.push_back(entry); } }
+                    const auto offset = static_cast<size_t>(std::min<uint64_t>(lastApplied_ - lastIncludedIndex_, log_.size()));
+                    for (size_t i = offset; i < log_.size() && log_[i].index <= commitIndex_; ++i) { toApply.push_back(log_[i]); }
                 }
 
                 uint64_t appliedThrough = 0;
@@ -4299,7 +4664,8 @@ namespace akkaradb::engine::cluster {
                                 entry.key,
                                 entry.value,
                                 entry.flags,
-                                entry.sourceNodeId
+                                entry.sourceNodeId,
+                                entry.timestampNs
                             );
                             appliedDurableMutation = true;
                         }
@@ -4320,7 +4686,7 @@ namespace akkaradb::engine::cluster {
                 crashAtLogTestPoint("raft.request.after_apply");
                 std::lock_guard lock{mutex_};
                 if (appliedThrough > lastApplied_) {
-                    const auto backup = captureDurableLogStateLocked();
+                    const auto backup = captureDurableLogStateLocked(lastLogIndex() + 1);
                     lastApplied_ = appliedThrough;
                     rebuildRequestResultsLocked(backup.lastApplied);
                     try { persistLog(); }
@@ -4360,8 +4726,9 @@ namespace akkaradb::engine::cluster {
                 }
                 self_ = config_.findById(selfNodeId_);
                 if (self_ == nullptr || !self_->dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: local node must be data-bearing"); }
+                learnerBootstrapPending_ = self_->raftLearner();
                 if (runtimeOptions_.transportMode == TransportMode::SECURE) { localIdentity_ = loadSecureIdentity(runtimeOptions_); }
-                committedVoters_ = config_.dataNodes();
+                committedMembers_ = config_.dataNodes();
                 refreshPeersFromMembershipLocked();
                 if (config_.dataNodes().empty()) { throw std::invalid_argument("RaftConsensusRuntime: no data-bearing nodes"); }
                 recoverState();
@@ -4378,6 +4745,7 @@ namespace akkaradb::engine::cluster {
                 }
                 this->replayCommittedMembership();
                 rebuildRequestResultsLocked();
+                validateLogPrefixLocked(log_.size());
                 validatePeerConfiguration(replicationTargetsLocked());
             }
 
@@ -4453,6 +4821,9 @@ namespace akkaradb::engine::cluster {
                     std::lock_guard lock{workersMutex_};
                     workersStopping_ = true;
                     for (auto& [_, worker] : workers_) { workers.push_back(worker); }
+                    for (auto& weak : forwardChannels_) { if (auto worker = weak.lock()) { workers.push_back(std::move(worker)); } }
+                    for (auto& weak : placementReadChannels_) { if (auto worker = weak.lock()) { workers.push_back(std::move(worker)); } }
+                    forwardChannelsCv_.notify_all();
                 }
                 for (auto& worker : workers) {
                     {
@@ -4504,19 +4875,36 @@ namespace akkaradb::engine::cluster {
                 {
                     std::lock_guard lock{mutex_};
                     out.currentTerm = currentTerm_;
+                    out.configurationGeneration = lastConfigurationGeneration_;
+                    out.jointConsensus = jointNewMembers_.has_value();
                     out.leaderNodeId = role_.load() == RaftRole::LEADER ? selfNodeId_ :
                         (observedLeaderTerm_ == currentTerm_ ? observedLeaderId_ : 0);
                     out.commitIndex = commitIndex_;
                     out.appliedIndex = lastApplied_;
                     out.appliedStateMachineSeq = lastIncludedStateMachineSeq_;
-                    for (const auto& entry : log_) {
-                        if (entry.index > lastApplied_) { break; }
-                        if (isStateMachineEntry(entry.kind)) {
-                            out.appliedStateMachineSeq = std::max(out.appliedStateMachineSeq, entry.clientSeq);
+                    const auto appliedCount = lastApplied_ <= lastIncludedIndex_ ? size_t{0} :
+                        static_cast<size_t>(std::min<uint64_t>(lastApplied_ - lastIncludedIndex_, log_.size()));
+                    if (appliedCount != 0 && appliedCount <= validatedLog_.size()) {
+                        out.appliedStateMachineSeq = std::max(out.appliedStateMachineSeq, validatedLog_[appliedCount - 1].sequence);
+                    }
+                    else {
+                        // A failed persistence rollback can invalidate the cache.
+                        for (size_t i = appliedCount; i != 0; --i) {
+                            const auto& entry = log_[i - 1];
+                            if (isStateMachineEntry(entry.kind)) {
+                                out.appliedStateMachineSeq = std::max(out.appliedStateMachineSeq, entry.clientSeq);
+                                break;
+                            }
                         }
                     }
                     out.lastLogIndex = lastLogIndex();
                     out.snapshotIndex = lastIncludedIndex_;
+                    const auto members = replicationTargetsLocked();
+                    for (const auto& member : members) {
+                        if (isVotingMemberLocked(member.nodeId)) { ++out.voterCount; }
+                        else { ++out.learnerCount; }
+                    }
+                    out.localLearner = isReplicationMemberLocked(selfNodeId_) && !isVotingMemberLocked(selfNodeId_);
                     out.proposalQueueDepth = proposalQueue_.size();
                     out.pendingProposals = proposals_.size();
                     out.retainedRequestResults = requestState_.results.size();
@@ -4525,13 +4913,18 @@ namespace akkaradb::engine::cluster {
                     out.requestJournalRecords = requestJournalRecords_;
                     for (const auto& proposal : proposals_) { if (proposal->request && !proposal->error) { ++out.pendingRequests; } }
                     for (const auto& proposal : proposalQueue_) { out.replicationQueueBytes += proposal->bytes; }
-                    out.peers.reserve(peerReplication_.size());
-                    for (const auto& peer : peerReplication_) {
+                    out.peers.reserve(members.size());
+                    for (const auto& member : members) {
+                        if (member.nodeId == selfNodeId_) { continue; }
                         RaftPeerStats peerStats;
-                        peerStats.nodeId = peer.node.nodeId;
-                        peerStats.matchIndex = peer.matchIndex;
-                        peerStats.nextIndex = peer.nextIndex;
-                        peerStats.replicationLag = out.lastLogIndex > peer.matchIndex ? out.lastLogIndex - peer.matchIndex : 0;
+                        peerStats.nodeId = member.nodeId;
+                        peerStats.learner = !isVotingMemberLocked(member.nodeId);
+                        const auto peer = std::ranges::find_if(peerReplication_, [&](const auto& state) { return state.node.nodeId == member.nodeId; });
+                        if (peer != peerReplication_.end()) {
+                            peerStats.matchIndex = peer->matchIndex;
+                            peerStats.nextIndex = peer->nextIndex;
+                            peerStats.replicationLag = out.lastLogIndex > peer->matchIndex ? out.lastLogIndex - peer->matchIndex : 0;
+                        }
                         out.peers.push_back(std::move(peerStats));
                     }
                 }
@@ -4571,6 +4964,34 @@ namespace akkaradb::engine::cluster {
 
             const ClusterRouter& router() const noexcept { return router_; }
 
+            ForwardResponse forwardTo(uint64_t nodeId, ForwardRequest request) {
+                const auto nodes = activeNodes();
+                const auto it = std::ranges::find_if(nodes, [nodeId](const NodeInfo& node) { return node.nodeId == nodeId; });
+                if (it == nodes.end() || nodeId == selfNodeId_) { throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE); }
+                request.requestId = nextForwardId_.fetch_add(1);
+                const auto wire = encodeForwardRequest(request);
+                if (wire.empty()) { throw ClusterRoutingError(ClusterRoutingCode::PAYLOAD_TOO_LARGE); }
+                DecodedFrame frame;
+                ForwardResponse response;
+                bool submitted = false;
+                bool completed = false;
+                try {
+                    completed = exchangeRpc(*it, wire, ReplMsgType::FORWARD_RESPONSE, frame, static_cast<int>(request.timeoutMs), &submitted, &request) &&
+                        decodeForwardResponse(frame.payload, response) && response.requestId == request.requestId;
+                }
+                catch (...) {
+                    // Allocation/transport failures after send are just as
+                    // ambiguous as a lost response; never lose this distinction.
+                }
+                if (!completed) {
+                    throw ClusterRoutingError(submitted ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE,
+                        {}, "Forward RPC failed; an operation sent to the destination must not be replayed blindly");
+                }
+                response.memoryReservation = std::move(frame.memoryReservation);
+                return response;
+            }
+
+            std::atomic<uint64_t> nextForwardId_{1};
             static uint64_t requestNow() {
                 return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count());
@@ -4609,9 +5030,8 @@ namespace akkaradb::engine::cluster {
 
             uint64_t reserveStateMachineSequenceLocked() {
                 uint64_t highest = std::max(lastAssignedStateMachineSeq_, lastIncludedStateMachineSeq_);
-                for (const auto& entry : log_) {
-                    if (isStateMachineEntry(entry.kind)) { highest = std::max(highest, entry.clientSeq); }
-                }
+                validateLogPrefixLocked(log_.size());
+                if (!validatedLog_.empty()) { highest = std::max(highest, validatedLog_.back().sequence); }
                 if (highest == UINT64_MAX) { throw std::overflow_error("RaftConsensusRuntime: state-machine sequence exhausted"); }
                 lastAssignedStateMachineSeq_ = highest + 1;
                 return lastAssignedStateMachineSeq_;
@@ -4659,6 +5079,7 @@ namespace akkaradb::engine::cluster {
                 entry.op = mutation.op;
                 entry.flags = mutation.recordFlags;
                 entry.sourceNodeId = mutation.sourceNodeId;
+                entry.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
                 entry.key = std::move(mutation.key);
                 entry.value = std::move(mutation.value);
                 if (!isValidRaftLogEntryShape(entry)) {
@@ -4690,14 +5111,15 @@ namespace akkaradb::engine::cluster {
                 ClusterMutationFactory prepare
             ) {
                 if (!prepare) { throw std::invalid_argument("Raft: retry-safe mutation factory is required"); }
-                std::lock_guard admission{mutationAdmissionMutex_};
+                auto admission = detail::ReconfigurationDeadline::lock(mutationAdmissionMutex_);
                 auto proposal = std::make_shared<Proposal>();
                 proposal->request = std::make_shared<RequestCompletion>();
                 proposal->request->id = id;
                 proposal->request->fingerprint = fingerprint;
                 uint64_t now = 0, term = 0, sequence = 0;
                 {
-                    std::lock_guard lock{mutex_};
+                    std::unique_lock lock{mutex_};
+                    waitForAdministrationLocked(lock);
                     if (!running_ || role_.load() != RaftRole::LEADER || administrativeChange_) {
                         throw std::runtime_error("Raft: retry-safe write requires an active leader");
                     }
@@ -4723,7 +5145,7 @@ namespace akkaradb::engine::cluster {
                         proposal->entryTerm = entry.term;
                         proposal->request->sequence = entry.clientSeq;
                         proposal->term = currentTerm_;
-                        proposal->deadline = Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs};
+                        proposal->deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{config_.consistency().ackTimeoutMs});
                         proposals_.push_back(proposal);
                         cv_.notify_all();
                         return proposal->request->future;
@@ -4775,11 +5197,14 @@ namespace akkaradb::engine::cluster {
 
             ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare) {
                 if (!prepare) { throw std::invalid_argument("RaftConsensusRuntime: mutation factory is required"); }
-                std::lock_guard admission{mutationAdmissionMutex_};
+                auto admission = detail::ReconfigurationDeadline::lock(mutationAdmissionMutex_);
+                const bool localCompletion = config_.consistency().mode != ConsistencyMode::RAFT_QUORUM;
+                if (localCompletion) { linearizableReadBarrier(); }
                 uint64_t sequence = 0;
                 uint64_t term = 0;
                 {
-                    std::lock_guard lock{mutex_};
+                    std::unique_lock lock{mutex_};
+                    waitForAdministrationLocked(lock);
                     if (!running_ || role_.load() != RaftRole::LEADER || administrativeChange_) {
                         throw std::runtime_error("RaftConsensusRuntime: mutation requires an active leader");
                     }
@@ -4790,6 +5215,28 @@ namespace akkaradb::engine::cluster {
                 auto proposal = std::make_shared<Proposal>();
                 proposal->term = term;
                 auto completion = submitProposal(std::move(entries), proposal);
+                if (localCompletion) {
+                    {
+                        std::unique_lock lock{mutex_};
+                        cv_.wait_until(lock, proposal->deadline, [&] {
+                            return proposal->localDurable || proposal->error || !running_ || currentTerm_ != term;
+                        });
+                        if (proposal->error) { std::rethrow_exception(proposal->error); }
+                        if (!proposal->localDurable || !running_ || currentTerm_ != term || role_.load() != RaftRole::LEADER) {
+                            throw std::runtime_error("RaftConsensusRuntime: local journal acceptance interrupted; outcome may be unknown");
+                        }
+                    }
+                    // Confirm the writer with a fresh quorum after durable local acceptance.
+                    // Data replication continues independently; only committed entries become visible.
+                    linearizableReadBarrier();
+                    std::lock_guard lock{mutex_};
+                    if (!running_ || currentTerm_ != term || role_.load() != RaftRole::LEADER) {
+                        throw std::runtime_error("RaftConsensusRuntime: leadership changed during local acceptance");
+                    }
+                    std::promise<void> accepted;
+                    completion = accepted.get_future();
+                    accepted.set_value();
+                }
                 return ClusterMutationSubmission{.sequence = sequence, .completion = std::move(completion)};
             }
 
@@ -4798,13 +5245,14 @@ namespace akkaradb::engine::cluster {
                 std::span<const uint8_t> value, uint8_t flags, uint64_t source
             ) {
                 if (seq == 0) { throw std::invalid_argument("RaftConsensusRuntime: state-machine sequence must be non-zero"); }
-                std::lock_guard admission{mutationAdmissionMutex_};
+                auto admission = detail::ReconfigurationDeadline::lock(mutationAdmissionMutex_);
                 RaftLogEntry entry;
                 entry.clientSeq = seq;
                 entry.kind = RaftEntryKind::MUTATION;
                 entry.op = op;
                 entry.flags = flags;
                 entry.sourceNodeId = source;
+                entry.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
                 entry.key.assign(key.begin(), key.end());
                 entry.value.assign(value.begin(), value.end());
                 if (!isValidRaftLogEntryShape(entry)) {
@@ -4868,7 +5316,7 @@ namespace akkaradb::engine::cluster {
             void validatePeerConfiguration(const std::vector<NodeInfo>& nodes) const {
                 // Recovered/online membership can differ from the original config.
                 (void)ClusterConfig{nodes, ReplicationMode::STANDALONE, {},
-                                    ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM}};
+                                    ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM}, config_.raft()};
                 if (runtimeOptions_.transportMode == TransportMode::SECURE) {
                     std::vector<uint64_t> required;
                     for (const auto& peer : nodes) { if (peer.nodeId != selfNodeId_) { required.push_back(peer.nodeId); } }
@@ -4876,9 +5324,10 @@ namespace akkaradb::engine::cluster {
                 }
             }
 
-            void addVotingNode(const NodeInfo& node) {
+            void addVotingNode(NodeInfo node, bool promotion = false) {
                 AdministrativeGuard admission{*this};
                 if (!node.dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: Raft voting node must be data-bearing"); }
+                if (node.raftLearner()) { throw std::invalid_argument("RaftConsensusRuntime: voter cannot have RAFT_LEARNER capability"); }
                 if (!onlineMembershipChangeEnabled()) { throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled"); }
                 {
                     std::lock_guard lock{mutex_};
@@ -4887,58 +5336,136 @@ namespace akkaradb::engine::cluster {
                     validatePeerConfiguration(targets);
                 }
                 (void)this->commitOutstandingEntry(std::chrono::milliseconds{20000});
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
+                std::vector<NodeInfo> oldMembers;
+                std::vector<NodeInfo> newMembers;
                 bool finishExistingJoint = false;
                 std::optional<RaftLogEntry> pendingConfigEntry;
                 {
                     std::lock_guard lock{mutex_};
                     if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
+                    const auto member = std::ranges::find(committedMembers_, node.nodeId, &NodeInfo::nodeId);
+                    if (promotion) {
+                        if (!config_.raft().membership.allowLearners) { throw std::runtime_error("RaftConsensusRuntime: learners are disabled"); }
+                        if (member == committedMembers_.end() || !member->raftLearner()) {
+                            throw std::invalid_argument("RaftConsensusRuntime: node is not a learner");
+                        }
+                        const auto* state = peerState(node.nodeId);
+                        if (node.nodeId != selfNodeId_ && (state == nullptr || state->matchIndex < lastLogIndex())) {
+                            throw std::runtime_error("RaftConsensusRuntime: learner has not caught up to the leader log");
+                        }
+                        node = *member;
+                        node.capabilities &= ~static_cast<uint32_t>(RAFT_LEARNER);
+                    }
+                    else if (member != committedMembers_.end() && member->raftLearner()) {
+                        throw std::invalid_argument("RaftConsensusRuntime: use promoteLearner for an existing learner");
+                    }
                     if (commitIndex_ != lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().kind ==
                         RaftEntryKind::CONFIG_FINAL)) {
-                        std::vector<NodeInfo> pendingNewVoters;
-                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && containsNode(pendingNewVoters, node.nodeId)) {
+                        std::vector<NodeInfo> pendingNewMembers;
+                        if (decodeNodeSet(log_.back().value, pendingNewMembers) && std::ranges::any_of(pendingNewMembers,
+                            [&](const NodeInfo& member) { return member.nodeId == node.nodeId && !member.raftLearner(); })) {
                             pendingConfigEntry = log_.back();
                         }
                         else { throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted"); }
                     }
-                    else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointNewVoters_ && containsNode(*jointNewVoters_, node.nodeId) && !containsNode(committedVoters_, node.nodeId)) {
-                            oldVoters = jointOldVoters_.value_or(committedVoters_);
-                            newVoters = *jointNewVoters_;
+                    else if (jointOldMembers_ || jointNewMembers_) {
+                        if (jointNewMembers_ && std::ranges::any_of(*jointNewMembers_, [&](const NodeInfo& member) {
+                            return member.nodeId == node.nodeId && !member.raftLearner();
+                        }) && (promotion || !containsNode(committedMembers_, node.nodeId))) {
+                            oldMembers = jointOldMembers_.value_or(committedMembers_);
+                            newMembers = *jointNewMembers_;
                             finishExistingJoint = true;
                         }
                         else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
                     }
-                    else if (containsNode(committedVoters_, node.nodeId)) {
+                    else if (containsNode(committedMembers_, node.nodeId) && !promotion) {
                         throw std::invalid_argument("RaftConsensusRuntime: node is already a voting member");
                     }
                     else {
-                        oldVoters = committedVoters_;
-                        newVoters = committedVoters_;
-                        newVoters.push_back(node);
-                        newVoters = sortedUniqueVoters(std::move(newVoters));
+                        oldMembers = committedMembers_;
+                        newMembers = committedMembers_;
+                        std::erase_if(newMembers, [&](const NodeInfo& existing) { return existing.nodeId == node.nodeId; });
+                        newMembers.push_back(node);
+                        newMembers = sortedUniqueMembers(std::move(newMembers));
                     }
                 }
                 if (pendingConfigEntry) {
                     this->appendReplicateAndCommitConfig(*pendingConfigEntry, false);
                     if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
-                        std::vector<NodeInfo> oldFinalVoters;
-                        std::vector<NodeInfo> finalVoters;
-                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalVoters) || !decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
+                        std::vector<NodeInfo> oldFinalMembers;
+                        std::vector<NodeInfo> finalMembers;
+                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalMembers) || !decodeNodeSet(pendingConfigEntry->value, finalMembers)) {
                             throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
                         }
-                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalVoters, finalVoters);
+                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalMembers, finalMembers);
                         this->appendReplicateAndCommitConfig(final);
                     }
                     return;
                 }
                 if (finishExistingJoint) {
-                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
+                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldMembers, newMembers);
                     this->appendReplicateAndCommitConfig(final);
                     return;
                 }
-                this->proposeMembershipChange(oldVoters, newVoters);
+                this->proposeMembershipChange(oldMembers, newMembers);
+            }
+
+            void changeLearner(NodeInfo node, bool remove) {
+                AdministrativeGuard admission{*this};
+                if (!config_.raft().membership.allowLearners) { throw std::runtime_error("RaftConsensusRuntime: learners are disabled"); }
+                (void)commitOutstandingEntry(std::chrono::milliseconds{20000});
+                std::vector<NodeInfo> oldMembers;
+                std::vector<NodeInfo> newMembers;
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
+                    if (jointOldMembers_ || jointNewMembers_ || commitIndex_ != lastLogIndex()) {
+                        throw std::runtime_error("RaftConsensusRuntime: membership change already in progress");
+                    }
+                    const auto existing = std::ranges::find(committedMembers_, node.nodeId, &NodeInfo::nodeId);
+                    oldMembers = committedMembers_;
+                    newMembers = oldMembers;
+                    if (remove) {
+                        if (existing == committedMembers_.end() || !existing->raftLearner()) {
+                            throw std::invalid_argument("RaftConsensusRuntime: node is not a learner");
+                        }
+                        std::erase_if(newMembers, [&](const NodeInfo& member) { return member.nodeId == node.nodeId; });
+                    }
+                    else {
+                        if (existing != committedMembers_.end()) { throw std::invalid_argument("RaftConsensusRuntime: node is already a member"); }
+                        if (!node.dataBearing()) { throw std::invalid_argument("RaftConsensusRuntime: learner must be data-bearing"); }
+                        node.capabilities |= RAFT_LEARNER;
+                        newMembers.push_back(node);
+                        newMembers = sortedUniqueMembers(std::move(newMembers));
+                    }
+                    validatePeerConfiguration(newMembers);
+                }
+                // Voters are identical on both sides, so one committed entry
+                // suffices without a joint voting transition.
+                auto entry = makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldMembers, newMembers);
+                appendReplicateAndCommitConfig(entry);
+            }
+
+            void addLearner(const NodeInfo& node) { changeLearner(node, false); }
+
+            void removeLearner(uint64_t nodeId) {
+                NodeInfo node;
+                node.nodeId = nodeId;
+                changeLearner(std::move(node), true);
+            }
+
+            void promoteLearner(uint64_t nodeId) {
+                NodeInfo node;
+                {
+                    std::lock_guard lock{mutex_};
+                    const auto member = std::ranges::find(committedMembers_, nodeId, &NodeInfo::nodeId);
+                    if (member == committedMembers_.end() || !member->raftLearner()) {
+                        throw std::invalid_argument("RaftConsensusRuntime: node is not a learner");
+                    }
+                    node = *member;
+                    node.capabilities &= ~static_cast<uint32_t>(RAFT_LEARNER);
+                }
+                addVotingNode(std::move(node), true);
             }
 
             void removeVotingNode(uint64_t nodeId) {
@@ -4946,8 +5473,8 @@ namespace akkaradb::engine::cluster {
                 if (!onlineMembershipChangeEnabled()) { throw std::runtime_error("RaftConsensusRuntime: online Raft membership change is disabled"); }
                 (void)this->commitOutstandingEntry(std::chrono::milliseconds{20000});
                 if (nodeId == selfNodeId_) { throw std::runtime_error("RaftConsensusRuntime: removing the local leader is not supported by this API"); }
-                std::vector<NodeInfo> oldVoters;
-                std::vector<NodeInfo> newVoters;
+                std::vector<NodeInfo> oldMembers;
+                std::vector<NodeInfo> newMembers;
                 bool finishExistingJoint = false;
                 std::optional<RaftLogEntry> pendingConfigEntry;
                 {
@@ -4955,48 +5482,64 @@ namespace akkaradb::engine::cluster {
                     if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
                     if (commitIndex_ != this->lastLogIndex() && !log_.empty() && (log_.back().kind == RaftEntryKind::CONFIG_JOINT || log_.back().kind ==
                         RaftEntryKind::CONFIG_FINAL)) {
-                        std::vector<NodeInfo> pendingNewVoters;
-                        if (decodeNodeSet(log_.back().value, pendingNewVoters) && !containsNode(pendingNewVoters, nodeId)) { pendingConfigEntry = log_.back(); }
+                        std::vector<NodeInfo> pendingNewMembers;
+                        if (decodeNodeSet(log_.back().value, pendingNewMembers) && !containsNode(pendingNewMembers, nodeId)) { pendingConfigEntry = log_.back(); }
                         else { throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted"); }
                     }
-                    else if (jointOldVoters_ || jointNewVoters_) {
-                        if (jointOldVoters_ && jointNewVoters_ && containsNode(*jointOldVoters_, nodeId) && !containsNode(*jointNewVoters_, nodeId)) {
-                            oldVoters = *jointOldVoters_;
-                            newVoters = *jointNewVoters_;
+                    else if (jointOldMembers_ || jointNewMembers_) {
+                        if (jointOldMembers_ && jointNewMembers_ && containsNode(*jointOldMembers_, nodeId) && !containsNode(*jointNewMembers_, nodeId)) {
+                            oldMembers = *jointOldMembers_;
+                            newMembers = *jointNewMembers_;
                             finishExistingJoint = true;
                         }
                         else { throw std::runtime_error("RaftConsensusRuntime: membership change already in progress"); }
                     }
-                    else if (!containsNode(committedVoters_, nodeId)) { throw std::invalid_argument("RaftConsensusRuntime: node is not a voting member"); }
+                    else if (!isVotingMemberLocked(nodeId)) { throw std::invalid_argument("RaftConsensusRuntime: node is not a voting member"); }
                     else {
-                        oldVoters = committedVoters_;
-                        for (const auto& node : committedVoters_) { if (node.nodeId != nodeId) { newVoters.push_back(node); } }
-                        if (newVoters.empty()) { throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member"); }
+                        oldMembers = committedMembers_;
+                        for (const auto& node : committedMembers_) { if (node.nodeId != nodeId) { newMembers.push_back(node); } }
+                        if (std::ranges::none_of(newMembers, [](const NodeInfo& node) { return !node.raftLearner(); })) {
+                            throw std::invalid_argument("RaftConsensusRuntime: cannot remove the last voting member");
+                        }
                     }
                 }
                 if (pendingConfigEntry) {
                     this->appendReplicateAndCommitConfig(*pendingConfigEntry, false);
                     if (pendingConfigEntry->kind == RaftEntryKind::CONFIG_JOINT) {
-                        std::vector<NodeInfo> oldFinalVoters;
-                        std::vector<NodeInfo> finalVoters;
-                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalVoters) || !decodeNodeSet(pendingConfigEntry->value, finalVoters)) {
+                        std::vector<NodeInfo> oldFinalMembers;
+                        std::vector<NodeInfo> finalMembers;
+                        if (!decodeNodeSet(pendingConfigEntry->key, oldFinalMembers) || !decodeNodeSet(pendingConfigEntry->value, finalMembers)) {
                             throw std::runtime_error("RaftConsensusRuntime: corrupt joint membership entry");
                         }
-                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalVoters, finalVoters);
+                        RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldFinalMembers, finalMembers);
                         this->appendReplicateAndCommitConfig(final);
                     }
                     return;
                 }
                 if (finishExistingJoint) {
-                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldVoters, newVoters);
+                    RaftLogEntry final = this->makeConfigEntry(RaftEntryKind::CONFIG_FINAL, oldMembers, newMembers);
                     this->appendReplicateAndCommitConfig(final);
                     return;
                 }
-                this->proposeMembershipChange(oldVoters, newVoters);
+                this->proposeMembershipChange(oldMembers, newMembers);
+            }
+
+            void campaignLeadership() {
+                std::lock_guard lock{mutex_};
+                if (!running_ || !self_->coordinatorEligible() || !isVotingMemberLocked(selfNodeId_)) {
+                    throw std::runtime_error("RaftConsensusRuntime: campaign requires an eligible active voter");
+                }
+                if (role_.load() == RaftRole::LEADER) { return; }
+                forceElection_ = true;
+                cv_.notify_all();
             }
 
             void transferLeadership(uint64_t targetNodeId) {
                 AdministrativeGuard admission{*this};
+                transferLeadershipAdmitted(targetNodeId);
+            }
+
+            void transferLeadershipAdmitted(uint64_t targetNodeId) {
                 if (targetNodeId == selfNodeId_) { return; }
                 NodeInfo target;
                 uint64_t targetIndex = 0;
@@ -5035,11 +5578,129 @@ namespace akkaradb::engine::cluster {
                     throw std::runtime_error("RaftConsensusRuntime: leadership changed during transfer");
                 }
                 if (!response.accepted) { throw std::runtime_error("RaftConsensusRuntime: leader transfer target rejected request"); }
+                std::optional<NodeRole> roleChange;
                 {
                     std::lock_guard lock{mutex_};
-                    if (role_.load() == RaftRole::LEADER && currentTerm_ == term) { electionDeadline_ = this->nextElectionDeadline(); }
+                    if (role_.load() == RaftRole::LEADER && currentTerm_ == term) {
+                        electionDeadline_ = this->nextElectionDeadline();
+                        roleChange = setRole(RaftRole::FOLLOWER);
+                    }
                 }
-                this->setRoleAndNotify(RaftRole::FOLLOWER);
+                notifyRoleChange(roleChange);
+            }
+
+            void reconfigure(const ClusterConfig& target, uint64_t generation) {
+                detail::ReconfigurationDeadline budget{runtimeOptions_.reconfiguration.timeoutMs, runtimeOptions_.reconfiguration.cancelled};
+                detail::ReconfigurationDeadline::check();
+                target.validate();
+                if (raftCompatibilityFingerprint(target, runtimeOptions_) != compatibilityFingerprint_) {
+                    throw std::invalid_argument("Raft reconfiguration: online changes must preserve cluster identity and consensus policy");
+                }
+                if (!onlineMembershipChangeEnabled()) {
+                    throw std::runtime_error("Raft reconfiguration: enable joint consensus and online voter changes");
+                }
+                auto desired = sortedUniqueMembers(target.dataNodes());
+                if (desired.empty() || !hasVoter(desired)) { throw std::invalid_argument("Raft reconfiguration: at least one voter is required"); }
+                if (std::ranges::none_of(desired, [](const auto& node) { return !node.raftLearner() && node.coordinatorEligible(); })) {
+                    throw std::invalid_argument("Raft reconfiguration: at least one eligible voter is required");
+                }
+                if (role_.load() != RaftRole::LEADER) {
+                    ClusterRouteTarget destination;
+                    const auto state = stats();
+                    destination.nodeId = state.leaderNodeId;
+                    destination.raftTerm = state.currentTerm;
+                    throw ClusterRoutingError(ClusterRoutingCode::NOT_OWNER, destination);
+                }
+                AdministrativeGuard admission{*this, false};
+                const auto same = [](const auto& left, const auto& right) { return encodeNodeSet(left) == encodeNodeSet(right); };
+                std::vector<NodeInfo> old;
+                bool completeJoint = false;
+                bool retireLeader = false;
+                std::vector<NodeInfo> catchup;
+                uint64_t catchupIndex = 0;
+                uint64_t migrationTerm = 0;
+                {
+                    std::lock_guard lock{mutex_};
+                    migrationTerm = currentTerm_;
+                    if (generation < lastConfigurationGeneration_) {
+                        throw std::runtime_error("Raft reconfiguration: stale placement generation");
+                    }
+                    old = committedMembers_;
+                    if (!containsNode(desired, selfNodeId_)) {
+                        if (!config_.raft().membership.allowLearners) {
+                            throw std::invalid_argument("Raft reconfiguration: removing the leader requires allowLearners or prior leadership transfer");
+                        }
+                        auto retiring = *self_;
+                        retiring.capabilities |= RAFT_LEARNER;
+                        desired.push_back(retiring);
+                        desired = sortedUniqueMembers(std::move(desired));
+                        retireLeader = true;
+                    }
+                    if (same(old, desired) && !jointNewMembers_ && !retireLeader && generation == lastConfigurationGeneration_) { return; }
+                    auto all = old;
+                    all.insert(all.end(), desired.begin(), desired.end());
+                    all = sortedUniqueMembers(std::move(all));
+                    validatePeerConfiguration(all);
+                    ensurePeerReplicationTargetsLocked(&all);
+                    catchup = desired;
+                    catchupIndex = lastLogIndex();
+                    if (jointNewMembers_) {
+                        if (!same(*jointNewMembers_, desired)) {
+                            throw std::runtime_error("Raft reconfiguration: another membership transition is pending");
+                        }
+                        old = *jointOldMembers_;
+                        completeJoint = true;
+                    }
+                }
+                // Every new holder receives the complete committed prefix before
+                // it can vote or placement can advertise the copy as available.
+                const auto needsCatchup = [&](const NodeInfo& holder) {
+                    const auto existing = std::ranges::find(old, holder.nodeId, &NodeInfo::nodeId);
+                    return existing == old.end() || (existing->raftLearner() && !holder.raftLearner());
+                };
+                for (const auto& holder : catchup) {
+                    if (holder.nodeId != selfNodeId_ && needsCatchup(holder) &&
+                        !replicatePeerTo(holder.nodeId, catchupIndex, true, 0, true)) {
+                        throw std::runtime_error("Raft reconfiguration: new holder did not catch up");
+                    }
+                }
+                // Bulk transfer leaves write admission open. Only the final tail
+                // and joint membership commit need a stable journal boundary.
+                admission.pauseWrites();
+                (void)commitOutstandingEntry(std::chrono::milliseconds{runtimeOptions_.reconfiguration.timeoutMs});
+                {
+                    std::lock_guard lock{mutex_};
+                    if (role_.load() != RaftRole::LEADER || currentTerm_ != migrationTerm) {
+                        ClusterRouteTarget destination;
+                        destination.nodeId = observedLeaderTerm_ == currentTerm_ ? observedLeaderId_ : 0;
+                        destination.raftTerm = currentTerm_;
+                        throw ClusterRoutingError(ClusterRoutingCode::NOT_OWNER, destination);
+                    }
+                    catchupIndex = lastLogIndex();
+                }
+                for (const auto& holder : catchup) {
+                    if (holder.nodeId != selfNodeId_ && needsCatchup(holder) &&
+                        !replicatePeerTo(holder.nodeId, catchupIndex, true, 0, true)) {
+                        throw std::runtime_error("Raft reconfiguration: new holder did not catch up to the final write boundary");
+                    }
+                }
+                if (completeJoint) {
+                    appendReplicateAndCommitConfig(makeConfigEntry(RaftEntryKind::CONFIG_FINAL, old, desired, generation));
+                }
+                else { proposeMembershipChange(old, desired, generation); }
+                if (retireLeader) {
+                    const auto successor = std::ranges::find_if(desired, [this](const auto& node) {
+                        return node.nodeId != selfNodeId_ && !node.raftLearner() && node.coordinatorEligible();
+                    });
+                    if (successor == desired.end()) { throw std::invalid_argument("Raft reconfiguration: no eligible successor"); }
+                    transferLeadershipAdmitted(successor->nodeId);
+                    ClusterRouteTarget destination;
+                    destination.nodeId = successor->nodeId;
+                    destination.host = successor->host;
+                    destination.replPort = successor->replPort;
+                    throw ClusterRoutingError(ClusterRoutingCode::NOT_OWNER, destination,
+                        "Raft reconfiguration: finalize removal on the successor");
+                }
             }
     };
 
@@ -5062,8 +5723,10 @@ namespace akkaradb::engine::cluster {
         const ClusterRequestId& id, const std::array<uint8_t, 32>& fingerprint, ClusterMutationFactory prepare
     ) { return impl_->submitRequest(id, fingerprint, std::move(prepare)); }
     ClusterRequestResult RaftConsensusRuntime::queryRequest(const ClusterRequestId& id) { return impl_->queryRequest(id); }
+    ForwardResponse RaftConsensusRuntime::forwardTo(uint64_t nodeId, ForwardRequest request) { return impl_->forwardTo(nodeId, std::move(request)); }
 
     void RaftConsensusRuntime::start() { impl_->start(); }
+    void RaftConsensusRuntime::reconfigure(const ClusterConfig& config, uint64_t generation) { impl_->reconfigure(config, generation); }
 
     void RaftConsensusRuntime::close() { impl_->close(); }
     RaftRuntimeStats RaftConsensusRuntime::stats() const { return impl_->stats(); }
@@ -5097,8 +5760,13 @@ namespace akkaradb::engine::cluster {
     void RaftConsensusRuntime::linearizableReadBarrier() { impl_->linearizableReadBarrier(); }
 
     void RaftConsensusRuntime::addVotingNode(const NodeInfo& node) { impl_->addVotingNode(node); }
+    void RaftConsensusRuntime::addLearner(const NodeInfo& node) { impl_->addLearner(node); }
+    void RaftConsensusRuntime::promoteLearner(uint64_t nodeId) { impl_->promoteLearner(nodeId); }
+    void RaftConsensusRuntime::removeLearner(uint64_t nodeId) { impl_->removeLearner(nodeId); }
 
     void RaftConsensusRuntime::removeVotingNode(uint64_t nodeId) { impl_->removeVotingNode(nodeId); }
+
+    void RaftConsensusRuntime::campaignLeadership() { impl_->campaignLeadership(); }
 
     void RaftConsensusRuntime::transferLeadership(uint64_t targetNodeId) { impl_->transferLeadership(targetNodeId); }
 }

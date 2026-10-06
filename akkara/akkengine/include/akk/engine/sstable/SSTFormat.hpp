@@ -15,9 +15,9 @@
 #include <type_traits>
 
 namespace akkaradb::engine::sst {
-    inline constexpr uint32_t SST_MAGIC_V2 = 0x32534B41u; // "AKS2", little-endian
-    inline constexpr uint32_t SST_FOOTER_MAGIC_V2 = 0x46533241u; // "A2SF", little-endian
-    inline constexpr uint16_t SST_VERSION_V2 = 2;
+    inline constexpr uint32_t SST_MAGIC_V1 = 0x31534B41u; // "AKS1", little-endian
+    inline constexpr uint32_t SST_FOOTER_MAGIC_V1 = 0x46533141u; // "A1SF", little-endian
+    inline constexpr uint16_t SST_VERSION_V1 = 1;
     inline constexpr uint32_t SST_DEFAULT_BLOCK_SIZE = 32u * 1024u;
     inline constexpr uint32_t SST_DEFAULT_BLOOM_BITS_PER_KEY = 10;
     inline constexpr uint64_t SST_DEFAULT_TARGET_FILE_SIZE = 64ULL * 1024ULL * 1024ULL;
@@ -41,7 +41,7 @@ namespace akkaradb::engine::sst {
     }
 
     #pragma pack(push, 1)
-    struct SSTFileHeaderV2 {
+    struct SSTFileHeaderV1 {
         uint32_t magic;
         uint16_t version;
         uint16_t headerSize;
@@ -66,7 +66,7 @@ namespace akkaradb::engine::sst {
         uint32_t crc32c;
     };
 
-    struct SSTBlockHeaderV2 {
+    struct SSTBlockHeaderV1 {
         uint32_t headerSize;
         uint32_t flags;
         uint32_t recordCount;
@@ -81,7 +81,7 @@ namespace akkaradb::engine::sst {
         uint32_t reserved;
     };
 
-    struct SSTBlockIndexEntryV2 {
+    struct SSTBlockIndexEntryV1 {
         uint64_t blockOffset;
         uint32_t blockSize;
         uint32_t uncompressedSize;
@@ -97,20 +97,20 @@ namespace akkaradb::engine::sst {
         uint32_t flags;
     };
 
-    struct SSTBloomHeaderV2 {
+    struct SSTBloomHeaderV1 {
         uint32_t numBits;
         uint32_t numHashes;
         uint32_t bitsSize;
         uint32_t reserved;
     };
 
-    struct SSTMetadataCrcV2 {
+    struct SSTMetadataCrcV1 {
         uint32_t indexCrc32c;
         uint32_t keyArenaCrc32c;
         uint32_t bloomCrc32c;
     };
 
-    struct SSTFooterV2 {
+    struct SSTFooterV1 {
         uint64_t file_size;
         uint64_t indexOffset;
         uint64_t keyArenaOffset;
@@ -122,16 +122,16 @@ namespace akkaradb::engine::sst {
     };
     #pragma pack(pop)
 
-    static_assert(sizeof(SSTFileHeaderV2) == 256, "SSTFileHeaderV2 must be 256 bytes");
-    static_assert(sizeof(SSTBlockHeaderV2) == 64, "SSTBlockHeaderV2 must be 64 bytes");
-    static_assert(sizeof(SSTBlockIndexEntryV2) == 72, "SSTBlockIndexEntryV2 must be 72 bytes");
-    static_assert(sizeof(SSTBloomHeaderV2) == 16, "SSTBloomHeaderV2 must be 16 bytes");
-    static_assert(sizeof(SSTMetadataCrcV2) == 12, "SSTMetadataCrcV2 must be 12 bytes");
-    static_assert(sizeof(SSTFooterV2) == 48, "SSTFooterV2 must be 48 bytes");
-    static_assert(std::is_trivially_copyable_v<SSTFileHeaderV2>);
-    static_assert(std::is_trivially_copyable_v<SSTBlockHeaderV2>);
-    static_assert(std::is_trivially_copyable_v<SSTBlockIndexEntryV2>);
-    static_assert(std::is_trivially_copyable_v<SSTBloomHeaderV2>);
-    static_assert(std::is_trivially_copyable_v<SSTMetadataCrcV2>);
-    static_assert(std::is_trivially_copyable_v<SSTFooterV2>);
+    static_assert(sizeof(SSTFileHeaderV1) == 256, "SSTFileHeaderV1 must be 256 bytes");
+    static_assert(sizeof(SSTBlockHeaderV1) == 64, "SSTBlockHeaderV1 must be 64 bytes");
+    static_assert(sizeof(SSTBlockIndexEntryV1) == 72, "SSTBlockIndexEntryV1 must be 72 bytes");
+    static_assert(sizeof(SSTBloomHeaderV1) == 16, "SSTBloomHeaderV1 must be 16 bytes");
+    static_assert(sizeof(SSTMetadataCrcV1) == 12, "SSTMetadataCrcV1 must be 12 bytes");
+    static_assert(sizeof(SSTFooterV1) == 48, "SSTFooterV1 must be 48 bytes");
+    static_assert(std::is_trivially_copyable_v<SSTFileHeaderV1>);
+    static_assert(std::is_trivially_copyable_v<SSTBlockHeaderV1>);
+    static_assert(std::is_trivially_copyable_v<SSTBlockIndexEntryV1>);
+    static_assert(std::is_trivially_copyable_v<SSTBloomHeaderV1>);
+    static_assert(std::is_trivially_copyable_v<SSTMetadataCrcV1>);
+    static_assert(std::is_trivially_copyable_v<SSTFooterV1>);
 } // namespace akkaradb::engine::sst

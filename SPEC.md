@@ -120,8 +120,8 @@ Application
 ### 2.3 Non-Goals
 
 - SQL compatibility.
-- Multi-key transactions.
-- Compare-and-swap or optimistic concurrency control.
+- Distributed transactions across Cluster nodes.
+- Public compare-and-swap operations (transactions use optimistic validation).
 - Cross-language object identity.
 - A stable ABI for private implementation classes.
 - A promise that low-level persisted formats can be read by arbitrary future
@@ -209,6 +209,7 @@ When `paths.dataDir` is set and a component-specific path is empty, defaults are
 | `paths.sstDir` | `{dataDir}/sstable` |
 | `paths.manifestPath` | `{dataDir}/manifest.akmf` |
 | `paths.versionLogPath` | `{dataDir}/history.akvlog` |
+| `paths.rollbackJournalPath` | `{dataDir}/rollback-journal.akrb` |
 | `paths.clusterConfigPath` | `{dataDir}/cluster.akcc` |
 | `paths.nodeIdPath` | `{dataDir}/node.id` |
 
@@ -268,8 +269,9 @@ Sequences are unsigned 64-bit mutation identifiers. They provide:
 - Blob id assignment for values externalized by local writes,
 - cluster write identity and acknowledgement tracking.
 
-Sequence numbers are not transactions. A batch reserves a range but does not
-create all-or-nothing visibility or durability.
+Sequence numbers alone do not provide transactions. Internal protocol bulk
+writes reserve a range without atomicity. Standalone transactions publish
+one commit sequence for all keys, with durable redo and validation.
 
 ### 5.2 MemHdr16
 
@@ -515,10 +517,106 @@ For a normal local mutation:
 hints. A wrong hint is caller error. Standard `put` and `remove` compute hints
 internally.
 
-`putBatch(span<BatchPutEntry>)` reserves a sequence range and applies entries in
-that range. It immediately returns for an empty span. It is not a transaction:
-there is no all-or-nothing rollback, isolation, or independent durability
-boundary for the group.
+### 7.1 Standalone Native Transactions
+
+The C++ `AkkEngine` public API removes `putBatch` and `BatchPutEntry`:
+
+```cpp
+auto tx = engine.begin(); // SERIALIZABLE by default
+auto value = tx.get(key);
+tx.put(otherKey, newValue);
+tx.remove(deletedKey);
+// Also: tx.exists, tx.getBatch, tx.scan(arena,start,end), tx.count(start,end)
+tx.end(); // atomically commit, or throw
+```
+
+`begin({TransactionIsolation::SNAPSHOT_ISOLATION})` selects Snapshot Isolation.
+Both modes read a fixed begin snapshot and their own staged changes. Repeated
+staging for one key coalesces into its final value/tombstone. Regular Engine
+writes commit independently and do not join a session. `rollback()` or session
+destruction without `end()` discards staging.
+
+Both modes validate write keys against changes since begin (first committer
+wins), including ordinary writes, internal bulk writes and history rollbacks.
+Serializable also validates point reads, including absent keys, and half-open
+scan/count predicates `[start,end)`, including unconsumed scan cursors. It detects
+range phantoms and put/remove ABA changes. Snapshot Isolation permits write skew
+on disjoint keys. Conflicts throw `TransactionConflict` and abort the session;
+retry with a fresh begin. Sessions require standalone mode, `GLOBAL_ATOMIC`
+sequence allocation, and recovery enabled for any enabled WAL/SST component.
+
+Cluster distributed transactions, typed-layer transactions and transaction
+endpoints in Java/JNI, HTTP, TCP and gRPC are outside this API. Existing external
+bulk protocols retain their non-transactional behavior through the internal
+`detail::ProtocolBulkWriter`; no public C++ putBatch compatibility alias remains.
+
+Sessions retain immutable MemTable generations, SST readers and Blob read leases.
+Writers continue while a session is open; commit takes exclusive mutation
+admission/publication. Ordinary point/batch reads cannot observe partial commit.
+Ordinary scans keep `runtime.scanConsistency`; transaction scans always use the
+fixed begin snapshot. A transaction scan captures staged writes at its call and
+returns `ArenaGenerator<ScanRecordView>`. It may outlive end/rollback, retaining
+that cut. Views follow the supplied Arena lifetime. Finish/destroy all sessions
+and cursors before `engine.close()`, which waits for their operation leases.
+Concurrent session/cursor use is unsupported; sequential thread handoff is
+supported, including Blob snapshots.
+
+`options.transactions` bounds resources:
+
+| Option | Default | Contract |
+|---|---:|---|
+| `maxOpen` | 64 | Retained transaction snapshots, including surviving cursors |
+| `maxLifetimeMs` | 300000 | Deadline checked at session operations/commit; idle sessions and independent cursors release pins on destruction |
+| `maxWrites` | 65536 | Distinct staged keys |
+| `maxWriteBytes` | 67108864 | Staged key/value bytes plus accounting overhead |
+| `maxReadSetBytes` | 33554432 | Serializable read/range validation set |
+| `maxPinnedBytes` | 536870912 | Conservative sum of retained MemTable bytes |
+| `maxTrackedBytes` | 67108864 | Mutation tracking; overflow invalidates open sessions instead of stopping ordinary writers |
+| `maxJournalBytes` | 268435456 | Retained redo; checkpoint before another commit exceeds the budget |
+
+Capacity/staging errors throw before staging the offending change. Expired
+sessions throw `TransactionConflict` and abort. Tracking invalidation is detected
+on commit. A single oversized journal aborts before its decision. Retained journal
+count is also bounded at 1024. Read-only commits validate without persistence I/O.
+
+### 7.2 Transaction Persistence and Recovery
+
+With any WAL, SST, VersionLog or Blob component enabled, transactions require
+`paths.transactionDir`, defaulting to `dataDir/transactions`. Memory-only engines
+need no journal. Commit durably saves sequence allocation before Blob preparation,
+then durably publishes complete redo before applying any key. The decision is
+always synchronized, even with weaker ordinary-write acknowledgements; persistent
+transaction commits therefore have a minimum synchronization cost. Durable current
+state still requires WAL or SST: Blob/VersionLog alone does not persist ordinary
+MemTable contents after a clean close.
+
+All transaction mutations share a commit sequence and timestamp in WAL/SST/history;
+Blob IDs use distinct reserved slots. With VersionLog enabled, getAt before that
+sequence sees prior revisions and getAt at it sees all new revisions. Interrupted
+application is replayed before exposing an open Engine. Replay preserves higher
+sequence overwrites and deduplicates history already persisted.
+
+`<commit-seq>.aktxn`: `AKTX1`, little-endian u64 base/commit/source/time/count,
+then key-sorted records of flags(u8), key length(u32), stored value length(u64),
+key/value bytes, and CRC32C(u32). Blob payloads remain in durable Blob files.
+`allocated.aktm`/`checkpoint.aktm`: `AKTM1`, u64 watermark, CRC32C.
+Invalid sizes, sequence ranges, flags, ordering, checksums and trailing data reject
+open; incomplete `.tmp` decisions are uncommitted.
+
+Allocation watermarks prevent Blob ID reuse after pre-decision crashes. Retained
+redo prevents orphan Blob collection from startup through recovery/checkpoint.
+Checkpoint drains complete MemTables to SST where enabled, synchronizes WAL/history,
+durably saves a checkpoint watermark, then removes redundant redo. Partial shard
+flushes cannot discard an incompletely applied transaction. Existing WAL/SST/Blob/
+history formats are unchanged. Keep the new journal directory with the database;
+recovery requires a transaction-aware Engine. No older-binary migration is provided.
+
+Before-decision errors discard staging. Errors after a decision or after memory
+application starts throw `TransactionOutcomeUnknown` and block reads/writes on that
+Engine. Close/reopen to recover; close retains incomplete redo even if it reports a
+storage error. Memory-only engines cannot recover interrupted application after
+close. Missing/corrupt committed Blob data rejects open rather than exposing a
+partial transaction.
 
 ## 8. Read Path
 
@@ -556,6 +654,89 @@ and must not alter snapshot semantics.
 visibility snapshot. Empty start or end spans are unbounded. Scan merges
 MemTable and SST ordered iterators, gives a MemTable version precedence over an
 SST version of the same key, and suppresses tombstones.
+
+With Cluster enabled these APIs return public keys across the configured data
+placement. PARTITIONED queries each data owner, filters physical replicas by
+ownership, and merges scans in unsigned byte-key order without duplicates.
+Each owner captures its own read cut: this is not a globally atomic distributed
+transaction snapshot. MIRROR/Raft queries the current Primary/leader in
+OWNER_LINEARIZABLE mode, including when invoked on a follower or learner; the
+leader completes ReadIndex before capturing its snapshot. LOCAL_STALE_OK permits
+node-local MIRROR/Raft results. PARTITIONED range queries still gather all owners
+in LOCAL_STALE_OK mode. PARTITIONED Raft range planning checks partition leaders
+concurrently through one executor per initiating engine, with at most eight
+active checks and 64 queued tasks shared across concurrent queries. All checks
+retain the same placement view and share the original forwarding deadline,
+including queueing and local ReadIndex. Results are grouped in partition order
+only after every check succeeds; any failure joins submitted work and fails the
+query without returning a partial plan. This does not add a common read cut
+across partitions. STRIPE queries its metadata-Raft leader through a fresh
+quorum barrier, translates metadata keys to public keys, suppresses logical
+tombstones, and reconstructs public values from the captured shard generations.
+STRIPE count counts live metadata keys and does not require reading their shards.
+
+OWNER_ONLY never contacts a remote authority; a range requiring remote owners
+fails instead of returning just the local portion. These read-only query RPCs
+are independent of mutation `routingMode`, so REDIRECT/LOCAL_ONLY do not disable
+internal range/history gathering. `scanLocalStorage` remains explicit physical
+node-local inspection, including replicated records and internal STRIPE keys.
+
+Cluster scan/history delivery is selected by `queryResultMode`, and the
+initiating engine includes its choice in OPEN. `PREPARED` (default) writes the
+complete result to a private disk spool before returning; consumption then
+needs no storage snapshot pins. `STREAMING` captures fixed sources at OPEN and
+generates up to 1 MiB per NEXT page without spooling the complete result. A
+record may span pages. The reader retains one page and one current record per
+owner, plus caller-owned output. Page replay retains only the latest page;
+non-sequential offsets are rejected. A failed streaming cursor cannot resume
+as if it had completed successfully.
+
+Both modes seal active MemTables into immutable sources and switch writers to
+new active tables. The short capture excludes publication, but copying and
+consumer waits do not hold MemTable shard locks. Sources keep their exact
+MemTable/SST ownership and Blob read pins until materialization ends. SST-less
+engines use the existing immutable memory snapshot mechanism. Each partition
+still captures its own read cut; this does not add a distributed transaction
+snapshot. STRIPE metadata range capture preserves public byte order, seeks only
+the requested range, and reconstructs one public value at a time. No separate
+full metadata spool is required. COUNT streams live metadata without shard reads
+or result spooling.
+
+Snapshot admission is independent of result delivery: `querySnapshotAdmission`
+is `REJECT` by default, or `WAIT` within the original OPEN deadline. Capacity
+waits release write admission. `queryMaxPinnedBytes` defaults to 512 MiB
+(1 MiB–1 TiB) and bounds aggregate reservations for captured MemTable sources;
+shared generations can be conservatively counted more than once. It is not a
+limit on SST files, history index locations, individual decoded values or total
+process RSS. `queryMaxPinnedSnapshots` defaults to 64 (1–1,024). The existing
+SST-less snapshot capacity also applies. Overlarge captures fail under either
+admission policy. The MemTable/SST-less immutable sources are released on
+completion, explicit close, abandonment, or cursor expiry.
+
+Streaming STRIPE scans/history acquire renewable GC pins on every active data
+node before capture. All those nodes must be reachable for this optional mode.
+Pins prevent deletion of captured shard generations, and are renewed for each
+page. A missing/expired pin or placement change fails the query explicitly.
+Closing the cursor requests release; an unreachable node releases its pin by
+TTL. No thread-owned GC or iterator lock crosses RPC workers.
+
+Runtime cursor limits are `queryMaxSpoolBytes` (1 GiB aggregate per engine;
+1–INT64_MAX), `queryMaxOpenCursors` (64; 1–1,024),
+`queryCursorIdleTimeoutMs` (60,000; 1–300,000), and
+`queryCursorMaxLifetimeMs` (300,000; 1–3,600,000, including preparation).
+Spools use `transfer.spoolDirectory` or the OS temporary directory, are private
+anonymous/delete-on-close files, and are discarded on close, abandonment, TTL,
+or process exit. An expired cursor throws instead of returning truncated
+success. `forwardingTimeoutMs` bounds each OPEN/NEXT RPC; capacity and peer-pin
+work share that RPC's remaining budget. Exceeded quotas, failed owners/quorum,
+missing required shards/Blobs, and mid-query disconnects fail explicitly.
+A scan or history generator may have yielded a prefix before failure; only
+normal end-of-iteration means the complete result was received. COUNT/getAt
+return no partial successful result. Failed unsent RPCs may wait for reconnection
+within their original timeout; an ambiguous OPEN is not replayed automatically.
+The pre-release READ_QUERY OPEN/page protocol changes with these policies;
+all cluster binaries must be updated together. Persisted data formats do not
+change for query delivery.
 
 `scan` returns `ArenaGenerator<ScanRecordView>`. Each `ScanRecordView` contains
 non-owning key/value spans into the supplied `BufferArena`. Resetting or
@@ -758,7 +939,7 @@ store compact references.
 | `gcOnFlush` | `false` | Run orphan collection after flush lifecycle |
 | `gcOnClose` | `false` | Run orphan collection during close |
 
-Blob id currently equals the creating sequence. Blob files carry a 48-byte v5
+Blob id currently equals the creating sequence. Blob files carry a 48-byte v1
 header and CRCs for both header and original content. Reads validate the header,
 codec, stored size, and expected content CRC before returning a public value.
 
@@ -838,6 +1019,46 @@ VersionLog is opt-in. It backs:
 - `history(key)`,
 - `rollbackTo(seq)`,
 - `rollbackKey(key, seq)`.
+
+`getAt` and `history` support Cluster through the same bounded read-query cursor
+protocol as range reads. PARTITIONED always reads the key's actual owner history,
+even with LOCAL_STALE_OK, because a replica's physical apply sequence is not an
+owner-stream revision. MIRROR/Raft honors readMode and performs ReadIndex on the
+leader for OWNER_LINEARIZABLE. STRIPE reads metadata-leader history through a
+quorum barrier and reconstructs historical public shard generations; placement
+repairs with an unchanged logicalSeq are coalesced into one public version.
+Both `AkkEngine::history(key)` and `VersionLog::history(key)` return
+`core::ArenaGenerator<VersionEntry>`; the owning-vector history APIs were removed.
+A generator owns its coroutine Arena, copies the input key, and captures its
+read cut during the call. Entry values are materialized one at a time; a yielded
+entry reference remains valid only until advancement or destruction, and callers
+copy entries they intend to retain. Iteration can move between threads but must
+be serialized. An engine history generator holds operation admission, so
+`close()` waits until it is consumed/destroyed. Runtime read failures can occur
+during iteration. VersionLog-disabled history yields no entries.
+VersionLog captures per-key index locations plus its bounded pending-value
+overlay, pins retention, and reads disk payloads in sequence order. Index metadata
+memory grows with the number of matching revisions, but full historical values
+are never collected into a vector. STRIPE coalescing retains revision metadata,
+then reconstructs values one at a time. Existing TCP/HTTP/gRPC streaming paths
+iterate directly; whole-response protocols still allocate their encoded response,
+and JNI still returns the Java array required by its existing Java contract.
+Returned history is ordered by logical seq, materializes values rather than
+Blob references or metadata bytes, and preserves tombstone/rollback/retention
+base flags. Missing required historical bytes throw rather than masquerading
+as an absent version.
+
+`getAt(key, uint64_t)` interprets the scalar in that key's logical stream:
+PARTITIONED owner stream; shared MIRROR/Raft stream; STRIPE metadata stream.
+`getAt(key, Revision)` additionally validates streamId (owner node id for
+PARTITIONED, zero otherwise) and is available only with Cluster enabled.
+There is no cross-owner global scalar sequence. VersionLog-disabled behavior is
+determined at the read authority: missing for getAt, empty for history. Targets
+earlier than the retained base remain unavailable under ordinary retention
+semantics, not reconstructible from current values. STRIPE public timestamps
+come from the metadata leader's local VersionLog append and are not a globally
+synchronized event clock; source identity comes from metadata authority (or
+ROLLBACK_NODE).
 
 ### 13.1 Options
 
@@ -926,7 +1147,7 @@ The same settings are exposed at the high-level startup surface as
 When VersionLog is disabled:
 
 - `getAt` returns `std::nullopt`,
-- `history` returns an empty vector,
+- `history` returns an empty generator,
 - `rollbackTo` and `rollbackKey` throw.
 
 VersionLog is incompatible with `THREAD_LOCAL_RANGES`. Its write admission is
@@ -1015,10 +1236,88 @@ VersionLog commit frontier; `APPLIED` is the opt-in lower-latency alternative.
 
 ### 13.4 Rollback
 
-Rollback does not rewrite old records. It appends a new normal or tombstone
-mutation that represents the rolled-back state. Rollback mutations are marked
-with the rollback source node id and rollback flag, then follow normal local and
-cluster shipment paths.
+Rollback is a compensating write, not a sequence rewind. It resolves the value
+or tombstone visible at the target revision, submits that state through the
+normal write coordinator, and appends a new mutation at the current head.
+Rollback mutations use `ROLLBACK_NODE` and `VLOG_FLAG_ROLLBACK`; cluster
+rollback therefore follows the same ownership, acknowledgement, replication,
+Raft, fencing, and durability rules as an ordinary write.
+
+The scalar `rollbackTo(uint64_t)` and `rollbackKey(key, uint64_t)` overloads are
+first-class non-cluster APIs and throw when the cluster runtime is enabled.
+Cluster callers use `Revision{streamId, seq}` and `ClusterCheckpoint` so a
+partition-owner sequence cannot be mistaken for a global sequence:
+
+The existing JNI, HTTP, TCP, and gRPC rollback operations carry only a scalar
+sequence and therefore remain non-cluster endpoints. Distributed checkpoint
+and rollback are exposed by the Native C++ API until those wire contracts gain
+an explicit revision/checkpoint representation.
+
+| Mode | Revision stream |
+|---|---|
+| non-cluster | scalar local storage sequence |
+| `MIRROR` and data `RAFT_QUORUM` | stream `0`, the leader's replicated mutation sequence |
+| `PARTITIONED` with `PRIMARY_ACK`/`ASYNC` | one stream per owner; `streamId` is the owner node id |
+| `PARTITIONED` with `RAFT_QUORUM` | stable partition stream; `streamId` is the zero-based partition index plus one |
+| `STRIPE` | stream `0`, the metadata-Raft state-machine sequence |
+
+`createClusterCheckpoint()` returns the cluster id, configuration epoch,
+timeline id, and one watermark per required stream. A checkpoint is accepted
+only by the same cluster identity, epoch, and timeline, must contain exactly the
+expected streams, and cannot name a future watermark. PARTITIONED checkpoint
+collection is a vector cut rather than a cross-partition transaction.
+PARTITIONED Raft checkpoints remain valid across holder-count changes because
+the logical partition streams do not change; their placement epoch is informational.
+`revisionStreamId(key)` returns the current public stream identity. STRIPE
+watermarks pass a linearizable metadata-Raft read barrier before the applied
+state-machine sequence is captured.
+
+VersionLog append is asynchronous by default, so checkpoint and rollback
+control take the mutation epoch exclusively and force the VersionLog queue to a
+durable visibility boundary before capturing or scanning a watermark. This
+prevents a committed owner mutation from being visible in storage sequence
+state but missing from rollback history.
+
+`RollbackOptions::execution` selects:
+
+| Value | Behavior |
+|---|---|
+| `IMMEDIATE` | Execute now and do not create a retry journal entry |
+| `IMMEDIATE_AND_DEFER_FAILED` | Durably journal before attempting; remove the entry after a completed request and retain transport/availability failures for replay after restart |
+| `NEXT_STARTUP` | Durably journal without executing in the current process; replay in a background startup worker after the next open |
+
+The startup worker begins after local recovery and cluster startup but before
+the optional API server is started. Cluster peers may still be unavailable, so
+it retries pending transport failures once per second. `NEXT_STARTUP` is thus
+eventually applied after the next open rather than blocking `open` until every
+peer is reachable. The CRC32C-protected `AKRJ1` journal is replaced atomically
+and records task/operation ids, the scheduling startup id, cluster identity and
+epoch, action, target stream/sequence, planning watermark, conflict policy, and
+optional key. Reopening with a journal from another cluster mode, id, or epoch
+is rejected rather than applying it to a different topology.
+
+`RollbackOptions::conflict` defaults to `FAIL_IF_CHANGED`. Deferred work records
+the planning watermark; a key whose head advanced beyond it reports `CONFLICT`
+and is not overwritten. `OVERWRITE_LATEST` deliberately applies the historical
+state over a newer head. History removed by configured retention or a STRIPE
+metadata snapshot base can produce `PERMANENT_FAILURE`; rollback does not infer
+missing historical state. Operators must retain VersionLog history and STRIPE
+generations through the oldest checkpoint or deferred target they intend to
+use. Every owner/authority that may execute a distributed rollback must have
+VersionLog enabled; a mixed cluster fails the control request instead of silently
+rolling back only the nodes with history.
+
+`RollbackResult` contains a random operation id and per-key `APPLIED`,
+`DEFERRED`, `CONFLICT`, or `PERMANENT_FAILURE` results. `complete()` is true only
+when every returned item is applied. Distributed stream rollback processes keys
+in deterministic lexical pages of at most 256 keys, carrying a continuation
+cursor in the cluster control response so no result frame grows without
+bound. Distributed rollback is not an atomic
+multi-stream transaction: all current stream watermarks are planned before
+execution, but a later transport failure can follow successful mutations on an
+earlier stream. Use `IMMEDIATE_AND_DEFER_FAILED` when that retry behavior is
+required. Exact physical database restore is a separate offline generation
+replacement operation, not online rollback.
 
 VLog entry corruption is never accepted. `EAGER` recovery fails `open`; in
 `BACKGROUND` mode the first operation that crosses the recovery barrier throws
@@ -1099,7 +1398,7 @@ migration from legacy flat directories.
 ## 15. Cluster and Replication
 
 Cluster configuration is persisted separately from runtime transport options.
-The config file uses `AKC6` magic and version 6.
+The config file uses `AKC1` magic and version 1.
 
 ### 15.1 Persistent Cluster Config
 
@@ -1114,6 +1413,7 @@ The config file uses `AKC6` magic and version 6.
 - replica lag behavior,
 - Raft membership options,
 - stripe data/parity shard counts,
+- PARTITIONED total copy count (`PartitionOptions::replicationFactor`, default 3),
 - the single fixed Primary node id for non-Raft `MIRROR`,
 - a nonzero random 128-bit cluster id.
 
@@ -1126,7 +1426,7 @@ For non-Raft `MIRROR`, `ClusterConfig::primaryNodeId()` must identify a
 configured node with both `COORDINATOR_ELIGIBLE` and `DATA_BEARING`. If the
 constructor's `primaryNodeId` argument is zero or omitted, it selects the first
 node in configuration order with both capabilities. All other placements,
-including `RAFT_QUORUM`, require this field to be zero; it is not a list of
+including data-consensus groups, require this field to be zero; it is not a list of
 per-key owners or a persisted Raft election result.
 
 Runtime-only values such as bind host, replica-side primary endpoint overrides,
@@ -1158,7 +1458,7 @@ peer pins before creating an identity or starting connection retries.
 |---|---|
 | `STANDALONE` | No replication runtime |
 | `MIRROR` | Ship writes to every data-bearing node |
-| `PARTITIONED` | Assign each key to one owner using rendezvous-style placement |
+| `PARTITIONED` | Store each key on the highest-ranked N holders, first holder owns mutations |
 | `STRIPE` | Split data and optional parity shards across distinct data-bearing nodes |
 
 `RaidOptions{.preset = RaidPreset::RAID0, .dataShards = k}` is the public
@@ -1185,6 +1485,33 @@ complete. The Primary reports `REBUILDING` during catch-up and returns to
 never automatic and uses the same explicit offline MIRROR promotion contract.
 Loading these canonical fields derives `RAID.1` without a parallel preset flag.
 
+`RaidOptions{.preset = RaidPreset::RAID5, .dataShards = k}` is the public
+`RAID.5` preset. It normalizes to `STRIPE` with `k` data shards and one parity
+shard. `k` must be at least two, so at least three data-bearing nodes are
+required. One missing node may be tolerated by reads and `DATA_SHARDS` writes.
+Loading the canonical fields derives `RAID.5` without persisted preset state.
+
+`RaidOptions{.preset = RaidPreset::RAID6, .dataShards = k}` is the public
+`RAID.6` preset. It normalizes to `STRIPE` with `k` data shards and two parity
+shards. `k` must be at least two. At least five data-bearing nodes are required
+even for a `2 + 2` shard layout so the metadata-Raft group retains a three-node
+majority after any two voters fail. Two missing nodes may be tolerated by reads
+and `DATA_SHARDS` writes. Loading the canonical fields derives `RAID.6` without
+persisted preset state.
+
+`RaidOptions{.preset = RaidPreset::RAID10, .dataShards = k}` is the public
+`RAID.10` preset. It normalizes to `STRIPE` with `k` logical data shards, zero
+parity shards, and two copies per shard. `k` must be at least two and exactly
+`2 * k` data-bearing nodes are required. Adjacent nodes in configured membership
+order form fixed mirror pairs; rendezvous ranking assigns those pairs to logical
+shards per key and ranks the two members within each pair. Loading the canonical
+fields derives `RAID.10` without persisted preset state.
+`RaidOptions::hotSpareNodeId` may designate one additional coordinator-eligible,
+data-bearing node as a shared hot spare. Zero disables this option. The preset
+normalizes the selected node to `STRIPE_FAILOVER_ELIGIBLE`; the capability is
+persisted with membership, while the convenience option itself is not stored.
+The spare participates in metadata Raft but is excluded from normal shard pairs.
+
 The active native cluster runtime accepts `MIRROR`, `PARTITIONED`, and
 `STRIPE`. Non-Raft `MIRROR` has exactly one Primary selected by the persistent
 config; only that node may accept writes or start with the `PRIMARY` role.
@@ -1194,34 +1521,155 @@ nonzero `ClusterRuntimeOptions::clusterGroupId`. Zero is rejected because these
 multi-owner placements cannot independently generate one shared identity.
 Non-Raft `MIRROR` retains its persisted Primary-generated default when the value
 is zero.
-`PARTITIONED` runs every data-bearing node as a partition owner for
-its rendezvous-hash key range. Writes are always owner-only: a node rejects a
-mutation whose key is owned by another node instead of forwarding it. Owner
-mutations are replicated to the other data-bearing nodes, and remote entries are
+Static `PARTITIONED` with `PRIMARY_ACK` or `ASYNC` and no data consensus runs every data-bearing node as a partition owner for
+its rendezvous-hash key range. Mutations are applied only by the owner;
+`routingMode` determines whether a non-owner rejects, redirects, or forwards. Owner
+mutations are replicated only to the remaining selected holders, and remote entries are
 assigned local storage sequence numbers on receipt so independent owners do not
 collide in the local MemTable/WAL sequence space. Consequently, one owner's
 replication sequence can contain gaps where that owner applied another owner's
 mutation; receivers accept forward gaps while rejecting replayed entries.
+Placement scores use the first eight bytes (little-endian) of BLAKE2b-256 over
+length-delimited `AKHRW1`, the binary key, and little-endian node identities.
+PARTITIONED and STRIPE use the same node scores; RAID.10 hashes both sorted
+members of each fixed mirror pair rather than collapsing the pair to a synthetic
+node id. Scores sort descending, with smaller node ids breaking ties.
+`PartitionOptions::replicationFactor` is the total number of copies including
+the owner, defaults to 3, and must be nonzero. The effective count is capped by
+the configured data-node count. Thus a two-node cluster defaults to two copies.
+`ClusterRouter::writeTargets()` and `readCandidates()` return all selected holders,
+owner first. Only the owner accepts mutations in static replication; consensus groups use their current leader.
+Live replication, catch-up, snapshots, receiver validation, and ACK accounting
+use the same holder set. `ALL_CONFIGURED` requires every selected replica,
+including offline holders; offline non-holders do not delay a write. Quorum
+counts refer to replicas excluding the owner and cannot exceed that key's replicas.
+With one copy, `ALL_TARGETS`/`ALL_CONFIGURED` complete locally; a requested replica
+quorum or `ONE_REPLICA` is invalid.
+
+Completed owner snapshots are staged within the shared transfer budget, then installed as
+a WAL snapshot transaction using a local storage sequence. Only that owner's
+selected keys are replaced; keys of other owners remain intact. Interrupted
+receives do not advance persisted peer progress. Deletes absent from the snapshot
+are applied only within that owner's scope.
+
+The BLAKE2b placement contract changes owner/shard locations from earlier development
+builds. Upgrade all nodes together, recreate and redistribute the config, and
+recreate PARTITIONED/STRIPE data. No migration, legacy placement, or dedicated
+old-placement error is provided. Existing data is never deleted automatically.
+
 PARTITIONED requires WAL storage. A receiver forces an applied mutation durable
 before atomically advancing its persisted per-peer replication progress, so
 recovery never skips data whose progress alone reached stable storage.
 
 `ClusterRuntimeOptions::readMode` controls point-read routing for native
-placement. Non-Raft placement uses owner routing; Raft placement serves
-`OWNER_LINEARIZABLE` only on the current leader after a fresh quorum ReadIndex
+placement. Owner reads use the routing policy below; Raft placement executes
+`OWNER_LINEARIZABLE` on the current leader after a fresh quorum ReadIndex
 confirmation and local application through the captured commit index:
 
 | Value | Meaning |
 |---|---|
 | `LOCAL_STALE_OK` | Serve reads from local storage without freshness coordination |
 | `OWNER_ONLY` | Serve only keys owned by the local node; remote-owner reads fail |
-| `OWNER_LINEARIZABLE` | Non-Raft routes each key to its current owner; Raft leaders confirm a fresh quorum ReadIndex before reading locally |
+| `OWNER_LINEARIZABLE` | Require the current owner, redirect/forward according to `routingMode`; Raft leaders confirm a fresh quorum ReadIndex before reading locally |
+
+#### Native client routing
+
+`ClusterRuntimeOptions::routingMode` is runtime-only (not serialized in AKC1).
+
+| Value | Public Native behavior on a non-owner data node |
+|---|---|
+| `LOCAL_ONLY` | Throw `ClusterRoutingError` with `LOCAL_ONLY`; no network forwarding or redirect hint |
+| `REDIRECT` (default) | Throw `NOT_OWNER` with a structured `ClusterRouteTarget` |
+| `FORWARD` | Send one peer RPC using the configured transport to the owner and return its result |
+
+The target contains `nodeId`, `host`, `tcpPort`, `httpPort`, `grpcPort`,
+`replPort`, `configurationEpoch` (non-Raft group epoch; zero for data Raft), and
+`raftTerm` (zero outside data Raft).
+`NodeInfo::dataPort` supplies the default TCP port. Configure runtime
+`apiEndpoints` on the entry nodes to advertise protocol-specific public ports;
+zero means unspecified, not a guessed HTTP/gRPC endpoint. Unknown/duplicate
+endpoint node ids and invalid modes/timeouts are rejected at startup.
+
+MIRROR routes to the **data Primary**, never its separate authority leader.
+Data Raft routes to the current data leader, including when the entry node is a
+learner. PARTITIONED routes by key. STRIPE uses its owner/failover eligibility,
+then executes the ordinary fenced metadata/shard write coordinator at that
+destination. Authority-only MIRROR witnesses advertise redirects but do not
+host data forwarding connections. No forwarding path bypasses WriteCoordinator,
+ownership checks, ReadIndex, or MIRROR/STRIPE fencing.
+
+Forwarding covers put/remove (including hinted forms), same-owner protocol bulk writes,
+owner-coordinated point reads (get/getInto/getIntoArena/getBatch/exists), and
+Raft putWithRequest/removeWithRequest/queryRequest. Hints are recomputed at the
+destination. `LOCAL_STALE_OK` stays node-local for non-STRIPE reads; `OWNER_ONLY`
+never forwards. STRIPE `LOCAL_COORDINATOR` retains its explicit local gather and
+authoritative metadata validation. Read batches may route keys independently
+and are not a cluster-wide snapshot. A write batch spanning destinations throws
+`CROSS_OWNER_BATCH` **before any application**; it is never silently split.
+Co-located batches retain their existing completion/atomicity contract.
+
+`forwardingTimeoutMs` defaults to 5000 (valid range 1-300000). One monotonic
+budget bounds admission, send, and response wait; the destination subtracts its
+queue delay before execution. Platform DNS resolution is synchronous and may
+delay the reported timeout; the remaining budget is rechecked before submission,
+so a resolver delay never permits a new mutation after its deadline.
+A destination never forwards again: stale routing
+returns another structured error to the caller, so internal loops are impossible.
+Timeout is not cancellation: an admitted mutation may commit after the caller's
+deadline. No forwarded mutation is automatically replayed. `NO_TARGET` means no
+writable leader/owner was known, `FORWARD_UNAVAILABLE` means no operation was
+admitted for application at the destination (or the RPC was never sent), and
+`OUTCOME_UNKNOWN` means application/commit may have occurred.
+Resolve unknown outcomes with the original Raft request identity and query/retry
+APIs when enabled; ordinary writes have no implicit exactly-once guarantee.
+SECURE forwarding inherits peer identity pins and cluster membership checks;
+explicit PLAIN transport retains its trusted-network-only contract.
+
+Forward request/response payloads are bounded to 4 MiB (including framing fields)
+on both data transports. Larger remote operations return `PAYLOAD_TOO_LARGE`
+before submission (or after a read whose value cannot fit); connect directly to
+the advertised owner for larger values. Up to 64 outstanding forward requests
+per non-Raft peer connection are identified independently. Streaming large
+forwarded values and transparent client-side redirect following are future work.
+Raft forwarding uses independent RPC channels, with `raftMaxForwardRequests`
+limiting active channels per runtime (default 64, range 1–256). Waiting for a
+channel consumes the caller's original deadline. Consensus traffic uses separate
+connections so forwarded administration cannot block its own replication.
+One additional channel is reserved for leaf placement-state reads needed by
+forwarding callbacks, allowing reconfiguration even when the ordinary limit is 1.
+Forward frames use AKR1 types 0x24/0x25; mixed development builds are unsupported.
+Native callers and optional runtime/API backends must be rebuilt together for
+the changed C++ ABI. Online placement changes persist the committed AKC1 configuration.
+
+API backends preserve the same JSON error object: TCP returns
+`ApiStatus::ROUTING_ERROR` (0x02) without closing the connection or treating it as
+a protocol violation; HTTP returns 409 (routing/local-only/cross-owner), 503
+(no target/unsubmitted forwarding failure), 413 (payload limit), or 500
+(unknown outcome), with `application/json`. HTTP does not issue an automatic
+307 replay. gRPC returns FAILED_PRECONDITION, or UNKNOWN for ambiguous outcomes,
+with the JSON object in `Status::error_details()`. Clients must inspect the
+outcome field before considering retries.
+
+Administrative operations remain explicit: maintenance runs on the connected
+node. Native placement reconfiguration follows `routingMode` and may forward to
+the placement authority; other membership/leadership calls require their local
+authority. Distributed rollback uses its checkpoint/control protocol.
+
+Distributed aggregate/range/history reads use READ_QUERY over the authenticated
+node-to-node forwarding transport, with bounded ephemeral cursor pages. See 8.3
+and 13 for authority selection, read-mode behavior, logical history streams,
+resource limits and distributed-cut semantics. They do not proxy administrative
+operations or replay mutations. Existing API/JNI scalar historical callers keep
+working with key-stream seq semantics; native callers may use Revision for
+explicit stream validation. All native core/backend binaries must be rebuilt
+together (runtime interface and query operation added). Current pre-release format markers remain version 1. All consumers must use
+the new layout; no backward readers or migration layer are provided.
 
 `STRIPE` stores public values as internal metadata plus Reed-Solomon data shards
 and optional parity shard records. The first shard target is the key owner.
-Non-owner public writes are rejected rather than forwarded, except that the
-configured STRIPE failover candidate may accept them while that key's owner is
-unreachable. Reads reconstruct
+Non-owner public writes follow `routingMode`; a configured STRIPE failover
+candidate may accept them while that key's owner is unreachable, still subject
+to the existing metadata authority fencing. Reads reconstruct
 the value from the latest authoritative metadata and at least `dataShards`
 available shards.
 For `RAID.0`, every data shard is required: one missing or corrupt shard makes
@@ -1235,7 +1683,7 @@ published after placing only a subset.
 | Value | Meaning |
 |---|---|
 | `ALL_SHARDS` | Durably place every data/parity shard, then atomically publish durable owner metadata |
-| `DATA_SHARDS` | With parity, publish after any `dataShards` shards are durable and record missing positions for rebuild |
+| `DATA_SHARDS` | With parity, publish after any `dataShards` shards are durable; with RAID.10, require one durable copy of every logical shard; record missing positions for rebuild |
 
 `DATA_SHARDS` is the default. It permits degraded writes through as many node
 failures as `parityShards`: RAID5-style layouts continue with one missing node
@@ -1244,6 +1692,10 @@ fewer than `dataShards` new-generation shards are durable. A successful degraded
 write sets engine health to `REBUILDING`; disconnected peers remain
 `DEGRADED` at the transport layer. `ALL_SHARDS` remains available for
 deployments which prefer rejecting every incomplete generation.
+For `RAID.10`, `DATA_SHARDS` permits a write while at least one member of every
+mirror pair is reachable. Losing both members of any one pair makes the value
+unavailable. A returning member is rebuilt from its surviving mirror without
+Reed-Solomon decoding.
 
 `ClusterRuntimeOptions::stripeReadCoordinatorMode` controls where STRIPE reads
 are assembled:
@@ -1253,15 +1705,16 @@ are assembled:
 | `OWNER` | Route public reads to the current authority; it gathers shards |
 | `LOCAL_COORDINATOR` | Fetch authoritative metadata, gather shards, and revalidate the generation before returning |
 
-STRIPE requires WAL storage. Each mutation first persists an authority-local intent
-under the internal `0x00 || "AKST1"` key prefix, using a reserved storage sequence
-which is separate from its generation/fencing token.
+STRIPE requires WAL storage. Each mutation first persists an authority-local
+`AKST1` intent payload under the internal `0x00 || "AKST1"` key prefix, using a
+reserved storage sequence which is separate from its generation/fencing token.
 Only after that intent is durable may immutable generation-qualified shards be
 sent. Targeted shard operations always require `ALL_TARGETS`/`DURABLE`
 acknowledgement with `FAIL_WRITE` on timeout, including when the configured
 general replication policy is `ASYNC` or `NONE`.
 The authority then asks the current STRIPE metadata-Raft leader to publish one
-WAL-backed `AKSM1` record. Publication succeeds only after the metadata entry is
+WAL-backed `AKSM1` value under the internal `0x00 || "AKSM1" || publicKey` key,
+without a key-length prefix. Publication succeeds only after the metadata entry is
 durably committed by a majority of the configured data-bearing voters and
 applied locally. This quorum commit is the sole metadata commit point; an
 uncommitted local record is never a source of authority. Metadata reads use a
@@ -1269,6 +1722,21 @@ Raft read barrier and therefore also require a live majority.
 Deletes use the same intent/publication protocol with tombstone metadata.
 An ambiguous owner-local persistence failure stops STRIPE reads/writes until
 the engine is reopened.
+
+Within an engine, STRIPE read/write/repair/garbage-collection operations serialize
+only for the same binary public key. Shard reads and mutation sends use eight
+workers with at most 64 queued tasks per engine. Completion waits for all submitted
+tasks, including on failure, before releasing the generation's key guard.
+Range-query materialization pins captured generations against garbage collection;
+other keys remain free to publish newer generations. The metadata authority keeps
+only short shared lease-map locks. During quorum publication, a per-key reservation
+continues to fence competing operations and owner/failover handoff across term and
+connection changes. Control RPCs correlate responses by request id with at most
+64 pending requests per connection and four authority workers/64 queued requests
+per server. Targeted shard ACKs must match the individual request id; a higher id
+is not evidence that an earlier request has completed.
+Rollback control RPCs retain separate per-connection serialization for their
+shared rollback worker without blocking metadata control RPCs.
 
 STRIPE metadata Raft is a second logical Raft group which reuses the native Raft
 implementation but has its own listener (`NodeInfo::stripeMetadataPort`), hard
@@ -1282,6 +1750,20 @@ automatically and may run on any data-bearing node. A metadata request waits
 through the election window independently of the shorter shard-acknowledgement
 timeout. `EngineStats::ClusterStats` exposes the metadata term, leader,
 commit/applied indexes, and snapshot index.
+
+Multi-failure STRIPE layouts with two or more parity shards require at least
+`2 * parityShards + 1` data-bearing metadata voters. This keeps metadata quorum
+available through the same number of node failures as the encoded value. In
+particular, a RAID6-style two-parity layout requires at least five data-bearing
+nodes; a four-node `2 + 2` layout is rejected even though its value shards can be
+encoded, because two failures would leave metadata Raft without a majority.
+RAID.10 has no equivalent multi-failure metadata-quorum guarantee: its minimum
+four-voter group continues through one voter failure, but two pair-distinct node
+failures can leave every value shard available while metadata reads and writes
+are blocked by loss of majority.
+A five-voter RAID.10 layout with one hot spare retains metadata quorum through
+two node failures, although one spare can replace only one missing placement per
+value generation.
 
 Targeted STRIPE operations use per-target request ids allocated before sending;
 a failed attempt does not allow its id to be reused for a different operation
@@ -1298,8 +1780,13 @@ retry. A local coordinator racing generation retirement revalidates against the
 owner and retries rather than returning a partially reconstructed generation.
 The current published generation is never collected.
 
-Published STRIPE metadata uses `AKSM1` and durably records the placement and
-observed presence of every generation-qualified shard. The current metadata-Raft
+Published STRIPE metadata values use `AKSM1` and durably record tombstone and
+rollback flags, generation and fencing fields, the metadata logical sequence,
+and the placement and observed presence of every generation-qualified shard.
+For RAID.10,
+the placement count is twice the logical shard count and adjacent placement
+entries are the two copies of one logical shard. The copy count is derived from
+those counts rather than stored as a second metadata field. The current metadata-Raft
 leader runs a bounded background scrub/rebuild loop. It may write a repaired
 shard on behalf of the logical owner, but the receiver still validates its shard
 index against the normal or owner-excluded placement. Presence updates are
@@ -1312,13 +1799,25 @@ foreground read and resumes from published metadata after process restart.
 `stripeAutoRebuild` may disable the worker without disabling read repair.
 `EngineStats::stripeRebuild` exposes cycles, scanned keys, attempts, successes,
 failures, last failed node, and current rebuild activity. RAID.0 never enters
-this reconstruction path.
+this reconstruction path; RAID.10 copies the surviving mirror shard.
 
 `STRIPE_FAILOVER_ELIGIBLE` enables owner failover. At most one configured node
 may have this capability; it must also be `COORDINATOR_ELIGIBLE` and
-`DATA_BEARING`. Enabling it requires at least one data-bearing node more than
-`dataShards + parityShards`, because a failover generation excludes the failed
-owner and places its shard on a spare.
+`DATA_BEARING`. Enabling it requires at least one data-bearing node more than the
+configured shard-placement count, because a failover generation excludes the
+failed owner and places its shard on a spare. In RAID.10 this capability denotes
+the sole shared hot spare. A disconnected placement node is replaced during the
+background rebuild by copying its surviving mirror to the spare, then committing
+the changed effective placement in `AKSM1`. If the unavailable node is the key
+owner, the same spare obtains the fenced failover lease and writes the new
+generation directly into that replacement placement.
+
+RAID.10 does not automatically fail back. Once `AKSM1` names the spare for a
+placement, subsequent generations preserve that placement even if the original
+node reconnects. Reusing the original node requires an explicit
+reconfigureCluster placement change. Only one hot spare may be configured; a second
+simultaneous placement failure remains degraded and is not remapped onto the
+already active spare.
 
 Every owner/failover read or write first acquires a per-key authority lease from
 the current metadata-Raft leader. The lease carries an unpredictable nonzero
@@ -1327,6 +1826,16 @@ publish metadata with that token. Leases are leader-term-local: a term change
 clears them, the old leader cannot commit without a majority, and the new leader
 rejects every token issued in an earlier term. Shards written with a rejected
 token remain unreferenced and cannot become visible.
+
+Remote leases also belong to the specific accepted replication connection that
+acquired them. Before processing authority requests, the metadata leader revokes
+all leases from disconnected connections, including leases on other keys. A
+reconnection or process restart cannot revive the old token. A fresh acquisition
+by the same owner or failover holder fences its previous grant, including a grant
+whose response was lost on a live connection. Native engines serialize their
+STRIPE operations; callers of the low-level API must respect that contract.
+Commit and reacquisition are serialized by the authority lock, so a superseded
+token cannot publish after a new grant.
 
 `STRIPE_FAILOVER_ELIGIBLE` does not select the metadata leader. It selects only
 the one optional data-operation authority that may replace an unreachable key
@@ -1340,13 +1849,17 @@ Raft replication itself uses the dedicated metadata endpoints. Mixed-version
 rolling operation is not supported.
 
 On owner return, the metadata leader stops granting new failover leases. The returning
-owner receives `BUSY` while a failover read/write still holds the key lease and
-waits until that operation commits or releases it; the next lease is then granted
+owner receives `BUSY` while a live failover read/write still holds any lease for
+that owner's keys and waits until those operations commit or release their leases;
+the next lease is then granted
 to the original owner with a new fencing token. The candidate behaves as an
 ordinary data-bearing node when it does not hold a failover lease.
-`AKSM1` is the initial pre-release metadata format. Intermediate development
-formats have no migration path; STRIPE data created by those builds must be
-recreated.
+`AKSM1` and `AKST1` are the current pre-release metadata and intent payload
+formats. The metadata key namespace is `0x00 || "AKSM1" || publicKey`, ordered
+by the public key's raw bytes. Intent keys use `AKST1` and shard keys use `AKSS1`.
+Readers validate the current format and report ordinary metadata read errors
+for malformed input. There is no historical-format detection, backward reader,
+migration, or automatic data deletion. All STRIPE nodes must use the same build.
 
 `ClusterRuntimeOptions::stripeReadRepair` enables owner-side best-effort repair
 of missing shards when an owner read can reconstruct the value.
@@ -1358,11 +1871,142 @@ write completed with the normal durability acknowledgement. Statistics are
 thread-safe, not persisted, and expose no keys or values. Disabled repair and
 non-owner reads do not increment them.
 
-Online placement
-reconfiguration is intentionally unsupported: stop every node, atomically
-replace the one shared `ClusterConfig`, and reopen the cluster. Online membership
-changes are available only for `RAFT_QUORUM` through its joint-consensus voter
-APIs.
+`reconfigureCluster(config)` supports MIRROR data-consensus membership
+replacement, PARTITIONED data-consensus node addition/removal and copy-count
+changes, and STRIPE node/placement/hot-spare replacement. Replication mode,
+cluster identity, partition count, existing node endpoints, consensus policy,
+and stripe geometry stay fixed. Geometry changes require a separate rebuild.
+PARTITIONED holder changes require `JOINT_CONSENSUS`,
+`allowOnlineVoterChanges`, and `allowLearners`.
+
+PARTITIONED consensus hashes the length-delimited `AKPT1` domain and key with
+BLAKE2b-256, takes the first four digest bytes as a little-endian integer modulo
+`partitionCount`, and rendezvous-ranks holders with the partition's two-byte
+little-endian index. Each partition owns storage and a consensus journal under
+`partitions/<index>`. Its stable revision stream is index + 1. A surviving
+voting majority elects its replacement leader when automatic failover is enabled,
+without changing retained logical revisions. One copy has no failure redundancy.
+`partitionCount` defaults to 16 and is bounded by 256. Each data node supplies
+`partitionReplBasePort`, reserving `partitionCount + 1` consecutive ports for
+data groups and placement authority. All endpoints use the chosen PLAIN/SECURE
+transport.
+
+The placement authority durably commits the complete target configuration
+before transfer. New PARTITIONED holders receive a retained-history snapshot and its journal suffix before
+promotion and joint consensus; only after every group finishes membership does
+the authority activate placement. New nodes start with the active configuration
+plus themselves as `RAFT_LEARNER` (PARTITIONED) or `PLACEMENT_STANDBY` (STRIPE).
+The target configuration removes that bootstrap capability to activate them.
+SECURE deployments must provision their identity pins on every participant
+before admission; extra pins for future members are allowed. Removed nodes'
+storage is retained, and they may be stopped after activation.
+An already unavailable STRIPE node can be removed when surviving shards allow
+reconstruction and the old/new metadata memberships can commit the transition;
+every node retained in the target placement must be reachable for transfer.
+
+STRIPE's default `runtime.reconfiguration.stripeMigrationMode = FREEZE`
+waits for existing fenced operations to finish, freezes new operations
+which need leases, and copies every retained metadata revision and its shards
+before atomically activating placement aliases. Reads through a local coordinator
+can continue against the active metadata. Owner reads, writes, and rollback need
+leases and wait or fail according to write admission policy. Thus STRIPE migration
+can pause these operations for the duration of transfer. Original logical
+sequence, generation token, writer id, timestamp and tombstone stay unchanged.
+`LIVE_COPY` keeps the old placement serving owner reads, writes and rollback
+during bulk copying. It then commits a lease freeze, drains admitted operations,
+copies newly published revisions, and activates the target. Already copied
+revisions have durable plan-scoped checkpoints and are not transferred again.
+Aliases use `0x00 || "AKSH2" || placementGeneration:u64le || logicalSeq:u64le || publicKey`, with a placement
+generation followed by current `AKSM1` metadata. Shard payloads use `AKSS1`.
+Garbage collection and automatic rebuild are suspended until activation, so
+retained revisions remain readable and rollback checkpoints survive placement
+changes.
+
+An unfinished intent blocks a different plan. Repeating the same configuration
+is idempotent. `runtime.reconfiguration.resumePendingChanges` defaults to true:
+a surviving authority leader retries after interruption, restart or leadership
+change. Set it to false to require an explicit `reconfigureCluster` retry.
+`stripeInterruptionPolicy = RETAIN` (default) retains interrupted intents and
+source data. `CANCEL` asks the authority recovery worker to cancel an interrupted
+STRIPE plan before authority membership activation starts, even when
+`resumePendingChanges` is false. Cleanup is a separate bounded attempt: the
+caller returns on its deadline without waiting for another timeout. It requires
+a surviving authority quorum and retries after failure or restart. The policy
+and freeze/activation phases are stored in the committed intent, so a successor
+uses the same contract. While quorum is unavailable the pending plan remains.
+After authority activation starts, the plan must be resumed to completion;
+automatic recovery follows `resumePendingChanges`, and explicit retry is always
+available. Clear a cancellation hook before resuming such a plan.
+`cancelClusterReconfiguration()` explicitly cancels an idle pending STRIPE plan
+under either policy, forwards according to `routingMode`, returns false when
+none remains, and rejects cancellation after authority activation starts.
+Cancelling keeps the old active configuration and never reuses the cancelled
+generation or exposes its aliases. Preparatory non-voting learners remain
+reusable; the next successful authority membership transition removes unused
+ones. Staged shard data is retained; cancellation
+does not delete real storage. Both new policy options are STRIPE-only.
+`clusterReconfigurationStatus()` reports authority, active/pending generations,
+completed partitions and the latest local error. STRIPE also reports transferred
+bytes, completed records, `stripeWritesBlocked`, and `activationStarted` for the authority's current transfer attempt; these
+counters reset on retry or restart. `clusterPartitionStats()` exposes local
+streams, leaders, sequences, commit indices, configuration generations and
+each local child's complete storage statistics. PARTITIONED root storage
+statistics describe its control engine; data sequences and storage metrics
+belong to these independent partition engines.
+
+`runtime.reconfiguration.writePolicy` selects `WAIT` (default) or `REJECT`
+during group administration or a STRIPE lease freeze. `timeoutMs` defaults to
+60000 (maximum 300000) and is one overall budget for serialization admission,
+authority reads/intent commit, preparation, draining, shard transfer, membership,
+and activation. Nested and forwarded requests inherit the remaining budget;
+parallel partition and shard work share its deadline. Existing per-RPC limits
+can expire earlier. A deadline cannot preempt a local filesystem flush or an
+embedding's blocking callback; checks surround cooperative work and network
+waits are bounded. A submitted consensus command may still commit after the
+caller times out: inspect status and retry/cancel the exact pending plan rather
+than assuming rollback. `maxConcurrentPartitions` defaults to 1 (maximum 16).
+`maxTransferBytesPerSecond` limits new-holder catch-up per partition or the
+STRIPE transfer; zero is unlimited. Existing transport resource limits also apply,
+and embeddings may supply a thread-safe cancellation hook. PARTITIONED bulk copy admits
+writes until the final journal tail and joint membership transition; unrelated
+groups continue accepting writes. Batches do not provide cross-group atomicity.
+Range queries require complete coverage and reject leadership changes during
+capture.
+
+MIRROR, partition and placement Raft groups apply the configured snapshot policy
+on leaders and followers. Snapshots preserve retained history, original mutation
+timestamps, request results and membership configuration generations, allowing
+the committed journal prefix to be reclaimed without losing these state-machine
+records. Placement snapshots include active and unfinished target configurations;
+STRIPE also includes retained metadata revisions and placement aliases. Shard
+payloads continue to use the placement transfer path.
+Placement authority state now uses `AKPC2`; STRIPE placement aliases use `AKSH2`.
+These pre-release internal formats replace `AKPC1`/`AKSH1` without migration.
+Existing PARTITIONED/STRIPE cluster storage using those old formats must be
+recreated. Public revision and shard payload formats remain unchanged.
+VersionLog retention still controls public history availability. Retry identities
+are partition-scoped: use `queryRequest(id, originalKey)` for PARTITIONED
+consensus. Keyless request queries remain available for a shared MIRROR stream.
+Retry-safe requests require quorum completion.
+
+`ClusterConfig::failover()` separates owner election from acknowledgement:
+
+| Policy | Contract |
+|---|---|
+| `NONE` | No automatic data-owner election. Consensus groups require an explicit `campaignClusterLeadership(streamId)` or leadership transfer. Static replication keeps its fixed owner. |
+| `PRESERVE_ACKNOWLEDGED` | Automatic quorum election with quorum-completed writes; requires `RAFT_QUORUM`. |
+| `ALLOW_ACKNOWLEDGED_LOSS` | Automatic fenced election with local-journal acknowledgement, permitted for `ASYNC` or `PRIMARY_ACK` with local completion. Accepted writes may be lost after failover. |
+
+Constructor `DEFAULT` resolves to PRESERVE for RAFT_QUORUM and NONE otherwise;
+only the three resolved policies are serialized. Data consensus is selected by
+RAFT_QUORUM, ALLOW_ACKNOWLEDGED_LOSS, or explicit JOINT_CONSENSUS membership.
+This permits manual election and online placement with local acknowledgement.
+A locally acknowledged mutation becomes visible only after background quorum
+commit. Acceptance confirms a current-term writer with a fresh quorum fence;
+a network-isolated old leader cannot acknowledge new writes. Local completion
+does not promise read-after-write visibility or survival after failover.
+For PARTITIONED campaigns, stream id is partition index + 1; MIRROR uses 0.
+Existing fixed-primary replication and external fencing remain separate choices.
 
 ### 15.3 Node Roles and Capabilities
 
@@ -1374,8 +2018,10 @@ Capabilities are bit flags:
 | Capability | Meaning |
 |---|---|
 | `COORDINATOR_ELIGIBLE` | Node may be selected as primary |
+| `RAFT_LEARNER` | Receives a data-consensus journal without voting or owning a new partition |
+| `PLACEMENT_STANDBY` | STRIPE joining node, excluded from active shard placement and initial metadata voting |
 | `DATA_BEARING` | Node can store KV data and receive routed writes |
-| `STRIPE_FAILOVER_ELIGIBLE` | Sole optional owner-failover candidate; unrelated to metadata-Raft leadership |
+| `STRIPE_FAILOVER_ELIGIBLE` | Sole optional owner-failover candidate; for RAID.10, the shared hot spare excluded from normal pairs; unrelated to metadata-Raft leadership |
 
 Node id zero is reserved and invalid for configured nodes.
 
@@ -1420,11 +2066,10 @@ when it matches that configured Primary; expired or missing leases do not
 self-promote a primary and require explicit startup-role selection. A replica
 uses the configured Primary id unless a matching runtime assertion is supplied.
 The Primary renews its local manifest lease every 10 seconds for a 30-second
-window. This lease is not distributed fencing. Changing the Primary requires
-stopping or externally fencing the old writer and replacing the shared config
-offline; a node still running with a different or obsolete config cannot be
-fenced by this mechanism. Merely changing `ClusterConfig::primaryNodeId()` is
-not sufficient: an existing `AKCG2` membership naming another Primary rejects
+window. This lease is not distributed fencing. Primary changes require an
+explicit authorized transition under the MIRROR fencing policy below and a
+shared replacement config. Merely changing `ClusterConfig::primaryNodeId()` is
+not sufficient: an existing `AKCG1` membership naming another Primary rejects
 startup.
 
 An offline promotion must set `mirrorPromotion.enabled` on every node for the
@@ -1438,8 +2083,10 @@ skipped epoch is rejected. Replicas accept the successor only when their existin
 membership has the same group id, the same authorized previous Primary/epoch,
 the incoming Primary matches their configured endpoint, and the incoming epoch
 is exactly the next epoch. The operation is retryable after membership was
-published but endpoint startup failed. It does not contact or fence the old
-Primary and therefore is not an online failover protocol. Promotion requires
+published but endpoint startup failed. Promotion is rejected under `STATIC`;
+the other policies must fence the previous authority before publishing the
+successor. This remains an explicit offline configuration transition, not
+automatic data-Primary election. Promotion requires
 explicit `PRIMARY`/`REPLICA` startup roles; `AUTO`, membership reset, Raft, and
 non-MIRROR placement are rejected.
 
@@ -1448,6 +2095,194 @@ An unexpected lease-renewal failure is contained by the background worker: it
 stores the failure, demotes the manager to `REPLICA`, and causes the owning
 runtime to stop replication endpoints. Subsequent runtime operations rethrow the
 stored failure through the manager health check instead of terminating the process.
+
+#### MIRROR fencing policy
+
+`ClusterRuntimeOptions::mirrorFencing` separates Primary authority from data
+replication. It applies only to non-Raft `MIRROR` (`PRIMARY_ACK` or `ASYNC`).
+
+| `MirrorFencingMode` | Contract |
+|---|---|
+| `STATIC` (default) | Fixed configured Primary; reject `mirrorPromotion`. No dynamic election or distributed lease. |
+| `QUORUM_FENCED` | Separate Raft group orders write grants and authority changes; value payloads stay on the selected data replication path. |
+| `EXTERNAL_FENCED` | An embedding-provided `IMirrorFencingProvider` must fence the old writer before promotion and validate current authority before writes and authoritative reads. |
+
+For `QUORUM_FENCED`, supply `mirrorFencing.authorityNodes` with exactly one
+voter per configured node, including authority-only witnesses. Use the same
+node ids and advertised hosts, both coordinator/data-bearing control
+capabilities, and dedicated replication ports that do not overlap data or
+STRIPE metadata endpoints. Control `dataPort` is unused. At least three and at
+most 512 voters and an explicit shared nonzero `clusterGroupId` are required.
+Secure transport must pin every authority voter, including witnesses. A main
+node without `DATA_BEARING` votes on authority but receives no mirrored data.
+Authority topology is fixed; these voters are not exposed through the data
+Raft membership APIs. `transferMirrorAuthorityLeadership()` transfers control
+leadership only, not data Primary authority. Control leadership automatically
+converges to the configured/current data Primary (or authorized successor).
+Native engines require WAL and WAL recovery to be enabled for this policy.
+An embedded runtime must supply real durable apply/forceDurable/sequence
+callbacks; a no-op durability callback cannot satisfy the recovery contract.
+
+Each Native public mutation runs through `executePrimaryWrite`: commit a BEGIN
+grant by authority quorum, perform the local mutation and selected data
+replication, force local storage durable, persist a durable completion receipt,
+then commit END by authority quorum. The control log contains only Primary id,
+epoch and operation token; never public keys or values. One grant may be active
+at a time. BEGIN orders the mutation before any subsequent Primary transition;
+a transition cannot commit while that grant is active. END follows durable
+local application. A put batch uses one grant; each rollback mutation is also
+guarded (a multi-key rollback need not be one atomic grant).
+Authority quorum loss fails closed before local application when no grant was
+committed, regardless of `ACCEPT_LOCAL`. Loss after BEGIN may report failure
+after local application; callers must not infer that a failed operation had no
+effect. Fencing does not add atomic rollback of a partially applied batch.
+
+Data may remain `ASYNC`: writes wait for authority BEGIN/END and local durability,
+not replica data arrival. A stopped data replica does not block writes when the
+authority majority is reachable. Async promotion can still lose acknowledged
+data not present on the selected successor; fencing is not a zero-data-loss
+guarantee and does not establish a global MVCC timeline across failover.
+
+**Recovery contract:** outstanding grants never expire by
+timeout or clock. A process pause, authority leader change, or restart cannot
+revoke a possibly executing local mutation and simultaneously permit a new
+Primary. An exception or crash before a durable completion receipt leaves the
+grant unresolved and blocks further writes and promotion. When the original
+Primary has a matching durable receipt, it automatically retries END after
+startup or authority quorum recovery, without waiting for another public write.
+Recovery is serialized with public writes and matches the receipt's Primary id,
+epoch and operation token against the current authority grant. An old or foreign
+receipt cannot release a different grant, and recovery never replays the mutation
+or fabricates a receipt. A public write also retries this recovery before BEGIN.
+Receipts identify the grant obtained before local application, even if external
+fencing changes authority while the operation is running. An obsolete Primary
+cannot report successful release merely because the successor has no active grant.
+Otherwise `ClusterRuntimeOptions::mirrorRecovery` selects how to resolve the
+unconfirmed grant. This policy is independent of `ASYNC`/`PRIMARY_ACK` and the
+data acknowledgement policy; it applies to `QUORUM_FENCED` authority grants.
+
+| Recovery mode | Behavior without a matching durable completion receipt |
+|---|---|
+| `BLOCK` (default) | Keep the grant unresolved; never invoke an external recovery provider. |
+| `MANUAL` | `AkkEngine::recoverMirrorWrite()` (or the runtime method) explicitly asks the provider to resume the original Primary. An explicitly authorized promotion asks it to revoke the old Primary instead. |
+| `AUTOMATIC` | The original Primary retries provider recovery in the background at `retryIntervalMs`; explicit recovery and promotion remain available. Primary promotion itself still requires `mirrorPromotion`. |
+
+`MANUAL`/`AUTOMATIC` require `mirrorRecovery.provider`, an
+`IMirrorRecoveryProvider`; `BLOCK` rejects a configured provider to avoid silently
+ignoring it. The retry interval defaults to 1000 ms and must be in [50, 3600000].
+These are local runtime choices and may be changed on restart without rewriting
+the authority state. Matching completion receipts are always recovered
+automatically, including with `BLOCK` or `MANUAL`.
+
+A `MirrorRecoveryRequest` names the cluster/group, old Primary/epoch, exact
+operation id, candidate, expected local durable sequence and requested action.
+The provider returns `nullopt` or throws if safety remains uncertain. A
+`MirrorRecoveryProof` must contain the exact request; a proof for another
+operation, generation, candidate, sequence or action is rejected. Providers are
+trusted integrations: matching fields alone cannot prove that an external
+process has stopped. Never return a proof merely because a heartbeat timed out.
+
+For `RESUME_PRIMARY`, the provider must establish that the old operation and all
+older execution instances can never resume writing, while allowing this runtime
+to continue. Partial effects must be recoverable by the engine's durability
+callback. The engine serializes recovery with writes, rechecks authority through
+a quorum barrier, forces local durability, confirms the expected sequence,
+persists a matching receipt and commits END for that operation. This does not
+report the original failed operation as successful or roll back partial effects.
+
+For `PROMOTE_PRIMARY`, the provider must additionally prevent the old Primary
+from writing or restarting under its old authority, including paused/in-flight
+operations. After checking proof, authority and candidate durability, the engine
+commits END for the exact operation and then the ordinary guarded Primary
+transition. A changed/intervening grant is never forcibly discarded. If the
+transition fails after END, retrying the same promotion can complete it.
+Previously persisted forced transitions remain replayable; new recovery does
+not emit them. Data and authority persisted formats are unchanged.
+
+The provider must be idempotent and thread-safe, honor the supplied cancellation
+token, and must not re-enter the engine/runtime. Native close cancels recovery
+before waiting for active public operations. Cancellation, failed durability,
+stale proof or lost quorum never supplies permission to release a grant. A valid
+durable receipt can still complete recovery after a failed END attempt. `recoverMirrorWrite()`
+returns true when it resolves a pending grant, false when none is pending or the
+provider cannot yet prove recovery, and throws on invalid proof or failed checks.
+Automatic attempts preserve the pending grant on failure and retry; the existing
+`mirrorWritePending` observation exposes that unresolved state.
+
+Existing external fencing implementations can be used for quorum promotion:
+
+```cpp
+runtime.mirrorRecovery.mode = MirrorRecoveryMode::MANUAL;
+runtime.mirrorRecovery.provider =
+    std::make_shared<MirrorFencingRecoveryProvider>(fencingProvider);
+```
+
+This adapter calls the existing fencer for `PROMOTE_PRIMARY` and declines
+`RESUME_PRIMARY`, since fencing this runtime would not let it resume.
+The adapter checks cancellation before and after `fence()`; the wrapped callback
+must return in bounded time because its existing API has no cancellation token.
+Independent providers may integrate process/session recovery, storage access revocation or
+other mechanisms meeting the requested guarantee. Engine-managed expiring leases
+and universal generation fencing are not supplied by this policy interface.
+The old optional `mirrorFencing.external` setting for quorum recovery is replaced
+by `mirrorRecovery`; `mirrorFencing.external` now belongs only to
+`EXTERNAL_FENCED` authority.
+
+Without a recovery proof, an unresolved grant deliberately sacrifices availability;
+do not delete the authority state or fabricate a completion receipt to recover.
+
+`EXTERNAL_FENCED` requires `mirrorFencing.external`. The provider's `fence()`
+must prevent the previous Primary from writing or restarting as a writer,
+covering already-running operations and long process pauses. It must be
+idempotent for the same transition and throw on uncertainty. `validatePrimary()`
+must reject revoked authority. These calls are integration hooks, not a bundled
+STONITH/lease service: a heartbeat, an unchecked success callback, or a local
+flag is not sufficient external fencing. Fencing failure does not advance the
+persisted group epoch. No new production service dependency is imposed.
+
+Quorum data frames, retained history and snapshot keys carry the authority
+epoch (`AKMD1` envelope). Receivers reject unapproved/obsolete generations
+before application. An authorized successor forces a full replica snapshot,
+including equal-sequence replicas, to avoid merging divergent old data.
+`cluster.membership.mirror-resync` records the intent before successor
+membership is published and is cleared only after snapshot application is
+durable. Reopening without the promotion options still retries an unfinished
+snapshot; a candidate with an outstanding resync intent cannot be promoted.
+Rejoining with storage ahead of the authorized candidate sequence is rejected;
+restore an authoritative copy first. Promotion still requires exact previous
+group identity/epoch and exact candidate durable sequence on every retry.
+The promotion options authorize one transition, not subsequent ordinary boots:
+clear them after that node has completed the transition. Keeping the old
+expected sequence after later writes intentionally fails the startup assertion.
+An unfinished replica snapshot still resumes from its durable intent even when
+these options have been cleared after successor membership was accepted.
+
+`mirror.fencing` durably records the chosen policy and authority topology;
+changing or downgrading it in an existing database directory is rejected.
+`mirror-authority/` stores independently checksummed control state and recovery
+receipts. Do not remove these files to change mode. Choose a policy for a new
+directory, or explicitly rebuild from an authoritative copy with all old
+writers stopped. Enabling fencing does not retroactively constrain old binaries.
+The pre-release replication wire magic is reset to `AKR1`; this denotes the
+current protocol, not compatibility with earlier development builds that used
+that name. All peers must upgrade together and
+mixed fencing modes are rejected in the handshake. Native clients must be
+rebuilt for the changed runtime-options/stats ABI. The pre-release `AKC1`
+ClusterConfig format remains unchanged; fencing options are runtime options.
+
+`EngineStats::cluster` exposes `mirrorAuthorityLeaderNodeId`,
+`mirrorAuthorityPrimaryNodeId`, `mirrorAuthorityEpoch`,
+`mirrorAuthorityCommitIndex` and `mirrorWritePending`.
+
+**Future improvement:** ReadIndex plus BEGIN/END consensus and receipt sync
+add latency, control-log traffic and serialization even with async data.
+Investigate safe batching/pipelining and bounded authority leases. Improving
+unfinished-write recovery and reducing promotion downtime are also open work.
+These are optimization/availability opportunities, not permission to weaken
+fencing. A lease design needs a correctness argument for clock behavior,
+expiry, in-flight writes and long process/VM pauses, with explicit watchdog or
+external fencing requirements. Do not replace per-operation consensus with a
+heartbeat-only check or the local manifest lease.
 
 Timeout action is `ACCEPT_LOCAL`, `FAIL_ACK`, or `FAIL_WRITE`. `FAIL_ACK`
 reports acknowledgement failure after local commit in local-first primary-ack
@@ -1482,16 +2317,55 @@ validation do not establish an authentication or quorum trust boundary. PLAIN is
 for explicitly trusted networks/processes only; use SECURE with peer pins when
 that assumption does not hold.
 
+Both non-Raft hello payloads are exactly 82 bytes: the existing 34-byte identity,
+role, fencing and group prefix, followed by the persistent 16-byte cluster ID and
+a 32-byte configuration fingerprint. Both endpoints compare these fields before
+admitting data, catch-up, membership persistence or acknowledgement targets.
+PLAIN and SECURE enforce the same compatibility contract. This comparison does
+not authenticate a PLAIN peer.
+
+`ClusterConfig::replicationFingerprint()` hashes the `AKNP1` canonical encoding
+of the cluster ID, flags, replication mode, primary, acknowledgement and
+consistency policies, membership policy, stripe geometry, stable partition count
+and placement algorithm. Non-STRIPE contracts also include membership sorted
+by node ID (including capabilities, advertised hosts and all ports). STRIPE
+topology and RAID.10 pair order are instead validated by committed placement
+intents, permitting online replacement. PARTITIONED data consensus excludes its
+mutable copy count from this fingerprint and validates it through placement.
+Save timestamps and local runtime choices such as paths and peer pins are
+excluded. `ClusterRuntime` supplies the contract from its config; direct
+`ReplicationClient`/`ReplicationServer` users supply matching
+`replicationClusterId` and `replicationConfigFingerprint` runtime options.
+
+The earlier 34-byte hello is rejected; upgrade all non-Raft nodes together.
+The runtime-options layout and STRIPE control callback signature also changed,
+so native embedding callers must rebuild. The callback now receives the
+transport-owned connection lifetime via `PeerSession`. The hello and callback
+changes retain the stored config and membership formats.
+
 ### 15.6 Erasure Codec
 
 The native erasure codec API supports Reed-Solomon-style and external codec
 selection contracts. Stripe configuration records data and parity shard counts,
-defaulting to 4 data and 2 parity shards. Active native STRIPE uses the RS codec
-for data/parity placement, degraded reads, and best-effort read repair. Its
-systematic data-splitting path also accepts zero parity for canonical `RAID.0`;
-decode then requires all data shards and repair of a missing shard fails.
+the number of copies per logical shard, and defaults to 4 data, 2 parity, and one
+copy. Active native STRIPE uses the RS codec for data/parity placement, degraded
+reads, and best-effort read repair. Its systematic data-splitting path also
+accepts zero parity for canonical `RAID.0` and `RAID.10`; RAID.0 requires every
+data shard, while RAID.10 satisfies each logical shard from either mirror copy.
 
 ### 15.7 Replication Connection Lifecycle
+
+Point-read and STRIPE-control `timeoutMs` is one budget starting at API entry.
+It includes admission, pending-response drainage, state/socket/message/send-lock
+waits, transmission (including large-transfer READY), and response waiting.
+An unsent admission timeout leaves the connection usable. A stalled or partial
+send is interrupted by shutting down the connection and cancelling transfer
+waits; it cannot be resumed as a different request on that socket. A point-read
+response timeout leaves the connection alive for replication ACKs, and the late
+read response is drained before another point read is sent.
+Physical writes share that deadline: Windows uses cancellable overlapped I/O
+and retains send buffers until cancellation completes; POSIX uses nonblocking
+per-call sends and deadline-bounded writable waits.
 
 Non-Raft listeners dispatch handshakes to four fixed workers with at most 64
 queued sockets; overflow is disconnected. The existing five-second socket I/O
@@ -1585,7 +2459,7 @@ is rejected as a policy mismatch before voting or log replication. The
 fingerprint covers Raft/consistency behavior but deliberately excludes the
 current node list so joint-consensus membership changes can introduce a node
 that already carries the same cluster id and policy. A Raft configuration may
-contain at most 512 data-bearing voters; together with the 32768-entry retry
+contain at most 512 data-bearing members (voters plus learners); together with the 32768-entry retry
 request-state limit, this keeps final snapshot metadata within one 4 MiB Raft
 frame even for maximum-length configured host names.
 
@@ -1616,7 +2490,7 @@ and appended while earlier batches await quorum. AppendEntries carries multiple
 entries within the frame limit; commit advances over a quorum-replicated
 current-term prefix, and application shares its durability barrier across the
 committed batch. Blob chunks for one payload remain contiguous in the log.
-Engine `putBatch` submits bounded groups without promising transactionality.
+Internal protocol bulk writes submit bounded groups without promising transactionality.
 
 Raft log compaction exports a full state-machine snapshot only after at least
 `raftSnapshot.minLogEntries` committed entries, approximately
@@ -1624,6 +2498,20 @@ Raft log compaction exports a full state-machine snapshot only after at least
 `raftSnapshot.maxIntervalMs` with uncompacted commits. The trigger check is
 rate-limited to once per second. This keeps ordinary proposal batches from
 scanning the full database while still bounding log growth.
+Every holder compacts its applied prefix, including followers. Reclaimed log
+entries release their in-memory payloads and unreferenced segment files. A segment
+with a retained suffix can still contain at most its original rotation-sized
+unused prefix. VersionLog retention is independent: keeping all public history
+intentionally retains that history, but no longer requires keeping the Raft journal.
+
+Raft engine snapshot keys use an internal `AKES1` envelope distinguishing current
+heads, historical records and placement state. Historical records retain their
+sequence, writer, timestamp, logical flags and Blob identity. Values are expanded
+for transport and restored with their original Blob identities; tombstones and
+rollback revisions remain historical records. Heads restore current visibility
+without synthesizing additional public revisions. Non-Raft snapshots keep their
+existing key/value representation. Placement snapshots contain one state record
+followed by STRIPE metadata history and heads when applicable.
 
 Snapshot export captures one visibility sequence and immediately returns a
 lazy entry stream. Its first consumer drives one scan that writes each record to
@@ -1662,6 +2550,9 @@ reports completed consolidations, failures, the monotonic timestamp of the last
 failure, and whether work remains pending. Tombstones remain in the consolidated
 base. Blob-file deletion is pinned until the fixed view has resolved all
 referenced values.
+Retained-history capture pins VersionLog segment files and their captured byte
+boundaries until the lazy history stream is released. Later appends remain outside
+the fixed view, and retention pruning resumes after the pin is released.
 
 Memory-only snapshot admission has two policies. `THROUGHPUT_FIRST` never waits
 behind another snapshot-generation transition and rejects a snapshot whose
@@ -1680,13 +2571,101 @@ count is finalized and verified only by the completion request. An interrupted
 last consumer aborts generation and never publishes its partial export as
 reusable. If another consumer is already following the active export, generation
 continues for that follower.
+The receiver closes and syncs its validated staging file before Raft publishes a
+durable snapshot-install intent. Reopen completes that intent from staging. History
+is synced before the KV snapshot WAL commit, and interrupted replay detects already
+stored history records. Identical retried snapshot WAL records are idempotent;
+conflicting records for the same snapshot sequence and key fail recovery.
 
 Proposal deadlines use `ackTimeoutMs` from admission. Timeout, shutdown, or
 leadership loss completes affected futures with an error; a timeout is not a
-rollback. Ordinary `put`, `remove`, and `putBatch` do not deduplicate retries;
+rollback. Ordinary `put`, `remove`, and external bulk writes do not deduplicate retries;
 the opt-in request API below does. Membership changes
 and leadership transfer serialize with each other and reject in-flight proposals;
 new proposal admission is paused during these administrative operations.
+
+With `raft.membership.allowLearners = true`, a `RAFT_LEARNER` node capability
+marks an initial data-bearing non-voting member. All other initial data nodes
+are voters. At least one voter is required. The capability is invalid outside
+`RAFT_QUORUM` or with learners disabled. A newly joining process must include
+itself with this capability in its bootstrap config before it starts; use the
+same cluster id and Raft policy as the existing group. SECURE peers must have
+the new node's public-key pin provisioned before addition.
+
+The leader's `AkkEngine::addClusterLearner(NodeInfo)` adds a non-voting member
+through a committed membership entry. Its replication/snapshot stream uses
+the normal Raft peer workers. Learners cannot campaign, vote, count towards
+write or ReadIndex quorum, or receive leadership transfer. Their unavailability
+does not change voter quorum. `LOCAL_STALE_OK` reads may inspect their local
+replica; this does not provide a linearizable learner read.
+
+`promoteClusterLearner(nodeId)` requires `JOINT_CONSENSUS` and
+`allowOnlineVoterChanges`, pauses new proposals, and rejects promotion unless
+the learner's acknowledged match index covers the leader's complete current
+log. Promotion preserves endpoint and coordinator eligibility, clears the
+learner capability, and commits joint then final membership. No automatic
+promotion occurs. If leadership or transport fails, the outcome may be partial;
+inspect committed membership and retry promotion on the current leader. A
+durably appended joint entry participates in election quorum and voter
+eligibility even before commit notification, so a crash between joint
+replication and final commit cannot strand the promoted member outside the
+recovery election.
+
+`removeClusterLearner(nodeId)` commits removal without changing voter quorum.
+Learner-only changes are also available with STATIC voter membership; voter
+changes still require joint consensus. Adding an existing member, promoting
+an absent/voting node, or removing a voter through the learner API is rejected.
+`ClusterRuntime` exposes the corresponding `addRaftLearner`,
+`promoteRaftLearner`, and `removeRaftLearner` methods. These are Native C++ APIs;
+the network-facing data protocols do not expose membership administration.
+
+Member roles are encoded in the existing membership node sets, so Raft log
+metadata, snapshot RPCs, durable snapshot-install transactions, compaction,
+and restart all preserve them. Recovered membership overrides the initial
+learner flag after promotion. `activeNodes()` returns these current roles;
+`raftStats()` reports `voterCount`, `learnerCount`, `localLearner`, and each
+replication peer's `learner` flag. During a joint transition, a node voting in
+either side is reported as a voter. Upgrade all Raft peers together: the
+compatibility-fingerprint domain is `AKRP2`. `AKC1` remains the initial pre-release config format.
+A joining learner may accept leader replication while a pre-admission snapshot
+still excludes it from authoritative membership; it cannot vote. This local
+bootstrap allowance is durably cleared when committed membership admits it,
+so removing and restarting the member cannot re-enable the allowance.
+
+Ordinary elections always run a non-binding pre-vote round before advancing
+the persisted term or voting for self. A sole-voter quorum needs no peer
+exchange. `RAFT_PRE_VOTE` (`0x3A`) uses the same
+32-byte payload as RequestVote (prospective term, candidate id, last log index,
+last log term). `RAFT_PRE_VOTE_RESPONSE` (`0x3B`) uses its 9-byte response layout,
+but reports the receiver's **actual** term, never the prospective term. Receiving
+a probe does not change hard state, role, observed leader, or election/contact
+deadlines. The candidate identity must match the negotiated peer hello and,
+in SECURE mode, the configured public-key pin. PLAIN remains trusted-network-only.
+Learners cannot
+campaign or supply pre-votes; normal and pending/committed joint configurations
+use the same voter eligibility and both-majorities rule as the real election.
+
+A voter grants only for a future term and an up-to-date log, with no current
+local leadership and no accepted same/newer-term AppendEntries or snapshot
+contact during the baseline election timeout (3-6 seconds, derived from
+`ackTimeoutMs`, before randomization). A heartbeat whose log prefix mismatches
+still counts as leader contact. Timing uses the local monotonic clock; clock
+synchronization is not required and this is not a data-read or fencing lease.
+Isolation alone therefore does not inflate terms. A higher **actual** peer term
+still updates hard state through the usual follower transition. If leader
+contact, term, or voter configuration changes while probing, the result is
+discarded before starting a real election. Late RPC replies cannot demote a
+leader with an equal or newer term.
+
+An accepted `TimeoutNow` from the observed leader bypasses pre-vote for an
+explicit leadership transfer; otherwise healthy-leader suppression would block
+the requested transfer. Normal retry/failover elections retain pre-vote. There
+is no disabling option. The extra peer round trip applies to ordinary elections,
+not to steady-state writes or reads. Pre-vote reduces avoidable election churn;
+it does not guarantee progress through every asymmetric network partition.
+Upgrade all Raft participants together, including STRIPE metadata and MIRROR
+quorum-fencing authorities. Old `AKRP2` peers are rejected. This change does not
+alter `AKR1`, `AKC1`, hard-state/log layouts, or require recreating persisted data.
 
 A leader still appends a NOOP on election and must commit an entry in its current
 term before serving linearizable reads. Subsequent reads do not append NOOPs:
@@ -1885,14 +2864,14 @@ API TLS options include:
 
 ### 16.3 TCP Protocol
 
-The TCP binary protocol is version 2.
+The TCP binary protocol is version 1.
 
 Request header (`ApiRequestHeader`, 16 bytes):
 
 | Field | Meaning |
 |---|---|
-| `magic[4]` | `AK5Q` |
-| `version` | `2` |
+| `magic[4]` | `AK1Q` |
+| `version` | `1` |
 | `opcode` | `ApiOp` |
 | `requestId` | Caller request id |
 | `keyLen` | Key byte length |
@@ -1902,8 +2881,8 @@ Response header (`ApiResponseHeader`, 13 bytes):
 
 | Field | Meaning |
 |---|---|
-| `magic[4]` | `AK5S` |
-| `status` | `OK`, `NOT_FOUND`, or `ERROR_STATUS` |
+| `magic[4]` | `AK1S` |
+| `status` | `OK` (0), `NOT_FOUND` (1), `ROUTING_ERROR` (2, JSON payload), or `ERROR_STATUS` (255) |
 | `requestId` | Echoed request id |
 | `valLen` | Response payload byte length |
 
@@ -2194,6 +3173,7 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `raftSnapshot.minLogBytes` | 67108864 | Approximate committed Raft-log bytes that trigger compaction; positive, at most 1 TiB |
 | `raftSnapshot.maxIntervalMs` | 300000 | Maximum interval before compacting nonempty committed log state; positive, at most 7 days |
 | `raftHeartbeatIntervalMs` | 100 | Raft leader heartbeat interval in milliseconds; 10-1000. Larger values reduce idle traffic but approach the 3-second minimum election timeout |
+| `raftMaxForwardRequests` | 64 | Concurrent independent Raft forwarding channels per runtime; 1–256. Admission waiting consumes the original forwarding deadline |
 | `raftMaxReceiveMemoryBytes` | 67108864 | Aggregate inbound/outbound Raft frame receive/decode reservation; from three maximum 4 MiB frame buffers (`3 * (14 + 4194304)` bytes) through 64 GiB |
 | `memoryOnlySnapshot.mode` | `COMPLETION_FIRST` | SST-disabled snapshot admission: `THROUGHPUT_FIRST` rejects instead of waiting for unavailable capacity; `COMPLETION_FIRST` waits and prioritizes completion |
 | `memoryOnlySnapshot.maxPinnedBytes` | 536870912 | Conservative sum of memory-only generations admitted to concurrent snapshots; 1 MiB-1 TiB. `COMPLETION_FIRST` permits one snapshot larger than this limit |
@@ -2217,6 +3197,12 @@ to `bindHost = 127.0.0.1` and `transportMode = PLAIN`.
 | `clusterMembershipPath` | empty | Non-Raft primary group state / replica membership state path |
 | `resetClusterMembership` | `false` | Explicitly allow a valid replica membership switch |
 | `mirrorPromotion.enabled` | `false` | Explicitly authorize one offline non-Raft MIRROR Primary transition; must be supplied to the candidate and replicas for that transition |
+| `mirrorFencing.mode` | `STATIC` | `STATIC` rejects promotion; `QUORUM_FENCED` uses authority-only Raft; `EXTERNAL_FENCED` requires a provider (section 15.4) |
+| `mirrorFencing.authorityNodes` | empty | QUORUM_FENCED only: same ids/hosts as all configured nodes, dedicated replication ports; includes witnesses |
+| `mirrorFencing.external` | null | Required only for EXTERNAL_FENCED authority; embedding must implement real fencing |
+| `mirrorRecovery.mode` | `BLOCK` | Unconfirmed quorum grants: BLOCK, MANUAL via recoverMirrorWrite/promotion, or AUTOMATIC background retry; matching receipts always recover automatically |
+| `mirrorRecovery.provider` | null | Required for MANUAL/AUTOMATIC; must establish the requested guarantee for the exact generation/operation; MirrorFencingRecoveryProvider adapts an existing promotion fencer |
+| `mirrorRecovery.retryIntervalMs` | 1000 | Automatic retry interval [50, 3600000] ms; independent of data replication acknowledgement policy |
 | `mirrorPromotion.previousPrimaryNodeId`, `previousGroupEpoch`, `expectedDurableSeq` | 0 | Expected prior membership and exact candidate durable sequence. The new Primary advances the epoch by one; replicas verify the same transition. |
 | `corruptStateAction` | `FAIL_STARTUP` | Corrupt small non-Raft cluster state files fail startup unless explicitly backed up/deleted and recreated. Raft hard state is always fail-fast and never resets persisted term/vote |
 | `raftLogRecoveryAction` | `FAIL_STARTUP` | `TRUNCATE_UNCOMMITTED_TAIL` may discard corrupt segment entries only beyond an intact committed prefix; corrupt log metadata or committed entries always fail startup |
@@ -2361,6 +3347,7 @@ throw standard exceptions, typically `std::invalid_argument` or
 | Invalid configuration | Open or setter boundary throws |
 | Corrupt required persisted data | Throws rather than silently accepting |
 | VersionLog disabled | `getAt` returns missing, `history` empty, rollback throws |
+| Cluster range/history read | Full public result under the selected authority/read-mode contract, or explicit owner/quorum/cursor/resource failure; no successful incomplete fallback |
 | Unregistered index lookup | Typed API throws |
 | Iterator `next()` after exhaustion | Throws `std::out_of_range` in typed iterators |
 | Detached/missing `Ref<T>` target | Throws |
@@ -2428,20 +3415,21 @@ dispatch where available.
 | Artifact | Magic | Version | Integrity boundary |
 |---|---|---:|---|
 | WAL segment | `AKWA` | 1 | Header CRC and entry CRC |
-| SST file | `AKS2` | 2 | Header, metadata, footer, and block CRCs |
-| SST footer | `A2SF` | 2 | Footer CRC |
-| Blob file | `AKB5` | 1 | Header CRC and original-content CRC |
-| Manifest | `AMV5` | 1 | Header CRC and per-record payload CRC |
-| VersionLog segment | `AKV5` | 1 | File-header and entry CRCs |
-| VersionLog sidecar index | `AKVI` | 2 | Header CRC and payload CRC |
+| SST file | `AKS1` | 1 | Header, metadata, footer, and block CRCs |
+| SST footer | `A1SF` | 1 | Footer CRC |
+| Blob file | `AKB1` | 1 | Header CRC and original-content CRC |
+| Manifest | `AMV1` | 1 | Header CRC and per-record payload CRC |
+| VersionLog segment | `AKV1` | 1 | File-header and entry CRCs |
+| VersionLog sidecar index | `AKVI` | 1 | Header CRC and payload CRC |
 | VersionLog durable tail | `AKVT` | 1 | Tail-header CRC |
-| Cluster config | `AKC6` | 6 | Config CRC |
-| Raft hard state | `AKRS3` | Encoded in magic | Whole-file CRC32C |
+| Deferred rollback journal | `AKRJ1` | 1 | Whole-file CRC32C and atomic replacement |
+| Cluster config | `AKC1` | 1 | Config CRC |
+| Raft hard state | `AKRS1` | Encoded in magic | Whole-file CRC32C |
 | Raft log metadata | `AKRL1` | No separate version field | Whole-metadata CRC32C |
 | Raft log segment | No file magic | No separate version field | Per-entry payload CRC32C |
 | Raft request journal | `AKRQ1` | No separate version field | Per-record payload CRC32C plus metadata-published byte boundary |
-| TCP API request | `AK5Q` | protocol 2 | Transport framing and payload validation |
-| TCP API response | `AK5S` | protocol 2 | Transport framing and payload validation |
+| TCP API request | `AK1Q` | protocol 1 | Transport framing and payload validation |
+| TCP API response | `AK1S` | protocol 1 | Transport framing and payload validation |
 
 The serializer/deserializer implementations are the byte-layout authority:
 
@@ -2450,6 +3438,7 @@ The serializer/deserializer implementations are the byte-layout authority:
 - `BlobFraming.hpp/.cpp`
 - `ManifestFraming.hpp/.cpp`
 - `VersionLog.cpp`
+- `AkkEngine.cpp` (deferred rollback journal and STRIPE metadata/intent payloads)
 - `ClusterConfig.cpp`
 - `RaftConsensusRuntime.cpp`
 - `ApiFraming.hpp/.cpp`
@@ -2487,7 +3476,7 @@ The serializer/deserializer implementations are the byte-layout authority:
 
 ### 24.4 Blob Header
 
-`AkBlobHeaderV5` is 48 bytes:
+`AkBlobHeaderV1` is 48 bytes:
 
 | Offset | Size | Field |
 |---:|---:|---|
@@ -2502,28 +3491,28 @@ The serializer/deserializer implementations are the byte-layout authority:
 | 40 | 4 | `contentCrc32c` |
 | 44 | 4 | `headerCrc32c` |
 
-### 24.5 SST v2 File Shape
+### 24.5 SST v1 File Shape
 
-An SST v2 file contains:
+An SST v1 file contains:
 
 ```text
-[SSTFileHeaderV2:256]
+[SSTFileHeaderV1:256]
 [data blocks...]
 [block index entries...]
 [key arena...]
 [Bloom filter...]
-[SSTFooterV2:48]
+[SSTFooterV1:48]
 ```
 
 Fixed structures:
 
 | Structure | Size |
 |---|---:|
-| `SSTFileHeaderV2` | 256 |
-| `SSTBlockHeaderV2` | 64 |
-| `SSTBlockIndexEntryV2` | 72 |
-| `SSTBloomHeaderV2` | 16 |
-| `SSTFooterV2` | 48 |
+| `SSTFileHeaderV1` | 256 |
+| `SSTBlockHeaderV1` | 64 |
+| `SSTBlockIndexEntryV1` | 72 |
+| `SSTBloomHeaderV1` | 16 |
+| `SSTFooterV1` | 48 |
 
 Per-file flags include block Zstd and metadata CRCs. All SST files must checksum
 the block index, key arena, and Bloom filter; files without metadata checksums
@@ -2544,11 +3533,11 @@ cluster lifecycle events.
 
 ### 24.7 VersionLog
 
-Each `.akvlog` segment starts with this 32-byte `AKV5` v1 header:
+Each `.akvlog` segment starts with this 32-byte `AKV1` v1 header:
 
 | Offset | Size | Field |
 |---:|---:|---|
-| 0 | 4 | `magic` (`AKV5`) |
+| 0 | 4 | `magic` (`AKV1`) |
 | 4 | 2 | `version` (`1`) |
 | 6 | 1 | `syncModeHint` |
 | 7 | 1 | reserved |
@@ -2560,7 +3549,7 @@ Each `.akvlog` segment starts with this 32-byte `AKV5` v1 header:
 It is followed by variable-sized entries:
 
 ```text
-[AkvlogV5EntryHeader:43][key:keyLen][stored value:valueLen][entry CRC32C:u32]
+[AkvlogV1EntryHeader:43][key:keyLen][stored value:valueLen][entry CRC32C:u32]
 ```
 
 The packed entry header contains `entryLen`, `seq`, `sourceNodeId`,
@@ -2571,7 +3560,7 @@ payload. Public `VersionEntry` values are decompressed and do not expose that
 internal flag.
 
 Each VLog segment may have a derived sibling `.akvidx` file. It begins with a
-44-byte `AKVI` v2 header containing the Bloom hash count, authoritative VLog
+44-byte `AKVI` v1 header containing the Bloom hash count, authoritative VLog
 byte length, key/version counts, Bloom bit count, payload CRC32C, and header
 CRC32C. Its payload is `[Bloom bytes][24-byte fingerprint directory
 records][16-byte (seq, VLog-offset) records]`. The directory is ordered by key
@@ -2590,24 +3579,34 @@ VLog corruption is never accepted. `EAGER` recovery reports it from `open`;
 with `BACKGROUND` recovery the first operation waiting on recovery receives the
 stored error instead.
 
+The deferred rollback journal begins with `AKRJ1`, a little-endian task count,
+and variable-sized tasks. Each task stores 16-byte task, operation, scheduling
+startup, and cluster ids; the configuration epoch; action, cluster, and conflict
+bytes; target node, target sequence, and planning watermark; and a length-prefixed
+key. A trailing CRC32C covers every preceding byte. Unknown actions, invalid
+policies, truncation, trailing bytes, and checksum failures reject `open`.
+
 ### 24.8 Cluster Config
 
-Cluster config is a CRC-protected `AKC6` v6 binary file. It stores persistent
+Cluster config is a CRC-protected `AKC1` v1 binary file. It stores persistent
 membership, placement, acknowledgement, consistency, Raft, stripe, and the
 fixed non-Raft `MIRROR` Primary settings. The fixed header is 72 bytes, with the
-little-endian `uint64_t primaryNodeId` at byte offset 48 and the 16-byte cluster
-id at byte offset 56. Each node has a 20-byte fixed prefix containing node id,
-capabilities, data port, normal replication port, STRIPE metadata-Raft port, and
-host length, followed by the host bytes. Runtime transport settings remain
-out-of-band. `AKC6` readers reject CRC mismatches, oversized host names,
+STRIPE data-shard, parity-shard, and copies-per-shard bytes at offsets 40, 41,
+and 42, the nonzero little-endian `uint16_t partitionReplicationFactor` at
+byte offset 44, failover policy at byte offset 43, the stable `uint16_t partitionCount` at byte offset 46,
+the little-endian `uint64_t primaryNodeId` at byte offset 48, and the
+16-byte cluster id at byte offset 56. Each node has a 22-byte fixed prefix containing node id,
+capabilities, data port, normal replication port, STRIPE metadata-Raft port,
+PARTITIONED replication base port, and host length, followed by the host bytes. Runtime transport settings remain
+out-of-band. `AKC1` readers reject CRC mismatches, oversized host names,
 truncation, and trailing bytes.
 
 Non-Raft primary group state and replica membership state use CRC-protected
-`AKCG2` little-endian binary files containing group id, Primary node id, and
+`AKCG1` little-endian binary files containing group id, Primary node id, and
 group epoch. Ordinary startup cannot change the persisted Primary. Explicit
 offline MIRROR promotion preserves the group id and advances the other two
 fields atomically. Raft persisted term/vote hard state uses the
-41-byte CRC-protected `AKRS3` layout: magic, 16-byte cluster id, term, voted-for
+41-byte CRC-protected `AKRS1` layout: magic, 16-byte cluster id, term, voted-for
 node id, and CRC32C. A valid hard-state file carrying another cluster id fails
 startup. Raft's `cluster-raft.log` is an `AKRL1` CRC32C-protected
 metadata file containing commit/applied/snapshot/membership state and the valid
@@ -2616,6 +3615,9 @@ contain a little-endian `uint64_t` payload length, `uint32_t` payload CRC32C, an
 encoded entry. Metadata references segment id/begin/end byte extents. Segments are
 append-only, rotating at 16 MiB (one larger entry may occupy its own segment).
 Index-only state changes rewrite metadata, not entry payloads.
+Metadata also stores the latest membership configuration generation and the
+local learner bootstrap allowance. Snapshot RPCs and durable install intents
+carry the configuration generation together with the authoritative member sets.
 
 Retry-safe results are stored separately in generation files named
 `cluster-raft.requests.<generation>`, beginning with `AKRQ1`. The Raft metadata
@@ -2629,23 +3631,33 @@ Segments are synced before metadata is atomically replaced. Conflicting
 uncommitted suffixes are written into a new segment; the old durable suffix
 remains intact until replacement metadata is published. Compaction advances
 the referenced extents and unreferenced segment files are collected afterward.
+The in-memory location/extent index is updated by appended entries and discarded
+prefix/suffix ranges. Normal metadata publication does not rebuild every retained
+entry location. Replication and apply batches start at their contiguous log-index
+offset. Entry shape and sequence validation is cached for the immutable prefix;
+conflict replacement invalidates only the changed suffix, while startup and
+snapshot compaction validate the retained log against their new base. Ordinary
+AppendEntries rollback copies only the affected suffix, and apply-progress rollback
+keeps the unchanged log prefix.
+
 Partially referenced segments retain their unused prefix until the entire
 segment is unreferenced; compaction does not rewrite retained entry payloads.
 Bytes beyond the published extents are interrupted appends and ignored.
 Metadata corruption always fails startup. Entry corruption also fails by default;
 the explicit tail-recovery policy may discard only entries strictly beyond the
 committed prefix. Uncertain persistence errors stop the runtime until reopen.
-This layout replaces the development-only monolithic AKRL1 file without changing
-its pre-release version or providing migration; old Raft data must be recreated.
+The current log layout is version 1 (`AKRL1`). No legacy or dual-format reader
+is provided. Existing data is never automatically deleted.
 
-`AKC5` configs and `AKRS2` hard state are intentionally incompatible with this
-pre-release change. `AKC6` adds the dedicated STRIPE metadata-Raft port and has
-no dual-format reader. The current Raft peer hello is version 1 and
-uses the `AKRP1` compatibility-fingerprint domain. Earlier peer-hello/log
+Earlier pre-release cluster configs and `AKRS2` hard state are intentionally
+incompatible with this initial format. `AKC1` includes the dedicated STRIPE
+metadata-Raft port and has no legacy or dual-format reader. The current Raft peer hello is version 2 and
+uses the `AKRP2` compatibility-fingerprint domain. Raft mutation records carry
+the original timestamp; Forward QUERY_REQUEST carries one key entry. Earlier peer-hello/log
 layouts, including development builds that used version 1 or 2, have no
 compatibility bridge because request metadata and proposal-final boundaries were
-changed in place. Upgrade every node together, recreate and redistribute one v6
-config, and recreate existing Raft data directories. No dual-format reader or
+changed in place. Upgrade every node and its core/cluster backend together;
+keep one matching v1 config and recreate existing Raft data directories. No dual-format reader or
 rolling-upgrade bridge is provided.
 
 ### 24.9 Endianness Exceptions
@@ -2683,11 +3695,34 @@ and API framing.
 
 Native cluster smoke coverage includes:
 
+- ordered STRIPE metadata ranges over binary keys and different key lengths,
+  count independent of spool quotas, bounded metadata/result capture and cleanup,
+  SST/restart, concurrent RPC admission in PLAIN/SECURE, socket-lock contention,
+  and stalled transfer
+  READY, physical send backpressure, expired zero budgets, and recovery after
+  local encoding errors under the caller's total budget
+  (`akkaradb_cluster_query_resource_test`),
+- non-Raft cluster ID/configuration admission in MIRROR, PARTITIONED and STRIPE
+  over PLAIN/SECURE, independent server-hello rejection before membership
+  persistence, canonical policy fingerprints excluding mutable STRIPE topology
+  and RAID.10 pair order, and STRIPE
+  failover restart, orphan-lease handoff and stale-token rejection without a
+  metadata-leader term change (`akkaradb_cluster_authority_contract_test`),
 - repeated replica disconnect/reconnect cycles followed by successful replication,
 - fixed MIRROR Primary config round trips, capability validation, and rejection
   of a second Primary under the same config; offline MIRROR promotion additionally
   covers rejection without authorization, stale-candidate rejection, atomic
   Primary/epoch transition, successor acceptance, and routed reads after demotion,
+- MIRROR STATIC promotion rejection, external-fence failure without epoch advance,
+  authority-only quorum with ASYNC data and a witness, quorum loss before local
+  application, plain/secure transport, control snapshot/restart, unresolved-grant
+  persistence and promotion rejection, external provider recovery, durable-receipt
+  release recovery, obsolete-generation frame rejection, and stale-Primary
+  restart without write permission (`akkaradb_mirror_fencing_test`),
+- MIRROR recovery option validation, manual recovery with ASYNC and PRIMARY_ACK,
+  unresolved/invalid/stale proofs, durability failure, automatic provider retry,
+  restart, cancellation during runtime/Native close, external fencing adaptation
+  and automatic durable-receipt recovery (`akkaradb_mirror_recovery_test`),
 - STRIPE crash/reopen before and after metadata publication, recovery of pending
   intents, abandoned/superseded shard cleanup, durable-ACK enforcement under
   ASYNC/NONE, concurrent reads/overwrites, tombstone cleanup, and owner outage,
@@ -2698,11 +3733,24 @@ Native cluster smoke coverage includes:
   full-copy replication, degraded Primary-local writes, reconnect rebuild and
   health transitions, plus rejection of replica writes without explicit Primary
   promotion,
+- `RAID.5` preset normalization and config round trip, one-node degraded writes,
+  parity reconstruction, and rejection of layouts with fewer than two data shards,
+- `RAID.6` preset normalization and config round trip, two-node degraded writes
+  and reads with a surviving metadata quorum, plus rejection of four-node layouts,
+- `RAID.10` preset normalization and config round trip, fixed mirror-pair
+  placement, degraded writes with one missing pair member, reads from the
+  surviving copy, and automatic rebuild on return; hot-spare coverage additionally
+  verifies option normalization, exclusion from normal placement, secondary and
+  owner replacement, persisted effective placement, and no automatic failback,
 - 4 MiB Raft frame enforcement, aggregate receive-memory and heartbeat bounds,
   retry-result capacity bounds, lazy/file-backed snapshot transfer, and
   memory-only snapshot admission, consolidation, failure reporting, and retry,
 - endpoint role changes and shutdown without joining callback workers while the
   runtime state lock is held, plus retry after endpoint startup failure,
+- scalar local rollback execution modes and journal recovery; MIRROR and Raft
+  global-stream rollback; PARTITIONED owner-stream checkpoints, multi-page
+  rollback, next-startup replay, and conflict preservation; and STRIPE logical
+  metadata rollback with historical generation reconstruction,
 - Raft crashes at segment-sync and metadata-publication boundaries, uncommitted
   versus committed corruption, metadata-corruption rejection, segment rotation,
   and preservation of existing segment contents during later appends.
@@ -2715,6 +3763,57 @@ topology/configuration metadata, Raft peer disconnect/recovery counters, and
 non-Raft owner-read success/failure/recovery. This focused target is labelled
 `cluster` and `observability` and may be run without the monolithic cluster smoke
 executable.
+
+`akkaradb_cluster_routing_test` (`--routing`) isolates Native routing coverage:
+PLAIN/SECURE PARTITIONED and Raft forwarding (including learners), structured
+redirects and local-only rejection, concurrent request IDs, same-owner versus
+cross-owner batches, STRIPE coordinator writes/reads, payload limits, late
+responses without replay, and MIRROR
+strict-ACK and quorum-authority/ASYNC-data forwarding. It also checks 1 MiB
+PLAIN/SECURE batch forwarding, large transport responses, interleaved replication
+ACKs, cancellation of transfer READY waits, and Raft admission consuming the
+destination's remaining timeout budget. The API server smoke test
+additionally verifies TCP connection reuse and HTTP/gRPC structured route errors.
+
+`akkaradb_cluster_queries_test` (`--cluster-queries`) isolates public range and
+history coverage across PLAIN/SECURE PARTITIONED, MIRROR, STRIPE, and data Raft
+with a learner. It checks owner aggregation, public-key ordering and binary keys,
+MemTable/SST snapshot cuts even with WEAK_ORDERED local scans, tombstones,
+materialized Blob values larger than a frame, bounded paging, logical revisions,
+rollback history, restart, strict OWNER_ONLY, missing owners/quorum, spool and
+cursor limits, expiry, and prepared-cursor lifetime during shutdown. The default
+cluster smoke includes these scenarios. The API server smoke additionally checks
+TCP/HTTP/gRPC range/history queries through a MIRROR replica; MIRROR fencing
+tests cover authority-quorum reads with asynchronous data replication.
+
+`akkaradb_cluster_partition_query_parallelism_test`
+(`--partition-query-parallelism`) gates real remote STATUS callbacks across 16
+partitions to verify overlapping checks and the eight-check engine-wide bound
+across concurrent queries. It checks complete counts, ordered unique scans,
+bounded ranges, and explicit failure within the shared deadline when an owner
+is unavailable, including shutdown while a query is pending. Saturated executor
+checks verify deadline expiry during admission and after queueing, removal of
+unstarted work, and subsequent executor reuse.
+
+`akkaradb_cluster_partition_raft_test` (`--partition-raft`) covers PARTITIONED
+leader failure and online holder/copy-count changes, MIRROR manual/automatic
+election and acknowledged local-write loss, MIRROR admission with retained
+history, and RAID.10 placement/hot-spare replacement. Its PLAIN/SECURE STRIPE
+cases verify cancellation with a committed intent, write rejection while pending,
+restart and automatic resumption, removal of an already unavailable member,
+and forwarding with the ordinary channel limit set to one. Placement changes
+preserve logical sequences, original writer ids and timestamps, historical
+values and rollback checkpoints. `--stripe-online` isolates those STRIPE cases.
+The focused target has a six-minute timeout and shares the cluster loopback lock.
+
+`akkaradb_raft_prevote_test` (`--raft-prevote`) isolates election-probe coverage:
+strict wire sizes and peer identity, rejection of `AKRP2` peers, prospective vs.
+actual terms, preservation of durable votes, heartbeat/probe races, live-leader suppression without
+deadline extension, stale-log rejection, repeated isolation without term growth,
+and PLAIN/SECURE one-way partitions followed by catch-up without leader churn.
+It also checks election and linearizable access after a real leader failure and
+explicit leadership transfer. These scenarios are included in default cluster
+smoke; the focused CTest target shares its loopback resource lock.
 
 Raft pipeline tests additionally cover PLAIN and SECURE connection reuse,
 128 outstanding proposals, fewer persistence batches than proposals, concurrent
@@ -2766,7 +3865,7 @@ database behavior.
 - `APPLIED` visibility can expose later sequences while earlier writers remain
   incomplete.
 - Thread-local sequence ranges can create holes in the snapshot upper bound.
-- `putBatch` is not transactional.
+- External bulk protocols are not transactional; standalone C++ callers use `begin()`/`end()`.
 - Typed table compound writes, secondary-index maintenance, and foreign-key
   actions are not transactional.
 - Blob GC is disabled with VersionLog because historical versions may reference
@@ -2777,6 +3876,12 @@ database behavior.
 - `RAID.0` has no shard redundancy: every data shard must remain readable, and
   authoritative metadata operations still require a metadata-Raft majority;
   losing one participating shard node can make affected values unavailable.
+- `RAID.10` has fixed two-node mirror pairs and at most one shared hot spare. It
+  can lose one member from every pair at the value layer, but only one missing
+  placement is automatically remapped per generation. All authoritative
+  operations still require a metadata-Raft majority; a four-node layout without
+  a spare therefore stops metadata progress after two node failures even when
+  they are from different pairs.
 - Server backend availability depends on build flags and runtime library
   loading.
 - Low-level C++ object layout is not an external ABI.

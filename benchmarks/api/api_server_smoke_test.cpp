@@ -8,6 +8,7 @@
  */
 
 // benchmarks/api/api_server_smoke_test.cpp
+#include "../smoke/detail/CollectHistory.hpp"
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -599,6 +601,122 @@ namespace {
         AKK_TEST_CHECK(closed);
     }
 
+    void testClusterRoutingErrors(const std::filesystem::path& dir, uint16_t port) {
+        using namespace akkaradb::engine::cluster;
+        NodeInfo primary;
+        primary.nodeId = 1; primary.host = "127.0.0.1"; primary.dataPort = port;
+        primary.replPort = static_cast<uint16_t>(port + 3); primary.capabilities = COORDINATOR_ELIGIBLE | DATA_BEARING;
+        auto replica = primary; replica.nodeId = 2; replica.dataPort = static_cast<uint16_t>(port + 10); replica.replPort = static_cast<uint16_t>(port + 13);
+        const ClusterConfig config{{primary, replica}, ReplicationMode::MIRROR, {}, {}, {}, {}, 1};
+        AkkEngineOptions options;
+        options.paths.dataDir = dir / "routing";
+        options.components.clusterEnabled = true; options.components.blobEnabled = false; options.components.apiEnabled = true;
+        options.cluster.config = config;
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.startupRole = NodeStartupRole::REPLICA;
+        options.cluster.runtime.clusterGroupId = 24900;
+        options.cluster.runtime.apiEndpoints = {{1, port, static_cast<uint16_t>(port + 1), static_cast<uint16_t>(port + 2)}};
+        options.api.bindHost = "127.0.0.1";
+        options.api.tcpPort = static_cast<uint16_t>(port + 10); options.api.httpPort = static_cast<uint16_t>(port + 11); options.api.grpcPort = static_cast<uint16_t>(port + 12);
+        std::filesystem::create_directories(options.paths.dataDir);
+        {
+            std::ofstream id{options.paths.dataDir / "node.id", std::ios::binary};
+            const uint64_t nodeId = 2; id.write(reinterpret_cast<const char*>(&nodeId), sizeof(nodeId));
+            AKK_TEST_CHECK(id.good());
+        }
+        auto engine = AkkEngine::open(options);
+        akkaradb::net::TlsStream stream;
+        stream.connect("127.0.0.1", options.api.tcpPort, {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
+        const auto request = makeRequest(901, ApiOp::PUT, bytes("routed"), bytes("denied"));
+        tlsSendAll(stream, request.data(), request.size());
+        const auto result = readResponse(stream);
+        AKK_TEST_CHECK(result.status == ApiStatus::ROUTING_ERROR && result.requestId == 901);
+        AKK_TEST_CHECK(text(result.value).find("\"code\":\"NOT_OWNER\"") != std::string::npos && text(result.value).find("\"nodeId\":1") != std::string::npos);
+        const auto ping = makeRequest(902, ApiOp::PING, {});
+        tlsSendAll(stream, ping.data(), ping.size()); AKK_TEST_CHECK(readResponse(stream).status == ApiStatus::OK);
+        AKK_TEST_CHECK(engine->stats().api.tcpProtocolErrorsTotal == 0 && !engine->exists(bytes("routed")));
+        const auto http = httpRequest(options.api.httpPort,
+            "POST /v1/put?key=routed HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 6\r\n\r\ndenied");
+        AKK_TEST_CHECK(http.find("409 Conflict") != std::string::npos && http.find("application/json") != std::string::npos);
+        AKK_TEST_CHECK(http.find("\"outcomeUnknown\":false") != std::string::npos);
+#ifdef AKKARADB_TEST_HAS_GRPC
+        const auto channel = ::grpc::CreateChannel("127.0.0.1:" + std::to_string(options.api.grpcPort), ::grpc::InsecureChannelCredentials());
+        auto stub = wire::AkkaraDB::NewStub(channel);
+        ::grpc::ClientContext context;
+        wire::PutRequest put; put.set_key("routed"); put.set_value("denied");
+        wire::Empty response;
+        const auto status = stub->Put(&context, put, &response);
+        AKK_TEST_CHECK(status.error_code() == ::grpc::StatusCode::FAILED_PRECONDITION);
+        AKK_TEST_CHECK(status.error_details().find("\"nodeId\":1") != std::string::npos);
+#endif
+        stream.close(); engine->close();
+    }
+
+    void testClusterPublicQueries(const std::filesystem::path& dir, uint16_t port) {
+        using namespace akkaradb::engine::cluster;
+        const NodeInfo n1{.nodeId = 1, .host = "127.0.0.1", .dataPort = port,
+            .replPort = static_cast<uint16_t>(port + 3), .capabilities = COORDINATOR_ELIGIBLE | DATA_BEARING};
+        auto n2 = n1; n2.nodeId = 2; n2.dataPort = static_cast<uint16_t>(port + 10); n2.replPort = static_cast<uint16_t>(port + 13);
+        const ClusterConfig config{{n1, n2}, ReplicationMode::MIRROR, {}, {}, {}, {}, 1};
+        const auto makeOptions = [&](uint64_t id) {
+            AkkEngineOptions options;
+            options.paths.dataDir = dir / ("query-node-" + std::to_string(id));
+            options.components.clusterEnabled = true; options.components.blobEnabled = false;
+            options.components.versionLogEnabled = true; options.components.apiEnabled = id == 2;
+            options.cluster.config = config;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            options.cluster.runtime.clusterGroupId = 24950;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.api.bindHost = "127.0.0.1";
+            options.api.tcpPort = static_cast<uint16_t>(port + 10); options.api.httpPort = static_cast<uint16_t>(port + 11);
+            options.api.grpcPort = static_cast<uint16_t>(port + 12);
+            std::filesystem::create_directories(options.paths.dataDir);
+            std::ofstream file{options.paths.dataDir / "node.id", std::ios::binary};
+            file.write(reinterpret_cast<const char*>(&id), sizeof(id)); AKK_TEST_CHECK(file.good());
+            return options;
+        };
+        auto primary = AkkEngine::open(makeOptions(1)), replica = AkkEngine::open(makeOptions(2));
+        primary->put(bytes("query-key"), bytes("before"));
+        const auto seq = akk_test::collectHistory(primary->history(bytes("query-key"))).front().seq;
+        primary->put(bytes("query-key"), bytes("after"));
+        akkaradb::net::TlsStream stream;
+        stream.connect("127.0.0.1", static_cast<uint16_t>(port + 10), {}, kSmokeIoTimeoutMs, kSmokeIoTimeoutMs);
+        const auto exchange = [&](ApiOp op, std::span<const uint8_t> value = {}) {
+            const auto request = makeRequest(950, op, bytes("query-key"), value);
+            tlsSendAll(stream, request.data(), request.size());
+            auto response = readResponse(stream); AKK_TEST_CHECK(response.status == ApiStatus::OK); return response.value;
+        };
+        AKK_TEST_CHECK(text(exchange(ApiOp::GET_AT, u64Le(seq))) == "before");
+        const auto count = exchange(ApiOp::COUNT);
+        uint64_t counted = 0; AKK_TEST_CHECK(count.size() == sizeof(counted));
+        std::memcpy(&counted, count.data(), sizeof(counted)); AKK_TEST_CHECK(counted == 1);
+        const auto history = exchange(ApiOp::HISTORY);
+        uint32_t versions = 0; AKK_TEST_CHECK(history.size() >= sizeof(versions));
+        std::memcpy(&versions, history.data(), sizeof(versions)); AKK_TEST_CHECK(versions == 2);
+        std::vector<uint8_t> scanPayload; appendPlain(scanPayload, uint32_t{10});
+        const auto scan = exchange(ApiOp::SCAN, scanPayload);
+        uint32_t scanned = 0; AKK_TEST_CHECK(scan.size() >= sizeof(scanned));
+        std::memcpy(&scanned, scan.data(), sizeof(scanned)); AKK_TEST_CHECK(scanned == 1);
+        const auto httpPort = static_cast<uint16_t>(port + 11);
+        for (const auto path : {"/v1/count", "/v1/scan", "/v1/history?key=query-key"}) {
+            const auto response = httpRequest(httpPort, std::string{"GET "} + path +
+                " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+            AKK_TEST_CHECK(response.find("200 OK") != std::string::npos);
+        }
+#ifdef AKKARADB_TEST_HAS_GRPC
+        auto stub = wire::AkkaraDB::NewStub(::grpc::CreateChannel("127.0.0.1:" + std::to_string(port + 12), ::grpc::InsecureChannelCredentials()));
+        ::grpc::ClientContext countContext; wire::CountRequest countRequest; wire::CountResponse countResponse;
+        AKK_TEST_CHECK(stub->Count(&countContext, countRequest, &countResponse).ok() && countResponse.count() == 1);
+        ::grpc::ClientContext scanContext; wire::ScanRequest scanRequest; wire::ScanResponse scanResponse;
+        AKK_TEST_CHECK(stub->Scan(&scanContext, scanRequest, &scanResponse).ok() && scanResponse.items_size() == 1);
+        ::grpc::ClientContext historyContext; wire::HistoryRequest historyRequest; wire::HistoryResponse historyResponse;
+        historyRequest.set_key("query-key");
+        AKK_TEST_CHECK(stub->History(&historyContext, historyRequest, &historyResponse).ok() && historyResponse.entries_size() == 2);
+#endif
+        stream.close(); replica->close(); primary->close();
+    }
+
     void testHttp(uint16_t port) {
         const auto put = httpRequest(
             port,
@@ -814,7 +932,7 @@ int main() try {
     auto engine = AkkEngine::open(options);
     engine->put(bytes("history"), bytes("v1"));
     engine->put(bytes("history"), bytes("v2"));
-    const auto history = engine->history(bytes("history"));
+    const auto history = akk_test::collectHistory(engine->history(bytes("history")));
     AKK_TEST_CHECK(history.size() == 2);
 
     testTcp(tcpPort, history);
@@ -831,6 +949,8 @@ int main() try {
     AKK_TEST_CHECK(stats.api.tcpProtocolErrorsTotal >= 1);
 
     engine->close();
+    testClusterRoutingErrors(options.paths.dataDir, static_cast<uint16_t>(httpPort + 30));
+    testClusterPublicQueries(options.paths.dataDir, static_cast<uint16_t>(httpPort + 50));
     return 0;
 }
 catch (const std::exception& e) {

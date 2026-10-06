@@ -147,8 +147,8 @@ namespace akkaradb::engine::sst {
                     if (!file_) { return false; }
 
                     readAt(0, &header_, sizeof(header_));
-                    if (header_.magic != SST_MAGIC_V2 || header_.version != SST_VERSION_V2 || header_.headerSize != sizeof(
-                        SSTFileHeaderV2)) { return false; }
+                    if (header_.magic != SST_MAGIC_V1 || header_.version != SST_VERSION_V1 || header_.headerSize != sizeof(
+                        SSTFileHeaderV1)) { return false; }
                     const uint32_t stored = header_.crc32c;
                     header_.crc32c = 0;
                     const uint32_t computed = cpu::CRC32C(reinterpret_cast<const std::byte*>(&header_), sizeof(header_));
@@ -156,12 +156,12 @@ namespace akkaradb::engine::sst {
                     if (stored != computed) { return false; }
                     if ((header_.flags & SST_FILE_FLAG_METADATA_CRC) == 0) { return false; }
                     const uint64_t actualFileSize = std::filesystem::file_size(path_);
-                    if (actualFileSize != header_.file_size || header_.file_size < sizeof(SSTFileHeaderV2) + sizeof(SSTFooterV2)) {
+                    if (actualFileSize != header_.file_size || header_.file_size < sizeof(SSTFileHeaderV1) + sizeof(SSTFooterV1)) {
                         return false;
                     }
-                    if (header_.dataOffset != sizeof(SSTFileHeaderV2) || header_.entryCount == 0 || header_.blockCount == 0 || header_.
-                        footerOffset != header_.file_size - sizeof(SSTFooterV2) || header_.blockCount > UINT64_MAX / sizeof(
-                            SSTBlockIndexEntryV2) || header_.indexSize != header_.blockCount * sizeof(SSTBlockIndexEntryV2) || header_.
+                    if (header_.dataOffset != sizeof(SSTFileHeaderV1) || header_.entryCount == 0 || header_.blockCount == 0 || header_.
+                        footerOffset != header_.file_size - sizeof(SSTFooterV1) || header_.blockCount > UINT64_MAX / sizeof(
+                            SSTBlockIndexEntryV1) || header_.indexSize != header_.blockCount * sizeof(SSTBlockIndexEntryV1) || header_.
                         blockCount > std::numeric_limits<size_t>::max() || header_.keyArenaSize > std::numeric_limits<size_t>::max() ||
                         header_.bloomSize > std::numeric_limits<size_t>::max() || header_.indexOffset <= header_.dataOffset || header_.
                         keyArenaOffset < header_.indexOffset || header_.bloomOffset < header_.keyArenaOffset || header_.footerOffset <=
@@ -171,28 +171,28 @@ namespace akkaradb::engine::sst {
                             header_.bloomOffset
                         ) || !rangeWithin(header_.bloomOffset, header_.bloomSize, header_.footerOffset)) { return false; }
 
-                    SSTFooterV2 footer{};
+                    SSTFooterV1 footer{};
                     readAt(header_.footerOffset, &footer, sizeof(footer));
                     const uint32_t storedFooter = footer.footerCrc32c;
                     footer.footerCrc32c = 0;
                     const uint32_t computedFooter = cpu::CRC32C(reinterpret_cast<const std::byte*>(&footer), sizeof(footer));
-                    if (storedFooter != computedFooter || footer.magic != SST_FOOTER_MAGIC_V2 || footer.version != SST_VERSION_V2 || footer.
+                    if (storedFooter != computedFooter || footer.magic != SST_FOOTER_MAGIC_V1 || footer.version != SST_VERSION_V1 || footer.
                         headerCrc32c != stored || footer.file_size != header_.file_size || footer.indexOffset != header_.indexOffset ||
                         footer.keyArenaOffset != header_.keyArenaOffset || footer.bloomOffset != header_.bloomOffset) { return false; }
 
                     index_.resize(static_cast<size_t>(header_.blockCount));
-                    if (!index_.empty()) { readAt(header_.indexOffset, index_.data(), index_.size() * sizeof(SSTBlockIndexEntryV2)); }
+                    if (!index_.empty()) { readAt(header_.indexOffset, index_.data(), index_.size() * sizeof(SSTBlockIndexEntryV1)); }
                     keyArena_ = readVecAt(header_.keyArenaOffset, static_cast<size_t>(header_.keyArenaSize));
                     bloomData_ = readVecAt(header_.bloomOffset, static_cast<size_t>(header_.bloomSize));
-                    SSTMetadataCrcV2 metadataCrc{};
+                    SSTMetadataCrcV1 metadataCrc{};
                     std::memcpy(&metadataCrc, header_.reserved, sizeof(metadataCrc));
                     if (crc32cPodVector(index_) != metadataCrc.indexCrc32c || crc32c(keyArena_) != metadataCrc.keyArenaCrc32c || crc32c(
                         bloomData_
                     ) != metadataCrc.bloomCrc32c) { return false; }
-                    if (bloomData_.size() < sizeof(SSTBloomHeaderV2)) { return false; }
+                    if (bloomData_.size() < sizeof(SSTBloomHeaderV1)) { return false; }
                     std::memcpy(&bloomHeader_, bloomData_.data(), sizeof(bloomHeader_));
                     if (bloomHeader_.numBits == 0 || bloomHeader_.numHashes == 0 || (bloomHeader_.numBits & (bloomHeader_.numBits - 1u)) !=
-                        0 || bloomHeader_.bitsSize != bloomHeader_.numBits / 8u || bloomHeader_.bitsSize + sizeof(SSTBloomHeaderV2) !=
+                        0 || bloomHeader_.bitsSize != bloomHeader_.numBits / 8u || bloomHeader_.bitsSize + sizeof(SSTBloomHeaderV1) !=
                         bloomData_.size() || !validateIndexMetadata()) { return false; }
                     const auto first = arenaKey(keyArena_, index_.front().firstKeyOffset, index_.front().firstKeyLen);
                     const auto last = arenaKey(keyArena_, index_.back().lastKeyOffset, index_.back().lastKeyLen);
@@ -285,7 +285,7 @@ namespace akkaradb::engine::sst {
                 }
             }
 
-            [[nodiscard]] const SSTFileHeaderV2& header() const noexcept { return header_; }
+            [[nodiscard]] const SSTFileHeaderV1& header() const noexcept { return header_; }
             [[nodiscard]] std::span<const uint8_t> firstKey() const noexcept { return firstKey_; }
             [[nodiscard]] std::span<const uint8_t> lastKey() const noexcept { return lastKey_; }
             [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
@@ -299,7 +299,7 @@ namespace akkaradb::engine::sst {
                     const auto arenaRangeIsValid = [this](uint32_t offset, uint32_t length) noexcept {
                         return offset <= keyArena_.size() && length <= keyArena_.size() - offset;
                     };
-                    if (entry.blockOffset != expectedBlockOffset || entry.blockSize < sizeof(SSTBlockHeaderV2) || entry.recordCount == 0 ||
+                    if (entry.blockOffset != expectedBlockOffset || entry.blockSize < sizeof(SSTBlockHeaderV1) || entry.recordCount == 0 ||
                         entry.uncompressedSize == 0 || !rangeWithin(entry.blockOffset, entry.blockSize, header_.indexOffset) || !
                         arenaRangeIsValid(entry.firstKeyOffset, entry.firstKeyLen) || !arenaRangeIsValid(
                             entry.lastKeyOffset,
@@ -331,7 +331,7 @@ namespace akkaradb::engine::sst {
 
             [[nodiscard]] bool bloomMightContain(uint64_t fp) const noexcept {
                 if (bloomHeader_.numBits == 0 || bloomHeader_.bitsSize == 0) { return true; }
-                const uint8_t* bits = bloomData_.data() + sizeof(SSTBloomHeaderV2);
+                const uint8_t* bits = bloomData_.data() + sizeof(SSTBloomHeaderV1);
                 const uint32_t mask = bloomHeader_.numBits - 1;
                 const uint32_t h1 = static_cast<uint32_t>(fp);
                 const uint32_t h2 = (static_cast<uint32_t>(fp >> 32) | 1u);
@@ -392,19 +392,19 @@ namespace akkaradb::engine::sst {
                 if (idx >= index_.size()) { throw std::out_of_range("SSTReader: block index out of range"); }
                 const auto& entry = index_[idx];
                 const auto blockFile = readVecAt(entry.blockOffset, entry.blockSize);
-                if (blockFile.size() < sizeof(SSTBlockHeaderV2)) { throw std::runtime_error("SSTReader: corrupt block header"); }
+                if (blockFile.size() < sizeof(SSTBlockHeaderV1)) { throw std::runtime_error("SSTReader: corrupt block header"); }
 
-                SSTBlockHeaderV2 bh{};
+                SSTBlockHeaderV1 bh{};
                 std::memcpy(&bh, blockFile.data(), sizeof(bh));
                 constexpr uint32_t knownBlockFlags = SST_BLOCK_FLAG_COMPRESSED | SST_BLOCK_FLAG_RAW | SST_BLOCK_FLAG_PREFIX_COMPRESSED;
                 const bool compressed = (bh.flags & SST_BLOCK_FLAG_COMPRESSED) != 0;
                 const bool raw = (bh.flags & SST_BLOCK_FLAG_RAW) != 0;
-                if (bh.headerSize != sizeof(SSTBlockHeaderV2) || bh.recordCount != entry.recordCount || bh.flags != entry.flags || (bh.flags
+                if (bh.headerSize != sizeof(SSTBlockHeaderV1) || bh.recordCount != entry.recordCount || bh.flags != entry.flags || (bh.flags
                     & ~knownBlockFlags) != 0 || compressed == raw || (compressed && (header_.flags & SST_FILE_FLAG_BLOCK_ZSTD) == 0)) {
                     throw std::runtime_error("SSTReader: corrupt block metadata");
                 }
 
-                const size_t payloadOff = sizeof(SSTBlockHeaderV2);
+                const size_t payloadOff = sizeof(SSTBlockHeaderV1);
                 const size_t offsetsOff = payloadOff + static_cast<size_t>(bh.compressedSize);
                 const size_t crcLen = static_cast<size_t>(bh.compressedSize) + static_cast<size_t>(bh.offsetsSize);
                 const size_t expectedBlockSize = static_cast<size_t>(alignUpU64(payloadOff + crcLen, 8));
@@ -535,11 +535,11 @@ namespace akkaradb::engine::sst {
             Options options_;
             mutable std::ifstream file_;
             mutable std::mutex ioMu_;
-            SSTFileHeaderV2 header_{};
-            std::vector<SSTBlockIndexEntryV2> index_;
+            SSTFileHeaderV1 header_{};
+            std::vector<SSTBlockIndexEntryV1> index_;
             std::vector<uint8_t> keyArena_;
             std::vector<uint8_t> bloomData_;
-            SSTBloomHeaderV2 bloomHeader_{};
+            SSTBloomHeaderV1 bloomHeader_{};
             std::vector<uint8_t> firstKey_;
             std::vector<uint8_t> lastKey_;
 
@@ -589,7 +589,7 @@ namespace akkaradb::engine::sst {
     }
 
     bool SSTReader::keyInRange(std::span<const uint8_t> key) const noexcept { return impl_->keyInRange(key); }
-    const SSTFileHeaderV2& SSTReader::header() const noexcept { return impl_->header(); }
+    const SSTFileHeaderV1& SSTReader::header() const noexcept { return impl_->header(); }
     std::span<const uint8_t> SSTReader::firstKey() const noexcept { return impl_->firstKey(); }
     std::span<const uint8_t> SSTReader::lastKey() const noexcept { return impl_->lastKey(); }
     const std::filesystem::path& SSTReader::path() const noexcept { return impl_->path(); }

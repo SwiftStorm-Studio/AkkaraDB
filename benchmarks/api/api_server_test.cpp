@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
         }
     }
     if (useTcp) {
-        std::printf("  TCP  %s:%u (%s)\n", bindHost.c_str(), tcpPort, tls ? "TLS AK5 protocol" : "Plain AK5 protocol");
+        std::printf("  TCP  %s:%u (%s)\n", bindHost.c_str(), tcpPort, tls ? "TLS AK1 protocol" : "Plain AK1 protocol");
         std::printf(
             "       workers=%u maxBatchItems=%u pipelineBatchLimit=%u acceptQueueLimit=%u\n",
             tcpWorkerThreads,

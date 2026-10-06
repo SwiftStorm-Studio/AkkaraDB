@@ -80,7 +80,6 @@ namespace akkaradb::core {
             Block* current_;
 
             [[nodiscard]] static bool isPowerOfTwo(size_t x) noexcept;
-            [[nodiscard]] static size_t alignUp(size_t x, size_t align) noexcept;
             [[nodiscard]] Block* createBlock(size_t capacity, size_t alignment);
             [[nodiscard]] static std::byte* tryAllocateFromBlock(Block* block, size_t size, size_t align) noexcept;
     };

@@ -96,6 +96,10 @@ void resetActiveIndex(uint64_t segmentId, SegmentKeyIndex index) {
 void pruneClosedSegments() {
     if (!retentionEnabled()) { return; }
     std::unique_lock retentionLock{retentionMu_};
+    if (snapshotPins_->load(std::memory_order_acquire) != 0) {
+        retentionPrunePending_.store(true, std::memory_order_release);
+        return;
+    }
     for (uint32_t attempt = 0; attempt < 2; ++attempt) {
         std::vector<SegmentInfo> segments;
         std::vector<SegmentInfo> expired;
@@ -192,7 +196,7 @@ void writeActiveSegmentIndexLocked() {
             const auto summary = scanSegment(
                 segmentPath(activeSegmentId_),
                 false,
-                [&rebuilt](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t>, uint64_t offset) {
+                [&rebuilt](std::string_view key, const AkvlogV1EntryHeader& header, std::span<const uint8_t>, uint64_t offset) {
                     rebuilt[std::string{key}].push_back(IndexVersion{header.seq, offset});
                 }
             );

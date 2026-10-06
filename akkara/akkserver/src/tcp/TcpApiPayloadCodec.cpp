@@ -103,10 +103,15 @@ namespace akkaradb::engine::server::tcp {
         }
     }
 
-    void encodeHistoryPayload(std::span<const VersionEntry> entries, std::vector<uint8_t>& out) {
+    void encodeHistoryPayload(core::ArenaGenerator<VersionEntry> entries, std::vector<uint8_t>& out, uint64_t maxBytes) {
         out.clear();
-        appendPlain(out, static_cast<uint32_t>(entries.size()));
+        uint32_t count = 0; appendPlain(out, count);
         for (const auto& entry : entries) {
+            if (count == UINT32_MAX || entry.value.size() > UINT32_MAX ||
+                (maxBytes != 0 && (out.size() > maxBytes || 32ull + entry.value.size() > maxBytes - out.size()))) {
+                throw std::length_error("TCP history response exceeds its limit; use streaming");
+            }
+            ++count;
             appendPlain(out, entry.seq);
             appendPlain(out, entry.sourceNodeId);
             appendPlain(out, entry.timestampNs);
@@ -114,6 +119,7 @@ namespace akkaradb::engine::server::tcp {
             appendPlain(out, static_cast<uint32_t>(entry.value.size()));
             appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
         }
+        std::memcpy(out.data(), &count, sizeof(count));
     }
 
     void encodeScanStreamPayload(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out) {

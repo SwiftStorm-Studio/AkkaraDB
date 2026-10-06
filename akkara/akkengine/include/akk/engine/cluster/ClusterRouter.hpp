@@ -24,6 +24,8 @@
 #include "akk/engine/cluster/ClusterConfig.hpp"
 
 #include <cstdint>
+#include <atomic>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -34,13 +36,14 @@ namespace akkaradb::engine::cluster {
      * The router is a pure, in-memory view over ClusterConfig.  It does not
      * perform I/O and does not observe runtime health.  Mirror mode returns all
      * data-bearing nodes; Partitioned mode returns the deterministic
-     * rendezvous-hash owner for the key.  Stripe mode returns the nodes that
+     * rendezvous-hash holders for the key, owner first. Stripe mode returns the nodes that
      * hold erasure-coded data and parity shards for the key.
      */
     class AKKARADB_CLUSTER_RUNTIME_API ClusterRouter {
         public:
             struct StripeShardTarget {
                 uint16_t shardIndex = 0;
+                uint8_t replicaIndex = 0;
                 NodeInfo node;
             };
 
@@ -50,6 +53,7 @@ namespace akkaradb::engine::cluster {
              * @throws std::invalid_argument if config is invalid.
              */
             explicit ClusterRouter(ClusterConfig config);
+            void reconfigure(ClusterConfig config);
 
             /**
              * Returns nodes that should receive a write for key.
@@ -74,15 +78,15 @@ namespace akkaradb::engine::cluster {
              * Returns the ordered data/parity shard placement for Stripe mode.
              *
              * Shard indexes [0, dataShards) are data shards; the following
-             * parityShards indexes are parity shards.
+             * parityShards indexes are parity shards. Mirrored layouts return
+             * one target per replica with the same shard index.
              */
             [[nodiscard]] std::vector<StripeShardTarget> stripeShardTargets(std::span<const uint8_t> key) const;
 
         private:
-            /** Returns the rendezvous-hash owner for key in Partitioned mode. */
-            [[nodiscard]] NodeInfo partitionTarget(std::span<const uint8_t> key) const;
+            /** Returns PARTITIONED holders in descending score order, owner first. */
+            [[nodiscard]] std::vector<NodeInfo> partitionTargets(std::span<const uint8_t> key) const;
 
-            ClusterConfig config_;
-            std::vector<NodeInfo> dataNodes_;
+            std::atomic<std::shared_ptr<const ClusterConfig>> config_;
     };
 } // namespace akkaradb::engine::cluster

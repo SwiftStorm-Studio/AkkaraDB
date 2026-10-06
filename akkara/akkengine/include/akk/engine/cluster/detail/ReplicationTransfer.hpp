@@ -82,6 +82,9 @@ namespace akkaradb::engine::cluster::detail {
     using MessagePtr = std::shared_ptr<const TransferMessage>;
     using SendFrame = std::function<bool(std::span<const uint8_t>)>;
     using ReceiveFrame = std::function<bool(DecodedFrame&)>;
+    // Bidirectional data traffic can ACK an earlier replication entry while a
+    // client upload is being assembled. Dispatch only that out-of-band control.
+    using ReceiveInterleavedAck = std::function<bool(const DecodedFrame&)>;
 
     class AKKARADB_CLUSTER_RUNTIME_API SnapshotMessageBuilder {
     public:
@@ -111,7 +114,8 @@ namespace akkaradb::engine::cluster::detail {
     AKKARADB_CLUSTER_RUNTIME_API bool sendMessage(const TransferMessage& message, const std::shared_ptr<TransferBudget>& budget,
         const std::shared_ptr<TransferSession>& session, const SendFrame& send);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr receiveMessage(const std::shared_ptr<TransferBudget>& budget,
-        const std::shared_ptr<TransferSession>& session, const ReceiveFrame& receive, const SendFrame& sendControl);
+        const std::shared_ptr<TransferSession>& session, const ReceiveFrame& receive, const SendFrame& sendControl,
+        const ReceiveInterleavedAck& receiveAck = {});
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr entryMessage(uint64_t seq, uint64_t source, ReplOpType op, uint8_t flags,
         std::span<const uint8_t> key, std::span<const uint8_t> value, const std::shared_ptr<TransferBudget>& budget);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr snapshotMessage(const ReplSnapshotEntry& entry, const std::shared_ptr<TransferBudget>& budget);

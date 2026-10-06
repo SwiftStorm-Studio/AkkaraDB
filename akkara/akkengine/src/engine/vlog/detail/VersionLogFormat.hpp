@@ -9,17 +9,17 @@
 
 // akkengine/src/engine/vlog/detail/VersionLogFormat.hpp
 namespace {
-    static constexpr uint32_t AKVLOG_V5_MAGIC = 0x35564B41u; // "AKV5"
-    static constexpr uint16_t AKVLOG_V5_VERSION = 0x0001u;
+    static constexpr uint32_t AKVLOG_V1_MAGIC = 0x31564B41u; // "AKV1"
+    static constexpr uint16_t AKVLOG_V1_VERSION = 0x0001u;
     static constexpr uint32_t AKVLOG_INDEX_MAGIC = 0x49564B41u; // "AKVI"
-    static constexpr uint16_t AKVLOG_INDEX_VERSION = 0x0002u;
+    static constexpr uint16_t AKVLOG_INDEX_VERSION = 0x0001u;
     static constexpr uint32_t AKVLOG_TAIL_MAGIC = 0x54564B41u; // "AKVT"
     static constexpr uint16_t AKVLOG_TAIL_VERSION = 0x0001u;
     static constexpr uint32_t INDEX_BLOOM_BITS_PER_KEY = 10;
     static constexpr uint32_t INDEX_BLOOM_HASHES = 7;
 
     #pragma pack(push, 1)
-    struct AkvlogV5FileHeader {
+    struct AkvlogV1FileHeader {
         uint32_t magic;
         uint16_t version;
         uint8_t syncModeHint;
@@ -32,7 +32,7 @@ namespace {
     #pragma pack(pop)
 
     #pragma pack(push, 1)
-    struct AkvlogV5EntryHeader {
+    struct AkvlogV1EntryHeader {
         uint32_t entryLen;
         uint64_t seq;
         uint64_t sourceNodeId;
@@ -85,8 +85,8 @@ namespace {
     };
     #pragma pack(pop)
 
-    static_assert(sizeof(AkvlogV5FileHeader) == 32);
-    static_assert(sizeof(AkvlogV5EntryHeader) == 43);
+    static_assert(sizeof(AkvlogV1FileHeader) == 32);
+    static_assert(sizeof(AkvlogV1EntryHeader) == 43);
     static_assert(sizeof(AkvlogIndexFileHeader) == 44);
     static_assert(sizeof(AkvlogIndexKeyRecord) == 24);
     static_assert(sizeof(AkvlogIndexVersionRecord) == 16);
@@ -144,7 +144,7 @@ namespace {
         out[offset + 3u] = static_cast<uint8_t>((value >> 24u) & 0xffu);
     }
 
-    [[nodiscard]] static std::vector<uint8_t> encodeFileHeader(AkvlogV5FileHeader header) {
+    [[nodiscard]] static std::vector<uint8_t> encodeFileHeader(AkvlogV1FileHeader header) {
         std::vector<uint8_t> out;
         out.reserve(FILE_HDR_SIZE);
         appendU32Le(out, header.magic);
@@ -158,8 +158,8 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] static AkvlogV5FileHeader decodeFileHeader(const uint8_t* data) noexcept {
-        AkvlogV5FileHeader header{};
+    [[nodiscard]] static AkvlogV1FileHeader decodeFileHeader(const uint8_t* data) noexcept {
+        AkvlogV1FileHeader header{};
         header.magic = readU32Le(data);
         header.version = readU16Le(data + 4u);
         header.syncModeHint = data[6];
@@ -171,7 +171,7 @@ namespace {
         return header;
     }
 
-    [[nodiscard]] static std::vector<uint8_t> encodeEntryHeader(const AkvlogV5EntryHeader& header) {
+    [[nodiscard]] static std::vector<uint8_t> encodeEntryHeader(const AkvlogV1EntryHeader& header) {
         std::vector<uint8_t> out;
         out.reserve(ENTRY_HDR_SIZE);
         appendU32Le(out, header.entryLen);
@@ -185,8 +185,8 @@ namespace {
         return out;
     }
 
-    [[nodiscard]] static AkvlogV5EntryHeader decodeEntryHeader(const uint8_t* data) noexcept {
-        AkvlogV5EntryHeader header{};
+    [[nodiscard]] static AkvlogV1EntryHeader decodeEntryHeader(const uint8_t* data) noexcept {
+        AkvlogV1EntryHeader header{};
         header.entryLen = readU32Le(data);
         header.seq = readU64Le(data + 4u);
         header.sourceNodeId = readU64Le(data + 12u);

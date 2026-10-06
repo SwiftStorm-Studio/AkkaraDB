@@ -90,6 +90,8 @@ namespace akkaradb::engine::sst {
 
                     [[nodiscard]] bool hasNext() const noexcept;
                     [[nodiscard]] std::optional<SSTRecord> next();
+                    [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const;
+                    [[nodiscard]] Iterator fork(std::span<const uint8_t> startKey = {}, std::span<const uint8_t> endKey = {}) const;
 
                 private:
                     friend class Impl;
@@ -124,7 +126,8 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] Iterator scanIter(
                 std::span<const uint8_t> startKey = {},
                 std::span<const uint8_t> endKey = {},
-                uint64_t snapshotSeq = UINT64_MAX
+                uint64_t snapshotSeq = UINT64_MAX,
+                bool includeTombstones = false
             ) const;
 
             [[nodiscard]] std::vector<LevelStats> levelStats() const;

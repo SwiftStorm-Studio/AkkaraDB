@@ -17,6 +17,7 @@
  */
 
 // akkserver/src/tcp/TcpApiConnection.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akk/engine/server/tcp/detail/TcpApiConnection.hpp"
 
 #include "akk/engine/server/tcp/detail/TcpApiFrameReader.hpp"
@@ -46,7 +47,7 @@ namespace akkaradb::engine::server::tcp {
         std::vector<uint8_t> responseBuffer;
         std::vector<uint8_t> writeBuffer;
         std::vector<ApiBatchPutItem> batchPutItems;
-        std::vector<AkkEngine::BatchPutEntry> enginePutItems;
+        std::vector<akkaradb::engine::detail::BulkPutEntry> enginePutItems;
         std::vector<std::span<const uint8_t>> batchGetKeys;
         std::vector<AkkEngine::BatchGetResult> engineGetResults;
         std::vector<ApiBatchGetResult> wireGetResults;
@@ -161,7 +162,7 @@ namespace akkaradb::engine::server::tcp {
                         enginePutItems.clear();
                         enginePutItems.reserve(batchPutItems.size());
                         for (const ApiBatchPutItem& item : batchPutItems) { enginePutItems.push_back({item.key, item.value}); }
-                        engine_.putBatch(std::span<const AkkEngine::BatchPutEntry>{enginePutItems.data(), enginePutItems.size()});
+                        akkaradb::engine::detail::ProtocolBulkWriter::put(engine_, std::span<const akkaradb::engine::detail::BulkPutEntry>{enginePutItems.data(), enginePutItems.size()});
                         counters_.batchPutItemsTotal.fetch_add(batchPutItems.size(), std::memory_order_relaxed);
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
@@ -238,8 +239,7 @@ namespace akkaradb::engine::server::tcp {
                         break;
                     }
                     case ApiOp::HISTORY: {
-                        const auto entries = engine_.history(frame.key);
-                        encodeHistoryPayload({entries.data(), entries.size()}, outputBuffer);
+                        encodeHistoryPayload(engine_.history(frame.key), outputBuffer, options_.tcpMaxPendingResponseBytes);
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {outputBuffer.data(), outputBuffer.size()}, responseBuffer);
                         break;
                     }
@@ -314,7 +314,8 @@ namespace akkaradb::engine::server::tcp {
                             encodeError(frame.header.requestId, responseBuffer);
                             return false;
                         }
-                        engine_.rollbackTo(targetSeq);
+                        const auto result = engine_.rollbackTo(targetSeq);
+                        if (!result.complete()) { throw std::runtime_error("rollbackTo did not complete"); }
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
                     }
@@ -325,7 +326,8 @@ namespace akkaradb::engine::server::tcp {
                             encodeError(frame.header.requestId, responseBuffer);
                             return false;
                         }
-                        engine_.rollbackKey(frame.key, targetSeq);
+                        const auto result = engine_.rollbackKey(frame.key, targetSeq);
+                        if (!result.complete()) { throw std::runtime_error("rollbackKey did not complete"); }
                         encodeResponse(ApiStatus::OK, frame.header.requestId, {}, responseBuffer);
                         break;
                     }
@@ -350,6 +352,12 @@ namespace akkaradb::engine::server::tcp {
                         encodeError(frame.header.requestId, responseBuffer);
                         return false;
                 }
+            }
+            catch (const cluster::ClusterRoutingError& error) {
+                const auto json = cluster::routingErrorJson(error);
+                encodeResponse(ApiStatus::ROUTING_ERROR, frame.header.requestId,
+                    {reinterpret_cast<const uint8_t*>(json.data()), json.size()}, responseBuffer);
+                return true;
             }
             catch (...) {
                 counters_.protocolErrorsTotal.fetch_add(1, std::memory_order_relaxed);

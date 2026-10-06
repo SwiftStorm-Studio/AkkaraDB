@@ -9,11 +9,13 @@
 
 // akkengine/include/akk/engine/vlog/VersionLog.hpp
 #pragma once
+#include <akk/core/utils/ArenaGenerator.hpp>
 
 #include "akkaradb/Export.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -181,8 +183,21 @@ namespace akkaradb::engine::vlog {
             void waitUntilReady() const;
 
             [[nodiscard]] std::optional<VersionEntry> getAt(std::span<const uint8_t> key, uint64_t atSeq) const;
-            [[nodiscard]] std::vector<VersionEntry> history(std::span<const uint8_t> key) const;
+            // Captures visibility and retention; reads one payload at a time.
+            // Entry references expire on advancement; consume to normal end for a complete result.
+            [[nodiscard]] core::ArenaGenerator<VersionEntry> history(std::span<const uint8_t> key) const;
             [[nodiscard]] std::vector<VersionRecord> collectSince(uint64_t afterSeq) const;
+
+            // The caller excludes append admission while capturing this fixed cut.
+            // Replay holds one record at a time and pins retention, not a thread-owned lock.
+            using RecordVisitor = std::function<bool(std::span<const uint8_t>, const VersionEntry&)>;
+            using RecordSnapshot = std::function<bool(const RecordVisitor&)>;
+            [[nodiscard]] RecordSnapshot captureRecords();
+            // Includes durable records beyond the public commit frontier, for
+            // idempotent recovery of an interrupted snapshot import.
+            [[nodiscard]] uint64_t highestStoredSequence() const;
+            [[nodiscard]] bool containsStoredRecord(std::span<const uint8_t> key, uint64_t seq,
+                uint64_t source, uint64_t timestamp, uint8_t flags) const;
 
             [[nodiscard]] std::vector<std::pair<std::vector<uint8_t>, std::optional<VersionEntry>>> collectRollbackTargets(
                 uint64_t targetSeq
@@ -198,6 +213,6 @@ namespace akkaradb::engine::vlog {
             VersionLog();
 
             class Impl;
-            std::unique_ptr<Impl> impl_;
+            std::shared_ptr<Impl> impl_;
     };
 } // namespace akkaradb::engine::vlog

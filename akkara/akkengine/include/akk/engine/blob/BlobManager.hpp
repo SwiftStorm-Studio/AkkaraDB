@@ -17,7 +17,6 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
-#include <shared_mutex>
 #include <span>
 #include <vector>
 
@@ -35,9 +34,9 @@ namespace akkaradb::engine::blob {
 
                 private:
                     friend class BlobManager;
-                    explicit ReadPin(std::shared_mutex& mutex) : lock_(mutex) {}
+                    explicit ReadPin(std::shared_ptr<void> lease) : lease_{std::move(lease)} {}
 
-                    std::shared_lock<std::shared_mutex> lock_;
+                    std::shared_ptr<void> lease_;
             };
 
             struct Options {

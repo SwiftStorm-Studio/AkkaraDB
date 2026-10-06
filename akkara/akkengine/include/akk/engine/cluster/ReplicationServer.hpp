@@ -25,6 +25,7 @@
 #include "akk/engine/cluster/ReplFraming.hpp"
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -69,8 +70,18 @@ namespace akkaradb::engine::cluster {
             };
 
             using SnapshotProvider = std::function<std::optional<Snapshot>()>;
+            // When supplied, all entry paths use these key-specific replica ids.
+            // An empty result means no replicas; the local owner is excluded.
+            using EntryTargets = std::function<std::vector<uint64_t>(std::span<const uint8_t> key)>;
             using ReadCallback = std::function<ReadResponse(const ReadRequest&)>;
-            using StripeControlCallback = std::function<StripeControlResponse(uint64_t peerNodeId, const StripeControlRequest&)>;
+            // Unique to an accepted connection. The transport permanently clears
+            // connected on disconnect; callbacks may retain it to fence grants.
+            struct PeerSession {
+                std::atomic<bool> connected{true};
+            };
+            using StripeControlCallback = std::function<StripeControlResponse(uint64_t peerNodeId,
+                const StripeControlRequest&, const std::shared_ptr<const PeerSession>&)>;
+            using ForwardCallback = std::function<ForwardResponse(const ForwardRequest&)>;
             /**
              * Maximum number of recent entry frames kept for reconnect catch-up.
              *
@@ -105,7 +116,8 @@ namespace akkaradb::engine::cluster {
                 ClusterRuntimeOptions runtimeOptions = {},
                 HistoryProvider historyProvider = {},
                 SnapshotProvider snapshotProvider = {},
-                std::shared_ptr<detail::TransferBudget> transferBudget = {}
+                std::shared_ptr<detail::TransferBudget> transferBudget = {},
+                EntryTargets entryTargets = {}
             );
 
             ~ReplicationServer();
@@ -118,12 +130,14 @@ namespace akkaradb::engine::cluster {
              *
              * @throws std::runtime_error if socket creation, bind, or listen fails.
              */
+            void allowReplica(uint64_t nodeId);
             void start();
 
             /** Stops accepting, disconnects replicas, and joins worker threads. */
             void close();
             void setReadCallback(ReadCallback callback);
             void setStripeControlCallback(StripeControlCallback callback);
+            void setForwardCallback(ForwardCallback callback);
 
             /**
              * Ships a replicated key/value entry to all current replication targets.

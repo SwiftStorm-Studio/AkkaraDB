@@ -263,6 +263,7 @@ namespace akkaradb::engine {
 
             struct PeerStats {
                 uint64_t nodeId = 0;
+                bool learner = false;
                 uint64_t matchIndex = 0;
                 uint64_t nextIndex = 0;
                 uint64_t replicationLag = 0;
@@ -305,6 +306,14 @@ namespace akkaradb::engine {
             uint64_t appliedIndex = 0;
             uint64_t lastLogIndex = 0;
             uint64_t snapshotIndex = 0;
+            uint64_t voterCount = 0;
+            uint64_t learnerCount = 0;
+            bool localLearner = false;
+            uint64_t mirrorAuthorityLeaderNodeId = 0;
+            uint64_t mirrorAuthorityPrimaryNodeId = 0;
+            uint64_t mirrorAuthorityEpoch = 0;
+            uint64_t mirrorAuthorityCommitIndex = 0;
+            bool mirrorWritePending = false;
             bool stripeMetadataRaftEnabled = false;
             uint64_t stripeMetadataRaftTerm = 0;
             uint64_t stripeMetadataLeaderNodeId = 0;

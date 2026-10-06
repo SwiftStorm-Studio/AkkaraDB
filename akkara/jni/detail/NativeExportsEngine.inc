@@ -155,12 +155,12 @@
             std::vector<std::span<const uint8_t>> valueSpans;
             readDirectBufferArray(env, keys, keySpans);
             readDirectBufferArray(env, values, valueSpans);
-            std::vector<AkkEngine::BatchPutEntry> entries;
+            std::vector<akkaradb::engine::detail::BulkPutEntry> entries;
             entries.reserve(static_cast<size_t>(keyCount));
             for (jsize i = 0; i < keyCount; ++i) {
                 entries.push_back({keySpans[static_cast<size_t>(i)], valueSpans[static_cast<size_t>(i)]});
             }
-            db->engine().putBatch(entries);
+            akkaradb::engine::detail::ProtocolBulkWriter::put(db->engine(), entries);
             return 0;
         }
     );

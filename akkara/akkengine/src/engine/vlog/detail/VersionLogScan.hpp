@@ -65,7 +65,7 @@ template <typename Visitor>
         throwVLogError("truncated file header", path, 0);
     }
 
-    AkvlogV5FileHeader fileHdr = decodeFileHeader(encodedFileHdr.data());
+    AkvlogV1FileHeader fileHdr = decodeFileHeader(encodedFileHdr.data());
     const uint32_t storedHeaderCrc = fileHdr.crc32c;
     fileHdr.crc32c = 0;
     encodedFileHdr[24] = 0;
@@ -73,7 +73,7 @@ template <typename Visitor>
     encodedFileHdr[26] = 0;
     encodedFileHdr[27] = 0;
     const uint32_t computedHeaderCrc = cpu::CRC32C(reinterpret_cast<const std::byte*>(encodedFileHdr.data()), encodedFileHdr.size());
-    if (fileHdr.magic != AKVLOG_V5_MAGIC || fileHdr.version != AKVLOG_V5_VERSION || storedHeaderCrc != computedHeaderCrc) {
+    if (fileHdr.magic != AKVLOG_V1_MAGIC || fileHdr.version != AKVLOG_V1_VERSION || storedHeaderCrc != computedHeaderCrc) {
         throwVLogError("corrupt file header", path, 0);
     }
     summary.durableBytes += FILE_HDR_SIZE;
@@ -169,7 +169,7 @@ template <typename Visitor>
         }
         auto logicalHeader = ehdr;
         logicalHeader.flags &= static_cast<uint8_t>(~VLOG_FLAG_ZSTD);
-        if constexpr (std::is_invocable_v<Visitor&, std::string_view, const AkvlogV5EntryHeader&, std::span<const uint8_t>, uint64_t>) {
+        if constexpr (std::is_invocable_v<Visitor&, std::string_view, const AkvlogV1EntryHeader&, std::span<const uint8_t>, uint64_t>) {
             visitor(key, logicalHeader, value, entryOffset);
         }
         else { visitor(key, logicalHeader, value); }

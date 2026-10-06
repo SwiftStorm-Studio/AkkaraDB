@@ -235,3 +235,65 @@ struct ParsedEntry {
         throw;
     }
 }
+
+// Validate index/key identity without materializing payloads. A stale derived
+// index or fingerprint collision falls back before any history is yielded.
+bool historyIndexMatches(const SegmentInfo& segment, std::string_view key, std::span<const IndexVersion> versions) const {
+    if (versions.empty()) { return true; }
+    const std::unique_ptr<FILE, decltype(&std::fclose)> file{openReadFile(segment.path), &std::fclose};
+    if (!file) { throw std::runtime_error("VersionLog: cannot open history segment"); }
+    std::array<uint8_t, ENTRY_HDR_SIZE> bytes{};
+    std::string storedKey;
+    for (const auto& version : versions) {
+        if (version.offset > segment.bytes || segment.bytes - version.offset < ENTRY_HDR_SIZE) { return false; }
+        seekFile(file.get(), version.offset);
+        if (fread(bytes.data(), 1, bytes.size(), file.get()) != bytes.size()) { return false; }
+        const auto header = decodeEntryHeader(bytes.data());
+        const uint64_t expected = ENTRY_HDR_SIZE + static_cast<uint64_t>(header.keyLen) + header.valueLen + CRC_SIZE;
+        if (header.seq != version.seq || header.entryLen != expected || expected > MAX_ENTRY_SIZE ||
+            expected > segment.bytes - version.offset || header.keyLen != key.size()) { return false; }
+        storedKey.resize(header.keyLen);
+        if (fread(storedKey.data(), 1, storedKey.size(), file.get()) != storedKey.size() || storedKey != key) { return false; }
+    }
+    return true;
+}
+// Snapshot indexes contain locations, never all historical payloads. Pending
+// values remain bounded by the existing VersionLog write-admission policy.
+struct HistoryLocation { uint64_t seq, offset; size_t segment; };
+static core::ArenaGenerator<VersionEntry> historyGenerator(std::shared_ptr<Impl> impl, std::string key,
+    std::vector<SegmentInfo> segments, std::vector<HistoryLocation> locations,
+    std::vector<VersionEntry> resident, std::shared_ptr<void> retentionPin) {
+    (void)retentionPin;
+    size_t disk = 0, memory = 0;
+    std::optional<VersionEntry> previous;
+    using Reader = std::unique_ptr<FILE, decltype(&std::fclose)>;
+    // Parallel lanes interleave sequences. Keep a bounded LRU instead of
+    // reopening a segment for every value, or opening every segment at once.
+    std::vector<std::pair<size_t, Reader>> files;
+    while (disk < locations.size() || memory < resident.size()) {
+        VersionEntry entry;
+        if (memory < resident.size() && (disk == locations.size() || resident[memory].seq < locations[disk].seq)) {
+            entry = std::move(resident[memory++]);
+        } else {
+            const auto location = locations[disk++];
+            const auto& segment = segments[location.segment];
+            auto found = std::ranges::find_if(files, [&](const auto& file) { return file.first == location.segment; });
+            if (found == files.end()) {
+                Reader file{impl->openReadFile(segment.path), &std::fclose};
+                if (!file) { throw std::runtime_error("VersionLog: missing pinned history segment"); }
+                if (files.size() == 8) { files.erase(files.begin()); }
+                files.emplace_back(location.segment, std::move(file));
+            } else {
+                auto reused = std::move(*found); files.erase(found); files.push_back(std::move(reused));
+            }
+            auto parsed = impl->readEntryAt(files.back().second.get(), segment.path, location.offset);
+            if (parsed.key != key || parsed.entry.seq != location.seq) { throw std::runtime_error("VersionLog: invalid history index entry"); }
+            entry = std::move(parsed.entry);
+        }
+        if (previous && previous->seq == entry.seq && previous->sourceNodeId == entry.sourceNodeId &&
+            previous->timestampNs == entry.timestampNs && previous->flags == entry.flags && previous->value == entry.value) { continue; }
+        previous = entry;
+        co_yield std::move(entry);
+    }
+    files.clear(); previous.reset(); resident.clear(); retentionPin.reset(); impl.reset();
+}

@@ -314,8 +314,8 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
-    [[nodiscard]] akkaradb::engine::sst::SSTFileHeaderV2 readSstHeader(const std::filesystem::path& path) {
-        akkaradb::engine::sst::SSTFileHeaderV2 header{};
+    [[nodiscard]] akkaradb::engine::sst::SSTFileHeaderV1 readSstHeader(const std::filesystem::path& path) {
+        akkaradb::engine::sst::SSTFileHeaderV1 header{};
         std::ifstream in(path, std::ios::binary);
         require(static_cast<bool>(in), "failed to open SST for header read");
         in.read(reinterpret_cast<char*>(&header), sizeof(header));
@@ -342,11 +342,11 @@ namespace {
 
         std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
         require(static_cast<bool>(file), "failed to open SST for legacy-format test");
-        sst::SSTFileHeaderV2 header{};
+        sst::SSTFileHeaderV1 header{};
         file.read(reinterpret_cast<char*>(&header), sizeof(header));
         require(static_cast<bool>(file), "failed to read SST header for legacy-format test");
 
-        sst::SSTFooterV2 footer{};
+        sst::SSTFooterV1 footer{};
         file.seekg(static_cast<std::streamoff>(header.footerOffset));
         file.read(reinterpret_cast<char*>(&footer), sizeof(footer));
         require(static_cast<bool>(file), "failed to read SST footer for legacy-format test");
@@ -402,7 +402,7 @@ namespace {
 
         const fs::path corruptBlock = dir / "block.aksst";
         fs::copy_file(source, corruptBlock, fs::copy_options::overwrite_existing);
-        flipFileByte(corruptBlock, header.dataOffset + sizeof(sst::SSTBlockHeaderV2));
+        flipFileByte(corruptBlock, header.dataOffset + sizeof(sst::SSTBlockHeaderV1));
         auto reader = sst::SSTReader::open(corruptBlock);
         require(reader != nullptr, "block corruption must be detected on block access");
         std::vector<uint8_t> out;

@@ -8,6 +8,7 @@
  */
 
 // benchmarks/smoke/version_log_fault_injection_smoke_test.cpp
+#include "detail/CollectHistory.hpp"
 #include "TestErrorHandlers.hpp"
 
 #include "akk/cpu/CRC32C.hpp"
@@ -203,7 +204,7 @@ namespace {
         createLog(path, serialSyncOptions());
         writeText(tailPathFor(path).string() + ".tmp", "not-a-valid-tail");
         auto log = vlog::VersionLog::create(path, serialSyncOptions());
-        require(log->history(bytes("fault-key")).size() == 4, "stale durable-tail temporary files must not affect recovery");
+        require(akk_test::collectHistory(log->history(bytes("fault-key"))).size() == 4, "stale durable-tail temporary files must not affect recovery");
         log->close();
     }
 
@@ -214,11 +215,11 @@ namespace {
 
         const uint64_t partialId = highestSegmentId(path) + 1u;
         const auto partialPath = segmentPathFor(path, partialId);
-        const std::array<uint8_t, 7> partialHeader{{'A', 'K', 'V', '5', 1, 0, 0}};
+        const std::array<uint8_t, 7> partialHeader{{'A', 'K', 'V', '1', 1, 0, 0}};
         writeBytes(partialPath, partialHeader);
 
         auto log = vlog::VersionLog::create(path, options);
-        require(log->history(bytes("fault-key")).size() == 8, "partial active headers must not hide previously durable history");
+        require(akk_test::collectHistory(log->history(bytes("fault-key"))).size() == 8, "partial active headers must not hide previously durable history");
         log->append(bytes("after-partial-header"), 9, 0, 0, 0, bytes("value-9"));
         const auto observed = log->getAt(bytes("after-partial-header"), 9);
         require(observed.has_value() && observed->value == std::vector<uint8_t>{'v', 'a', 'l', 'u', 'e', '-', '9'},
@@ -238,7 +239,7 @@ namespace {
         writeText(path, "interrupted-entry-bytes", true);
 
         auto log = vlog::VersionLog::create(path, options);
-        require(log->history(bytes("fault-key")).size() == 1, "missing tail recovery must keep only the validated prefix");
+        require(akk_test::collectHistory(log->history(bytes("fault-key"))).size() == 1, "missing tail recovery must keep only the validated prefix");
         log->close();
         require(fs::file_size(path) == validBytes, "missing tail recovery must truncate interrupted bytes");
     }

@@ -17,6 +17,7 @@
  */
 
 // akkserver/src/http/HttpApiServer.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akk/engine/server/HttpApiServer.hpp"
 
 #include "akk/engine/server/ApiFraming.hpp"
@@ -68,6 +69,9 @@ namespace akkaradb::engine::server {
                 case 204: return "No Content";
                 case 400: return "Bad Request";
                 case 404: return "Not Found";
+                case 409: return "Conflict";
+                case 413: return "Content Too Large";
+                case 503: return "Service Unavailable";
                 default: return "Internal Server Error";
             }
         }
@@ -107,11 +111,13 @@ namespace akkaradb::engine::server {
             }
         }
 
-        void encodeHistory(std::span<const VersionEntry> entries, bool truncated, std::vector<uint8_t>& out) {
+        void encodeHistory(core::ArenaGenerator<VersionEntry> entries, uint32_t limit, std::vector<uint8_t>& out) {
             out.clear();
-            appendPlain(out, static_cast<uint32_t>(entries.size()));
-            appendPlain(out, static_cast<uint8_t>(truncated ? 1 : 0));
+            uint32_t count = 0; appendPlain(out, count); appendPlain(out, uint8_t{0});
             for (const auto& entry : entries) {
+                if (limit != 0 && count >= limit) { out[4] = 1; break; }
+                if (count == UINT32_MAX || entry.value.size() > UINT32_MAX) { throw std::length_error("HTTP history response is too large"); }
+                ++count;
                 appendPlain(out, entry.seq);
                 appendPlain(out, entry.sourceNodeId);
                 appendPlain(out, entry.timestampNs);
@@ -119,6 +125,7 @@ namespace akkaradb::engine::server {
                 appendPlain(out, static_cast<uint32_t>(entry.value.size()));
                 appendBytes(out, std::span<const uint8_t>{entry.value.data(), entry.value.size()});
             }
+            std::memcpy(out.data(), &count, sizeof(count));
         }
 
         void appendStreamFrameHeader(std::vector<uint8_t>& out, uint8_t type, uint32_t payloadBytes) {
@@ -616,9 +623,9 @@ namespace akkaradb::engine::server {
         return lowered != "0" && lowered != "false" && lowered != "off" && lowered != "no";
     }
 
-    bool HttpApiServer::sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body) {
+    bool HttpApiServer::sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body, std::string_view contentType) {
         const std::string header = "HTTP/1.1 " + std::to_string(statusCode) + " " + std::string{reasonPhrase(statusCode)} + "\r\n"
-            "Content-Type: application/octet-stream\r\n" "Content-Length: " + std::to_string(body.size()) + "\r\n" "\r\n";
+            "Content-Type: " + std::string{contentType} + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n" "\r\n";
         if (!connection.sendAll(reinterpret_cast<const uint8_t*>(header.data()), header.size())) { return false; }
         const bool sent = body.empty() || connection.sendAll(body.data(), body.size());
         if (sent) {
@@ -848,13 +855,7 @@ namespace akkaradb::engine::server {
                     if (!finishChunkedResponse(connection, 200, sentBytes)) { return false; }
                 }
                 else {
-                    bool truncated = false;
-                    const uint32_t maxEntries = maxHistoryEntries();
-                    if (maxEntries != 0 && entries.size() > maxEntries) {
-                        entries.resize(maxEntries);
-                        truncated = true;
-                    }
-                    encodeHistory(std::span<const VersionEntry>{entries.data(), entries.size()}, truncated, valueBuffer);
+                    encodeHistory(std::move(entries), maxHistoryEntries(), valueBuffer);
                     sendResponse(connection, 200, std::span<const uint8_t>{valueBuffer.data(), valueBuffer.size()});
                 }
             }
@@ -864,7 +865,8 @@ namespace akkaradb::engine::server {
                     sendEmpty(connection, 400);
                     return request.keepAlive;
                 }
-                engine_.rollbackTo(targetSeq);
+                const auto result = engine_.rollbackTo(targetSeq);
+                if (!result.complete()) { throw std::runtime_error("rollbackTo did not complete"); }
                 sendEmpty(connection, 204);
             }
             else if (request.path == "/v1/rollbackKey" && request.method == "POST") {
@@ -873,7 +875,8 @@ namespace akkaradb::engine::server {
                     sendEmpty(connection, 400);
                     return request.keepAlive;
                 }
-                engine_.rollbackKey(keySpan, targetSeq);
+                const auto result = engine_.rollbackKey(keySpan, targetSeq);
+                if (!result.complete()) { throw std::runtime_error("rollbackKey did not complete"); }
                 sendEmpty(connection, 204);
             }
             else if (request.path == "/v1/batchPut" && request.method == "POST") {
@@ -892,10 +895,10 @@ namespace akkaradb::engine::server {
                     sendEmpty(connection, 400);
                     return request.keepAlive;
                 }
-                std::vector<AkkEngine::BatchPutEntry> entries;
+                std::vector<akkaradb::engine::detail::BulkPutEntry> entries;
                 entries.reserve(items.size());
                 for (const auto& item : items) { entries.push_back({item.key, item.value}); }
-                engine_.putBatch(std::span<const AkkEngine::BatchPutEntry>{entries.data(), entries.size()});
+                akkaradb::engine::detail::ProtocolBulkWriter::put(engine_, std::span<const akkaradb::engine::detail::BulkPutEntry>{entries.data(), entries.size()});
                 batchPutItemsTotal_.fetch_add(items.size(), std::memory_order_relaxed);
                 sendEmpty(connection, 204);
             }
@@ -941,6 +944,13 @@ namespace akkaradb::engine::server {
                 sendText(connection, 200, pong);
             }
             else { sendEmpty(connection, 404); }
+        }
+        catch (const cluster::ClusterRoutingError& error) {
+            errorsTotal_.fetch_add(1, std::memory_order_relaxed);
+            const auto json = cluster::routingErrorJson(error);
+            const int status = error.outcomeUnknown() ? 500 : error.code == cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE ? 413 :
+                (error.code == cluster::ClusterRoutingCode::NO_TARGET || error.code == cluster::ClusterRoutingCode::FORWARD_UNAVAILABLE) ? 503 : 409;
+            sendResponse(connection, status, {reinterpret_cast<const uint8_t*>(json.data()), json.size()}, "application/json");
         }
         catch (...) {
             errorsTotal_.fetch_add(1, std::memory_order_relaxed);

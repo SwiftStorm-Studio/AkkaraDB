@@ -12,6 +12,10 @@ struct AppendCompletion;
 fs::path logPath_;
 VersionLogOptions opts_;
 mutable std::mutex writeMu_;
+// forceSync()/close() temporarily stop asynchronous writers. Keep an append
+// admitted for its complete enqueue operation so that this transition cannot
+// reject an otherwise valid concurrent append.
+mutable std::shared_mutex appendLifecycleMu_;
 mutable std::mutex serialAdmissionMu_;
 std::shared_ptr<AppendCompletion> lastSerialAppendCompletion_;
 mutable std::mutex parallelQueueMu_;
@@ -31,6 +35,7 @@ mutable std::mutex indexValidationMu_;
 // Serializes retention planning/commit without making normal reads
 // or writes wait for the expensive state reconstruction scan.
 mutable std::mutex retentionMu_;
+std::shared_ptr<std::atomic<uint64_t>> snapshotPins_ = std::make_shared<std::atomic<uint64_t>>(0);
 std::condition_variable flushCv_;
 std::condition_variable queueSpaceCv_;
 mutable std::mutex asyncErrorMu_;

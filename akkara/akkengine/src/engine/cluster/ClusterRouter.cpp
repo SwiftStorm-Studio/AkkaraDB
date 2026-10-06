@@ -9,38 +9,33 @@
 
 // akkengine/src/engine/cluster/ClusterRouter.cpp
 #include "akk/engine/cluster/ClusterRouter.hpp"
+#include "akk/engine/cluster/detail/ClusterPlacement.hpp"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 
 namespace akkaradb::engine::cluster {
-    namespace {
-        uint64_t fnv1a64(std::span<const uint8_t> bytes, uint64_t seed = 14695981039346656037ull) noexcept {
-            uint64_t hash = seed;
-            for (uint8_t b : bytes) {
-                hash ^= b;
-                hash *= 1099511628211ull;
-            }
-            return hash;
-        }
+    using detail::rendezvousScore;
+    using detail::rankNodes;
 
-        uint64_t rendezvousScore(std::span<const uint8_t> key, uint64_t nodeId) noexcept {
-            uint8_t idBytes[8];
-            for (size_t i = 0; i < 8; ++i) { idBytes[i] = static_cast<uint8_t>(nodeId >> (8 * i)); }
-            return fnv1a64(std::span<const uint8_t>(idBytes, 8), fnv1a64(key));
-        }
-    } // namespace
+    ClusterRouter::ClusterRouter(ClusterConfig config) { reconfigure(std::move(config)); }
 
-    ClusterRouter::ClusterRouter(ClusterConfig config) : config_{std::move(config)}, dataNodes_{config_.dataNodes()} { config_.validate(); }
+    void ClusterRouter::reconfigure(ClusterConfig config) {
+        config.validate();
+        config_.store(std::make_shared<const ClusterConfig>(std::move(config)));
+    }
 
     std::vector<NodeInfo> ClusterRouter::writeTargets(std::span<const uint8_t> key) const {
-        switch (config_.mode()) {
-            case ReplicationMode::STANDALONE: return dataNodes_.empty()
+        const auto view = config_.load();
+        const auto& config = *view;
+        const auto dataNodes = config.mode() == ReplicationMode::STRIPE ? config.stripePlacementNodes() : config.dataNodes();
+        switch (config.mode()) {
+            case ReplicationMode::STANDALONE: return dataNodes.empty()
                                                          ? std::vector<NodeInfo>{}
-                                                         : std::vector<NodeInfo>{dataNodes_.front()};
-            case ReplicationMode::MIRROR: return dataNodes_;
-            case ReplicationMode::PARTITIONED: return {partitionTarget(key)};
+                                                         : std::vector<NodeInfo>{dataNodes.front()};
+            case ReplicationMode::MIRROR: return dataNodes;
+            case ReplicationMode::PARTITIONED: return partitionTargets(key);
             case ReplicationMode::STRIPE: {
                 std::vector<NodeInfo> out;
                 const auto targets = stripeShardTargets(key);
@@ -53,12 +48,15 @@ namespace akkaradb::engine::cluster {
     }
 
     std::vector<NodeInfo> ClusterRouter::readCandidates(std::span<const uint8_t> key) const {
-        switch (config_.mode()) {
-            case ReplicationMode::STANDALONE: return dataNodes_.empty()
+        const auto view = config_.load();
+        const auto& config = *view;
+        const auto dataNodes = config.mode() == ReplicationMode::STRIPE ? config.stripePlacementNodes() : config.dataNodes();
+        switch (config.mode()) {
+            case ReplicationMode::STANDALONE: return dataNodes.empty()
                                                          ? std::vector<NodeInfo>{}
-                                                         : std::vector<NodeInfo>{dataNodes_.front()};
-            case ReplicationMode::MIRROR: return dataNodes_;
-            case ReplicationMode::PARTITIONED: return {partitionTarget(key)};
+                                                         : std::vector<NodeInfo>{dataNodes.front()};
+            case ReplicationMode::MIRROR: return dataNodes;
+            case ReplicationMode::PARTITIONED: return partitionTargets(key);
             case ReplicationMode::STRIPE: {
                 std::vector<NodeInfo> out;
                 const auto targets = stripeShardTargets(key);
@@ -71,39 +69,64 @@ namespace akkaradb::engine::cluster {
     }
 
     std::vector<ClusterRouter::StripeShardTarget> ClusterRouter::stripeShardTargets(std::span<const uint8_t> key) const {
-        const uint16_t totalShards = config_.stripe().totalShards();
+        const auto view = config_.load();
+        const auto& config = *view;
+        const auto dataNodes = config.mode() == ReplicationMode::STRIPE ? config.stripePlacementNodes() : config.dataNodes();
+        const uint16_t totalShards = config.stripe().totalShards();
+        const uint8_t copiesPerShard = config.stripe().copiesPerShard;
+        const uint16_t totalPlacements = config.stripe().totalPlacements();
         if (totalShards == 0) { throw std::runtime_error("ClusterRouter: invalid stripe shard count"); }
-        if (dataNodes_.size() < totalShards) { throw std::runtime_error("ClusterRouter: not enough data-bearing nodes for stripe"); }
+        if (dataNodes.size() < totalPlacements) { throw std::runtime_error("ClusterRouter: not enough data-bearing nodes for stripe"); }
 
-        std::vector<std::pair<uint64_t, NodeInfo>> scored;
-        scored.reserve(dataNodes_.size());
-        for (const auto& node : dataNodes_) { scored.emplace_back(rendezvousScore(key, node.nodeId), node); }
-        std::ranges::sort(
-            scored,
-            [](const auto& left, const auto& right) {
-                if (left.first != right.first) { return left.first > right.first; }
-                return left.second.nodeId < right.second.nodeId;
+        if (copiesPerShard == 2) {
+            struct MirrorPair {
+                uint64_t score = 0;
+                NodeInfo first;
+                NodeInfo second;
+            };
+            std::vector<MirrorPair> pairs;
+            pairs.reserve(totalShards);
+            for (uint16_t i = 0; i < totalShards; ++i) {
+                auto first = dataNodes[i * 2];
+                auto second = dataNodes[i * 2 + 1];
+                const uint64_t firstScore = rendezvousScore(key, first.nodeId);
+                const uint64_t secondScore = rendezvousScore(key, second.nodeId);
+                if (secondScore > firstScore || (secondScore == firstScore && second.nodeId < first.nodeId)) {
+                    std::swap(first, second);
+                }
+                const auto pairIds = std::minmax(first.nodeId, second.nodeId);
+                pairs.push_back(MirrorPair{.score = rendezvousScore(key, pairIds.first, pairIds.second), .first = std::move(first), .second = std::move(second)});
             }
-        );
+            std::ranges::sort(pairs, [](const auto& left, const auto& right) {
+                if (left.score != right.score) { return left.score > right.score; }
+                return std::min(left.first.nodeId, left.second.nodeId) < std::min(right.first.nodeId, right.second.nodeId);
+            });
+
+            std::vector<StripeShardTarget> out;
+            out.reserve(totalPlacements);
+            for (uint16_t shardIndex = 0; shardIndex < pairs.size(); ++shardIndex) {
+                out.push_back(StripeShardTarget{.shardIndex = shardIndex, .replicaIndex = 0, .node = pairs[shardIndex].first});
+                out.push_back(StripeShardTarget{.shardIndex = shardIndex, .replicaIndex = 1, .node = pairs[shardIndex].second});
+            }
+            return out;
+        }
+
+        const auto scored = rankNodes(key, dataNodes);
 
         std::vector<StripeShardTarget> out;
         out.reserve(totalShards);
-        for (uint16_t i = 0; i < totalShards; ++i) { out.push_back(StripeShardTarget{.shardIndex = i, .node = scored[i].second}); }
+        for (uint16_t i = 0; i < totalShards; ++i) {
+            out.push_back(StripeShardTarget{.shardIndex = i, .replicaIndex = 0, .node = scored[i].second});
+        }
         return out;
     }
 
-    NodeInfo ClusterRouter::partitionTarget(std::span<const uint8_t> key) const {
-        if (dataNodes_.empty()) { throw std::runtime_error("ClusterRouter: no data-bearing nodes"); }
+    std::vector<NodeInfo> ClusterRouter::partitionTargets(std::span<const uint8_t> key) const {
+        const auto view = config_.load();
+        const auto& config = *view;
+        const auto dataNodes = config.mode() == ReplicationMode::STRIPE ? config.stripePlacementNodes() : config.dataNodes();
+        if (dataNodes.empty()) { throw std::runtime_error("ClusterRouter: no data-bearing nodes"); }
 
-        const NodeInfo* best = nullptr;
-        uint64_t bestScore = 0;
-        for (const auto& node : dataNodes_) {
-            const uint64_t score = rendezvousScore(key, node.nodeId);
-            if (best == nullptr || score > bestScore || (score == bestScore && node.nodeId < best->nodeId)) {
-                best = &node;
-                bestScore = score;
-            }
-        }
-        return *best;
+        return detail::partitionTargets(config, key);
     }
 } // namespace akkaradb::engine::cluster

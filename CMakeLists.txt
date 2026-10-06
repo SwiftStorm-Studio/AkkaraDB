@@ -34,4 +34,4 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraJni.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraPackaging.cmake")
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/AkkaraQueryRewriteBuild.cmake")
 
-message(STATUS "AkkaraDB CMake configuration completed. TLS is enabled; SIMD paths are selected at runtime.")
+message(STATUS "AkkaraDB CMake configuration completed. SIMD paths are selected at runtime.")

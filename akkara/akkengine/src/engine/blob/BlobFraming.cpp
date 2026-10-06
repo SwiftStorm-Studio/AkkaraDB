@@ -61,7 +61,7 @@ namespace akkaradb::engine::blob {
 
     BlobRef decodeBlobRef(const uint8_t* data) noexcept { return BlobRef{getU64(data), getU64(data + 8), getU32(data + 16),}; }
 
-    void serializeBlobHeader(const AkBlobHeaderV5& header, uint8_t out[AKBLOB_HEADER_SIZE_V5]) noexcept {
+    void serializeBlobHeader(const AkBlobHeaderV1& header, uint8_t out[AKBLOB_HEADER_SIZE_V1]) noexcept {
         putU32(out, header.magic);
         putU16(out + 4, header.version);
         putU16(out + 6, header.headerSize);
@@ -74,8 +74,8 @@ namespace akkaradb::engine::blob {
         putU32(out + 44, header.headerCrc32c);
     }
 
-    AkBlobHeaderV5 deserializeBlobHeader(const uint8_t in[AKBLOB_HEADER_SIZE_V5]) noexcept {
-        AkBlobHeaderV5 header{};
+    AkBlobHeaderV1 deserializeBlobHeader(const uint8_t in[AKBLOB_HEADER_SIZE_V1]) noexcept {
+        AkBlobHeaderV1 header{};
         header.magic = getU32(in);
         header.version = getU16(in + 4);
         header.headerSize = getU16(in + 6);
@@ -89,17 +89,17 @@ namespace akkaradb::engine::blob {
         return header;
     }
 
-    AkBlobHeaderV5 buildBlobHeader(
+    AkBlobHeaderV1 buildBlobHeader(
         uint64_t blobId,
         uint64_t totalSize,
         uint64_t storedSize,
         BlobCodec codec,
         uint32_t contentCrc32c
     ) noexcept {
-        AkBlobHeaderV5 header{};
-        header.magic = AKBLOB_MAGIC_V5;
-        header.version = AKBLOB_VERSION_V5;
-        header.headerSize = AKBLOB_HEADER_SIZE_V5;
+        AkBlobHeaderV1 header{};
+        header.magic = AKBLOB_MAGIC_V1;
+        header.version = AKBLOB_VERSION_V1;
+        header.headerSize = AKBLOB_HEADER_SIZE_V1;
         header.flags = codec == BlobCodec::ZSTD ? AKBLOB_FLAG_ZSTD : 0;
         header.codec = static_cast<uint32_t>(codec);
         header.blobId = blobId;
@@ -108,24 +108,24 @@ namespace akkaradb::engine::blob {
         header.contentCrc32c = contentCrc32c;
         header.headerCrc32c = 0;
 
-        uint8_t bytes[AKBLOB_HEADER_SIZE_V5]{};
+        uint8_t bytes[AKBLOB_HEADER_SIZE_V1]{};
         serializeBlobHeader(header, bytes);
-        header.headerCrc32c = crc32c(std::span<const uint8_t>{bytes, AKBLOB_HEADER_SIZE_V5 - sizeof(uint32_t)});
+        header.headerCrc32c = crc32c(std::span<const uint8_t>{bytes, AKBLOB_HEADER_SIZE_V1 - sizeof(uint32_t)});
         return header;
     }
 
-    bool verifyBlobHeader(const AkBlobHeaderV5& header) noexcept {
-        if (header.magic != AKBLOB_MAGIC_V5 || header.version != AKBLOB_VERSION_V5 || header.headerSize != AKBLOB_HEADER_SIZE_V5) {
+    bool verifyBlobHeader(const AkBlobHeaderV1& header) noexcept {
+        if (header.magic != AKBLOB_MAGIC_V1 || header.version != AKBLOB_VERSION_V1 || header.headerSize != AKBLOB_HEADER_SIZE_V1) {
             return false;
         }
         if (header.codec != static_cast<uint32_t>(BlobCodec::NONE) && header.codec != static_cast<uint32_t>(BlobCodec::ZSTD)) {
             return false;
         }
 
-        AkBlobHeaderV5 copy = header;
+        AkBlobHeaderV1 copy = header;
         copy.headerCrc32c = 0;
-        uint8_t bytes[AKBLOB_HEADER_SIZE_V5]{};
+        uint8_t bytes[AKBLOB_HEADER_SIZE_V1]{};
         serializeBlobHeader(copy, bytes);
-        return crc32c(std::span<const uint8_t>{bytes, AKBLOB_HEADER_SIZE_V5 - sizeof(uint32_t)}) == header.headerCrc32c;
+        return crc32c(std::span<const uint8_t>{bytes, AKBLOB_HEADER_SIZE_V1 - sizeof(uint32_t)}) == header.headerCrc32c;
     }
 } // namespace akkaradb::engine::blob

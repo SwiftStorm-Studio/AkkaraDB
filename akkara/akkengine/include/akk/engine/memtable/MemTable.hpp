@@ -93,6 +93,9 @@ namespace akkaradb::engine::memtable {
                     [[nodiscard]] bool hasNext() const noexcept;
                     [[nodiscard]] std::optional<RecordView> next() noexcept;
                     [[nodiscard]] uint64_t snapshotSeq() const noexcept;
+                    // Only sealed snapshots can be queried/forked repeatedly.
+                    [[nodiscard]] std::optional<RecordView> get(std::span<const uint8_t> key) const;
+                    [[nodiscard]] RangeIterator fork(const KeyRange& range) const;
 
                 private:
                     friend class MemTable;
@@ -124,6 +127,9 @@ namespace akkaradb::engine::memtable {
 
             void advanceSeq(uint64_t seq) noexcept;
 
+            // Retain the published generations until the borrowed view has been copied.
+            struct PinnedRecord { RecordView view; std::shared_ptr<const void> lifetime; };
+            [[nodiscard]] std::optional<PinnedRecord> getPinned(std::span<const uint8_t> key, uint64_t snapshotSeq) const;
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const;
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const;
 
@@ -147,7 +153,8 @@ namespace akkaradb::engine::memtable {
                 uint64_t snapshotSeq,
                 bool completionFirst,
                 uint64_t maxPinnedBytes,
-                uint32_t maxPinnedGenerations
+                uint32_t maxPinnedGenerations,
+                bool waitForAdmission = false
             );
 
             [[nodiscard]] uint64_t nextSeq() noexcept;

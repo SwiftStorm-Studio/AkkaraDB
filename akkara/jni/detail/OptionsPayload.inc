@@ -11,7 +11,7 @@
 [[nodiscard]] AkkaraDB::Options readOptions(JNIEnv* env, jobject optionsBuffer) {
     BytesReader in(readDirectBuffer(env, optionsBuffer));
     const auto version = in.u8();
-    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5) {
+    if (version != 1) {
         throw std::runtime_error("Unsupported AkkaraDB options payload version");
     }
 
@@ -40,71 +40,65 @@
     const auto sstBloomBitsPerKey = static_cast<jlong>(in.i64());
     if (sstBloomBitsPerKey >= 0) { options.overrides.sstBloomBitsPerKey = checkedCast<size_t>(sstBloomBitsPerKey, "sstBloomBitsPerKey"); }
 
-    if (version >= 5) {
-        const auto sstZstdCompressionLevel = static_cast<jint>(in.i32());
-        if (sstZstdCompressionLevel != std::numeric_limits<jint>::min()) {
-            options.overrides.sstZstdCompressionLevel = sstZstdCompressionLevel;
-        }
+    const auto sstZstdCompressionLevel = static_cast<jint>(in.i32());
+    if (sstZstdCompressionLevel != std::numeric_limits<jint>::min()) {
+        options.overrides.sstZstdCompressionLevel = sstZstdCompressionLevel;
     }
 
     const auto maxL0SstFiles = static_cast<jlong>(in.i64());
     if (maxL0SstFiles >= 0) { options.overrides.maxL0SstFiles = checkedCast<size_t>(maxL0SstFiles, "maxL0SstFiles"); }
 
-    if (version >= 2) {
-        const auto hasApi = static_cast<jint>(in.i32());
-        if (hasApi != 0) {
-            AkkaraDB::Options::ApiOptions api;
-            const auto backendCount = static_cast<jint>(in.i32());
-            if (backendCount < 0) { throw std::runtime_error("api.backends count must be >= 0"); }
-            api.backends.reserve(static_cast<size_t>(backendCount));
-            for (jint i = 0; i < backendCount; ++i) { api.backends.push_back(apiBackendFromOrdinal(static_cast<jint>(in.i32()))); }
-            api.bindHost = readUtf8String(in);
-            api.httpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.httpPort");
-            api.tcpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.tcpPort");
-            api.grpcPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.grpcPort");
-            api.transportMode = apiTransportModeFromOrdinal(static_cast<jint>(in.i32()));
-            if (const auto value = readOptionalUtf8String(in)) { api.serverBackendPath = *value; }
-            if (const auto value = readOptionalUtf8String(in)) { api.transportBackendPath = *value; }
-            if (const auto value = readOptionalUtf8String(in)) { api.httpBackendPath = *value; }
-            if (const auto value = readOptionalUtf8String(in)) { api.tcpBackendPath = *value; }
-            if (const auto value = readOptionalUtf8String(in)) { api.grpcBackendPath = *value; }
-            if (version >= 3) {
-                api.httpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxBatchItems");
-                api.httpMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxScanItems");
-                api.httpMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxHistoryEntries");
-                api.httpMaxContentLength = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.httpMaxContentLength");
-                api.grpcWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcWorkerThreads");
-                api.grpcCompletionQueues = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcCompletionQueues");
-                api.grpcMinPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMinPollers");
-                api.grpcMaxPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxPollers");
-                api.grpcMaxConcurrentStreams = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxConcurrentStreams");
-                api.grpcResourceQuotaBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.grpcResourceQuotaBytes");
-                api.grpcMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxBatchItems");
-                api.grpcMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxScanItems");
-                api.grpcMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxHistoryEntries");
-                api.tcpIoBackend = apiIoBackendFromOrdinal(static_cast<jint>(in.i32()));
-                api.tcpWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWorkerThreads");
-                api.tcpAcceptQueueLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueLimit");
-                api.tcpAcceptQueueTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueTimeoutMs");
-                api.tcpListenBacklog = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpListenBacklog");
-                api.tcpRecvBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpRecvBufferBytes");
-                api.tcpSendBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpSendBufferBytes");
-                api.tcpPipelineBatchLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpPipelineBatchLimit");
-                api.tcpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpMaxBatchItems");
-                api.tcpMaxPendingResponseBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.tcpMaxPendingResponseBytes");
-                api.tcpReadTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpReadTimeoutMs");
-                api.tcpWriteTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWriteTimeoutMs");
-                api.tcpNoDelay = boolFromInt(static_cast<jint>(in.i32()), "api.tcpNoDelay");
-                api.tcpKeepAlive = boolFromInt(static_cast<jint>(in.i32()), "api.tcpKeepAlive");
-                if (const auto value = readOptionalUtf8String(in)) { api.tls.certPath = *value; }
-                if (const auto value = readOptionalUtf8String(in)) { api.tls.keyPath = *value; }
-                if (const auto value = readOptionalUtf8String(in)) { api.tls.caPath = *value; }
-                if (version >= 4) { if (const auto value = readOptionalBytes(in)) { api.tls.psk = std::move(*value); } }
-                if (const auto value = readOptionalUtf8String(in)) { api.tls.pskIdentity = *value; }
-                api.tls.verifyPeer = boolFromInt(static_cast<jint>(in.i32()), "api.tls.verifyPeer");
-            }
-            options.api = std::move(api);
-        }
+    const auto hasApi = static_cast<jint>(in.i32());
+    if (hasApi != 0) {
+        AkkaraDB::Options::ApiOptions api;
+        const auto backendCount = static_cast<jint>(in.i32());
+        if (backendCount < 0) { throw std::runtime_error("api.backends count must be >= 0"); }
+        api.backends.reserve(static_cast<size_t>(backendCount));
+        for (jint i = 0; i < backendCount; ++i) { api.backends.push_back(apiBackendFromOrdinal(static_cast<jint>(in.i32()))); }
+        api.bindHost = readUtf8String(in);
+        api.httpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.httpPort");
+        api.tcpPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.tcpPort");
+        api.grpcPort = checkedCast<uint16_t>(static_cast<jlong>(in.i32()), "api.grpcPort");
+        api.transportMode = apiTransportModeFromOrdinal(static_cast<jint>(in.i32()));
+        if (const auto value = readOptionalUtf8String(in)) { api.serverBackendPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.transportBackendPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.httpBackendPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.tcpBackendPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.grpcBackendPath = *value; }
+        api.httpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxBatchItems");
+        api.httpMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxScanItems");
+        api.httpMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.httpMaxHistoryEntries");
+        api.httpMaxContentLength = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.httpMaxContentLength");
+        api.grpcWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcWorkerThreads");
+        api.grpcCompletionQueues = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcCompletionQueues");
+        api.grpcMinPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMinPollers");
+        api.grpcMaxPollers = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxPollers");
+        api.grpcMaxConcurrentStreams = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxConcurrentStreams");
+        api.grpcResourceQuotaBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.grpcResourceQuotaBytes");
+        api.grpcMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxBatchItems");
+        api.grpcMaxScanItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxScanItems");
+        api.grpcMaxHistoryEntries = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.grpcMaxHistoryEntries");
+        api.tcpIoBackend = apiIoBackendFromOrdinal(static_cast<jint>(in.i32()));
+        api.tcpWorkerThreads = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWorkerThreads");
+        api.tcpAcceptQueueLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueLimit");
+        api.tcpAcceptQueueTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpAcceptQueueTimeoutMs");
+        api.tcpListenBacklog = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpListenBacklog");
+        api.tcpRecvBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpRecvBufferBytes");
+        api.tcpSendBufferBytes = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpSendBufferBytes");
+        api.tcpPipelineBatchLimit = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpPipelineBatchLimit");
+        api.tcpMaxBatchItems = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpMaxBatchItems");
+        api.tcpMaxPendingResponseBytes = checkedCast<uint64_t>(static_cast<jlong>(in.i64()), "api.tcpMaxPendingResponseBytes");
+        api.tcpReadTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpReadTimeoutMs");
+        api.tcpWriteTimeoutMs = checkedCast<uint32_t>(static_cast<jlong>(in.i32()), "api.tcpWriteTimeoutMs");
+        api.tcpNoDelay = boolFromInt(static_cast<jint>(in.i32()), "api.tcpNoDelay");
+        api.tcpKeepAlive = boolFromInt(static_cast<jint>(in.i32()), "api.tcpKeepAlive");
+        if (const auto value = readOptionalUtf8String(in)) { api.tls.certPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.tls.keyPath = *value; }
+        if (const auto value = readOptionalUtf8String(in)) { api.tls.caPath = *value; }
+        if (const auto value = readOptionalBytes(in)) { api.tls.psk = std::move(*value); }
+        if (const auto value = readOptionalUtf8String(in)) { api.tls.pskIdentity = *value; }
+        api.tls.verifyPeer = boolFromInt(static_cast<jint>(in.i32()), "api.tls.verifyPeer");
+        options.api = std::move(api);
     }
 
     if (!in.eof()) { throw std::runtime_error("Trailing bytes in AkkaraDB options payload"); }

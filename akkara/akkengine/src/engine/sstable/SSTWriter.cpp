@@ -72,7 +72,7 @@ namespace akkaradb::engine::sst {
         }
 
         struct BloomBuild {
-            SSTBloomHeaderV2 header{};
+            SSTBloomHeaderV1 header{};
             std::vector<uint8_t> bits;
 
             explicit BloomBuild(size_t entries, uint32_t bitsPerKey) {
@@ -239,7 +239,7 @@ namespace akkaradb::engine::sst {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) { throw std::runtime_error("SSTWriter: cannot open " + path.string()); }
 
-        SSTFileHeaderV2 header{};
+        SSTFileHeaderV1 header{};
         writeExact(out, &header, sizeof(header));
 
         SSTWriter::Result result;
@@ -247,7 +247,7 @@ namespace akkaradb::engine::sst {
 
         BloomBuild bloom(estimatedRecordCount, options.bloomBitsPerKey);
 
-        std::vector<SSTBlockIndexEntryV2> index;
+        std::vector<SSTBlockIndexEntryV1> index;
         std::vector<uint8_t> keyArena;
         PendingBlock block;
         std::optional<core::RecordView> previousRecord;
@@ -267,8 +267,8 @@ namespace akkaradb::engine::sst {
             for (const uint32_t off : rawOffsets) { appendPod(offsetsBytes, off); }
 
             const uint64_t blockOffset = static_cast<uint64_t>(out.tellp());
-            SSTBlockHeaderV2 bh{};
-            bh.headerSize = sizeof(SSTBlockHeaderV2);
+            SSTBlockHeaderV1 bh{};
+            bh.headerSize = sizeof(SSTBlockHeaderV1);
             bh.flags = blockFlags;
             bh.recordCount = static_cast<uint32_t>(block.offsets.size());
             bh.compressedSize = static_cast<uint32_t>(payload.size());
@@ -299,7 +299,7 @@ namespace akkaradb::engine::sst {
             const uint32_t firstKeyOff = addKey(keyArena, block.firstKey);
             const uint32_t lastKeyOff = addKey(keyArena, block.lastKey);
             index.push_back(
-                SSTBlockIndexEntryV2{
+                SSTBlockIndexEntryV1{
                     .blockOffset = blockOffset,
                     .blockSize = static_cast<uint32_t>(next - blockOffset),
                     .uncompressedSize = static_cast<uint32_t>(block.raw.size()),
@@ -351,30 +351,30 @@ namespace akkaradb::engine::sst {
         writeExact(out, bloom.bits.data(), bloom.bits.size());
 
         const uint64_t footerOffset = static_cast<uint64_t>(out.tellp());
-        SSTFooterV2 footer{};
-        footer.file_size = footerOffset + sizeof(SSTFooterV2);
+        SSTFooterV1 footer{};
+        footer.file_size = footerOffset + sizeof(SSTFooterV1);
         footer.indexOffset = indexOffset;
         footer.keyArenaOffset = keyArenaOffset;
         footer.bloomOffset = bloomOffset;
-        footer.magic = SST_FOOTER_MAGIC_V2;
-        footer.version = SST_VERSION_V2;
+        footer.magic = SST_FOOTER_MAGIC_V1;
+        footer.version = SST_VERSION_V1;
 
-        header.magic = SST_MAGIC_V2;
-        header.version = SST_VERSION_V2;
-        header.headerSize = sizeof(SSTFileHeaderV2);
+        header.magic = SST_MAGIC_V1;
+        header.version = SST_VERSION_V1;
+        header.headerSize = sizeof(SSTFileHeaderV1);
         header.flags = SST_FILE_FLAG_METADATA_CRC;
         if (options.codec == SSTWriter::Codec::ZSTD) { header.flags |= SST_FILE_FLAG_BLOCK_ZSTD; }
         header.level = static_cast<uint32_t>(options.level);
         header.file_size = footer.file_size;
         header.entryCount = result.entryCount;
         header.blockCount = index.size();
-        header.dataOffset = sizeof(SSTFileHeaderV2);
+        header.dataOffset = sizeof(SSTFileHeaderV1);
         header.indexOffset = indexOffset;
-        header.indexSize = index.size() * sizeof(SSTBlockIndexEntryV2);
+        header.indexSize = index.size() * sizeof(SSTBlockIndexEntryV1);
         header.keyArenaOffset = keyArenaOffset;
         header.keyArenaSize = keyArena.size();
         header.bloomOffset = bloomOffset;
-        header.bloomSize = sizeof(SSTBloomHeaderV2) + bloom.bits.size();
+        header.bloomSize = sizeof(SSTBloomHeaderV1) + bloom.bits.size();
         header.footerOffset = footerOffset;
         header.minSeq = result.minSeq;
         header.maxSeq = result.maxSeq;
@@ -383,7 +383,7 @@ namespace akkaradb::engine::sst {
         bloomData.reserve(sizeof(bloom.header) + bloom.bits.size());
         appendPod(bloomData, bloom.header);
         bloomData.insert(bloomData.end(), bloom.bits.begin(), bloom.bits.end());
-        const SSTMetadataCrcV2 metadataCrc{
+        const SSTMetadataCrcV1 metadataCrc{
             .indexCrc32c = crc32cPodVector(index),
             .keyArenaCrc32c = crc32c(keyArena),
             .bloomCrc32c = crc32c(bloomData)

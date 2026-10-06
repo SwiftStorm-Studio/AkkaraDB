@@ -174,9 +174,10 @@ namespace akkaradb::engine::sst {
                 std::vector<std::shared_ptr<SSTReader>> readers,
                 std::span<const uint8_t> startKey,
                 std::span<const uint8_t> endKey,
-                uint64_t snapshotSeq
+                uint64_t snapshotSeq,
+                bool includeTombstones
             )
-                : startKey_{startKey.begin(), startKey.end()}, endKey_{endKey.begin(), endKey.end()} {
+                : snapshotSeq_{snapshotSeq}, includeTombstones_{includeTombstones}, startKey_{startKey.begin(), startKey.end()}, endKey_{endKey.begin(), endKey.end()} {
                 sources_.reserve(readers.size());
                 for (auto& reader : readers) {
                     if (!reader) { continue; }
@@ -199,6 +200,20 @@ namespace akkaradb::engine::sst {
                 pending_.reset();
                 advance();
                 return out;
+            }
+
+            [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const {
+                std::optional<SSTRecord> result;
+                for (const auto& source : sources_) {
+                    auto record = source.reader->get(key, snapshotSeq_);
+                    if (record && (!result || record->seq > result->seq)) { result = std::move(record); }
+                }
+                return result;
+            }
+            [[nodiscard]] std::unique_ptr<Impl> fork(std::span<const uint8_t> start, std::span<const uint8_t> end) const {
+                std::vector<std::shared_ptr<SSTReader>> readers;
+                for (const auto& source : sources_) { readers.push_back(source.reader); }
+                return std::make_unique<Impl>(std::move(readers), start, end, snapshotSeq_, includeTombstones_);
             }
 
         private:
@@ -242,13 +257,15 @@ namespace akkaradb::engine::sst {
                         if (next.rec.seq > best.rec.seq) { best.rec = std::move(next.rec); }
                     }
 
-                    if (!best.rec.isTombstone()) {
+                    if (includeTombstones_ || !best.rec.isTombstone()) {
                         pending_ = std::move(best.rec);
                         return;
                     }
                 }
             }
 
+            uint64_t snapshotSeq_;
+            bool includeTombstones_;
             std::vector<uint8_t> startKey_;
             std::vector<uint8_t> endKey_;
             std::vector<Source> sources_;
@@ -504,7 +521,8 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] Iterator scanIter(
                 std::span<const uint8_t> startKey,
                 std::span<const uint8_t> endKey,
-                uint64_t snapshotSeq
+                uint64_t snapshotSeq,
+                bool includeTombstones
             ) const {
                 auto snap = snapshot_.load(std::memory_order_acquire);
                 if (!snap) { return Iterator{}; }
@@ -513,7 +531,7 @@ namespace akkaradb::engine::sst {
                 for (const auto& level : *snap) {
                     for (const auto& meta : level) { if (meta.reader && meta.minSeq <= snapshotSeq) { readers.push_back(meta.reader); } }
                 }
-                return Iterator{std::make_unique<Iterator::Impl>(std::move(readers), startKey, endKey, snapshotSeq)};
+                return Iterator{std::make_unique<Iterator::Impl>(std::move(readers), startKey, endKey, snapshotSeq, includeTombstones)};
             }
 
             [[nodiscard]] std::vector<LevelStats> levelStats() const {
@@ -909,6 +927,13 @@ namespace akkaradb::engine::sst {
     SSTManager::Iterator& SSTManager::Iterator::operator=(Iterator&&) noexcept = default;
     bool SSTManager::Iterator::hasNext() const noexcept { return impl_ && impl_->hasNext(); }
 
+    std::optional<SSTRecord> SSTManager::Iterator::get(std::span<const uint8_t> key) const {
+        return impl_ ? impl_->get(key) : std::nullopt;
+    }
+    SSTManager::Iterator SSTManager::Iterator::fork(std::span<const uint8_t> start, std::span<const uint8_t> end) const {
+        return impl_ ? Iterator{impl_->fork(start, end)} : Iterator{};
+    }
+
     std::optional<SSTRecord> SSTManager::Iterator::next() {
         if (!hasNext()) { return std::nullopt; }
         return impl_->next();
@@ -947,8 +972,9 @@ namespace akkaradb::engine::sst {
     SSTManager::Iterator SSTManager::scanIter(
         std::span<const uint8_t> startKey,
         std::span<const uint8_t> endKey,
-        uint64_t snapshotSeq
-    ) const { return impl_->scanIter(startKey, endKey, snapshotSeq); }
+        uint64_t snapshotSeq,
+        bool includeTombstones
+    ) const { return impl_->scanIter(startKey, endKey, snapshotSeq, includeTombstones); }
 
     std::vector<SSTManager::LevelStats> SSTManager::levelStats() const { return impl_->levelStats(); }
     uint64_t SSTManager::maxSequence() const noexcept { return impl_->maxSequence(); }

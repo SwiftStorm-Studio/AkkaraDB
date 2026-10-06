@@ -54,7 +54,7 @@ namespace akkaradb::engine::manifest {
         SST_BLOB_REFS = 0x09,
         ///< Blob ids referenced by one SST file
 
-        // Cluster events (v4)
+        // Cluster events (v1)
         NODE_JOIN = 0x10,
         ///< A node joined the cluster
         NODE_LEAVE = 0x11,
@@ -62,7 +62,7 @@ namespace akkaradb::engine::manifest {
         PRIMARY_LEASE = 0x12,
         ///< Primary lease record (nodeId + expiry)
 
-        // Blob lifecycle events (v5)
+        // Blob lifecycle events (v1)
         BLOB_PUT = 0x20,
         ///< Blob file was durably written
         BLOB_DELETE = 0x21,
@@ -88,7 +88,7 @@ namespace akkaradb::engine::manifest {
      */
     #pragma pack(push, 1)
     struct AKDB_API ManifestFileHeader {
-        static constexpr uint32_t MAGIC = 0x35564D41; ///< "AMV5" (Manifest v5)
+        static constexpr uint32_t MAGIC = 0x31564D41; ///< "AMV1" (Manifest v1)
         static constexpr uint16_t VERSION = 0x0001;
 
         uint32_t magic;
@@ -383,7 +383,7 @@ namespace akkaradb::engine::manifest {
     [[nodiscard]] AKDB_API bool decodeSstBlobRefs(const uint8_t* payload, uint16_t len, DecodedSSTBlobRefs& out);
 
     // ========================================================================
-    // Blob lifecycle encode / decode (v5)
+    // Blob lifecycle encode / decode (v1)
     // ========================================================================
 
     /**
@@ -423,7 +423,7 @@ namespace akkaradb::engine::manifest {
     [[nodiscard]] AKDB_API bool decodeBlobDelete(const uint8_t* payload, uint16_t len, DecodedBlobDelete& out);
 
     // ========================================================================
-    // Cluster event encode / decode (v4)
+    // Cluster event encode / decode (v1)
     // ========================================================================
 
     /**

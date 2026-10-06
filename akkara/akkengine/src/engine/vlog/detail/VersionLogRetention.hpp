@@ -27,7 +27,7 @@ using RetentionStateMap = std::unordered_map<std::string, RetentionBaseState, St
         (void)scanSegment(
             segment.path,
             false,
-            [&](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t> value) {
+            [&](std::string_view key, const AkvlogV1EntryHeader& header, std::span<const uint8_t> value) {
                 if (header.seq > baseSeq) { return; }
                 const auto it = states.find(key);
                 if (it != states.end() && it->second.entry.seq >= header.seq) { return; }

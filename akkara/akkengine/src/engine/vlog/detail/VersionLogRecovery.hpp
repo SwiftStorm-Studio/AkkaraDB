@@ -65,7 +65,7 @@ void runRecovery() noexcept {
             const auto summary = scanSegment(
                 segment.path,
                 serialAsyncActiveSegment,
-                [&segmentIndex](std::string_view key, const AkvlogV5EntryHeader& header, std::span<const uint8_t>, uint64_t offset) {
+                [&segmentIndex](std::string_view key, const AkvlogV1EntryHeader& header, std::span<const uint8_t>, uint64_t offset) {
                     auto& versions = segmentIndex[std::string{key}];
                     versions.push_back(IndexVersion{header.seq, offset});
                 },

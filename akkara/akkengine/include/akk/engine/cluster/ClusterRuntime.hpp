@@ -81,6 +81,14 @@ namespace akkaradb::engine::cluster {
 
             /** Returns true when the local node owns writes for key. */
             [[nodiscard]] bool ownsWriteKey(std::span<const uint8_t> key) const override;
+            [[nodiscard]] ClusterRouteTarget routeTarget(std::span<const uint8_t> key) const override;
+            [[nodiscard]] ForwardResponse forwardTo(uint64_t nodeId, ForwardRequest request) override;
+            [[nodiscard]] ReadResponse linearizableReadKey(std::span<const uint8_t> key) override;
+            void queryReadBarrier() override;
+            [[nodiscard]] uint64_t ownerNodeId(std::span<const uint8_t> key) const override;
+            [[nodiscard]] uint64_t configurationEpoch() const noexcept override;
+            [[nodiscard]] uint64_t stripeMetadataLinearizableWatermark() override;
+            [[nodiscard]] StripeControlResponse rollbackControl(uint64_t targetNodeId, StripeControlRequest request) override;
 
             /** Performs a cluster-routed key read according to runtime options. */
             [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) override;
@@ -139,11 +147,29 @@ namespace akkaradb::engine::cluster {
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) override;
 
             void addRaftVotingNode(const NodeInfo& node) override;
+            void addRaftLearner(const NodeInfo& node) override;
+            void executePrimaryWrite(const std::function<void()>& write) override;
+            bool recoverMirrorWrite() override;
+            void cancelMirrorRecovery() noexcept override;
+            [[nodiscard]] MirrorFencingMode mirrorFencingMode() const noexcept override;
+            [[nodiscard]] MirrorRecoveryMode mirrorRecoveryMode() const noexcept override;
+            void transferMirrorAuthorityLeadership(uint64_t targetNodeId) override;
+            void promoteRaftLearner(uint64_t nodeId) override;
+            void removeRaftLearner(uint64_t nodeId) override;
 
             void removeRaftVotingNode(uint64_t nodeId) override;
 
             void transferRaftLeadership(uint64_t targetNodeId) override;
-            void reconfigure(ClusterConfig config) override;
+            void campaignLeadership() override;
+            void reconfigure(ClusterConfig config, uint64_t generation = 0) override;
+            void preparePlacementNodes(const ClusterConfig&) override;
+            void waitForStripeOperations() override;
+            void publishStripePlacementAlias(std::span<const uint8_t>, std::span<const uint8_t>, uint64_t) override;
+            [[nodiscard]] ClusterPlacementState placementState(bool fresh = false) override;
+            uint64_t beginPlacementChange(const ClusterConfig&) override;
+            void finishPlacementChange(uint64_t generation) override;
+            void freezeStripePlacement(uint64_t generation) override;
+            void cancelPlacementChange(uint64_t generation) override;
 
         private:
             class Impl;

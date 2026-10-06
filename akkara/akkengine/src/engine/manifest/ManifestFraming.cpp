@@ -568,7 +568,7 @@ namespace akkaradb::engine::manifest {
     }
 
     // ============================================================================
-    // Blob lifecycle encode / decode (v5)
+    // Blob lifecycle encode / decode (v1)
     // ============================================================================
 
     std::vector<uint8_t> encodeBlobPut(
@@ -615,7 +615,7 @@ namespace akkaradb::engine::manifest {
     }
 
     // ============================================================================
-    // Cluster event encode / decode (v4)
+    // Cluster event encode / decode (v1)
     // ============================================================================
 
     std::vector<uint8_t> encodeNodeJoin(uint64_t tsUs, uint64_t nodeId, uint16_t replPort, const std::string& host) {

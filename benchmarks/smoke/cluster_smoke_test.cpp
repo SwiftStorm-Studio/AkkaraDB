@@ -8,10 +8,16 @@
  */
 
 // benchmarks/smoke/cluster_smoke_test.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #ifdef _WIN32
+#include "detail/CollectHistory.hpp"
+#include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -23,11 +29,14 @@
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterManager.hpp"
 #include "akk/engine/cluster/ClusterRuntime.hpp"
+#include "akk/engine/cluster/detail/RaftLogIndex.hpp"
+#include "akk/engine/cluster/detail/BoundedExecutor.hpp"
 #include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include "akk/engine/cluster/ReplicationServer.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
+#include "akk/engine/cluster/detail/ForwardDeadline.hpp"
 #include "akk/engine/erasure/ErasureCodec.hpp"
 #include "akk/engine/erasure/ErasureCodecExt.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
@@ -38,17 +47,21 @@
 #include "akk/engine/wal/WalWriter.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/Identity.hpp"
+#include "akk/crypto/Random.hpp"
 
 #include <array>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
+#include <set>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -142,8 +155,8 @@ namespace {
     TestGroupState readGroupState(const std::filesystem::path& path) {
         std::ifstream in(path, std::ios::binary);
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        AKK_CLUSTER_CHECK(bytes.size() == 33);
-        AKK_CLUSTER_CHECK((std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} == "AKCG2"));
+        if (bytes.size() != 33) { throw std::runtime_error("invalid group state size at " + path.string() + ": " + std::to_string(bytes.size())); }
+        AKK_CLUSTER_CHECK((std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} == "AKCG1"));
         auto readU32 = [](const std::vector<uint8_t>& data, size_t off) {
             return static_cast<uint32_t>(data[off]) |
                    (static_cast<uint32_t>(data[off + 1]) << 8) |
@@ -330,14 +343,28 @@ namespace {
         return out;
     }
 
-    uint64_t readRaftLogLastIncludedIndex(const std::filesystem::path& path) {
+    uint64_t readRaftLogHeaderValue(const std::filesystem::path& path, size_t offset) {
+        std::array<uint8_t, 49> bytes{};
+#ifdef _WIN32
+        // Observing live metadata must not block its atomic replacement.
+        const auto file = CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) { return 0; }
+        DWORD count = 0;
+        const bool read = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr) != FALSE;
+        CloseHandle(file);
+        if (!read || count != bytes.size()) { return 0; }
+#else
         std::ifstream in(path, std::ios::binary);
-        if (!in) { return 0; }
-        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        if (bytes.size() < 5) { return 0; }
+        if (!in.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) { return 0; }
+#endif
         const std::string_view magic{reinterpret_cast<const char*>(bytes.data()), 5};
-        if (magic == "AKRL1" && bytes.size() >= 49) { return readU64Le(bytes, 21); }
+        if (magic == "AKRL1" && offset + 8 <= bytes.size()) { return readU64Le(bytes, offset); }
         return 0;
+    }
+
+    uint64_t readRaftLogLastIncludedIndex(const std::filesystem::path& path) {
+        return readRaftLogHeaderValue(path, 21);
     }
 
     uint64_t nextPrng(uint64_t& state) noexcept {
@@ -498,7 +525,9 @@ namespace {
         const ClusterConfig& cfg,
         uint64_t nodeId,
         ClusterRuntimeOptions options = {},
-        bool secure = false
+        bool secure = false,
+        std::function<ForwardResponse(const ForwardRequest&)> forward = {},
+        std::function<void(ClusterEngineCallbacks&)> configure = {}
     ) {
         auto harness = std::make_unique<RuntimeHarness>();
         harness->nodeId = nodeId;
@@ -506,6 +535,7 @@ namespace {
         harness->loadDurableState();
         options.transportMode = secure ? TransportMode::SECURE : TransportMode::PLAIN;
         ClusterEngineCallbacks callbacks;
+        callbacks.forward = std::move(forward);
         callbacks.getLastSeq = [harness = harness.get()] { return harness->lastSeq.load(); };
         callbacks.getCurrentSeq = [harness = harness.get()] { return harness->lastSeq.load(); };
         callbacks.read = [harness = harness.get()](std::span<const uint8_t> key, uint64_t) {
@@ -517,7 +547,7 @@ namespace {
             return response;
         };
         callbacks.commitStripeMetadata = [harness = harness.get()](
-            std::span<const uint8_t> key, std::span<const uint8_t> metadata
+            uint64_t, std::span<const uint8_t> key, std::span<const uint8_t> metadata
         ) {
             std::lock_guard lock{harness->stateMutex};
             harness->stripeMetadata[std::string{reinterpret_cast<const char*>(key.data()), key.size()}] =
@@ -584,7 +614,7 @@ namespace {
             std::span<const uint8_t> value,
             uint8_t,
             uint64_t
-        ) {
+        , uint64_t) {
             harness->setState(seq, key, value);
             harness->appliedCount.fetch_add(1);
         };
@@ -607,6 +637,7 @@ namespace {
             harness->lastBlobContent.clear();
         };
         callbacks.forceDurable = [harness = harness.get()] { harness->durableCount.fetch_add(1); };
+        if (configure) { configure(callbacks); }
         harness->runtime = ClusterRuntime::create(dir, cfg, nodeId, std::move(callbacks), options);
         return harness;
     }
@@ -636,6 +667,10 @@ namespace {
     }
 
     bool isRetryableLeaderChange(const std::runtime_error& error) {
+        if (const auto* routing = dynamic_cast<const ClusterRoutingError*>(&error)) {
+            return routing->code == ClusterRoutingCode::NOT_OWNER || routing->code == ClusterRoutingCode::NO_TARGET ||
+                routing->code == ClusterRoutingCode::FORWARD_UNAVAILABLE;
+        }
         const std::string message = error.what();
         return message.find("local node is not Raft leader") != std::string::npos ||
                message.find("leadership changed") != std::string::npos ||
@@ -747,6 +782,19 @@ namespace {
 
     std::optional<std::vector<uint8_t>> engineGet(akkaradb::engine::AkkEngine& engine, const std::string& key) {
         return engine.get(bytesOf(key));
+    }
+
+    std::optional<std::vector<uint8_t>> engineGetLocalStorage(
+        akkaradb::engine::AkkEngine& engine,
+        const std::string& key
+    ) {
+        const auto keyBytes = bytesOf(key);
+        akkaradb::core::BufferArena arena;
+        for (const auto& record : engine.scanLocalStorage(arena, keyBytes)) {
+            if (!std::ranges::equal(record.key, keyBytes)) { break; }
+            return std::vector<uint8_t>{record.value.begin(), record.value.end()};
+        }
+        return std::nullopt;
     }
 
     std::string keyOwnedBy(const ClusterConfig& cfg, uint64_t nodeId, const std::string& prefix) {
@@ -898,6 +946,7 @@ namespace {
         options.cluster.runtime.clusterGroupId = 9180;
         options.cluster.runtime.clusterGroupEpoch = 1;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
         writeNodeIdFile(options.paths.dataDir / "node.id", id);
         return options;
@@ -922,7 +971,7 @@ namespace {
         akkaradb::core::BufferArena arena;
         size_t shards = 0;
         size_t intents = 0;
-        for (const auto& record : engine.scan(arena)) {
+        for (const auto& record : engine.scanLocalStorage(arena)) {
             if (record.key.size() < 6 || record.key[0] != 0 || record.key[1] != 'A' || record.key[2] != 'K' || record.key[3] != 'S') { continue; }
             if (record.key[4] == 'S') { ++shards; }
             if (record.key[4] == 'T') { ++intents; }
@@ -932,7 +981,7 @@ namespace {
 
     bool hasStripeMetadataMagic(akkaradb::engine::AkkEngine& engine, std::string_view magic) {
         akkaradb::core::BufferArena arena;
-        for (const auto& record : engine.scan(arena)) {
+        for (const auto& record : engine.scanLocalStorage(arena)) {
             if (record.key.size() >= 6 && record.key[0] == 0 && record.key[1] == 'A' && record.key[2] == 'K' &&
                 record.key[3] == 'S' && record.key[4] == 'M' && record.key[5] == '1') {
                 return record.value.size() >= magic.size() &&
@@ -1095,6 +1144,7 @@ namespace {
         options.cluster.runtime.clusterGroupId = 9190;
         options.cluster.runtime.clusterGroupEpoch = 1;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
         writeNodeIdFile(options.paths.dataDir / "node.id", id);
         return options;
@@ -1110,6 +1160,14 @@ namespace {
 
         const auto configPath = dir / "cluster.cfg";
         ClusterConfig::save(configPath, config);
+        {
+            std::ifstream file{configPath, std::ios::binary};
+            std::array<uint8_t, 6> header{};
+            file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+            AKK_CLUSTER_CHECK(file.gcount() == static_cast<std::streamsize>(header.size()));
+            AKK_CLUSTER_CHECK(std::memcmp(header.data(), "AKC1", 4) == 0);
+            AKK_CLUSTER_CHECK(header[4] == 1 && header[5] == 0);
+        }
         const auto loaded = ClusterConfig::load(configPath);
         AKK_CLUSTER_CHECK(loaded.mode() == ReplicationMode::STRIPE);
         AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID0);
@@ -1300,6 +1358,519 @@ namespace {
         replica->close();
     }
 
+    ClusterConfig raid5StorageConfig() {
+        return ClusterConfig{
+            {
+                node(1, 23831, 23931),
+                node(2, 23832, 23932),
+                node(3, 23833, 23933),
+            },
+            RaidOptions{.preset = RaidPreset::RAID5, .dataShards = 2},
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            testClusterId(9192),
+        };
+    }
+
+    akkaradb::engine::AkkEngineOptions raid5StorageOptions(const std::filesystem::path& dir, uint64_t id) {
+        akkaradb::engine::AkkEngineOptions options;
+        options.paths.dataDir = dir / ("n" + std::to_string(id));
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.cluster.config = raid5StorageConfig();
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.clusterGroupId = 9192;
+        options.cluster.runtime.clusterGroupEpoch = 1;
+        options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+        options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+        writeNodeIdFile(options.paths.dataDir / "node.id", id);
+        return options;
+    }
+
+    void testRaid5PresetDegradedWriteAndRead() {
+        const auto dir = makeTempDir("raid5-preset");
+        const auto config = raid5StorageConfig();
+        AKK_CLUSTER_CHECK(config.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID5);
+        AKK_CLUSTER_CHECK(config.stripe().dataShards == 2);
+        AKK_CLUSTER_CHECK(config.stripe().parityShards == 1);
+
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, config);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID5);
+        AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 2);
+        AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 1);
+
+        bool rejectedSingleDataShard = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 23834, 23934), node(2, 23835, 23935), node(3, 23836, 23936)},
+                RaidOptions{.preset = RaidPreset::RAID5, .dataShards = 1},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedSingleDataShard = true; }
+        AKK_CLUSTER_CHECK(rejectedSingleDataShard);
+
+        constexpr std::array<uint64_t, 3> placement{1, 2, 3};
+        const auto key = keyPlacedOn(config, placement, "raid5-degraded");
+        auto n1 = akkaradb::engine::AkkEngine::open(raid5StorageOptions(dir, 1));
+        auto n2 = akkaradb::engine::AkkEngine::open(raid5StorageOptions(dir, 2));
+        auto n3 = akkaradb::engine::AkkEngine::open(raid5StorageOptions(dir, 3));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("raid5-full")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n3->close();
+        n3.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats();
+            const auto peer = std::ranges::find(
+                stats.cluster.peers, uint64_t{3}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId
+            );
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("raid5-one-node-down")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n2, key);
+                return value && textOf(*value) == "raid5-one-node-down";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n1->close();
+        n2->close();
+    }
+
+    void testStripeDistributedRollback() {
+        namespace engine = akkaradb::engine;
+        const auto dir = makeTempDir("stripe-distributed-rollback");
+        auto optionsFor = [&](uint64_t id) {
+            auto options = raid5StorageOptions(dir, id);
+            options.components.versionLogEnabled = true;
+            return options;
+        };
+        auto n1 = engine::AkkEngine::open(optionsFor(1));
+        auto n2 = engine::AkkEngine::open(optionsFor(2));
+        auto n3 = engine::AkkEngine::open(optionsFor(3));
+        const auto config = raid5StorageConfig();
+        const std::string key = keyOwnedBy(config, 1, "stripe-rollback");
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("stripe-old")); return true; }
+            catch (...) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        const auto checkpoint = n2->createClusterCheckpoint();
+        n1->put(bytesOf(key), bytesOf("stripe-new"));
+        const auto rollback = n3->rollbackTo(checkpoint);
+        AKK_CLUSTER_CHECK(rollback.complete());
+        AKK_CLUSTER_CHECK(rollback.appliedCount() == 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n2, key);
+                return value && textOf(*value) == "stripe-old";
+            }
+            catch (...) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
+    void testGlobalStreamDistributedRollback() {
+        namespace engine = akkaradb::engine;
+        const auto run = [&](bool raft) {
+            const auto dir = makeTempDir(raft ? "raft-global-rollback" : "mirror-global-rollback");
+            const uint16_t basePort = raft ? 21751 : 21741;
+            std::vector<NodeInfo> nodes{node(1, static_cast<uint16_t>(basePort - 100), basePort)};
+            if (!raft) { nodes.push_back(node(2, static_cast<uint16_t>(basePort - 99), static_cast<uint16_t>(basePort + 1))); }
+            const ClusterConfig cfg{
+                nodes,
+                ReplicationMode::MIRROR,
+                AckPolicy{},
+                ConsistencyOptions{
+                    .mode = raft ? ConsistencyMode::RAFT_QUORUM : ConsistencyMode::PRIMARY_ACK,
+                    .ackTimeoutMs = 1000,
+                },
+                {},
+                {},
+                raft ? 0ULL : 1ULL,
+                testClusterId(raft ? 9005 : 9004),
+            };
+            const auto makeOptions = [&](uint64_t nodeId) {
+                engine::AkkEngineOptions options;
+                options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+                options.components.clusterEnabled = true;
+                options.components.blobEnabled = false;
+                options.components.versionLogEnabled = true;
+                options.cluster.config = cfg;
+                options.cluster.runtime.transportMode = TransportMode::PLAIN;
+                options.cluster.runtime.clusterGroupId = raft ? 9005 : 9004;
+                options.cluster.runtime.clusterGroupEpoch = 1;
+                options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+                options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+                options.cluster.runtime.startupRole = nodeId == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+                writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+                return options;
+            };
+            auto database = engine::AkkEngine::open(makeOptions(1));
+            auto replica = raft ? std::unique_ptr<engine::AkkEngine>{} : engine::AkkEngine::open(makeOptions(2));
+            if (!waitUntil([&] {
+                return database->stats().cluster.role == static_cast<uint32_t>(NodeRole::PRIMARY);
+            }, std::chrono::milliseconds{8000})) {
+                throw std::runtime_error(raft ? "RAFT rollback test did not elect a leader" : "MIRROR rollback test did not start its primary");
+            }
+            database->put(bytesOf("global-rollback"), bytesOf("old"));
+            const auto checkpoint = database->createClusterCheckpoint();
+            AKK_CLUSTER_CHECK(checkpoint.watermarks.size() == 1 && checkpoint.watermarks.front().streamId == 0);
+            database->put(bytesOf("global-rollback"), bytesOf("new"));
+            const auto all = database->rollbackTo(checkpoint);
+            AKK_CLUSTER_CHECK(all.complete() && all.appliedCount() == 1);
+            AKK_CLUSTER_CHECK(textOf(*engineGet(*database, "global-rollback")) == "old");
+            database->put(bytesOf("global-rollback"), bytesOf("newer"));
+            const auto one = database->rollbackKey(bytesOf("global-rollback"), checkpoint.watermarks.front());
+            AKK_CLUSTER_CHECK(one.complete() && one.appliedCount() == 1);
+            AKK_CLUSTER_CHECK(textOf(*engineGet(*database, "global-rollback")) == "old");
+            AKK_CLUSTER_CHECK(database->stats().vlog.rollbackEntries >= 2);
+            if (replica) {
+                AKK_CLUSTER_CHECK(waitUntil([&] {
+                    const auto value = engineGetLocalStorage(*replica, "global-rollback");
+                    return value && textOf(*value) == "old";
+                }));
+                replica->close();
+            }
+            database->close();
+        };
+        run(false);
+        run(true);
+    }
+
+    ClusterConfig raid10StorageConfig() {
+        return ClusterConfig{
+            {
+                node(1, 23841, 23941),
+                node(2, 23842, 23942),
+                node(3, 23843, 23943),
+                node(4, 23844, 23944),
+            },
+            RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2},
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            testClusterId(9193),
+        };
+    }
+
+    akkaradb::engine::AkkEngineOptions raid10StorageOptions(const std::filesystem::path& dir, uint64_t id) {
+        akkaradb::engine::AkkEngineOptions options;
+        options.paths.dataDir = dir / ("n" + std::to_string(id));
+        options.components.clusterEnabled = true;
+        options.components.blobEnabled = false;
+        options.cluster.config = raid10StorageConfig();
+        options.cluster.runtime.transportMode = TransportMode::PLAIN;
+        options.cluster.runtime.clusterGroupId = 9193;
+        options.cluster.runtime.clusterGroupEpoch = 1;
+        options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+        options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+        options.cluster.runtime.stripeRebuildIntervalMs = 100;
+        writeNodeIdFile(options.paths.dataDir / "node.id", id);
+        return options;
+    }
+
+    void testRaid10PresetMirroredStripeAndRebuild() {
+        const auto dir = makeTempDir("raid10-preset");
+        const auto config = raid10StorageConfig();
+        AKK_CLUSTER_CHECK(config.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID10);
+        AKK_CLUSTER_CHECK(config.stripe().dataShards == 2);
+        AKK_CLUSTER_CHECK(config.stripe().parityShards == 0);
+        AKK_CLUSTER_CHECK(config.stripe().copiesPerShard == 2);
+        AKK_CLUSTER_CHECK(config.stripe().totalPlacements() == 4);
+
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, config);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID10);
+        AKK_CLUSTER_CHECK(loaded.stripe().copiesPerShard == 2);
+
+        bool rejectedSinglePair = false;
+        try {
+            (void)ClusterConfig{
+                {node(1, 23845, 23945), node(2, 23846, 23946)},
+                RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 1},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedSinglePair = true; }
+        AKK_CLUSTER_CHECK(rejectedSinglePair);
+
+        bool rejectedUnpairedNode = false;
+        try {
+            (void)ClusterConfig{
+                {
+                    node(1, 23845, 23945),
+                    node(2, 23846, 23946),
+                    node(3, 23847, 23947),
+                    node(4, 23848, 23948),
+                    node(5, 23849, 23949),
+                },
+                RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedUnpairedNode = true; }
+        AKK_CLUSTER_CHECK(rejectedUnpairedNode);
+
+        const ClusterConfig hotSpareConfig{
+            {
+                node(1, 23845, 23945),
+                node(2, 23846, 23946),
+                node(3, 23847, 23947),
+                node(4, 23848, 23948),
+                node(5, 23849, 23949),
+            },
+            RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2, .hotSpareNodeId = 5},
+            AckPolicy{},
+        };
+        AKK_CLUSTER_CHECK(hotSpareConfig.stripeFailoverNode() != nullptr);
+        AKK_CLUSTER_CHECK(hotSpareConfig.stripeFailoverNode()->nodeId == 5);
+        AKK_CLUSTER_CHECK(hotSpareConfig.stripePlacementNodes().size() == 4);
+        const auto hotSpareTargets = ClusterRouter{hotSpareConfig}.stripeShardTargets(bytesOf("raid10-hot-spare-layout"));
+        AKK_CLUSTER_CHECK(std::ranges::none_of(hotSpareTargets, [](const auto& target) { return target.node.nodeId == 5; }));
+
+        bool rejectedSpareWithoutFullPairs = false;
+        try {
+            (void)ClusterConfig{
+                {
+                    node(1, 23845, 23945),
+                    node(2, 23846, 23946),
+                    node(3, 23847, 23947),
+                    node(4, 23848, 23948),
+                },
+                RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2, .hotSpareNodeId = 4},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedSpareWithoutFullPairs = true; }
+        AKK_CLUSTER_CHECK(rejectedSpareWithoutFullPairs);
+
+        auto n1 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 1));
+        auto n2 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 2));
+        auto n3 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 3));
+        auto n4 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 4));
+        uint64_t metadataLeader = 0;
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto a = n1->stats().cluster.stripeMetadataLeaderNodeId;
+            const auto b = n2->stats().cluster.stripeMetadataLeaderNodeId;
+            const auto c = n3->stats().cluster.stripeMetadataLeaderNodeId;
+            const auto d = n4->stats().cluster.stripeMetadataLeaderNodeId;
+            if (a == 0 || a != b || a != c || a != d) { return false; }
+            metadataLeader = a;
+            return true;
+        }, std::chrono::milliseconds{15000}));
+
+        const bool leaderInFirstPair = metadataLeader == 1 || metadataLeader == 2;
+        const std::array<uint64_t, 4> placement = leaderInFirstPair
+            ? std::array<uint64_t, 4>{3, 4, 1, 2}
+            : std::array<uint64_t, 4>{1, 2, 3, 4};
+        const auto key = keyPlacedOn(config, placement, "raid10-degraded");
+        ClusterRouter router{config};
+        const auto targets = router.stripeShardTargets(bytesOf(key));
+        AKK_CLUSTER_CHECK(targets.size() == 4);
+        AKK_CLUSTER_CHECK(targets[0].shardIndex == 0 && targets[0].replicaIndex == 0);
+        AKK_CLUSTER_CHECK(targets[1].shardIndex == 0 && targets[1].replicaIndex == 1);
+        AKK_CLUSTER_CHECK(targets[2].shardIndex == 1 && targets[2].replicaIndex == 0);
+        AKK_CLUSTER_CHECK(targets[3].shardIndex == 1 && targets[3].replicaIndex == 1);
+        for (size_t i = 0; i < placement.size(); ++i) { AKK_CLUSTER_CHECK(targets[i].node.nodeId == placement[i]); }
+
+        auto* owner = leaderInFirstPair ? n3.get() : n1.get();
+        const uint64_t mirrorNodeId = leaderInFirstPair ? 4 : 2;
+        AKK_CLUSTER_CHECK(owner->stats().nodeId != metadataLeader);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { owner->put(bytesOf(key), bytesOf("raid10-full")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        if (mirrorNodeId == 2) { n2->close(); n2.reset(); }
+        else { n4->close(); n4.reset(); }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = owner->stats();
+            const auto peer = std::ranges::find(
+                stats.cluster.peers, mirrorNodeId, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId
+            );
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { owner->put(bytesOf(key), bytesOf("raid10-one-mirror-down")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*owner, key);
+                return value && textOf(*value) == "raid10-one-mirror-down";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        if (mirrorNodeId == 2) { n2 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 2)); }
+        else { n4 = akkaradb::engine::AkkEngine::open(raid10StorageOptions(dir, 4)); }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto a = n1->stats().stripeRebuild.succeeded;
+            const auto b = n2->stats().stripeRebuild.succeeded;
+            const auto c = n3->stats().stripeRebuild.succeeded;
+            const auto d = n4->stats().stripeRebuild.succeeded;
+            return a + b + c + d >= 1;
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                auto* rebuilt = mirrorNodeId == 2 ? n2.get() : n4.get();
+                const auto value = engineGet(*rebuilt, key);
+                return value && textOf(*value) == "raid10-one-mirror-down";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n4->close();
+        n3->close();
+        n2->close();
+        n1->close();
+    }
+
+    ClusterConfig raid10HotSpareStorageConfig() {
+        return ClusterConfig{
+            {
+                node(1, 23851, 23951),
+                node(2, 23852, 23952),
+                node(3, 23853, 23953),
+                node(4, 23854, 23954),
+                node(5, 23855, 23955),
+            },
+            RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2, .hotSpareNodeId = 5},
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            testClusterId(9194),
+        };
+    }
+
+    akkaradb::engine::AkkEngineOptions raid10HotSpareStorageOptions(const std::filesystem::path& dir, uint64_t id) {
+        auto options = raid10StorageOptions(dir, id);
+        options.cluster.config = raid10HotSpareStorageConfig();
+        options.cluster.runtime.clusterGroupId = 9194;
+        return options;
+    }
+
+    void testRaid10HotSpareReplacementAndNoFailback() {
+        const auto dir = makeTempDir("raid10-hot-spare");
+        const auto config = raid10HotSpareStorageConfig();
+        AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID10);
+        AKK_CLUSTER_CHECK(config.stripeFailoverNode() != nullptr && config.stripeFailoverNode()->nodeId == 5);
+        AKK_CLUSTER_CHECK(config.dataNodes().size() == 5);
+        AKK_CLUSTER_CHECK(config.stripePlacementNodes().size() == 4);
+
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, config);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.stripeFailoverNode() != nullptr && loaded.stripeFailoverNode()->nodeId == 5);
+
+        constexpr std::array<uint64_t, 4> secondaryFailurePlacement{1, 2, 3, 4};
+        constexpr std::array<uint64_t, 4> ownerFailurePlacement{2, 1, 3, 4};
+        const auto secondaryFailureKey = keyPlacedOn(config, secondaryFailurePlacement, "raid10-spare-secondary");
+        const auto ownerFailureKey = keyPlacedOn(config, ownerFailurePlacement, "raid10-spare-owner");
+
+        auto n1 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 1));
+        auto n2 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 2));
+        auto n3 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 3));
+        auto n4 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 4));
+        auto n5 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 5));
+
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(secondaryFailureKey), bytesOf("before-spare")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n2->close();
+        n2.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats();
+            const auto peer = std::ranges::find(
+                stats.cluster.peers, uint64_t{2}, &akkaradb::engine::EngineStats::ClusterStats::PeerStats::nodeId
+            );
+            return peer != stats.cluster.peers.end() && !peer->connected;
+        }));
+
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(secondaryFailureKey), bytesOf("rebuilt-on-spare")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto totalRebuilt = n1->stats().stripeRebuild.succeeded + n3->stats().stripeRebuild.succeeded +
+                n4->stats().stripeRebuild.succeeded + n5->stats().stripeRebuild.succeeded;
+            return totalRebuilt >= 1 && stripeInternalCounts(*n5).first >= 1;
+        }, std::chrono::milliseconds{20000}));
+
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n5->put(bytesOf(ownerFailureKey), bytesOf("owner-on-spare")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n3, ownerFailureKey);
+                return value && textOf(*value) == "owner-on-spare";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n2 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 2));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n2->put(bytesOf(ownerFailureKey), bytesOf("no-automatic-failback")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n2->close();
+        n2.reset();
+        n1->close();
+        n1.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n3->stats();
+            return std::ranges::count_if(stats.cluster.peers, [](const auto& peer) { return !peer.connected; }) >= 2;
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n3, ownerFailureKey);
+                return value && textOf(*value) == "no-automatic-failback";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n5->close();
+        n4->close();
+        n3->close();
+        n5.reset();
+        n4.reset();
+        n3.reset();
+
+        n3 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 3));
+        n4 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 4));
+        n5 = akkaradb::engine::AkkEngine::open(raid10HotSpareStorageOptions(dir, 5));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n4, ownerFailureKey);
+                return value && textOf(*value) == "no-automatic-failback";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n5->close();
+        n4->close();
+        n3->close();
+    }
+
     ClusterConfig stripeFailoverStorageConfig() {
         constexpr uint32_t failoverCapabilities = DATA_AND_COORDINATOR |
             static_cast<uint32_t>(NodeCapability::STRIPE_FAILOVER_ELIGIBLE);
@@ -1383,7 +1954,7 @@ namespace {
         ClusterEngineCallbacks callbacks;
         callbacks.getLastSeq = [] { return uint64_t{0}; };
         callbacks.getCurrentSeq = [] { return uint64_t{0}; };
-        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t) {};
+        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t, uint64_t) {};
         callbacks.forceDurable = [] {};
         ClusterRuntimeOptions options;
         options.transportMode = TransportMode::PLAIN;
@@ -1505,6 +2076,11 @@ namespace {
         AKK_CLUSTER_CHECK(loaded.raft().membership.allowOnlineVoterChanges);
         AKK_CLUSTER_CHECK(loaded.clusterId() == cfg.clusterId());
 
+        const ClusterConfig localCompletion{cfg.nodes(), ReplicationMode::MIRROR, {},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK}, onlineRaftMembership()};
+        AKK_CLUSTER_CHECK(localCompletion.usesDataConsensus() && localCompletion.failover() == FailoverPolicy::NONE);
+        AKK_CLUSTER_CHECK(ClusterConfig::decode(localCompletion.encode()).failover() == FailoverPolicy::NONE);
+
         bool rejected = false;
         try {
             (void)ClusterConfig{
@@ -1514,7 +2090,7 @@ namespace {
                 },
                 ReplicationMode::MIRROR,
                 AckPolicy{},
-                ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK},
+                ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .writeConsistency = WriteConsistency::ONE_REPLICA},
                 onlineRaftMembership(),
             };
         }
@@ -1726,6 +2302,8 @@ namespace {
             .role = NodeRole::REPLICA,
             .groupId = 0x12345678,
             .groupEpoch = 7,
+            .clusterId = testClusterId(9533),
+            .configFingerprint = {1, 2, 3, 4},
         };
         DecodedFrame clientFrame;
         AKK_CLUSTER_CHECK(decodeFrame(encodeClientHello(client), clientFrame));
@@ -1735,6 +2313,11 @@ namespace {
         AKK_CLUSTER_CHECK(decodedClient.lastSeq == client.lastSeq);
         AKK_CLUSTER_CHECK(decodedClient.groupId == client.groupId);
         AKK_CLUSTER_CHECK(decodedClient.groupEpoch == client.groupEpoch);
+        AKK_CLUSTER_CHECK(decodedClient.clusterId == client.clusterId);
+        AKK_CLUSTER_CHECK(decodedClient.configFingerprint == client.configFingerprint);
+        AKK_CLUSTER_CHECK(!decodeClientHello(std::span<const uint8_t>{clientFrame.payload}.first(34), decodedClient));
+        clientFrame.payload.push_back(0);
+        AKK_CLUSTER_CHECK(!decodeClientHello(clientFrame.payload, decodedClient));
 
         const ServerHello server{
             .nodeId = 1,
@@ -1742,6 +2325,8 @@ namespace {
             .role = NodeRole::PRIMARY,
             .groupId = client.groupId,
             .groupEpoch = client.groupEpoch,
+            .clusterId = client.clusterId,
+            .configFingerprint = client.configFingerprint,
         };
         DecodedFrame serverFrame;
         AKK_CLUSTER_CHECK(decodeFrame(encodeServerHello(server), serverFrame));
@@ -1751,6 +2336,11 @@ namespace {
         AKK_CLUSTER_CHECK(decodedServer.currentSeq == server.currentSeq);
         AKK_CLUSTER_CHECK(decodedServer.groupId == server.groupId);
         AKK_CLUSTER_CHECK(decodedServer.groupEpoch == server.groupEpoch);
+        AKK_CLUSTER_CHECK(decodedServer.clusterId == server.clusterId);
+        AKK_CLUSTER_CHECK(decodedServer.configFingerprint == server.configFingerprint);
+        AKK_CLUSTER_CHECK(!decodeServerHello(std::span<const uint8_t>{serverFrame.payload}.first(34), decodedServer));
+        serverFrame.payload.push_back(0);
+        AKK_CLUSTER_CHECK(!decodeServerHello(serverFrame.payload, decodedServer));
     }
 
     void testPartitionedAndStripeRouting() {
@@ -1765,7 +2355,7 @@ namespace {
         };
         ClusterRouter partitionedRouter{partitioned};
         const auto partitionedTargets = partitionedRouter.writeTargets(bytesOf("partitioned-key"));
-        AKK_CLUSTER_CHECK(partitionedTargets.size() == 1);
+        AKK_CLUSTER_CHECK(partitionedTargets.size() == 3);
 
         StripeOptions stripeOptions;
         stripeOptions.dataShards = 3;
@@ -1806,6 +2396,21 @@ namespace {
         AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 3);
         AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
         AKK_CLUSTER_CHECK(loaded.stripeFailoverNode() && loaded.stripeFailoverNode()->nodeId == 6);
+
+        bool rejectedRaid6WithoutMetadataQuorum = false;
+        try {
+            (void)ClusterConfig{
+                {
+                    node(1, 20317, 20417),
+                    node(2, 20318, 20418),
+                    node(3, 20319, 20419),
+                    node(4, 20320, 20420),
+                },
+                ReplicationMode::STRIPE, AckPolicy{}, {}, {}, StripeOptions{.dataShards = 2, .parityShards = 2},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedRaid6WithoutMetadataQuorum = true; }
+        AKK_CLUSTER_CHECK(rejectedRaid6WithoutMetadataQuorum);
 
         bool rejectedDuplicateFailover = false;
         try {
@@ -1932,6 +2537,349 @@ namespace {
         n1->runtime->close();
     }
 
+    void testForwardFraming() {
+        ForwardRequest request;
+        request.requestId = 42; request.operation = ForwardOperation::PUT_REQUEST; request.timeoutMs = 500;
+        request.deduplicationId.nonce[0] = 1; request.deduplicationId.expiresAtUnixMs = 123;
+        request.entries.push_back({{0, 1, 2}, {3, 4}});
+        DecodedFrame frame;
+        ForwardRequest decoded;
+        AKK_CLUSTER_CHECK(decodeFrame(encodeForwardRequest(request), frame));
+        AKK_CLUSTER_CHECK(decodeForwardRequest(frame.payload, decoded));
+        AKK_CLUSTER_CHECK(decoded.requestId == 42 && decoded.deduplicationId == request.deduplicationId && decoded.entries[0].value == request.entries[0].value);
+        frame.payload.push_back(0); AKK_CLUSTER_CHECK(!decodeForwardRequest(frame.payload, decoded));
+        request.operation = ForwardOperation::GET; AKK_CLUSTER_CHECK(encodeForwardRequest(request).empty());
+        request.operation = ForwardOperation::QUERY_REQUEST; AKK_CLUSTER_CHECK(encodeForwardRequest(request).empty());
+        request.operation = ForwardOperation::READ_QUERY;
+        AKK_CLUSTER_CHECK(decodeFrame(encodeForwardRequest(request), frame) && decodeForwardRequest(frame.payload, decoded));
+        AKK_CLUSTER_CHECK(decoded.operation == ForwardOperation::READ_QUERY);
+        request.operation = static_cast<ForwardOperation>(255); AKK_CLUSTER_CHECK(encodeForwardRequest(request).empty());
+        request.operation = ForwardOperation::PUT_REQUEST;
+        request.entries[0].value.resize(MAX_FORWARD_PAYLOAD); AKK_CLUSTER_CHECK(encodeForwardRequest(request).empty());
+        ForwardResponse response;
+        response.requestId = 42; response.errorCode = ClusterRoutingCode::NOT_OWNER;
+        response.target = {2, "host\"\\\n", 1, 2, 3, 4, 5, 6};
+        response.message = "redirect";
+        ForwardResponse decodedResponse;
+        AKK_CLUSTER_CHECK(decodeFrame(encodeForwardResponse(response), frame) && decodeForwardResponse(frame.payload, decodedResponse));
+        AKK_CLUSTER_CHECK(decodedResponse.target.host == response.target.host && decodedResponse.target.raftTerm == 6);
+        frame.payload[8] = 2; AKK_CLUSTER_CHECK(!decodeForwardResponse(frame.payload, decodedResponse));
+        const auto json = routingErrorJson(ClusterRoutingError(response.errorCode, response.target));
+        AKK_CLUSTER_CHECK(json.find("host\\\"\\\\\\u000a") != std::string::npos);
+        const ClusterConfig config{{node(1, 24401, 24411), node(2, 24402, 24412)}, ReplicationMode::PARTITIONED,
+            {}, ConsistencyOptions{.mode = ConsistencyMode::ASYNC}};
+        ClusterRuntimeOptions options;
+        options.transportMode = TransportMode::PLAIN;
+        options.clusterGroupId = 24400;
+        const auto invalid = [&](const ClusterRuntimeOptions& candidate) {
+            bool rejected = false;
+            try { config.validateRuntime(1, candidate); } catch (const std::invalid_argument&) { rejected = true; }
+            AKK_CLUSTER_CHECK(rejected);
+        };
+        config.validateRuntime(1, options);
+        options.routingMode = static_cast<ClusterRoutingMode>(255); invalid(options);
+        options.routingMode = ClusterRoutingMode::REDIRECT;
+        options.forwardingTimeoutMs = 0; invalid(options);
+        options.forwardingTimeoutMs = 300001; invalid(options);
+        options.forwardingTimeoutMs = 5000;
+        options.queryMaxSpoolBytes = 0; invalid(options);
+        options.queryMaxSpoolBytes = UINT64_MAX; invalid(options);
+        options.queryMaxSpoolBytes = 1024ull * 1024 * 1024;
+        options.queryMaxOpenCursors = 0; invalid(options);
+        options.queryMaxOpenCursors = 1025; invalid(options);
+        options.queryMaxOpenCursors = 64;
+        options.queryCursorIdleTimeoutMs = 0; invalid(options);
+        options.queryCursorIdleTimeoutMs = 300001; invalid(options);
+        options.queryCursorIdleTimeoutMs = 60000;
+        options.apiEndpoints = {{3, 1, 2, 3}}; invalid(options);
+        options.apiEndpoints = {{1, 1, 2, 3}, {1, 4, 5, 6}}; invalid(options);
+        namespace transfer = akkaradb::engine::cluster::detail;
+        auto budget = std::make_shared<transfer::TransferBudget>(ReplicationTransferOptions{});
+        const std::vector<uint8_t> oversizedPayload(MAX_FORWARD_PAYLOAD + 1);
+        for (const auto type : {ReplMsgType::FORWARD_REQUEST, ReplMsgType::FORWARD_RESPONSE}) {
+            bool rejected = false;
+            const std::array parts{std::span<const uint8_t>{oversizedPayload}};
+            try { (void)transfer::makeMessage(type, parts, budget); } catch (const std::length_error&) { rejected = true; }
+            AKK_CLUSTER_CHECK(rejected);
+            std::vector<uint8_t> begin(46);
+            begin[0] = static_cast<uint8_t>(type);
+            for (size_t i = 0; i < 8; ++i) { begin[2 + i] = static_cast<uint8_t>(uint64_t{MAX_FORWARD_PAYLOAD + 1} >> (i * 8)); }
+            size_t reads = 0;
+            AKK_CLUSTER_CHECK(!transfer::receiveMessage(budget, [&](DecodedFrame& out) {
+                ++reads;
+                return reads == 1 && decodeFrame(encodeFrame(ReplMsgType::TRANSFER_BEGIN, begin), out);
+            }));
+            AKK_CLUSTER_CHECK(reads == 1 && budget->used(transfer::TransferBudget::Resource::SPOOL) == 0);
+        }
+        request.entries[0].value.resize(128u * 1024u);
+        const auto message = transfer::messageFromWire(encodeForwardRequest(request), budget);
+        std::vector<std::vector<uint8_t>> chunks;
+        AKK_CLUSTER_CHECK(transfer::sendMessage(*message, budget, [&](auto wire) {
+            chunks.emplace_back(wire.begin(), wire.end()); return true;
+        }));
+        chunks.insert(chunks.begin() + 2, encodeAck(ReplAck{.seq = 9, .stage = AckStage::DURABLE}));
+        size_t next = 0, acknowledgements = 0;
+        const auto assembled = transfer::receiveMessage(budget, {}, [&](DecodedFrame& out) {
+            return next < chunks.size() && decodeFrame(chunks[next++], out);
+        }, {}, [&](const DecodedFrame& out) {
+            ReplAck ack;
+            const bool valid = decodeAck(out.payload, ack) && ack.seq == 9 && ack.stage == AckStage::DURABLE;
+            if (valid) { ++acknowledgements; }
+            return valid;
+        });
+        AKK_CLUSTER_CHECK(assembled && acknowledgements == 1 && decodeForwardRequest(assembled->payload, decoded) &&
+            decoded.entries.front().value == request.entries.front().value);
+        auto session = std::make_shared<transfer::TransferSession>();
+        const auto started = std::chrono::steady_clock::now();
+        {
+            transfer::ForwardDeadline deadline{started + std::chrono::milliseconds{50}, [session] { session->cancel(); }};
+            AKK_CLUSTER_CHECK(!transfer::sendMessage(*message, budget, session, [](auto) { return true; }));
+        }
+        AKK_CLUSTER_CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds{1});
+    }
+
+    void testNativePartitionRouting(bool secure) {
+        using Engine = akkaradb::engine::AkkEngine;
+        const auto dir = makeTempDir(secure ? "routing-partition-secure" : "routing-partition");
+        const ClusterConfig cfg{{node(1, 24401, 24411), node(2, 24402, 24412)}, ReplicationMode::PARTITIONED,
+            {}, ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 1000}};
+        std::vector<ClusterPeerPublicKeyPin> pins;
+        if (secure) {
+            for (uint64_t id = 1; id <= 2; ++id) {
+                const auto identity = akkaradb::crypto::IdentityStore{dir / ("identity-" + std::to_string(id))}.loadOrCreate();
+                pins.push_back({id, identity.publicKey});
+            }
+        }
+        const auto makeOptions = [&](uint64_t id, ClusterRoutingMode mode) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(id));
+            options.components.clusterEnabled = true; options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            auto& runtime = options.cluster.runtime;
+            runtime.transportMode = secure ? TransportMode::SECURE : TransportMode::PLAIN;
+            runtime.routingMode = mode; runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            runtime.clusterGroupId = 24400;
+            runtime.apiEndpoints = {{1, 24401, 24501, 24601}, {2, 24402, 24502, 24602}};
+            runtime.secure.pinnedPeers = pins; runtime.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
+            writeNodeIdFile(options.paths.dataDir / "node.id", id);
+            return options;
+        };
+        auto n1 = Engine::open(makeOptions(1, ClusterRoutingMode::REDIRECT));
+        auto n2 = Engine::open(makeOptions(2, ClusterRoutingMode::FORWARD));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto s1 = n1->stats(), s2 = n2->stats();
+            return !s1.cluster.peers.empty() && !s2.cluster.peers.empty() && s1.cluster.peers[0].connected && s2.cluster.peers[0].connected;
+        }, std::chrono::seconds{15}));
+        const auto k1 = keyOwnedBy(cfg, 1, "route-one"), k2 = keyOwnedBy(cfg, 2, "route-two");
+        bool redirected = false;
+        try { n1->put(bytesOf(k2), bytesOf("denied")); }
+        catch (const ClusterRoutingError& error) {
+            redirected = error.code == ClusterRoutingCode::NOT_OWNER && error.target.nodeId == 2 &&
+                error.target.httpPort == 24502 && error.target.grpcPort == 24602 && error.target.configurationEpoch == 1;
+        }
+        AKK_CLUSTER_CHECK(redirected && !n2->get(bytesOf(k2)).has_value());
+        n2->putHinted(bytesOf(k1), bytesOf("forwarded"), 0, 0);
+        AKK_CLUSTER_CHECK(textOf(*n1->get(bytesOf(k1))) == "forwarded");
+        AKK_CLUSTER_CHECK(textOf(*n2->get(bytesOf(k1))) == "forwarded" && n2->exists(bytesOf(k1)));
+        const auto k1b = keyOwnedBy(cfg, 1, "route-one-b");
+        const std::string batchText = "batch", wrongText = "wrong";
+        const std::array<akkaradb::engine::detail::BulkPutEntry, 2> batch{{{bytesOf(k1), bytesOf(batchText)}, {bytesOf(k1b), bytesOf(batchText)}}};
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*n2, batch);
+        const auto batchValue = n1->get(bytesOf(k1b));
+        AKK_CLUSTER_CHECK(batchValue && textOf(*batchValue) == "batch");
+        const std::array<akkaradb::engine::detail::BulkPutEntry, 2> mixed{{{bytesOf(k1), bytesOf(wrongText)}, {bytesOf(k2), bytesOf(wrongText)}}};
+        bool rejected = false;
+        try { akkaradb::engine::detail::ProtocolBulkWriter::put(*n2, mixed); } catch (const ClusterRoutingError& error) { rejected = error.code == ClusterRoutingCode::CROSS_OWNER_BATCH; }
+        AKK_CLUSTER_CHECK(rejected && textOf(*n1->get(bytesOf(k1))) == "batch" && !n2->get(bytesOf(k2)).has_value());
+        std::vector<std::future<void>> writers;
+        for (unsigned i = 0; i < 8; ++i) {
+            writers.push_back(std::async(std::launch::async, [&, i] {
+                const auto key = keyOwnedBy(cfg, 1, "concurrent-" + std::to_string(i));
+                n2->put(bytesOf(key), bytesOf("concurrent"));
+                AKK_CLUSTER_CHECK(textOf(*n2->get(bytesOf(key))) == "concurrent");
+            }));
+        }
+        for (auto& writer : writers) { writer.get(); }
+        const std::vector<uint8_t> batchItemValue(32u * 1024u, 0x5A);
+        std::vector<std::string> largeBatchKeys;
+        std::vector<akkaradb::engine::detail::BulkPutEntry> largeBatch;
+        largeBatchKeys.reserve(32); largeBatch.reserve(32);
+        for (unsigned i = 0; i < 32; ++i) {
+            largeBatchKeys.push_back(keyOwnedBy(cfg, 1, "large-forward-" + std::to_string(i)));
+            largeBatch.push_back({bytesOf(largeBatchKeys.back()), batchItemValue});
+        }
+        std::fprintf(stderr, "[cluster] routing large same-owner batch\n");
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*n2, largeBatch);
+        std::fprintf(stderr, "[cluster] routing large batch readback\n");
+        AKK_CLUSTER_CHECK(n2->get(bytesOf(largeBatchKeys.back())) == std::optional{batchItemValue});
+        n2->removeHinted(bytesOf(k1), 0, 0); AKK_CLUSTER_CHECK(!n1->exists(bytesOf(k1)));
+        const std::vector<uint8_t> oversized(MAX_FORWARD_PAYLOAD, 1);
+        rejected = false;
+        try { n2->put(bytesOf(k1), oversized); } catch (const ClusterRoutingError& error) { rejected = error.code == ClusterRoutingCode::PAYLOAD_TOO_LARGE; }
+        AKK_CLUSTER_CHECK(rejected && !n1->exists(bytesOf(k1)));
+        const std::array<akkaradb::engine::detail::BulkPutEntry, 1> oversizedBatch{{{bytesOf(k1), oversized}}};
+        rejected = false;
+        try { akkaradb::engine::detail::ProtocolBulkWriter::put(*n2, oversizedBatch); } catch (const ClusterRoutingError& error) { rejected = error.code == ClusterRoutingCode::PAYLOAD_TOO_LARGE; }
+        AKK_CLUSTER_CHECK(rejected && !n1->exists(bytesOf(k1)));
+        std::vector<akkaradb::engine::detail::BulkPutEntry> tooManyEntries(65537, {bytesOf(k1), {}});
+        rejected = false;
+        try { akkaradb::engine::detail::ProtocolBulkWriter::put(*n2, tooManyEntries); } catch (const ClusterRoutingError& error) { rejected = error.code == ClusterRoutingCode::PAYLOAD_TOO_LARGE; }
+        AKK_CLUSTER_CHECK(rejected && !n1->exists(bytesOf(k1)));
+        n2->close();
+        n2 = Engine::open(makeOptions(2, ClusterRoutingMode::LOCAL_ONLY));
+        rejected = false;
+        try { n2->put(bytesOf(k1), bytesOf("local-only")); } catch (const ClusterRoutingError& error) { rejected = error.code == ClusterRoutingCode::LOCAL_ONLY && error.target.nodeId == 0; }
+        AKK_CLUSTER_CHECK(rejected && !n1->exists(bytesOf(k1)));
+        n2->close(); n1->close();
+    }
+
+    void testNativeRaftRouting(bool secure) {
+        using Engine = akkaradb::engine::AkkEngine;
+        const auto dir = makeTempDir(secure ? "routing-raft-secure" : "routing-raft");
+        auto raft = onlineRaftMembership(); raft.membership.allowLearners = true;
+        const ClusterConfig cfg{{node(1, 24701, 24711), node(2, 24702, 24712), node(3, 24703, 24713, DATA_AND_COORDINATOR | RAFT_LEARNER)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 2000}, raft};
+        std::vector<ClusterPeerPublicKeyPin> pins;
+        if (secure) {
+            for (uint64_t id = 1; id <= 3; ++id) {
+                const auto identity = akkaradb::crypto::IdentityStore{dir / ("identity-" + std::to_string(id))}.loadOrCreate();
+                pins.push_back({id, identity.publicKey});
+            }
+        }
+        const auto makeOptions = [&](uint64_t id) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(id));
+            options.components.clusterEnabled = true; options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = secure ? TransportMode::SECURE : TransportMode::PLAIN;
+            options.cluster.runtime.secure.pinnedPeers = pins;
+            options.cluster.runtime.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
+            options.cluster.runtime.routingMode = id == 1 ? ClusterRoutingMode::REDIRECT : ClusterRoutingMode::FORWARD;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.requests.enabled = true;
+            writeNodeIdFile(options.paths.dataDir / "node.id", id);
+            return options;
+        };
+        auto n1 = Engine::open(makeOptions(1)), n2 = Engine::open(makeOptions(2)), n3 = Engine::open(makeOptions(3));
+        Engine* nodes[]{n1.get(), n2.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findEngineLeader(nodes) != nullptr; }, std::chrono::seconds{20}));
+        auto* leader = findEngineLeader(nodes);
+        if (leader != n2.get()) { leader->transferClusterLeadership(2); }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            return findEngineLeader(nodes) == n2.get() && n1->stats().cluster.leaderNodeId == 2 && n3->stats().cluster.leaderNodeId == 2;
+        }, std::chrono::seconds{15}));
+        bool redirected = false;
+        try { n1->put(bytesOf("redirect"), bytesOf("denied")); }
+        catch (const ClusterRoutingError& error) { redirected = error.code == ClusterRoutingCode::NOT_OWNER && error.target.nodeId == 2 && error.target.raftTerm > 0; }
+        AKK_CLUSTER_CHECK(redirected);
+        const auto id = n3->newRequestId();
+        const auto first = n3->putWithRequest(id, bytesOf("once-forwarded"), bytesOf("value"));
+        const auto second = n3->putWithRequest(id, bytesOf("once-forwarded"), bytesOf("value"));
+        AKK_CLUSTER_CHECK(first.status == ClusterRequestStatus::APPLIED && first.sequence == second.sequence && first.logIndex == second.logIndex);
+        AKK_CLUSTER_CHECK(n3->queryRequest(id).sequence == first.sequence && n2->stats().putsTotal == 1);
+        AKK_CLUSTER_CHECK(textOf(*n3->get(bytesOf("once-forwarded"))) == "value");
+        n3->remove(bytesOf("once-forwarded")); AKK_CLUSTER_CHECK(!n3->exists(bytesOf("once-forwarded")));
+        const std::vector<uint8_t> batchValue(32u * 1024u, 0xA5);
+        std::vector<std::string> batchKeys;
+        std::vector<akkaradb::engine::detail::BulkPutEntry> batch;
+        batchKeys.reserve(32); batch.reserve(32);
+        for (unsigned i = 0; i < 32; ++i) {
+            batchKeys.push_back("raft-forward-batch-" + std::to_string(i));
+            batch.push_back({bytesOf(batchKeys.back()), batchValue});
+        }
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*n3, batch);
+        AKK_CLUSTER_CHECK(n3->get(bytesOf(batchKeys.back())) == std::optional{batchValue});
+        n3->close(); n2->close(); n1->close();
+    }
+
+    void testNativeMirrorAckForwarding() {
+        using Engine = akkaradb::engine::AkkEngine;
+        const auto dir = makeTempDir("routing-mirror-ack");
+        const ClusterConfig cfg{{node(1, 24301, 24311), node(2, 24302, 24312)}, ReplicationMode::MIRROR,
+            AckPolicy{.stage = AckStage::DURABLE}, ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK,
+                .writeConsistency = WriteConsistency::ONE_REPLICA, .ackTimeoutAction = AckTimeoutAction::FAIL_WRITE, .ackTimeoutMs = 1000}, {}, {}, 1};
+        const auto makeOptions = [&](uint64_t id) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(id));
+            options.components.clusterEnabled = true; options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            auto& runtime = options.cluster.runtime;
+            runtime.transportMode = TransportMode::PLAIN; runtime.clusterGroupId = 24300;
+            runtime.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            runtime.routingMode = ClusterRoutingMode::FORWARD; runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            writeNodeIdFile(options.paths.dataDir / "node.id", id); return options;
+        };
+        auto primary = Engine::open(makeOptions(1)), replica = Engine::open(makeOptions(2));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = primary->stats(), replicaStats = replica->stats();
+            return !stats.cluster.peers.empty() && stats.cluster.peers[0].connected &&
+                !replicaStats.cluster.peers.empty() && replicaStats.cluster.peers[0].connected;
+        }));
+        replica->put(bytesOf("through-replica"), bytesOf("durable"));
+        AKK_CLUSTER_CHECK(textOf(*primary->get(bytesOf("through-replica"))) == "durable");
+        AKK_CLUSTER_CHECK(textOf(*replica->get(bytesOf("through-replica"))) == "durable");
+        replica->remove(bytesOf("through-replica")); AKK_CLUSTER_CHECK(!primary->exists(bytesOf("through-replica")));
+        replica->close(); primary->close();
+    }
+
+    void testForwardTimeoutNeverReplays() {
+        std::atomic<unsigned> executions{0};
+        ClusterRuntimeOptions runtime;
+        runtime.transportMode = TransportMode::PLAIN; runtime.clusterGroupId = 24800; runtime.clusterGroupEpoch = 1;
+        auto server = ReplicationServer::create(24811, 1, [] { return uint64_t{0}; }, {}, {}, 1, {2},
+            runtime);
+        server->setForwardCallback([&](const ForwardRequest& request) {
+            ++executions; std::this_thread::sleep_for(std::chrono::milliseconds{150});
+            ForwardResponse response; response.success = true; response.value = request.entries.front().value; return response;
+        });
+        server->start();
+        auto client = ReplicationClient::create("127.0.0.1", 24811, 2, [] { return uint64_t{0}; }, {},
+            runtime, true);
+        client->start(); AKK_CLUSTER_CHECK(waitUntil([&] { return client->connected(); }));
+        ForwardRequest request; request.operation = ForwardOperation::PUT; request.timeoutMs = 40; request.entries.push_back({{1}, {2}});
+        const auto started = std::chrono::steady_clock::now();
+        bool unknown = false;
+        try { (void)client->forward(request); } catch (const ClusterRoutingError& error) { unknown = error.outcomeUnknown(); }
+        AKK_CLUSTER_CHECK(unknown && std::chrono::steady_clock::now() - started < std::chrono::seconds{1});
+        AKK_CLUSTER_CHECK(waitUntil([&] { return executions.load() == 1; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds{200}); AKK_CLUSTER_CHECK(executions.load() == 1);
+        request.timeoutMs = 1000;
+        AKK_CLUSTER_CHECK(client->forward(request).success && executions.load() == 2); // late response cannot satisfy a newer ID
+        request.timeoutMs = 5000;
+        request.entries.front().value.resize(1024u * 1024u, 0x5A);
+        const auto large = client->forward(request);
+        AKK_CLUSTER_CHECK(large.success && large.value == request.entries.front().value && executions.load() == 3);
+        client->close(); server->close();
+    }
+
+    void testRaftForwardAdmissionBudget() {
+        const auto dir = makeTempDir("routing-raft-admission");
+        const ClusterConfig config{{node(1, 24101, 24111), node(2, 24102, 24112), node(3, 24103, 24113)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 2000}};
+        std::atomic<unsigned> executions{0};
+        std::atomic<uint32_t> secondBudget{0};
+        const auto execute = [&](const ForwardRequest& request) {
+            if (++executions == 1) { std::this_thread::sleep_for(std::chrono::milliseconds{300}); }
+            else { secondBudget.store(request.timeoutMs); }
+            ForwardResponse response; response.success = true; return response;
+        };
+        auto n1 = makeRuntime(dir / "n1", config, 1, {}, false, execute);
+        ClusterRuntimeOptions serialAdmission;
+        serialAdmission.raftMaxForwardRequests = 1;
+        auto n2 = makeRuntime(dir / "n2", config, 2, serialAdmission, false, execute);
+        auto n3 = makeRuntime(dir / "n3", config, 3, {}, false, execute);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        std::array<RuntimeHarness*, 3> nodes{n1.get(), n2.get(), n3.get()};
+        ensurePreferredLeader(nodes, std::chrono::seconds{20});
+        ForwardRequest request; request.operation = ForwardOperation::GET; request.timeoutMs = 2000; request.entries.push_back({{1}, {}});
+        auto first = std::async(std::launch::async, [&, request] { return n2->runtime->forwardTo(1, request); });
+        AKK_CLUSTER_CHECK(waitUntil([&] { return executions.load() == 1; }));
+        request.timeoutMs = 1000;
+        AKK_CLUSTER_CHECK(n2->runtime->forwardTo(1, request).success && first.get().success);
+        AKK_CLUSTER_CHECK(secondBudget.load() > 0 && secondBudget.load() < 900);
+        n3->runtime->close(); n2->runtime->close(); n1->runtime->close();
+    }
+
     void testPartitionedEngineOwnerLinearizableRead() {
         const auto dir = makeTempDir("partitioned-engine-owner-read");
         const ClusterConfig cfg{
@@ -1954,6 +2902,7 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9002;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
         };
@@ -1964,14 +2913,11 @@ namespace {
         const std::string owner1Key = keyOwnedBy(cfg, 1, "engine-owner1");
         const std::string value = "linearizable-owner-value";
 
-        bool nonOwnerRejected = false;
-        try {
-            n2->put(bytesOf(owner1Key), bytesOf("wrong-owner"));
-        }
-        catch (const std::runtime_error&) {
-            nonOwnerRejected = true;
-        }
-        AKK_CLUSTER_CHECK(nonOwnerRejected);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n2->stats(); return !stats.cluster.peers.empty() && stats.cluster.peers[0].connected;
+        }));
+        n2->put(bytesOf(owner1Key), bytesOf("forwarded-owner"));
+        AKK_CLUSTER_CHECK(textOf(*n1->get(bytesOf(owner1Key))) == "forwarded-owner");
 
         n1->put(bytesOf(owner1Key), bytesOf(value));
         AKK_CLUSTER_CHECK(waitUntil(
@@ -2022,6 +2968,113 @@ namespace {
         n1->close();
     }
 
+    void testPartitionedDistributedRollback() {
+        namespace engine = akkaradb::engine;
+        const auto dir = makeTempDir("partitioned-distributed-rollback");
+        const ClusterConfig cfg{
+            {
+                node(1, 21631, 21731),
+                node(2, 21632, 21732),
+            },
+            ReplicationMode::PARTITIONED,
+            AckPolicy{},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 1000},
+            {},
+            {},
+            0,
+            testClusterId(9003),
+        };
+        auto makeOptions = [&](uint64_t nodeId) {
+            engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.components.versionLogEnabled = true;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9003;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = engine::AkkEngine::open(makeOptions(1));
+        auto n2 = engine::AkkEngine::open(makeOptions(2));
+        const std::string key1 = keyOwnedBy(cfg, 1, "rollback-owner1");
+        const std::string key2 = keyOwnedBy(cfg, 2, "rollback-owner2");
+        n1->put(bytesOf(key1), bytesOf("old-1"));
+        n2->put(bytesOf(key2), bytesOf("old-2"));
+        std::vector<std::string> pagedKeys;
+        pagedKeys.reserve(257);
+        for (size_t i = 0; i < 257; ++i) {
+            pagedKeys.push_back(keyOwnedBy(cfg, 1, "rollback-page-" + std::to_string(i)));
+            n1->put(bytesOf(pagedKeys.back()), bytesOf("old-page"));
+        }
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { return n1->createClusterCheckpoint().watermarks.size() == 2; }
+            catch (...) { return false; }
+        }));
+        const auto checkpoint = n1->createClusterCheckpoint();
+        n1->put(bytesOf(key1), bytesOf("new-1"));
+        n2->put(bytesOf(key2), bytesOf("new-2"));
+        for (const auto& key : pagedKeys) { n1->put(bytesOf(key), bytesOf("new-page")); }
+
+        const auto rollback = n1->rollbackTo(checkpoint);
+        AKK_CLUSTER_CHECK(rollback.complete());
+        AKK_CLUSTER_CHECK(rollback.appliedCount() == 2 + pagedKeys.size());
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value1 = engineGet(*n1, key1);
+            const auto value2 = engineGet(*n2, key2);
+            if (!value1 || !value2 || textOf(*value1) != "old-1" || textOf(*value2) != "old-2") { return false; }
+            return std::ranges::all_of(pagedKeys, [&](const std::string& key) {
+                const auto value = engineGet(*n1, key);
+                return value && textOf(*value) == "old-page";
+            });
+        }, std::chrono::milliseconds{8000}));
+
+        bool scalarRejected = false;
+        try { (void)n1->rollbackKey(bytesOf(key1), uint64_t{1}); }
+        catch (const std::runtime_error&) { scalarRejected = true; }
+        AKK_CLUSTER_CHECK(scalarRejected);
+
+        const auto stream1 = *std::ranges::find(checkpoint.watermarks, uint64_t{1}, &engine::Revision::streamId);
+        const auto stream2 = *std::ranges::find(checkpoint.watermarks, uint64_t{2}, &engine::Revision::streamId);
+        n1->put(bytesOf(key1), bytesOf("deferred-new-1"));
+        const auto deferredApply = n1->rollbackKey(
+            bytesOf(key1), stream1,
+            engine::RollbackOptions{.execution = engine::RollbackExecutionMode::NEXT_STARTUP}
+        );
+        AKK_CLUSTER_CHECK(deferredApply.deferredCount() == 1);
+        n2->put(bytesOf(key2), bytesOf("deferred-new-2"));
+        const auto deferredConflict = n1->rollbackKey(
+            bytesOf(key2), stream2,
+            engine::RollbackOptions{.execution = engine::RollbackExecutionMode::NEXT_STARTUP}
+        );
+        AKK_CLUSTER_CHECK(deferredConflict.deferredCount() == 1);
+        n2->put(bytesOf(key2), bytesOf("after-schedule-2"));
+        n1->close();
+        n2->close();
+
+        n1 = engine::AkkEngine::open(makeOptions(1));
+        n2 = engine::AkkEngine::open(makeOptions(2));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value1 = engineGet(*n1, key1);
+                const auto value2 = engineGet(*n2, key2);
+                return value1 && value2 && textOf(*value1) == "old-1" && textOf(*value2) == "after-schedule-2";
+            }
+            catch (...) { return false; }
+        }, std::chrono::milliseconds{10000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            std::error_code error;
+            return std::filesystem::file_size(dir / "n1" / "rollback-journal.akrb", error) == 13 && !error;
+        }, std::chrono::milliseconds{10000}));
+        n1->close();
+        n2->close();
+    }
+
     void testStripeEngineOwnerOnlyWritesAndCoordinatorReads() {
         const auto dir = makeTempDir("stripe-engine-owner-read");
         StripeOptions stripeOptions;
@@ -2051,6 +3104,7 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9011;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = nodeId == 2 ? ClusterRoutingMode::REDIRECT : ClusterRoutingMode::FORWARD;
             options.cluster.runtime.stripeReadCoordinatorMode = coordinatorMode;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
@@ -2100,6 +3154,18 @@ namespace {
             std::chrono::milliseconds{8000}
         ));
 
+        const std::string forwardedValue = "forwarded-stripe";
+        n3->put(bytesOf(owner1Key), bytesOf(forwardedValue));
+        const auto forwardedOwnerValue = engineGet(*n1, owner1Key);
+        AKK_CLUSTER_CHECK(forwardedOwnerValue && textOf(*forwardedOwnerValue) == forwardedValue);
+        const auto batchKey = keyOwnedBy(cfg, 1, "stripe-forward-batch");
+        const std::array<akkaradb::engine::detail::BulkPutEntry, 2> batch{{
+            {bytesOf(owner1Key), bytesOf(value)}, {bytesOf(batchKey), bytesOf(value)}}};
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*n3, batch);
+        AKK_CLUSTER_CHECK(textOf(*n1->get(bytesOf(batchKey))) == value);
+        n3->remove(bytesOf(owner1Key));
+        AKK_CLUSTER_CHECK(!n1->exists(bytesOf(owner1Key)));
+
         n3->close();
         n2->close();
         n1->close();
@@ -2134,6 +3200,7 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9012;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
             options.cluster.runtime.stripeWriteCommitMode = StripeWriteCommitMode::DATA_SHARDS;
             options.cluster.runtime.stripeReadCoordinatorMode = coordinatorMode;
             options.cluster.runtime.stripeRebuildIntervalMs = 100;
@@ -2250,6 +3317,7 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9013;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
             options.cluster.runtime.stripeRebuildIntervalMs = 100;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
@@ -2330,8 +3398,10 @@ namespace {
             options.cluster.config = cfg;
             options.cluster.runtime.transportMode = TransportMode::PLAIN;
             options.cluster.runtime.clusterGroupId = 9014;
+            options.components.versionLogEnabled = true;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
             options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
             options.cluster.runtime.raftSnapshot.minLogEntries = 2;
             options.cluster.runtime.raftSnapshot.minLogBytes = 1024ull * 1024 * 1024;
@@ -2402,9 +3472,11 @@ namespace {
             }
             catch (const std::runtime_error&) { return false; }
         }));
-        AKK_CLUSTER_CHECK(waitUntil([&] {
-            return metadataLeaderStats().stripeMetadataSnapshotIndex != 0;
-        }, std::chrono::milliseconds{10000}));
+        // Placement authority retains its complete metadata journal so a new
+        // holder can recover history, rather than only a compacted KV head.
+        AKK_CLUSTER_CHECK(metadataLeaderStats().stripeMetadataSnapshotIndex == 0);
+        const auto expectedHistory = akk_test::collectHistory(writer->history(bytesOf(key)));
+        AKK_CLUSTER_CHECK(expectedHistory.size() >= 7 && textOf(expectedHistory.front().value) == "before-leader-loss");
 
         if (oldLeader == 1) { n1 = akkaradb::engine::AkkEngine::open(makeOptions(1)); }
         else if (oldLeader == 2) { n2 = akkaradb::engine::AkkEngine::open(makeOptions(2)); }
@@ -2422,13 +3494,112 @@ namespace {
             }
             catch (const std::runtime_error&) { return false; }
         }));
+        const auto recoveredHistory = akk_test::collectHistory(restarted->history(bytesOf(key)));
+        AKK_CLUSTER_CHECK(recoveredHistory.size() == expectedHistory.size());
+        for (size_t i = 0; i < expectedHistory.size(); ++i) {
+            AKK_CLUSTER_CHECK(recoveredHistory[i].seq == expectedHistory[i].seq && recoveredHistory[i].value == expectedHistory[i].value &&
+                recoveredHistory[i].sourceNodeId == expectedHistory[i].sourceNodeId && recoveredHistory[i].timestampNs == expectedHistory[i].timestampNs);
+        }
 
         n3->close();
         n2->close();
         n1->close();
     }
 
-    void testStripeEngineRejectsOnlineReconfiguration() {
+    void testRaid6PresetMetadataQuorumSurvivesTwoFailures() {
+        const auto dir = makeTempDir("stripe-metadata-two-failure-quorum");
+        const ClusterConfig cfg{
+            {
+                node(1, 21645, 21745),
+                node(2, 21646, 21746),
+                node(3, 21647, 21747),
+                node(4, 21648, 21748),
+                node(5, 21649, 21749),
+            },
+            RaidOptions{.preset = RaidPreset::RAID6, .dataShards = 2},
+            AckPolicy{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED},
+            ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 250},
+            testClusterId(9015),
+        };
+        AKK_CLUSTER_CHECK(cfg.mode() == ReplicationMode::STRIPE);
+        AKK_CLUSTER_CHECK(cfg.raidPreset() == RaidPreset::RAID6);
+        AKK_CLUSTER_CHECK(cfg.stripe().dataShards == 2);
+        AKK_CLUSTER_CHECK(cfg.stripe().parityShards == 2);
+        const auto configPath = dir / "cluster.cfg";
+        ClusterConfig::save(configPath, cfg);
+        const auto loaded = ClusterConfig::load(configPath);
+        AKK_CLUSTER_CHECK(loaded.raidPreset() == RaidPreset::RAID6);
+        AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 2);
+        AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
+
+        bool rejectedFourNodeRaid6 = false;
+        try {
+            (void)ClusterConfig{
+                {
+                    node(1, 21650, 21750),
+                    node(2, 21651, 21751),
+                    node(3, 21652, 21752),
+                    node(4, 21653, 21753),
+                },
+                RaidOptions{.preset = RaidPreset::RAID6, .dataShards = 2},
+                AckPolicy{},
+            };
+        }
+        catch (const std::invalid_argument&) { rejectedFourNodeRaid6 = true; }
+        AKK_CLUSTER_CHECK(rejectedFourNodeRaid6);
+        constexpr std::array<uint64_t, 4> placement{1, 2, 3, 4};
+        const auto key = keyPlacedOn(cfg, placement, "metadata-two-failure-quorum");
+        const auto makeOptions = [&](uint64_t nodeId) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(nodeId));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = cfg;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.clusterGroupId = 9015;
+            options.cluster.runtime.clusterGroupEpoch = 1;
+            options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+            options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
+            writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
+            return options;
+        };
+
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        auto n4 = akkaradb::engine::AkkEngine::open(makeOptions(4));
+        auto n5 = akkaradb::engine::AkkEngine::open(makeOptions(5));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("all-voters")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+
+        n4->close();
+        n4.reset();
+        n3->close();
+        n3.reset();
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try { n1->put(bytesOf(key), bytesOf("two-voters-down")); return true; }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            try {
+                const auto value = engineGet(*n1, key);
+                return value && textOf(*value) == "two-voters-down";
+            }
+            catch (const std::runtime_error&) { return false; }
+        }, std::chrono::milliseconds{15000}));
+        const auto stats = n1->stats().cluster;
+        AKK_CLUSTER_CHECK(stats.stripeMetadataLeaderNodeId != 0);
+        AKK_CLUSTER_CHECK(stats.stripeMetadataCommitIndex == stats.stripeMetadataAppliedIndex);
+
+        n5->close();
+        n2->close();
+        n1->close();
+    }
+
+    void testStripeEngineRejectsForeignConfiguration() {
         const auto dir = makeTempDir("stripe-engine-reconfigure");
         StripeOptions stripeOptions;
         stripeOptions.dataShards = 2;
@@ -2470,6 +3641,7 @@ namespace {
             options.cluster.runtime.clusterGroupId = 9013;
             options.cluster.runtime.clusterGroupEpoch = 1;
             options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
             options.cluster.runtime.stripeReadCoordinatorMode = StripeReadCoordinatorMode::LOCAL_COORDINATOR;
             writeNodeIdFile(options.paths.dataDir / "node.id", nodeId);
             return options;
@@ -2483,7 +3655,7 @@ namespace {
         try {
             n1->reconfigureCluster(newCfg);
         }
-        catch (const std::runtime_error&) {
+        catch (const std::exception&) {
             rejected = true;
         }
         AKK_CLUSTER_CHECK(rejected);
@@ -3016,6 +4188,476 @@ namespace {
             }
             AKK_CLUSTER_CHECK(rejected);
         }
+    }
+
+    class RaftTestSocket {
+    public:
+#ifdef _WIN32
+        using Handle = SOCKET;
+        static constexpr Handle INVALID = INVALID_SOCKET;
+#else
+        using Handle = int;
+        static constexpr Handle INVALID = -1;
+#endif
+        Handle handle = INVALID;
+        RaftTestSocket() {
+#ifdef _WIN32
+            struct Winsock {
+                Winsock() { WSADATA data; AKK_CLUSTER_CHECK(::WSAStartup(MAKEWORD(2, 2), &data) == 0); }
+                ~Winsock() { ::WSACleanup(); }
+            };
+            static Winsock winsock;
+#endif
+        }
+        explicit RaftTestSocket(Handle socket) : RaftTestSocket() { handle = socket; configure(); }
+        ~RaftTestSocket() { close(); }
+        RaftTestSocket(const RaftTestSocket&) = delete;
+        RaftTestSocket& operator=(const RaftTestSocket&) = delete;
+        void configure() const {
+#if !defined(_WIN32) && defined(SO_NOSIGPIPE)
+            const int enabled = 1;
+            AKK_CLUSTER_CHECK(::setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) == 0);
+#endif
+        }
+        void shutdown() const {
+            if (handle == INVALID) { return; }
+#ifdef _WIN32
+            ::shutdown(handle, SD_BOTH);
+#else
+            ::shutdown(handle, SHUT_RDWR);
+#endif
+        }
+        void close() {
+            if (handle == INVALID) { return; }
+#ifdef _WIN32
+            ::closesocket(handle);
+#else
+            ::close(handle);
+#endif
+            handle = INVALID;
+        }
+        bool connect(const char* host, uint16_t port) {
+            handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (handle == INVALID) { return false; }
+            configure();
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            if (::inet_pton(AF_INET, host, &address.sin_addr) != 1) { return false; }
+            address.sin_port = htons(port);
+            return ::connect(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0;
+        }
+        void listen(uint16_t port) {
+            handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            AKK_CLUSTER_CHECK(handle != INVALID);
+#ifndef _WIN32
+            const int reuse = 1;
+            AKK_CLUSTER_CHECK(::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+#endif
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            AKK_CLUSTER_CHECK(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+            address.sin_port = htons(port);
+            AKK_CLUSTER_CHECK(::bind(handle, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+            AKK_CLUSTER_CHECK(::listen(handle, 16) == 0);
+        }
+        bool send(std::span<const uint8_t> bytes) const {
+            size_t offset = 0;
+            while (offset < bytes.size()) {
+#ifdef _WIN32
+                const int count = ::send(handle, reinterpret_cast<const char*>(bytes.data() + offset), static_cast<int>(bytes.size() - offset), 0);
+#else
+#ifdef MSG_NOSIGNAL
+                constexpr int flags = MSG_NOSIGNAL;
+#else
+                constexpr int flags = 0;
+#endif
+                const auto count = ::send(handle, bytes.data() + offset, bytes.size() - offset, flags);
+#endif
+                if (count <= 0) { return false; }
+                offset += static_cast<size_t>(count);
+            }
+            return true;
+        }
+        bool receive(std::span<uint8_t> bytes) const {
+            size_t offset = 0;
+            while (offset < bytes.size()) {
+                const auto count = ::recv(handle, reinterpret_cast<char*>(bytes.data() + offset), static_cast<int>(bytes.size() - offset), 0);
+                if (count <= 0) { return false; }
+                offset += static_cast<size_t>(count);
+            }
+            return true;
+        }
+        DecodedFrame receiveFrame() const {
+            std::vector<uint8_t> wire(ReplFrameHeader::SIZE);
+            AKK_CLUSTER_CHECK(receive(wire));
+            uint32_t size = 0;
+            for (size_t i = 0; i < 4; ++i) { size |= uint32_t{wire[6 + i]} << (i * 8); }
+            AKK_CLUSTER_CHECK(size <= ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE);
+            wire.resize(ReplFrameHeader::SIZE + size);
+            AKK_CLUSTER_CHECK(receive(std::span{wire}.subspan(ReplFrameHeader::SIZE)));
+            DecodedFrame frame;
+            AKK_CLUSTER_CHECK(decodeFrame(wire, frame));
+            return frame;
+        }
+    };
+
+    // Transparent at the byte level, so the same fault exercises PLAIN and SECURE.
+    // Only inbound traffic to the selected follower is cut; it can still campaign
+    // against the healthy majority, a stronger case than a completely offline peer.
+    class RaftInboundFaultProxy {
+        struct Connection { RaftTestSocket client, backend; };
+        RaftTestSocket listener_;
+        std::atomic<bool> stopping_{false}, failed_{false};
+        std::atomic<bool> rejectMutations_{false};
+        bool inspectFrames_ = false;
+        bool blocked_ = true;
+        std::mutex mutex_;
+        std::vector<std::shared_ptr<Connection>> connections_;
+        std::vector<std::thread> workers_;
+        std::thread acceptThread_;
+        static void pump(const RaftTestSocket& source, const RaftTestSocket& destination) {
+            std::array<uint8_t, 16384> buffer{};
+            for (;;) {
+                const auto count = ::recv(source.handle, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
+                if (count <= 0 || !destination.send(std::span{buffer}.first(static_cast<size_t>(count)))) { break; }
+            }
+            source.shutdown(); destination.shutdown();
+        }
+        void pumpRequests(const RaftTestSocket& source, const RaftTestSocket& destination) {
+            if (!inspectFrames_) { pump(source, destination); return; }
+            const auto number = [](std::span<const uint8_t> bytes, size_t offset, size_t width) {
+                uint64_t value = 0;
+                for (size_t i = 0; i < width; ++i) { value |= uint64_t{bytes[offset + i]} << (8 * i); }
+                return value;
+            };
+            for (;;) {
+                std::vector<uint8_t> wire(ReplFrameHeader::SIZE);
+                if (!source.receive(wire)) { break; }
+                const auto length = static_cast<size_t>(number(wire, 6, 4));
+                if (length > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) { failed_.store(true); break; }
+                wire.resize(ReplFrameHeader::SIZE + length);
+                if (!source.receive(std::span{wire}.subspan(ReplFrameHeader::SIZE))) { break; }
+                DecodedFrame frame;
+                if (!decodeFrame(wire, frame)) { failed_.store(true); break; }
+                bool reject = false;
+                if (rejectMutations_.load() && frame.type == ReplMsgType::RAFT_APPEND_ENTRIES && frame.payload.size() >= 44) {
+                    size_t cursor = 44;
+                    const auto count = number(frame.payload, 40, 4);
+                    for (uint64_t i = 0; i < count && cursor + 4 <= frame.payload.size(); ++i) {
+                        const auto size = static_cast<size_t>(number(frame.payload, cursor, 4)); cursor += 4;
+                        if (size < 25 || size > frame.payload.size() - cursor) { failed_.store(true); break; }
+                        if (frame.payload[cursor + 24] == 0) { reject = true; }
+                        cursor += size;
+                    }
+                }
+                if (reject) {
+                    std::vector<uint8_t> response(frame.payload.begin(), frame.payload.begin() + 8);
+                    response.push_back(0);
+                    const auto prev = number(frame.payload, 16, 8);
+                    for (uint64_t value : {prev, prev + 1, uint64_t{0}}) {
+                        for (size_t i = 0; i < 8; ++i) { response.push_back(static_cast<uint8_t>(value >> (8 * i))); }
+                    }
+                    if (!source.send(encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE, response))) { break; }
+                }
+                else if (!destination.send(wire)) { break; }
+            }
+            source.shutdown(); destination.shutdown();
+        }
+    public:
+        explicit RaftInboundFaultProxy(uint16_t port, bool inspectFrames = false) : inspectFrames_{inspectFrames} {
+            listener_.listen(port);
+            acceptThread_ = std::thread([this, port] {
+                try {
+                    while (!stopping_.load()) {
+                        fd_set readable;
+                        FD_ZERO(&readable); FD_SET(listener_.handle, &readable);
+                        timeval timeout{0, 100000};
+#ifdef _WIN32
+                        const int ready = ::select(0, &readable, nullptr, nullptr, &timeout);
+#else
+                        const int ready = ::select(listener_.handle + 1, &readable, nullptr, nullptr, &timeout);
+#endif
+                        if (ready == 0) { continue; }
+                        if (ready < 0) { break; }
+                        auto connection = std::make_shared<Connection>();
+                        connection->client.handle = ::accept(listener_.handle, nullptr, nullptr);
+                        if (connection->client.handle == RaftTestSocket::INVALID) { break; }
+                        connection->client.configure();
+                        std::lock_guard lock{mutex_};
+                        if (blocked_ || stopping_.load() || !connection->backend.connect("127.0.0.2", port)) { continue; }
+                        connections_.push_back(connection);
+                        workers_.emplace_back([this, connection] {
+                            try {
+                                std::thread upload([this, connection] { pumpRequests(connection->client, connection->backend); });
+                                pump(connection->backend, connection->client);
+                                upload.join();
+                            }
+                            catch (...) { failed_.store(true); connection->client.shutdown(); connection->backend.shutdown(); }
+                        });
+                    }
+                }
+                catch (...) { failed_.store(true); }
+            });
+        }
+        ~RaftInboundFaultProxy() {
+            stopping_.store(true);
+            setBlocked(true);
+            listener_.shutdown();
+            acceptThread_.join();
+            for (auto& worker : workers_) { worker.join(); }
+        }
+        void setBlocked(bool blocked) {
+            std::lock_guard lock{mutex_};
+            blocked_ = blocked;
+            if (blocked) {
+                for (const auto& connection : connections_) { connection->client.shutdown(); connection->backend.shutdown(); }
+            }
+        }
+        bool failed() const { return failed_.load(); }
+        void rejectMutations(bool enabled) { rejectMutations_.store(enabled); }
+    };
+
+    void appendRaftTestInteger(std::vector<uint8_t>& bytes, uint64_t value, size_t width = 8) {
+        for (size_t i = 0; i < width; ++i) { bytes.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+    }
+
+    void openRaftTestPeer(RaftTestSocket& socket, uint16_t port, uint64_t sender, const ClusterConfig& config, const char domain = '1') {
+        AKK_CLUSTER_CHECK(socket.connect("127.0.0.1", port));
+        // Independent wire fixture: changing the protocol must update this contract too.
+        const auto consistency = config.consistency();
+        const auto membership = config.raft().membership;
+        const std::vector<uint8_t> fingerprintInput{'A', 'K', 'R', 'P', static_cast<uint8_t>(domain),
+            static_cast<uint8_t>(config.mode()), static_cast<uint8_t>(consistency.mode), static_cast<uint8_t>(config.failover()),
+            static_cast<uint8_t>(consistency.writeConsistency), static_cast<uint8_t>(consistency.ackTimeoutAction),
+            static_cast<uint8_t>(consistency.replicaLagAction), static_cast<uint8_t>(membership.mode),
+            static_cast<uint8_t>(membership.allowOnlineVoterChanges), static_cast<uint8_t>(membership.allowLearners),
+            static_cast<uint8_t>(RaftBlobPolicy::REJECT), 1};
+        const std::array parts{std::span<const uint8_t>{fingerprintInput}};
+        const auto fingerprint = akkaradb::crypto::hash256(parts);
+        std::vector<uint8_t> hello;
+        appendRaftTestInteger(hello, 1, 4);
+        appendRaftTestInteger(hello, sender);
+        const auto clusterId = config.clusterId();
+        hello.insert(hello.end(), clusterId.begin(), clusterId.end());
+        hello.insert(hello.end(), fingerprint.begin(), fingerprint.end());
+        hello.push_back(static_cast<uint8_t>(RaftBlobPolicy::REJECT)); hello.push_back(0);
+        appendRaftTestInteger(hello, ClusterRuntimeOptions{}.requests.maxRetentionMs);
+        appendRaftTestInteger(hello, ClusterRuntimeOptions{}.requests.maxTrackedRequests, 4);
+        AKK_CLUSTER_CHECK(socket.send(encodeFrame(ReplMsgType::RAFT_PEER_HELLO, hello)));
+        const auto response = socket.receiveFrame();
+        AKK_CLUSTER_CHECK(response.type == ReplMsgType::RAFT_PEER_HELLO_RESPONSE && response.payload.size() == 1);
+        AKK_CLUSTER_CHECK(response.payload[0] == (domain == '1' ? 0 : 3));
+    }
+
+    DecodedFrame probeRaftTestPeer(const RaftTestSocket& socket, uint64_t term, uint64_t candidate, uint64_t index, uint64_t logTerm,
+        ReplMsgType type = ReplMsgType::RAFT_PRE_VOTE) {
+        std::vector<uint8_t> request;
+        for (uint64_t value : {term, candidate, index, logTerm}) { appendRaftTestInteger(request, value); }
+        AKK_CLUSTER_CHECK(socket.send(encodeFrame(type, request)));
+        return socket.receiveFrame();
+    }
+
+    void testRaftPreVoteWireContract() {
+        const auto dir = makeTempDir("raft-prevote-wire");
+        auto raft = onlineRaftMembership();
+        raft.membership.allowLearners = true;
+        const ClusterConfig config{{node(1, 24701, 24711), node(2, 24702, 24712), node(3, 24703, 24713),
+            node(4, 24704, 24714, DATA_AND_COORDINATOR | static_cast<uint32_t>(NodeCapability::RAFT_LEARNER))},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000}, raft};
+        auto n1 = makeRuntime(dir / "n1", config, 1);
+        n1->runtime->start();
+        RaftTestSocket voter, learner, oldProtocol;
+        openRaftTestPeer(voter, 24711, 2, config);
+        openRaftTestPeer(learner, 24711, 4, config);
+        openRaftTestPeer(oldProtocol, 24711, 3, config, '2');
+        auto check = [](const DecodedFrame& response, uint64_t term, bool granted) {
+            AKK_CLUSTER_CHECK(response.type == ReplMsgType::RAFT_PRE_VOTE_RESPONSE && response.payload.size() == 9);
+            AKK_CLUSTER_CHECK(readU64Le(response.payload, 0) == term && response.payload[8] == static_cast<uint8_t>(granted));
+        };
+        const auto before = n1->runtime->raftStats();
+        check(probeRaftTestPeer(voter, 5000, 2, 0, 0), before.currentTerm, true);
+        check(probeRaftTestPeer(voter, 0, 2, 0, 0), before.currentTerm, false);
+        check(probeRaftTestPeer(voter, 5000, 3, 0, 0), 0, false); // Cannot impersonate another hello identity.
+        check(probeRaftTestPeer(learner, 5000, 4, 0, 0), before.currentTerm, false);
+        // Truncated and extended requests must not be interpreted as valid votes.
+        for (size_t size : {size_t{31}, size_t{33}}) {
+            AKK_CLUSTER_CHECK(voter.send(encodeFrame(ReplMsgType::RAFT_PRE_VOTE, std::vector<uint8_t>(size, 0xFF))));
+            check(voter.receiveFrame(), 0, false);
+        }
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().currentTerm == before.currentTerm && n1->runtime->role() == NodeRole::REPLICA);
+        // A real vote advances hard state; later probes must report that actual term.
+        const auto vote = probeRaftTestPeer(voter, 1, 2, 0, 0, ReplMsgType::RAFT_REQUEST_VOTE);
+        AKK_CLUSTER_CHECK(vote.type == ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE && vote.payload[8] == 1);
+        check(probeRaftTestPeer(voter, 1, 2, 0, 0), 1, false);
+        check(probeRaftTestPeer(voter, 5000, 2, 0, 0), 1, true);
+        RaftTestSocket otherVoter;
+        openRaftTestPeer(otherVoter, 24711, 3, config);
+        check(probeRaftTestPeer(otherVoter, 5000, 3, 0, 0), 1, true);
+        const auto deniedVote = probeRaftTestPeer(otherVoter, 1, 3, 0, 0, ReplMsgType::RAFT_REQUEST_VOTE);
+        AKK_CLUSTER_CHECK(deniedVote.type == ReplMsgType::RAFT_REQUEST_VOTE_RESPONSE && deniedVote.payload[8] == 0);
+        // A same-term heartbeat protects a live leader, even from an enormous
+        // prospective term. Receiving the probe must not refresh that protection.
+        std::vector<uint8_t> heartbeat;
+        for (uint64_t value : {uint64_t{1}, uint64_t{2}, uint64_t{0}, uint64_t{0}, uint64_t{0}}) { appendRaftTestInteger(heartbeat, value); }
+        appendRaftTestInteger(heartbeat, 0, 4);
+        AKK_CLUSTER_CHECK(voter.send(encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES, heartbeat)));
+        AKK_CLUSTER_CHECK(voter.receiveFrame().type == ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE);
+        check(probeRaftTestPeer(otherVoter, UINT64_MAX, 3, 0, 0), 1, false);
+        const auto protectionExpires = std::chrono::steady_clock::now() + std::chrono::milliseconds{3100};
+        while (std::chrono::steady_clock::now() < protectionExpires) {
+            (void)probeRaftTestPeer(otherVoter, UINT64_MAX, 3, 0, 0);
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        check(probeRaftTestPeer(otherVoter, UINT64_MAX, 3, 0, 0), 1, true);
+        otherVoter.shutdown();
+        voter.shutdown(); learner.shutdown(); oldProtocol.shutdown();
+        n1->runtime->close();
+        n1.reset();
+        n1 = makeRuntime(dir / "n1", config, 1);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().currentTerm == 1); // Probes never persist their prospective term.
+    }
+
+    void testRaftPreVoteRejectsStaleLog() {
+        const auto dir = makeTempDir("raft-prevote-stale-log");
+        const ClusterConfig config{{node(1, 24741, 24751), node(2, 24742, 24752), node(3, 24743, 24753)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000}};
+        auto n1 = makeRuntime(dir / "n1", config, 1), n2 = makeRuntime(dir / "n2", config, 2);
+        n1->runtime->start(); n2->runtime->start();
+        RuntimeHarness* majority[] = {n1.get(), n2.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(majority) == n1.get(); }, std::chrono::seconds{12}));
+        n1->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("prevote-log"), bytesOf("committed"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, "prevote-log", "committed"); }));
+        RaftTestSocket peer;
+        openRaftTestPeer(peer, 24752, 3, config);
+        const auto term = n1->runtime->raftStats().currentTerm;
+        auto response = probeRaftTestPeer(peer, term + 10, 3, UINT64_MAX, term);
+        AKK_CLUSTER_CHECK(response.payload[8] == 0); // Healthy follower refuses even a fresh log.
+        n1->runtime->close();
+        std::this_thread::sleep_for(std::chrono::milliseconds{3100});
+        response = probeRaftTestPeer(peer, term + 10, 3, 0, 0);
+        AKK_CLUSTER_CHECK(readU64Le(response.payload, 0) == term && response.payload[8] == 0);
+        response = probeRaftTestPeer(peer, term + 10, 3, UINT64_MAX, term);
+        AKK_CLUSTER_CHECK(readU64Le(response.payload, 0) == term && response.payload[8] == 1);
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().currentTerm == term && n2->runtime->role() == NodeRole::REPLICA);
+        peer.shutdown(); n2->runtime->close();
+    }
+
+    void testRaftPreVoteDiscardsProbeAfterHeartbeat() {
+        const auto dir = makeTempDir("raft-prevote-heartbeat-race");
+        const ClusterConfig config{{node(1, 24761, 24771), node(2, 24762, 24772), node(3, 24763, 24773)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000}};
+        RaftTestSocket listener;
+        listener.listen(24772);
+        std::promise<void> probeEntered, releaseProbe;
+        auto entered = probeEntered.get_future();
+        auto release = releaseProbe.get_future();
+        auto fakeVoter = std::async(std::launch::async, [&] {
+            RaftTestSocket connection{::accept(listener.handle, nullptr, nullptr)};
+            AKK_CLUSTER_CHECK(connection.handle != RaftTestSocket::INVALID);
+            const auto hello = connection.receiveFrame();
+            AKK_CLUSTER_CHECK(hello.type == ReplMsgType::RAFT_PEER_HELLO);
+            AKK_CLUSTER_CHECK(connection.send(encodeFrame(ReplMsgType::RAFT_PEER_HELLO_RESPONSE, std::array<uint8_t, 1>{0})));
+            const auto probe = connection.receiveFrame();
+            AKK_CLUSTER_CHECK(probe.type == ReplMsgType::RAFT_PRE_VOTE && readU64Le(probe.payload, 0) == 1);
+            probeEntered.set_value();
+            AKK_CLUSTER_CHECK(release.wait_for(std::chrono::seconds{5}) == std::future_status::ready);
+            std::vector<uint8_t> response;
+            appendRaftTestInteger(response, 0); response.push_back(1);
+            AKK_CLUSTER_CHECK(connection.send(encodeFrame(ReplMsgType::RAFT_PRE_VOTE_RESPONSE, response)));
+            // Keep the successful probe connection alive until the runtime closes it.
+            std::array<uint8_t, 1> byte{};
+            (void)connection.receive(byte);
+        });
+        auto n1 = makeRuntime(dir / "n1", config, 1);
+        n1->runtime->start();
+        RaftTestSocket leader;
+        openRaftTestPeer(leader, 24771, 3, config);
+        AKK_CLUSTER_CHECK(entered.wait_for(std::chrono::seconds{7}) == std::future_status::ready);
+        std::vector<uint8_t> heartbeat;
+        for (uint64_t value : {uint64_t{0}, uint64_t{3}, uint64_t{0}, uint64_t{0}, uint64_t{0}}) { appendRaftTestInteger(heartbeat, value); }
+        appendRaftTestInteger(heartbeat, 0, 4);
+        AKK_CLUSTER_CHECK(leader.send(encodeFrame(ReplMsgType::RAFT_APPEND_ENTRIES, heartbeat)));
+        const auto heartbeatResponse = leader.receiveFrame();
+        AKK_CLUSTER_CHECK(heartbeatResponse.type == ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE && heartbeatResponse.payload[8] == 1);
+        releaseProbe.set_value();
+        // Wait for the completed vote-probe round trip, so a timeout cannot
+        // masquerade as safe rejection. Forward RPCs have independent channels.
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto peers = n1->runtime->raftStats().peers;
+            const auto peer = std::ranges::find(peers, uint64_t{2}, &RaftPeerStats::nodeId);
+            return peer != peers.end() && peer->roundTripsSucceeded != 0;
+        }, std::chrono::seconds{2}));
+        const auto observeUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
+        while (std::chrono::steady_clock::now() < observeUntil) {
+            AKK_CLUSTER_CHECK(n1->runtime->raftStats().currentTerm == 0 && n1->runtime->role() == NodeRole::REPLICA);
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        leader.shutdown(); n1->runtime->close();
+        fakeVoter.get();
+    }
+
+    void testRaftPreVoteIsolationAndRecovery(bool secure = false) {
+        const auto dir = makeTempDir(secure ? "raft-prevote-isolation-secure" : "raft-prevote-isolation");
+        const ClusterConfig config{{node(1, 24721, 24731), node(2, 24722, 24732), node(3, 24723, 24733)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000}};
+        ClusterRuntimeOptions options;
+        options.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        if (secure) {
+            for (uint64_t id = 1; id <= 3; ++id) {
+                const auto identity = akkaradb::crypto::IdentityStore{dir / ("identity-" + std::to_string(id))}.loadOrCreate();
+                options.secure.pinnedPeers.push_back({id, identity.publicKey});
+            }
+        }
+        auto makePeer = [&](uint64_t id) {
+            auto peerOptions = options;
+            if (id == 3) { peerOptions.replBindHost = "127.0.0.2"; }
+            peerOptions.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
+            return makeRuntime(dir / ("n" + std::to_string(id)), config, id, peerOptions, secure);
+        };
+        auto n1 = makePeer(1), n2 = makePeer(2), n3 = makePeer(3);
+        RaftInboundFaultProxy proxy{24733};
+        n3->runtime->start();
+        // Observe more than two election deadlines while every other voter is offline.
+        const auto isolatedUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds{7500};
+        while (std::chrono::steady_clock::now() < isolatedUntil) {
+            AKK_CLUSTER_CHECK(n3->runtime->raftStats().currentTerm == 0 && n3->runtime->role() == NodeRole::REPLICA);
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        n3->runtime->close(); n3.reset();
+        // Establish the majority's leader before letting the cut node campaign.
+        // During initial startup, that node could legitimately win with its
+        // working outbound links, which is not the failure this test targets.
+        n1->runtime->start(); n2->runtime->start();
+        RuntimeHarness* majority[] = {n1.get(), n2.get()};
+        ensurePreferredLeader(majority, std::chrono::seconds{12});
+        n1->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("prevote"), bytesOf("before"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, "prevote", "before"); }));
+        const auto stableTerm = n1->runtime->raftStats().currentTerm;
+        n3 = makePeer(3);
+        AKK_CLUSTER_CHECK(n3->runtime->raftStats().currentTerm == 0);
+        n3->runtime->start();
+        // The cut follower can contact the majority but receives no heartbeats.
+        const auto campaignUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds{7500};
+        while (std::chrono::steady_clock::now() < campaignUntil) {
+            AKK_CLUSTER_CHECK(n1->runtime->role() == NodeRole::PRIMARY && n1->runtime->raftStats().currentTerm == stableTerm);
+            AKK_CLUSTER_CHECK(n2->runtime->raftStats().currentTerm == stableTerm && n3->runtime->raftStats().currentTerm <= stableTerm);
+            std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        }
+        proxy.setBlocked(false);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->hasState(1, "prevote", "before"); }, std::chrono::seconds{8}));
+        AKK_CLUSTER_CHECK(n1->runtime->role() == NodeRole::PRIMARY && n1->runtime->raftStats().currentTerm == stableTerm);
+        n1->runtime->shipEntry(2, ReplOpType::PUT, bytesOf("prevote"), bytesOf("rejoined"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->hasState(2, "prevote", "rejoined"); }));
+        n1->runtime->close();
+        RuntimeHarness* survivors[] = {n2.get(), n3.get()};
+        AKK_CLUSTER_CHECK(waitUntil([&] { return findLeader(survivors) != nullptr; }, std::chrono::seconds{12}));
+        auto* replacement = findLeader(survivors);
+        AKK_CLUSTER_CHECK(replacement != nullptr && replacement->runtime->raftStats().currentTerm > stableTerm);
+        replacement->runtime->shipEntry(3, ReplOpType::PUT, bytesOf("prevote"), bytesOf("after-failure"), 0, replacement->nodeId);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(3, "prevote", "after-failure") && n3->hasState(3, "prevote", "after-failure"); }));
+        AKK_CLUSTER_CHECK(replacement->runtime->readKey(bytesOf("prevote"), 0).status == ReadStatus::FOUND);
+        AKK_CLUSTER_CHECK(!proxy.failed());
+        n3->runtime->close(); n2->runtime->close();
     }
 
     void testRaftElectionAndLoopbackReplication() {
@@ -3714,6 +5356,8 @@ namespace {
         options.transportMode = TransportMode::PLAIN;
         options.clusterGroupId = 9021;
         options.clusterGroupEpoch = 1;
+        options.replicationClusterId = cfg.clusterId();
+        options.replicationConfigFingerprint = cfg.replicationFingerprint();
 
         auto peer = ReplicationServer::create(23512, 2, [] { return uint64_t{0}; }, {},
             ConsistencyOptions{.mode = ConsistencyMode::PRIMARY_ACK, .ackTimeoutMs = 3000}, 1, {1}, options);
@@ -3774,6 +5418,8 @@ namespace {
         options.startupRole = NodeStartupRole::PRIMARY;
         options.clusterGroupId = 9025;
         options.clusterGroupEpoch = 1;
+        options.replicationClusterId = cfg.clusterId();
+        options.replicationConfigFingerprint = cfg.replicationFingerprint();
 
         ClusterRuntime* runtimeView = nullptr;
         std::promise<void> readEntered;
@@ -3795,7 +5441,7 @@ namespace {
             response.status = ReadStatus::NOT_FOUND;
             return response;
         };
-        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t) {};
+        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t, uint64_t) {};
         callbacks.forceDurable = [] {};
         callbacks.roleChange = [&](NodeRole role) {
             if (role == NodeRole::REPLICA && !replicaRoleReported.exchange(true)) { roleChangeFinished.set_value(); }
@@ -3926,6 +5572,7 @@ namespace {
         options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
         options.cluster.runtime.raftSnapshot.minLogEntries = 1;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         writeNodeIdFile(dir / "node.id", 1);
         auto engine = akkaradb::engine::AkkEngine::open(options);
         AKK_CLUSTER_CHECK(waitUntil([&] { return engine->stats().cluster.role == static_cast<uint32_t>(NodeRole::PRIMARY); }));
@@ -4303,6 +5950,7 @@ namespace {
         };
         options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         writeNodeIdFile(dir / "node.id", 1);
         auto engine = akkaradb::engine::AkkEngine::open(options);
         std::vector<std::future<void>> writers;
@@ -4317,10 +5965,10 @@ namespace {
         for (auto& writer : writers) { writer.get(); }
         std::vector<std::string> keys;
         for (unsigned i = 0; i < 64; ++i) { keys.push_back("batch-" + std::to_string(i)); }
-        std::vector<akkaradb::engine::AkkEngine::BatchPutEntry> batch;
+        std::vector<akkaradb::engine::detail::BulkPutEntry> batch;
         const std::string batchValue = "batch-value";
         for (const auto& key : keys) { batch.push_back({bytesOf(key), bytesOf(batchValue)}); }
-        engine->putBatch(batch);
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*engine, batch);
         for (unsigned w = 0; w < 8; ++w) {
             for (unsigned i = 0; i < 16; ++i) {
                 auto value = engine->get(bytesOf(std::to_string(w) + ":" + std::to_string(i)));
@@ -4672,6 +6320,295 @@ namespace {
         n3->runtime->close();
         n2->runtime->close();
         n1->runtime->close();
+    }
+
+    void testRaftLearnerValidationAndStaticMembership() {
+        const auto dir = makeTempDir("raft-learner-validation");
+        auto learner = node(2, 23132, 23232);
+        learner.capabilities |= RAFT_LEARNER;
+        const auto rejects = [](const auto& operation) {
+            bool rejected = false;
+            try { operation(); } catch (const std::exception&) { rejected = true; }
+            AKK_CLUSTER_CHECK(rejected);
+        };
+        const auto voter = node(1, 23131, 23231);
+        const ConsistencyOptions consistency{.mode = ConsistencyMode::RAFT_QUORUM};
+        rejects([&] { (void)ClusterConfig{{voter, learner}, ReplicationMode::MIRROR, {}, consistency}; });
+        RaftOptions raft;
+        raft.membership.allowLearners = true;
+        rejects([&] { (void)ClusterConfig{{learner}, ReplicationMode::MIRROR, {}, consistency, raft}; });
+        rejects([&] { (void)ClusterConfig{{voter, learner}, ReplicationMode::MIRROR, {}, {}, raft}; });
+        auto noDataLearner = learner;
+        noDataLearner.capabilities &= ~static_cast<uint32_t>(DATA_BEARING);
+        rejects([&] { (void)ClusterConfig{{voter, noDataLearner}, ReplicationMode::MIRROR, {}, consistency, raft}; });
+        const ClusterConfig disabled{{voter}, ReplicationMode::MIRROR, {}, consistency};
+        auto runtime = makeRuntime(dir / "disabled", disabled, 1);
+        runtime->runtime->start();
+        rejects([&] { runtime->runtime->addRaftLearner(learner); });
+        rejects([&] { runtime->runtime->removeRaftLearner(2); });
+        rejects([&] { runtime->runtime->promoteRaftLearner(2); });
+        runtime->runtime->close();
+        const ClusterConfig enabled{{voter}, ReplicationMode::MIRROR, {}, consistency, raft};
+        runtime = makeRuntime(dir / "static", enabled, 1);
+        runtime->runtime->start();
+        runtime->runtime->addRaftLearner(learner);
+        AKK_CLUSTER_CHECK(runtime->runtime->raftStats().learnerCount == 1);
+        rejects([&] { runtime->runtime->promoteRaftLearner(2); });
+        runtime->runtime->removeRaftLearner(2);
+        AKK_CLUSTER_CHECK(runtime->runtime->raftStats().voterCount == 1);
+        AKK_CLUSTER_CHECK(runtime->runtime->raftStats().learnerCount == 0);
+        runtime->runtime->close();
+    }
+
+    void testRaftLearnerEngineApi() {
+        const auto dir = makeTempDir("raft-learner-engine");
+        auto raft = onlineRaftMembership();
+        raft.membership.allowLearners = true;
+        const auto voter = node(1, 23141, 23241);
+        auto learner = node(2, 23142, 23242);
+        learner.capabilities |= RAFT_LEARNER;
+        const ConsistencyOptions consistency{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1500};
+        const ClusterConfig initial{{voter}, ReplicationMode::MIRROR, {}, consistency, raft};
+        const ClusterConfig joining{{voter, learner}, ReplicationMode::MIRROR, {}, consistency, raft, {}, 0, initial.clusterId()};
+        const auto makeOptions = [&](uint64_t id, const ClusterConfig& config) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(id));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.cluster.config = config;
+            options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.readMode = ClusterReadMode::LOCAL_STALE_OK;
+            writeNodeIdFile(options.paths.dataDir / "node.id", id);
+            return options;
+        };
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1, initial));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2, joining));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->stats().cluster.role == static_cast<uint32_t>(NodeRole::PRIMARY); }));
+        n1->addClusterLearner(learner);
+        n1->put(bytesOf("learner-api"), bytesOf("replicated"));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*n2, "learner-api");
+            return value && textOf(*value) == "replicated" && n2->stats().cluster.localLearner;
+        }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->stats().cluster;
+            return std::ranges::any_of(stats.peers, [&](const auto& peer) {
+                return peer.nodeId == 2 && peer.learner && peer.matchIndex == stats.lastLogIndex;
+            });
+        }));
+        n1->promoteClusterLearner(2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->stats().cluster.voterCount == 2 && !n2->stats().cluster.localLearner; }));
+        n1->put(bytesOf("learner-api"), bytesOf("promoted"));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*n2, "learner-api");
+            return value && textOf(*value) == "promoted";
+        }));
+        auto offline = node(3, 23143, 23243);
+        n1->addClusterLearner(offline);
+        n1->removeClusterLearner(3);
+        AKK_CLUSTER_CHECK(n1->stats().cluster.learnerCount == 0);
+        n2->close();
+        n1->close();
+    }
+
+    ClusterConfig learnerCrashConfig() {
+        auto raft = onlineRaftMembership();
+        raft.membership.allowLearners = true;
+        auto learner = node(2, 23122, 23222);
+        learner.capabilities |= RAFT_LEARNER;
+        return ClusterConfig{{node(1, 23121, 23221), learner}, ReplicationMode::MIRROR, {},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1500},
+            raft, {}, 0, testClusterId(23220)};
+    }
+
+    int runLearnerPromotionCrashWriter(const char* point, const std::filesystem::path& dir) {
+        auto leader = makeRuntime(dir / "n1", learnerCrashConfig(), 1);
+        leader->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return leader->runtime->role() == NodeRole::PRIMARY; }, std::chrono::seconds{20}));
+        leader->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("promotion"), bytesOf("before"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = leader->runtime->raftStats();
+            return std::ranges::any_of(stats.peers, [&](const RaftPeerStats& peer) { return peer.nodeId == 2 && peer.matchIndex == stats.lastLogIndex; });
+        }));
+        setStorageCrashPoint(point);
+        leader->runtime->promoteRaftLearner(2);
+        return 42;
+    }
+
+    void testRaftLearnerPromotionCrashRecovery(const std::filesystem::path& executable) {
+        for (const char* point : {"raft.learner.after_joint_replication", "raft.learner.after_joint_commit"}) {
+            const auto dir = makeTempDir(point);
+            const auto config = learnerCrashConfig();
+            auto n2 = makeRuntime(dir / "n2", config, 2);
+            n2->runtime->start();
+            runStorageCrashChild(executable, "--learner-promotion-crash-writer", point, dir);
+            auto n1 = makeRuntime(dir / "n1", config, 1);
+            n1->runtime->start();
+            std::array<RuntimeHarness*, 2> nodes{n1.get(), n2.get()};
+            ensurePreferredLeader(nodes, std::chrono::seconds{30});
+            auto* leader = findLeader(nodes);
+            AKK_CLUSTER_CHECK(leader != nullptr);
+            AKK_CLUSTER_CHECK(waitUntil([&] {
+                const auto stats = leader->runtime->raftStats();
+                return std::ranges::all_of(stats.peers, [&](const RaftPeerStats& peer) { return peer.matchIndex == stats.lastLogIndex; });
+            }));
+            leader->runtime->promoteRaftLearner(2);
+            AKK_CLUSTER_CHECK(leader->runtime->raftStats().voterCount == 2);
+            AKK_CLUSTER_CHECK(leader->runtime->raftStats().learnerCount == 0);
+            leader->runtime->shipEntry(2, ReplOpType::PUT, bytesOf("promotion"), bytesOf("after"), 0, leader->nodeId);
+            AKK_CLUSTER_CHECK(waitUntil([&] { return n1->hasState(2, "promotion", "after") && n2->hasState(2, "promotion", "after"); }));
+            n2->runtime->close();
+            n1->runtime->close();
+        }
+    }
+
+    void testRaftLearnerLifecycle(bool secure = false) {
+        const auto dir = makeTempDir(secure ? "raft-learners-secure" : "raft-learners");
+        auto raft = onlineRaftMembership();
+        raft.membership.allowLearners = true;
+        const auto n1Info = node(1, 23101, 23201);
+        auto n2Info = node(2, 23102, 23202);
+        n2Info.capabilities |= RAFT_LEARNER;
+        const auto n3Info = node(3, 23103, 23203);
+        const ConsistencyOptions consistency{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000};
+        const ClusterConfig initial{{n1Info}, ReplicationMode::MIRROR, {}, consistency, raft};
+        const ClusterConfig joining{{n1Info, n2Info}, ReplicationMode::MIRROR, {}, consistency, raft,
+            {}, 0, initial.clusterId()};
+        ClusterConfig::save(dir / "learner.akcc", joining);
+        AKK_CLUSTER_CHECK(ClusterConfig::load(dir / "learner.akcc").findById(2)->raftLearner());
+        ClusterRuntimeOptions options;
+        options.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.raftSnapshot.minLogEntries = 1;
+        if (secure) {
+            for (uint64_t id = 1; id <= 3; ++id) {
+                const auto identity = akkaradb::crypto::IdentityStore{dir / ("identity-" + std::to_string(id))}.loadOrCreate();
+                options.secure.pinnedPeers.push_back({id, identity.publicKey});
+            }
+        }
+        const auto makePeer = [&](uint64_t id, const ClusterConfig& config) {
+            auto peerOptions = options;
+            peerOptions.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
+            return makeRuntime(dir / ("n" + std::to_string(id)), config, id, peerOptions, secure);
+        };
+        const auto rejects = [](const auto& operation) {
+            bool rejected = false;
+            try { operation(); } catch (const std::exception&) { rejected = true; }
+            AKK_CLUSTER_CHECK(rejected);
+        };
+        auto n1 = makePeer(1, initial);
+        n1->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->role() == NodeRole::PRIMARY; }));
+        n1->runtime->addRaftLearner(n2Info);
+        n1->runtime->addRaftLearner(n3Info);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().voterCount == 1);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().learnerCount == 2);
+        rejects([&] { n1->runtime->promoteRaftLearner(2); });
+        rejects([&] { n1->runtime->addRaftVotingNode(n2Info); });
+        rejects([&] { n1->runtime->removeRaftVotingNode(2); });
+        rejects([&] { n1->runtime->removeRaftVotingNode(1); });
+        for (uint64_t seq = 1; seq <= 4; ++seq) {
+            n1->runtime->shipEntry(seq, ReplOpType::PUT, bytesOf("learner"), bytesOf(std::to_string(seq)), 0, 1);
+        }
+        AKK_CLUSTER_CHECK(n1->runtime->readKey(bytesOf("learner"), 0).status == ReadStatus::FOUND);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().snapshotIndex > 0; }));
+        // Reopen after compaction so no pre-compaction replication RPC can
+        // satisfy catch-up from a still-resident entry batch.
+        n1->runtime->close();
+        n1 = makePeer(1, initial);
+        n1->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->role() == NodeRole::PRIMARY; }, std::chrono::seconds{20}));
+
+        auto n2 = makePeer(2, joining);
+        n2->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(4, "learner", "4"); }, std::chrono::seconds{20}));
+        AKK_CLUSTER_CHECK(n2->snapshotsInstalled.load() != 0);
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().localLearner);
+        rejects([&] { n1->runtime->transferRaftLeadership(2); });
+        rejects([&] { n2->runtime->shipEntry(5, ReplOpType::PUT, bytesOf("learner"), bytesOf("forbidden"), 0, 2); });
+        const auto learnerTerm = n2->runtime->raftStats().currentTerm;
+        n1->runtime->close();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{6500};
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            AKK_CLUSTER_CHECK(n2->runtime->role() != NodeRole::PRIMARY);
+            AKK_CLUSTER_CHECK(n2->runtime->raftStats().currentTerm == learnerTerm);
+            return std::chrono::steady_clock::now() >= deadline;
+        }, std::chrono::seconds{10}));
+        n2->runtime->close();
+        n1 = makePeer(1, initial);
+        n2 = makePeer(2, joining);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().learnerCount == 2);
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().localLearner);
+        n1->runtime->start();
+        n2->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->role() == NodeRole::PRIMARY; }, std::chrono::seconds{20}));
+        n1->runtime->shipEntry(5, ReplOpType::PUT, bytesOf("learner"), bytesOf("5"), 0, 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(5, "learner", "5"); }));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->runtime->raftStats();
+            return std::ranges::any_of(stats.peers, [&](const RaftPeerStats& peer) {
+                return peer.nodeId == 2 && peer.matchIndex == stats.lastLogIndex;
+            });
+        }));
+        n1->runtime->promoteRaftLearner(2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return !n2->runtime->raftStats().localLearner; }));
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().voterCount == 2);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().learnerCount == 1);
+        n1->runtime->transferRaftLeadership(2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->runtime->role() == NodeRole::PRIMARY; }, std::chrono::seconds{20}));
+        n2->runtime->removeRaftLearner(3);
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().learnerCount == 0);
+        n2->runtime->shipEntry(6, ReplOpType::PUT, bytesOf("learner"), bytesOf("6"), 0, 2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->hasState(6, "learner", "6"); }));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().learnerCount == 0; }));
+        n2->runtime->close();
+        n1->runtime->close();
+        n1 = makePeer(1, initial);
+        n2 = makePeer(2, joining);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().voterCount == 2);
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().voterCount == 2);
+        AKK_CLUSTER_CHECK(!n2->runtime->raftStats().localLearner);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().learnerCount == 0);
+        n1->runtime->start();
+        n2->runtime->start();
+        std::array<RuntimeHarness*, 2> voters{n1.get(), n2.get()};
+        ensurePreferredLeader(voters, std::chrono::seconds{20});
+        AKK_CLUSTER_CHECK(findLeader(voters)->runtime->readKey(bytesOf("learner"), 0).status == ReadStatus::FOUND);
+        n2->runtime->close();
+        n1->runtime->close();
+    }
+
+    void testRaftLearnersNeverSupplyQuorum() {
+        const auto dir = makeTempDir("raft-learner-quorum");
+        auto raft = onlineRaftMembership();
+        raft.membership.allowLearners = true;
+        auto n4Info = node(4, 23114, 23214);
+        auto n5Info = node(5, 23115, 23215);
+        n4Info.capabilities |= RAFT_LEARNER;
+        n5Info.capabilities |= RAFT_LEARNER;
+        const ClusterConfig config{{node(1, 23111, 23211), node(2, 23112, 23212), node(3, 23113, 23213), n4Info, n5Info},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1000}, raft};
+        ClusterRuntimeOptions options;
+        options.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        auto n1 = makeRuntime(dir / "n1", config, 1, options);
+        auto n2 = makeRuntime(dir / "n2", config, 2, options);
+        auto n4 = makeRuntime(dir / "n4", config, 4, options);
+        auto n5 = makeRuntime(dir / "n5", config, 5, options);
+        for (auto* node : {n1.get(), n2.get(), n4.get(), n5.get()}) { node->runtime->start(); }
+        std::array<RuntimeHarness*, 2> voters{n1.get(), n2.get()};
+        ensurePreferredLeader(voters, std::chrono::seconds{20});
+        auto* leader = findLeader(voters);
+        AKK_CLUSTER_CHECK(leader != nullptr);
+        leader->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("quorum"), bytesOf("committed"), 0, leader->nodeId);
+        AKK_CLUSTER_CHECK(leader->runtime->readKey(bytesOf("quorum"), 0).status == ReadStatus::FOUND);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n4->hasState(1, "quorum", "committed") && n5->hasState(1, "quorum", "committed"); }));
+        (leader == n1.get() ? n2.get() : n1.get())->runtime->close();
+        bool rejected = false;
+        try { leader->runtime->shipEntry(2, ReplOpType::PUT, bytesOf("quorum"), bytesOf("uncommitted"), 0, leader->nodeId); }
+        catch (const std::runtime_error&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected);
+        AKK_CLUSTER_CHECK(leader->runtime->readKey(bytesOf("quorum"), 0).status == ReadStatus::ERROR_STATUS);
+        AKK_CLUSTER_CHECK(n4->lastSeq.load() == 1 && n5->lastSeq.load() == 1);
+        for (auto* node : {n1.get(), n2.get(), n4.get(), n5.get()}) { node->runtime->close(); }
     }
 
     void testRaftOnlineMembershipChange() {
@@ -5626,7 +7563,7 @@ namespace {
 
     void testNonRaftPrimaryRejectsCorruptGroupState() {
         const auto dir = makeTempDir("non-raft-corrupt-group-state");
-        writeTextFile(dir / "n1" / "cluster.membership", "not a valid AKCG2 state\n");
+        writeTextFile(dir / "n1" / "cluster.membership", "not a valid AKCG1 state\n");
 
         const ClusterConfig cfg{
             {
@@ -5656,7 +7593,7 @@ namespace {
     void testNonRaftPrimaryBacksUpCorruptGroupState() {
         const auto dir = makeTempDir("non-raft-corrupt-group-state-backup");
         const auto membershipPath = dir / "n1" / "cluster.membership";
-        writeTextFile(membershipPath, "not a valid AKCG2 state\n");
+        writeTextFile(membershipPath, "not a valid AKCG1 state\n");
 
         const ClusterConfig cfg{
             {
@@ -5713,6 +7650,351 @@ namespace {
         restarted->runtime->close();
     }
 
+    void testMirrorQuorumFencing(bool secure = false) {
+        const auto dir = makeTempDir(secure ? "mirror-fencing-secure" : "mirror-fencing");
+        const std::vector<NodeInfo> nodes{node(1, 23301, 23311), node(2, 23302, 23312), node(3, 23303, 23313)};
+        const std::vector<NodeInfo> authorities{node(1, 23401, 23411), node(2, 23402, 23412), node(3, 23403, 23413)};
+        const ConsistencyOptions consistency{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 1000};
+        const ClusterConfig config{nodes, ReplicationMode::MIRROR, {}, consistency, {}, {}, 1};
+        ClusterRuntimeOptions options;
+        options.clusterGroupId = 23300;
+        options.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+        options.mirrorFencing.authorityNodes = authorities;
+        options.raftSnapshot.minLogEntries = 1;
+        if (secure) {
+            for (uint64_t id = 1; id <= 3; ++id) {
+                const auto identity = akkaradb::crypto::IdentityStore{dir / ("identity-" + std::to_string(id))}.loadOrCreate();
+                options.secure.pinnedPeers.push_back({id, identity.publicKey});
+            }
+        }
+        const auto makePeer = [&](uint64_t id) {
+            auto runtime = options;
+            runtime.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            runtime.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
+            return makeRuntime(dir / ("n" + std::to_string(id)), config, id, runtime, secure);
+        };
+        auto n1 = makePeer(1), n2 = makePeer(2), n3 = makePeer(3);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        const auto write = [&](uint64_t seq, const char* value) {
+            n1->runtime->executePrimaryWrite([&] {
+                n1->setState(seq, bytesOf("authority-key"), bytesOf(value));
+                n1->runtime->shipEntry(seq, ReplOpType::PUT, bytesOf("authority-key"), bytesOf(value), 0, 1);
+            });
+        };
+        write(1, "first");
+        AKK_CLUSTER_CHECK(!n1->runtime->raftStats().mirrorWritePending);
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().mirrorAuthorityPrimaryNodeId == 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, "authority-key", "first") && n3->hasState(1, "authority-key", "first"); }));
+        n2->runtime->close();
+        write(2, "async-data-with-one-replica-offline");
+        AKK_CLUSTER_CHECK(n2->lastSeq.load() == 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->lastSeq.load() == 2; }));
+        n3->runtime->close();
+        bool invoked = false, rejected = false;
+        try { n1->runtime->executePrimaryWrite([&] { invoked = true; }); }
+        catch (const std::runtime_error&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected && !invoked && n1->lastSeq.load() == 2);
+        n1->runtime->close();
+        n1.reset(); n2.reset(); n3.reset();
+        n1 = makePeer(1); n2 = makePeer(2); n3 = makePeer(3);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        write(3, "restart-after-control-snapshot");
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(3, "authority-key", "restart-after-control-snapshot"); }));
+        bool interrupted = false;
+        try { n1->runtime->executePrimaryWrite([] { throw std::runtime_error("interrupted mutation"); }); }
+        catch (const std::runtime_error&) { interrupted = true; }
+        AKK_CLUSTER_CHECK(interrupted && n1->runtime->raftStats().mirrorWritePending);
+        n3->runtime->close(); n2->runtime->close(); n1->runtime->close();
+        n1.reset(); n2.reset(); n3.reset();
+        n1 = makePeer(1); n2 = makePeer(2); n3 = makePeer(3);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        invoked = false; rejected = false;
+        try { n1->runtime->executePrimaryWrite([&] { invoked = true; }); }
+        catch (const std::runtime_error&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected && !invoked && n1->runtime->raftStats().mirrorWritePending);
+        n3->runtime->close(); n2->runtime->close(); n1->runtime->close();
+        auto downgraded = options;
+        downgraded.mirrorFencing = {};
+        bool downgradeRejected = false;
+        try { (void)makeRuntime(dir / "n1", config, 1, downgraded, secure); }
+        catch (const std::runtime_error&) { downgradeRejected = true; }
+        AKK_CLUSTER_CHECK(downgradeRejected);
+        for (const auto& file : std::filesystem::recursive_directory_iterator(dir / "n1" / "mirror-authority")) {
+            if (!file.is_regular_file()) { continue; }
+            std::ifstream in(file.path(), std::ios::binary);
+            const std::string image((std::istreambuf_iterator<char>(in)), {});
+            AKK_CLUSTER_CHECK(image.find("async-data-with-one-replica-offline") == std::string::npos);
+        }
+    }
+
+    void testMirrorFencingEngineApi() {
+        const auto dir = makeTempDir("mirror-fencing-engine");
+        const ClusterConfig config{{node(1, 23501, 23511), node(2, 23502, 23512), node(3, 23503, 23513, COORDINATOR_ELIGIBLE)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 1000}, {}, {}, 1};
+        const auto makeOptions = [&](uint64_t id) {
+            akkaradb::engine::AkkEngineOptions options;
+            options.paths.dataDir = dir / ("n" + std::to_string(id));
+            options.components.clusterEnabled = true;
+            options.components.blobEnabled = false;
+            options.components.versionLogEnabled = true;
+            options.cluster.config = config;
+            auto& runtime = options.cluster.runtime;
+            runtime.transportMode = TransportMode::PLAIN;
+            runtime.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            runtime.clusterGroupId = 23500;
+            runtime.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+            runtime.mirrorFencing.authorityNodes = {node(1, 23601, 23611), node(2, 23602, 23612), node(3, 23603, 23613)};
+            runtime.routingMode = id == 2 ? ClusterRoutingMode::FORWARD : ClusterRoutingMode::REDIRECT;
+            runtime.readMode = id == 2 ? ClusterReadMode::OWNER_LINEARIZABLE : ClusterReadMode::LOCAL_STALE_OK;
+            writeNodeIdFile(options.paths.dataDir / "node.id", id);
+            return options;
+        };
+        auto volatileOptions = makeOptions(1);
+        volatileOptions.components.walEnabled = false;
+        volatileOptions.runtime.writeDurability = akkaradb::engine::AkkEngineOptions::WriteDurabilityMode::MEMORY;
+        bool volatileRejected = false;
+        try { (void)akkaradb::engine::AkkEngine::open(volatileOptions); }
+        catch (const std::invalid_argument&) { volatileRejected = true; }
+        AKK_CLUSTER_CHECK(volatileRejected);
+        auto n1 = akkaradb::engine::AkkEngine::open(makeOptions(1));
+        auto n2 = akkaradb::engine::AkkEngine::open(makeOptions(2));
+        auto n3 = akkaradb::engine::AkkEngine::open(makeOptions(3));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->stats().cluster.mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        n1->put(bytesOf("fenced-api"), bytesOf("one"));
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto value = engineGet(*n2, "fenced-api"); return value && textOf(*value) == "one";
+        }));
+        n2->put(bytesOf("forwarded-fenced"), bytesOf("quorum-authority-async-data"));
+        AKK_CLUSTER_CHECK(textOf(*n1->get(bytesOf("forwarded-fenced"))) == "quorum-authority-async-data" && !n1->stats().cluster.mirrorWritePending);
+        const std::array<std::string, 4> batchStorage{"batch-one", "one", "batch-two", "two"};
+        const std::array<akkaradb::engine::detail::BulkPutEntry, 2> batch{
+            akkaradb::engine::detail::BulkPutEntry{bytesOf(batchStorage[0]), bytesOf(batchStorage[1])},
+            akkaradb::engine::detail::BulkPutEntry{bytesOf(batchStorage[2]), bytesOf(batchStorage[3])}};
+        akkaradb::engine::detail::ProtocolBulkWriter::put(*n1, batch);
+        n1->remove(bytesOf("batch-one"));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return engineGet(*n2, "batch-two").has_value() && !engineGet(*n2, "batch-one").has_value(); }));
+        AKK_CLUSTER_CHECK(n2->count() == 3);
+        const auto history = akk_test::collectHistory(n2->history(bytesOf("fenced-api")));
+        AKK_CLUSTER_CHECK(history.size() == 1 && textOf(history.front().value) == "one");
+        AKK_CLUSTER_CHECK(textOf(*n2->getAt(bytesOf("fenced-api"), history.front().seq)) == "one");
+        AKK_CLUSTER_CHECK(!engineGet(*n3, "fenced-api").has_value()); // authority-only witness
+        n2->close();
+        n1->put(bytesOf("fenced-api"), bytesOf("async"));
+        AKK_CLUSTER_CHECK(!n1->stats().cluster.mirrorWritePending);
+        n3->close();
+        bool rejected = false;
+        try { n1->put(bytesOf("denied"), bytesOf("must-not-apply")); } catch (const std::runtime_error&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected && !engineGet(*n1, "denied").has_value());
+        n1->close();
+    }
+
+    void testMirrorFencingValidation() {
+        static_assert(ReplFrameHeader::MAGIC == 0x31524B41); // current pre-release AKR1 protocol
+        for (const auto mode : {MirrorFencingMode::STATIC, MirrorFencingMode::QUORUM_FENCED, MirrorFencingMode::EXTERNAL_FENCED}) {
+            DecodedFrame frame;
+            AKK_CLUSTER_CHECK(decodeFrame(encodeClientHello(ClientHello{.nodeId = 2, .mirrorFencingMode = mode, .forceSnapshot = true}), frame));
+            ClientHello client;
+            AKK_CLUSTER_CHECK(decodeClientHello(frame.payload, client) && client.mirrorFencingMode == mode && client.forceSnapshot);
+            frame.payload[17] = 6;
+            AKK_CLUSTER_CHECK(!decodeClientHello(frame.payload, client));
+            AKK_CLUSTER_CHECK(decodeFrame(encodeServerHello(ServerHello{.nodeId = 1, .mirrorFencingMode = mode}), frame));
+            ServerHello server;
+            AKK_CLUSTER_CHECK(decodeServerHello(frame.payload, server) && server.mirrorFencingMode == mode);
+            frame.payload[17] = 3;
+            AKK_CLUSTER_CHECK(!decodeServerHello(frame.payload, server));
+        }
+        const auto dir = makeTempDir("mirror-fencing-validation");
+        const ClusterConfig config{{node(1, 23331, 23341), node(2, 23332, 23342)}, ReplicationMode::MIRROR, {}, {}, {}, {}, 2};
+        ClusterRuntimeOptions options;
+        options.startupRole = NodeStartupRole::PRIMARY;
+        options.mirrorPromotion = MirrorPromotionOptions{true, 1, 1, 0};
+        bool rejected = false;
+        try { (void)makeRuntime(dir / "static", config, 2, options); } catch (const std::invalid_argument&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected);
+        options.mirrorPromotion = {};
+        options.mirrorFencing.mode = MirrorFencingMode::EXTERNAL_FENCED;
+        rejected = false;
+        try { (void)makeRuntime(dir / "external", config, 2, options); } catch (const std::invalid_argument&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected);
+        options.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+        rejected = false;
+        try { (void)makeRuntime(dir / "quorum", config, 2, options); } catch (const std::invalid_argument&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected);
+    }
+
+    class TestMirrorFencer final : public IMirrorFencingProvider {
+    public:
+        uint64_t primary = 1, epoch = 1;
+        bool failFence = false;
+        unsigned fenced = 0;
+        void fence(const MirrorFenceRequest& request) override {
+            if (failFence) { throw std::runtime_error("test fencing failed"); }
+            AKK_CLUSTER_CHECK(request.groupId != 0 && request.previousPrimaryNodeId == 1 && request.previousGroupEpoch == 1);
+            primary = request.candidateNodeId; epoch = request.previousGroupEpoch + 1; ++fenced;
+        }
+        void validatePrimary(const ClusterId&, uint64_t group, uint64_t node, uint64_t generation) override {
+            if (group == 0 || node != primary || generation != epoch) { throw std::runtime_error("test: fenced Primary"); }
+        }
+    };
+
+    void testMirrorQuorumPromotion(bool unresolved) {
+        const auto dir = makeTempDir(unresolved ? "mirror-quorum-pending-promotion" : "mirror-quorum-promotion");
+        const std::vector<NodeInfo> nodes{node(1, 23701, 23711), node(2, 23702, 23712), node(3, 23703, 23713)};
+        const std::vector<NodeInfo> authorities{node(1, 23801, 23811), node(2, 23802, 23812), node(3, 23803, 23813)};
+        const ConsistencyOptions consistency{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 1000};
+        const ClusterConfig original{nodes, ReplicationMode::MIRROR, {}, consistency, {}, {}, 1};
+        ClusterRuntimeOptions options;
+        options.clusterGroupId = 23700;
+        options.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+        options.mirrorFencing.authorityNodes = authorities;
+        const auto makePeer = [&](uint64_t id, const ClusterConfig& config, bool promoting,
+                                  std::shared_ptr<IMirrorFencingProvider> external = {}) {
+            auto runtime = options;
+            runtime.startupRole = id == config.primaryNodeId() ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            if (external) {
+                runtime.mirrorRecovery.mode = MirrorRecoveryMode::MANUAL;
+                runtime.mirrorRecovery.provider = std::make_shared<MirrorFencingRecoveryProvider>(std::move(external));
+            }
+            if (promoting) { runtime.mirrorPromotion = MirrorPromotionOptions{true, 1, 1, 1}; }
+            return makeRuntime(dir / ("n" + std::to_string(id)), config, id, runtime);
+        };
+        auto n1 = makePeer(1, original, false), n2 = makePeer(2, original, false), n3 = makePeer(3, original, false);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        n1->runtime->executePrimaryWrite([&] {
+            n1->setState(1, bytesOf("promotion-key"), bytesOf("before"));
+            n1->runtime->shipEntry(1, ReplOpType::PUT, bytesOf("promotion-key"), bytesOf("before"), 0, 1);
+        });
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n2->hasState(1, "promotion-key", "before") && n3->hasState(1, "promotion-key", "before"); }));
+        if (unresolved) {
+            bool failed = false;
+            try { n1->runtime->executePrimaryWrite([] { throw std::runtime_error("write interrupted after grant"); }); }
+            catch (const std::runtime_error&) { failed = true; }
+            AKK_CLUSTER_CHECK(failed && n1->runtime->raftStats().mirrorWritePending);
+            AKK_CLUSTER_CHECK(waitUntil([&] { return n2->runtime->raftStats().mirrorWritePending && n3->runtime->raftStats().mirrorWritePending; }));
+        }
+        n3->runtime->close(); n2->runtime->close(); n1->runtime->close();
+        n1.reset(); n2.reset(); n3.reset();
+        const ClusterConfig promoted{nodes, ReplicationMode::MIRROR, {}, consistency, {}, {}, 2, original.clusterId()};
+        n3 = makePeer(3, promoted, true); n3->runtime->start();
+        n2 = makePeer(2, promoted, true);
+        if (unresolved) {
+            bool rejected = false;
+            try { n2->runtime->start(); } catch (const std::runtime_error&) { rejected = true; }
+            AKK_CLUSTER_CHECK(rejected);
+            AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").primaryNodeId == 1);
+            n2->runtime->close(); n2.reset();
+            const auto fencer = std::make_shared<TestMirrorFencer>();
+            n2 = makePeer(2, promoted, true, fencer); n2->runtime->start();
+            AKK_CLUSTER_CHECK(fencer->fenced == 1);
+        }
+        else { n2->runtime->start(); }
+        AKK_CLUSTER_CHECK(n2->runtime->raftStats().mirrorAuthorityPrimaryNodeId == 2);
+        AKK_CLUSTER_CHECK(!n2->runtime->raftStats().mirrorWritePending);
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupEpoch == 2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->snapshotsInstalled.load() > 0; }));
+        n2->runtime->executePrimaryWrite([&] {
+            n2->setState(2, bytesOf("promotion-key"), bytesOf("after"));
+            n2->runtime->shipEntry(2, ReplOpType::PUT, bytesOf("promotion-key"), bytesOf("after"), 0, 2);
+        });
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->hasState(2, "promotion-key", "after"); }));
+        AKK_CLUSTER_CHECK(waitUntil([&] { return !std::filesystem::exists(dir / "n3" / "cluster.membership.mirror-resync"); }));
+        n3->runtime->close();
+        n3->setState(2, bytesOf("promotion-key"), bytesOf("unreconciled"));
+        std::filesystem::copy_file(dir / "n3" / "cluster.membership", dir / "n3" / "cluster.membership.mirror-resync");
+        n3.reset(); n3 = makePeer(3, promoted, false); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n3->hasState(2, "promotion-key", "after") && n3->snapshotsInstalled.load() > 0; }));
+        // A stale process/config may restart, but cannot get a new write permit.
+        n1 = makePeer(1, original, false); n1->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityPrimaryNodeId == 2; }));
+        bool invoked = false, rejected = false;
+        try { n1->runtime->executePrimaryWrite([&] { invoked = true; }); }
+        catch (const std::runtime_error&) { rejected = true; }
+        AKK_CLUSTER_CHECK(rejected && !invoked && n1->lastSeq.load() == 1);
+        n1->runtime->close(); n2->runtime->close();
+        // Replay a previous-generation frame through an otherwise valid successor connection.
+        ClusterRuntimeOptions replayOptions;
+        replayOptions.transportMode = TransportMode::PLAIN;
+        replayOptions.clusterGroupId = 23700; replayOptions.clusterGroupEpoch = 2;
+        replayOptions.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+        replayOptions.replicationClusterId = promoted.clusterId();
+        replayOptions.replicationConfigFingerprint = promoted.replicationFingerprint();
+        auto replay = ReplicationServer::create(23712, 2, [] { return uint64_t{2}; }, {}, consistency, 1, {3}, replayOptions);
+        replay->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return replay->replicaCount() == 1; }));
+        std::vector<uint8_t> staleKey{'A', 'K', 'M', 'D', '1'};
+        for (size_t i = 0; i < 8; ++i) { staleKey.push_back(static_cast<uint8_t>(uint64_t{1} >> (i * 8))); }
+        const std::string publicKey = "promotion-key";
+        staleKey.insert(staleKey.end(), publicKey.begin(), publicKey.end());
+        replay->shipEntry(3, ReplOpType::PUT, staleKey, bytesOf("obsolete"), 0, 2);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return replay->replicaCount() == 0; }));
+        AKK_CLUSTER_CHECK(n3->hasState(2, "promotion-key", "after"));
+        replay->close(); n3->runtime->close();
+    }
+
+    void testMirrorQuorumCompletionRecovery(bool restartPrimary = true) {
+        const auto dir = makeTempDir(restartPrimary ? "mirror-quorum-completion-recovery" : "mirror-quorum-live-completion-recovery");
+        const ClusterConfig config{{node(1, 23901, 23911), node(2, 23902, 23912), node(3, 23903, 23913)},
+            ReplicationMode::MIRROR, {}, ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 500}, {}, {}, 1};
+        const auto makePeer = [&](uint64_t id) {
+            ClusterRuntimeOptions options;
+            options.clusterGroupId = 23900;
+            options.startupRole = id == 1 ? NodeStartupRole::PRIMARY : NodeStartupRole::REPLICA;
+            options.mirrorFencing.mode = MirrorFencingMode::QUORUM_FENCED;
+            options.mirrorFencing.authorityNodes = {node(1, 24001, 24011), node(2, 24002, 24012), node(3, 24003, 24013)};
+            return makeRuntime(dir / ("n" + std::to_string(id)), config, id, options);
+        };
+        auto n1 = makePeer(1), n2 = makePeer(2), n3 = makePeer(3);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        AKK_CLUSTER_CHECK(waitUntil([&] { return n1->runtime->raftStats().mirrorAuthorityLeaderNodeId == 1; }, std::chrono::seconds{30}));
+        bool failed = false;
+        uint64_t invocations = 0;
+        try {
+            n1->runtime->executePrimaryWrite([&] {
+                ++invocations;
+                n2->runtime->close(); n3->runtime->close(); // grant committed, release cannot reach quorum
+                std::this_thread::sleep_for(std::chrono::milliseconds{1200}); // pause longer than the authority timeout
+                AKK_CLUSTER_CHECK(n1->runtime->raftStats().mirrorWritePending);
+                n1->setState(1, bytesOf("completed-key"), bytesOf("durable"));
+            });
+        }
+        catch (const std::runtime_error&) { failed = true; }
+        AKK_CLUSTER_CHECK(failed && n1->hasState(1, "completed-key", "durable"));
+        AKK_CLUSTER_CHECK(std::filesystem::exists(dir / "n1" / "mirror-authority" / "completed"));
+        AKK_CLUSTER_CHECK(n1->runtime->raftStats().mirrorWritePending);
+        n2.reset(); n3.reset();
+        if (restartPrimary) {
+            n1->runtime->close(); n1.reset();
+            n1 = makePeer(1); n1->runtime->start();
+        }
+        n2 = makePeer(2); n3 = makePeer(3);
+        n2->runtime->start(); n3->runtime->start();
+        // Stats are passive: no public write/read may trigger this recovery.
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            const auto stats = n1->runtime->raftStats();
+            return stats.mirrorAuthorityPrimaryNodeId == 1 && stats.mirrorAuthorityEpoch == 1 &&
+                !stats.mirrorWritePending && !n2->runtime->raftStats().mirrorWritePending && !n3->runtime->raftStats().mirrorWritePending;
+        }, std::chrono::seconds{30}));
+        AKK_CLUSTER_CHECK(invocations == 1 && n1->hasState(1, "completed-key", "durable"));
+        bool invoked = false;
+        n1->runtime->executePrimaryWrite([&] { invoked = true; });
+        AKK_CLUSTER_CHECK(invoked && !n1->runtime->raftStats().mirrorWritePending);
+        AKK_CLUSTER_CHECK(n1->hasState(1, "completed-key", "durable"));
+        // The previous receipt must not certify a later interrupted operation.
+        failed = false;
+        try { n1->runtime->executePrimaryWrite([] { throw std::runtime_error("no completion receipt for this grant"); }); }
+        catch (const std::runtime_error&) { failed = true; }
+        AKK_CLUSTER_CHECK(failed && n1->runtime->raftStats().mirrorWritePending);
+        invoked = false; failed = false;
+        try { n1->runtime->executePrimaryWrite([&] { invoked = true; }); }
+        catch (const std::runtime_error&) { failed = true; }
+        AKK_CLUSTER_CHECK(failed && !invoked && n1->runtime->raftStats().mirrorWritePending);
+        n3->runtime->close(); n2->runtime->close(); n1->runtime->close();
+    }
+
     void testNonRaftMirrorOfflinePromotion() {
         const auto dir = makeTempDir("non-raft-mirror-promotion");
         const std::vector<NodeInfo> nodes{
@@ -5726,11 +8008,15 @@ namespace {
             .ackTimeoutMs = 2000,
         };
         const ClusterConfig original{nodes, ReplicationMode::MIRROR, ack, consistency, {}, {}, 1};
+        const auto fencer = std::make_shared<TestMirrorFencer>();
+        const MirrorFencingOptions fencing{.mode = MirrorFencingMode::EXTERNAL_FENCED, .authorityNodes = {}, .external = fencer};
 
         ClusterRuntimeOptions oldPrimaryOptions;
         oldPrimaryOptions.startupRole = NodeStartupRole::PRIMARY;
+        oldPrimaryOptions.mirrorFencing = fencing;
         ClusterRuntimeOptions oldReplicaOptions;
         oldReplicaOptions.startupRole = NodeStartupRole::REPLICA;
+        oldReplicaOptions.mirrorFencing = fencing;
         auto oldPrimary = makeRuntime(dir / "n1", original, 1, oldPrimaryOptions);
         auto candidate = makeRuntime(dir / "n2", original, 2, oldReplicaOptions);
         oldPrimary->runtime->start();
@@ -5743,6 +8029,10 @@ namespace {
         oldPrimary->setState(7, bytesOf("mirror-key"), bytesOf("before-promotion"));
         candidate->setState(7, bytesOf("mirror-key"), bytesOf("before-promotion"));
         const auto originalGroup = readGroupState(dir / "n1" / "cluster.membership");
+        AKK_CLUSTER_CHECK(waitUntil([&] {
+            std::error_code ec;
+            return std::filesystem::file_size(dir / "n2" / "cluster.membership", ec) == 33 && !ec;
+        }));
         AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupId == originalGroup.groupId);
         candidate->runtime->close();
         oldPrimary->runtime->close();
@@ -5752,6 +8042,7 @@ namespace {
         const ClusterConfig promoted{nodes, ReplicationMode::MIRROR, ack, consistency, {}, {}, 2, original.clusterId()};
         ClusterRuntimeOptions unapproved;
         unapproved.startupRole = NodeStartupRole::PRIMARY;
+        unapproved.mirrorFencing = fencing;
         auto rejected = makeRuntime(dir / "n2", promoted, 2, unapproved);
         bool rejectedWithoutAuthorization = false;
         try { rejected->runtime->start(); }
@@ -5763,6 +8054,7 @@ namespace {
 
         ClusterRuntimeOptions promotion;
         promotion.startupRole = NodeStartupRole::PRIMARY;
+        promotion.mirrorFencing = fencing;
         promotion.mirrorPromotion = MirrorPromotionOptions{
             .enabled = true,
             .previousPrimaryNodeId = 1,
@@ -5792,6 +8084,14 @@ namespace {
         AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupEpoch == originalGroup.groupEpoch);
 
         promotion.clusterGroupId = 0;
+        fencer->failFence = true;
+        auto denied = makeRuntime(dir / "n2", promoted, 2, promotion);
+        bool deniedFence = false;
+        try { denied->runtime->start(); } catch (const std::runtime_error&) { deniedFence = true; }
+        AKK_CLUSTER_CHECK(deniedFence);
+        AKK_CLUSTER_CHECK(readGroupState(dir / "n2" / "cluster.membership").groupEpoch == originalGroup.groupEpoch);
+        denied.reset();
+        fencer->failFence = false;
         auto newPrimary = makeRuntime(dir / "n2", promoted, 2, promotion);
         newPrimary->runtime->start();
         const auto promotedGroup = readGroupState(dir / "n2" / "cluster.membership");
@@ -5801,6 +8101,7 @@ namespace {
 
         ClusterRuntimeOptions demoted;
         demoted.startupRole = NodeStartupRole::REPLICA;
+        demoted.mirrorFencing = fencing;
         demoted.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
         demoted.mirrorPromotion = promotion.mirrorPromotion;
         auto oldAsReplica = makeRuntime(dir / "n1", promoted, 1, demoted);
@@ -6259,6 +8560,7 @@ namespace {
         options.components.versionLogEnabled = true;
         options.cluster.config = cfg;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
+        options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         writeNodeIdFile(options.paths.dataDir / "node.id", 1);
 
         auto engine = akkaradb::engine::AkkEngine::open(options);
@@ -6273,11 +8575,31 @@ namespace {
         const auto stored = engine->get(bytesOf(key));
         AKK_CLUSTER_CHECK(stored.has_value());
         AKK_CLUSTER_CHECK(textOf(*stored) == value);
-        const auto history = engine->history(bytesOf(key));
-        AKK_CLUSTER_CHECK(history.size() == 1);
         AKK_CLUSTER_CHECK(engine->stats().putsTotal == 1);
+
+        AKK_CLUSTER_CHECK(engine->count() == 1);
+        akkaradb::core::BufferArena arena;
+        size_t records = 0;
+        for (const auto& record : engine->scan(arena)) {
+            AKK_CLUSTER_CHECK(textOf(record.key) == key && textOf(record.value) == value); ++records;
+        }
+        AKK_CLUSTER_CHECK(records == 1);
+        const auto history = akk_test::collectHistory(engine->history(bytesOf(key)));
+        AKK_CLUSTER_CHECK(history.size() == 1 && textOf(history.front().value) == value);
+        AKK_CLUSTER_CHECK(textOf(*engine->getAt(bytesOf(key), history.front().seq)) == value);
         engine->close();
     }
+
+    #include "detail/cluster_queries_test.inc"
+#include "detail/cluster_authority_contract_test.inc"
+#include "detail/cluster_query_resource_test.inc"
+#include "detail/cluster_query_delivery_test.inc"
+#include "detail/cluster_partition_placement_test.inc"
+#include "detail/cluster_partition_raft_test.inc"
+#include "detail/cluster_placement_options_test.inc"
+#include "detail/cluster_log_retention_test.inc"
+#include "detail/cluster_mirror_recovery_test.inc"
+#include "detail/cluster_parallelism_test.inc"
 
     void testRaftEngineLeadershipTransferApi() {
         const auto dir = makeTempDir("raft-engine-leader-transfer-api");
@@ -6645,12 +8967,99 @@ int main(int argc, char** argv) {
         akkaradb::test::installMsvcTestErrorHandlers();
         enableDeterministicRaftElection();
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
+        if (argc == 4 && std::string_view{argv[1]} == "--retention-snapshot-receiver") { return runRetainedHistorySnapshotReceiver(argv[3], argv[2]); }
         if (argc == 4 && std::string_view{argv[1]} == "--stripe-crash-writer") { return runStripeCrashWriter(argv[2], argv[3]); }
         if (argc == 4 && std::string_view{argv[1]} == "--raft-log-crash-writer") { return runRaftLogCrashWriter(argv[2], argv[3]); }
         if (argc == 4 && std::string_view{argv[1]} == "--retry-crash-writer") { return runRetryCrashWriter(argv[2], argv[3]); }
         const auto executable = std::filesystem::absolute(argv[0]);
+        if (argc == 2 && std::string_view{argv[1]} == "--authority-contract") {
+            runClusterAuthorityContractTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--query-delivery") {
+            testQueryDeliverySnapshots(false); testQueryDeliverySnapshots(true); testPartitionQueryDelivery();
+            testNativeClusterQueries(ReplicationMode::STRIPE, false, true, true);
+            testNativeClusterQueries(ReplicationMode::MIRROR, true, false, true);
+            testNativeClusterQueries(ReplicationMode::PARTITIONED, false, false, true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--query-resources") {
+            runClusterQueryResourceTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--rpc-deadlines") {
+            runClusterRpcDeadlineTests();
+            return 0;
+        }
+        if (argc == 5 && std::string_view{argv[1]} == "--cluster-query-one") {
+            testNativeClusterQueries(static_cast<ReplicationMode>(std::stoi(argv[2])), std::stoi(argv[3]) != 0, std::stoi(argv[4]) != 0);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-query-limits") {
+            testNativeQueryLimitsAndLifetime();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-queries") {
+            testRaftEngineLeaderAppliesMutationOnce();
+            runNativeClusterQueryTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-prevote") {
+            std::fprintf(stderr, "[cluster] pre-vote wire contract\n");
+            testRaftPreVoteWireContract();
+            std::fprintf(stderr, "[cluster] pre-vote stale log\n");
+            testRaftPreVoteRejectsStaleLog();
+            std::fprintf(stderr, "[cluster] pre-vote heartbeat race\n");
+            testRaftPreVoteDiscardsProbeAfterHeartbeat();
+            std::fprintf(stderr, "[cluster] pre-vote isolation/recovery PLAIN\n");
+            testRaftPreVoteIsolationAndRecovery();
+            std::fprintf(stderr, "[cluster] pre-vote isolation/recovery SECURE\n");
+            testRaftPreVoteIsolationAndRecovery(true);
+            std::fprintf(stderr, "[cluster] pre-vote explicit transfer\n");
+            testRaftLeaderTransfer();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--stripe-crash-recovery") {
             testStripePublicationCrashRecovery(executable);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--partition-placement") {
+            testClusterPlacementDistribution();
+            testPartitionedCatchupTargets(true);
+            testPartitionedCatchupTargets(false);
+            testPartitionedSingleCopy();
+            testPartitionedEmptySnapshots();
+            testPartitionedBoundedStorage(false);
+            testPartitionedBoundedStorage(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--placement-options") {
+            testReconfigurationDeadlineBudget(); testStripePlacementOptions(false); testStripePlacementOptions(true);
+            testPartitionRaftLiveCopies(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-online") { testStripeOnlinePlacement(); testStripeOnlinePlacement(true); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--local-acceptance-loss") { testMirrorLocalAcceptanceLoss(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid10-online") { testRaid10OnlineSpareReplacement(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--partition-query-parallelism") {
+            testPartitionQueryQueueDeadline(); testPartitionQueryParallelism(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--partition-raft") {
+            std::fprintf(stderr, "[cluster] STRIPE online PLAIN\n");
+            testStripeOnlinePlacement();
+            std::fprintf(stderr, "[cluster] STRIPE online SECURE\n");
+            testStripeOnlinePlacement(true);
+            std::fprintf(stderr, "[cluster] MIRROR failover policies\n");
+            testMirrorFailoverPolicies();
+            std::fprintf(stderr, "[cluster] MIRROR local acceptance loss\n");
+            testMirrorLocalAcceptanceLoss();
+            std::fprintf(stderr, "[cluster] MIRROR online history\n");
+            testMirrorOnlineRetainsHistory();
+            std::fprintf(stderr, "[cluster] RAID.10 online spare replacement\n");
+            testRaid10OnlineSpareReplacement();
+            std::fprintf(stderr, "[cluster] PARTITIONED failover\n");
+            testPartitionRaftFailover();
+            std::fprintf(stderr, "[cluster] PARTITIONED online copy count\n");
+            testPartitionRaftLiveCopies();
             return 0;
         }
         if (argc == 2 && std::string_view{argv[1]} == "--replication-catchup") {
@@ -6661,6 +9070,13 @@ int main(int argc, char** argv) {
             testReplicationServerReapsDisconnectedReplicas();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-log-retention") {
+            testRaftEmptyStateCompaction(); testRaftRetainedHistorySnapshot(argv[0]); testMirrorOnlineRetainsHistory();
+            testPartitionRaftLiveCopies(); testStripeOnlinePlacement(); testStripeOnlinePlacement(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-history-snapshot") { testRaftRetainedHistorySnapshot(argv[0]); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--mirror-history-snapshot") { testMirrorOnlineRetainsHistory(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--partition-history-snapshot") { testPartitionRaftLiveCopies(); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--raft-snapshot-stream") {
             std::fprintf(stderr, "[cluster] testBlobReadPinDefersGcDeletion\n");
             testBlobReadPinDefersGcDeletion();
@@ -6680,6 +9096,33 @@ int main(int argc, char** argv) {
             runDeterministicClusterSoak(seed, rounds, executable);
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-learners") {
+            testRaftLearnerValidationAndStaticMembership();
+            testRaftLearnerEngineApi();
+            testRaftLearnerLifecycle();
+            testRaftLearnerLifecycle(true);
+            testRaftLearnersNeverSupplyQuorum();
+            testRaftLearnerPromotionCrashRecovery(executable);
+            return 0;
+        }
+        if (argc == 4 && std::string_view{argv[1]} == "--learner-promotion-crash-writer") {
+            return runLearnerPromotionCrashWriter(argv[2], argv[3]);
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-parallelism") {
+            testTargetedAckMatchesRequest();
+            testRollbackControlSerialization();
+            testStripeMetadataParallelism(false);
+            testStripeMetadataParallelism(true);
+            testStripeEngineIndependentKeys(false);
+            testStripeEngineIndependentKeys(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-log-delta") {
+            testRaftLogDeltaIndex();
+            testRaftSegmentedLogRecovery(executable);
+            testRaftLogTrailingBytesRecoveryPolicy();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--stripe-concurrency") {
             testStripeFailureAndConcurrentReads();
             return 0;
@@ -6688,10 +9131,23 @@ int main(int argc, char** argv) {
             testStripeReadRepairStatistics();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-rollback") {
+            testStripeDistributedRollback();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-rollback") {
+            testGlobalStreamDistributedRollback();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--stripe-degraded-rebuild") {
+            std::fprintf(stderr, "[stripe degraded] degraded write and automatic rebuild\n");
             testStripeEngineDegradedWriteAndAutomaticRebuild();
+            std::fprintf(stderr, "[stripe degraded] metadata leader automatic rebuild\n");
             testStripeMetadataLeaderAutomaticRebuild();
+            std::fprintf(stderr, "[stripe degraded] metadata Raft leader failover\n");
             testStripeMetadataRaftLeaderFailover();
+            std::fprintf(stderr, "[stripe degraded] RAID.6 two failures\n");
+            testRaid6PresetMetadataQuorumSurvivesTwoFailures();
             return 0;
         }
         if (argc == 2 && std::string_view{argv[1]} == "--raid0") {
@@ -6704,8 +9160,48 @@ int main(int argc, char** argv) {
             testRaid1PresetMirroringAndRebuild();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid5") {
+            testRaid5PresetDegradedWriteAndRead();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid6") {
+            testRaid6PresetMetadataQuorumSurvivesTwoFailures();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raid10") {
+            testRaid10PresetMirroredStripeAndRebuild();
+            testRaid10HotSpareReplacementAndNoFailback();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--routing") {
+            std::fprintf(stderr, "[cluster] routing framing/validation\n");
+            testForwardFraming();
+            std::fprintf(stderr, "[cluster] routing PARTITIONED PLAIN\n");
+            testNativePartitionRouting(false);
+            std::fprintf(stderr, "[cluster] routing PARTITIONED SECURE\n");
+            testNativePartitionRouting(true);
+            std::fprintf(stderr, "[cluster] routing Raft PLAIN/learner\n");
+            testNativeRaftRouting(false);
+            std::fprintf(stderr, "[cluster] routing Raft SECURE/learner\n");
+            testNativeRaftRouting(true);
+            std::fprintf(stderr, "[cluster] routing MIRROR strict ACK\n");
+            testNativeMirrorAckForwarding();
+            std::fprintf(stderr, "[cluster] routing timeout/no replay\n");
+            testForwardTimeoutNeverReplays();
+            std::fprintf(stderr, "[cluster] routing Raft admission budget\n");
+            testRaftForwardAdmissionBudget();
+            std::fprintf(stderr, "[cluster] routing STRIPE write/read coordinator\n");
+            testStripeEngineOwnerOnlyWritesAndCoordinatorReads();
+            std::fprintf(stderr, "[cluster] routing MIRROR quorum authority/ASYNC data\n");
+            testMirrorFencingEngineApi();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--partitioned-owner-read") {
             testPartitionedEngineOwnerLinearizableRead();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--partitioned-rollback") {
+            testPartitionedDistributedRollback();
             return 0;
         }
         if (argc == 2 && std::string_view{argv[1]} == "--lease-renewal") {
@@ -6718,6 +9214,34 @@ int main(int argc, char** argv) {
             testNonRaftMirrorRejectsSecondPrimary();
             testNonRaftPrimaryReusesGroupStateAfterRestart();
             testNonRaftMirrorOfflinePromotion();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--mirror-completion-recovery") {
+            testMirrorQuorumCompletionRecovery();
+            testMirrorQuorumCompletionRecovery(false);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--placement-options-secure") { testStripePlacementOptions(true); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--mirror-recovery") {
+            testMirrorRecoveryValidation();
+            testMirrorManualRecovery(ConsistencyMode::ASYNC);
+            testMirrorManualRecovery(ConsistencyMode::PRIMARY_ACK);
+            testMirrorAutomaticRecovery();
+            testMirrorRecoveryEngineApi();
+            testMirrorQuorumPromotion(true);
+            testMirrorQuorumCompletionRecovery();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--mirror-fencing") {
+            testMirrorFencingValidation();
+            testNonRaftMirrorOfflinePromotion();
+            testMirrorQuorumFencing();
+            testMirrorQuorumFencing(true);
+            testMirrorQuorumPromotion(false);
+            testMirrorQuorumPromotion(true);
+            testMirrorQuorumCompletionRecovery();
+            testMirrorQuorumCompletionRecovery(false);
+            testMirrorFencingEngineApi();
             return 0;
         }
         if (argc == 2 && std::string_view{argv[1]} == "--runtime-lifecycle") {
@@ -6775,6 +9299,8 @@ int main(int argc, char** argv) {
             if (argc == 2) { return 0; }
         }
         if (argc == 1 || (argc == 2 && std::string_view{argv[1]} == "--cluster-hardening")) {
+            runClusterAuthorityContractTests();
+            runClusterQueryResourceTests();
             std::fprintf(stderr, "[cluster] endpoint and pin validation\n");
             testClusterEndpointAndPinValidation();
             testSecureReplicationRequiresPeerPins();
@@ -6851,12 +9377,20 @@ int main(int argc, char** argv) {
         testRaid0PresetStorageAndFailure();
         std::fprintf(stderr, "[cluster] testRaid1PresetMirroringAndRebuild\n");
         testRaid1PresetMirroringAndRebuild();
+        std::fprintf(stderr, "[cluster] testRaid5PresetDegradedWriteAndRead\n");
+        testRaid5PresetDegradedWriteAndRead();
+        std::fprintf(stderr, "[cluster] testRaid10PresetMirroredStripeAndRebuild\n");
+        testRaid10PresetMirroredStripeAndRebuild();
+        std::fprintf(stderr, "[cluster] testRaid10HotSpareReplacementAndNoFailback\n");
+        testRaid10HotSpareReplacementAndNoFailback();
         std::fprintf(stderr, "[cluster] testStripeOwnerFailoverAndHandoff\n");
         testStripeOwnerFailoverAndHandoff();
         std::fprintf(stderr, "[cluster] testStripeMetadataLeaderAutomaticRebuild\n");
         testStripeMetadataLeaderAutomaticRebuild();
         std::fprintf(stderr, "[cluster] testStripeMetadataRaftLeaderFailover\n");
         testStripeMetadataRaftLeaderFailover();
+        std::fprintf(stderr, "[cluster] testRaid6PresetMetadataQuorumSurvivesTwoFailures\n");
+        testRaid6PresetMetadataQuorumSurvivesTwoFailures();
         std::fprintf(stderr, "[cluster] testRaftSegmentedLogRecovery\n");
         testRaftSegmentedLogRecovery(executable);
         if (argc == 2 && std::string_view{argv[1]} == "--storage") { return 0; }
@@ -6879,13 +9413,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[cluster] testPartitionedRuntimeOwnerOnlyReplication\n");
         testPartitionedRuntimeOwnerOnlyReplication();
         std::fprintf(stderr, "[cluster] testPartitionedEngineOwnerLinearizableRead\n");
+        testForwardFraming();
+        testNativePartitionRouting(false);
+        testNativePartitionRouting(true);
+        testNativeRaftRouting(false);
+        testNativeRaftRouting(true);
+        testNativeMirrorAckForwarding();
+        testForwardTimeoutNeverReplays();
+        testRaftForwardAdmissionBudget();
         testPartitionedEngineOwnerLinearizableRead();
+        std::fprintf(stderr, "[cluster] testPartitionedDistributedRollback\n");
+        testPartitionedDistributedRollback();
         std::fprintf(stderr, "[cluster] testStripeEngineOwnerOnlyWritesAndCoordinatorReads\n");
         testStripeEngineOwnerOnlyWritesAndCoordinatorReads();
+        std::fprintf(stderr, "[cluster] testStripeDistributedRollback\n");
+        testStripeDistributedRollback();
+        std::fprintf(stderr, "[cluster] testGlobalStreamDistributedRollback\n");
+        testGlobalStreamDistributedRollback();
         std::fprintf(stderr, "[cluster] testStripeEngineDegradedWriteAndAutomaticRebuild\n");
         testStripeEngineDegradedWriteAndAutomaticRebuild();
-        std::fprintf(stderr, "[cluster] testStripeEngineRejectsOnlineReconfiguration\n");
-        testStripeEngineRejectsOnlineReconfiguration();
+        std::fprintf(stderr, "[cluster] testStripeEngineRejectsForeignConfiguration\n");
+        testStripeEngineRejectsForeignConfiguration();
         std::fprintf(stderr, "[cluster] testClusterManagerRecoversPrimaryLeaseFromManifest\n");
         testClusterManagerRecoversPrimaryLeaseFromManifest();
         std::fprintf(stderr, "[cluster] testClusterManagerIgnoresExpiredManifestPrimaryLease\n");
@@ -6910,6 +9458,12 @@ int main(int argc, char** argv) {
         testErsCodecRecovery();
         std::fprintf(stderr, "[cluster] testRaftElectionAndLoopbackReplication\n");
         testRaftElectionAndLoopbackReplication();
+        std::fprintf(stderr, "[cluster] Raft pre-vote\n");
+        testRaftPreVoteWireContract();
+        testRaftPreVoteRejectsStaleLog();
+        testRaftPreVoteDiscardsProbeAfterHeartbeat();
+        testRaftPreVoteIsolationAndRecovery();
+        testRaftPreVoteIsolationAndRecovery(true);
         std::fprintf(stderr, "[cluster] testRaftRejectsForeignClusterIdentity\n");
         testRaftRejectsForeignClusterIdentity();
         std::fprintf(stderr, "[cluster] testRaftRejectsBlobPolicyMismatch\n");
@@ -6931,6 +9485,13 @@ int main(int argc, char** argv) {
         testRaftLeaderTransfer();
         std::fprintf(stderr, "[cluster] testRaftOnlineMembershipChange\n");
         testRaftOnlineMembershipChange();
+        std::fprintf(stderr, "[cluster] Raft learner lifecycle and quorum\n");
+        testRaftLearnerValidationAndStaticMembership();
+        testRaftLearnerEngineApi();
+        testRaftLearnerLifecycle();
+        testRaftLearnerLifecycle(true);
+        testRaftLearnersNeverSupplyQuorum();
+        testRaftLearnerPromotionCrashRecovery(executable);
         std::fprintf(stderr, "[cluster] testPrimaryAckPathStillUsesLegacyRuntime\n");
         testPrimaryAckPathStillUsesLegacyRuntime();
         std::fprintf(stderr, "[cluster] testReplicationServerStreamsSnapshotCatchupThroughBoundedQueue\n");
@@ -6971,6 +9532,19 @@ int main(int argc, char** argv) {
         testNonRaftPrimaryReusesGroupStateAfterRestart();
         std::fprintf(stderr, "[cluster] testNonRaftMirrorOfflinePromotion\n");
         testNonRaftMirrorOfflinePromotion();
+        testMirrorFencingValidation();
+        testMirrorQuorumFencing();
+        testMirrorQuorumFencing(true);
+        testMirrorQuorumPromotion(false);
+        testMirrorQuorumPromotion(true);
+        testMirrorQuorumCompletionRecovery();
+        testMirrorQuorumCompletionRecovery(false);
+        testMirrorFencingEngineApi();
+        testMirrorRecoveryValidation();
+        testMirrorManualRecovery(ConsistencyMode::ASYNC);
+        testMirrorManualRecovery(ConsistencyMode::PRIMARY_ACK);
+        testMirrorAutomaticRecovery();
+        testMirrorRecoveryEngineApi();
         std::fprintf(stderr, "[cluster] testClusterRuntimeRejectsUnknownReplicaFromAckQuorum\n");
         testClusterRuntimeRejectsUnknownReplicaFromAckQuorum();
         std::fprintf(stderr, "[cluster] testClusterRuntimeRejectsDuplicateReplicaFromAckQuorum\n");
@@ -6989,6 +9563,7 @@ int main(int argc, char** argv) {
         testRaftLogBlobPolicyExternalizesEngineValue();
         std::fprintf(stderr, "[cluster] testRaftEngineLeaderAppliesMutationOnce\n");
         testRaftEngineLeaderAppliesMutationOnce();
+        runNativeClusterQueryTests();
         std::fprintf(stderr, "[cluster] testRaftEngineLeadershipTransferApi\n");
         testRaftEngineLeadershipTransferApi();
         std::fprintf(stderr, "[cluster] testRaftEngineLargeBlobSnapshotCatchUp\n");

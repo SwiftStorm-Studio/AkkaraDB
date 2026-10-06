@@ -8,7 +8,9 @@
  */
 
 // akkengine/src/engine/cluster/ReplicationServer.cpp
+#include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include "akk/engine/cluster/ReplicationServer.hpp"
+#include "akk/engine/cluster/detail/BoundedExecutor.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -330,6 +333,10 @@ namespace akkaradb::engine::cluster {
         struct BufferedWire {
             uint64_t seq = 0;
             detail::MessagePtr wire;
+            std::optional<std::vector<uint64_t>> targets;
+            [[nodiscard]] uint64_t retainedBytes() const {
+                return wire->size() + sizeof(BufferedWire) + (targets ? targets->size() * sizeof(uint64_t) : 0);
+            }
         };
 
         enum class ReplicaPhase : uint8_t {
@@ -341,6 +348,8 @@ namespace akkaradb::engine::cluster {
             SocketHandle sock = BAD_SOCKET;
             std::unique_ptr<crypto::SecureSession> secure;
             uint64_t nodeId = 0;
+            std::shared_ptr<ReplicationServer::PeerSession> session = std::make_shared<ReplicationServer::PeerSession>();
+            std::unordered_map<uint64_t, std::shared_ptr<std::atomic<bool>>> pendingTargetAcks;
             std::atomic<uint64_t> lastAckedSeq{0};
             std::atomic<uint8_t> lastAckStage{static_cast<uint8_t>(AckStage::DURABLE)};
             std::atomic<uint64_t> lastSuccessfulContactAtUs{0};
@@ -371,6 +380,12 @@ namespace akkaradb::engine::cluster {
                 std::shared_ptr<void> reservation;
             };
             std::optional<PendingStripeControl> pendingStripeControl;
+            struct PendingForward {
+                ForwardRequest request;
+                std::shared_ptr<void> reservation;
+                std::chrono::steady_clock::time_point deadline;
+            };
+            std::deque<PendingForward> pendingForwards;
 
             ~ReplicaState() { closeSocket(sock); }
         };
@@ -383,8 +398,10 @@ namespace akkaradb::engine::cluster {
             std::function<uint64_t()> getCurrentSeq;
             HistoryProvider historyProvider;
             SnapshotProvider snapshotProvider;
+            EntryTargets entryTargets;
             ReadCallback readCallback;
             StripeControlCallback stripeControlCallback;
+            ForwardCallback forwardCallback;
             AckPolicy ackPolicy;
             ConsistencyOptions consistency;
             uint16_t configuredReplicaCount = 0;
@@ -419,6 +436,17 @@ namespace akkaradb::engine::cluster {
             std::mutex ackMutex;
             std::condition_variable ackCv;
             std::unordered_set<uint64_t> lagBlockedReplicas;
+            std::unique_ptr<detail::BoundedExecutor> stripeControlExecutor;
+
+            static bool targetsNode(const std::optional<std::vector<uint64_t>>& targets, uint64_t nodeId) {
+                return !targets || std::ranges::find(*targets, nodeId) != targets->end();
+            }
+
+            bool sendsKeyTo(std::span<const uint8_t> key, uint64_t nodeId) const {
+                if (!entryTargets) { return true; }
+                const auto targets = entryTargets(key);
+                return std::ranges::find(targets, nodeId) != targets.end();
+            }
 
             bool queueHasCapacityLocked(const ReplicaState& replica, size_t wireSize) const noexcept {
                 if (runtimeOptions.maxReplicaQueueFrames != 0 && replica.queue.size() >= runtimeOptions.maxReplicaQueueFrames) { return false; }
@@ -478,6 +506,7 @@ namespace akkaradb::engine::cluster {
                 running.store(true);
                 reaperStopping.store(false);
                 try {
+                    stripeControlExecutor = std::make_unique<detail::BoundedExecutor>(4, 64);
                     reaperThread = std::thread([this] { reapLoop(); });
                     for (size_t i = 0; i < HANDSHAKE_WORKERS; ++i) {
                         handshakeWorkers.emplace_back([this] { handshakeLoop(); });
@@ -521,6 +550,7 @@ namespace akkaradb::engine::cluster {
                 reaperStopping.store(true);
                 reaperCv.notify_all();
                 if (reaperThread.joinable()) { reaperThread.join(); }
+                stripeControlExecutor.reset();
             }
 
             void reapLoop() {
@@ -646,15 +676,19 @@ namespace akkaradb::engine::cluster {
                 if (hello.role != NodeRole::REPLICA) {
                     return false;
                 }
+                if (hello.clusterId != runtimeOptions.replicationClusterId ||
+                    hello.configFingerprint != runtimeOptions.replicationConfigFingerprint) { return false; }
+                if (hello.mirrorFencingMode != runtimeOptions.mirrorFencing.mode ||
+                    (hello.forceSnapshot && hello.mirrorFencingMode == MirrorFencingMode::STATIC)) { return false; }
                 if (hello.groupId != 0 && hello.groupId != runtimeOptions.clusterGroupId) {
                     return false;
                 }
                 if (hello.groupEpoch != 0 && hello.groupEpoch != runtimeOptions.clusterGroupEpoch) {
                     return false;
                 }
-                if (!configuredReplicaNodeIds.empty() && std::ranges::find(configuredReplicaNodeIds, hello.nodeId) ==
-                    configuredReplicaNodeIds.end()) {
-                    return false;
+                {
+                    std::lock_guard lock{replicasMutex};
+                    if (!configuredReplicaNodeIds.empty() && !std::ranges::contains(configuredReplicaNodeIds, hello.nodeId)) { return false; }
                 }
                 if (secure) {
                     const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId);
@@ -672,6 +706,9 @@ namespace akkaradb::engine::cluster {
                 ServerHello response{};
                 response.nodeId = selfNodeId;
                 response.role = NodeRole::PRIMARY;
+                response.mirrorFencingMode = runtimeOptions.mirrorFencing.mode;
+                response.clusterId = runtimeOptions.replicationClusterId;
+                response.configFingerprint = runtimeOptions.replicationConfigFingerprint;
                 {
                     std::lock_guard lock{replicasMutex};
                     const auto duplicate = std::ranges::find_if(
@@ -710,8 +747,8 @@ namespace akkaradb::engine::cluster {
                     replicas.push_back(replica);
                 }
                 try {
-                    replica->bootstrapThread = std::thread([this, replica, lastSeq = hello.lastSeq] {
-                        bootstrapLoop(replica, lastSeq);
+                    replica->bootstrapThread = std::thread([this, replica, lastSeq = hello.lastSeq, forceSnapshot = hello.forceSnapshot] {
+                        bootstrapLoop(replica, lastSeq, forceSnapshot);
                     });
                 }
                 catch (...) { requestReplicaStop(replica); }
@@ -730,18 +767,19 @@ namespace akkaradb::engine::cluster {
                 return false;
             }
 
-            void bootstrapLoop(const std::shared_ptr<ReplicaState>& replica, uint64_t lastSeq) noexcept {
+            void bootstrapLoop(const std::shared_ptr<ReplicaState>& replica, uint64_t lastSeq, bool forceSnapshot) noexcept {
                 bool resyncRequired = false;
                 try {
                     uint64_t cursor = lastSeq;
                     while (!replica->dead.load() && running.load()) {
-                        if (historyProvider) {
+                        if (historyProvider || forceSnapshot) {
                             uint64_t through = 0;
                             {
                                 std::lock_guard lock{replicasMutex};
                                 through = getCurrentSeq ? getCurrentSeq() : 0;
                             }
-                            if (through <= cursor) {
+                            if (forceSnapshot && through == 0 && cursor == 0) { forceSnapshot = false; }
+                            if (through <= cursor && !forceSnapshot) {
                                 if (!waitForRaid1BootstrapDurable(replica, cursor)) {
                                     resyncRequired = true;
                                     break;
@@ -755,9 +793,9 @@ namespace akkaradb::engine::cluster {
                                 return;
                             }
 
-                            const auto entries = historyProvider(cursor, through);
+                            const auto entries = forceSnapshot || !historyProvider ? std::nullopt : historyProvider(cursor, through);
                             if (!entries) {
-                                if (consistency.replicaLagAction != ReplicaLagAction::ASYNC_RESYNC || !snapshotProvider) {
+                                if ((!forceSnapshot && consistency.replicaLagAction != ReplicaLagAction::ASYNC_RESYNC) || !snapshotProvider) {
                                     resyncRequired = true;
                                     break;
                                 }
@@ -774,18 +812,23 @@ namespace akkaradb::engine::cluster {
                                 }
                                 uint64_t streamedEntries = 0;
                                 std::unique_ptr<detail::SnapshotMessageBuilder> snapshotEntry;
+                                bool skippingEntry = false;
                                 const ReplicationServer::Snapshot::EntryVisitor snapshotVisitor{
                                     .beginEntry = [&](std::span<const uint8_t> key, uint64_t valueSize, uint32_t) {
-                                        if (snapshotEntry || streamedEntries == UINT64_MAX) { return false; }
+                                        if (snapshotEntry || skippingEntry || streamedEntries == UINT64_MAX) { return false; }
+                                        skippingEntry = !sendsKeyTo(key, replica->nodeId);
+                                        if (skippingEntry) { return true; }
                                         snapshotEntry = detail::beginSnapshotMessage(key, valueSize, transferBudget);
                                         return true;
                                     },
                                     .appendValueChunk = [&](uint64_t offset, std::span<const uint8_t> chunk) {
+                                        if (skippingEntry) { return true; }
                                         if (!snapshotEntry) { return false; }
                                         snapshotEntry->appendValueChunk(offset, chunk);
                                         return true;
                                     },
                                     .finishEntry = [&] {
+                                        if (skippingEntry) { skippingEntry = false; return true; }
                                         if (!snapshotEntry) { return false; }
                                         auto message = snapshotEntry->finish();
                                         snapshotEntry.reset();
@@ -795,7 +838,15 @@ namespace akkaradb::engine::cluster {
                                     },
                                     .fileEntryThresholdBytes = transferBudget->options.thresholdBytes,
                                     .fileEntry = [&](const SnapshotFileEntry& entry) {
-                                        if (snapshotEntry || streamedEntries == UINT64_MAX) { return false; }
+                                        if (snapshotEntry || skippingEntry || streamedEntries == UINT64_MAX) { return false; }
+                                        if (entryTargets) {
+                                            auto keyMemory = transferBudget->reserve(detail::TransferBudget::Resource::MEMORY, entry.keySize);
+                                            std::ifstream in(entry.path, std::ios::binary);
+                                            in.seekg(static_cast<std::streamoff>(entry.dataOffset));
+                                            std::vector<uint8_t> key(entry.keySize);
+                                            if (!in.read(reinterpret_cast<char*>(key.data()), key.size())) { return false; }
+                                            if (!sendsKeyTo(key, replica->nodeId)) { return true; }
+                                        }
                                         if (!queueBootstrapWire(replica, detail::snapshotFileMessage(entry, transferBudget))) {
                                             return false;
                                         }
@@ -804,20 +855,23 @@ namespace akkaradb::engine::cluster {
                                     },
                                 };
                                 const bool streamed = snapshot->forEachEntry(snapshotVisitor);
-                                if (!streamed) { resyncRequired = true; }
+                                if (!streamed || snapshotEntry || skippingEntry) { resyncRequired = true; }
                                 if (resyncRequired || !queueBootstrapWire(replica, encodeSnapshotEnd(snapshot->seq))) {
                                     resyncRequired = true;
                                     break;
                                 }
                                 cursor = snapshot->seq;
+                                forceSnapshot = false;
                                 continue;
                             }
 
                             uint64_t expected = cursor;
                             for (const auto& entry : *entries) {
-                                if (expected == UINT64_MAX || entry.seq != expected + 1 || entry.seq > through || !queueBootstrapWire(
-                                    replica,
-                                    detail::entryMessage(
+                                if (expected == UINT64_MAX || entry.seq != expected + 1 || entry.seq > through) {
+                                    resyncRequired = true;
+                                    break;
+                                }
+                                if (sendsKeyTo(entry.key, replica->nodeId) && !queueBootstrapWire(replica, detail::entryMessage(
                                         entry.seq,
                                         entry.sourceNodeId,
                                         entry.op,
@@ -825,8 +879,7 @@ namespace akkaradb::engine::cluster {
                                         entry.key,
                                         entry.value,
                                         transferBudget
-                                    )
-                                )) {
+                                    ))) {
                                     resyncRequired = true;
                                     break;
                                 }
@@ -855,7 +908,7 @@ namespace akkaradb::engine::cluster {
                         }
                         for (const auto& entry : buffered) {
                             if (entry.seq <= cursor) { continue; }
-                            if (!queueBootstrapWire(replica, entry.wire)) {
+                            if (targetsNode(entry.targets, replica->nodeId) && !queueBootstrapWire(replica, entry.wire)) {
                                 resyncRequired = true;
                                 break;
                             }
@@ -891,6 +944,7 @@ namespace akkaradb::engine::cluster {
             }
             bool sendFrame(const std::shared_ptr<ReplicaState>& replica, std::span<const uint8_t> wire) {
                 std::lock_guard lock{replica->sendMutex};
+                if (replica->dead.load()) { return false; }
                 try {
                     return replica->secure ? sendSecureFrame(replica->sock, *replica->secure, wire.data(), wire.size(), transferBudget) :
                            sendAll(replica->sock, wire.data(), wire.size());
@@ -919,11 +973,13 @@ namespace akkaradb::engine::cluster {
             }
 
             void requestReplicaStop(const std::shared_ptr<ReplicaState>& replica) {
-                replica->dead.store(true);
+                replica->session->connected.store(false, std::memory_order_release);
+                { std::lock_guard ackLock{ackMutex}; replica->dead.store(true); }
                 replica->transferSession->cancel();
                 if (!replica->shutdownStarted.exchange(true)) { shutdownSocket(replica->sock); }
                 replica->queueCv.notify_all();
                 replica->readCv.notify_all();
+                ackCv.notify_all();
                 reaperCv.notify_all();
             }
 
@@ -933,12 +989,14 @@ namespace akkaradb::engine::cluster {
                 if (replica->sendThread.joinable()) { replica->sendThread.join(); }
                 if (replica->recvThread.joinable()) { replica->recvThread.join(); }
                 if (replica->readThread.joinable()) { replica->readThread.join(); }
+                std::lock_guard sendLock{replica->sendMutex};
                 closeSocket(replica->sock);
                 replica->sock = BAD_SOCKET;
             }
 
             void setReadCallback(ReadCallback callback) { readCallback = std::move(callback); }
             void setStripeControlCallback(StripeControlCallback callback) { stripeControlCallback = std::move(callback); }
+            void setForwardCallback(ForwardCallback callback) { forwardCallback = std::move(callback); }
 
             void sendLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
@@ -982,31 +1040,62 @@ namespace akkaradb::engine::cluster {
                 while (!replica->dead.load()) {
                     std::optional<ReplicaState::PendingRead> pendingRead;
                     std::optional<ReplicaState::PendingStripeControl> pendingControl;
+                    std::optional<ReplicaState::PendingForward> pendingForward;
                     {
                         std::unique_lock lock{replica->readMutex};
                         replica->readCv.wait(lock, [&] {
-                            return replica->dead.load() || replica->pendingRead.has_value() || replica->pendingStripeControl.has_value();
+                            return replica->dead.load() || replica->pendingRead.has_value() || replica->pendingStripeControl.has_value() || !replica->pendingForwards.empty();
                         });
                         if (replica->dead.load()) { return; }
                         if (replica->pendingRead) {
                             pendingRead = std::move(replica->pendingRead);
                             replica->pendingRead.reset();
                         }
-                        else {
+                        else if (replica->pendingStripeControl) {
                             pendingControl = std::move(replica->pendingStripeControl);
                             replica->pendingStripeControl.reset();
                         }
+                        else {
+                            pendingForward = std::move(replica->pendingForwards.front());
+                            replica->pendingForwards.pop_front();
+                        }
                     }
                     try {
+                        if (pendingForward) {
+                            ForwardResponse response;
+                            response.errorCode = ClusterRoutingCode::FORWARD_UNAVAILABLE;
+                            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                pendingForward->deadline - std::chrono::steady_clock::now()).count();
+                            if (forwardCallback && remaining > 0) {
+                                pendingForward->request.timeoutMs = static_cast<uint32_t>(remaining);
+                                try { response = forwardCallback(pendingForward->request); }
+                                catch (const ClusterRoutingError& error) {
+                                    response.errorCode = error.code; response.target = error.target; response.message = error.what();
+                                }
+                                catch (const std::exception& error) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; response.message = error.what(); }
+                                catch (...) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; }
+                            }
+                            response.requestId = pendingForward->request.requestId;
+                            response.message.resize(std::min<size_t>(4096, response.message.size()));
+                            auto wire = encodeForwardResponse(response);
+                            if (wire.empty()) {
+                                response = {}; response.requestId = pendingForward->request.requestId;
+                                response.errorCode = ClusterRoutingCode::PAYLOAD_TOO_LARGE;
+                                wire = encodeForwardResponse(response);
+                            }
+                            const auto message = detail::messageFromWire(std::move(wire), transferBudget);
+                            if (sendTo(replica, *message)) { continue; }
+                        }
                         if (pendingRead && handleReadRequest(replica, pendingRead->request)) { continue; }
                         if (pendingControl) {
                             StripeControlResponse response;
                             if (stripeControlCallback) {
-                                response = stripeControlCallback(replica->nodeId, pendingControl->request);
+                                response = stripeControlCallback(replica->nodeId, pendingControl->request, replica->session);
                             }
                             response.requestId = pendingControl->request.requestId;
                             const auto wire = encodeStripeControlResponse(response);
-                            if (sendFrame(replica, wire)) { continue; }
+                            const auto message = detail::messageFromWire(wire, transferBudget);
+                            if (sendTo(replica, *message)) { continue; }
                         }
                     }
                     catch (...) {}
@@ -1015,11 +1104,29 @@ namespace akkaradb::engine::cluster {
             }
 
             void recvLoop(const std::shared_ptr<ReplicaState>& replica) {
+                const auto receiveAck = [&](const auto& frame) {
+                    if (frame.type != ReplMsgType::ACK) { return false; }
+                    ReplAck ack;
+                    if (!decodeAck(frame.payload, ack)) { return false; }
+                    {
+                        std::lock_guard lock{replicasMutex};
+                        replica->lastAckedSeq.store(ack.seq);
+                        replica->lastAckStage.store(static_cast<uint8_t>(ack.stage));
+                        if (ack.stage >= ackPolicy.stage) {
+                            const auto pending = replica->pendingTargetAcks.find(ack.seq);
+                            if (pending != replica->pendingTargetAcks.end()) {
+                                std::lock_guard ackLock{ackMutex}; pending->second->store(true);
+                            }
+                        }
+                    }
+                    ackCv.notify_all();
+                    return true;
+                };
                 while (!replica->dead.load()) {
                     detail::MessagePtr message;
                     try { message = detail::receiveMessage(transferBudget, replica->transferSession, [&](DecodedFrame& part) {
                         return recvFrameFrom(replica->sock, replica->secure.get(), part);
-                    }, [&](std::span<const uint8_t> wire) { return sendFrame(replica, wire); }); } catch (...) {}
+                    }, [&](std::span<const uint8_t> wire) { return sendFrame(replica, wire); }, receiveAck); } catch (...) {}
                     if (!message) { break; }
                     const auto& frame = *message;
                     replica->lastSuccessfulContactAtUs.store(contactNowUs(), std::memory_order_relaxed);
@@ -1038,6 +1145,22 @@ namespace akkaradb::engine::cluster {
                         replica->readCv.notify_one();
                         continue;
                     }
+                    if (frame.type == ReplMsgType::FORWARD_REQUEST) {
+                        ReplicaState::PendingForward pending;
+                        try {
+                            pending.reservation = transferBudget->reserve(detail::TransferBudget::Resource::MEMORY, forwardRequestMemoryBytes(frame.payload));
+                            if (!decodeForwardRequest(frame.payload, pending.request)) { break; }
+                        }
+                        catch (...) { break; }
+                        pending.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(pending.request.timeoutMs);
+                        {
+                            std::lock_guard lock{replica->readMutex};
+                            if (replica->pendingForwards.size() >= 64) { break; }
+                            replica->pendingForwards.push_back(std::move(pending));
+                        }
+                        replica->readCv.notify_one();
+                        continue;
+                    }
                     if (frame.type == ReplMsgType::STRIPE_CONTROL_REQUEST) {
                         ReplicaState::PendingStripeControl pending;
                         try {
@@ -1045,80 +1168,112 @@ namespace akkaradb::engine::cluster {
                             if (!decodeStripeControlRequest(frame.payload, pending.request)) { break; }
                         }
                         catch (...) { break; }
-                        {
-                            std::lock_guard lock{replica->readMutex};
-                            if (replica->pendingStripeControl) { break; }
-                            replica->pendingStripeControl = std::move(pending);
+                        try {
+                            const auto action = pending.request.action;
+                            if (action == StripeControlAction::ROLLBACK_WATERMARK || action == StripeControlAction::ROLLBACK_KEY ||
+                                action == StripeControlAction::ROLLBACK_STREAM || action == StripeControlAction::ROLLBACK_APPLY) {
+                                std::lock_guard lock{replica->readMutex};
+                                if (replica->pendingStripeControl) { break; }
+                                replica->pendingStripeControl = std::move(pending);
+                                replica->readCv.notify_one();
+                            }
+                            else if (!stripeControlExecutor->trySubmit([this, replica, pending = std::move(pending)] {
+                                if (replica->dead.load()) { return; }
+                                try {
+                                    StripeControlResponse response;
+                                    if (stripeControlCallback) { response = stripeControlCallback(replica->nodeId, pending.request, replica->session); }
+                                    response.requestId = pending.request.requestId;
+                                    const auto message = detail::messageFromWire(encodeStripeControlResponse(response), transferBudget);
+                                    if (sendTo(replica, *message)) { return; }
+                                }
+                                catch (...) { /* A failed request closes the connection and wakes all client waiters. */ }
+                                requestReplicaStop(replica);
+                            })) { break; }
                         }
-                        replica->readCv.notify_one();
+                        catch (...) { break; }
                         continue;
                     }
-                    if (frame.type != ReplMsgType::ACK) { break; }
-                    ReplAck ack;
-                    if (!decodeAck(frame.payload, ack)) { break; }
-                    replica->lastAckedSeq.store(ack.seq);
-                    replica->lastAckStage.store(static_cast<uint8_t>(ack.stage));
-                    ackCv.notify_all();
+                    if (!receiveAck(frame)) { break; }
                 }
                 requestReplicaStop(replica);
             }
 
-            void enqueueWire(uint64_t seq, detail::MessagePtr wire, bool retainForCatchup) {
+            void enqueueWire(uint64_t seq, detail::MessagePtr wire, bool retainForCatchup,
+                std::optional<std::vector<uint64_t>> targets = {}) {
                 if (!wire) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
                 {
                     std::lock_guard lock{replicasMutex};
-                    if (seq != 0 && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES && !lagBlockedReplicas.empty()) {
+                    if (seq != 0 && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES &&
+                        std::ranges::any_of(lagBlockedReplicas, [&](uint64_t id) { return targetsNode(targets, id); })) {
                         throw std::runtime_error("ReplicationServer: write blocked by lagging replica");
                     }
                     if (retainForCatchup && !historyProvider) {
-                        entryBuffer.push_back(BufferedWire{seq, wire});
-                        entryBufferBytes += wire->size();
+                        entryBuffer.push_back(BufferedWire{seq, wire, targets});
+                        entryBufferBytes += entryBuffer.back().retainedBytes();
                         const auto limit = std::min(transferBudget->options.maxMemoryBytes, transferBudget->options.maxSpoolBytes) / 4;
                         while (entryBuffer.size() > ENTRY_BUFFER_SIZE || entryBufferBytes > limit) {
-                            entryBufferBytes -= entryBuffer.front().wire->size();
+                            entryBufferBytes -= entryBuffer.front().retainedBytes();
                             entryBuffer.pop_front();
                         }
                     }
                     for (auto& replica : replicas) {
-                        if (!replica->dead.load() && replica->phase == ReplicaPhase::LIVE) {
+                        if (!replica->dead.load() && replica->phase == ReplicaPhase::LIVE && targetsNode(targets, replica->nodeId)) {
                             (void)queueLiveWireLocked(replica, wire);
                         }
                     }
                 }
-                if (!waitForAcks(seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.ackTimeoutAction ==
+                if (!waitForAcks(seq, targets) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.ackTimeoutAction ==
                     AckTimeoutAction::FAIL_WRITE)) { throw std::runtime_error("ReplicationServer: write acknowledgement timeout"); }
             }
 
             void enqueueWireTo(uint64_t targetNodeId, uint64_t seq, detail::MessagePtr wire, bool waitForAck) {
                 if (!wire) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
+                const bool requiresAck = waitForAck && ackPolicy.mode != AckPolicyMode::NONE && seq != 0;
+                auto completed = std::make_shared<std::atomic<bool>>(false);
+                std::shared_ptr<ReplicaState> target;
                 {
                     std::lock_guard lock{replicasMutex};
-                    const auto it = std::ranges::find_if(
-                        replicas,
-                        [targetNodeId](const std::shared_ptr<ReplicaState>& replica) {
-                            return !replica->dead.load() && replica->phase == ReplicaPhase::LIVE && replica->nodeId == targetNodeId;
-                        }
-                    );
+                    const auto it = std::ranges::find_if(replicas, [targetNodeId](const auto& replica) {
+                        return !replica->dead.load() && replica->phase == ReplicaPhase::LIVE && replica->nodeId == targetNodeId;
+                    });
                     if (it == replicas.end()) { throw std::runtime_error("ReplicationServer: target replica is not connected"); }
-                    if (!queueLiveWireLocked(*it, wire)) { throw std::runtime_error("ReplicationServer: target replica queue is full"); }
+                    target = *it;
+                    if (requiresAck && (target->pendingTargetAcks.size() >= 64 ||
+                        !target->pendingTargetAcks.emplace(seq, completed).second)) {
+                        throw std::runtime_error("ReplicationServer: target ACK queue is full or request id is in use");
+                    }
+                    if (!queueLiveWireLocked(target, wire)) {
+                        if (requiresAck) { target->pendingTargetAcks.erase(seq); }
+                        throw std::runtime_error("ReplicationServer: target replica queue is full");
+                    }
                 }
-                if (!waitForAck) { return; }
-                if (!waitForTargetAck(targetNodeId, seq) && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK || consistency.
-                    ackTimeoutAction == AckTimeoutAction::FAIL_WRITE)) {
+                if (!requiresAck) { return; }
+                const auto deadline = detail::ReconfigurationDeadline::cap(std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs));
+                {
+                    std::unique_lock lock{ackMutex};
+                    ackCv.wait_until(lock, deadline, [&] { return completed->load() || target->dead.load(); });
+                }
+                {
+                    std::lock_guard lock{replicasMutex}; target->pendingTargetAcks.erase(seq);
+                }
+                // Targeted requests can be enqueued out of sequence by different
+                // keys. A later request's ACK cannot prove this request durable.
+                if (!completed->load() && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK ||
+                    consistency.ackTimeoutAction == AckTimeoutAction::FAIL_WRITE)) {
                     throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
                 }
             }
 
-            bool waitForAcks(uint64_t seq) {
-                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return true; }
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs);
+            bool waitForAcks(uint64_t seq, const std::optional<std::vector<uint64_t>>& targets) {
+                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0 || (targets && targets->empty())) { return true; }
+                const auto deadline = detail::ReconfigurationDeadline::cap(std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs));
                 while (std::chrono::steady_clock::now() < deadline) {
                     size_t live = 0;
                     size_t acked = 0;
                     {
                         std::lock_guard lock{replicasMutex};
                         for (const auto& replica : replicas) {
-                            if (!replica->dead.load() && replica->phase == ReplicaPhase::LIVE) {
+                            if (!replica->dead.load() && replica->phase == ReplicaPhase::LIVE && targetsNode(targets, replica->nodeId)) {
                                 ++live;
                                 const uint64_t ackSeq = replica->lastAckedSeq.load();
                                 const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
@@ -1129,7 +1284,7 @@ namespace akkaradb::engine::cluster {
 
                     const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS
                                         ? (consistency.writeConsistency == WriteConsistency::ALL_CONFIGURED
-                                               ? acked >= configuredReplicaCount
+                                               ? acked >= (targets ? targets->size() : configuredReplicaCount)
                                                : consistency.writeConsistency == WriteConsistency::AVAILABLE_REPLICAS
                                                      ? acked >= live
                                                      : live > 0 && acked >= live)
@@ -1142,7 +1297,7 @@ namespace akkaradb::engine::cluster {
                 if (consistency.writeConsistency == WriteConsistency::AVAILABLE_REPLICAS) {
                     std::lock_guard lock{replicasMutex};
                     for (const auto& replica : replicas) {
-                        if (replica->dead.load() || replica->phase != ReplicaPhase::LIVE) { continue; }
+                        if (replica->dead.load() || replica->phase != ReplicaPhase::LIVE || !targetsNode(targets, replica->nodeId)) { continue; }
                         const uint64_t ackSeq = replica->lastAckedSeq.load();
                         const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
                         if (ackSeq < seq || (ackSeq == seq && ackStage < ackPolicy.stage)) {
@@ -1154,25 +1309,7 @@ namespace akkaradb::engine::cluster {
                 return false;
             }
 
-            bool waitForTargetAck(uint64_t targetNodeId, uint64_t seq) {
-                if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0) { return true; }
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs);
-                while (std::chrono::steady_clock::now() < deadline) {
-                    {
-                        std::lock_guard lock{replicasMutex};
-                        for (const auto& replica : replicas) {
-                            if (replica->dead.load() || replica->phase != ReplicaPhase::LIVE || replica->nodeId != targetNodeId) { continue; }
-                            const uint64_t ackSeq = replica->lastAckedSeq.load();
-                            const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
-                            if (ackSeq > seq || (ackSeq == seq && ackStage >= ackPolicy.stage)) { return true; }
-                        }
-                    }
 
-                    std::unique_lock lock{ackMutex};
-                    ackCv.wait_for(lock, std::chrono::milliseconds(50));
-                }
-                return false;
-            }
     };
 
     ReplicationServer::ReplicationServer(std::unique_ptr<Impl> impl) : impl_{std::move(impl)} {}
@@ -1189,7 +1326,8 @@ namespace akkaradb::engine::cluster {
         ClusterRuntimeOptions runtimeOptions,
         HistoryProvider historyProvider,
         SnapshotProvider snapshotProvider,
-        std::shared_ptr<detail::TransferBudget> transferBudget
+        std::shared_ptr<detail::TransferBudget> transferBudget,
+        EntryTargets entryTargets
     ) {
         if (replPort == 0 || selfNodeId == 0) { throw std::invalid_argument("ReplicationServer: nonzero port and node id are required"); }
         runtimeOptions.secure.validatePins();
@@ -1210,8 +1348,18 @@ namespace akkaradb::engine::cluster {
         impl->runtimeOptions = std::move(runtimeOptions);
         impl->historyProvider = std::move(historyProvider);
         impl->snapshotProvider = std::move(snapshotProvider);
+        impl->entryTargets = std::move(entryTargets);
         if (impl->runtimeOptions.transportMode == TransportMode::SECURE) { impl->localIdentity = loadSecureIdentity(impl->runtimeOptions); }
         return std::unique_ptr<ReplicationServer>(new ReplicationServer(std::move(impl)));
+    }
+
+    void ReplicationServer::allowReplica(uint64_t nodeId) {
+        if (nodeId == 0 || nodeId == impl_->selfNodeId) { throw std::invalid_argument("ReplicationServer: invalid admitted replica"); }
+        if (impl_->runtimeOptions.transportMode == TransportMode::SECURE && !pinnedPeerKey(impl_->runtimeOptions, nodeId)) {
+            throw std::invalid_argument("ReplicationServer: admitted replica requires a SECURE peer pin");
+        }
+        std::lock_guard lock{impl_->replicasMutex};
+        if (!std::ranges::contains(impl_->configuredReplicaNodeIds, nodeId)) { impl_->configuredReplicaNodeIds.push_back(nodeId); }
     }
 
     void ReplicationServer::start() { impl_->start(); }
@@ -1220,6 +1368,7 @@ namespace akkaradb::engine::cluster {
     void ReplicationServer::setStripeControlCallback(StripeControlCallback callback) {
         impl_->setStripeControlCallback(std::move(callback));
     }
+    void ReplicationServer::setForwardCallback(ForwardCallback callback) { impl_->setForwardCallback(std::move(callback)); }
 
     void ReplicationServer::shipEntry(
         uint64_t seq,
@@ -1229,7 +1378,8 @@ namespace akkaradb::engine::cluster {
         uint8_t recordFlags,
         uint64_t sourceNodeId
     ) {
-        impl_->enqueueWire(seq, detail::entryMessage(seq, sourceNodeId, op, recordFlags, key, value, impl_->transferBudget), true);
+        auto targets = impl_->entryTargets ? std::optional{impl_->entryTargets(key)} : std::nullopt;
+        impl_->enqueueWire(seq, detail::entryMessage(seq, sourceNodeId, op, recordFlags, key, value, impl_->transferBudget), true, std::move(targets));
     }
 
     void ReplicationServer::shipEntryTo(

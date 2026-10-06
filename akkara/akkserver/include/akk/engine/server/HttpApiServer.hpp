@@ -63,7 +63,8 @@ namespace akkaradb::engine::server {
             void handleConnection(detail::Connection& connection);
             bool readRequest(detail::Connection& connection, ParsedRequest& request, bool& protocolError);
             bool route(detail::Connection& connection, const ParsedRequest& request, std::vector<uint8_t>& valueBuffer);
-            bool sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body);
+            bool sendResponse(detail::Connection& connection, int statusCode, std::span<const uint8_t> body,
+                std::string_view contentType = "application/octet-stream");
             bool sendChunkedResponseHeader(
                 detail::Connection& connection,
                 int statusCode,

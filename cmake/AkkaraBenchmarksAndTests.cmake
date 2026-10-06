@@ -122,6 +122,8 @@ if (TARGET akkaradb_api AND TARGET akkaradb_api_tcp)
 endif ()
 
 set(AKKARADB_COMMON_TEST_TARGETS
+        akkaradb_transaction_smoke_test|benchmarks/smoke/transaction_smoke_test.cpp
+        akkaradb_arena_smoke_test|benchmarks/smoke/arena_smoke_test.cpp
         akkaradb_memtable_throughput_benchmark|benchmarks/throughput/memtable_throughput_benchmark.cpp
         akkaradb_akkengine_bptree_put_benchmark|benchmarks/throughput/akkengine_bptree_put_benchmark.cpp
         akkaradb_wal_throughput_benchmark|benchmarks/throughput/wal_throughput_benchmark.cpp
@@ -209,6 +211,8 @@ if (WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
+        akkaradb_transaction_smoke_test
+        akkaradb_arena_smoke_test
         akkaradb_bptree_mutable_concurrency_stress_test
         akkaradb_cluster_observability_test
         akkaradb_cluster_smoke_test
@@ -227,6 +231,22 @@ list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 
 if (AKKARADB_BUILD_TESTS)
     add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS})
+    if (WIN32 AND BUILD_SHARED_LIBS)
+        add_custom_command(TARGET akkaradb POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_TEST_OUTPUT_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:akkaradb> "${AKKARADB_TEST_OUTPUT_DIR}"
+                COMMENT "Refreshing engine DLL for native tests"
+        )
+        # The import library can stay unchanged after a backend implementation
+        # edit, leaving test executables unlinked and their POST_BUILD unrun.
+        add_custom_command(TARGET akkaradb_cluster POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_TEST_OUTPUT_DIR}"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:akkaradb_cluster> "${AKKARADB_TEST_OUTPUT_DIR}"
+                COMMENT "Refreshing cluster backend DLL for native tests"
+        )
+    endif ()
     foreach (AKKARADB_TEST_TARGET IN LISTS AKKARADB_SMOKE_TEST_TARGETS)
         set_target_properties(${AKKARADB_TEST_TARGET} PROPERTIES
                 RUNTIME_OUTPUT_DIRECTORY "${AKKARADB_TEST_OUTPUT_DIR}"
@@ -258,4 +278,42 @@ if (AKKARADB_BUILD_TESTS)
         endif ()
     endforeach ()
     set_tests_properties(akkaradb_cluster_observability_test PROPERTIES LABELS "cluster;observability" TIMEOUT 90)
+    add_test(NAME akkaradb_raft_learners_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-learners)
+    add_test(NAME akkaradb_mirror_fencing_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --mirror-fencing)
+    add_test(NAME akkaradb_mirror_recovery_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --mirror-recovery)
+    set_tests_properties(akkaradb_mirror_recovery_test PROPERTIES LABELS "cluster;mirror;recovery" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_cluster_routing_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --routing)
+    add_test(NAME akkaradb_raft_prevote_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-prevote)
+    add_test(NAME akkaradb_cluster_queries_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --cluster-queries)
+    add_test(NAME akkaradb_cluster_authority_contract_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --authority-contract)
+    add_test(NAME akkaradb_stripe_parallelism_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --stripe-parallelism)
+    set_tests_properties(akkaradb_stripe_parallelism_test PROPERTIES LABELS "cluster;stripe;concurrency" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_raft_log_delta_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-log-delta)
+    set_tests_properties(akkaradb_raft_log_delta_test PROPERTIES LABELS "cluster;raft;recovery" TIMEOUT 120 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_raft_log_retention_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-log-retention)
+    set_tests_properties(akkaradb_raft_log_retention_test PROPERTIES LABELS "cluster;raft;recovery;history" TIMEOUT 240 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_cluster_partition_placement_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --partition-placement)
+    add_test(NAME akkaradb_cluster_placement_options_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --placement-options)
+    set_tests_properties(akkaradb_cluster_placement_options_test PROPERTIES LABELS "cluster;placement;deadline" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_cluster_partition_raft_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --partition-raft)
+    add_test(NAME akkaradb_cluster_partition_query_parallelism_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --partition-query-parallelism)
+    set_tests_properties(akkaradb_cluster_partition_query_parallelism_test PROPERTIES LABELS "cluster;partition;queries;concurrency" TIMEOUT 90 RESOURCE_LOCK akkaradb_cluster_loopback)
+    set_tests_properties(akkaradb_cluster_partition_raft_test PROPERTIES LABELS "cluster;partition;raft" TIMEOUT 360 RESOURCE_LOCK akkaradb_cluster_loopback)
+    set_tests_properties(akkaradb_cluster_partition_placement_test PROPERTIES LABELS "cluster;partition;placement" TIMEOUT 300 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_cluster_query_delivery_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --query-delivery)
+    set_tests_properties(akkaradb_cluster_query_delivery_test PROPERTIES LABELS "cluster;queries;streaming;history" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    add_test(NAME akkaradb_cluster_query_resource_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --query-resources)
+    set_tests_properties(akkaradb_cluster_query_resource_test PROPERTIES LABELS "cluster;queries;deadline" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    set_tests_properties(akkaradb_cluster_authority_contract_test PROPERTIES LABELS "cluster;fencing;contract" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
+    set_tests_properties(akkaradb_cluster_queries_test PROPERTIES LABELS "cluster;queries" TIMEOUT 600 RESOURCE_LOCK akkaradb_cluster_loopback)
+    set_tests_properties(akkaradb_raft_prevote_test PROPERTIES LABELS "cluster;raft;prevote" TIMEOUT 180)
+    set_tests_properties(akkaradb_cluster_routing_test PROPERTIES LABELS "cluster;routing" TIMEOUT 240)
+    set_tests_properties(akkaradb_mirror_fencing_test PROPERTIES LABELS "cluster;mirror;fencing" TIMEOUT 300)
+    set_tests_properties(akkaradb_raft_learners_test PROPERTIES LABELS "cluster;raft;learners" TIMEOUT 240)
+    set_tests_properties(akkaradb_cluster_smoke_test akkaradb_raft_learners_test akkaradb_mirror_fencing_test akkaradb_cluster_routing_test akkaradb_raft_prevote_test
+            PROPERTIES RESOURCE_LOCK akkaradb_cluster_loopback)
+endif ()
+
+if (AKKARADB_BUILD_TESTS)
+    set_tests_properties(akkaradb_transaction_smoke_test PROPERTIES TIMEOUT 180 LABELS "transactions;recovery")
 endif ()

@@ -91,8 +91,11 @@ uint64_t seq,
             [[nodiscard]] bool connected() const noexcept;
             /** Unix timestamp in microseconds of the latest accepted handshake or valid frame; zero before first contact. */
             [[nodiscard]] uint64_t lastSuccessfulContactAtUs() const noexcept;
+            /** Total budget from API entry, including admission, sending and response waits. */
             [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs);
+            /** Total budget from API entry; a timed-out partial send disconnects the peer. */
             [[nodiscard]] StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs);
+            [[nodiscard]] ForwardResponse forward(ForwardRequest request);
 
         private:
             class Impl;

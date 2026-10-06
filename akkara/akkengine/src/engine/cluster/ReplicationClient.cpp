@@ -9,11 +9,14 @@
 
 // akkengine/src/engine/cluster/ReplicationClient.cpp
 #include "akk/engine/cluster/ReplicationClient.hpp"
+#include <unordered_map>
+#include "akk/engine/cluster/detail/ForwardDeadline.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -23,6 +26,7 @@
 #include <fstream>
 #include <mutex>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -41,6 +45,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -170,6 +175,64 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
+        bool sendAllUntil(SocketHandle s, const uint8_t* data, size_t size,
+            std::chrono::steady_clock::time_point deadline) {
+            #ifdef _WIN32
+            struct SendEvent {
+                WSAEVENT handle = ::WSACreateEvent();
+                ~SendEvent() { if (handle != WSA_INVALID_EVENT) { ::WSACloseEvent(handle); } }
+            } event;
+            if (event.handle == WSA_INVALID_EVENT) { return false; }
+            #endif
+            size_t sent = 0;
+            while (sent < size) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) { return false; }
+                #ifdef _WIN32
+                ::WSAResetEvent(event.handle);
+                WSAOVERLAPPED operation{};
+                operation.hEvent = event.handle;
+                WSABUF buffer{};
+                buffer.buf = reinterpret_cast<char*>(const_cast<uint8_t*>(data + sent));
+                buffer.len = static_cast<ULONG>(std::min<size_t>(size - sent, std::numeric_limits<ULONG>::max()));
+                const int rc = ::WSASend(s, &buffer, 1, nullptr, 0, &operation, nullptr);
+                if (rc != 0 && ::WSAGetLastError() != WSA_IO_PENDING) { return false; }
+                if (rc != 0) {
+                    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                    const DWORD timeout = static_cast<DWORD>(std::clamp<int64_t>(remaining, 0, WSA_INFINITE - 1));
+                    if (::WSAWaitForMultipleEvents(1, &event.handle, FALSE, timeout, FALSE) != WSA_WAIT_EVENT_0) {
+                        // Cancellation is asynchronous: retain both the frame and
+                        // OVERLAPPED until the transport has stopped accessing them.
+                        (void)::CancelIoEx(reinterpret_cast<HANDLE>(s), &operation);
+                        DWORD completed = 0, flags = 0;
+                        (void)::WSAGetOverlappedResult(s, &operation, &completed, TRUE, &flags);
+                        return false;
+                    }
+                }
+                DWORD completed = 0, flags = 0;
+                if (!::WSAGetOverlappedResult(s, &operation, &completed, FALSE, &flags) || completed == 0) { return false; }
+                sent += completed;
+                #else
+                int flags = MSG_DONTWAIT;
+                #ifdef MSG_NOSIGNAL
+                flags |= MSG_NOSIGNAL;
+                #endif
+                const ssize_t n = ::send(s, data + sent, size - sent, flags);
+                if (n > 0) { sent += static_cast<size_t>(n); continue; }
+                if (n == 0) { return false; }
+                if (errno == EINTR) { continue; }
+                if (errno != EAGAIN && errno != EWOULDBLOCK) { return false; }
+                const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                const int timeout = static_cast<int>(std::clamp<int64_t>(remaining, 0, std::numeric_limits<int>::max()));
+                pollfd writable{s, POLLOUT, 0};
+                const int rc = ::poll(&writable, 1, timeout);
+                if (rc < 0 && errno == EINTR) { continue; }
+                if (rc <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) { return false; }
+                #endif
+            }
+            return true;
+        }
+
         bool recvAll(SocketHandle s, uint8_t* data, size_t size) {
             size_t received = 0;
             while (received < size) {
@@ -277,7 +340,8 @@ namespace akkaradb::engine::cluster {
         }
 
         bool sendSecureFrame(SocketHandle socket, crypto::SecureSession& session, const uint8_t* data, size_t size,
-            const std::shared_ptr<detail::TransferBudget>& budget) {
+            const std::shared_ptr<detail::TransferBudget>& budget,
+            std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
             if (size > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
             auto encryptedMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, size);
             const auto encrypted = session.seal(std::span<const uint8_t>{data, size});
@@ -291,6 +355,10 @@ namespace akkaradb::engine::cluster {
             writeU32Le(header.data() + 14, static_cast<uint32_t>(encrypted.ciphertext.size()));
             std::memcpy(header.data() + 18, encrypted.tag.data(), encrypted.tag.size());
 
+            if (deadline) {
+                return sendAllUntil(socket, header.data(), header.size(), *deadline) &&
+                    sendAllUntil(socket, encrypted.ciphertext.data(), encrypted.ciphertext.size(), *deadline);
+            }
             return sendAll(socket, header.data(), header.size()) && (encrypted.ciphertext.empty() || sendAll(
                 socket,
                 encrypted.ciphertext.data(),
@@ -492,7 +560,7 @@ namespace akkaradb::engine::cluster {
                 constexpr size_t expectedSize = 5 + 8 + 8 + 8 + 4;
                 constexpr size_t crcOffset = expectedSize - 4;
                 if (bytes.size() != expectedSize) { throw std::runtime_error("invalid cluster membership state size"); }
-                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKCG2") {
+                if (std::string_view{reinterpret_cast<const char*>(bytes.data()), 5} != "AKCG1") {
                     throw std::runtime_error("bad cluster membership state magic");
                 }
                 if (readLe32(bytes, crcOffset) != crcWithZeroedField(bytes, crcOffset)) {
@@ -514,7 +582,7 @@ namespace akkaradb::engine::cluster {
             if (path.empty()) { return; }
             if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
             std::vector<uint8_t> bytes;
-            bytes.insert(bytes.end(), {'A', 'K', 'C', 'G', '2'});
+            bytes.insert(bytes.end(), {'A', 'K', 'C', 'G', '1'});
             writeLe64(bytes, state.groupId);
             writeLe64(bytes, state.primaryNodeId);
             writeLe64(bytes, state.groupEpoch);
@@ -620,9 +688,11 @@ namespace akkaradb::engine::cluster {
             uint64_t lastSuccessfulContactAtUs() const noexcept { return lastSuccessfulContactAtUs_.load(std::memory_order_relaxed); }
 
             ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
-                std::lock_guard admission{readAdmissionMutex_};
-                std::unique_lock readLock{readMutex_};
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+                std::unique_lock admission{readAdmissionMutex_, std::defer_lock};
+                if (!admission.try_lock_until(deadline)) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
+                std::unique_lock readLock{readMutex_, std::defer_lock};
+                if (!readLock.try_lock_until(deadline)) { throw std::runtime_error("ReplicationClient: owner read state timeout"); }
                 // A caller timeout does not cancel the wire request. Drain its
                 // response before admitting another, without blocking write ACKs.
                 while (pendingReadRequestId_ != 0) {
@@ -630,6 +700,7 @@ namespace akkaradb::engine::cluster {
                         throw std::runtime_error("ReplicationClient: previous owner read is still pending");
                     }
                 }
+                if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
                 const uint64_t requestId = nextReadRequestId_++;
                 const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_);
                 pendingReadRequestId_ = requestId;
@@ -639,14 +710,15 @@ namespace akkaradb::engine::cluster {
 
                 bool sent = false;
                 {
-                    std::lock_guard socketLock{socketMutex_};
-                    if (connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
-                        sent = sendTo(socket_, activeSecure_, *message);
+                    std::unique_lock socketLock{socketMutex_, std::defer_lock};
+                    if (socketLock.try_lock_until(deadline) && connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
+                        sent = sendToUntil(socket_, activeSecure_, *message, deadline);
                     }
                 }
                 if (!sent) {
                     pendingReadRequestId_ = 0;
-                    throw std::runtime_error("ReplicationClient: owner read request send failed");
+                    throw std::runtime_error(std::chrono::steady_clock::now() >= deadline
+                        ? "ReplicationClient: owner read send timeout" : "ReplicationClient: owner read request send failed");
                 }
 
                 while (!pendingReadResponse_.has_value() && !pendingReadFailed_) {
@@ -666,44 +738,86 @@ namespace akkaradb::engine::cluster {
                 return response;
             }
 
-            StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs) {
-                std::lock_guard admission{stripeControlAdmissionMutex_};
-                std::unique_lock lock{stripeControlMutex_};
-                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-                while (pendingStripeControlRequestId_ != 0) {
-                    if (stripeControlCv_.wait_until(lock, deadline) == std::cv_status::timeout) {
-                        throw std::runtime_error("ReplicationClient: previous STRIPE control request is still pending");
-                    }
-                }
-                request.requestId = nextStripeControlRequestId_++;
-                pendingStripeControlRequestId_ = request.requestId;
-                pendingStripeControlResponse_.reset();
-                pendingStripeControlFailed_ = false;
-                const auto wire = encodeStripeControlRequest(request);
-                bool sent = false;
+            ForwardResponse forward(ForwardRequest request) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(request.timeoutMs);
+                auto pending = std::make_shared<PendingForward>();
                 {
-                    std::lock_guard socketLock{socketMutex_};
-                    if (connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
-                        sent = sendTo(socket_, activeSecure_, wire.data(), wire.size());
+                    std::lock_guard lock{forwardMutex_};
+                    if (pendingForwards_.size() >= 64) { throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward queue is full"); }
+                    request.requestId = nextForwardId_++;
+                    pendingForwards_.emplace(request.requestId, pending);
+                }
+                const auto erase = [&] { std::lock_guard lock{forwardMutex_}; pendingForwards_.erase(request.requestId); };
+                try {
+                    std::unique_lock socketLock{socketMutex_, std::defer_lock};
+                    if (!socketLock.try_lock_until(deadline)) {
+                        throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward admission timed out before send");
+                    }
+                    if (!connected_.load(std::memory_order_acquire) || socket_ == INVALID_SOCKET_HANDLE) {
+                        throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward destination is disconnected");
+                    }
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                    if (remaining <= 0) { throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward deadline expired before send"); }
+                    request.timeoutMs = static_cast<uint32_t>(remaining);
+                    auto wire = encodeForwardRequest(request);
+                    if (wire.empty()) { throw ClusterRoutingError(ClusterRoutingCode::PAYLOAD_TOO_LARGE); }
+                    const auto message = detail::messageFromWire(std::move(wire), transferBudget_);
+                    if (!sendToUntil(socket_, activeSecure_, *message, deadline)) {
+                        throw ClusterRoutingError(ClusterRoutingCode::OUTCOME_UNKNOWN, {}, "Forward send failed; do not replay the mutation blindly");
                     }
                 }
-                if (!sent) {
-                    pendingStripeControlRequestId_ = 0;
-                    throw std::runtime_error("ReplicationClient: STRIPE control request send failed");
+                catch (...) { erase(); throw; }
+                std::unique_lock lock{forwardMutex_};
+                pending->cv.wait_until(lock, deadline, [&] { return pending->response.has_value() || pending->failed; });
+                pendingForwards_.erase(request.requestId);
+                if (!pending->response) {
+                    throw ClusterRoutingError(ClusterRoutingCode::OUTCOME_UNKNOWN, {}, "Forward response lost or timed out; do not replay the mutation blindly");
                 }
-                while (!pendingStripeControlResponse_ && !pendingStripeControlFailed_) {
-                    if (stripeControlCv_.wait_until(lock, deadline) == std::cv_status::timeout) { break; }
+                return std::move(*pending->response);
+            }
+
+            StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs) {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+                // Rollback controls share the server's single rollback worker.
+                std::unique_lock rollbackAdmission{stripeRollbackAdmissionMutex_, std::defer_lock};
+                if (request.action == StripeControlAction::ROLLBACK_WATERMARK || request.action == StripeControlAction::ROLLBACK_KEY ||
+                    request.action == StripeControlAction::ROLLBACK_STREAM || request.action == StripeControlAction::ROLLBACK_APPLY) {
+                    if (!rollbackAdmission.try_lock_until(deadline)) {
+                        throw std::runtime_error("ReplicationClient: rollback control admission timeout");
+                    }
                 }
-                if (!pendingStripeControlResponse_) {
-                    pendingStripeControlRequestId_ = 0;
-                    throw std::runtime_error(pendingStripeControlFailed_
-                        ? "ReplicationClient: STRIPE control connection closed"
+                auto pending = std::make_shared<PendingStripeControl>();
+                {
+                    std::unique_lock lock{stripeControlMutex_, std::defer_lock};
+                    if (!lock.try_lock_until(deadline) || !stripeControlCv_.wait_until(lock, deadline,
+                        [&] { return pendingStripeControls_.size() < 64; })) {
+                        throw std::runtime_error("ReplicationClient: STRIPE control admission timeout");
+                    }
+                    if (nextStripeControlRequestId_ == 0) { throw std::runtime_error("ReplicationClient: STRIPE request ids exhausted"); }
+                    request.requestId = nextStripeControlRequestId_++;
+                    pendingStripeControls_.emplace(request.requestId, pending);
+                }
+                const auto erase = [&] {
+                    std::lock_guard lock{stripeControlMutex_};
+                    pendingStripeControls_.erase(request.requestId); stripeControlCv_.notify_all();
+                };
+                try {
+                    const auto message = detail::messageFromWire(encodeStripeControlRequest(request), transferBudget_);
+                    std::unique_lock socketLock{socketMutex_, std::defer_lock};
+                    if (!socketLock.try_lock_until(deadline) || !connected_.load(std::memory_order_acquire) ||
+                        socket_ == INVALID_SOCKET_HANDLE || !sendToUntil(socket_, activeSecure_, *message, deadline)) {
+                        throw std::runtime_error("ReplicationClient: STRIPE control send timeout or disconnected");
+                    }
+                }
+                catch (...) { erase(); throw; }
+                std::unique_lock lock{stripeControlMutex_};
+                pending->cv.wait_until(lock, deadline, [&] { return pending->response.has_value() || pending->failed; });
+                pendingStripeControls_.erase(request.requestId); stripeControlCv_.notify_all();
+                if (!pending->response) {
+                    throw std::runtime_error(pending->failed ? "ReplicationClient: STRIPE control connection closed"
                         : "ReplicationClient: STRIPE control request timeout");
                 }
-                auto response = *pendingStripeControlResponse_;
-                pendingStripeControlResponse_.reset();
-                pendingStripeControlRequestId_ = 0;
-                return response;
+                return std::move(*pending->response);
             }
 
         private:
@@ -717,6 +831,10 @@ namespace akkaradb::engine::cluster {
             }
 
             void failPendingRead() {
+                {
+                    std::lock_guard lock{forwardMutex_};
+                    for (auto& [id, pending] : pendingForwards_) { pending->failed = true; pending->cv.notify_all(); }
+                }
                 std::lock_guard lock{readMutex_};
                 pendingReadFailed_ = true;
                 if (pendingReadAbandoned_) { pendingReadRequestId_ = 0; }
@@ -725,17 +843,18 @@ namespace akkaradb::engine::cluster {
 
             void completePendingStripeControl(StripeControlResponse response) {
                 std::lock_guard lock{stripeControlMutex_};
-                if (response.requestId == pendingStripeControlRequestId_) {
-                    pendingStripeControlResponse_ = response;
-                    stripeControlCv_.notify_all();
+                const auto it = pendingStripeControls_.find(response.requestId);
+                if (it != pendingStripeControls_.end()) {
+                    it->second->response = std::move(response); it->second->cv.notify_all();
                 }
             }
 
             void failPendingStripeControl() {
                 std::lock_guard lock{stripeControlMutex_};
-                pendingStripeControlFailed_ = true;
-                pendingStripeControlRequestId_ = 0;
-                stripeControlCv_.notify_all();
+                for (const auto& [id, pending] : pendingStripeControls_) {
+                    (void)id; pending->failed = true; pending->cv.notify_all();
+                }
+                pendingStripeControls_.clear(); stripeControlCv_.notify_all();
             }
 
             void run() {
@@ -829,13 +948,37 @@ namespace akkaradb::engine::cluster {
                 return OpenSecureSession{std::move(session), serverHello.staticPublicKey};
             }
 
+            std::filesystem::path mirrorResyncPath() const {
+                if (runtimeOptions_.clusterMembershipPath.empty()) { return {}; }
+                auto path = runtimeOptions_.clusterMembershipPath;
+                path += ".mirror-resync";
+                return path;
+            }
+
+            void clearMirrorResync() {
+                const auto path = mirrorResyncPath();
+                if (path.empty()) { return; }
+                if (std::filesystem::remove(path)) {
+                    #ifndef _WIN32
+                    syncParentDirectory(path);
+                    #endif
+                }
+            }
+
             bool handshake(SocketHandle socket, crypto::SecureSession* secure, const crypto::PublicKey& secureRemotePublicKey) {
+                const auto resyncPath = mirrorResyncPath();
+                const bool resyncPending = !resyncPath.empty() && std::filesystem::exists(resyncPath);
                 const ClientHello hello{
                     .nodeId = selfNodeId_,
                     .lastSeq = getLastSeq_ ? getLastSeq_() : 0,
                     .role = NodeRole::REPLICA,
                     .groupId = runtimeOptions_.clusterGroupId,
                     .groupEpoch = runtimeOptions_.clusterGroupEpoch,
+                    .mirrorFencingMode = runtimeOptions_.mirrorFencing.mode,
+                    .forceSnapshot = runtimeOptions_.mirrorFencing.mode != MirrorFencingMode::STATIC &&
+                        ((runtimeOptions_.mirrorPromotion.enabled && !fencedSnapshotCompleted_.load()) || resyncPending),
+                    .clusterId = runtimeOptions_.replicationClusterId,
+                    .configFingerprint = runtimeOptions_.replicationConfigFingerprint,
                 };
                 const auto wire = encodeClientHello(hello);
                 if (!sendTo(socket, secure, wire.data(), wire.size())) { return false; }
@@ -844,6 +987,9 @@ namespace akkaradb::engine::cluster {
                 if (!recvFrameFrom(socket, secure, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
                 ServerHello serverHello;
                 if (!decodeServerHello(frame.payload, serverHello) || serverHello.role != NodeRole::PRIMARY) { return false; }
+                if (serverHello.clusterId != runtimeOptions_.replicationClusterId ||
+                    serverHello.configFingerprint != runtimeOptions_.replicationConfigFingerprint) { return false; }
+                if (serverHello.mirrorFencingMode != runtimeOptions_.mirrorFencing.mode) { return false; }
                 if (runtimeOptions_.clusterGroupId != 0 && serverHello.groupId != runtimeOptions_.clusterGroupId) { return false; }
                 if (runtimeOptions_.clusterGroupEpoch != 0 && serverHello.groupEpoch != runtimeOptions_.clusterGroupEpoch) { return false; }
                 if (runtimeOptions_.secure.expectedPrimaryNodeId != 0 && serverHello.nodeId != runtimeOptions_.secure.
@@ -871,7 +1017,23 @@ namespace akkaradb::engine::cluster {
                             runtimeOptions_.secure.expectedPrimaryNodeId == incoming.primaryNodeId;
                         if (!authorizedMirrorSuccessor) { return false; }
                     }
+                    if (resyncPending) {
+                        const auto pending = loadMembership(resyncPath, CorruptClusterStateAction::FAIL_STARTUP);
+                        if (!pending || pending->groupId != incoming.groupId ||
+                            ((pending->primaryNodeId != incoming.primaryNodeId || pending->groupEpoch != incoming.groupEpoch) &&
+                             (!runtimeOptions_.mirrorPromotion.enabled ||
+                              pending->primaryNodeId != runtimeOptions_.mirrorPromotion.previousPrimaryNodeId ||
+                              pending->groupEpoch != runtimeOptions_.mirrorPromotion.previousGroupEpoch))) { return false; }
+                    }
+                    // Publish intent before membership: a crash after the hello must
+                    // not turn an equal-sequence divergent replica into a live one.
+                    if (hello.forceSnapshot && (hello.lastSeq != 0 || serverHello.currentSeq != 0)) {
+                        saveMembership(resyncPath, incoming);
+                    }
                     saveMembership(runtimeOptions_.clusterMembershipPath, incoming);
+                    if (hello.forceSnapshot && hello.lastSeq == 0 && serverHello.currentSeq == 0) {
+                        clearMirrorResync(); fencedSnapshotCompleted_.store(true);
+                    }
                 }
                 catch (...) { return false; }
                 transferSession_->setScope(serverHello.groupId, selfNodeId_, serverHello.nodeId);
@@ -886,6 +1048,38 @@ namespace akkaradb::engine::cluster {
                     });
                 }
                 catch (...) { return false; }
+            }
+
+            bool sendToUntil(SocketHandle socket, crypto::SecureSession* secure, const detail::TransferMessage& message,
+                std::chrono::steady_clock::time_point deadline) {
+                // The caller owns socketMutex_: shutdown cannot race descriptor
+                // reuse or destruction of activeSecure_. A stalled frame/READY
+                // wait closes the connection, since partial sends cannot be retried.
+                bool attempted = false;
+                bool success = false;
+                try {
+                    std::unique_lock messageLock{messageMutex_, std::defer_lock};
+                    if (!messageLock.try_lock_until(deadline) || std::chrono::steady_clock::now() >= deadline) { return false; }
+                    detail::ForwardDeadline sendDeadline{deadline, [this, socket, session = transferSession_] {
+                        connected_.store(false);
+                        shutdownSocket(socket);
+                        session->cancel();
+                    }};
+                    success = detail::sendMessage(message, transferBudget_, transferSession_, [&](std::span<const uint8_t> wire) {
+                        std::unique_lock sendLock{sendMutex_, std::defer_lock};
+                        if (!sendLock.try_lock_until(deadline) || std::chrono::steady_clock::now() >= deadline) { return false; }
+                        attempted = true;
+                        return secure ? sendSecureFrame(socket, *secure, wire.data(), wire.size(), transferBudget_, deadline) :
+                            sendAllUntil(socket, wire.data(), wire.size(), deadline);
+                    });
+                }
+                catch (...) { success = false; }
+                if (!success && attempted) {
+                    connected_.store(false);
+                    shutdownSocket(socket);
+                    transferSession_->cancel();
+                }
+                return success;
             }
 
             bool sendFrame(SocketHandle socket, crypto::SecureSession* secure, std::span<const uint8_t> wire) {
@@ -1035,16 +1229,24 @@ namespace akkaradb::engine::cluster {
                         uint64_t endSeq = 0;
                         if (!receivingSnapshot || !decodeSnapshotEnd(frame.payload, endSeq) || endSeq != snapshotSeq) { return; }
                         SnapshotEndCallback callback;
+                        std::function<void()> forceDurable;
                         {
                             std::lock_guard lock{callbackMutex_};
                             callback = snapshotEndCallback_;
+                            forceDurable = forceDurableCallback_;
                         }
                         if (!callback) { return; }
                         callback(endSeq, snapshotEntryCount);
-                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE &&
-                            !sendAck(socket, secure, endSeq, AckStage::DURABLE)) {
-                            return;
+                        if (runtimeOptions_.mirrorFencing.mode != MirrorFencingMode::STATIC) {
+                            if (!forceDurable) { throw std::runtime_error("ReplicationClient: fenced snapshot requires durability confirmation"); }
+                            forceDurable();
+                            clearMirrorResync();
                         }
+                        fencedSnapshotCompleted_.store(true);
+                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
+                            if (forceDurable) { forceDurable(); }
+                        }
+                        if (!sendAck(socket, secure, endSeq, ackPolicy_.stage)) { return; }
                         receivingSnapshot = false;
                         expectedSeq = endSeq + 1;
                     }
@@ -1053,6 +1255,18 @@ namespace akkaradb::engine::cluster {
                         ReadResponse response;
                         if (!decodeReadResponse(frame.payload, response)) { return; }
                         completePendingRead(std::move(response));
+                    }
+                    else if (frame.type == ReplMsgType::FORWARD_RESPONSE) {
+                        ForwardResponse response;
+                        auto reservation = transferBudget_->reserve(detail::TransferBudget::Resource::MEMORY, frame.payload.size());
+                        if (!decodeForwardResponse(frame.payload, response)) { return; }
+                        response.memoryReservation = std::move(reservation);
+                        std::lock_guard lock{forwardMutex_};
+                        const auto it = pendingForwards_.find(response.requestId);
+                        if (it != pendingForwards_.end()) {
+                            it->second->response = std::move(response);
+                            it->second->cv.notify_all();
+                        }
                     }
                     else if (frame.type == ReplMsgType::STRIPE_CONTROL_RESPONSE) {
                         StripeControlResponse response;
@@ -1064,6 +1278,14 @@ namespace akkaradb::engine::cluster {
             }
 
             std::string primaryHost_;
+            struct PendingForward {
+                std::condition_variable cv;
+                std::optional<ForwardResponse> response;
+                bool failed = false;
+            };
+            std::mutex forwardMutex_;
+            uint64_t nextForwardId_ = 1;
+            std::unordered_map<uint64_t, std::shared_ptr<PendingForward>> pendingForwards_;
             uint16_t primaryReplPort_;
             uint64_t selfNodeId_;
             std::function<uint64_t()> getLastSeq_;
@@ -1073,35 +1295,39 @@ namespace akkaradb::engine::cluster {
 
             std::atomic<bool> running_{false};
             std::atomic<bool> connected_{false};
+            std::atomic<bool> fencedSnapshotCompleted_{false};
             std::atomic<uint64_t> lastSuccessfulContactAtUs_{0};
             std::thread worker_;
 
-            mutable std::mutex socketMutex_;
+            mutable std::timed_mutex socketMutex_;
             const bool targetedEntries_;
             const bool allowSequenceGaps_;
             std::shared_ptr<detail::TransferBudget> transferBudget_;
             SocketHandle socket_ = INVALID_SOCKET_HANDLE;
             crypto::SecureSession* activeSecure_ = nullptr;
-            std::mutex messageMutex_;
-            std::mutex sendMutex_;
+            std::timed_mutex messageMutex_;
+            std::timed_mutex sendMutex_;
             std::shared_ptr<detail::TransferSession> transferSession_ = std::make_shared<detail::TransferSession>();
 
-            std::mutex readAdmissionMutex_;
-            mutable std::mutex readMutex_;
+            std::timed_mutex readAdmissionMutex_;
+            mutable std::timed_mutex readMutex_;
             bool pendingReadAbandoned_ = false;
-            std::condition_variable readCv_;
+            std::condition_variable_any readCv_;
             uint64_t nextReadRequestId_ = 1;
             uint64_t pendingReadRequestId_ = 0;
             std::optional<ReadResponse> pendingReadResponse_;
             bool pendingReadFailed_ = false;
 
-            std::mutex stripeControlAdmissionMutex_;
-            mutable std::mutex stripeControlMutex_;
-            std::condition_variable stripeControlCv_;
+            struct PendingStripeControl {
+                std::condition_variable_any cv;
+                std::optional<StripeControlResponse> response;
+                bool failed = false;
+            };
+            mutable std::timed_mutex stripeControlMutex_;
+            std::timed_mutex stripeRollbackAdmissionMutex_;
+            std::condition_variable_any stripeControlCv_;
             uint64_t nextStripeControlRequestId_ = 1;
-            uint64_t pendingStripeControlRequestId_ = 0;
-            std::optional<StripeControlResponse> pendingStripeControlResponse_;
-            bool pendingStripeControlFailed_ = false;
+            std::unordered_map<uint64_t, std::shared_ptr<PendingStripeControl>> pendingStripeControls_;
 
             mutable std::mutex callbackMutex_;
             ApplyCallback applyCallback_;
@@ -1207,4 +1433,5 @@ namespace akkaradb::engine::cluster {
     StripeControlResponse ReplicationClient::stripeControl(StripeControlRequest request, uint32_t timeoutMs) {
         return impl_->stripeControl(std::move(request), timeoutMs);
     }
+    ForwardResponse ReplicationClient::forward(ForwardRequest request) { return impl_->forward(std::move(request)); }
 } // namespace akkaradb::engine::cluster

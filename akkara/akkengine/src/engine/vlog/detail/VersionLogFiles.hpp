@@ -9,9 +9,9 @@
 
 // akkengine/src/engine/vlog/detail/VersionLogFiles.hpp
 static void writeFileHeaderRaw(FILE* wf, VLogSyncMode syncModeHint) {
-    AkvlogV5FileHeader hdr{};
-    hdr.magic = AKVLOG_V5_MAGIC;
-    hdr.version = AKVLOG_V5_VERSION;
+    AkvlogV1FileHeader hdr{};
+    hdr.magic = AKVLOG_V1_MAGIC;
+    hdr.version = AKVLOG_V1_VERSION;
     hdr.syncModeHint = static_cast<uint8_t>(syncModeHint);
     hdr.reserved0 = 0;
     hdr.createdNs = nowNsFallback();

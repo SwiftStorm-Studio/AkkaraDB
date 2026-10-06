@@ -70,7 +70,7 @@ static void waitForAppend(const std::shared_ptr<AppendCompletion>& completion) {
 
     const uint32_t entryLen = static_cast<uint32_t>(total);
     std::vector<uint8_t> out(entryLen);
-    AkvlogV5EntryHeader hdr{};
+    AkvlogV1EntryHeader hdr{};
     hdr.entryLen = entryLen;
     hdr.seq = seq;
     hdr.sourceNodeId = sourceNodeId;

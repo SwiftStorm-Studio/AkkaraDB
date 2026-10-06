@@ -36,7 +36,7 @@ namespace akkaradb::engine::server::tcp {
     void encodeBoolPayload(bool value, std::vector<uint8_t>& out);
     void encodeU64Payload(uint64_t value, std::vector<uint8_t>& out);
     void encodeScanPayload(std::span<const AkkEngine::ScanRecordView> records, bool truncated, std::vector<uint8_t>& out);
-    void encodeHistoryPayload(std::span<const VersionEntry> entries, std::vector<uint8_t>& out);
+    void encodeHistoryPayload(core::ArenaGenerator<VersionEntry> entries, std::vector<uint8_t>& out, uint64_t maxBytes);
     void encodeScanStreamPayload(const AkkEngine::ScanRecordView& record, std::vector<uint8_t>& out);
     void encodeHistoryStreamPayload(const VersionEntry& entry, std::vector<uint8_t>& out);
     void encodeStreamEndPayload(uint32_t emitted, bool truncated, std::vector<uint8_t>& out);

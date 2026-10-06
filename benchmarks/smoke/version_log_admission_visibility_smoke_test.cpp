@@ -8,6 +8,7 @@
  */
 
 // benchmarks/smoke/version_log_admission_visibility_smoke_test.cpp
+#include "detail/CollectHistory.hpp"
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/AkkEngine.hpp"
@@ -74,7 +75,7 @@ namespace {
             auto log = vlog::VersionLog::create(dir / "commit.akvlog", logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER));
             log->appendDeferred(bytes(key), 1, 0, 0, 0, bytes(value));
             require(!log->getAt(bytes(key), 1).has_value(), "COMMIT_ORDER must hide a deferred append");
-            require(log->history(bytes(key)).empty(), "COMMIT_ORDER history must hide a deferred append");
+            require(akk_test::collectHistory(log->history(bytes(key))).empty(), "COMMIT_ORDER history must hide a deferred append");
             log->markCommitted(1);
             const auto observed = log->getAt(bytes(key), 1);
             require(observed.has_value() && observed->value == std::vector<uint8_t>{value.begin(), value.end()}, "COMMIT_ORDER must reveal a committed append");
@@ -112,7 +113,50 @@ namespace {
         // getAt waits for background validation and scans the persisted history on demand.
         const auto observed = log->getAt(bytes(key), entryCount);
         require(observed.has_value() && observed->seq == entryCount, "background recovery must expose persisted history after waiting");
-        require(log->history(bytes(key)).size() == entryCount, "on-demand history must retain every persisted version");
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == entryCount, "on-demand history must retain every persisted version");
+        log->close();
+    }
+
+    void verifyConcurrentForceSync(const fs::path& dir) {
+        constexpr std::string_view key{"force-sync-key"};
+        const std::string value(4096, 'f');
+        constexpr uint64_t entryCount = 512;
+
+        auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
+        options.syncMode = vlog::VLogSyncMode::ASYNC;
+        auto log = vlog::VersionLog::create(dir / "force-sync.akvlog", std::move(options));
+
+        std::atomic<bool> start{false};
+        std::exception_ptr failure;
+        std::mutex failureMu;
+        const auto recordFailure = [&] {
+            std::lock_guard lock{failureMu};
+            if (!failure) { failure = std::current_exception(); }
+        };
+        std::thread writer([&] {
+            while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+            try {
+                for (uint64_t seq = 1; seq <= entryCount; ++seq) {
+                    log->append(bytes(key), seq, 0, 0, 0, bytes(value));
+                }
+            }
+            catch (...) { recordFailure(); }
+        });
+        std::thread syncer([&] {
+            while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+            try {
+                for (uint32_t attempt = 0; attempt < 64; ++attempt) { log->forceSync(); }
+            }
+            catch (...) { recordFailure(); }
+        });
+        start.store(true, std::memory_order_release);
+        writer.join();
+        syncer.join();
+        if (failure) { std::rethrow_exception(failure); }
+
+        log->forceSync();
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == entryCount,
+                "concurrent forceSync must neither reject asynchronous appends nor lose history");
         log->close();
     }
 
@@ -200,7 +244,7 @@ namespace {
         require(zero.has_value() && zero->seq == 0, "segment index must retain a zero-sequence version");
         const auto observed = log->getAt(bytes(key), 6);
         require(observed.has_value() && observed->seq == 6, "segment index must retain the version range needed by getAt");
-        require(log->history(bytes(key)).size() == entryCount + 1, "history must return every indexed segment entry");
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == entryCount + 1, "history must return every indexed segment entry");
         require(log->snapshot().segmentCount > 1, "background recovery must rebuild the segment index");
         const auto baseIndexPath = dir / "segments.akvidx";
         #ifdef _WIN32
@@ -215,7 +259,7 @@ namespace {
                 "VersionLog sidecar index corruption setup must succeed");
         fclose(corruptedIndex);
         fs::remove(dir / "segments-seg-1.akvidx");
-        require(log->history(bytes(key)).size() == entryCount + 1,
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == entryCount + 1,
                 "missing or corrupt derived segment indexes must fall back to the authoritative VLog segment");
         log->close();
     }
@@ -231,7 +275,7 @@ namespace {
             auto log = vlog::VersionLog::create(path, std::move(options));
             log->append(bytes(key), 1, 0, 0, 0, bytes(value));
             log->append(bytes(key), 2, 0, 0, 0, bytes(value));
-            require(log->history(bytes(key)).size() == 2,
+            require(akk_test::collectHistory(log->history(bytes(key))).size() == 2,
                     "a single-file VLog must scan safely instead of retaining an unbounded active index");
             log->close();
         }
@@ -239,9 +283,9 @@ namespace {
         auto options = logOptions(vlog::VLogReadVisibilityMode::COMMIT_ORDER);
         options.segmentBytes = 0;
         auto log = vlog::VersionLog::create(path, std::move(options));
-        require(log->history(bytes(key)).size() == 2, "recovery must regenerate the single-file index sidecar");
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == 2, "recovery must regenerate the single-file index sidecar");
         log->append(bytes(key), 3, 0, 0, 0, bytes(value));
-        require(log->history(bytes(key)).size() == 3,
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == 3,
                 "a stale single-file sidecar must fall back to the authoritative VLog data");
         log->close();
     }
@@ -275,7 +319,7 @@ namespace {
             require(!log->getAt(bytes(key), 6).has_value(), "expired history must not be returned before the retained sequence boundary");
             const auto retained = log->getAt(bytes(key), 7);
             require(retained.has_value() && retained->seq == 7, "retention must preserve the cutoff sequence and newer history");
-            require(log->history(bytes(key)).size() == 6, "retention must expose only retained history entries");
+            require(akk_test::collectHistory(log->history(bytes(key))).size() == 6, "retention must expose only retained history entries");
             log->close();
         }
 
@@ -306,7 +350,7 @@ namespace {
                         carried->value == std::vector<uint8_t>{carriedValue.begin(), carriedValue.end()} &&
                         (carried->flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0,
                     "retention compaction must preserve the carried state at the sequence boundary");
-            const auto carriedHistory = log->history(bytes(carriedKey));
+            const auto carriedHistory = akk_test::collectHistory(log->history(bytes(carriedKey)));
             require(carriedHistory.size() == 1 && carriedHistory.front().seq == 7 &&
                         (carriedHistory.front().flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0,
                     "history must expose the synthetic retention base entry");
@@ -332,7 +376,7 @@ namespace {
             auto log = vlog::VersionLog::create(agePath, std::move(options));
             require(!fs::exists(agePath), "age retention must remove a closed segment older than the configured number of days");
             require(fs::exists(dir / "retention-age-seg-1.akvlog"), "age retention must retain newer closed segments");
-            require(log->history(bytes(key)).size() == 2, "age retention must retain only entries from non-expired segments");
+            require(akk_test::collectHistory(log->history(bytes(key))).size() == 2, "age retention must retain only entries from non-expired segments");
             log->close();
         }
     }
@@ -360,7 +404,7 @@ namespace {
             while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
             try {
                 for (uint32_t iteration = 0; iteration < 256; ++iteration) {
-                    (void)log->history(bytes(driverKey));
+                    (void)akk_test::collectHistory(log->history(bytes(driverKey)));
                     (void)log->getAt(bytes(carriedKey), 64);
                 }
             }
@@ -416,7 +460,7 @@ namespace {
                 while (!start.load(std::memory_order_acquire)) { std::this_thread::yield(); }
                 try {
                     for (uint32_t iteration = 0; iteration < readerIterations; ++iteration) {
-                        const auto history = log->history(bytes(readKey));
+                        const auto history = akk_test::collectHistory(log->history(bytes(readKey)));
                         require(history.size() == seedEntries, "concurrent readers must retain the full key history");
                         const auto observed = log->getAt(bytes(readKey), seedEntries);
                         require(observed.has_value() && observed->seq == seedEntries, "concurrent readers must observe the requested version");
@@ -441,7 +485,7 @@ namespace {
         for (auto& reader : readers) { reader.join(); }
         writer.join();
         if (failure) { std::rethrow_exception(failure); }
-        require(log->history(bytes(writeKey)).size() == seedEntries, "concurrent writer must publish every version");
+        require(akk_test::collectHistory(log->history(bytes(writeKey))).size() == seedEntries, "concurrent writer must publish every version");
         log->close();
     }
 
@@ -456,7 +500,7 @@ namespace {
         auto log = vlog::VersionLog::create(path, std::move(options));
         log->append(bytes(key), 1, 0, 0, 0, bytes(value));
         log->append(bytes(key), 2, 0, 0, 0, bytes(value));
-        const auto history = log->history(bytes(key));
+        const auto history = akk_test::collectHistory(log->history(bytes(key)));
         require(history.size() == 2 && history.back().seq == 2,
                 "serial append gate must let the current put commit while gating the next VLog submission");
         log->close();
@@ -500,7 +544,7 @@ namespace {
         auto log = vlog::VersionLog::create(path, std::move(options));
         for (uint32_t writer = 0; writer < writerCount; ++writer) {
             const std::string key = "true-parallel-key-" + std::to_string(writer);
-            const auto history = log->history(bytes(key));
+            const auto history = akk_test::collectHistory(log->history(bytes(key)));
             require(history.size() == entriesPerWriter, "parallel VLog must recover every lane entry from its durable tail");
         }
         log->close();
@@ -559,7 +603,7 @@ namespace {
         engine->put(bytes(key), bytes(value));
         const auto observed = engine->get(bytes(key));
         require(observed.has_value() && *observed == std::vector<uint8_t>{value.begin(), value.end()}, "engine get/put must complete after background VersionLog recovery");
-        require(engine->history(bytes(key)).size() == 1, "engine background recovery must retain the new VersionLog record");
+        require(akk_test::collectHistory(engine->history(bytes(key))).size() == 1, "engine background recovery must retain the new VersionLog record");
         engine->close();
     }
 
@@ -602,7 +646,7 @@ namespace {
         if (failure) { std::rethrow_exception(failure); }
 
         for (uint32_t writer = 0; writer < writerCount; ++writer) {
-            const auto history = engine->history(bytes(keys[writer]));
+            const auto history = akk_test::collectHistory(engine->history(bytes(keys[writer])));
             require(history.size() == 1, "VersionLog writes must publish one history entry per key");
             const auto observed = engine->getAt(bytes(keys[writer]), history.front().seq);
             require(observed.has_value(), "VersionLog writes must be readable at their committed sequence");
@@ -642,6 +686,7 @@ int main() {
         TempDir dir;
         verifyReadVisibility(dir.path());
         verifyBackgroundRecovery(dir.path());
+        verifyConcurrentForceSync(dir.path());
         verifyZstdCompression(dir.path());
         verifySegmentation(dir.path());
         verifySingleFileIndexFallback(dir.path());

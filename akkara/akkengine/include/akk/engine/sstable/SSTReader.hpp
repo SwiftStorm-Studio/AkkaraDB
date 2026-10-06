@@ -74,7 +74,7 @@ namespace akkaradb::engine::sst {
             ) const;
 
             [[nodiscard]] bool keyInRange(std::span<const uint8_t> key) const noexcept;
-            [[nodiscard]] const SSTFileHeaderV2& header() const noexcept;
+            [[nodiscard]] const SSTFileHeaderV1& header() const noexcept;
             [[nodiscard]] std::span<const uint8_t> firstKey() const noexcept;
             [[nodiscard]] std::span<const uint8_t> lastKey() const noexcept;
             [[nodiscard]] const std::filesystem::path& path() const noexcept;

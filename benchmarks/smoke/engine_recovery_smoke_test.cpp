@@ -8,6 +8,7 @@
  */
 
 // benchmarks/smoke/engine_recovery_smoke_test.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
@@ -137,11 +138,11 @@ namespace {
 
     void writeMatrixRecords(akkaradb::engine::AkkEngine& engine, const MatrixData& data) {
         engine.put(bytes(data.alphaKey), bytes(data.alphaOld));
-        const std::vector<akkaradb::engine::AkkEngine::BatchPutEntry> batch{
-            akkaradb::engine::AkkEngine::BatchPutEntry{bytes(data.betaKey), bytes(data.betaValue)},
-            akkaradb::engine::AkkEngine::BatchPutEntry{bytes(data.gammaKey), bytes(data.gammaValue)},
+        const std::vector<akkaradb::engine::detail::BulkPutEntry> batch{
+            akkaradb::engine::detail::BulkPutEntry{bytes(data.betaKey), bytes(data.betaValue)},
+            akkaradb::engine::detail::BulkPutEntry{bytes(data.gammaKey), bytes(data.gammaValue)},
         };
-        engine.putBatch(batch);
+        akkaradb::engine::detail::ProtocolBulkWriter::put(engine, batch);
         engine.remove(bytes(data.gammaKey));
         engine.put(bytes(data.alphaKey), bytes(data.alphaNew));
     }
@@ -988,10 +989,10 @@ namespace {
 
                             engine->put(bytes(putKey), bytes(putValue));
                             const std::array batch{
-                                akkaradb::engine::AkkEngine::BatchPutEntry{bytes(batchFirstKey), bytes(batchFirstValue)},
-                                akkaradb::engine::AkkEngine::BatchPutEntry{bytes(batchSecondKey), bytes(batchSecondValue)},
+                                akkaradb::engine::detail::BulkPutEntry{bytes(batchFirstKey), bytes(batchFirstValue)},
+                                akkaradb::engine::detail::BulkPutEntry{bytes(batchSecondKey), bytes(batchSecondValue)},
                             };
-                            engine->putBatch(batch);
+                            akkaradb::engine::detail::ProtocolBulkWriter::put(*engine, batch);
                             engine->put(bytes(removedKey), bytes("removed"));
                             engine->remove(bytes(removedKey));
                             if ((operation & 3U) == 0) { std::this_thread::yield(); }
@@ -1055,6 +1056,69 @@ namespace {
             fs::remove_all(dir, ec);
         }
     }
+
+    void runRollbackExecutionModeRecoveryTest() {
+        namespace engine = akkaradb::engine;
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_rollback_execution_modes";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        require(!ec, "failed to create rollback execution-mode test directory");
+
+        auto options = persistentOptions(dir);
+        options.components.versionLogEnabled = true;
+        const auto key = bytes("rollback-key");
+        auto database = engine::AkkEngine::open(options);
+        database->put(key, bytes("v1"));
+        const uint64_t v1 = database->stats().currentSeq;
+        database->put(key, bytes("v2"));
+        const auto immediate = database->rollbackKey(key, v1);
+        require(immediate.complete() && immediate.appliedCount() == 1, "immediate rollback did not report success");
+        require(database->get(key) == std::optional<std::vector<uint8_t>>{{'v', '1'}}, "immediate rollback restored the wrong value");
+
+        database->put(key, bytes("v3"));
+        const auto deferred = database->rollbackKey(
+            key, v1, engine::RollbackOptions{.execution = engine::RollbackExecutionMode::NEXT_STARTUP}
+        );
+        require(deferred.deferredCount() == 1, "next-startup rollback was not durably deferred");
+        require(database->get(key) == std::optional<std::vector<uint8_t>>{{'v', '3'}}, "next-startup rollback ran too early");
+        database->close();
+
+        database = engine::AkkEngine::open(options);
+        require(waitUntil([&] {
+            return database->get(key) == std::optional<std::vector<uint8_t>>{{'v', '1'}};
+        }), "next-startup rollback was not recovered");
+
+        const uint64_t conflictTarget = database->stats().currentSeq;
+        database->put(key, bytes("v4"));
+        (void)database->rollbackKey(
+            key, conflictTarget, engine::RollbackOptions{.execution = engine::RollbackExecutionMode::NEXT_STARTUP}
+        );
+        database->put(key, bytes("v5"));
+        database->close();
+        database = engine::AkkEngine::open(options);
+        std::this_thread::sleep_for(std::chrono::milliseconds{1250});
+        require(database->get(key) == std::optional<std::vector<uint8_t>>{{'v', '5'}}, "FAIL_IF_CHANGED overwrote a newer value");
+
+        const uint64_t overwriteTarget = database->stats().currentSeq;
+        database->put(key, bytes("v6"));
+        (void)database->rollbackKey(
+            key,
+            overwriteTarget,
+            engine::RollbackOptions{
+                .execution = engine::RollbackExecutionMode::NEXT_STARTUP,
+                .conflict = engine::RollbackConflictPolicy::OVERWRITE_LATEST,
+            }
+        );
+        database->put(key, bytes("v7"));
+        database->close();
+        database = engine::AkkEngine::open(options);
+        require(waitUntil([&] {
+            return database->get(key) == std::optional<std::vector<uint8_t>>{{'v', '5'}};
+        }), "OVERWRITE_LATEST did not apply the deferred rollback");
+        database->close();
+        fs::remove_all(dir, ec);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -1077,6 +1141,7 @@ int main(int argc, char** argv) {
         runParallelWalSstCorrectnessTest();
         runFlushBoundaryCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));
         runCompactionCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));
+        runRollbackExecutionModeRecoveryTest();
         return 0;
     }
     catch (const std::exception& ex) {

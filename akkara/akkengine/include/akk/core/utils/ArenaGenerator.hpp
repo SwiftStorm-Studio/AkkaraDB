@@ -15,7 +15,9 @@
 #include <cstddef>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -27,9 +29,16 @@ namespace akkaradb::core {
      *
      * Coroutine frames are allocated from the currently active arena
      * (set via withArena()).
+     * Frame storage supports alignments up to __STDCPP_DEFAULT_NEW_ALIGNMENT__. T, coroutine
+     * parameters and locals must not be over-aligned: the allocation hook
+     * receives a size, but no frame alignment from the compiler. In addition,
+     * the Windows coroutine_handle ABI cannot recover an over-aligned promise.
      */
     template <typename T>
     class ArenaGenerator {
+        static constexpr size_t FRAME_ALIGNMENT = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+        static_assert(alignof(T) <= FRAME_ALIGNMENT, "ArenaGenerator does not support over-aligned value types");
+
         public:
             struct promise_type;
             using HandleType = std::coroutine_handle<promise_type>;
@@ -43,7 +52,9 @@ namespace akkaradb::core {
                 #pragma warning(disable: 4324)
                 #endif
 
-                struct alignas(std::max_align_t) AllocationHeader {
+                // max_align_t can be smaller than the default frame alignment
+                // (8 versus 16 on Windows). The prefix must preserve both.
+                struct alignas(FRAME_ALIGNMENT) AllocationHeader {
                     bool fromArena;
                 };
 
@@ -54,10 +65,13 @@ namespace akkaradb::core {
                 static thread_local BufferArena* tlsArena_;
 
                 [[nodiscard]] void* operator new(size_t size) {
+                    static_assert(alignof(promise_type) <= FRAME_ALIGNMENT);
+                    static_assert(sizeof(AllocationHeader) % FRAME_ALIGNMENT == 0);
+                    if (size > std::numeric_limits<size_t>::max() - sizeof(AllocationHeader)) { throw std::bad_alloc(); }
                     const size_t total = size + sizeof(AllocationHeader);
 
                     if (tlsArena_ != nullptr) {
-                        std::byte* raw = tlsArena_->allocate(total, alignof(std::max_align_t));
+                        std::byte* raw = tlsArena_->allocate(total, FRAME_ALIGNMENT);
                         auto* header = reinterpret_cast<AllocationHeader*>(raw);
                         header->fromArena = true;
                         return raw + sizeof(AllocationHeader);

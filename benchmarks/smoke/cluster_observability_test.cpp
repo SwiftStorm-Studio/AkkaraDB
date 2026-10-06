@@ -220,7 +220,7 @@ namespace {
             std::span<const uint8_t> value,
             uint8_t,
             uint64_t
-        ) {
+        , uint64_t) {
             std::lock_guard lock{node->valuesMutex};
             const std::string decodedKey = textOf(key);
             if (operation == ReplOpType::REMOVE) { node->values.erase(decodedKey); }

@@ -8,6 +8,7 @@
  */
 
 // jni/AkkaraJni.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akkaradb/AkkaraDB.hpp"
 
 #include <jni.h>

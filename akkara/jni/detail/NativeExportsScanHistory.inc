@@ -91,20 +91,28 @@
             auto* db = dbFrom(handle);
             if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
             const auto k = readDirectBuffer(env, key);
-            const auto history = db->engine().history(k);
             const auto& ids = bindings(env);
-            if (history.size() > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
-                throw std::runtime_error("AkkaraDB JNI history result is too large");
-            }
-            jobjectArray out = env->NewObjectArray(static_cast<jsize>(history.size()), ids.versionEntryClass, nullptr);
-            if (out == nullptr || env->ExceptionCheck()) { return nullptr; }
-            for (jsize i = 0; i < static_cast<jsize>(history.size()); ++i) {
-                jobject entry = makeVersionEntry(env, history[static_cast<size_t>(i)]);
-                if (entry == nullptr || env->ExceptionCheck()) { return nullptr; }
-                env->SetObjectArrayElement(out, i, entry);
+            jclass listClass = env->FindClass("java/util/ArrayList");
+            if (!listClass || env->ExceptionCheck()) { return nullptr; }
+            const auto constructor = env->GetMethodID(listClass, "<init>", "()V");
+            const auto add = env->GetMethodID(listClass, "add", "(Ljava/lang/Object;)Z");
+            const auto toArray = env->GetMethodID(listClass, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;");
+            if (!constructor || !add || !toArray || env->ExceptionCheck()) { return nullptr; }
+            jobject list = env->NewObject(listClass, constructor);
+            if (!list || env->ExceptionCheck()) { return nullptr; }
+            size_t count = 0;
+            for (const auto& value : db->engine().history(k)) {
+                if (count++ == static_cast<size_t>(std::numeric_limits<jsize>::max())) { throw std::runtime_error("AkkaraDB JNI history result is too large"); }
+                jobject entry = makeVersionEntry(env, value);
+                if (!entry || env->ExceptionCheck()) { return nullptr; }
+                env->CallBooleanMethod(list, add, entry); env->DeleteLocalRef(entry);
                 if (env->ExceptionCheck()) { return nullptr; }
-                env->DeleteLocalRef(entry);
             }
+            jobjectArray empty = env->NewObjectArray(0, ids.versionEntryClass, nullptr);
+            if (!empty || env->ExceptionCheck()) { return nullptr; }
+            auto out = static_cast<jobjectArray>(env->CallObjectMethod(list, toArray, empty));
+            env->DeleteLocalRef(empty); env->DeleteLocalRef(list); env->DeleteLocalRef(listClass);
+            if (env->ExceptionCheck()) { return nullptr; }
             return out;
         }
     );
@@ -121,7 +129,8 @@
         [&]() {
             auto* db = dbFrom(handle);
             if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-            db->engine().rollbackTo(static_cast<uint64_t>(targetSeq));
+            const auto result = db->engine().rollbackTo(static_cast<uint64_t>(targetSeq));
+            if (!result.complete()) { throw std::runtime_error("rollbackTo did not complete"); }
             return 0;
         }
     );
@@ -139,7 +148,8 @@
         [&]() {
             auto* db = dbFrom(handle);
             if (db == nullptr) { throw std::runtime_error("AkkEngine handle is null"); }
-            db->engine().rollbackKey(readDirectBuffer(env, key), static_cast<uint64_t>(targetSeq));
+            const auto result = db->engine().rollbackKey(readDirectBuffer(env, key), static_cast<uint64_t>(targetSeq));
+            if (!result.complete()) { throw std::runtime_error("rollbackKey did not complete"); }
             return 0;
         }
     );

@@ -74,6 +74,7 @@ namespace akkaradb::engine::cluster {
 
     struct RaftPeerStats {
         uint64_t nodeId = 0;
+        bool learner = false;
         uint64_t matchIndex = 0;
         uint64_t nextIndex = 0;
         uint64_t replicationLag = 0;
@@ -97,12 +98,22 @@ namespace akkaradb::engine::cluster {
         ClusterFailureCode lastFailure = ClusterFailureCode::NONE;
         uint64_t lastFailureAtUs = 0;
         uint64_t currentTerm = 0;
+        uint64_t configurationGeneration = 0;
+        bool jointConsensus = false;
         uint64_t leaderNodeId = 0;
         uint64_t commitIndex = 0;
         uint64_t appliedIndex = 0;
         uint64_t appliedStateMachineSeq = 0;
         uint64_t lastLogIndex = 0;
         uint64_t snapshotIndex = 0;
+        uint64_t voterCount = 0;
+        uint64_t learnerCount = 0;
+        bool localLearner = false;
+        uint64_t mirrorAuthorityLeaderNodeId = 0;
+        uint64_t mirrorAuthorityPrimaryNodeId = 0;
+        uint64_t mirrorAuthorityEpoch = 0;
+        uint64_t mirrorAuthorityCommitIndex = 0;
+        bool mirrorWritePending = false;
         uint64_t outboundConnections = 0;
         uint64_t peerWorkers = 0;
         uint64_t proposalBatches = 0;
@@ -136,37 +147,54 @@ namespace akkaradb::engine::cluster {
     };
 
     struct AKDB_API ClusterEngineCallbacks {
+        // Executes one public operation at its destination. Never forwards again.
+        std::function<ForwardResponse(const ForwardRequest&)> forward;
         std::function<uint64_t()> getCurrentSeq;
         std::function<uint64_t()> getLastSeq;
+        // The leader of the stable per-key Raft group, or zero while unknown.
+        std::function<uint64_t(std::span<const uint8_t>)> partitionLeader;
+        std::function<std::vector<NodeInfo>(std::span<const uint8_t>)> partitionCandidates;
+        std::function<void(const ClusterConfig&, uint64_t generation)> placementChanged;
         // Returns a complete, contiguous (afterSeq, throughSeq] mutation range,
         // or nullopt when the retained WAL cannot satisfy the request.
         std::function<std::optional<std::vector<ClusterHistoryEntry>>(uint64_t afterSeq, uint64_t throughSeq)> getEntries;
         std::function<std::optional<ClusterSnapshot>()> exportSnapshot;
+        // Replaces only this owner's PARTITIONED keys using local storage sequences.
+        // The completed producer is repeatable; return only after durable install.
+        std::function<void(uint64_t ownerNodeId, const ClusterSnapshot&)> installPartitionSnapshot;
         // entryCount is zero while a streaming producer has not completed.
         std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> beginSnapshot;
         std::function<void(std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c)> beginSnapshotEntry;
         std::function<void(uint64_t offset, std::span<const uint8_t> chunk)> appendSnapshotEntryChunk;
         std::function<void()> finishSnapshotEntry;
+        // Validate and sync receive staging before Raft publishes install intent.
+        std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> prepareSnapshot;
         // Receives the exact count observed by the completed producer.
         std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> finishSnapshot;
         std::function<void(uint64_t snapshotSeq)> recoverSnapshot;
         std::function<bool(uint64_t snapshotSeq)> isSnapshotDurable;
         std::function<void(
-uint64_t seq,
- ReplOpType op,
- std::span<const uint8_t> key,
- std::span<const uint8_t> value,
- uint8_t recordFlags,
- uint64_t sourceNodeId
+            uint64_t seq,
+            ReplOpType op,
+            std::span<const uint8_t> key,
+            std::span<const uint8_t> value,
+            uint8_t recordFlags,
+            uint64_t sourceNodeId,
+            uint64_t timestampNs
         )> apply;
         std::function<ReadResponse(std::span<const uint8_t> key, uint64_t snapshotSeq)> read;
         // Applies an authoritative STRIPE metadata entry after the metadata
         // Raft leader validates its fencing token and reaches quorum commit.
-        std::function<void(std::span<const uint8_t> publicKey, std::span<const uint8_t> metadata)> commitStripeMetadata;
+        std::function<void(uint64_t logicalSeq, std::span<const uint8_t> publicKey, std::span<const uint8_t> metadata)> commitStripeMetadata;
         std::function<std::optional<std::vector<uint8_t>>(std::span<const uint8_t> publicKey)> readStripeMetadata;
-        // Produces only public-key/AKSM1 entries for the metadata Raft state
-        // machine. The supplied sequence is the Raft state-machine sequence.
+        // Fixed cut of STRIPE metadata heads, retained revisions and placement aliases.
         std::function<std::optional<ClusterSnapshot>(uint64_t sequence)> exportStripeMetadataSnapshot;
+        std::function<void(const ClusterSnapshot&, uint64_t afterAuthoritySequence)> installStripeMetadataSnapshot;
+        // Node-to-node rollback/checkpoint control. The framing reuses the
+        // bounded STRIPE control envelope and inherits the selected transport's
+        // authentication properties; these actions are available to every
+        // partition owner.
+        std::function<StripeControlResponse(uint64_t requesterNodeId, const StripeControlRequest&)> rollbackControl;
         std::function<void()> forceDurable;
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)> beginBlob;
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)> appendBlobChunk;
@@ -189,6 +217,18 @@ uint64_t seq,
             using std::runtime_error::runtime_error;
     };
 
+    struct ClusterPlacementState {
+        uint64_t leaderNodeId = 0;
+        uint64_t generation = 1;
+        uint64_t pendingGeneration = 0;
+        uint64_t lastIssuedGeneration = 1;
+        bool stripeWritesBlocked = false;
+        bool activationStarted = false;
+        bool cancelOnInterruption = false;
+        std::vector<uint8_t> activeConfig;
+        std::vector<uint8_t> pendingConfig;
+    };
+
     class AKDB_API IClusterRuntime {
         public:
             virtual ~IClusterRuntime() = default;
@@ -203,6 +243,22 @@ uint64_t seq,
             [[nodiscard]] virtual NodeRole role() const noexcept { return NodeRole::STANDALONE; }
             [[nodiscard]] virtual std::vector<NodeInfo> activeNodes() const { return {}; }
             [[nodiscard]] virtual bool ownsWriteKey(std::span<const uint8_t>) const { return true; }
+            [[nodiscard]] virtual ClusterRouteTarget routeTarget(std::span<const uint8_t>) const { return {}; }
+            [[nodiscard]] virtual ForwardResponse forwardTo(uint64_t, ForwardRequest) {
+                throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE);
+            }
+            [[nodiscard]] virtual ReadResponse linearizableReadKey(std::span<const uint8_t> key) { return readKey(key, 0); }
+            virtual void queryReadBarrier() {
+                throw std::runtime_error("IClusterRuntime: cluster query read barrier is unsupported");
+            }
+            [[nodiscard]] virtual uint64_t ownerNodeId(std::span<const uint8_t>) const { return 0; }
+            [[nodiscard]] virtual uint64_t configurationEpoch() const noexcept { return 1; }
+            [[nodiscard]] virtual uint64_t stripeMetadataLinearizableWatermark() {
+                throw std::runtime_error("IClusterRuntime: STRIPE metadata watermark is not supported");
+            }
+            [[nodiscard]] virtual StripeControlResponse rollbackControl(uint64_t, StripeControlRequest) {
+                throw std::runtime_error("IClusterRuntime: distributed rollback control is not supported");
+            }
             [[nodiscard]] virtual ReadResponse readKey(std::span<const uint8_t>, uint64_t) {
                 throw std::runtime_error("IClusterRuntime: cluster reads are not supported");
             }
@@ -264,10 +320,44 @@ uint64_t seq,
                 shipEntry(seq, op, key, value, recordFlags, sourceNodeId);
             }
             virtual void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content) = 0;
-            virtual void reconfigure(ClusterConfig) {
+            virtual void campaignLeadership() { throw std::runtime_error("IClusterRuntime: explicit campaign requires data consensus"); }
+            virtual void reconfigure(ClusterConfig, uint64_t = 0) {
                 throw std::runtime_error("IClusterRuntime: cluster reconfiguration is not supported");
             }
+            virtual void preparePlacementNodes(const ClusterConfig&) { throw std::logic_error("IClusterRuntime: placement transport unavailable"); }
+            virtual void waitForStripeOperations() { throw std::logic_error("IClusterRuntime: stripe authority unavailable"); }
+            virtual void publishStripePlacementAlias(std::span<const uint8_t>, std::span<const uint8_t>, uint64_t) {
+                throw std::logic_error("IClusterRuntime: stripe authority unavailable");
+            }
+            [[nodiscard]] virtual ClusterPlacementState placementState(bool = false) { return {}; }
+            virtual uint64_t beginPlacementChange(const ClusterConfig&) {
+                throw std::runtime_error("IClusterRuntime: placement authority is unavailable");
+            }
+            virtual void finishPlacementChange(uint64_t) {
+                throw std::runtime_error("IClusterRuntime: placement authority is unavailable");
+            }
+            virtual void freezeStripePlacement(uint64_t) { throw std::logic_error("IClusterRuntime: stripe authority unavailable"); }
+            virtual void cancelPlacementChange(uint64_t) { throw std::logic_error("IClusterRuntime: placement authority unavailable"); }
 
+            virtual void addRaftLearner(const NodeInfo&) {
+                throw std::runtime_error("ClusterRuntimeProvider: Raft learners are unsupported");
+            }
+            virtual void executePrimaryWrite(const std::function<void()>& write) { write(); }
+            // Returns true if a pending grant was resolved; false if none remains
+            // or the configured provider cannot yet prove safe recovery.
+            virtual bool recoverMirrorWrite() { throw std::runtime_error("IClusterRuntime: MIRROR authority recovery is unavailable"); }
+            virtual void cancelMirrorRecovery() noexcept {}
+            [[nodiscard]] virtual MirrorFencingMode mirrorFencingMode() const noexcept { return MirrorFencingMode::STATIC; }
+            [[nodiscard]] virtual MirrorRecoveryMode mirrorRecoveryMode() const noexcept { return MirrorRecoveryMode::BLOCK; }
+            virtual void transferMirrorAuthorityLeadership(uint64_t) {
+                throw std::runtime_error("IClusterRuntime: MIRROR authority quorum is not enabled");
+            }
+            virtual void promoteRaftLearner(uint64_t) {
+                throw std::runtime_error("ClusterRuntimeProvider: Raft learners are unsupported");
+            }
+            virtual void removeRaftLearner(uint64_t) {
+                throw std::runtime_error("ClusterRuntimeProvider: Raft learners are unsupported");
+            }
             virtual void addRaftVotingNode(const NodeInfo&) {
                 throw std::runtime_error("IClusterRuntime: online Raft membership change is not supported");
             }

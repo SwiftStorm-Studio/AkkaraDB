@@ -204,10 +204,10 @@ namespace akkaradb::engine::blob {
             }
         }
 
-        [[nodiscard]] AkBlobHeaderV5 readBlobHeaderOnly(const fs::path& path) {
+        [[nodiscard]] AkBlobHeaderV1 readBlobHeaderOnly(const fs::path& path) {
             FILE* f = openFileRead(path);
             if (!f) { throw std::runtime_error("BlobManager: cannot open file: " + path.string()); }
-            uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+            uint8_t headerBuf[AKBLOB_HEADER_SIZE_V1]{};
             try {
                 if (fread(headerBuf, 1, sizeof(headerBuf), f) != sizeof(headerBuf)) {
                     throw std::runtime_error("BlobManager: cannot read header: " + path.string());
@@ -272,7 +272,8 @@ namespace akkaradb::engine::blob {
             fs::path blobDir;
             Options options;
             mutable std::mutex writeMu;
-            mutable std::shared_mutex readPinMu;
+            struct ReadPins { std::mutex mutex; std::condition_variable cv; uint64_t count = 0; };
+            std::shared_ptr<ReadPins> readPins = std::make_shared<ReadPins>();
             std::mutex delMu;
             std::condition_variable delCv;
             std::vector<uint64_t> delQueue;
@@ -350,7 +351,7 @@ namespace akkaradb::engine::blob {
 
                 const uint32_t contentCrc = crc32c(content);
                 const auto header = buildBlobHeader(blobId, content.size(), payloadSize, actualCodec, contentCrc);
-                uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+                uint8_t headerBuf[AKBLOB_HEADER_SIZE_V1]{};
                 serializeBlobHeader(header, headerBuf);
                 writeAtomicSplit(path, headerBuf, sizeof(headerBuf), payload, payloadSize);
                 if (options.onBlobPut) {
@@ -414,7 +415,7 @@ namespace akkaradb::engine::blob {
                 pending.expectedCrc32c = contentCrc32c;
                 try {
                     const auto header = buildBlobHeader(blobId, totalSize, totalSize, BlobCodec::NONE, contentCrc32c);
-                    uint8_t headerBuf[AKBLOB_HEADER_SIZE_V5]{};
+                    uint8_t headerBuf[AKBLOB_HEADER_SIZE_V1]{};
                     serializeBlobHeader(header, headerBuf);
                     writeAll(pending.file, headerBuf, sizeof(headerBuf));
                     pendingStreamingBlobs.emplace(blobId, std::move(pending));
@@ -463,7 +464,7 @@ namespace akkaradb::engine::blob {
                     }
                     blobsWritten.fetch_add(1, std::memory_order_relaxed);
                     bytesUncompressed.fetch_add(pending.totalSize, std::memory_order_relaxed);
-                    bytesOnDisk.fetch_add(static_cast<uint64_t>(AKBLOB_HEADER_SIZE_V5) + pending.totalSize, std::memory_order_relaxed);
+                    bytesOnDisk.fetch_add(static_cast<uint64_t>(AKBLOB_HEADER_SIZE_V1) + pending.totalSize, std::memory_order_relaxed);
                 }
                 catch (...) {
                     abortPendingNoThrow(pending);
@@ -493,7 +494,11 @@ namespace akkaradb::engine::blob {
 
                     if (!batch.empty()) {
                         gcCycles.fetch_add(1, std::memory_order_relaxed);
-                        std::unique_lock readPinLock{readPinMu};
+                        std::unique_lock readPinLock{readPins->mutex};
+                        while (readPins->count != 0 && running.load(std::memory_order_acquire)) {
+                            readPins->cv.wait_for(readPinLock, std::chrono::milliseconds{200});
+                        }
+                        if (readPins->count != 0) { continue; }
                         for (uint64_t id : batch) {
                             const auto src = pathFor(id);
                             auto dst = src;
@@ -514,7 +519,8 @@ namespace akkaradb::engine::blob {
                 }
                 if (!finalBatch.empty()) {
                     gcCycles.fetch_add(1, std::memory_order_relaxed);
-                    std::unique_lock readPinLock{readPinMu};
+                    std::unique_lock readPinLock{readPins->mutex};
+                    if (readPins->count != 0) { return; }
                     for (uint64_t id : finalBatch) {
                         const auto src = pathFor(id);
                         auto dst = src;
@@ -617,13 +623,13 @@ namespace akkaradb::engine::blob {
         if (!impl_) { throw std::runtime_error("BlobManager: not initialized"); }
         const auto path = impl_->pathFor(blobId);
         auto raw = readFile(path);
-        if (raw.size() < AKBLOB_HEADER_SIZE_V5) { throw std::runtime_error("BlobManager: file too small: " + path.string()); }
+        if (raw.size() < AKBLOB_HEADER_SIZE_V1) { throw std::runtime_error("BlobManager: file too small: " + path.string()); }
 
         const auto header = deserializeBlobHeader(raw.data());
         if (!verifyBlobHeader(header)) { throw std::runtime_error("BlobManager: header corrupt: " + path.string()); }
         if (header.blobId != blobId) { throw std::runtime_error("BlobManager: blobId mismatch: " + path.string()); }
 
-        const size_t payloadOffset = AKBLOB_HEADER_SIZE_V5;
+        const size_t payloadOffset = AKBLOB_HEADER_SIZE_V1;
         if (header.storedSize > raw.size() - payloadOffset) {
             throw std::runtime_error("BlobManager: payload truncated: " + path.string());
         }
@@ -667,7 +673,7 @@ namespace akkaradb::engine::blob {
         if (!file) { throw std::runtime_error("BlobManager: cannot open file: " + path.string()); }
 
         try {
-            uint8_t headerBytes[AKBLOB_HEADER_SIZE_V5]{};
+            uint8_t headerBytes[AKBLOB_HEADER_SIZE_V1]{};
             if (fread(headerBytes, 1, sizeof(headerBytes), file) != sizeof(headerBytes)) {
                 throw std::runtime_error("BlobManager: cannot read header: " + path.string());
             }
@@ -761,7 +767,12 @@ namespace akkaradb::engine::blob {
 
     BlobManager::ReadPin BlobManager::pinReads() const {
         if (!impl_) { return {}; }
-        return ReadPin{impl_->readPinMu};
+        auto state = impl_->readPins;
+        { std::lock_guard lock{state->mutex}; ++state->count; }
+        return ReadPin{std::shared_ptr<void>{state.get(), [state](void*) {
+            { std::lock_guard lock{state->mutex}; --state->count; }
+            state->cv.notify_all();
+        }}};
     }
 
     void BlobManager::scheduleDelete(uint64_t blobId) {

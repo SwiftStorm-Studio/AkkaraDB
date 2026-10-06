@@ -48,7 +48,7 @@ namespace akkaradb::engine::server {
         RUN_BLOB_GC = 0x13, };
 
     enum class ApiStatus : uint8_t {
-        OK = 0x00, NOT_FOUND = 0x01, ERROR_STATUS = 0xFF,
+        OK = 0x00, NOT_FOUND = 0x01, ROUTING_ERROR = 0x02, ERROR_STATUS = 0xFF,
     };
 
     #pragma pack(push, 1)
@@ -72,9 +72,9 @@ namespace akkaradb::engine::server {
     static_assert(sizeof(ApiRequestHeader) == 16);
     static_assert(sizeof(ApiResponseHeader) == 13);
 
-    inline constexpr char REQUEST_MAGIC[4] = {'A', 'K', '5', 'Q'};
-    inline constexpr char RESPONSE_MAGIC[4] = {'A', 'K', '5', 'S'};
-    inline constexpr uint8_t PROTOCOL_VERSION = 2;
+    inline constexpr char REQUEST_MAGIC[4] = {'A', 'K', '1', 'Q'};
+    inline constexpr char RESPONSE_MAGIC[4] = {'A', 'K', '1', 'S'};
+    inline constexpr uint8_t PROTOCOL_VERSION = 1;
 
     struct ApiBatchPutItem {
         std::span<const uint8_t> key;

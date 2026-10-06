@@ -8,6 +8,7 @@
  */
 
 // benchmarks/smoke/version_log_recovery_concurrency_smoke_test.cpp
+#include "detail/CollectHistory.hpp"
 #include "TestErrorHandlers.hpp"
 
 #include "akk/engine/vlog/VersionLog.hpp"
@@ -205,7 +206,7 @@ namespace {
         const auto observed = log->getAt(bytes(key), 1);
         require(observed.has_value() && observed->value == std::vector<uint8_t>{'v', 'a', 'l', 'u', 'e', '-', '1'},
                 "serial ASYNC recovery must retain entries before an interrupted active tail");
-        require(log->history(bytes(key)).size() == 1, "serial ASYNC recovery must ignore bytes after the valid active prefix");
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == 1, "serial ASYNC recovery must ignore bytes after the valid active prefix");
         log->close();
 
         const uint64_t recoveredBytes = fs::file_size(path);
@@ -232,7 +233,7 @@ namespace {
         const auto observed = log->getAt(bytes(key), 1);
         require(observed.has_value() && observed->value == std::vector<uint8_t>{'v', 'a', 'l', 'u', 'e', '-', '1'},
                 "parallel VLog recovery must ignore bytes beyond the durable tail");
-        require(log->history(bytes(key)).size() == 1, "garbage beyond the durable tail must not create history entries");
+        require(akk_test::collectHistory(log->history(bytes(key))).size() == 1, "garbage beyond the durable tail must not create history entries");
         const auto snapshot = log->snapshot();
         require(snapshot.recoveredSegmentCount != 0, "recovery stats must report recovered segments");
         require(snapshot.recoveredEntryCount == 1, "recovery stats must report entries bounded by the durable tail");
@@ -254,7 +255,7 @@ namespace {
         const auto index = dir / "sidecar-fallback.akvidx";
         require(fs::exists(index), "test setup must have a generated sidecar index");
         flipByte(index, static_cast<std::streamoff>(fs::file_size(index) - 1));
-        const auto history = log->history(bytes(key));
+        const auto history = akk_test::collectHistory(log->history(bytes(key)));
         require(history.size() == 8, "corrupt sidecar index must fall back to authoritative VLog scan");
         require(history.back().seq == 8, "sidecar fallback must preserve the newest version");
         require(log->snapshot().sidecarFallbackCount != 0, "sidecar fallback stats must report corrupt sidecar use");
@@ -283,7 +284,7 @@ namespace {
         fs::remove(tail, error);
         require(!error, "test setup must remove the closed segment durable tail");
         appendGarbageTail(path);
-        requireRuntimeError([&] { (void)log->history(bytes(key)); },
+        requireRuntimeError([&] { (void)akk_test::collectHistory(log->history(bytes(key))); },
                             "closed segment fallback must reject trailing garbage instead of accepting a valid prefix");
         log->close();
     }
@@ -336,7 +337,7 @@ namespace {
                 try {
                     for (uint32_t iteration = 0; iteration < readerIterations; ++iteration) {
                         const uint64_t target = highestSubmitted.load(std::memory_order_acquire);
-                        const auto history = log->history(bytes(sharedKey));
+                        const auto history = akk_test::collectHistory(log->history(bytes(sharedKey)));
                         uint64_t previous = 0;
                         for (const auto& entry : history) {
                             require(entry.seq > previous, "parallel history must remain strictly sorted during concurrent access");
@@ -369,7 +370,7 @@ namespace {
         require(parallelSnapshot.parallelLaneCount == 4, "parallel stats must report configured lane count");
         require(parallelSnapshot.parallelPendingWrites == 0, "forceSync must drain parallel pending writes");
         require(parallelSnapshot.parallelPendingBytes == 0, "forceSync must drain parallel pending bytes");
-        const auto beforeClose = log->history(bytes(sharedKey));
+        const auto beforeClose = akk_test::collectHistory(log->history(bytes(sharedKey)));
         require(beforeClose.size() == totalEntries, "parallel stress must publish every written history entry before close");
         log->close();
 
@@ -377,7 +378,7 @@ namespace {
         const auto recoverySnapshot = recovered->snapshot();
         require(recoverySnapshot.recoveredEntryCount == totalEntries, "parallel recovery stats must report recovered entry count");
         require(recoverySnapshot.recoveredSegmentCount != 0, "parallel recovery stats must report recovered segments");
-        const auto history = recovered->history(bytes(sharedKey));
+        const auto history = akk_test::collectHistory(recovered->history(bytes(sharedKey)));
         require(history.size() == totalEntries, "parallel stress recovery must retain every written history entry");
         for (uint64_t i = 0; i < history.size(); ++i) {
             const uint64_t expectedSeq = i + 1u;

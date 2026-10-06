@@ -16,6 +16,7 @@
  */
 
 // akkserver/src/grpc/AkkaraGRPCServer.cpp
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akkaradb/grpc/AkkaraGRPCServer.hpp"
 
 #include "akk/engine/server/AkkApiTransportProvider.hpp"
@@ -327,7 +328,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.put(bytes(request->key()), bytes(request->value()));
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("put failed"); }
                     }
 
@@ -337,7 +338,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.putHinted(bytes(request->key()), bytes(request->value()), request->fp64(), request->mini_key());
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("put hinted failed"); }
                     }
 
@@ -352,7 +353,7 @@ namespace akkaradb::grpcapi {
                             setBytes(response->mutable_value(), std::span<const uint8_t>{value.data(), value.size()});
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("get failed"); }
                     }
 
@@ -362,7 +363,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.remove(bytes(request->key()));
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("remove failed"); }
                     }
 
@@ -372,7 +373,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.removeHinted(bytes(request->key()), request->fp64(), request->mini_key());
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("remove hinted failed"); }
                     }
 
@@ -386,7 +387,7 @@ namespace akkaradb::grpcapi {
                             response->set_found(owner_.engine_.exists(bytes(request->key())));
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("exists failed"); }
                     }
 
@@ -402,7 +403,7 @@ namespace akkaradb::grpcapi {
                             );
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("count failed"); }
                     }
 
@@ -424,7 +425,7 @@ namespace akkaradb::grpcapi {
                             }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("scan failed"); }
                     }
 
@@ -465,7 +466,7 @@ namespace akkaradb::grpcapi {
                             }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("scan stream failed"); }
                     }
 
@@ -480,7 +481,7 @@ namespace akkaradb::grpcapi {
                             setBytes(response->mutable_value(), std::span<const uint8_t>{value->data(), value->size()});
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("getAt failed"); }
                     }
 
@@ -508,7 +509,7 @@ namespace akkaradb::grpcapi {
                             }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("history failed"); }
                     }
 
@@ -551,27 +552,29 @@ namespace akkaradb::grpcapi {
                             }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("history stream failed"); }
                     }
 
                     ::grpc::Status RollbackTo(::grpc::ServerContext*, const wire::RollbackToRequest* request, wire::Empty*) override {
                         RequestScope requestScope{owner_};
                         try {
-                            owner_.engine_.rollbackTo(request->target_seq());
+                            const auto result = owner_.engine_.rollbackTo(request->target_seq());
+                            if (!result.complete()) { return owner_.errorStatus("rollbackTo did not complete"); }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("rollbackTo failed"); }
                     }
 
                     ::grpc::Status RollbackKey(::grpc::ServerContext*, const wire::RollbackKeyRequest* request, wire::Empty*) override {
                         RequestScope requestScope{owner_};
                         try {
-                            owner_.engine_.rollbackKey(bytes(request->key()), request->target_seq());
+                            const auto result = owner_.engine_.rollbackKey(bytes(request->key()), request->target_seq());
+                            if (!result.complete()) { return owner_.errorStatus("rollbackKey did not complete"); }
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("rollbackKey failed"); }
                     }
 
@@ -581,14 +584,14 @@ namespace akkaradb::grpcapi {
                             if (static_cast<uint32_t>(request->items_size()) > owner_.maxBatchItems()) {
                                 return owner_.invalidArgument("too many batch put items");
                             }
-                            std::vector<engine::AkkEngine::BatchPutEntry> entries;
+                            std::vector<akkaradb::engine::detail::BulkPutEntry> entries;
                             entries.reserve(static_cast<size_t>(request->items_size()));
                             for (const auto& item : request->items()) { entries.push_back({bytes(item.key()), bytes(item.value())}); }
-                            owner_.engine_.putBatch(std::span<const engine::AkkEngine::BatchPutEntry>{entries.data(), entries.size()});
+                            akkaradb::engine::detail::ProtocolBulkWriter::put(owner_.engine_, std::span<const akkaradb::engine::detail::BulkPutEntry>{entries.data(), entries.size()});
                             owner_.batchPutItemsTotal_.fetch_add(entries.size(), std::memory_order_relaxed);
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("batch put failed"); }
                     }
 
@@ -619,7 +622,7 @@ namespace akkaradb::grpcapi {
                             owner_.batchGetItemsTotal_.fetch_add(keys.size(), std::memory_order_relaxed);
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("batch get failed"); }
                     }
 
@@ -629,7 +632,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.forceSync();
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("force sync failed"); }
                     }
 
@@ -639,7 +642,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.forceFlush();
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("force flush failed"); }
                     }
 
@@ -649,7 +652,7 @@ namespace akkaradb::grpcapi {
                             owner_.engine_.runBlobGc();
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("run blob gc failed"); }
                     }
 
@@ -659,7 +662,7 @@ namespace akkaradb::grpcapi {
                             copyStats(owner_.engine_.stats(), response->mutable_engine());
                             return ::grpc::Status::OK;
                         }
-                        catch (const std::exception& e) { return owner_.errorStatus(e.what()); }
+                        catch (const std::exception& e) { return owner_.errorStatus(e); }
                         catch (...) { return owner_.errorStatus("stats failed"); }
                     }
 
@@ -739,6 +742,16 @@ namespace akkaradb::grpcapi {
             [[nodiscard]] ::grpc::Status errorStatus(std::string message) {
                 recordError();
                 return {::grpc::StatusCode::INTERNAL, std::move(message)};
+            }
+            [[nodiscard]] ::grpc::Status errorStatus(const std::exception& error) {
+                if (const auto* routing = dynamic_cast<const engine::cluster::ClusterRoutingError*>(&error)) {
+                    recordError();
+                    // UNKNOWN deliberately avoids UNAVAILABLE's common automatic
+                    // retry treatment when the destination may have committed.
+                    return {routing->outcomeUnknown() ? ::grpc::StatusCode::UNKNOWN : ::grpc::StatusCode::FAILED_PRECONDITION,
+                        error.what(), engine::cluster::routingErrorJson(*routing)};
+                }
+                return errorStatus(std::string{error.what()});
             }
 
             [[nodiscard]] ::grpc::Status invalidArgument(std::string message) {

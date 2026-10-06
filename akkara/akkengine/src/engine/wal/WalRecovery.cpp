@@ -198,6 +198,7 @@ namespace akkaradb::engine::wal {
 
     WalRecoveryResult WalRecovery::recoverInto(const WalRecoveryOptions& options, memtable::MemTable& memtable) {
         std::unordered_map<uint64_t, std::vector<WalRecoveredEntry>> pendingSnapshotBatches;
+        std::unordered_map<uint64_t, std::unordered_map<std::string, size_t>> snapshotKeyPositions;
         std::unordered_map<uint64_t, uint64_t> committedSnapshotCounts;
         uint64_t appliedMaxSeq = 0;
         const auto replayEntry = [&memtable](const WalRecoveredEntry& entry) {
@@ -226,7 +227,20 @@ namespace akkaradb::engine::wal {
                     return;
                 }
                 if ((entry.flags & WAL_FLAG_SNAPSHOT_RECORD) != 0) {
-                    pendingSnapshotBatches[entry.seq].push_back(entry);
+                    auto& batch = pendingSnapshotBatches[entry.seq];
+                    auto& positions = snapshotKeyPositions[entry.seq];
+                    const std::string key{reinterpret_cast<const char*>(entry.key.data()), entry.key.size()};
+                    const auto [position, inserted] = positions.emplace(key, batch.size());
+                    if (inserted) { batch.push_back(entry); }
+                    else {
+                        // Recovery may restart an interrupted install of the same
+                        // fixed snapshot. WAL shards do not preserve global order,
+                        // so accept identical records rather than a begin marker.
+                        const auto& previous = batch[position->second];
+                        if (previous.flags != entry.flags || previous.value != entry.value || previous.keyFp64 != entry.keyFp64) {
+                            throw std::runtime_error("WAL recovery found conflicting snapshot records");
+                        }
+                    }
                     return;
                 }
                 replayEntry(entry);

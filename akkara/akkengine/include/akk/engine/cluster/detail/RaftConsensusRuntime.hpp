@@ -59,15 +59,21 @@ namespace akkaradb::engine::cluster {
             ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare);
 
             void linearizableReadBarrier();
+            ForwardResponse forwardTo(uint64_t nodeId, ForwardRequest request);
             std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
                 ClusterMutationFactory);
             ClusterRequestResult queryRequest(const ClusterRequestId&);
 
             void addVotingNode(const NodeInfo& node);
+            void addLearner(const NodeInfo& node);
+            void promoteLearner(uint64_t nodeId);
+            void removeLearner(uint64_t nodeId);
 
             void removeVotingNode(uint64_t nodeId);
 
             void transferLeadership(uint64_t targetNodeId);
+            void campaignLeadership();
+            void reconfigure(const ClusterConfig& config, uint64_t generation = 0);
 
         private:
             class Impl;

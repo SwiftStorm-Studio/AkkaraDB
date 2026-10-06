@@ -75,14 +75,147 @@ namespace akkaradb::engine::cluster {
         return true;
     }
 
+    namespace {
+        struct ForwardReader {
+            std::span<const uint8_t> bytes;
+            size_t position = 0;
+            bool integer(uint64_t& out, size_t width) {
+                if (width > bytes.size() - position) { return false; }
+                out = 0;
+                for (size_t i = 0; i < width; ++i) { out |= uint64_t{bytes[position++]} << (8 * i); }
+                return true;
+            }
+            bool buffer(std::vector<uint8_t>& out, size_t limit = MAX_FORWARD_PAYLOAD) {
+                uint64_t length;
+                return integer(length, 4) && length <= limit && readBytes(bytes, position, static_cast<size_t>(length), out);
+            }
+            bool string(std::string& out, size_t limit) {
+                std::vector<uint8_t> bufferValue;
+                if (!buffer(bufferValue, limit)) { return false; }
+                out.assign(bufferValue.begin(), bufferValue.end());
+                return true;
+            }
+        };
+        void forwardBytes(std::vector<uint8_t>& out, std::span<const uint8_t> bytes) {
+            writeU32(out, static_cast<uint32_t>(bytes.size()));
+            out.insert(out.end(), bytes.begin(), bytes.end());
+        }
+        void forwardString(std::vector<uint8_t>& out, const std::string& value) {
+            forwardBytes(out, {reinterpret_cast<const uint8_t*>(value.data()), value.size()});
+        }
+    }
+
+    std::vector<uint8_t> encodeForwardRequest(const ForwardRequest& request) {
+        size_t size = FORWARD_REQUEST_BASE_SIZE;
+        if (request.entries.size() > 65536 || request.timeoutMs == 0 || request.timeoutMs > 300000 ||
+            static_cast<uint8_t>(request.operation) > static_cast<uint8_t>(ForwardOperation::CLUSTER_ADMIN) ||
+            (request.operation == ForwardOperation::PUT_BATCH && request.entries.empty()) ||
+            (request.operation != ForwardOperation::PUT_BATCH && request.entries.size() != 1)) { return {}; }
+        for (const auto& entry : request.entries) {
+            if (entry.key.size() > MAX_FORWARD_PAYLOAD || entry.value.size() > MAX_FORWARD_PAYLOAD) { return {}; }
+            if ((request.operation == ForwardOperation::GET || request.operation == ForwardOperation::QUERY_REQUEST || request.operation == ForwardOperation::REMOVE ||
+                request.operation == ForwardOperation::REMOVE_REQUEST) && !entry.value.empty()) { return {}; }
+            size += 8 + entry.key.size() + entry.value.size();
+            if (size > MAX_FORWARD_PAYLOAD) { return {}; }
+        }
+        std::vector<uint8_t> out;
+        out.reserve(size);
+        writeU64(out, request.requestId);
+        out.push_back(static_cast<uint8_t>(request.operation));
+        writeU32(out, request.timeoutMs);
+        out.insert(out.end(), request.deduplicationId.nonce.begin(), request.deduplicationId.nonce.end());
+        writeU64(out, request.deduplicationId.expiresAtUnixMs);
+        writeU32(out, static_cast<uint32_t>(request.entries.size()));
+        for (const auto& entry : request.entries) { forwardBytes(out, entry.key); forwardBytes(out, entry.value); }
+        return encodeFrame(ReplMsgType::FORWARD_REQUEST, out);
+    }
+
+    bool decodeForwardRequest(std::span<const uint8_t> bytes, ForwardRequest& request) {
+        if (bytes.size() > MAX_FORWARD_PAYLOAD) { return false; }
+        ForwardRequest result;
+        ForwardReader reader{bytes};
+        uint64_t op, timeout, count;
+        if (!reader.integer(result.requestId, 8) || !reader.integer(op, 1) || op > static_cast<uint8_t>(ForwardOperation::CLUSTER_ADMIN) ||
+            !reader.integer(timeout, 4) || timeout == 0 || timeout > 300000) { return false; }
+        result.operation = static_cast<ForwardOperation>(op);
+        result.timeoutMs = static_cast<uint32_t>(timeout);
+        for (auto& byte : result.deduplicationId.nonce) {
+            uint64_t value;
+            if (!reader.integer(value, 1)) { return false; }
+            byte = static_cast<uint8_t>(value);
+        }
+        if (!reader.integer(result.deduplicationId.expiresAtUnixMs, 8) || !reader.integer(count, 4) || count > 65536 ||
+            count > (bytes.size() - reader.position) / 8) { return false; }
+        if ((result.operation != ForwardOperation::PUT_BATCH && count != 1) ||
+            (result.operation == ForwardOperation::PUT_BATCH && count == 0)) { return false; }
+        result.entries.resize(static_cast<size_t>(count));
+        for (auto& entry : result.entries) {
+            if (!reader.buffer(entry.key) || !reader.buffer(entry.value)) { return false; }
+            if ((result.operation == ForwardOperation::GET || result.operation == ForwardOperation::QUERY_REQUEST || result.operation == ForwardOperation::REMOVE ||
+                result.operation == ForwardOperation::REMOVE_REQUEST) && !entry.value.empty()) { return false; }
+        }
+        if (reader.position != bytes.size()) { return false; }
+        request = std::move(result);
+        return true;
+    }
+
+    std::vector<uint8_t> encodeForwardResponse(const ForwardResponse& response) {
+        if (response.value.size() > MAX_FORWARD_PAYLOAD || response.target.host.size() > 1024 || response.message.size() > 4096 ||
+            response.value.size() + response.target.host.size() + response.message.size() + 80 > MAX_FORWARD_PAYLOAD) { return {}; }
+        std::vector<uint8_t> out;
+        writeU64(out, response.requestId);
+        out.push_back(response.success ? 1 : 0);
+        out.push_back(response.found ? 1 : 0);
+        out.push_back(static_cast<uint8_t>(response.requestResult.status));
+        writeU64(out, response.requestResult.sequence);
+        writeU64(out, response.requestResult.logIndex);
+        forwardBytes(out, response.value);
+        out.push_back(static_cast<uint8_t>(response.errorCode));
+        writeU64(out, response.target.nodeId);
+        forwardString(out, response.target.host);
+        for (auto port : {response.target.tcpPort, response.target.httpPort, response.target.grpcPort, response.target.replPort}) {
+            out.push_back(static_cast<uint8_t>(port)); out.push_back(static_cast<uint8_t>(port >> 8));
+        }
+        writeU64(out, response.target.configurationEpoch);
+        writeU64(out, response.target.raftTerm);
+        forwardString(out, response.message);
+        return encodeFrame(ReplMsgType::FORWARD_RESPONSE, out);
+    }
+
+    bool decodeForwardResponse(std::span<const uint8_t> bytes, ForwardResponse& response) {
+        if (bytes.size() > MAX_FORWARD_PAYLOAD) { return false; }
+        ForwardResponse result;
+        ForwardReader reader{bytes};
+        uint64_t success, found, status, code;
+        if (!reader.integer(result.requestId, 8) || !reader.integer(success, 1) || success > 1 ||
+            !reader.integer(found, 1) || found > 1 || !reader.integer(status, 1) || status > static_cast<uint8_t>(ClusterRequestStatus::EXPIRED) ||
+            !reader.integer(result.requestResult.sequence, 8) || !reader.integer(result.requestResult.logIndex, 8) ||
+            !reader.buffer(result.value) || !reader.integer(code, 1) || code > static_cast<uint8_t>(ClusterRoutingCode::LOCAL_ONLY) ||
+            !reader.integer(result.target.nodeId, 8) || !reader.string(result.target.host, 1024)) { return false; }
+        result.success = success != 0; result.found = found != 0;
+        result.requestResult.status = static_cast<ClusterRequestStatus>(status);
+        result.errorCode = static_cast<ClusterRoutingCode>(code);
+        for (auto* port : {&result.target.tcpPort, &result.target.httpPort, &result.target.grpcPort, &result.target.replPort}) {
+            uint64_t value;
+            if (!reader.integer(value, 2)) { return false; }
+            *port = static_cast<uint16_t>(value);
+        }
+        if (!reader.integer(result.target.configurationEpoch, 8) || !reader.integer(result.target.raftTerm, 8) ||
+            !reader.string(result.message, 4096) || reader.position != bytes.size()) { return false; }
+        response = std::move(result);
+        return true;
+    }
+
     std::vector<uint8_t> encodeClientHello(const ClientHello& hello) {
         std::vector<uint8_t> p;
         writeU64(p, hello.nodeId);
         writeU64(p, hello.lastSeq);
         p.push_back(static_cast<uint8_t>(hello.role));
-        p.push_back(0);
+        p.push_back((static_cast<uint8_t>(hello.mirrorFencingMode) << 1) | (hello.forceSnapshot ? 1 : 0));
         writeU64(p, hello.groupId);
         writeU64(p, hello.groupEpoch);
+        p.insert(p.end(), hello.clusterId.begin(), hello.clusterId.end());
+        p.insert(p.end(), hello.configFingerprint.begin(), hello.configFingerprint.end());
         return encodeFrame(ReplMsgType::CLIENT_HELLO, p);
     }
 
@@ -91,9 +224,11 @@ namespace akkaradb::engine::cluster {
         writeU64(p, hello.nodeId);
         writeU64(p, hello.currentSeq);
         p.push_back(static_cast<uint8_t>(hello.role));
-        p.push_back(0);
+        p.push_back(static_cast<uint8_t>(hello.mirrorFencingMode));
         writeU64(p, hello.groupId);
         writeU64(p, hello.groupEpoch);
+        p.insert(p.end(), hello.clusterId.begin(), hello.clusterId.end());
+        p.insert(p.end(), hello.configFingerprint.begin(), hello.configFingerprint.end());
         return encodeFrame(ReplMsgType::SERVER_HELLO, p);
     }
 
@@ -194,22 +329,29 @@ namespace akkaradb::engine::cluster {
     }
 
     bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out) {
-        if (payload.size() != 34) { return false; }
+        if (payload.size() != 82 || payload[17] > 5) { return false; }
         out.nodeId = readU64(payload, 0);
         out.lastSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
+        out.mirrorFencingMode = static_cast<MirrorFencingMode>(payload[17] >> 1);
+        out.forceSnapshot = (payload[17] & 1) != 0;
         out.groupId = readU64(payload, 18);
         out.groupEpoch = readU64(payload, 26);
+        std::memcpy(out.clusterId.data(), payload.data() + 34, out.clusterId.size());
+        std::memcpy(out.configFingerprint.data(), payload.data() + 50, out.configFingerprint.size());
         return true;
     }
 
     bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out) {
-        if (payload.size() != 34) { return false; }
+        if (payload.size() != 82 || payload[17] > 2) { return false; }
         out.nodeId = readU64(payload, 0);
         out.currentSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
+        out.mirrorFencingMode = static_cast<MirrorFencingMode>(payload[17]);
         out.groupId = readU64(payload, 18);
         out.groupEpoch = readU64(payload, 26);
+        std::memcpy(out.clusterId.data(), payload.data() + 34, out.clusterId.size());
+        std::memcpy(out.configFingerprint.data(), payload.data() + 50, out.configFingerprint.size());
         return true;
     }
 
@@ -289,7 +431,9 @@ namespace akkaradb::engine::cluster {
         out.action = static_cast<StripeControlAction>(payload[8]);
         if (out.action != StripeControlAction::ACQUIRE && out.action != StripeControlAction::COMMIT &&
             out.action != StripeControlAction::RELEASE && out.action != StripeControlAction::READ_METADATA &&
-            out.action != StripeControlAction::REPAIR_METADATA) { return false; }
+            out.action != StripeControlAction::REPAIR_METADATA && out.action != StripeControlAction::ROLLBACK_WATERMARK &&
+            out.action != StripeControlAction::ROLLBACK_KEY && out.action != StripeControlAction::ROLLBACK_STREAM &&
+            out.action != StripeControlAction::ROLLBACK_APPLY) { return false; }
         out.ownerNodeId = readU64(payload, 9);
         out.fenceToken = readU64(payload, 17);
         const uint32_t keyLen = readU32(payload, 25);

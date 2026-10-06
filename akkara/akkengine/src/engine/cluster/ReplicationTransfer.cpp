@@ -47,7 +47,12 @@ namespace akkaradb::engine::cluster::detail {
         }
         bool transferable(ReplMsgType type) {
             return type == ReplMsgType::ENTRY || type == ReplMsgType::BLOB_PUT || type == ReplMsgType::SNAPSHOT_ENTRY ||
-                   type == ReplMsgType::READ_REQUEST || type == ReplMsgType::READ_RESPONSE;
+                   type == ReplMsgType::READ_REQUEST || type == ReplMsgType::READ_RESPONSE ||
+                   type == ReplMsgType::FORWARD_REQUEST || type == ReplMsgType::FORWARD_RESPONSE;
+        }
+        uint32_t logicalPayloadLimit(ReplMsgType type) {
+            return type == ReplMsgType::FORWARD_REQUEST || type == ReplMsgType::FORWARD_RESPONSE
+                ? MAX_FORWARD_PAYLOAD : ReplFrameHeader::MAX_PAYLOAD_SIZE;
         }
         std::filesystem::path baseSpoolDirectory(const ReplicationTransferOptions& options) {
             return options.spoolDirectory.empty() ? std::filesystem::temp_directory_path() : options.spoolDirectory;
@@ -618,7 +623,7 @@ namespace akkaradb::engine::cluster::detail {
     MessagePtr makeMessage(ReplMsgType type, std::span<const std::span<const uint8_t>> parts, const std::shared_ptr<TransferBudget>& budget) {
         size_t size = 0;
         for (const auto part : parts) {
-            if (part.size() > ReplFrameHeader::MAX_PAYLOAD_SIZE - size) { throw std::length_error("replication: logical frame too large"); }
+            if (part.size() > logicalPayloadLimit(type) - size) { throw std::length_error("replication: logical frame too large"); }
             size += part.size();
         }
         if (!transferable(type) && size > TRANSFER_FRAME_LIMIT) { throw std::length_error("replication: control frame too large"); }
@@ -692,14 +697,19 @@ namespace akkaradb::engine::cluster::detail {
         return receiveMessage(budget, {}, receive, {});
     }
     MessagePtr receiveMessage(const std::shared_ptr<TransferBudget>& budget, const std::shared_ptr<TransferSession>& session,
-        const ReceiveFrame& receive, const SendFrame& sendControl) {
-        auto receiveNext = [&](DecodedFrame& out) {
+        const ReceiveFrame& receive, const SendFrame& sendControl, const ReceiveInterleavedAck& receiveAck) {
+        auto receiveNext = [&](DecodedFrame& out, bool assembling = false) {
             for (;;) {
                 if (!receive(out)) { return false; }
                 TransferId readyId{}; uint64_t readyOffset = 0;
                 if (decodeReady(out, readyId, readyOffset)) {
                     if (!session) { return false; }
                     if (!session->notifyReady(readyId, readyOffset)) { return false; }
+                    out = {};
+                    continue;
+                }
+                if (assembling && out.type == ReplMsgType::ACK && receiveAck) {
+                    if (!receiveAck(out)) { return false; }
                     out = {};
                     continue;
                 }
@@ -720,7 +730,7 @@ namespace akkaradb::engine::cluster::detail {
         const uint32_t expectedCrc = static_cast<uint32_t>(readLe(first->payload, 10, 4));
         TransferId id{};
         std::copy_n(first->payload.begin() + 14, id.size(), id.begin());
-        if (!transferable(result->type) || size == 0 || size > ReplFrameHeader::MAX_PAYLOAD_SIZE || result->flags != 0) { return {}; }
+        if (!transferable(result->type) || size == 0 || size > logicalPayloadLimit(result->type) || result->flags != 0) { return {}; }
         first.reset();
         auto active = budget->reserve(TransferBudget::Resource::ACTIVE, 1);
         std::shared_ptr<SpoolBase> spool;
@@ -735,7 +745,7 @@ namespace akkaradb::engine::cluster::detail {
         }
         for (;;) {
             DecodedFrame frame;
-            if (!receiveNext(frame)) { return {}; }
+            if (!receiveNext(frame, true)) { return {}; }
             if (frame.type == ReplMsgType::TRANSFER_END) {
                 if (frame.flags != 0 || frame.payload.size() != 8 || readLe(frame.payload, 0, 8) != size || offset != size) {
                     spool->discard(); return {};

@@ -11,6 +11,8 @@
 #include "akk/core/buffer/BufferArena.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <memory>
 #include <new>
 #include <stdexcept>
 
@@ -30,7 +32,12 @@ namespace akkaradb::core {
         if (align == 0) { align = 1; }
         if (!isPowerOfTwo(align)) { throw std::invalid_argument("BufferArena::allocate: alignment must be power-of-two"); }
 
-        if (current_ != nullptr) { if (auto* ptr = tryAllocateFromBlock(current_, size, align); ptr != nullptr) { return ptr; } }
+        for (Block* block = current_; block != nullptr; block = block->next) {
+            if (auto* ptr = tryAllocateFromBlock(block, size, align); ptr != nullptr) {
+                current_ = block;
+                return ptr;
+            }
+        }
 
         if (size > (static_cast<size_t>(-1) - (align - 1))) { throw std::bad_alloc(); }
         const size_t minCapacity = size + (align - 1);
@@ -82,21 +89,23 @@ namespace akkaradb::core {
 
     bool BufferArena::isPowerOfTwo(size_t x) noexcept { return x != 0 && (x & (x - 1)) == 0; }
 
-    size_t BufferArena::alignUp(size_t x, size_t align) noexcept { return (x + (align - 1)) & ~(align - 1); }
-
     BufferArena::Block* BufferArena::createBlock(size_t capacity, size_t alignment) {
-        auto* block = new Block{};
+        auto block = std::make_unique<Block>();
         block->data = static_cast<std::byte*>(operator new(capacity, static_cast<std::align_val_t>(alignment)));
         block->capacity = capacity;
         block->offset = 0;
         block->alignment = alignment;
         block->next = nullptr;
-        return block;
+        return block.release();
     }
 
     std::byte* BufferArena::tryAllocateFromBlock(Block* block, size_t size, size_t align) noexcept {
-        const size_t aligned = alignUp(block->offset, align);
-        if (aligned > block->capacity || size > block->capacity - aligned) { return nullptr; }
+        // The block's base may have a smaller alignment than this request.
+        const auto address = reinterpret_cast<uintptr_t>(block->data + block->offset);
+        const size_t padding = (align - (address & (align - 1))) & (align - 1);
+        const size_t remaining = block->capacity - block->offset;
+        if (padding > remaining || size > remaining - padding) { return nullptr; }
+        const size_t aligned = block->offset + padding;
 
         auto* ptr = block->data + aligned;
         block->offset = aligned + size;
