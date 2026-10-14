@@ -37,6 +37,11 @@ namespace akkaradb::engine {
         REBUILDING = 3,
     };
 
+    /** Observed availability, never a promise that the next operation succeeds. */
+    enum class ClusterOperationAvailability : uint32_t {
+        UNKNOWN = 0, UNAVAILABLE = 1, AVAILABLE = 2,
+    };
+
     enum class ClusterFailureCode : uint32_t {
         NONE = 0,
         FOREIGN_CLUSTER = 1,
@@ -45,6 +50,8 @@ namespace akkaradb::engine {
         ENDPOINT_START = 4,
         PEER_READ_TIMEOUT = 5,
         RAFT_PERSISTENCE = 6,
+        RAFT_APPLY = 7,
+        REPLICATION_DIVERGENCE = 8,
     };
 
     /** Self-describing cumulative latency histogram suitable for management UIs. */
@@ -259,6 +266,7 @@ namespace akkaradb::engine {
                 uint16_t replPort = 0;
                 uint16_t stripeMetadataPort = 0;
                 uint32_t capabilities = 0;
+                std::string hostId, siteId;
             };
 
             struct PeerStats {
@@ -294,9 +302,22 @@ namespace akkaradb::engine {
             uint64_t clusterGroupEpoch = 0;
             /// Current process-local cluster state; failure history remains below after recovery.
             ClusterHealthState health = ClusterHealthState::HEALTHY;
+            /// Consensus observations; UNKNOWN when this node cannot establish the remote authority's readiness.
+            ClusterOperationAvailability quorumAvailability = ClusterOperationAvailability::UNKNOWN;
+            ClusterOperationAvailability writeAvailability = ClusterOperationAvailability::UNKNOWN;
+            ClusterOperationAvailability linearizableReadAvailability = ClusterOperationAvailability::UNKNOWN;
             ClusterFailureCode lastFailure = ClusterFailureCode::NONE;
             /// Unix timestamp in microseconds, or zero when no failure has been observed.
             uint64_t lastFailureAtUs = 0;
+            /// Local coordinator recovery observations; process-local, retained after recovery.
+            uint64_t transactionRecoveryFailuresTotal = 0;
+            uint64_t transactionRecoveryConsecutiveFailedPasses = 0;
+            uint64_t transactionRecoveryLastFailureAtUs = 0;
+            uint64_t transactionRecoveryFailingSinceUs = 0;
+            uint64_t transactionRecoveryLastSuccessfulPassAtUs = 0;
+            std::array<uint8_t, 16> transactionRecoveryLastFailedId{}; // Zero for a pass-level failure.
+            std::string transactionRecoveryLastError; // Bounded to 512 bytes.
+            uint64_t pendingDistributedTransactions = 0;
             uint64_t configuredNodeCount = 0;
             uint64_t activeNodeCount = 0;
             bool raftEnabled = false;
@@ -322,10 +343,19 @@ namespace akkaradb::engine {
             uint64_t stripeMetadataSnapshotIndex = 0;
             uint64_t outboundConnectionsTotal = 0;
             uint64_t peerWorkers = 0;
+            uint64_t incomingConsensusConnections = 0;
+            uint64_t incomingForwardConnections = 0;
+            uint64_t incomingControlConnections = 0;
+            uint64_t forwardReceiveMemoryBytes = 0;
+            uint64_t nodeRaftReceiveMemoryBytes = 0, nodeForwardReceiveMemoryBytes = 0;
+            uint64_t nodeOutgoingForwardRequests = 0, nodeIncomingForwardRequests = 0;
+            uint64_t nodeTransferMemoryBytes = 0, nodeActiveTransfers = 0;
+            uint64_t controlReceiveMemoryBytes = 0;
             uint64_t proposalBatches = 0;
             uint64_t proposalQueueDepth = 0;
             uint64_t pendingProposals = 0;
             uint64_t retainedRequestResults = 0;
+            uint64_t retainedRequestResultBytes = 0, requestResultByteLimit = 0;
             uint64_t pendingRequests = 0;
             uint64_t requestCapacity = 0;
             uint64_t expiredRequestsTotal = 0;

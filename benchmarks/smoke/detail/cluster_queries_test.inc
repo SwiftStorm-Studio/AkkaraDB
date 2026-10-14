@@ -1,5 +1,5 @@
 // Cluster public range/history regression scenarios; included by cluster_smoke_test.cpp.
-void testNativeClusterQueries(ReplicationMode mode, bool raft, bool secure, bool streaming = false) {
+void testNativeClusterQueries(ReplicationMode mode, bool raft, bool secure, bool streaming = false, bool global = false) {
     using Engine = akkaradb::engine::AkkEngine;
     using Options = akkaradb::engine::AkkEngineOptions;
     const auto suffix = std::to_string(static_cast<unsigned>(mode)) + (raft ? "-raft" : "") + (secure ? "-secure" : "");
@@ -38,6 +38,7 @@ void testNativeClusterQueries(ReplicationMode mode, bool raft, bool secure, bool
         runtime.routingMode = ClusterRoutingMode::REDIRECT;
         runtime.readMode = readMode;
         runtime.queryResultMode = streaming ? QueryResultMode::STREAMING : QueryResultMode::PREPARED;
+        runtime.queryConsistencyMode = global ? QueryConsistencyMode::GLOBAL_SNAPSHOT : QueryConsistencyMode::PER_PARTITION;
         runtime.stripeAutoRebuild = false;
         options.runtime.scanConsistency = Options::ScanConsistencyMode::WEAK_ORDERED;
         writeNodeIdFile(options.paths.dataDir / "node.id", id);

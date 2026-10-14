@@ -11,6 +11,9 @@
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include <unordered_map>
 #include "akk/engine/cluster/detail/ForwardDeadline.hpp"
+#include "akk/engine/cluster/detail/ClusterConnection.hpp"
+#include "akk/engine/cluster/detail/CancellableSocketReader.hpp"
+#include "akk/engine/cluster/detail/PeerLiveness.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/SecureChannel.hpp"
@@ -67,33 +70,12 @@ namespace akkaradb::engine::cluster {
         }
         #endif
 
-        void ensureSocketRuntime() {
-            #ifdef _WIN32
-            static std::once_flag once;
-            std::call_once(
-                once,
-                [] {
-                    WSADATA data{};
-                    if (::WSAStartup(MAKEWORD(2, 2), &data) != 0) { throw std::runtime_error("ReplicationClient: WSAStartup failed"); }
-                }
-            );
-            #endif
-        }
-
         void closeSocket(SocketHandle s) noexcept {
             if (s == INVALID_SOCKET_HANDLE) { return; }
             #ifdef _WIN32
             ::closesocket(s);
             #else
             ::close(s);
-            #endif
-        }
-
-        void configureNoSigPipe(SocketHandle s) noexcept {
-            #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
-            int enabled = 1; (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
-            #else
-            (void)s;
             #endif
         }
 
@@ -120,39 +102,6 @@ namespace akkaradb::engine::cluster {
             #else
             constexpr timeval timeout{};
             return ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0;
-            #endif
-        }
-
-        bool setBlocking(SocketHandle s, bool blocking) noexcept {
-            #ifdef _WIN32
-            u_long mode = blocking ? 0u : 1u;
-            return ::ioctlsocket(s, FIONBIO, &mode) == 0;
-            #else
-            const int flags = ::fcntl(s, F_GETFL, 0); if (flags < 0) { return false; } const int nextFlags =
-                blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK); return ::fcntl(s, F_SETFL, nextFlags) == 0;
-            #endif
-        }
-
-        bool waitForConnect(SocketHandle s, int timeoutMs) {
-            fd_set writeSet;
-            FD_ZERO(&writeSet);
-            FD_SET(s, &writeSet);
-            timeval tv{};
-            tv.tv_sec = timeoutMs / 1000;
-            tv.tv_usec = (timeoutMs % 1000) * 1000;
-            #ifdef _WIN32
-            const int rc = ::select(0, nullptr, &writeSet, nullptr, &tv);
-            #else
-            int rc = 0; do { rc = ::select(s + 1, nullptr, &writeSet, nullptr, &tv); }
-            while (rc < 0 && errno == EINTR);
-            #endif
-            if (rc <= 0) { return false; }
-            int error = 0;
-            #ifdef _WIN32
-            int len = sizeof(error);
-            return ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &len) == 0 && error == 0;
-            #else
-            socklen_t len = sizeof(error); return ::getsockopt(s, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0;
             #endif
         }
 
@@ -195,11 +144,11 @@ namespace akkaradb::engine::cluster {
                 WSABUF buffer{};
                 buffer.buf = reinterpret_cast<char*>(const_cast<uint8_t*>(data + sent));
                 buffer.len = static_cast<ULONG>(std::min<size_t>(size - sent, std::numeric_limits<ULONG>::max()));
-                const int rc = ::WSASend(s, &buffer, 1, nullptr, 0, &operation, nullptr);
+                const auto rc = ::WSASend(s, &buffer, 1, nullptr, 0, &operation, nullptr);
                 if (rc != 0 && ::WSAGetLastError() != WSA_IO_PENDING) { return false; }
                 if (rc != 0) {
                     const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-                    const DWORD timeout = static_cast<DWORD>(std::clamp<int64_t>(remaining, 0, WSA_INFINITE - 1));
+                    const auto timeout = static_cast<DWORD>(std::clamp<int64_t>(remaining, 0, WSA_INFINITE - 1));
                     if (::WSAWaitForMultipleEvents(1, &event.handle, FALSE, timeout, FALSE) != WSA_WAIT_EVENT_0) {
                         // Cancellation is asynchronous: retain both the frame and
                         // OVERLAPPED until the transport has stopped accessing them.
@@ -223,9 +172,9 @@ namespace akkaradb::engine::cluster {
                 if (errno == EINTR) { continue; }
                 if (errno != EAGAIN && errno != EWOULDBLOCK) { return false; }
                 const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-                const int timeout = static_cast<int>(std::clamp<int64_t>(remaining, 0, std::numeric_limits<int>::max()));
+                const auto timeout = static_cast<int>(std::clamp<int64_t>(remaining, 0, std::numeric_limits<int>::max()));
                 pollfd writable{s, POLLOUT, 0};
-                const int rc = ::poll(&writable, 1, timeout);
+                const auto rc = ::poll(&writable, 1, timeout);
                 if (rc < 0 && errno == EINTR) { continue; }
                 if (rc <= 0 || (writable.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) { return false; }
                 #endif
@@ -233,26 +182,23 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool recvAll(SocketHandle s, uint8_t* data, size_t size) {
-            size_t received = 0;
-            while (received < size) {
-                #ifdef _WIN32
-                const int n = ::recv(s, reinterpret_cast<char*>(data + received), static_cast<int>(size - received), 0);
-                if (n < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
-                #else
-                const ssize_t n = ::recv(s, data + received, size - received, 0); if (n < 0 && errno == EINTR) { continue; }
-                #endif
-                if (n <= 0) { return false; }
-                received += static_cast<size_t>(n);
-            }
-            return true;
+        struct ReceiveContext {
+            const std::atomic<bool>& running;
+            std::chrono::steady_clock::time_point deadline;
+            detail::CancellableSocketReader& cancellation;
+            bool expired() const { return !running || cancellation.cancelled() || std::chrono::steady_clock::now() >= deadline; }
+        };
+
+        bool recvAll(SocketHandle s, uint8_t* data, size_t size, const ReceiveContext& context) {
+            return !context.expired() && context.cancellation.readAll(s, data, size, context.deadline);
         }
 
-        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget,
+                       const ReceiveContext& context) {
             uint8_t header[ReplFrameHeader::SIZE];
-            if (!recvAll(s, header, sizeof(header))) { return false; }
+            if (!recvAll(s, header, sizeof(header), context)) { return false; }
 
-            const uint32_t payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(
+            const auto payloadLen = static_cast<uint32_t>(header[6]) | (static_cast<uint32_t>(header[7]) << 8) | (static_cast<uint32_t>(
                 header[8]) << 16) | (static_cast<uint32_t>(header[9]) << 24);
             if (payloadLen > detail::TRANSFER_FRAME_LIMIT) { return false; }
             auto wireMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, ReplFrameHeader::SIZE + payloadLen);
@@ -260,7 +206,7 @@ namespace akkaradb::engine::cluster {
 
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
-            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen)) { return false; }
+            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen, context)) { return false; }
             return decodeFrame(wire, out);
         }
 
@@ -301,8 +247,9 @@ namespace akkaradb::engine::cluster {
 
         std::optional<crypto::PublicKey> pinnedPeerKey(const ClusterRuntimeOptions& options, uint64_t nodeId) {
             if (nodeId == 0) { return std::nullopt; }
-            for (const auto& pin : options.secure.pinnedPeers) { if (pin.nodeId == nodeId) { return pin.publicKey; } }
-            return std::nullopt;
+            const auto pin = std::ranges::find(options.secure.pinnedPeers, nodeId, &ClusterPeerPublicKeyPin::nodeId);
+            if (pin == options.secure.pinnedPeers.end()) { return std::nullopt; }
+            return pin->publicKey;
         }
 
         bool writeSecureClientHello(SocketHandle socket, const crypto::ClientHello& hello) {
@@ -319,9 +266,9 @@ namespace akkaradb::engine::cluster {
             return sendAll(socket, wire.data(), wire.size());
         }
 
-        bool readSecureServerHello(SocketHandle socket, crypto::ServerHello& hello) {
+        bool readSecureServerHello(SocketHandle socket, crypto::ServerHello& hello, const ReceiveContext& context) {
             std::array<uint8_t, SECURE_SERVER_HELLO_SIZE> wire{};
-            if (!recvAll(socket, wire.data(), wire.size())) { return false; }
+            if (!recvAll(socket, wire.data(), wire.size(), context)) { return false; }
             if (readU32Le(wire.data()) != SECURE_HELLO_MAGIC || wire[4] != SECURE_VERSION || wire[5] != SECURE_SERVER_HELLO) {
                 return false;
             }
@@ -366,68 +313,26 @@ namespace akkaradb::engine::cluster {
             ));
         }
 
-        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget) {
+        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out,
+                             const std::shared_ptr<detail::TransferBudget>& budget, const ReceiveContext& context) {
             std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
-            if (!recvAll(socket, header.data(), header.size())) { return false; }
+            if (!recvAll(socket, header.data(), header.size(), context)) { return false; }
             if (readU32Le(header.data()) != SECURE_FRAME_MAGIC || header[4] != SECURE_VERSION) { return false; }
 
             crypto::EncryptedFrame encrypted;
             encrypted.counter = readU64Le(header.data() + 6);
-            const uint32_t ciphertextSize = readU32Le(header.data() + 14);
+            const auto ciphertextSize = readU32Le(header.data() + 14);
             if (ciphertextSize > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
             std::memcpy(encrypted.tag.data(), header.data() + 18, encrypted.tag.size());
             auto decryptMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, 2ull * ciphertextSize);
             out.memoryReservation = budget->reserve(detail::TransferBudget::Resource::MEMORY,
                 ciphertextSize > ReplFrameHeader::SIZE ? ciphertextSize - ReplFrameHeader::SIZE : 0);
             encrypted.ciphertext.resize(ciphertextSize);
-            if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize)) { return false; }
+            if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize, context)) { return false; }
 
             std::vector<uint8_t> plaintext;
             if (!session.open(encrypted, plaintext)) { return false; }
             return decodeFrame(plaintext, out);
-        }
-
-        SocketHandle connectTo(const std::string& host, uint16_t port) {
-            constexpr int CONNECT_TIMEOUT_MS = 1000;
-            ensureSocketRuntime();
-
-            addrinfo hints{};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-
-            addrinfo* result = nullptr;
-            const auto portText = std::to_string(port);
-            if (::getaddrinfo(host.c_str(), portText.c_str(), &hints, &result) != 0) { return INVALID_SOCKET_HANDLE; }
-
-            SocketHandle socket = INVALID_SOCKET_HANDLE;
-            for (addrinfo* it = result; it != nullptr; it = it->ai_next) {
-                socket = ::socket(it->ai_family, it->ai_socktype, it->ai_protocol);
-                if (socket == INVALID_SOCKET_HANDLE) { continue; }
-                configureNoSigPipe(socket);
-                setTimeouts(socket, CONNECT_TIMEOUT_MS);
-                if (!setBlocking(socket, false)) {
-                    closeSocket(socket);
-                    socket = INVALID_SOCKET_HANDLE;
-                    continue;
-                }
-                const int rc = ::connect(socket, it->ai_addr, static_cast<int>(it->ai_addrlen));
-                #ifdef _WIN32
-                const bool inProgress = rc != 0 && (::WSAGetLastError() == WSAEWOULDBLOCK || ::WSAGetLastError() == WSAEINPROGRESS ||
-                    ::WSAGetLastError() == WSAEINVAL);
-                #else
-                const bool inProgress = rc != 0 && errno == EINPROGRESS;
-                #endif
-                if (rc == 0 || (inProgress && waitForConnect(socket, CONNECT_TIMEOUT_MS))) {
-                    (void)setBlocking(socket, true);
-                    setTimeouts(socket, CONNECT_TIMEOUT_MS);
-                    break;
-                }
-                closeSocket(socket);
-                socket = INVALID_SOCKET_HANDLE;
-            }
-
-            ::freeaddrinfo(result);
-            return socket;
         }
 
         struct MembershipState {
@@ -494,15 +399,15 @@ namespace akkaradb::engine::cluster {
 
         void syncFile(const std::filesystem::path& path) {
             #ifdef _WIN32
-            const int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+            const auto fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
             if (fd < 0) { throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync"); }
-            const int rc = _commit(fd);
-            const int closeRc = _close(fd);
+            const auto rc = _commit(fd);
+            const auto closeRc = _close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error("ReplicationClient: temp membership state sync failed"); }
             #else
-            const int fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
+            const auto fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
                 throw std::runtime_error("ReplicationClient: cannot reopen temp membership state for sync");
-            } const int rc = ::fsync(fd); const int closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
+            } const auto rc = ::fsync(fd); const auto closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
                 throw std::runtime_error("ReplicationClient: temp membership state sync failed");
             }
             #endif
@@ -534,9 +439,9 @@ namespace akkaradb::engine::cluster {
         #ifdef O_DIRECTORY
         flags|= O_DIRECTORY;
         #endif
-        const int fd = ::open(parent.c_str(), flags);if (fd<0) {
+        const auto fd = ::open(parent.c_str(), flags);if (fd<0) {
             throw std::runtime_error("ReplicationClient: cannot open membership parent directory for sync");
-        } const int rc = ::fsync(fd); const int closeRc = ::close(fd);if (rc!= 0 || closeRc
+        } const auto rc = ::fsync(fd); const auto closeRc = ::close(fd);if (rc!= 0 || closeRc
 != 0) { throw std::runtime_error("ReplicationClient: membership parent directory sync failed"); }
         }
         #endif
@@ -586,7 +491,7 @@ namespace akkaradb::engine::cluster {
             writeLe64(bytes, state.groupId);
             writeLe64(bytes, state.primaryNodeId);
             writeLe64(bytes, state.groupEpoch);
-            const size_t crcOffset = bytes.size();
+            const auto crcOffset = bytes.size();
             writeLe32(bytes, 0);
             writeLe32At(bytes, crcOffset, crcWithZeroedField(bytes, crcOffset));
 
@@ -665,18 +570,25 @@ namespace akkaradb::engine::cluster {
             }
 
             void start() {
+                std::lock_guard lock{retryMutex_};
                 if (running_.exchange(true)) { return; }
+                receiveCancellation_.reset();
                 worker_ = std::thread([this] { run(); });
             }
 
             void close() {
-                running_ = false;
+                {
+                    std::lock_guard lock{retryMutex_};
+                    running_ = false;
+                    receiveCancellation_.cancel();
+                }
+                retryCv_.notify_all();
                 transferSession_->cancel();
                 {
                     std::lock_guard lock{socketMutex_};
+                    // The worker owns the descriptor until it exits. Only
+                    // interrupt it here, so reuse cannot race a second close.
                     shutdownSocket(socket_);
-                    closeSocket(socket_);
-                    socket_ = INVALID_SOCKET_HANDLE;
                 }
                 if (worker_.joinable()) { worker_.join(); }
                 connected_ = false;
@@ -684,10 +596,10 @@ namespace akkaradb::engine::cluster {
                 failPendingStripeControl();
             }
 
-            bool connected() const noexcept { return connected_; }
+            bool connected() const noexcept { return connected_.load(std::memory_order_acquire) && !liveness_.expired(); }
             uint64_t lastSuccessfulContactAtUs() const noexcept { return lastSuccessfulContactAtUs_.load(std::memory_order_relaxed); }
 
-            ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
+            ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs, ReadKeySpace keySpace) {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
                 std::unique_lock admission{readAdmissionMutex_, std::defer_lock};
                 if (!admission.try_lock_until(deadline)) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
@@ -701,8 +613,8 @@ namespace akkaradb::engine::cluster {
                     }
                 }
                 if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
-                const uint64_t requestId = nextReadRequestId_++;
-                const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_);
+                const auto requestId = nextReadRequestId_++;
+                const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_, keySpace);
                 pendingReadRequestId_ = requestId;
                 pendingReadResponse_.reset();
                 pendingReadFailed_ = false;
@@ -711,7 +623,7 @@ namespace akkaradb::engine::cluster {
                 bool sent = false;
                 {
                     std::unique_lock socketLock{socketMutex_, std::defer_lock};
-                    if (socketLock.try_lock_until(deadline) && connected_.load(std::memory_order_acquire) && socket_ != INVALID_SOCKET_HANDLE) {
+                    if (socketLock.try_lock_until(deadline) && connected() && socket_ != INVALID_SOCKET_HANDLE) {
                         sent = sendToUntil(socket_, activeSecure_, *message, deadline);
                     }
                 }
@@ -753,7 +665,7 @@ namespace akkaradb::engine::cluster {
                     if (!socketLock.try_lock_until(deadline)) {
                         throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward admission timed out before send");
                     }
-                    if (!connected_.load(std::memory_order_acquire) || socket_ == INVALID_SOCKET_HANDLE) {
+                    if (!connected() || socket_ == INVALID_SOCKET_HANDLE) {
                         throw ClusterRoutingError(ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward destination is disconnected");
                     }
                     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
@@ -763,7 +675,7 @@ namespace akkaradb::engine::cluster {
                     if (wire.empty()) { throw ClusterRoutingError(ClusterRoutingCode::PAYLOAD_TOO_LARGE); }
                     const auto message = detail::messageFromWire(std::move(wire), transferBudget_);
                     if (!sendToUntil(socket_, activeSecure_, *message, deadline)) {
-                        throw ClusterRoutingError(ClusterRoutingCode::OUTCOME_UNKNOWN, {}, "Forward send failed; do not replay the mutation blindly");
+                        throw ClusterRoutingError(forwardMayMutate(request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward send failed; do not replay the mutation blindly");
                     }
                 }
                 catch (...) { erase(); throw; }
@@ -771,7 +683,7 @@ namespace akkaradb::engine::cluster {
                 pending->cv.wait_until(lock, deadline, [&] { return pending->response.has_value() || pending->failed; });
                 pendingForwards_.erase(request.requestId);
                 if (!pending->response) {
-                    throw ClusterRoutingError(ClusterRoutingCode::OUTCOME_UNKNOWN, {}, "Forward response lost or timed out; do not replay the mutation blindly");
+                    throw ClusterRoutingError(forwardMayMutate(request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE, {}, "Forward response lost or timed out; do not replay the mutation blindly");
                 }
                 return std::move(*pending->response);
             }
@@ -804,7 +716,7 @@ namespace akkaradb::engine::cluster {
                 try {
                     const auto message = detail::messageFromWire(encodeStripeControlRequest(request), transferBudget_);
                     std::unique_lock socketLock{socketMutex_, std::defer_lock};
-                    if (!socketLock.try_lock_until(deadline) || !connected_.load(std::memory_order_acquire) ||
+                    if (!socketLock.try_lock_until(deadline) || !connected() ||
                         socket_ == INVALID_SOCKET_HANDLE || !sendToUntil(socket_, activeSecure_, *message, deadline)) {
                         throw std::runtime_error("ReplicationClient: STRIPE control send timeout or disconnected");
                     }
@@ -857,23 +769,38 @@ namespace akkaradb::engine::cluster {
                 pendingStripeControls_.clear(); stripeControlCv_.notify_all();
             }
 
+            void waitRetry() {
+                std::unique_lock lock{retryMutex_};
+                retryCv_.wait_for(lock, std::chrono::milliseconds{200}, [this] { return !running_; });
+            }
+
             void run() {
                 while (running_) {
+                    {
+                        std::lock_guard lock{retryMutex_};
+                        if (!running_) { break; }
+                        receiveCancellation_.reset();
+                    }
                     SocketHandle socket = INVALID_SOCKET_HANDLE;
                     std::unique_ptr<crypto::SecureSession> secure;
                     crypto::PublicKey secureRemotePublicKey{};
 
-                    socket = connectTo(primaryHost_, primaryReplPort_);
+                    socket = detail::connectWithDeadline(primaryHost_, primaryReplPort_,
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds{1000}, [this] { return !running_; });
                     if (socket == INVALID_SOCKET_HANDLE) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        waitRetry();
                         continue;
                     }
 
                     {
                         std::lock_guard lock{socketMutex_};
+                        if (!running_) { closeSocket(socket); break; }
                         socket_ = socket;
                     }
+                    setTimeouts(socket, 1000);
+                    receiveDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
                     transferSession_->reset();
+                    liveness_.reset();
 
                     if (runtimeOptions_.transportMode == TransportMode::SECURE) {
                         try {
@@ -882,10 +809,12 @@ namespace akkaradb::engine::cluster {
                             secure = std::make_unique<crypto::SecureSession>(std::move(opened.session));
                         }
                         catch (...) {
+                            {
+                                std::lock_guard lock{socketMutex_};
+                                if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
+                            }
                             closeSocket(socket);
-                            std::lock_guard lock{socketMutex_};
-                            if (socket_ == socket) { socket_ = INVALID_SOCKET_HANDLE; }
-                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            waitRetry();
                             continue;
                         }
                     }
@@ -900,6 +829,7 @@ namespace akkaradb::engine::cluster {
                                 if (socket_ == socket) { activeSecure_ = secure.get(); }
                             }
                             connected_ = true;
+                            receiveDeadline_ = std::chrono::steady_clock::time_point::max();
                             lastSuccessfulContactAtUs_.store(contactNowUs(), std::memory_order_relaxed);
                             receiveLoop(socket, secure.get());
                         }
@@ -922,7 +852,7 @@ namespace akkaradb::engine::cluster {
                     }
                     closeSocket(socket);
 
-                    if (running_) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); }
+                    waitRetry();
                 }
             }
 
@@ -938,7 +868,7 @@ namespace akkaradb::engine::cluster {
                 }
 
                 crypto::ServerHello serverHello{};
-                if (!readSecureServerHello(socket, serverHello)) {
+                if (!readSecureServerHello(socket, serverHello, ReceiveContext{running_, receiveDeadline_, receiveCancellation_})) {
                     throw std::runtime_error("ReplicationClient: secure hello receive failed");
                 }
 
@@ -967,7 +897,7 @@ namespace akkaradb::engine::cluster {
 
             bool handshake(SocketHandle socket, crypto::SecureSession* secure, const crypto::PublicKey& secureRemotePublicKey) {
                 const auto resyncPath = mirrorResyncPath();
-                const bool resyncPending = !resyncPath.empty() && std::filesystem::exists(resyncPath);
+                const auto resyncPending = !resyncPath.empty() && std::filesystem::exists(resyncPath);
                 const ClientHello hello{
                     .nodeId = selfNodeId_,
                     .lastSeq = getLastSeq_ ? getLastSeq_() : 0,
@@ -979,6 +909,7 @@ namespace akkaradb::engine::cluster {
                         ((runtimeOptions_.mirrorPromotion.enabled && !fencedSnapshotCompleted_.load()) || resyncPending),
                     .clusterId = runtimeOptions_.replicationClusterId,
                     .configFingerprint = runtimeOptions_.replicationConfigFingerprint,
+                    .liveness = runtimeOptions_.replicationLiveness,
                 };
                 const auto wire = encodeClientHello(hello);
                 if (!sendTo(socket, secure, wire.data(), wire.size())) { return false; }
@@ -987,6 +918,7 @@ namespace akkaradb::engine::cluster {
                 if (!recvFrameFrom(socket, secure, frame) || frame.type != ReplMsgType::SERVER_HELLO) { return false; }
                 ServerHello serverHello;
                 if (!decodeServerHello(frame.payload, serverHello) || serverHello.role != NodeRole::PRIMARY) { return false; }
+                if (serverHello.liveness != runtimeOptions_.replicationLiveness) { return false; }
                 if (serverHello.clusterId != runtimeOptions_.replicationClusterId ||
                     serverHello.configFingerprint != runtimeOptions_.replicationConfigFingerprint) { return false; }
                 if (serverHello.mirrorFencingMode != runtimeOptions_.mirrorFencing.mode) { return false; }
@@ -1007,7 +939,7 @@ namespace akkaradb::engine::cluster {
                     if (const auto existing = loadMembership(runtimeOptions_.clusterMembershipPath, runtimeOptions_.corruptStateAction);
                         existing && !runtimeOptions_.resetClusterMembership && (existing->groupId != incoming.groupId || existing->
                             primaryNodeId != incoming.primaryNodeId || existing->groupEpoch != incoming.groupEpoch)) {
-                        const bool authorizedMirrorSuccessor = existing->groupId == incoming.groupId &&
+                        const auto authorizedMirrorSuccessor = existing->groupId == incoming.groupId &&
                             existing->primaryNodeId != incoming.primaryNodeId &&
                             existing->groupEpoch != UINT64_MAX &&
                             incoming.groupEpoch == existing->groupEpoch + 1 &&
@@ -1037,6 +969,10 @@ namespace akkaradb::engine::cluster {
                 }
                 catch (...) { return false; }
                 transferSession_->setScope(serverHello.groupId, selfNodeId_, serverHello.nodeId);
+                if (hello.lastSeq != 0 && !hello.forceSnapshot && requiresDurableAck()) {
+                    forceDurableForAck();
+                    if (!sendAck(socket, secure, hello.lastSeq, AckStage::DURABLE)) { return false; }
+                }
                 return true;
             }
 
@@ -1062,6 +998,7 @@ namespace akkaradb::engine::cluster {
                     if (!messageLock.try_lock_until(deadline) || std::chrono::steady_clock::now() >= deadline) { return false; }
                     detail::ForwardDeadline sendDeadline{deadline, [this, socket, session = transferSession_] {
                         connected_.store(false);
+                        receiveCancellation_.cancel();
                         shutdownSocket(socket);
                         session->cancel();
                     }};
@@ -1069,6 +1006,7 @@ namespace akkaradb::engine::cluster {
                         std::unique_lock sendLock{sendMutex_, std::defer_lock};
                         if (!sendLock.try_lock_until(deadline) || std::chrono::steady_clock::now() >= deadline) { return false; }
                         attempted = true;
+                        if (!flushHeartbeatControls(socket, secure, deadline)) { return false; }
                         return secure ? sendSecureFrame(socket, *secure, wire.data(), wire.size(), transferBudget_, deadline) :
                             sendAllUntil(socket, wire.data(), wire.size(), deadline);
                     });
@@ -1076,15 +1014,33 @@ namespace akkaradb::engine::cluster {
                 catch (...) { success = false; }
                 if (!success && attempted) {
                     connected_.store(false);
+                    receiveCancellation_.cancel();
                     shutdownSocket(socket);
                     transferSession_->cancel();
                 }
                 return success;
             }
 
+            // Caller owns sendMutex_; controls can interleave with chunked
+            // messages without disturbing secure frame counter ordering.
+            bool flushHeartbeatControls(SocketHandle socket, crypto::SecureSession* secure,
+                std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
+                if (!connected_.load(std::memory_order_acquire)) { return true; }
+                const auto send = [&](ReplMsgType type, uint64_t nonce) {
+                    const auto wire = encodeHeartbeat(type, nonce);
+                    const auto memory = transferBudget_->reserve(detail::TransferBudget::Resource::MEMORY, wire.size());
+                    return secure ? sendSecureFrame(socket, *secure, wire.data(), wire.size(), transferBudget_, deadline) :
+                        deadline ? sendAllUntil(socket, wire.data(), wire.size(), *deadline) : sendAll(socket, wire.data(), wire.size());
+                };
+                if (const auto nonce = liveness_.takePong(); nonce != 0 && !send(ReplMsgType::HEARTBEAT_PONG, nonce)) { return false; }
+                if (const auto nonce = liveness_.beginProbe(); nonce != 0 && !send(ReplMsgType::HEARTBEAT_PING, nonce)) { return false; }
+                return true;
+            }
+
             bool sendFrame(SocketHandle socket, crypto::SecureSession* secure, std::span<const uint8_t> wire) {
                 std::lock_guard lock{sendMutex_};
                 try {
+                    if (!flushHeartbeatControls(socket, secure)) { return false; }
                     return secure ? sendSecureFrame(socket, *secure, wire.data(), wire.size(), transferBudget_) :
                            sendAll(socket, wire.data(), wire.size());
                 }
@@ -1100,8 +1056,31 @@ namespace akkaradb::engine::cluster {
             }
 
             bool recvFrameFrom(SocketHandle socket, crypto::SecureSession* secure, DecodedFrame& frame) {
-                if (secure != nullptr) { return recvSecureFrame(socket, *secure, frame, transferBudget_); }
-                return recvFrame(socket, frame, transferBudget_);
+                for (;;) {
+                    const auto established = receiveDeadline_ == std::chrono::steady_clock::time_point::max();
+                    const ReceiveContext context{running_, established ? liveness_.readDeadline() : receiveDeadline_, receiveCancellation_};
+                    const auto ok = secure ? recvSecureFrame(socket, *secure, frame, transferBudget_, context) :
+                        recvFrame(socket, frame, transferBudget_, context);
+                    if (!ok) { return false; }
+                    if (frame.type == ReplMsgType::HEARTBEAT_PONG) {
+                        uint64_t nonce;
+                        if (!established || frame.flags != 0 || !decodeHeartbeat(frame.payload, nonce) || !liveness_.acknowledge(nonce)) { return false; }
+                    }
+                    if (frame.type == ReplMsgType::HEARTBEAT_PING) {
+                        uint64_t nonce;
+                        if (!established || frame.flags != 0 || !decodeHeartbeat(frame.payload, nonce) || !liveness_.receiveProbe(nonce)) { return false; }
+                    }
+                    liveness_.observeInbound();
+                    if (established) { lastSuccessfulContactAtUs_.store(contactNowUs(), std::memory_order_relaxed); }
+                    if (established) {
+                        // Keep reverse-path activity visible during a long
+                        // incoming transfer, even when Pongs queue behind it.
+                        std::unique_lock sendLock{sendMutex_, std::try_to_lock};
+                        if (sendLock.owns_lock() && !flushHeartbeatControls(socket, secure)) { return false; }
+                    }
+                    if (frame.type != ReplMsgType::HEARTBEAT_PING && frame.type != ReplMsgType::HEARTBEAT_PONG) { return true; }
+                    frame = {};
+                }
             }
 
             bool sendAck(SocketHandle socket, crypto::SecureSession* secure, uint64_t seq, AckStage stage) {
@@ -1109,6 +1088,20 @@ namespace akkaradb::engine::cluster {
                 const auto ack = encodeAck(ReplAck{.seq = seq, .stage = stage});
                 auto memory = transferBudget_->reserve(detail::TransferBudget::Resource::MEMORY, ack.size());
                 return sendFrame(socket, secure, ack);
+            }
+
+            bool requiresDurableAck() const noexcept {
+                return ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE;
+            }
+
+            void forceDurableForAck() {
+                std::function<void()> callback;
+                {
+                    std::lock_guard lock{callbackMutex_};
+                    callback = forceDurableCallback_;
+                }
+                if (!callback) { throw std::runtime_error("ReplicationClient: DURABLE acknowledgement requires a durability callback"); }
+                callback();
             }
 
             void receiveLoop(SocketHandle socket, crypto::SecureSession* secure) {
@@ -1129,16 +1122,15 @@ namespace akkaradb::engine::cluster {
                         if (!detail::entryView(frame.payload, entry)) { return; }
                         if (receivingSnapshot) { return; }
                         if (!targetedEntries_ && entry.seq < expectedSeq) {
+                            if (requiresDurableAck()) { forceDurableForAck(); }
                             if (!sendAck(socket, secure, entry.seq, ackPolicy_.stage)) { return; }
                             continue;
                         }
                         if (!targetedEntries_ && !allowSequenceGaps_ && entry.seq != expectedSeq) { return; }
                         ApplyCallback applyCallback;
-                        std::function<void()> forceDurableCallback;
                         {
                             std::lock_guard lock{callbackMutex_};
                             applyCallback = applyCallback_;
-                            forceDurableCallback = forceDurableCallback_;
                         }
                         if (!sendAck(socket, secure, entry.seq, AckStage::RECEIVED)) { return; }
                         if (applyCallback) {
@@ -1149,8 +1141,8 @@ namespace akkaradb::engine::cluster {
                             expectedSeq = entry.seq + 1;
                         }
                         if (!sendAck(socket, secure, entry.seq, AckStage::APPLIED)) { return; }
-                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
-                            if (forceDurableCallback) { forceDurableCallback(); }
+                        if (requiresDurableAck()) {
+                            forceDurableForAck();
                             if (!sendAck(socket, secure, entry.seq, AckStage::DURABLE)) { return; }
                         }
                     }
@@ -1171,11 +1163,11 @@ namespace akkaradb::engine::cluster {
                             endCallback = blobEndCallback_;
                         }
                         if (beginCallback && chunkCallback && endCallback) {
-                            const uint32_t contentCrc32c = cpu::CRC32C(
+                            const auto contentCrc32c = cpu::CRC32C(
                                 reinterpret_cast<const std::byte*>(content.data()),
                                 content.size()
                             );
-                            beginCallback(blobSeq, blobId, static_cast<uint64_t>(content.size()), contentCrc32c);
+                            beginCallback(blobSeq, blobId, content.size(), contentCrc32c);
                             for (size_t offset = 0; offset < content.size();) {
                                 const auto count = std::min<size_t>(runtimeOptions_.transfer.chunkBytes, content.size() - offset);
                                 chunkCallback(blobSeq, blobId, offset, content.subspan(offset, count));
@@ -1211,11 +1203,11 @@ namespace akkaradb::engine::cluster {
                             endCallback = snapshotEntryEndCallback_;
                         }
                         if (!beginCallback || !chunkCallback || !endCallback) { return; }
-                        const uint32_t valueCrc32c = cpu::CRC32C(
+                        const auto valueCrc32c = cpu::CRC32C(
                             reinterpret_cast<const std::byte*>(entry.value.data()),
                             entry.value.size()
                         );
-                        beginCallback(entry.key, static_cast<uint64_t>(entry.value.size()), valueCrc32c);
+                        beginCallback(entry.key, entry.value.size(), valueCrc32c);
                         for (size_t offset = 0; offset < entry.value.size();) {
                             const auto count = std::min<size_t>(runtimeOptions_.transfer.chunkBytes, entry.value.size() - offset);
                             chunkCallback(offset, entry.value.subspan(offset, count));
@@ -1243,8 +1235,8 @@ namespace akkaradb::engine::cluster {
                             clearMirrorResync();
                         }
                         fencedSnapshotCompleted_.store(true);
-                        if (ackPolicy_.mode != AckPolicyMode::NONE && ackPolicy_.stage == AckStage::DURABLE) {
-                            if (forceDurable) { forceDurable(); }
+                        if (requiresDurableAck()) {
+                            forceDurableForAck();
                         }
                         if (!sendAck(socket, secure, endSeq, ackPolicy_.stage)) { return; }
                         receivingSnapshot = false;
@@ -1298,6 +1290,11 @@ namespace akkaradb::engine::cluster {
             std::atomic<bool> fencedSnapshotCompleted_{false};
             std::atomic<uint64_t> lastSuccessfulContactAtUs_{0};
             std::thread worker_;
+            std::mutex retryMutex_;
+            std::condition_variable retryCv_;
+            std::chrono::steady_clock::time_point receiveDeadline_ = std::chrono::steady_clock::time_point::max();
+            detail::CancellableSocketReader receiveCancellation_;
+            detail::PeerLiveness liveness_{runtimeOptions_.replicationLiveness};
 
             mutable std::timed_mutex socketMutex_;
             const bool targetedEntries_;
@@ -1373,9 +1370,10 @@ namespace akkaradb::engine::cluster {
             throw std::invalid_argument("ReplicationClient: host, nonzero port and node id are required");
         }
         if (!transferBudget) { transferBudget = std::make_shared<detail::TransferBudget>(runtimeOptions.transfer); }
+        runtimeOptions.replicationLiveness.validate();
         runtimeOptions.secure.validatePins();
         if (runtimeOptions.transportMode == TransportMode::SECURE) {
-            const uint64_t primaryId = runtimeOptions.secure.expectedPrimaryNodeId != 0
+            const auto primaryId = runtimeOptions.secure.expectedPrimaryNodeId != 0
                 ? runtimeOptions.secure.expectedPrimaryNodeId : runtimeOptions.primaryNodeId;
             if (primaryId == 0) { throw std::invalid_argument("ReplicationClient: SECURE requires an expected primary node id"); }
             runtimeOptions.secure.validatePins(std::span<const uint64_t>{&primaryId, 1});
@@ -1426,8 +1424,8 @@ namespace akkaradb::engine::cluster {
 
     uint64_t ReplicationClient::lastSuccessfulContactAtUs() const noexcept { return impl_->lastSuccessfulContactAtUs(); }
 
-    ReadResponse ReplicationClient::readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs) {
-        return impl_->readKey(key, snapshotSeq, timeoutMs);
+    ReadResponse ReplicationClient::readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs, ReadKeySpace keySpace) {
+        return impl_->readKey(key, snapshotSeq, timeoutMs, keySpace);
     }
 
     StripeControlResponse ReplicationClient::stripeControl(StripeControlRequest request, uint32_t timeoutMs) {

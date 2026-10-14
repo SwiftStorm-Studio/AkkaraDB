@@ -20,6 +20,7 @@
 
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/cluster/ClusterRuntime.hpp"
+#include "akk/engine/cluster/detail/ClusterHealth.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -107,31 +108,38 @@ namespace {
             WSADATA data{};
             AKK_OBSERVABILITY_CHECK(::WSAStartup(MAKEWORD(2, 2), &data) == 0);
         });
-        const SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        AKK_OBSERVABILITY_CHECK(socket != INVALID_SOCKET);
-#else
-        const int socket = ::socket(AF_INET, SOCK_STREAM, 0);
-        AKK_OBSERVABILITY_CHECK(socket >= 0);
 #endif
-        sockaddr_in address{};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = 0;
-        AKK_OBSERVABILITY_CHECK(::bind(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+        // Ephemeral client ports can occupy the adjacent partition listener
+        // after a port-zero probe closes. Use distinct pairs below that range.
+        static std::atomic<uint32_t> nextPort{35'000};
+        for (;;) {
+            const auto candidate = nextPort.fetch_add(2);
+            if (candidate > 45'000) { throw std::runtime_error("No free observability test port pair"); }
+            const auto open = [] {
 #ifdef _WIN32
-        int addressLength = sizeof(address);
+                return ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
-        socklen_t addressLength = sizeof(address);
+                return ::socket(AF_INET, SOCK_STREAM, 0);
 #endif
-        AKK_OBSERVABILITY_CHECK(::getsockname(socket, reinterpret_cast<sockaddr*>(&address), &addressLength) == 0);
-        const uint16_t port = ntohs(address.sin_port);
+            };
+            const auto first = open(), second = open();
 #ifdef _WIN32
-        ::closesocket(socket);
+            AKK_OBSERVABILITY_CHECK(first != INVALID_SOCKET && second != INVALID_SOCKET);
 #else
-        ::close(socket);
+            AKK_OBSERVABILITY_CHECK(first >= 0 && second >= 0);
 #endif
-        AKK_OBSERVABILITY_CHECK(port != 0);
-        return port;
+            sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(static_cast<uint16_t>(candidate));
+            const bool freeFirst = ::bind(first, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+            address.sin_port = htons(static_cast<uint16_t>(candidate + 1));
+            const bool freeSecond = ::bind(second, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+#ifdef _WIN32
+            ::closesocket(first); ::closesocket(second);
+#else
+            ::close(first); ::close(second);
+#endif
+            if (freeFirst && freeSecond) { return static_cast<uint16_t>(candidate); }
+        }
     }
 
     NodeInfo makeNode(uint64_t nodeId) {
@@ -213,6 +221,7 @@ namespace {
         ClusterEngineCallbacks callbacks;
         callbacks.getCurrentSeq = [node = node.get()] { return node->lastSeq.load(); };
         callbacks.getLastSeq = [node = node.get()] { return node->lastSeq.load(); };
+        callbacks.checkpointReplication = [node = node.get()] { return node->lastSeq.load(); };
         callbacks.apply = [node = node.get()](
             uint64_t seq,
             ReplOpType operation,
@@ -240,6 +249,7 @@ namespace {
             response.value.assign(value->second.begin(), value->second.end());
             return response;
         };
+        callbacks.readLocalStorage = callbacks.read;
         callbacks.forceDurable = [] {};
         node->runtime = ClusterRuntime::create(directory, config, nodeId, std::move(callbacks), std::move(options));
         return node;
@@ -274,6 +284,7 @@ namespace {
         AKK_OBSERVABILITY_CHECK(stats.sampledAtUs == 0 && stats.runtimeStartedAtUs == 0);
         AKK_OBSERVABILITY_CHECK(stats.configuredNodeCount == 0);
         AKK_OBSERVABILITY_CHECK(stats.configuredNodes.empty() && stats.peers.empty());
+        AKK_OBSERVABILITY_CHECK(stats.writeAvailability == ClusterOperationAvailability::UNKNOWN);
         engine->close();
         AKK_OBSERVABILITY_CHECK(!engine->stats().cluster.enabled);
     }
@@ -329,6 +340,8 @@ namespace {
         AKK_OBSERVABILITY_CHECK(rejected);
         const auto stats = node->runtime->raftStats();
         AKK_OBSERVABILITY_CHECK(stats.health == ClusterHealthState::FAILED);
+        AKK_OBSERVABILITY_CHECK(stats.writeAvailability == ClusterOperationAvailability::UNAVAILABLE);
+        AKK_OBSERVABILITY_CHECK(stats.linearizableReadAvailability == ClusterOperationAvailability::UNAVAILABLE);
         AKK_OBSERVABILITY_CHECK(stats.lastFailure == ClusterFailureCode::ENDPOINT_START);
         AKK_OBSERVABILITY_CHECK(stats.endpointStartFailures == 1);
         AKK_OBSERVABILITY_CHECK(stats.lastFailureAtUs != 0);
@@ -353,7 +366,7 @@ namespace {
 
         auto engine = AkkEngine::open(options);
         AKK_OBSERVABILITY_CHECK(waitUntil([&] {
-            return engine->stats().cluster.role == static_cast<uint32_t>(NodeRole::PRIMARY);
+            return engine->stats().cluster.linearizableReadAvailability == ClusterOperationAvailability::AVAILABLE;
         }));
         const auto first = engine->stats().cluster;
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
@@ -361,6 +374,8 @@ namespace {
 
         AKK_OBSERVABILITY_CHECK(first.enabled && first.raftEnabled);
         AKK_OBSERVABILITY_CHECK(first.health == ClusterHealthState::HEALTHY);
+        AKK_OBSERVABILITY_CHECK(first.quorumAvailability == ClusterOperationAvailability::AVAILABLE);
+        AKK_OBSERVABILITY_CHECK(first.writeAvailability == ClusterOperationAvailability::AVAILABLE);
         AKK_OBSERVABILITY_CHECK(first.sampledAtUs >= first.runtimeStartedAtUs && first.runtimeStartedAtUs != 0);
         AKK_OBSERVABILITY_CHECK(second.sampledAtUs > first.sampledAtUs);
         AKK_OBSERVABILITY_CHECK(second.runtimeStartedAtUs == first.runtimeStartedAtUs);
@@ -402,7 +417,8 @@ namespace {
         AKK_OBSERVABILITY_CHECK(waitUntil([&] {
             const auto stats = leader->runtime->raftStats();
             const auto& peer = peerById(stats, victim->nodeId);
-            return peer.connected && peer.roundTripsSucceeded != 0;
+            return peer.connected && peer.roundTripsSucceeded != 0 && stats.health == ClusterHealthState::HEALTHY &&
+                stats.linearizableReadAvailability == ClusterOperationAvailability::AVAILABLE;
         }));
         const auto before = leader->runtime->raftStats();
         const auto beforeSuccess = peerById(before, victim->nodeId).roundTripsSucceeded;
@@ -415,6 +431,9 @@ namespace {
             return !peer.connected && peer.roundTripsFailed != 0 && peer.lastRoundTripFailureAtUs != 0;
         }));
         const auto disconnected = leader->runtime->raftStats();
+        AKK_OBSERVABILITY_CHECK(disconnected.health == ClusterHealthState::DEGRADED);
+        AKK_OBSERVABILITY_CHECK(disconnected.quorumAvailability == ClusterOperationAvailability::AVAILABLE);
+        AKK_OBSERVABILITY_CHECK(disconnected.writeAvailability == ClusterOperationAvailability::AVAILABLE);
         const auto& failedPeer = peerById(disconnected, victim->nodeId);
         AKK_OBSERVABILITY_CHECK(failedPeer.consecutiveRoundTripFailures != 0);
         AKK_OBSERVABILITY_CHECK(failedPeer.lastRoundTripAtUs == failedPeer.lastRoundTripFailureAtUs);
@@ -431,6 +450,169 @@ namespace {
         AKK_OBSERVABILITY_CHECK(recovered.sampledAtUs >= recoveredPeer.lastRoundTripAtUs);
         AKK_OBSERVABILITY_CHECK(recoveredPeer.roundTripLatencyUs.sampleCount == recoveredPeer.roundTripsSucceeded);
         validateHistogram(recoveredPeer.roundTripLatencyUs);
+
+        victim->runtime->close();
+        RuntimeNode* remaining = nullptr;
+        for (auto* node : nodes) { if (node != leader && node != victim) { remaining = node; } }
+        AKK_OBSERVABILITY_CHECK(remaining != nullptr);
+        remaining->runtime->close();
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto stats = leader->runtime->raftStats();
+            return stats.health == ClusterHealthState::DEGRADED &&
+                stats.quorumAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.writeAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.linearizableReadAvailability == ClusterOperationAvailability::UNAVAILABLE;
+        }));
+        const auto isolated = leader->runtime->raftStats();
+        for (unsigned i = 0; i < 50; ++i) {
+            const auto stats = leader->runtime->raftStats();
+            AKK_OBSERVABILITY_CHECK(stats.lastLogIndex == isolated.lastLogIndex);
+            AKK_OBSERVABILITY_CHECK(stats.lastFailure == isolated.lastFailure);
+        }
+        victim->runtime->start(); remaining->runtime->start();
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            auto* current = findLeader(nodes);
+            return current && current->runtime->raftStats().health == ClusterHealthState::HEALTHY &&
+                current->runtime->raftStats().linearizableReadAvailability == ClusterOperationAvailability::AVAILABLE;
+        }, std::chrono::milliseconds{15'000}));
+        leader->runtime->close();
+        AKK_OBSERVABILITY_CHECK(leader->runtime->raftStats().writeAvailability == ClusterOperationAvailability::UNAVAILABLE);
+    }
+
+    void testLearnerCannotSupplyObservedQuorum() {
+        TempDirectory directory{"learner_quorum"};
+        auto learner = makeNode(3); learner.capabilities |= NodeCapability::RAFT_LEARNER;
+        const ClusterConfig config{{makeNode(1), makeNode(2), learner}, ReplicationMode::MIRROR, {},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1'000},
+            RaftOptions{.membership = {.allowLearners = true}}};
+        ClusterRuntimeOptions options; options.transportMode = TransportMode::PLAIN;
+        auto n1 = makeRuntimeNode(directory.path() / "n1", config, 1, options);
+        auto n2 = makeRuntimeNode(directory.path() / "n2", config, 2, options);
+        auto n3 = makeRuntimeNode(directory.path() / "n3", config, 3, options);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        RuntimeNode* voters[]{n1.get(), n2.get()};
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            auto* leader = findLeader(voters);
+            return leader && leader->runtime->raftStats().health == ClusterHealthState::HEALTHY;
+        }, std::chrono::milliseconds{15'000}));
+        auto* leader = findLeader(voters);
+        auto* other = leader == n1.get() ? n2.get() : n1.get();
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] { return n3->runtime->raftStats().health == ClusterHealthState::HEALTHY; }));
+        AKK_OBSERVABILITY_CHECK(n3->runtime->raftStats().quorumAvailability == ClusterOperationAvailability::UNKNOWN);
+        AKK_OBSERVABILITY_CHECK(n3->runtime->raftStats().writeAvailability == ClusterOperationAvailability::UNKNOWN);
+        other->runtime->close();
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto stats = leader->runtime->raftStats();
+            return peerById(stats, 3).connected && stats.quorumAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.health == ClusterHealthState::DEGRADED;
+        }));
+        leader->runtime->close();
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto stats = n3->runtime->raftStats();
+            return stats.health == ClusterHealthState::DEGRADED && stats.writeAvailability == ClusterOperationAvailability::UNAVAILABLE;
+        }));
+    }
+
+    void testHealthAggregation() {
+        RaftRuntimeStats root, child;
+        root.quorumAvailability = root.writeAvailability = root.linearizableReadAvailability = ClusterOperationAvailability::AVAILABLE;
+        child.health = ClusterHealthState::DEGRADED;
+        child.writeAvailability = ClusterOperationAvailability::UNAVAILABLE;
+        cluster::detail::mergeHealthObservation(root, child);
+        AKK_OBSERVABILITY_CHECK(root.health == ClusterHealthState::DEGRADED);
+        AKK_OBSERVABILITY_CHECK(root.writeAvailability == ClusterOperationAvailability::UNAVAILABLE);
+        AKK_OBSERVABILITY_CHECK(root.quorumAvailability == ClusterOperationAvailability::UNKNOWN);
+        child.health = ClusterHealthState::FAILED; child.lastFailure = ClusterFailureCode::RAFT_PERSISTENCE; child.lastFailureAtUs = 42;
+        cluster::detail::mergeHealthObservation(root, child);
+        AKK_OBSERVABILITY_CHECK(root.health == ClusterHealthState::FAILED && root.lastFailureAtUs == 42);
+        AKK_OBSERVABILITY_CHECK(cluster::detail::combineHealth(root.health, ClusterHealthState::REBUILDING) == ClusterHealthState::FAILED);
+    }
+
+    void testRequestAuthorityHealthDependency() {
+        TempDirectory directory{"authority_health"};
+        const ClusterConfig config{{makeNode(1), makeNode(2), makeNode(3)}, ReplicationMode::MIRROR, {},
+            ConsistencyOptions{.mode = ConsistencyMode::ASYNC, .ackTimeoutMs = 1'000}, {}, {}, 1};
+        ClusterRuntimeOptions options; options.transportMode = TransportMode::PLAIN;
+        options.requests.enabled = true;
+        options.clusterGroupId = 0xA44A'0005;
+        options.requests.authorityNodes = config.nodes();
+        for (auto& node : options.requests.authorityNodes) { node.replPort = unusedLoopbackPort(); }
+        options.startupRole = NodeStartupRole::PRIMARY;
+        auto n1 = makeRuntimeNode(directory.path() / "n1", config, 1, options);
+        options.startupRole = NodeStartupRole::REPLICA;
+        auto n2 = makeRuntimeNode(directory.path() / "n2", config, 2, options);
+        auto n3 = makeRuntimeNode(directory.path() / "n3", config, 3, options);
+        n1->runtime->start(); n2->runtime->start(); n3->runtime->start();
+        RuntimeNode* nodes[]{n1.get(), n2.get(), n3.get()};
+        RuntimeNode* authorityLeader = nullptr;
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            for (auto* node : nodes) {
+                const auto stats = node->runtime->raftStats();
+                if (stats.quorumAvailability == ClusterOperationAvailability::AVAILABLE && stats.health == ClusterHealthState::HEALTHY) {
+                    authorityLeader = node; return true;
+                }
+            }
+            return false;
+        }, std::chrono::milliseconds{15'000}));
+        for (auto* node : nodes) { if (node != authorityLeader) { node->runtime->close(); } }
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto stats = authorityLeader->runtime->raftStats();
+            return stats.quorumAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.writeAvailability == ClusterOperationAvailability::UNAVAILABLE && stats.health == ClusterHealthState::DEGRADED;
+        }));
+    }
+
+    void testPartitionChildHealthDependency(bool reduceCopies) {
+        TempDirectory directory{"partition_health"};
+        std::vector<NodeInfo> members{makeNode(1), makeNode(2), makeNode(3)};
+        for (auto& node : members) {
+            // Each group reserves its data port plus the adjacent placement port.
+            do { node.partitionReplBasePort = unusedLoopbackPort(); }
+            while (node.partitionReplBasePort == UINT16_MAX || std::ranges::any_of(members, [&](const auto& peer) {
+                const uint32_t begin = node.partitionReplBasePort, end = begin + 1;
+                return (peer.dataPort >= begin && peer.dataPort <= end) || (peer.replPort >= begin && peer.replPort <= end) ||
+                    (peer.stripeMetadataPort >= begin && peer.stripeMetadataPort <= end) ||
+                    (&peer != &node && peer.partitionReplBasePort != 0 &&
+                        uint32_t{peer.partitionReplBasePort} <= end && uint32_t{peer.partitionReplBasePort} + 1 >= begin);
+            }));
+        }
+        const ClusterConfig config{members, ReplicationMode::PARTITIONED, {},
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 1'000},
+            RaftOptions{.membership = {.mode = RaftMembershipMode::JOINT_CONSENSUS, .allowOnlineVoterChanges = true, .allowLearners = true}}, {}, 0, {},
+            PartitionOptions{.replicationFactor = 3, .partitionCount = 1}};
+        std::vector<std::unique_ptr<AkkEngine>> engines;
+        for (const auto& node : members) {
+            AkkEngineOptions options; options.paths.dataDir = directory.path() / std::to_string(node.nodeId);
+            options.components.clusterEnabled = true; options.components.blobEnabled = false;
+            options.cluster.config = config; options.cluster.runtime.transportMode = TransportMode::PLAIN;
+            options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
+            options.cluster.runtime.clusterGroupId = 0xA44A'0004;
+            writeNodeId(options.paths.dataDir / "node.id", node.nodeId);
+            engines.push_back(AkkEngine::open(options));
+        }
+        uint64_t leader = 0;
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto partitions = engines[0]->clusterPartitionStats();
+            if (partitions.empty()) { return false; }
+            leader = partitions.front().leaderNodeId;
+            return leader && std::ranges::all_of(engines, [](const auto& engine) { return engine->stats().cluster.health == ClusterHealthState::HEALTHY; });
+        }, std::chrono::milliseconds{15'000}));
+        if (reduceCopies) {
+            const ClusterConfig singleCopy{members, config.mode(), config.ackPolicy(), config.consistency(), config.raft(),
+                config.stripe(), config.primaryNodeId(), config.clusterId(), {.replicationFactor = 1, .partitionCount = 1}};
+            engines[0]->reconfigureCluster(singleCopy);
+            AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+                return std::ranges::all_of(engines, [](const auto& engine) { return engine->stats().cluster.health == ClusterHealthState::HEALTHY; });
+            }));
+            return;
+        }
+        for (size_t index = 0; index < engines.size(); ++index) { if (index + 1 != leader) { engines[index]->close(); } }
+        AKK_OBSERVABILITY_CHECK(waitUntil([&] {
+            const auto stats = engines[leader - 1]->stats().cluster;
+            return stats.health == ClusterHealthState::DEGRADED && stats.quorumAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.writeAvailability == ClusterOperationAvailability::UNAVAILABLE &&
+                stats.linearizableReadAvailability == ClusterOperationAvailability::UNAVAILABLE;
+        }));
     }
 
     void testNonRaftReadTelemetryAcrossFailureAndRecovery() {
@@ -450,7 +632,7 @@ namespace {
         n2->runtime->start();
         AKK_OBSERVABILITY_CHECK(waitUntil([&] { return peerById(n1->runtime->raftStats(), 12).connected; }));
 
-        auto response = n1->runtime->readKeyFromNode(12, bytesOf("managed-key"), 0);
+        auto response = n1->runtime->readLocalStorageFromNode(12, bytesOf("managed-key"), 0);
         AKK_OBSERVABILITY_CHECK(response.status == ReadStatus::FOUND && textOf(response.value) == "managed-value");
         auto stats = n1->runtime->raftStats();
         const auto initialRuntimeStart = stats.runtimeStartedAtUs;
@@ -464,7 +646,7 @@ namespace {
 
         n2->runtime->close();
         AKK_OBSERVABILITY_CHECK(waitUntil([&] { return !peerById(n1->runtime->raftStats(), 12).connected; }));
-        response = n1->runtime->readKeyFromNode(12, bytesOf("managed-key"), 0);
+        response = n1->runtime->readLocalStorageFromNode(12, bytesOf("managed-key"), 0);
         AKK_OBSERVABILITY_CHECK(response.status == ReadStatus::ERROR_STATUS);
         stats = n1->runtime->raftStats();
         const auto& failedPeer = peerById(stats, 12);
@@ -478,7 +660,7 @@ namespace {
 
         n2->runtime->start();
         AKK_OBSERVABILITY_CHECK(waitUntil([&] { return peerById(n1->runtime->raftStats(), 12).connected; }));
-        response = n1->runtime->readKeyFromNode(12, bytesOf("managed-key"), 0);
+        response = n1->runtime->readLocalStorageFromNode(12, bytesOf("managed-key"), 0);
         AKK_OBSERVABILITY_CHECK(response.status == ReadStatus::FOUND);
         stats = n1->runtime->raftStats();
         const auto& recoveredPeer = peerById(stats, 12);
@@ -509,6 +691,13 @@ int main() {
         testEngineManagementSnapshotContract();
         std::fprintf(stderr, "[cluster-observability] Raft disconnect and recovery\n");
         testRaftPeerTelemetryAcrossDisconnect();
+        std::fprintf(stderr, "[cluster-observability] learner exclusion and stale leader contact\n");
+        testLearnerCannotSupplyObservedQuorum();
+        testHealthAggregation();
+        std::fprintf(stderr, "[cluster-observability] required authority and partition health\n");
+        testRequestAuthorityHealthDependency();
+        testPartitionChildHealthDependency(false);
+        testPartitionChildHealthDependency(true);
         std::fprintf(stderr, "[cluster-observability] non-Raft read failure and recovery\n");
         testNonRaftReadTelemetryAcrossFailureAndRecovery();
         return 0;

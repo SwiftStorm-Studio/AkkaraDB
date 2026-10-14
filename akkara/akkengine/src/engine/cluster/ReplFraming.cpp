@@ -11,6 +11,8 @@
 #include "akk/engine/cluster/ReplFraming.hpp"
 
 #include <cstring>
+#include <stdexcept>
+#include <utility>
 
 #include "akk/cpu/CRC32C.hpp"
 
@@ -51,10 +53,10 @@ namespace akkaradb::engine::cluster {
         if (payload.size() > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return {}; }
         std::vector<uint8_t> wire(ReplFrameHeader::SIZE + payload.size());
         writeU32At(wire.data(), 0, ReplFrameHeader::MAGIC);
-        wire[4] = static_cast<uint8_t>(type);
+        wire[4] = std::to_underlying(type);
         wire[5] = flags;
         writeU32At(wire.data(), 6, static_cast<uint32_t>(payload.size()));
-        const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
+        const auto crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
         writeU32At(wire.data(), 10, crc);
         if (!payload.empty()) { std::memcpy(wire.data() + ReplFrameHeader::SIZE, payload.data(), payload.size()); }
         return wire;
@@ -67,7 +69,7 @@ namespace akkaradb::engine::cluster {
         if (payloadLen > ReplFrameHeader::MAX_PAYLOAD_SIZE) { return false; }
         if (wire.size() != ReplFrameHeader::SIZE + payloadLen) { return false; }
         const auto payload = wire.subspan(ReplFrameHeader::SIZE, payloadLen);
-        const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
+        const auto crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload.data()), payload.size());
         if (crc != readU32(wire, 10)) { return false; }
         out.type = static_cast<ReplMsgType>(wire[4]);
         out.flags = wire[5];
@@ -108,7 +110,7 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeForwardRequest(const ForwardRequest& request) {
         size_t size = FORWARD_REQUEST_BASE_SIZE;
         if (request.entries.size() > 65536 || request.timeoutMs == 0 || request.timeoutMs > 300000 ||
-            static_cast<uint8_t>(request.operation) > static_cast<uint8_t>(ForwardOperation::CLUSTER_ADMIN) ||
+            std::to_underlying(request.operation) > std::to_underlying(ForwardOperation::TRANSACTION) ||
             (request.operation == ForwardOperation::PUT_BATCH && request.entries.empty()) ||
             (request.operation != ForwardOperation::PUT_BATCH && request.entries.size() != 1)) { return {}; }
         for (const auto& entry : request.entries) {
@@ -121,7 +123,7 @@ namespace akkaradb::engine::cluster {
         std::vector<uint8_t> out;
         out.reserve(size);
         writeU64(out, request.requestId);
-        out.push_back(static_cast<uint8_t>(request.operation));
+        out.push_back(std::to_underlying(request.operation));
         writeU32(out, request.timeoutMs);
         out.insert(out.end(), request.deduplicationId.nonce.begin(), request.deduplicationId.nonce.end());
         writeU64(out, request.deduplicationId.expiresAtUnixMs);
@@ -135,7 +137,7 @@ namespace akkaradb::engine::cluster {
         ForwardRequest result;
         ForwardReader reader{bytes};
         uint64_t op, timeout, count;
-        if (!reader.integer(result.requestId, 8) || !reader.integer(op, 1) || op > static_cast<uint8_t>(ForwardOperation::CLUSTER_ADMIN) ||
+        if (!reader.integer(result.requestId, 8) || !reader.integer(op, 1) || op > std::to_underlying(ForwardOperation::TRANSACTION) ||
             !reader.integer(timeout, 4) || timeout == 0 || timeout > 300000) { return false; }
         result.operation = static_cast<ForwardOperation>(op);
         result.timeoutMs = static_cast<uint32_t>(timeout);
@@ -166,11 +168,11 @@ namespace akkaradb::engine::cluster {
         writeU64(out, response.requestId);
         out.push_back(response.success ? 1 : 0);
         out.push_back(response.found ? 1 : 0);
-        out.push_back(static_cast<uint8_t>(response.requestResult.status));
+        out.push_back(std::to_underlying(response.requestResult.status));
         writeU64(out, response.requestResult.sequence);
         writeU64(out, response.requestResult.logIndex);
         forwardBytes(out, response.value);
-        out.push_back(static_cast<uint8_t>(response.errorCode));
+        out.push_back(std::to_underlying(response.errorCode));
         writeU64(out, response.target.nodeId);
         forwardString(out, response.target.host);
         for (auto port : {response.target.tcpPort, response.target.httpPort, response.target.grpcPort, response.target.replPort}) {
@@ -188,9 +190,9 @@ namespace akkaradb::engine::cluster {
         ForwardReader reader{bytes};
         uint64_t success, found, status, code;
         if (!reader.integer(result.requestId, 8) || !reader.integer(success, 1) || success > 1 ||
-            !reader.integer(found, 1) || found > 1 || !reader.integer(status, 1) || status > static_cast<uint8_t>(ClusterRequestStatus::EXPIRED) ||
+            !reader.integer(found, 1) || found > 1 || !reader.integer(status, 1) || status > std::to_underlying(ClusterRequestStatus::EXPIRED) ||
             !reader.integer(result.requestResult.sequence, 8) || !reader.integer(result.requestResult.logIndex, 8) ||
-            !reader.buffer(result.value) || !reader.integer(code, 1) || code > static_cast<uint8_t>(ClusterRoutingCode::LOCAL_ONLY) ||
+            !reader.buffer(result.value) || !reader.integer(code, 1) || code > std::to_underlying(ClusterRoutingCode::WRITE_REJECTED) ||
             !reader.integer(result.target.nodeId, 8) || !reader.string(result.target.host, 1024)) { return false; }
         result.success = success != 0; result.found = found != 0;
         result.requestResult.status = static_cast<ClusterRequestStatus>(status);
@@ -207,36 +209,57 @@ namespace akkaradb::engine::cluster {
     }
 
     std::vector<uint8_t> encodeClientHello(const ClientHello& hello) {
+        hello.liveness.validate();
         std::vector<uint8_t> p;
         writeU64(p, hello.nodeId);
         writeU64(p, hello.lastSeq);
-        p.push_back(static_cast<uint8_t>(hello.role));
-        p.push_back((static_cast<uint8_t>(hello.mirrorFencingMode) << 1) | (hello.forceSnapshot ? 1 : 0));
+        p.push_back(std::to_underlying(hello.role));
+        p.push_back((std::to_underlying(hello.mirrorFencingMode) << 1) | (hello.forceSnapshot ? 1 : 0));
         writeU64(p, hello.groupId);
         writeU64(p, hello.groupEpoch);
         p.insert(p.end(), hello.clusterId.begin(), hello.clusterId.end());
         p.insert(p.end(), hello.configFingerprint.begin(), hello.configFingerprint.end());
+        writeU32(p, hello.liveness.heartbeatIntervalMs);
+        writeU32(p, hello.liveness.peerTimeoutMs);
         return encodeFrame(ReplMsgType::CLIENT_HELLO, p);
     }
 
     std::vector<uint8_t> encodeServerHello(const ServerHello& hello) {
+        hello.liveness.validate();
         std::vector<uint8_t> p;
         writeU64(p, hello.nodeId);
         writeU64(p, hello.currentSeq);
-        p.push_back(static_cast<uint8_t>(hello.role));
-        p.push_back(static_cast<uint8_t>(hello.mirrorFencingMode));
+        p.push_back(std::to_underlying(hello.role));
+        p.push_back(std::to_underlying(hello.mirrorFencingMode));
         writeU64(p, hello.groupId);
         writeU64(p, hello.groupEpoch);
         p.insert(p.end(), hello.clusterId.begin(), hello.clusterId.end());
         p.insert(p.end(), hello.configFingerprint.begin(), hello.configFingerprint.end());
+        writeU32(p, hello.liveness.heartbeatIntervalMs);
+        writeU32(p, hello.liveness.peerTimeoutMs);
         return encodeFrame(ReplMsgType::SERVER_HELLO, p);
+    }
+
+    std::vector<uint8_t> encodeHeartbeat(ReplMsgType type, uint64_t nonce) {
+        if ((type != ReplMsgType::HEARTBEAT_PING && type != ReplMsgType::HEARTBEAT_PONG) || nonce == 0) {
+            throw std::invalid_argument("Replication heartbeat: invalid kind or nonce");
+        }
+        std::vector<uint8_t> payload;
+        writeU64(payload, nonce);
+        return encodeFrame(type, payload);
+    }
+
+    bool decodeHeartbeat(std::span<const uint8_t> payload, uint64_t& nonce) {
+        if (payload.size() != 8) { return false; }
+        nonce = readU64(payload, 0);
+        return nonce != 0;
     }
 
     std::vector<uint8_t> encodeEntry(const ReplEntry& entry) {
         std::vector<uint8_t> p;
         writeU64(p, entry.seq);
         writeU64(p, entry.sourceNodeId);
-        p.push_back(static_cast<uint8_t>(entry.op));
+        p.push_back(std::to_underlying(entry.op));
         p.push_back(entry.recordFlags);
         writeU32(p, static_cast<uint32_t>(entry.key.size()));
         writeU32(p, static_cast<uint32_t>(entry.value.size()));
@@ -249,7 +272,7 @@ namespace akkaradb::engine::cluster {
         std::vector<uint8_t> p;
         writeU64(p, blob.seq);
         writeU64(p, blob.blobId);
-        writeU64(p, static_cast<uint64_t>(blob.content.size()));
+        writeU64(p, blob.content.size());
         p.insert(p.end(), blob.content.begin(), blob.content.end());
         return encodeFrame(ReplMsgType::BLOB_PUT, p);
     }
@@ -257,7 +280,7 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeAck(const ReplAck& ack) {
         std::vector<uint8_t> p;
         writeU64(p, ack.seq);
-        p.push_back(static_cast<uint8_t>(ack.stage));
+        p.push_back(std::to_underlying(ack.stage));
         p.push_back(0);
         return encodeFrame(ReplMsgType::ACK, p);
     }
@@ -285,10 +308,15 @@ namespace akkaradb::engine::cluster {
     }
 
     std::vector<uint8_t> encodeReadRequest(const ReadRequest& request) {
+        if (request.keySpace != ReadKeySpace::PUBLIC && request.keySpace != ReadKeySpace::LOCAL_STORAGE) {
+            throw std::invalid_argument("replication: invalid read key namespace");
+        }
+        if (request.key.size() > UINT32_MAX) { throw std::length_error("replication: oversized read key"); }
         std::vector<uint8_t> p;
         writeU64(p, request.requestId);
         writeU64(p, request.snapshotSeq);
         writeU32(p, static_cast<uint32_t>(request.key.size()));
+        p.push_back(std::to_underlying(request.keySpace));
         p.insert(p.end(), request.key.begin(), request.key.end());
         return encodeFrame(ReplMsgType::READ_REQUEST, p);
     }
@@ -296,7 +324,7 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeReadResponse(const ReadResponse& response) {
         std::vector<uint8_t> p;
         writeU64(p, response.requestId);
-        p.push_back(static_cast<uint8_t>(response.status));
+        p.push_back(std::to_underlying(response.status));
         p.push_back(response.recordFlags);
         writeU64(p, response.seq);
         writeU32(p, static_cast<uint32_t>(response.value.size()));
@@ -307,7 +335,7 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeStripeControlRequest(const StripeControlRequest& request) {
         std::vector<uint8_t> p;
         writeU64(p, request.requestId);
-        p.push_back(static_cast<uint8_t>(request.action));
+        p.push_back(std::to_underlying(request.action));
         writeU64(p, request.ownerNodeId);
         writeU64(p, request.fenceToken);
         writeU32(p, static_cast<uint32_t>(request.key.size()));
@@ -320,7 +348,7 @@ namespace akkaradb::engine::cluster {
     std::vector<uint8_t> encodeStripeControlResponse(const StripeControlResponse& response) {
         std::vector<uint8_t> p;
         writeU64(p, response.requestId);
-        p.push_back(static_cast<uint8_t>(response.status));
+        p.push_back(std::to_underlying(response.status));
         writeU64(p, response.authorityNodeId);
         writeU64(p, response.fenceToken);
         writeU32(p, static_cast<uint32_t>(response.metadata.size()));
@@ -329,7 +357,7 @@ namespace akkaradb::engine::cluster {
     }
 
     bool decodeClientHello(std::span<const uint8_t> payload, ClientHello& out) {
-        if (payload.size() != 82 || payload[17] > 5) { return false; }
+        if (payload.size() != 90 || payload[17] > 5) { return false; }
         out.nodeId = readU64(payload, 0);
         out.lastSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
@@ -339,11 +367,13 @@ namespace akkaradb::engine::cluster {
         out.groupEpoch = readU64(payload, 26);
         std::memcpy(out.clusterId.data(), payload.data() + 34, out.clusterId.size());
         std::memcpy(out.configFingerprint.data(), payload.data() + 50, out.configFingerprint.size());
-        return true;
+        out.liveness.heartbeatIntervalMs = readU32(payload, 82);
+        out.liveness.peerTimeoutMs = readU32(payload, 86);
+        return out.liveness.valid();
     }
 
     bool decodeServerHello(std::span<const uint8_t> payload, ServerHello& out) {
-        if (payload.size() != 82 || payload[17] > 2) { return false; }
+        if (payload.size() != 90 || payload[17] > 2) { return false; }
         out.nodeId = readU64(payload, 0);
         out.currentSeq = readU64(payload, 8);
         out.role = static_cast<NodeRole>(payload[16]);
@@ -352,7 +382,9 @@ namespace akkaradb::engine::cluster {
         out.groupEpoch = readU64(payload, 26);
         std::memcpy(out.clusterId.data(), payload.data() + 34, out.clusterId.size());
         std::memcpy(out.configFingerprint.data(), payload.data() + 50, out.configFingerprint.size());
-        return true;
+        out.liveness.heartbeatIntervalMs = readU32(payload, 82);
+        out.liveness.peerTimeoutMs = readU32(payload, 86);
+        return out.liveness.valid();
     }
 
     bool decodeEntry(std::span<const uint8_t> payload, ReplEntry& out) {
@@ -361,8 +393,8 @@ namespace akkaradb::engine::cluster {
         out.sourceNodeId = readU64(payload, 8);
         out.op = static_cast<ReplOpType>(payload[16]);
         out.recordFlags = payload[17];
-        const uint32_t keyLen = readU32(payload, 18);
-        const uint32_t valLen = readU32(payload, 22);
+        const auto keyLen = readU32(payload, 18);
+        const auto valLen = readU32(payload, 22);
         size_t cursor = 26;
         return readBytes(payload, cursor, keyLen, out.key) && readBytes(payload, cursor, valLen, out.value) && cursor == payload.size();
     }
@@ -371,7 +403,7 @@ namespace akkaradb::engine::cluster {
         if (payload.size() < 24) { return false; }
         out.seq = readU64(payload, 0);
         out.blobId = readU64(payload, 8);
-        const uint64_t contentLen = readU64(payload, 16);
+        const auto contentLen = readU64(payload, 16);
         if (contentLen > payload.size() - 24) { return false; }
         size_t cursor = 24;
         return readBytes(payload, cursor, static_cast<size_t>(contentLen), out.content) && cursor == payload.size();
@@ -393,8 +425,8 @@ namespace akkaradb::engine::cluster {
 
     bool decodeSnapshotEntry(std::span<const uint8_t> payload, ReplSnapshotEntry& out) {
         if (payload.size() < 8) { return false; }
-        const uint32_t keyLen = readU32(payload, 0);
-        const uint32_t valueLen = readU32(payload, 4);
+        const auto keyLen = readU32(payload, 0);
+        const auto valueLen = readU32(payload, 4);
         size_t cursor = 8;
         return readBytes(payload, cursor, keyLen, out.key) && readBytes(payload, cursor, valueLen, out.value) && cursor == payload.size();
     }
@@ -406,11 +438,12 @@ namespace akkaradb::engine::cluster {
     }
 
     bool decodeReadRequest(std::span<const uint8_t> payload, ReadRequest& out) {
-        if (payload.size() < 20) { return false; }
+        if (payload.size() < 21 || payload[20] > std::to_underlying(ReadKeySpace::LOCAL_STORAGE)) { return false; }
         out.requestId = readU64(payload, 0);
         out.snapshotSeq = readU64(payload, 8);
-        const uint32_t keyLen = readU32(payload, 16);
-        size_t cursor = 20;
+        out.keySpace = static_cast<ReadKeySpace>(payload[20]);
+        const auto keyLen = readU32(payload, 16);
+        size_t cursor = 21;
         return readBytes(payload, cursor, keyLen, out.key) && cursor == payload.size();
     }
 
@@ -420,7 +453,7 @@ namespace akkaradb::engine::cluster {
         out.status = static_cast<ReadStatus>(payload[8]);
         out.recordFlags = payload[9];
         out.seq = readU64(payload, 10);
-        const uint32_t valueLen = readU32(payload, 18);
+        const auto valueLen = readU32(payload, 18);
         size_t cursor = 22;
         return readBytes(payload, cursor, valueLen, out.value) && cursor == payload.size();
     }
@@ -433,11 +466,12 @@ namespace akkaradb::engine::cluster {
             out.action != StripeControlAction::RELEASE && out.action != StripeControlAction::READ_METADATA &&
             out.action != StripeControlAction::REPAIR_METADATA && out.action != StripeControlAction::ROLLBACK_WATERMARK &&
             out.action != StripeControlAction::ROLLBACK_KEY && out.action != StripeControlAction::ROLLBACK_STREAM &&
-            out.action != StripeControlAction::ROLLBACK_APPLY) { return false; }
+            out.action != StripeControlAction::ROLLBACK_APPLY && out.action != StripeControlAction::RECLAIM_GENERATION &&
+            out.action != StripeControlAction::GENERATION_RETAINED) { return false; }
         out.ownerNodeId = readU64(payload, 9);
         out.fenceToken = readU64(payload, 17);
-        const uint32_t keyLen = readU32(payload, 25);
-        const uint32_t metadataLen = readU32(payload, 29);
+        const auto keyLen = readU32(payload, 25);
+        const auto metadataLen = readU32(payload, 29);
         size_t cursor = 33;
         return readBytes(payload, cursor, keyLen, out.key) && readBytes(payload, cursor, metadataLen, out.metadata) &&
                cursor == payload.size();
@@ -449,7 +483,7 @@ namespace akkaradb::engine::cluster {
         out.status = static_cast<StripeControlStatus>(payload[8]);
         out.authorityNodeId = readU64(payload, 9);
         out.fenceToken = readU64(payload, 17);
-        const uint32_t metadataLen = readU32(payload, 25);
+        const auto metadataLen = readU32(payload, 25);
         size_t cursor = 29;
         if (!readBytes(payload, cursor, metadataLen, out.metadata) || cursor != payload.size()) { return false; }
         return out.status == StripeControlStatus::GRANTED || out.status == StripeControlStatus::COMMITTED ||

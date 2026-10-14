@@ -12,6 +12,8 @@
 #include "akk/engine/cluster/ReplicationServer.hpp"
 #include "akk/engine/cluster/detail/BoundedExecutor.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
+#include "akk/engine/cluster/detail/CancellableSocketReader.hpp"
+#include "akk/engine/cluster/detail/PeerLiveness.hpp"
 #include "akk/crypto/SecureChannel.hpp"
 
 #include <array>
@@ -22,6 +24,7 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <exception>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -92,7 +95,7 @@ namespace akkaradb::engine::cluster {
             size_t sent = 0;
             while (sent < size) {
                 #ifdef _WIN32
-                const int rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
+                const auto rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
                 if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
                 int flags = 0;
@@ -107,7 +110,10 @@ namespace akkaradb::engine::cluster {
             return true;
         }
 
-        bool recvAll(SocketHandle s, uint8_t* data, size_t size, const std::atomic<bool>* running = nullptr) {
+        bool recvAll(SocketHandle s, uint8_t* data, size_t size, const std::atomic<bool>* running = nullptr,
+                     detail::CancellableSocketReader* reader = nullptr,
+                     detail::ConnectionDeadline receiveDeadline = detail::ConnectionDeadline::max()) {
+            if (reader) { return reader->readAll(s, data, size, receiveDeadline); }
             const auto deadline = running != nullptr
                 ? std::chrono::steady_clock::now() + std::chrono::milliseconds{HANDSHAKE_TIMEOUT_MS}
                 : std::chrono::steady_clock::time_point{};
@@ -120,16 +126,16 @@ namespace akkaradb::engine::cluster {
                     FD_ZERO(&readable);
                     FD_SET(s, &readable);
                     timeval timeout{0, 50'000};
-                    const int ready = ::select(0, &readable, nullptr, nullptr, &timeout);
+                    const auto ready = ::select(0, &readable, nullptr, nullptr, &timeout);
 #else
                     pollfd readable{s, POLLIN, 0};
-                    const int ready = ::poll(&readable, 1, 50);
+                    const auto ready = ::poll(&readable, 1, 50);
 #endif
                     if (!running->load() || ready < 0) { return false; }
                     if (ready == 0) { continue; }
                 }
                 #ifdef _WIN32
-                const int rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
+                const auto rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
                 if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
                 #else
                 const ssize_t rc = ::recv(s, data + got, size - got, 0); if (rc < 0 && errno == EINTR) { continue; }
@@ -159,16 +165,18 @@ namespace akkaradb::engine::cluster {
                 uint32_t>(b[3]) << 24);
         }
 
-        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget, const std::atomic<bool>* running = nullptr) {
+        bool recvFrame(SocketHandle s, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget, const std::atomic<bool>* running = nullptr,
+                       detail::CancellableSocketReader* reader = nullptr,
+                       detail::ConnectionDeadline deadline = detail::ConnectionDeadline::max()) {
             uint8_t header[ReplFrameHeader::SIZE];
-            if (!recvAll(s, header, sizeof(header), running)) { return false; }
-            const uint32_t payloadLen = readU32(header + 6);
+            if (!recvAll(s, header, sizeof(header), running, reader, deadline)) { return false; }
+            const auto payloadLen = readU32(header + 6);
             if (payloadLen > detail::TRANSFER_FRAME_LIMIT) { return false; }
             auto wireMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, ReplFrameHeader::SIZE + payloadLen);
             out.memoryReservation = budget->reserve(detail::TransferBudget::Resource::MEMORY, payloadLen);
             std::vector<uint8_t> wire(sizeof(header) + payloadLen);
             std::memcpy(wire.data(), header, sizeof(header));
-            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen, running)) { return false; }
+            if (payloadLen > 0 && !recvAll(s, wire.data() + sizeof(header), payloadLen, running, reader, deadline)) { return false; }
             return decodeFrame(wire, out);
         }
 
@@ -209,8 +217,9 @@ namespace akkaradb::engine::cluster {
 
         std::optional<crypto::PublicKey> pinnedPeerKey(const ClusterRuntimeOptions& options, uint64_t nodeId) {
             if (nodeId == 0) { return std::nullopt; }
-            for (const auto& pin : options.secure.pinnedPeers) { if (pin.nodeId == nodeId) { return pin.publicKey; } }
-            return std::nullopt;
+            const auto pin = std::ranges::find(options.secure.pinnedPeers, nodeId, &ClusterPeerPublicKeyPin::nodeId);
+            if (pin == options.secure.pinnedPeers.end()) { return std::nullopt; }
+            return pin->publicKey;
         }
 
         bool readSecureClientHello(SocketHandle socket, crypto::ClientHello& hello, const std::atomic<bool>* running) {
@@ -269,21 +278,23 @@ namespace akkaradb::engine::cluster {
             ));
         }
 
-        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget, const std::atomic<bool>* running = nullptr) {
+        bool recvSecureFrame(SocketHandle socket, crypto::SecureSession& session, DecodedFrame& out, const std::shared_ptr<detail::TransferBudget>& budget, const std::atomic<bool>* running = nullptr,
+                             detail::CancellableSocketReader* reader = nullptr,
+                             detail::ConnectionDeadline deadline = detail::ConnectionDeadline::max()) {
             std::array<uint8_t, SECURE_FRAME_HEADER_SIZE> header{};
-            if (!recvAll(socket, header.data(), header.size(), running)) { return false; }
+            if (!recvAll(socket, header.data(), header.size(), running, reader, deadline)) { return false; }
             if (readU32Le(header.data()) != SECURE_FRAME_MAGIC || header[4] != SECURE_VERSION) { return false; }
 
             crypto::EncryptedFrame encrypted;
             encrypted.counter = readU64Le(header.data() + 6);
-            const uint32_t ciphertextSize = readU32Le(header.data() + 14);
+            const auto ciphertextSize = readU32Le(header.data() + 14);
             if (ciphertextSize > SECURE_MAX_CIPHERTEXT_SIZE) { return false; }
             std::memcpy(encrypted.tag.data(), header.data() + 18, encrypted.tag.size());
             auto decryptMemory = budget->reserve(detail::TransferBudget::Resource::MEMORY, 2ull * ciphertextSize);
             out.memoryReservation = budget->reserve(detail::TransferBudget::Resource::MEMORY,
                 ciphertextSize > ReplFrameHeader::SIZE ? ciphertextSize - ReplFrameHeader::SIZE : 0);
             encrypted.ciphertext.resize(ciphertextSize);
-            if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize, running)) { return false; }
+            if (ciphertextSize > 0 && !recvAll(socket, encrypted.ciphertext.data(), ciphertextSize, running, reader, deadline)) { return false; }
 
             std::vector<uint8_t> plaintext;
             if (!session.open(encrypted, plaintext)) { return false; }
@@ -345,6 +356,9 @@ namespace akkaradb::engine::cluster {
         };
 
         struct ReplicaState {
+            explicit ReplicaState(ReplicationLivenessOptions options) : liveness{options} {}
+            detail::PeerLiveness liveness;
+            detail::CancellableSocketReader reader;
             SocketHandle sock = BAD_SOCKET;
             std::unique_ptr<crypto::SecureSession> secure;
             uint64_t nodeId = 0;
@@ -437,21 +451,48 @@ namespace akkaradb::engine::cluster {
             std::condition_variable ackCv;
             std::unordered_set<uint64_t> lagBlockedReplicas;
             std::unique_ptr<detail::BoundedExecutor> stripeControlExecutor;
+            mutable std::mutex failureMutex;
+            std::exception_ptr replicationFailure;
+            std::function<void(std::exception_ptr)> fatalFailureCallback;
+
+            void checkHealth() const {
+                std::lock_guard lock{failureMutex};
+                if (replicationFailure) { std::rethrow_exception(replicationFailure); }
+            }
+
+            void failReplication(uint64_t peer, uint64_t localSeq, uint64_t peerSeq) {
+                const auto failure = std::make_exception_ptr(std::runtime_error(
+                    "ReplicationServer: recovery/resynchronization required; peer " + std::to_string(peer) +
+                    " has sequence " + std::to_string(peerSeq) + " beyond local sequence " + std::to_string(localSeq) +
+                    "; replication stopped with both data sets preserved"));
+                {
+                    std::lock_guard lock{failureMutex};
+                    if (replicationFailure) { return; }
+                    replicationFailure = failure;
+                }
+                {
+                    std::lock_guard lock{replicasMutex};
+                    for (const auto& replica : replicas) { requestReplicaStop(replica); }
+                }
+                ackCv.notify_all();
+                // Never join the endpoint from its own handshake/bootstrap worker.
+                if (fatalFailureCallback) { fatalFailureCallback(failure); }
+            }
 
             static bool targetsNode(const std::optional<std::vector<uint64_t>>& targets, uint64_t nodeId) {
-                return !targets || std::ranges::find(*targets, nodeId) != targets->end();
+                return !targets || std::ranges::contains(*targets, nodeId);
             }
 
             bool sendsKeyTo(std::span<const uint8_t> key, uint64_t nodeId) const {
                 if (!entryTargets) { return true; }
                 const auto targets = entryTargets(key);
-                return std::ranges::find(targets, nodeId) != targets.end();
+                return std::ranges::contains(targets, nodeId);
             }
 
             bool queueHasCapacityLocked(const ReplicaState& replica, size_t wireSize) const noexcept {
                 if (runtimeOptions.maxReplicaQueueFrames != 0 && replica.queue.size() >= runtimeOptions.maxReplicaQueueFrames) { return false; }
                 if (runtimeOptions.maxReplicaQueueBytes != 0) {
-                    const uint64_t bytes = static_cast<uint64_t>(wireSize);
+                    const auto bytes = static_cast<uint64_t>(wireSize);
                     if (bytes > runtimeOptions.maxReplicaQueueBytes || replica.queuedBytes > runtimeOptions.maxReplicaQueueBytes - bytes) { return false; }
                 }
                 return true;
@@ -461,8 +502,8 @@ namespace akkaradb::engine::cluster {
                 if (!queueHasCapacityLocked(replica, wireSize)) { return false; }
                 // Keep headroom in the shared transfer budget for constructing
                 // the next catch-up message and for the receiver/control paths.
-                const uint64_t largestHeapMessage = static_cast<uint64_t>(transferBudget->options.thresholdBytes) + ReplFrameHeader::SIZE;
-                const uint64_t resourceWindow = std::max<uint64_t>(1, transferBudget->options.maxMemoryBytes / (2 * largestHeapMessage));
+                const auto largestHeapMessage = static_cast<uint64_t>(transferBudget->options.thresholdBytes) + ReplFrameHeader::SIZE;
+                const auto resourceWindow = std::max<uint64_t>(1, transferBudget->options.maxMemoryBytes / (2 * largestHeapMessage));
                 return replica.queue.size() < std::min<uint64_t>(64, resourceWindow);
             }
 
@@ -501,6 +542,7 @@ namespace akkaradb::engine::cluster {
 
             void start() {
                 std::lock_guard lock{lifecycleMutex};
+                checkHealth();
                 if (running.load()) { return; }
                 listenSock = listenOn(runtimeOptions.replBindHost, replPort);
                 running.store(true);
@@ -556,10 +598,14 @@ namespace akkaradb::engine::cluster {
             void reapLoop() {
                 while (true) {
                     std::vector<std::shared_ptr<ReplicaState>> deadReplicas;
+                    std::vector<std::shared_ptr<ReplicaState>> expiredReplicas;
                     bool done = false;
                     {
                         std::lock_guard lock{replicasMutex};
                         for (auto it = replicas.begin(); it != replicas.end();) {
+                            if (!(*it)->dead.load() && (*it)->workersReady.load() && (*it)->liveness.expired()) {
+                                expiredReplicas.push_back(*it);
+                            }
                             if ((*it)->dead.load() && (*it)->workersReady.load()) {
                                 const auto nodeId = (*it)->nodeId;
                                 const auto contact = (*it)->lastSuccessfulContactAtUs.load(std::memory_order_relaxed);
@@ -572,6 +618,7 @@ namespace akkaradb::engine::cluster {
                         }
                         done = reaperStopping.load() && replicas.empty();
                     }
+                    for (const auto& replica : expiredReplicas) { requestReplicaStop(replica); }
                     for (const auto& replica : deadReplicas) { finalizeReplica(replica); }
                     if (done) { return; }
 
@@ -617,7 +664,7 @@ namespace akkaradb::engine::cluster {
                     std::shared_ptr<ReplicaState> replica;
                     bool connected = false;
                     try {
-                        replica = std::make_shared<ReplicaState>();
+                        replica = std::make_shared<ReplicaState>(runtimeOptions.replicationLiveness);
                         replica->sock = client;
                         connected = processHandshake(replica);
                     }
@@ -648,6 +695,7 @@ namespace akkaradb::engine::cluster {
             }
 
             bool processHandshake(const std::shared_ptr<ReplicaState>& replica) {
+                checkHealth();
                 const auto client = replica->sock;
                 std::unique_ptr<crypto::SecureSession> secure;
                 crypto::PublicKey secureRemotePublicKey{};
@@ -678,6 +726,7 @@ namespace akkaradb::engine::cluster {
                 }
                 if (hello.clusterId != runtimeOptions.replicationClusterId ||
                     hello.configFingerprint != runtimeOptions.replicationConfigFingerprint) { return false; }
+                if (hello.liveness != runtimeOptions.replicationLiveness) { return false; }
                 if (hello.mirrorFencingMode != runtimeOptions.mirrorFencing.mode ||
                     (hello.forceSnapshot && hello.mirrorFencingMode == MirrorFencingMode::STATIC)) { return false; }
                 if (hello.groupId != 0 && hello.groupId != runtimeOptions.clusterGroupId) {
@@ -701,7 +750,8 @@ namespace akkaradb::engine::cluster {
                 replica->nodeId = hello.nodeId;
                 replica->transferSession->setScope(runtimeOptions.clusterGroupId, selfNodeId, hello.nodeId);
                 replica->lastAckedSeq.store(hello.lastSeq);
-                replica->lastAckStage.store(static_cast<uint8_t>(AckStage::DURABLE));
+                // The hello advertises applied progress, not a durability proof.
+                replica->lastAckStage.store(static_cast<uint8_t>(hello.lastSeq == 0 ? AckStage::DURABLE : AckStage::APPLIED));
 
                 ServerHello response{};
                 response.nodeId = selfNodeId;
@@ -725,13 +775,20 @@ namespace akkaradb::engine::cluster {
                     response.groupId = runtimeOptions.clusterGroupId;
                     response.groupEpoch = runtimeOptions.clusterGroupEpoch;
                 }
+                response.liveness = runtimeOptions.replicationLiveness;
+                if (!hello.forceSnapshot && hello.lastSeq > response.currentSeq) {
+                    failReplication(hello.nodeId, response.currentSeq, hello.lastSeq);
+                    return false;
+                }
+                checkHealth();
                 const auto helloWire = encodeServerHello(response);
                 if (!sendTo(client, replica->secure.get(), helloWire.data(), helloWire.size())) {
                     requestReplicaStop(replica);
                     return false;
                 }
                 replica->lastSuccessfulContactAtUs.store(contactNowUs(), std::memory_order_relaxed);
-                setSocketTimeouts(client, 0);
+                replica->liveness.reset();
+                setSocketTimeouts(client, static_cast<int>(runtimeOptions.replicationLiveness.peerTimeoutMs));
                 try {
                     replica->sendThread = std::thread([this, replica] { sendLoop(replica); });
                     replica->readThread = std::thread([this, replica] { readLoop(replica); });
@@ -758,9 +815,12 @@ namespace akkaradb::engine::cluster {
             bool waitForRaid1BootstrapDurable(const std::shared_ptr<ReplicaState>& replica, uint64_t seq) {
                 if (consistency.writeConsistency != WriteConsistency::AVAILABLE_REPLICAS || seq == 0) { return true; }
                 while (running.load() && !replica->dead.load()) {
-                    const uint64_t ackSeq = replica->lastAckedSeq.load();
-                    const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
-                    if (ackSeq > seq || (ackSeq == seq && ackStage >= AckStage::DURABLE)) { return true; }
+                    {
+                        std::lock_guard progressLock{replicasMutex};
+                        const auto ackSeq = replica->lastAckedSeq.load();
+                        const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
+                        if (ackSeq >= seq && ackStage >= AckStage::DURABLE) { return true; }
+                    }
                     std::unique_lock lock{ackMutex};
                     ackCv.wait_for(lock, std::chrono::milliseconds(50));
                 }
@@ -772,6 +832,12 @@ namespace akkaradb::engine::cluster {
                 try {
                     uint64_t cursor = lastSeq;
                     while (!replica->dead.load() && running.load()) {
+                        checkHealth();
+                        const auto current = getCurrentSeq ? getCurrentSeq() : 0;
+                        if (!forceSnapshot && current < cursor) {
+                            failReplication(replica->nodeId, current, cursor);
+                            break;
+                        }
                         if (historyProvider || forceSnapshot) {
                             uint64_t through = 0;
                             {
@@ -854,7 +920,7 @@ namespace akkaradb::engine::cluster {
                                         return true;
                                     },
                                 };
-                                const bool streamed = snapshot->forEachEntry(snapshotVisitor);
+                                const auto streamed = snapshot->forEachEntry(snapshotVisitor);
                                 if (!streamed || snapshotEntry || skippingEntry) { resyncRequired = true; }
                                 if (resyncRequired || !queueBootstrapWire(replica, encodeSnapshotEnd(snapshot->seq))) {
                                     resyncRequired = true;
@@ -919,7 +985,7 @@ namespace akkaradb::engine::cluster {
                 }
                 catch (...) { resyncRequired = true; }
 
-                const bool reportResync = resyncRequired && running.load() && !replica->dead.load();
+                const auto reportResync = resyncRequired && running.load() && !replica->dead.load();
                 if (reportResync && consistency.replicaLagAction == ReplicaLagAction::BLOCK_WRITES) {
                     std::lock_guard lock{replicasMutex};
                     lagBlockedReplicas.insert(replica->nodeId);
@@ -944,10 +1010,25 @@ namespace akkaradb::engine::cluster {
             }
             bool sendFrame(const std::shared_ptr<ReplicaState>& replica, std::span<const uint8_t> wire) {
                 std::lock_guard lock{replica->sendMutex};
-                if (replica->dead.load()) { return false; }
+                if (replica->dead.load() || replica->liveness.expired()) { return false; }
                 try {
-                    return replica->secure ? sendSecureFrame(replica->sock, *replica->secure, wire.data(), wire.size(), transferBudget) :
-                           sendAll(replica->sock, wire.data(), wire.size());
+                    const auto send = [&](std::span<const uint8_t> bytes) {
+                        return replica->secure ? sendSecureFrame(replica->sock, *replica->secure, bytes.data(), bytes.size(), transferBudget) :
+                            sendAll(replica->sock, bytes.data(), bytes.size());
+                    };
+                    if (const auto nonce = replica->liveness.takePong(); nonce != 0) {
+                        const auto pong = encodeHeartbeat(ReplMsgType::HEARTBEAT_PONG, nonce);
+                        const auto memory = transferBudget->reserve(detail::TransferBudget::Resource::MEMORY, pong.size());
+                        if (!send(pong)) { return false; }
+                    }
+                    // Heartbeats may pass between physical transfer frames,
+                    // under the same send lock and secure counter ordering.
+                    if (const auto nonce = replica->liveness.beginProbe(); nonce != 0) {
+                        const auto ping = encodeHeartbeat(ReplMsgType::HEARTBEAT_PING, nonce);
+                        const auto memory = transferBudget->reserve(detail::TransferBudget::Resource::MEMORY, ping.size());
+                        if (!send(ping)) { return false; }
+                    }
+                    return wire.empty() || send(wire);
                 }
                 catch (...) { return false; }
             }
@@ -976,6 +1057,7 @@ namespace akkaradb::engine::cluster {
                 replica->session->connected.store(false, std::memory_order_release);
                 { std::lock_guard ackLock{ackMutex}; replica->dead.store(true); }
                 replica->transferSession->cancel();
+                replica->reader.cancel();
                 if (!replica->shutdownStarted.exchange(true)) { shutdownSocket(replica->sock); }
                 replica->queueCv.notify_all();
                 replica->readCv.notify_all();
@@ -1003,15 +1085,21 @@ namespace akkaradb::engine::cluster {
                     detail::MessagePtr wire;
                     {
                         std::unique_lock lock{replica->queueMutex};
-                        replica->queueCv.wait(lock, [&] { return replica->dead.load() || !replica->queue.empty(); });
-                        if (replica->dead.load() && replica->queue.empty()) { break; }
-                        const uint64_t wireBytes = static_cast<uint64_t>(replica->queue.front()->size());
-                        wire = std::move(replica->queue.front());
-                        replica->queue.pop_front();
-                        replica->queuedBytes = replica->queuedBytes > wireBytes ? replica->queuedBytes - wireBytes : 0;
-                        replica->queueCv.notify_all();
+                        if (replica->queue.empty() && !replica->dead.load()) {
+                            // A queue-only predicate would suppress control
+                            // reply notifications while the data queue is empty.
+                            replica->queueCv.wait_until(lock, replica->liveness.nextProbeDeadline());
+                        }
+                        if (replica->dead.load()) { break; }
+                        if (!replica->queue.empty()) {
+                            const auto wireBytes = static_cast<uint64_t>(replica->queue.front()->size());
+                            wire = std::move(replica->queue.front());
+                            replica->queue.pop_front();
+                            replica->queuedBytes = replica->queuedBytes > wireBytes ? replica->queuedBytes - wireBytes : 0;
+                            replica->queueCv.notify_all();
+                        }
                     }
-                    if (!sendTo(replica, *wire)) {
+                    if (!(wire ? sendTo(replica, *wire) : sendFrame(replica, {}))) {
                         requestReplicaStop(replica);
                         break;
                     }
@@ -1072,15 +1160,15 @@ namespace akkaradb::engine::cluster {
                                 catch (const ClusterRoutingError& error) {
                                     response.errorCode = error.code; response.target = error.target; response.message = error.what();
                                 }
-                                catch (const std::exception& error) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; response.message = error.what(); }
-                                catch (...) { response.errorCode = ClusterRoutingCode::OUTCOME_UNKNOWN; }
+                                catch (const std::exception& error) { response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; response.message = error.what(); }
+                                catch (...) { response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; }
                             }
                             response.requestId = pendingForward->request.requestId;
                             response.message.resize(std::min<size_t>(4096, response.message.size()));
                             auto wire = encodeForwardResponse(response);
                             if (wire.empty()) {
                                 response = {}; response.requestId = pendingForward->request.requestId;
-                                response.errorCode = ClusterRoutingCode::PAYLOAD_TOO_LARGE;
+                                response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::PAYLOAD_TOO_LARGE;
                                 wire = encodeForwardResponse(response);
                             }
                             const auto message = detail::messageFromWire(std::move(wire), transferBudget);
@@ -1100,6 +1188,32 @@ namespace akkaradb::engine::cluster {
                     }
                     catch (...) {}
                     requestReplicaStop(replica);
+                }
+            }
+
+            bool recvPeerFrame(const std::shared_ptr<ReplicaState>& replica, DecodedFrame& frame) {
+                for (;;) {
+                    const auto deadline = replica->liveness.readDeadline();
+                    const auto ok = replica->secure ? recvSecureFrame(replica->sock, *replica->secure, frame, transferBudget,
+                        nullptr, &replica->reader, deadline) : recvFrame(replica->sock, frame, transferBudget,
+                        nullptr, &replica->reader, deadline);
+                    if (!ok) { return false; }
+                    if (frame.type == ReplMsgType::HEARTBEAT_PING) {
+                        uint64_t nonce;
+                        if (frame.flags != 0 || !decodeHeartbeat(frame.payload, nonce) || !replica->liveness.receiveProbe(nonce)) { return false; }
+                        // Coalesce replies at a frame boundary. Receiving must
+                        // continue while a writer waits for TCP backpressure.
+                        replica->queueCv.notify_one();
+                    }
+                    if (frame.type == ReplMsgType::HEARTBEAT_PONG) {
+                        uint64_t nonce;
+                        if (frame.flags != 0 || !decodeHeartbeat(frame.payload, nonce) || !replica->liveness.acknowledge(nonce)) { return false; }
+                        replica->queueCv.notify_one();
+                    }
+                    replica->liveness.observeInbound();
+                    replica->lastSuccessfulContactAtUs.store(contactNowUs(), std::memory_order_relaxed);
+                    if (frame.type != ReplMsgType::HEARTBEAT_PING && frame.type != ReplMsgType::HEARTBEAT_PONG) { return true; }
+                    frame = {};
                 }
             }
 
@@ -1125,7 +1239,7 @@ namespace akkaradb::engine::cluster {
                 while (!replica->dead.load()) {
                     detail::MessagePtr message;
                     try { message = detail::receiveMessage(transferBudget, replica->transferSession, [&](DecodedFrame& part) {
-                        return recvFrameFrom(replica->sock, replica->secure.get(), part);
+                        return recvPeerFrame(replica, part);
                     }, [&](std::span<const uint8_t> wire) { return sendFrame(replica, wire); }, receiveAck); } catch (...) {}
                     if (!message) { break; }
                     const auto& frame = *message;
@@ -1200,6 +1314,7 @@ namespace akkaradb::engine::cluster {
 
             void enqueueWire(uint64_t seq, detail::MessagePtr wire, bool retainForCatchup,
                 std::optional<std::vector<uint64_t>> targets = {}) {
+                checkHealth();
                 if (!wire) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
                 {
                     std::lock_guard lock{replicasMutex};
@@ -1227,8 +1342,9 @@ namespace akkaradb::engine::cluster {
             }
 
             void enqueueWireTo(uint64_t targetNodeId, uint64_t seq, detail::MessagePtr wire, bool waitForAck) {
+                checkHealth();
                 if (!wire) { throw std::runtime_error("ReplicationServer: encoded replication frame exceeds maximum size"); }
-                const bool requiresAck = waitForAck && ackPolicy.mode != AckPolicyMode::NONE && seq != 0;
+                const auto requiresAck = waitForAck && ackPolicy.mode != AckPolicyMode::NONE && seq != 0;
                 auto completed = std::make_shared<std::atomic<bool>>(false);
                 std::shared_ptr<ReplicaState> target;
                 {
@@ -1258,6 +1374,7 @@ namespace akkaradb::engine::cluster {
                 }
                 // Targeted requests can be enqueued out of sequence by different
                 // keys. A later request's ACK cannot prove this request durable.
+                checkHealth();
                 if (!completed->load() && (consistency.ackTimeoutAction == AckTimeoutAction::FAIL_ACK ||
                     consistency.ackTimeoutAction == AckTimeoutAction::FAIL_WRITE)) {
                     throw std::runtime_error("ReplicationServer: write acknowledgement timeout");
@@ -1265,9 +1382,11 @@ namespace akkaradb::engine::cluster {
             }
 
             bool waitForAcks(uint64_t seq, const std::optional<std::vector<uint64_t>>& targets) {
+                checkHealth();
                 if (ackPolicy.mode == AckPolicyMode::NONE || seq == 0 || (targets && targets->empty())) { return true; }
                 const auto deadline = detail::ReconfigurationDeadline::cap(std::chrono::steady_clock::now() + std::chrono::milliseconds(consistency.ackTimeoutMs));
                 while (std::chrono::steady_clock::now() < deadline) {
+                    checkHealth();
                     size_t live = 0;
                     size_t acked = 0;
                     {
@@ -1275,32 +1394,33 @@ namespace akkaradb::engine::cluster {
                         for (const auto& replica : replicas) {
                             if (!replica->dead.load() && replica->phase == ReplicaPhase::LIVE && targetsNode(targets, replica->nodeId)) {
                                 ++live;
-                                const uint64_t ackSeq = replica->lastAckedSeq.load();
+                                const auto ackSeq = replica->lastAckedSeq.load();
                                 const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
-                                if (ackSeq > seq || (ackSeq == seq && ackStage >= ackPolicy.stage)) { ++acked; }
+                                if (ackSeq >= seq && ackStage >= ackPolicy.stage) { ++acked; }
                             }
                         }
                     }
 
-                    const bool ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS
+                    const auto ok = ackPolicy.mode == AckPolicyMode::ALL_TARGETS
                                         ? (consistency.writeConsistency == WriteConsistency::ALL_CONFIGURED
                                                ? acked >= (targets ? targets->size() : configuredReplicaCount)
                                                : consistency.writeConsistency == WriteConsistency::AVAILABLE_REPLICAS
                                                      ? acked >= live
                                                      : live > 0 && acked >= live)
                                         : acked >= ackPolicy.quorum;
-                    if (ok) { return true; }
+                    if (ok) { checkHealth(); return true; }
 
                     std::unique_lock lock{ackMutex};
                     ackCv.wait_for(lock, std::chrono::milliseconds(50));
                 }
                 if (consistency.writeConsistency == WriteConsistency::AVAILABLE_REPLICAS) {
+                    checkHealth();
                     std::lock_guard lock{replicasMutex};
                     for (const auto& replica : replicas) {
                         if (replica->dead.load() || replica->phase != ReplicaPhase::LIVE || !targetsNode(targets, replica->nodeId)) { continue; }
-                        const uint64_t ackSeq = replica->lastAckedSeq.load();
+                        const auto ackSeq = replica->lastAckedSeq.load();
                         const auto ackStage = static_cast<AckStage>(replica->lastAckStage.load());
-                        if (ackSeq < seq || (ackSeq == seq && ackStage < ackPolicy.stage)) {
+                        if (ackSeq < seq || ackStage < ackPolicy.stage) {
                             requestReplicaStop(replica);
                         }
                     }
@@ -1330,6 +1450,7 @@ namespace akkaradb::engine::cluster {
         EntryTargets entryTargets
     ) {
         if (replPort == 0 || selfNodeId == 0) { throw std::invalid_argument("ReplicationServer: nonzero port and node id are required"); }
+        runtimeOptions.replicationLiveness.validate();
         runtimeOptions.secure.validatePins();
         if (runtimeOptions.transportMode == TransportMode::SECURE) {
             if (runtimeOptions.secure.pinnedPeers.empty()) { throw std::invalid_argument("ReplicationServer: SECURE requires peer pins"); }
@@ -1408,8 +1529,17 @@ namespace akkaradb::engine::cluster {
         return count;
     }
 
+    void ReplicationServer::setFatalFailureCallback(std::function<void(std::exception_ptr)> callback) {
+        std::lock_guard lock{impl_->lifecycleMutex};
+        if (impl_->running.load()) { throw std::logic_error("ReplicationServer: failure callback must be installed before start"); }
+        impl_->fatalFailureCallback = std::move(callback);
+    }
+
+    void ReplicationServer::checkHealth() const { impl_->checkHealth(); }
+
     ReplicationServer::Stats ReplicationServer::stats() const noexcept {
         Stats out;
+        { std::lock_guard failureLock{impl_->failureMutex}; out.recoveryRequired = impl_->replicationFailure != nullptr; }
         std::lock_guard lock{impl_->replicasMutex};
         out.rebuildingReplicas = impl_->bootstrappingReplicaNodeIds.size();
         out.peers.reserve(std::max(impl_->configuredReplicaNodeIds.size(), impl_->lastSuccessfulContactByNode.size()));

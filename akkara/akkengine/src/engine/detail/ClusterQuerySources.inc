@@ -33,12 +33,61 @@ struct FixedQuerySource {
     sst::SSTManager::Iterator sst;
 };
 
+struct QuerySnapshotStamp {
+    std::shared_ptr<AkkEngine> child;
+    std::shared_ptr<StorageState> storage;
+    uint64_t sequence, allocated, term, epoch, snapshotGeneration;
+    std::vector<uint8_t> start, end;
+};
+// Snapshot installation can reuse an already visible sequence.
+// This process-local generation is protected by writeMu and never persisted.
+uint64_t querySnapshotGeneration = 0;
+
+bool validateQuerySnapshot(const std::vector<QuerySnapshotStamp>& stamps, bool singleSource,
+    const std::optional<cluster::ClusterTransactionId>& barrier) {
+    for (const auto& stamp : stamps) {
+        auto& engine = stamp.child ? *stamp.child->impl_ : *this;
+        std::optional<OperationGuard> operation;
+        if (stamp.child) { operation.emplace(engine); }
+        engine.clusterRuntime->queryReadBarrier();
+        std::unique_lock writeLock{engine.writeMu};
+        auto transactionRead = engine.distributedReadAdmission(stamp.start, stamp.end);
+        std::shared_lock storageLock{engine.storageMu};
+        const bool immutableRange = barrier.has_value() || (singleSource && stamps.size() == 1);
+        if (barrier) {
+            const auto found = engine.distributedState.participants.find(*barrier);
+            if (found == engine.distributedState.participants.end()) { return false; }
+            const auto& participant = found->second;
+            if (!participant.queryBarrier ||
+                !std::ranges::any_of(participant.ranges, [&](const auto& range) {
+                    return compareKey(range.first, stamp.start) <= 0 &&
+                        (range.second.empty() || (!stamp.end.empty() && compareKey(stamp.end, range.second) <= 0));
+                })) { return false; }
+        }
+        if (engine.storage != stamp.storage || (!immutableRange && engine.snapshotSeq() != stamp.sequence) ||
+            (!immutableRange && engine.memtable->lastSeq() != stamp.allocated) ||
+            engine.clusterRuntime->raftStats().currentTerm != stamp.term ||
+            engine.clusterRuntime->configurationEpoch() != stamp.epoch ||
+            engine.querySnapshotGeneration != stamp.snapshotGeneration ||
+            (engine.clusterConfig.usesDataConsensus() && engine.clusterRuntime->role() != cluster::NodeRole::PRIMARY)) {
+            return false;
+        }
+    }
+    return !stamps.empty();
+}
+
 FixedQuerySource captureQuerySource(std::span<const uint8_t> start, std::span<const uint8_t> end,
-    std::shared_ptr<QueryPinBudget> budget = {}) {
+    std::shared_ptr<QueryPinBudget> budget = {}, std::vector<QuerySnapshotStamp>* stamps = nullptr,
+    std::shared_ptr<AkkEngine> child = {}) {
+    if (stamps && (opts.runtime.writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER ||
+        opts.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC)) {
+        throw std::invalid_argument("Cluster query: GLOBAL_SNAPSHOT requires COMMIT_ORDER and GLOBAL_ATOMIC on every source");
+    }
     waitForKeySequenceReadVisibility();
     for (;;) {
         cluster::detail::ReconfigurationDeadline::check();
         std::unique_lock writeLock{writeMu};
+        auto transactionRead = distributedReadAdmission(start, end);
         std::shared_lock storageLock{storageMu};
         auto reservation = reserveQuerySnapshot(memtable->approxSize(), budget);
         if (reservation) {
@@ -52,6 +101,11 @@ FixedQuerySource captureQuerySource(std::span<const uint8_t> start, std::span<co
                 sst::SSTManager::Iterator st;
                 if (sstManager) { st = sstManager->scanIter(start, end, seq); }
                 auto blobPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
+                if (stamps) {
+                    stamps->push_back({std::move(child), storage, seq, memtable->lastSeq(),
+                        clusterRuntime->raftStats().currentTerm, clusterRuntime->configurationEpoch(), querySnapshotGeneration,
+                        {start.begin(), start.end()}, {end.begin(), end.end()}});
+                }
                 return {storage, std::move(reservation), std::move(blobPin), std::move(*mt), std::move(st)};
             }
         }
@@ -74,8 +128,9 @@ static core::ArenaGenerator<OwnedQueryRecord> fixedQueryRecords(FixedQuerySource
 }
 
 core::ArenaGenerator<OwnedQueryRecord> captureQueryRecords(std::span<const uint8_t> start,
-    std::span<const uint8_t> end, const std::vector<uint16_t>& expected = {}) {
-    if (!usesPartitionRaft()) { return fixedQueryRecords(captureQuerySource(start, end)); }
+    std::span<const uint8_t> end, const std::vector<uint16_t>& expected = {},
+    std::vector<QuerySnapshotStamp>* stamps = nullptr) {
+    if (!usesPartitionRaft()) { return fixedQueryRecords(captureQuerySource(start, end, {}, stamps)); }
     std::vector<core::ArenaGenerator<OwnedQueryRecord>> sources;
     const auto children = partitionSnapshot();
     for (const auto index : expected) {
@@ -84,7 +139,7 @@ core::ArenaGenerator<OwnedQueryRecord> captureQueryRecords(std::span<const uint8
         }
         auto& child = *children[index]->impl_;
         child.clusterRuntime->queryReadBarrier();
-        sources.push_back(fixedQueryRecords(child.captureQuerySource(start, end, queryPinBudget)));
+        sources.push_back(fixedQueryRecords(child.captureQuerySource(start, end, queryPinBudget, stamps, children[index])));
     }
     return mergeFixedQueryRecords(std::move(sources));
 }

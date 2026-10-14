@@ -7,7 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/detail/Transactions.inc
+// akkengine/src/engine/detail/AkkTransactionState.inc
 // Included inside AkkEngine::Impl. Public writers already share mutationEpochMu.
 struct TransactionRegistry {
     std::mutex mutex;
@@ -58,7 +58,7 @@ std::shared_ptr<TransactionReadSnapshot> captureTransactionReadSnapshot(std::sha
     {
         std::lock_guard lock{state->mutex};
         if (bytes > opts.transactions.maxPinnedBytes || state->pinnedBytes > opts.transactions.maxPinnedBytes - bytes ||
-            state->snapshots >= opts.transactions.maxOpen) { throw std::runtime_error("AkkEngine: transaction snapshot capacity exceeded"); }
+            state->snapshots >= opts.transactions.maxOpen) { throw TransactionSnapshotUnavailable("AkkEngine: transaction snapshot capacity exceeded"); }
         state->pinnedBytes += bytes; ++state->snapshots;
     }
     std::shared_ptr<void> reservation{state.get(), [state, bytes](void*) {
@@ -71,7 +71,7 @@ std::shared_ptr<TransactionReadSnapshot> captureTransactionReadSnapshot(std::sha
     std::optional<memtable::MemTable::RangeIterator> mt;
     if (sstManager) { mt.emplace(memtable->sealAndPinIterator(range, seq)); }
     else { mt = memtable->sealAndPinMemoryIterator(range, seq, false, opts.transactions.maxPinnedBytes, opts.transactions.maxOpen, true); }
-    if (!mt) { throw std::runtime_error("AkkEngine: transaction snapshot capacity exceeded"); }
+    if (!mt) { throw TransactionSnapshotUnavailable("AkkEngine: transaction snapshot capacity exceeded"); }
     auto st = sstManager ? sstManager->scanIter({}, {}, seq, true) : sst::SSTManager::Iterator{};
     auto blobPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
     return std::make_shared<TransactionReadSnapshot>(TransactionReadSnapshot{std::move(operation),

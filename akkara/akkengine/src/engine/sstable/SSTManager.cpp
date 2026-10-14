@@ -386,6 +386,7 @@ namespace akkaradb::engine::sst {
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
+                wopts.trackBlobReferences = options_.trackBlobReferences;
 
                 const auto result = SSTWriter::write(tmp, records, wopts);
                 crashAtTestPoint("sst.flush.after_tmp_write");
@@ -422,6 +423,7 @@ namespace akkaradb::engine::sst {
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
+                wopts.trackBlobReferences = options_.trackBlobReferences;
 
                 const auto result = SSTWriter::write(tmp, estimatedRecordCount, std::move(records), wopts);
                 crashAtTestPoint("sst.flush.after_tmp_write");
@@ -739,6 +741,7 @@ namespace akkaradb::engine::sst {
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
+                wopts.trackBlobReferences = options_.trackBlobReferences;
                 const auto result = SSTWriter::write(tmp, views, wopts);
                 crashAtTestPoint("sst.compaction.after_output_tmp_write");
                 durableRename(tmp, path);

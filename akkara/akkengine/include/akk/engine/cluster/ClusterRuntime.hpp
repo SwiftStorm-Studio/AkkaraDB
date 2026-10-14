@@ -85,6 +85,9 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] ForwardResponse forwardTo(uint64_t nodeId, ForwardRequest request) override;
             [[nodiscard]] ReadResponse linearizableReadKey(std::span<const uint8_t> key) override;
             void queryReadBarrier() override;
+            [[nodiscard]] uint64_t transactionLeaderNodeId() const override;
+            uint64_t transactionReadBarrier() override;
+            ClusterMutationSubmission submitTransactionControl(ClusterMutationFactory, uint64_t expectedTerm) override;
             [[nodiscard]] uint64_t ownerNodeId(std::span<const uint8_t> key) const override;
             [[nodiscard]] uint64_t configurationEpoch() const noexcept override;
             [[nodiscard]] uint64_t stripeMetadataLinearizableWatermark() override;
@@ -92,18 +95,19 @@ namespace akkaradb::engine::cluster {
 
             /** Performs a cluster-routed key read according to runtime options. */
             [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq) override;
-            [[nodiscard]] ReadResponse readKeyFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) override;
+            [[nodiscard]] ReadResponse readLocalStorageFromNode(uint64_t nodeId, std::span<const uint8_t> key, uint64_t snapshotSeq) override;
             [[nodiscard]] StripeOperationLease acquireStripeOperation(std::span<const uint8_t> key, uint64_t ownerNodeId) override;
             void commitStripeMetadata(const StripeOperationLease& lease, std::span<const uint8_t> key,
                 std::span<const uint8_t> metadata) override;
             void releaseStripeOperation(const StripeOperationLease& lease, std::span<const uint8_t> key) noexcept override;
-            [[nodiscard]] uint64_t stripeFailoverNodeId() const noexcept override;
+            [[nodiscard]] uint64_t stripeFailoverNodeId(std::span<const uint8_t> key) const noexcept override;
             [[nodiscard]] uint64_t stripeMetadataLeaderNodeId() const noexcept override;
             [[nodiscard]] bool stripeNodeReachable(uint64_t nodeId) const noexcept override;
             [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeMetadata(std::span<const uint8_t> key,
                 uint64_t ownerNodeId) override;
             bool repairStripeMetadata(std::span<const uint8_t> key, uint64_t expectedVersion,
                 std::span<const uint8_t> metadata) override;
+            bool reclaimStripeGeneration(std::span<const uint8_t> key, std::span<const uint8_t> metadata) override;
 
             /** Returns the immutable key router for this config. */
             [[nodiscard]] const ClusterRouter& router() const noexcept;
@@ -123,10 +127,12 @@ namespace akkaradb::engine::cluster {
             ) override;
             std::future<void> submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
                 std::span<const uint8_t> value, uint8_t flags, uint64_t source) override;
-            ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare) override;
+            ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare, uint64_t expectedTerm = 0) override;
             std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
-                ClusterMutationFactory) override;
+                ClusterMutationFactory, uint64_t expectedTerm = 0) override;
             ClusterRequestResult queryRequest(const ClusterRequestId&) override;
+            ClusterRequestResult executeRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
+                const std::function<uint64_t()>&) override;
             void shipEntryTo(
                 uint64_t targetNodeId,
                 uint64_t seq,
@@ -154,6 +160,7 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] MirrorFencingMode mirrorFencingMode() const noexcept override;
             [[nodiscard]] MirrorRecoveryMode mirrorRecoveryMode() const noexcept override;
             void transferMirrorAuthorityLeadership(uint64_t targetNodeId) override;
+            void reconfigureRequestAuthority(const std::vector<NodeInfo>& nodes) override;
             void promoteRaftLearner(uint64_t nodeId) override;
             void removeRaftLearner(uint64_t nodeId) override;
 

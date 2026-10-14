@@ -18,6 +18,7 @@ namespace akkaradb::engine::cluster {
     enum class ClusterRoutingCode : uint8_t {
         NOT_OWNER = 0, NO_TARGET = 1, CROSS_OWNER_BATCH = 2,
         FORWARD_UNAVAILABLE = 3, OUTCOME_UNKNOWN = 4, PAYLOAD_TOO_LARGE = 5, LOCAL_ONLY = 6,
+        TRANSACTION_CONFLICT = 7, WRITE_REJECTED = 8,
     };
 
     struct ClusterRouteTarget {
@@ -34,10 +35,11 @@ namespace akkaradb::engine::cluster {
     class ClusterRoutingError : public std::runtime_error {
     public:
         ClusterRoutingError(ClusterRoutingCode code, ClusterRouteTarget target = {},
-            std::string message = "Cluster operation requires another node")
-            : std::runtime_error(std::move(message)), code(code), target(std::move(target)) {}
+            std::string message = "Cluster operation requires another node", std::optional<ClusterRequestId> requestId = std::nullopt)
+            : std::runtime_error(std::move(message)), code(code), target(std::move(target)), requestId(std::move(requestId)) {}
         ClusterRoutingCode code;
         ClusterRouteTarget target;
+        std::optional<ClusterRequestId> requestId; ///< Reuse this identity for retry; absent means no deduplication guarantee.
         [[nodiscard]] bool outcomeUnknown() const noexcept { return code == ClusterRoutingCode::OUTCOME_UNKNOWN; }
     };
 
@@ -50,6 +52,8 @@ namespace akkaradb::engine::cluster {
             case ClusterRoutingCode::OUTCOME_UNKNOWN: return "OUTCOME_UNKNOWN";
             case ClusterRoutingCode::PAYLOAD_TOO_LARGE: return "PAYLOAD_TOO_LARGE";
             case ClusterRoutingCode::LOCAL_ONLY: return "LOCAL_ONLY";
+            case ClusterRoutingCode::TRANSACTION_CONFLICT: return "TRANSACTION_CONFLICT";
+            case ClusterRoutingCode::WRITE_REJECTED: return "WRITE_REJECTED";
         }
         return "UNKNOWN";
     }
@@ -65,10 +69,17 @@ namespace akkaradb::engine::cluster {
             }
             return result + '"';
         };
+        std::string request = "null";
+        if (error.requestId) {
+            constexpr char hex[] = "0123456789abcdef";
+            std::string nonce;
+            for (const auto b : error.requestId->nonce) { nonce += hex[b >> 4]; nonce += hex[b & 15]; }
+            request = "{\"nonce\":" + quote(nonce) + ",\"expiresAtUnixMs\":" + std::to_string(error.requestId->expiresAtUnixMs) + "}";
+        }
         const auto& t = error.target;
         return "{\"code\":" + quote(routingCodeName(error.code)) +
             ",\"outcomeUnknown\":" + (error.outcomeUnknown() ? "true" : "false") +
-            ",\"nodeId\":" + std::to_string(t.nodeId) + ",\"host\":" + quote(t.host) +
+            ",\"requestId\":" + request + ",\"nodeId\":" + std::to_string(t.nodeId) + ",\"host\":" + quote(t.host) +
             ",\"tcpPort\":" + std::to_string(t.tcpPort) + ",\"httpPort\":" + std::to_string(t.httpPort) +
             ",\"grpcPort\":" + std::to_string(t.grpcPort) + ",\"replPort\":" + std::to_string(t.replPort) +
             ",\"configurationEpoch\":" + std::to_string(t.configurationEpoch) +

@@ -46,6 +46,8 @@ namespace akkaradb::engine::sst {
                 uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
                 Codec codec = Codec::ZSTD;
                 int zstdCompressionLevel = 1;
+                // Disabling tracking requires every written record to be free of Blob references.
+                bool trackBlobReferences = true;
             };
 
             struct Result {

@@ -7,3 +7,5 @@
 NUL
 dist
 .bench-tmp
+scripts
+bin

@@ -34,13 +34,13 @@ namespace akkaradb::engine::cluster::detail {
             const auto handle = ::CreateFileW((directory / name).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                 CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
             if (handle == INVALID_HANDLE_VALUE) { throw std::runtime_error("Partition snapshot: cannot create spool"); }
-            const int descriptor = ::_open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_RDWR);
+            const auto descriptor = ::_open_osfhandle(reinterpret_cast<intptr_t>(handle), _O_BINARY | _O_RDWR);
             if (descriptor < 0) { ::CloseHandle(handle); throw std::runtime_error("Partition snapshot: cannot open spool"); }
             file_ = ::_fdopen(descriptor, "w+b");
             if (!file_) { ::_close(descriptor); }
 #else
             auto name = (directory / "akk-partition-XXXXXX").string();
-            const int descriptor = ::mkstemp(name.data());
+            const auto descriptor = ::mkstemp(name.data());
             if (descriptor < 0) { throw std::runtime_error("Partition snapshot: cannot create spool"); }
             if (::unlink(name.c_str()) != 0 || ::fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0) {
                 ::close(descriptor); throw std::runtime_error("Partition snapshot: cannot protect spool");
@@ -93,7 +93,7 @@ namespace akkaradb::engine::cluster::detail {
                 std::vector<uint8_t> key(static_cast<size_t>(keySize)); read(key);
                 if (!visitor.beginEntry(key, valueSize, static_cast<uint32_t>(crc))) { return false; }
                 for (uint64_t offset = 0; offset < valueSize;) {
-                    const auto chunk = std::span<uint8_t>{buffer}.first(static_cast<size_t>(std::min<uint64_t>(chunkSize, valueSize - offset)));
+                    const auto chunk = std::span{buffer}.first(static_cast<size_t>(std::min<uint64_t>(chunkSize, valueSize - offset)));
                     read(chunk);
                     if (!visitor.appendValueChunk(offset, chunk)) { return false; }
                     offset += chunk.size();

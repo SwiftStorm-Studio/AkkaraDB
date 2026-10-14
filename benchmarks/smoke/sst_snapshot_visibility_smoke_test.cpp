@@ -69,6 +69,26 @@ namespace {
         (void)akkaradb::engine::sst::SSTWriter::write(path, records, options);
     }
 
+    void testBlobFreeReferenceTracking() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+        const auto dir = fs::current_path() / ".bench-tmp" / "sst_blob_free_tracking";
+        fs::create_directories(dir);
+        const std::vector<uint8_t> key{'k'}, value{'v'};
+        const std::vector records{record(key, value, 1)};
+        sst::SSTWriter::Options options; options.trackBlobReferences = false;
+        const auto untracked = sst::SSTWriter::write(dir / "untracked.sst", records, options);
+        require(untracked.entryCount == 1 && untracked.blobRefs.empty(), "Blob-free SST must omit per-key reference metadata");
+        const auto tracked = sst::SSTWriter::write(dir / "tracked.sst", records);
+        require(tracked.blobRefs.size() == 1, "default SST reference tracking changed");
+        const std::vector blobs{record(key, value, 2, sst::SST_RECORD_FLAG_BLOB)};
+        bool rejected = false;
+        try { (void)sst::SSTWriter::write(dir / "invalid.sst", blobs, options); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "Blob records must reject disabled reference tracking");
+        fs::remove_all(dir);
+    }
+
     void testManifestRecoveryPrunesCompactionArtifacts() {
         namespace fs = std::filesystem;
         namespace manifest = akkaradb::engine::manifest;
@@ -488,6 +508,7 @@ int main() {
 
         manager->shutdown();
         fs::remove_all(dir, ec);
+        testBlobFreeReferenceTracking();
         testManifestRecoveryPrunesCompactionArtifacts();
         testManifestCompactPreservesReplayState();
         testZstdCompressionLevel();

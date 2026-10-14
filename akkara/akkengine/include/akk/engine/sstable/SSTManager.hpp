@@ -62,6 +62,8 @@ namespace akkaradb::engine::sst {
                 int compactThreads = 2;
                 SSTWriter::Codec codec = SSTWriter::Codec::ZSTD;
                 int zstdCompressionLevel = 1;
+                // Disabling tracking requires every written record to be free of Blob references.
+                bool trackBlobReferences = true;
             };
 
             struct LevelStats {

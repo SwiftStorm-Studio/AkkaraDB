@@ -1,5 +1,6 @@
 // Included inside AkkEngine::Impl: cluster read authority, snapshots and cursors.
-enum class QueryAction : uint8_t { SCAN, COUNT, HISTORY, GET_AT, NEXT, CLOSE, PIN, KEEP_ALIVE };
+enum class QueryAction : uint8_t { SCAN, COUNT, HISTORY, GET_AT, NEXT, CLOSE, PIN, KEEP_ALIVE,
+    SNAPSHOT_SCAN, SNAPSHOT_COUNT, VALIDATE, ACTIVATE, STRIPE_REVISIONS };
 static constexpr size_t QUERY_PAGE_BYTES = 1024 * 1024;
 #include "ClusterQuerySources.inc"
 struct RemoteQueryPins {
@@ -28,6 +29,8 @@ struct QuerySession {
     std::chrono::steady_clock::time_point expires;
     std::chrono::steady_clock::time_point maxLifetime;
     uint64_t epoch = 0;
+    bool awaitingAcceptance = false, validated = false, countOnly = false, prepared = false;
+    std::vector<QuerySnapshotStamp> stamps;
     bool streaming = false, pinOnly = false, started = false, finished = false, failed = false;
     uint64_t nextOffset = 0, replayOffset = UINT64_MAX;
     size_t recordOffset = 0;
@@ -42,6 +45,7 @@ std::atomic<uint64_t> querySpoolBytes{0};
 std::mutex querySessionsMu;
 std::map<std::array<uint8_t, 16>, std::shared_ptr<QuerySession>> querySessions;
 std::jthread queryReaper;
+std::unique_ptr<cluster::detail::BoundedExecutor> snapshotQueryExecutor;
 
 void reapQuerySessions() {
     std::vector<std::shared_ptr<QuerySession>> retired;
@@ -114,6 +118,7 @@ core::ArenaGenerator<VersionEntry> publicHistoryLocal(std::span<const uint8_t> k
         child.impl_->clusterRuntime->queryReadBarrier();
         return child.impl_->publicHistoryLocal(key);
     }
+    auto transactionRead = distributedReadAdmission(key, {}, true);
     std::shared_lock storageLock{storageMu};
     if (!versionLog) { return {}; }
     if (clusterReplicationMode != cluster::ReplicationMode::STRIPE) {
@@ -141,11 +146,13 @@ std::optional<VersionEntry> publicVersionAtLocal(std::span<const uint8_t> key, u
         child.impl_->clusterRuntime->queryReadBarrier();
         return child.impl_->publicVersionAtLocal(key, seq);
     }
+    auto transactionRead = distributedReadAdmission(key, {}, true);
     std::optional<cluster::detail::KeyedMutex::Guard> keyLock;
     if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) { keyLock.emplace(stripeKeys.lock(key)); }
     std::shared_lock storageLock{storageMu};
     if (!versionLog) { return {}; }
     if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
+        auto gcPin = pinStripeQuery();
         checkStripeHealthy();
         const auto metadata = stripeMetadataAt(key, seq);
         if (!metadata || metadata->tombstone) { return {}; }
@@ -199,7 +206,7 @@ core::ArenaGenerator<std::vector<uint8_t>> encodeQueryRecords(core::ArenaGenerat
 
 cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request) {
     const auto& input = request.entries.at(0);
-    if (input.value.empty() || input.value[0] > static_cast<uint8_t>(QueryAction::KEEP_ALIVE)) {
+    if (input.value.empty() || input.value[0] > static_cast<uint8_t>(QueryAction::STRIPE_REVISIONS)) {
         throw std::invalid_argument("Cluster query: malformed action");
     }
     const auto action = static_cast<QueryAction>(input.value[0]);
@@ -207,6 +214,46 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
     response.success = true;
     const auto now = std::chrono::steady_clock::now();
     cluster::detail::ReconfigurationDeadline budget{request.timeoutMs};
+    if (action == QueryAction::STRIPE_REVISIONS) {
+        size_t position = 1;
+        uint64_t generation, epoch, cut;
+        if (clusterReplicationMode != cluster::ReplicationMode::STRIPE || !input.key.empty() ||
+            !pullU64(input.value, position, generation) || !pullU64(input.value, position, epoch) ||
+            !pullU64(input.value, position, cut) || position != input.value.size() || !generation || !epoch || !cut) {
+            throw std::invalid_argument("Cluster placement: malformed retained-revision request");
+        }
+        for (;;) {
+            cluster::detail::ReconfigurationDeadline::check();
+            if (clusterRuntime->stripeMetadataRaftStats().appliedStateMachineSeq >= cut) {
+                const auto placement = clusterRuntime->placementState(false);
+                if (placement.pendingGeneration != generation || placement.generation != epoch) {
+                    throw std::runtime_error("Cluster placement: retained-revision migration changed");
+                }
+                break;
+            }
+            if (placementClosing()) { throw std::runtime_error("Cluster placement: closing while catching up history source"); }
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        auto session = std::make_shared<QuerySession>();
+        session->epoch = epoch; session->streaming = true; session->gcPin = pinStripeQuery();
+        const std::vector<uint8_t> start{0, 'A', 'K', 'S', 'M', '1'}, end{0, 'A', 'K', 'S', 'M', '2'};
+        auto source = captureQuerySource(start, end);
+        vlog::VersionLog::RecordSnapshot retention;
+        { std::lock_guard writeLock{writeMu}; if (source.storage->versionLog) { retention = source.storage->versionLog->captureRecords(); } }
+        session->producer = encodeQueryRecords(stripeMigrationRevisionStream(std::move(source), std::move(retention)),
+            false, false, false, {}, epoch);
+        session->expires = std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.queryCursorIdleTimeoutMs};
+        session->maxLifetime = std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.queryCursorMaxLifetimeMs};
+        std::array<uint8_t, 16> token{};
+        {
+            std::lock_guard lock{querySessionsMu};
+            if (querySessions.size() >= opts.cluster.runtime.queryMaxOpenCursors) { throw std::runtime_error("Cluster query: cursor limit exceeded"); }
+            do { crypto::secureRandom(token); } while (querySessions.contains(token));
+            querySessions.emplace(token, std::move(session));
+        }
+        response.value.assign(token.begin(), token.end()); pushU64(response.value, UINT64_MAX); pushU64(response.value, UINT64_MAX);
+        return response;
+    }
     if (action == QueryAction::PIN) {
         if (!input.key.empty() || input.value.size() != 1 || clusterReplicationMode != cluster::ReplicationMode::STRIPE) { throw std::invalid_argument("Cluster query: invalid retention pin request"); }
         auto session = std::make_shared<QuerySession>(); session->pinOnly = true; session->gcPin = pinStripeQuery();
@@ -218,11 +265,15 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
           do { crypto::secureRandom(token); } while (querySessions.contains(token)); querySessions.emplace(token, std::move(session)); }
         response.value.assign(token.begin(), token.end()); return response;
     }
-    if (action == QueryAction::NEXT || action == QueryAction::CLOSE || action == QueryAction::KEEP_ALIVE) {
+    if (action == QueryAction::NEXT || action == QueryAction::CLOSE || action == QueryAction::KEEP_ALIVE ||
+        action == QueryAction::VALIDATE || action == QueryAction::ACTIVATE) {
         uint64_t offset = 0;
         size_t position = 1;
-        if (!input.key.empty() || (action != QueryAction::NEXT ? input.value.size() != 1 :
-            !pullU64(input.value, position, offset) || position != input.value.size())) {
+        const bool malformed = action == QueryAction::NEXT
+            ? !pullU64(input.value, position, offset) || position != input.value.size()
+            : action == QueryAction::VALIDATE ? input.value.size() != 2 && input.value.size() != 18
+            : input.value.size() != 1;
+        if (!input.key.empty() || malformed) {
             throw std::invalid_argument("Cluster query: malformed cursor request");
         }
         std::shared_ptr<QuerySession> session;
@@ -244,6 +295,55 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
             session->expires = now + std::chrono::milliseconds{opts.cluster.runtime.queryCursorIdleTimeoutMs}; return response;
         }
         if (session->pinOnly) { throw std::invalid_argument("Cluster query: retention pin has no result pages"); }
+        if (action == QueryAction::VALIDATE) {
+            if (!session->awaitingAcceptance) { throw std::invalid_argument("Cluster query: snapshot is already activated"); }
+            if (input.value.size() < 2 || input.value[1] > 2 || input.value.size() != (input.value[1] == 2 ? 18 : 2)) {
+                throw std::invalid_argument("Cluster query: invalid snapshot validation policy");
+            }
+            std::optional<cluster::ClusterTransactionId> barrier;
+            if (input.value[1] == 2) { barrier.emplace(); std::copy_n(input.value.begin() + 2, 16, barrier->begin()); }
+            session->validated = session->epoch == clusterRuntime->configurationEpoch() &&
+                validateQuerySnapshot(session->stamps, input.value[1] == 1, barrier);
+            response.value.push_back(session->validated ? 1 : 0);
+            session->expires = std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.queryCursorIdleTimeoutMs};
+            return response;
+        }
+        if (action == QueryAction::ACTIVATE) {
+            if (!session->awaitingAcceptance || !session->validated) { throw std::invalid_argument("Cluster query: snapshot is not validated"); }
+            session->awaitingAcceptance = false;
+            if (session->epoch != clusterRuntime->configurationEpoch()) { throw std::runtime_error("Cluster query: configuration changed before activation"); }
+            if (session->countOnly || session->prepared) {
+                uint64_t records = 0;
+                try {
+                    for (const auto& record : session->producer) {
+                        cluster::detail::ReconfigurationDeadline::check();
+                        if (!session->countOnly) { session->spool->append(record); }
+                        if (records == UINT64_MAX) { throw std::overflow_error("Cluster query: count overflow"); }
+                        ++records;
+                    }
+                    cluster::detail::ReconfigurationDeadline::check();
+                    session->producer = {}; session->stamps.clear();
+                    session->remotePins.reset(); session->gcPin.reset(); session->streaming = false;
+                    if (session->countOnly) { pushU64(response.value, records); }
+                    else {
+                        response.value.assign(request.deduplicationId.nonce.begin(), request.deduplicationId.nonce.end());
+                        pushU64(response.value, session->spool->size()); pushU64(response.value, records);
+                    }
+                } catch (...) {
+                    session->failed = true; session->producer = {}; session->stamps.clear();
+                    session->remotePins.reset(); session->gcPin.reset(); throw;
+                }
+            } else {
+                session->stamps.clear();
+                response.value.assign(request.deduplicationId.nonce.begin(), request.deduplicationId.nonce.end());
+                pushU64(response.value, UINT64_MAX); pushU64(response.value, UINT64_MAX);
+            }
+            session->expires = std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.queryCursorIdleTimeoutMs};
+            return response;
+        }
+        if (session->awaitingAcceptance || session->countOnly || session->failed) {
+            throw std::runtime_error("Cluster query: snapshot has no readable result pages");
+        }
         if (session->streaming) {
             if (session->failed) { throw std::runtime_error("Cluster query: streaming cursor failed; start a new query"); }
             try {
@@ -282,6 +382,11 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
         throw std::invalid_argument("Cluster query: malformed open request");
     }
     const auto readMode = static_cast<cluster::ClusterReadMode>(input.value[1]);
+    const bool snapshot = action == QueryAction::SNAPSHOT_SCAN || action == QueryAction::SNAPSHOT_COUNT;
+    const bool countOnly = action == QueryAction::COUNT || action == QueryAction::SNAPSHOT_COUNT;
+    if (snapshot && readMode != cluster::ClusterReadMode::OWNER_LINEARIZABLE) {
+        throw std::invalid_argument("Cluster query: global snapshot requires authoritative reads");
+    }
     size_t position = 3;
     uint64_t epoch, term, seq;
     uint32_t endSize;
@@ -292,7 +397,7 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
         throw std::invalid_argument("Cluster query: malformed bounds");
     }
     std::vector<uint16_t> expectedPartitions;
-    if (usesPartitionRaft() && (action == QueryAction::SCAN || action == QueryAction::COUNT)) {
+    if (usesPartitionRaft() && (action == QueryAction::SCAN || action == QueryAction::COUNT || snapshot)) {
         uint32_t count = 0;
         if (!pullU32(input.value, position, count) || count == 0 || count > clusterConfig.partition().partitionCount) {
             throw std::invalid_argument("Cluster query: missing partition coverage");
@@ -350,8 +455,8 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
         core::ArenaGenerator<std::vector<uint8_t>> producer;
         std::shared_ptr<void> gcPin;
         if (stripe) { gcPin = pinStripeQuery(); }
-        const bool streaming = action != QueryAction::COUNT && action != QueryAction::GET_AT &&
-            static_cast<cluster::QueryResultMode>(input.value[2]) == cluster::QueryResultMode::STREAMING;
+        const bool streaming = snapshot || (action != QueryAction::COUNT && action != QueryAction::GET_AT &&
+            static_cast<cluster::QueryResultMode>(input.value[2]) == cluster::QueryResultMode::STREAMING);
         std::shared_ptr<RemoteQueryPins> remotePins;
         if (streaming && stripe) {
             remotePins = std::make_shared<RemoteQueryPins>(); remotePins->engine = this;
@@ -371,12 +476,16 @@ cluster::ForwardResponse receiveReadQuery(const cluster::ForwardRequest& request
         else {
             auto begin = stripe ? stripeMetaKey(input.key) : input.key;
             auto finish = stripe ? (end.empty() ? std::vector<uint8_t>{0, 'A', 'K', 'S', 'M', '2'} : stripeMetaKey(end)) : end;
-            producer = encodeQueryRecords(captureQueryRecords(begin, finish, expectedPartitions), action == QueryAction::COUNT,
+            producer = encodeQueryRecords(captureQueryRecords(begin, finish, expectedPartitions, snapshot ? &session->stamps : nullptr), countOnly,
                 stripe, partition && !usesPartitionRaft(), std::move(gcPin), epoch);
         }
         if (streaming) {
+            session->awaitingAcceptance = snapshot;
+            session->countOnly = countOnly;
+            session->prepared = snapshot && static_cast<cluster::QueryResultMode>(input.value[2]) == cluster::QueryResultMode::PREPARED;
             session->streaming = true; session->producer = std::move(producer);
-            session->remotePins = std::move(remotePins); session->gcPin = std::move(gcPin); session->spool.reset();
+            session->remotePins = std::move(remotePins); session->gcPin = std::move(gcPin);
+            if (!session->prepared) { session->spool.reset(); }
             session->expires = std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.queryCursorIdleTimeoutMs};
             response.value.assign(token.begin(), token.end()); pushU64(response.value, UINT64_MAX); pushU64(response.value, UINT64_MAX);
             return response;
@@ -436,7 +545,8 @@ cluster::ForwardResponse sendReadQuery(uint64_t target, cluster::ForwardRequest 
 }
 
 std::vector<uint64_t> queryTargets(std::span<const uint8_t> key, bool range) {
-    const auto readMode = opts.cluster.runtime.readMode;
+    const auto readMode = range && opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT
+        ? cluster::ClusterReadMode::OWNER_LINEARIZABLE : opts.cluster.runtime.readMode;
     std::vector<uint64_t> targets;
     if (usesPartitionRaft() && !range) {
         const auto index = partitionIndex(key);
@@ -474,15 +584,16 @@ cluster::ForwardRequest openQueryRequest(QueryAction action, std::span<const uin
     auto& entry = request.entries.emplace_back();
     entry.key.assign(key.begin(), key.end());
     entry.value.push_back(static_cast<uint8_t>(action));
-    entry.value.push_back(static_cast<uint8_t>(opts.cluster.runtime.readMode));
+    const bool snapshot = action == QueryAction::SNAPSHOT_SCAN || action == QueryAction::SNAPSHOT_COUNT;
+    entry.value.push_back(static_cast<uint8_t>(snapshot ? cluster::ClusterReadMode::OWNER_LINEARIZABLE : opts.cluster.runtime.readMode));
     entry.value.push_back(static_cast<uint8_t>(opts.cluster.runtime.queryResultMode));
     pushU64(entry.value, clusterRuntime->configurationEpoch());
-    pushU64(entry.value, clusterConfig.consistency().mode == cluster::ConsistencyMode::RAFT_QUORUM ? clusterRuntime->raftStats().currentTerm : 0);
+    pushU64(entry.value, !snapshot && clusterConfig.consistency().mode == cluster::ConsistencyMode::RAFT_QUORUM ? clusterRuntime->raftStats().currentTerm : 0);
     pushU64(entry.value, seq);
     if (end.size() > UINT32_MAX) { throw std::length_error("Cluster query: oversized end bound"); }
     pushU32(entry.value, static_cast<uint32_t>(end.size()));
     entry.value.insert(entry.value.end(), end.begin(), end.end());
-    if (usesPartitionRaft() && (action == QueryAction::SCAN || action == QueryAction::COUNT)) {
+    if (usesPartitionRaft() && (action == QueryAction::SCAN || action == QueryAction::COUNT || snapshot)) {
         pushU32(entry.value, static_cast<uint32_t>(partitions.size()));
         for (const auto index : partitions) { pushU32(entry.value, index); }
     }
@@ -510,6 +621,15 @@ struct QueryReader {
     }
     ~QueryReader() {
         if (!opened) { return; }
+        if (target == engine->nodeId) {
+            std::shared_ptr<QuerySession> retired;
+            {
+                std::lock_guard lock{engine->querySessionsMu};
+                const auto it = engine->querySessions.find(token);
+                if (it != engine->querySessions.end()) { retired = std::move(it->second); engine->querySessions.erase(it); }
+            }
+            return;
+        }
         try {
             cluster::ForwardRequest request;
             request.timeoutMs = 100;
@@ -520,6 +640,36 @@ struct QueryReader {
         catch (...) {} // Server TTL also reclaims cursors after disconnect/abandonment.
     }
     QueryReader(const QueryReader&) = delete;
+    cluster::ForwardResponse control(QueryAction action) {
+        cluster::ForwardRequest request; request.deduplicationId.nonce = token;
+        request.entries.push_back({{}, {static_cast<uint8_t>(action)}});
+        return engine->sendReadQuery(target, std::move(request));
+    }
+    bool validate(bool singleSource, const std::optional<cluster::ClusterTransactionId>& barrier = {}) {
+        cluster::ForwardRequest request; request.deduplicationId.nonce = token;
+        auto& value = request.entries.emplace_back().value;
+        value = {static_cast<uint8_t>(QueryAction::VALIDATE), static_cast<uint8_t>(barrier ? 2 : singleSource ? 1 : 0)};
+        if (barrier) { value.insert(value.end(), barrier->begin(), barrier->end()); }
+        const auto response = engine->sendReadQuery(target, std::move(request));
+        if (response.value.size() != 1 || response.value[0] > 1) { throw std::runtime_error("Cluster query: invalid validation response"); }
+        return response.value[0] != 0;
+    }
+    uint64_t activate(bool countOnly) {
+        const auto response = control(QueryAction::ACTIVATE);
+        size_t cursor = countOnly ? 0 : token.size();
+        uint64_t count = 0;
+        if (countOnly) {
+            if (!pullU64(response.value, cursor, count) || cursor != response.value.size()) {
+                throw std::runtime_error("Cluster query: invalid snapshot count");
+            }
+        } else {
+            if (response.value.size() != 32 || !std::equal(token.begin(), token.end(), response.value.begin()) ||
+                !pullU64(response.value, cursor, total) || !pullU64(response.value, cursor, records) ||
+                ((records == 0) != (total == 0))) { throw std::runtime_error("Cluster query: invalid activated cursor"); }
+            streaming = total == UINT64_MAX && records == UINT64_MAX;
+        }
+        return count;
+    }
     bool available() {
         if (position < page.size()) { return true; }
         if (streaming && eof) { return false; }
@@ -575,6 +725,51 @@ struct QueryReader {
         return entry;
     }
 };
+
+std::vector<std::unique_ptr<QueryReader>> prepareGlobalQuery(std::span<const uint8_t> start,
+    std::span<const uint8_t> end, bool countOnly) {
+    cluster::detail::ReconfigurationDeadline budget{opts.cluster.runtime.forwardingTimeoutMs,
+        [this] { return placementClosing(); }};
+    if (!end.empty() && compareKey(start, end) == 0) { return {}; }
+    const auto context = cluster::detail::ReconfigurationDeadline::current();
+    cluster::detail::BoundedExecutor* executor;
+    {
+        std::lock_guard lock{querySessionsMu};
+        if (!snapshotQueryExecutor) { snapshotQueryExecutor = std::make_unique<cluster::detail::BoundedExecutor>(8, 64); }
+        executor = snapshotQueryExecutor.get();
+    }
+    std::optional<cluster::ClusterTransactionId> barrier;
+    std::shared_ptr<void> reservation;
+    if (opts.cluster.runtime.globalSnapshotConflictPolicy == cluster::GlobalSnapshotConflictPolicy::BLOCK_WRITES) {
+        auto acquired = reserveGlobalQueryRange(start, end);
+        barrier = acquired.first; reservation = std::move(acquired.second);
+    }
+    for (;;) {
+        cluster::detail::ReconfigurationDeadline::check();
+        const auto epoch = clusterRuntime->configurationEpoch();
+        const auto targets = rangeQueryPlan(start);
+        std::vector<std::unique_ptr<QueryReader>> readers(targets.size());
+        executor->forEach(targets.size(), [&](size_t slot) {
+            cluster::detail::ReconfigurationDeadline scope{context};
+            const auto& target = targets[slot];
+            readers[slot] = std::make_unique<QueryReader>(*this, target.node,
+                openQueryRequest(countOnly ? QueryAction::SNAPSHOT_COUNT : QueryAction::SNAPSHOT_SCAN,
+                    start, end, 0, target.partitions));
+        }, context.deadline);
+        // All sources are pinned before validation. Unchanged stamps or a
+        // retained replicated range reservation prove a common read cut.
+        std::vector<uint8_t> valid(targets.size());
+        executor->forEach(targets.size(), [&](size_t slot) {
+            cluster::detail::ReconfigurationDeadline scope{context};
+            valid[slot] = readers[slot]->validate(targets.size() == 1, barrier) ? 1 : 0;
+        }, context.deadline);
+        cluster::detail::ReconfigurationDeadline::check();
+        if (epoch == clusterRuntime->configurationEpoch() &&
+            std::ranges::all_of(valid, [](uint8_t value) { return value != 0; })) { return readers; }
+        readers.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+}
 
 std::optional<std::vector<uint8_t>> getAtValue(std::span<const uint8_t> key, uint64_t atSeq) {
     throwIfBackgroundFailed();

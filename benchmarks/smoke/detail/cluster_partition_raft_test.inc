@@ -280,10 +280,14 @@ void testPartitionRaftLiveCopies() {
     }, 10s));
     std::fprintf(stderr, "[partition snapshot] new holder\n");
     engines[3] = AkkEngine::open(options[3]);
-    AKK_CLUSTER_CHECK(waitUntil([&] {
+    std::fprintf(stderr, "[partition snapshot] holder started\n");
+    std::string expansionError;
+    const bool expanded = waitUntil([&] {
         try { engines[0]->reconfigureCluster(configFor(3)); return true; }
-        catch (...) { return false; }
-    }, 60s));
+        catch (const std::exception& error) { expansionError = error.what(); return false; }
+    }, 60s);
+    if (!expanded) { std::fprintf(stderr, "[partition snapshot] expansion failed: %s\n", expansionError.c_str()); }
+    AKK_CLUSTER_CHECK(expanded);
     std::fprintf(stderr, "[partition snapshot] expanded membership\n");
     const auto status = engines[0]->clusterReconfigurationStatus();
     AKK_CLUSTER_CHECK(status.activeGeneration == 2 && status.pendingGeneration == 0 && status.completedPartitions == 2);
@@ -495,13 +499,21 @@ void testStripeOnlinePlacement(bool secure = false) {
     engines[0]->reconfigureCluster(configFor(members)); // Repeating a completed plan is idempotent.
     std::fprintf(stderr, "[stripe online] resumed after restart\n");
     AKK_CLUSTER_CHECK(textOf(*engines[3]->get(key)) == "second");
-    engines[2]->close(); engines[2].reset(); // Remove an unavailable shard holder.
+    engines[2]->close(); engines[2].reset();
     auto remaining = members; remaining.erase(remaining.begin() + 2);
+    // A retired metadata source can have a different retained history set.
+    // Verify it before its old storage can be retired.
+    bool historySourceUnavailable = false;
+    try { engines[0]->reconfigureCluster(configFor(remaining)); }
+    catch (const std::exception&) { historySourceUnavailable = true; }
+    AKK_CLUSTER_CHECK(historySourceUnavailable && engines[0]->clusterReconfigurationStatus().activeGeneration == 2);
+    options[2].cluster.config.reset(); engines[2] = AkkEngine::open(options[2]);
     AKK_CLUSTER_CHECK(waitUntil([&] {
         try { engines[0]->reconfigureCluster(configFor(remaining)); return true; }
         catch (...) { return false; }
     }, 90s));
-    std::fprintf(stderr, "[stripe online] unavailable member removed\n");
+    engines[2]->close(); engines[2].reset();
+    std::fprintf(stderr, "[stripe online] retired history source verified before removal\n");
     const auto after = akk_test::collectHistory(engines[3]->history(key));
     AKK_CLUSTER_CHECK(after.size() == before.size());
     for (size_t i = 0; i < before.size(); ++i) {

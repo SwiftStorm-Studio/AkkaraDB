@@ -23,6 +23,7 @@ namespace akkaradb::engine::cluster::detail {
     }
     ReconfigurationDeadline::Clock::time_point ReconfigurationDeadline::cap(Clock::time_point deadline) { return std::min(deadline, context.deadline); }
     uint32_t ReconfigurationDeadline::remaining(uint32_t timeoutMs) {
+        if (timeoutMs == 0) { throw std::invalid_argument("Cluster reconfiguration: RPC timeout must be nonzero"); }
         check();
         if (context.deadline == Clock::time_point::max()) { return timeoutMs; }
         const auto left = std::chrono::ceil<std::chrono::milliseconds>(context.deadline - Clock::now()).count();

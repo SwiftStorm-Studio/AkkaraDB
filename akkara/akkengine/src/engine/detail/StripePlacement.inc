@@ -4,22 +4,16 @@ cluster::ClusterConfig currentPlacement() const {
     return view ? *view : clusterConfig;
 }
 
-template <typename Visitor>
-void forEachStripeMigrationRecord(Visitor&& visit) {
-    auto retention = versionLog ? versionLog->captureRecords() : vlog::VersionLog::RecordSnapshot{};
-    core::BufferArena arena;
-    memtable::MemTable::KeyRange range;
-    const auto visible = snapshotSeq();
-    auto mt = memtable->iterator(range, visible);
-    sst::SSTManager::Iterator sst;
-    if (sstManager) { sst = sstManager->scanIter({}, {}, visible); }
-    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+core::ArenaGenerator<OwnedQueryRecord> stripeMigrationRevisionStream(FixedQuerySource source, vlog::VersionLog::RecordSnapshot retention) {
+    (void)retention;
+    auto storagePin = source.storage;
+    for (const auto& record : fixedQueryRecords(std::move(source))) {
         cluster::detail::ReconfigurationDeadline::check();
         auto key = publicKeyFromStripeMetaKey(record.key);
         if (!key) { continue; }
         std::map<uint64_t, StripeMetadata> revisions;
-        if (versionLog) {
-            for (const auto& entry : versionLog->history(stripeMetaKey(*key))) {
+        if (storagePin->versionLog) {
+            for (const auto& entry : storagePin->versionLog->history(record.key)) {
                 auto metadata = decodeStripeMetadata(entry.value);
                 if (!metadata) { throw std::runtime_error("Cluster placement: malformed stripe history"); }
                 revisions[metadata->logicalSeq] = effectiveStripeMetadata(*key, *metadata);
@@ -28,7 +22,10 @@ void forEachStripeMigrationRecord(Visitor&& visit) {
         auto head = decodeStripeMetadata(record.value);
         if (!head) { throw std::runtime_error("Cluster placement: malformed stripe head"); }
         revisions[head->logicalSeq] = effectiveStripeMetadata(*key, *head);
-        for (const auto& [sequence, metadata] : revisions) { (void)sequence; visit(*key, metadata); }
+        for (const auto& [sequence, metadata] : revisions) {
+            (void)sequence;
+            co_yield OwnedQueryRecord{*key, encodeStripeMetadata(metadata), 0, nullptr};
+        }
     }
 }
 
@@ -48,21 +45,21 @@ void reconfigureStripePlacement(cluster::ClusterConfig target) {
     active.validatePlacementChange(target);
     if (opts.cluster.runtime.transportMode == cluster::TransportMode::SECURE) {
         std::vector<uint64_t> ids;
-        for (const auto& node : target.dataNodes()) { if (node.nodeId != nodeId) { ids.push_back(node.nodeId); } }
+        for (const auto& node : target.stripeMetadataNodes()) { if (node.nodeId != nodeId) { ids.push_back(node.nodeId); } }
         opts.cluster.runtime.secure.validatePins(ids);
     }
     const auto generation = clusterRuntime->beginPlacementChange(target);
     state = clusterRuntime->placementState(true);
     if (state.pendingGeneration == 0) { return; }
-    auto participants = active.dataNodes();
-    for (const auto& node : target.dataNodes()) {
+    auto participants = active.stripeMetadataNodes();
+    for (const auto& node : target.stripeMetadataNodes()) {
         if (std::ranges::none_of(participants, [&](const auto& old) { return old.nodeId == node.nodeId; })) { participants.push_back(node); }
     }
     for (const auto& node : participants) {
         try { (void)partitionRpc(node.nodeId, partitionAdminHeader(PartitionAdmin::PREPARE, 0, generation)); }
         catch (const cluster::ClusterRoutingError& error) {
             const auto* retained = target.findById(node.nodeId);
-            if ((retained && retained->dataBearing()) ||
+            if (retained ||
                 (error.code != cluster::ClusterRoutingCode::FORWARD_UNAVAILABLE &&
                  error.code != cluster::ClusterRoutingCode::OUTCOME_UNKNOWN)) { throw; }
             // An unavailable retired node need not prepare. The committed intent
@@ -70,6 +67,13 @@ void reconfigureStripePlacement(cluster::ClusterConfig target) {
         }
     }
     if (state.stripeWritesBlocked) { clusterRuntime->waitForStripeOperations(); }
+    const auto finish = [&] {
+        clusterRuntime->finishPlacementChange(generation);
+        std::lock_guard progress{placementProgressMu}; placementLastError.clear();
+    };
+    // Activation intent is durable only after the frozen union was copied.
+    // Removed replicas may no longer receive later Raft cuts during recovery.
+    if (state.activationStarted) { finish(); return; }
     const auto started = std::chrono::steady_clock::now();
     uint64_t transferred = 0;
     stripeMigrationBytes.store(0, std::memory_order_relaxed);
@@ -94,6 +98,7 @@ void reconfigureStripePlacement(cluster::ClusterConfig target) {
                 copied->originNodeId != original.originNodeId || copied->timestampNs != original.timestampNs) {
                 throw std::runtime_error("Cluster placement: invalid migration checkpoint");
             }
+            cluster::detail::validateStripeFaultDomains(target, copied->nodeIds);
             return;
         }
         auto next = original;
@@ -126,14 +131,30 @@ void reconfigureStripePlacement(cluster::ClusterConfig target) {
         clusterRuntime->publishStripePlacementAlias(key, encodeStripeMetadata(next), generation);
         stripeMigrationRecords.fetch_add(1, std::memory_order_relaxed);
     };
-    forEachStripeMigrationRecord(copy);
+    const auto copyRetainedRevisions = [&] {
+        const auto cut = clusterRuntime->stripeMetadataLinearizableWatermark();
+        // A peer may retain older revisions than this leader, independently of
+        // its VersionLog policy. Each source must observe this migration cut.
+        for (const auto& peer : active.stripeMetadataNodes()) {
+            cluster::ForwardRequest request;
+            auto& value = request.entries.emplace_back().value;
+            value.push_back(static_cast<uint8_t>(QueryAction::STRIPE_REVISIONS));
+            pushU64(value, generation); pushU64(value, state.generation); pushU64(value, cut);
+            QueryReader reader{*this, peer.nodeId, std::move(request)};
+            while (auto record = reader.nextRecord()) {
+                const auto metadata = decodeStripeMetadata(record->second);
+                if (!metadata || !metadata->logicalSeq) { throw std::runtime_error("Cluster placement: invalid retained peer revision"); }
+                copy(record->first, *metadata);
+            }
+        }
+    };
+    copyRetainedRevisions();
     if (!state.stripeWritesBlocked) {
         clusterRuntime->freezeStripePlacement(generation);
         clusterRuntime->waitForStripeOperations();
         // Only revisions published during the bulk pass need another transfer.
-        forEachStripeMigrationRecord(copy);
+        copyRetainedRevisions();
     }
     check();
-    clusterRuntime->finishPlacementChange(generation);
-    { std::lock_guard progress{placementProgressMu}; placementLastError.clear(); }
+    finish();
 }

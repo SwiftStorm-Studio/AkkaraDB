@@ -146,11 +146,12 @@ void testPartitionedSingleCopy() {
 
 void expirePartitionFixtureWal(const std::filesystem::path& nodeDirectory) {
     // Simulate exhausted retention after the fixture's durable SST was published.
-    // Keep the closed WAL files in the same fixture for inspection.
+    // Retire the closed WAL and its existence proofs together. Leaving a proof
+    // behind models storage loss, not legitimate history retention expiry.
     const auto archived = nodeDirectory / "expired-wal";
     std::filesystem::create_directories(archived);
     for (const auto& entry : std::filesystem::directory_iterator(nodeDirectory / "wal")) {
-        if (entry.is_regular_file() && entry.path().extension() == ".akwal") {
+        if (entry.is_regular_file() && (entry.path().extension() == ".akwal" || entry.path().extension() == ".checkpoint")) {
             std::filesystem::rename(entry.path(), archived / entry.path().filename());
         }
     }

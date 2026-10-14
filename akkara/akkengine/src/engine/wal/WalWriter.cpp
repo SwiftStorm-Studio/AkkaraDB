@@ -13,6 +13,7 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/engine/wal/WalFraming.hpp"
+#include "WalCheckpoint.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -103,6 +104,10 @@ namespace akkaradb::engine::wal {
             #else
             if (::fdatasync(fileno(f)) != 0) { throw std::runtime_error("WAL fdatasync failed"); }
             #endif
+        }
+
+        void flushFile(FILE* file) {
+            if (std::fflush(file) != 0) { throw std::runtime_error("WAL flush failed"); }
         }
 
         [[nodiscard]] FILE* openRw(const fs::path& path, bool exists) {
@@ -312,11 +317,14 @@ namespace akkaradb::engine::wal {
 
                         std::lock_guard fileLock{fileMutex_};
                         writeOneLocked(entry);
-                        std::fflush(file_);
+                        const bool needsSync = options_.syncPolicy == WalSyncPolicy::ALWAYS ||
+                            (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && ack == WalAppendAck::SYNCED);
+                        if (needsSync) { updateHeaderLocked(); }
+                        flushFile(file_);
                         batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
-                        if (options_.syncPolicy == WalSyncPolicy::ALWAYS || (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && ack ==
-                            WalAppendAck::SYNCED)) {
+                        if (needsSync) {
                             doFdatasync(file_);
+                            publishCheckpointLocked();
                             syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
@@ -337,8 +345,9 @@ namespace akkaradb::engine::wal {
 
                         std::lock_guard fileLock{fileMutex_};
                         updateHeaderLocked();
-                        std::fflush(file_);
+                        flushFile(file_);
                         doFdatasync(file_);
+                        publishCheckpointLocked();
                         syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                     }
 
@@ -367,7 +376,7 @@ namespace akkaradb::engine::wal {
                             }
                         }
 
-                        for (const auto& path : removable) { fs::remove(path); }
+                        for (const auto& path : removable) { detail::retireCheckpoint(path); fs::remove(path); }
                     }
 
                     void close() {
@@ -383,9 +392,10 @@ namespace akkaradb::engine::wal {
                         std::lock_guard fileLock{fileMutex_};
                         if (file_ != nullptr) {
                             updateHeaderLocked();
-                            std::fflush(file_);
+                            flushFile(file_);
                             if (options_.syncPolicy != WalSyncPolicy::NEVER) {
                                 doFdatasync(file_);
+                                publishCheckpointLocked();
                                 syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                             }
                             closeFile(file_);
@@ -423,6 +433,12 @@ namespace akkaradb::engine::wal {
                 private:
                     void openSegment(uint64_t segmentId) {
                         path_ = segmentPath(walDir_, shardId_, segmentId);
+                        const auto checkpoint = detail::readCheckpoint(path_);
+                        if (checkpoint && !fs::exists(path_)) { throw std::runtime_error("WAL: checkpointed segment is missing"); }
+                        checkpointBytes_ = checkpoint ? checkpoint->publishedBytes : 0;
+                        if (fs::exists(path_) && fs::file_size(path_) != 0 && fs::file_size(path_) < WalSegmentHeader::SIZE) {
+                            throw std::runtime_error("WAL: truncated or incompatible segment header; restore storage or recreate the pre-release database");
+                        }
                         const bool exists = fs::exists(path_) && fs::file_size(path_) >= WalSegmentHeader::SIZE;
                         file_ = openRw(path_, exists);
 
@@ -433,7 +449,11 @@ namespace akkaradb::engine::wal {
                                 throw std::runtime_error("WAL failed to read segment header: " + path_.string());
                             }
                             header_ = WalSegmentHeader::deserialize(hdrBuf);
-                            if (!header_.verifyMagic() || !header_.verifyVersion() || !header_.verifyChecksum() || header_.shardId !=
+                            if (!header_.verifyVersion()) {
+                                closeFile(file_);
+                                throw std::runtime_error("WAL: incompatible segment version; recreate the pre-release database");
+                            }
+                            if (!header_.verifyMagic() || !header_.verifyChecksum() || header_.shardId !=
                                 shardId_) {
                                 closeFile(file_);
                                 ++segmentId_;
@@ -442,6 +462,12 @@ namespace akkaradb::engine::wal {
                             }
 
                             const SegmentScanResult scan = scanSegmentSequences(path_);
+                            if (header_.publishedBytes < WalSegmentHeader::SIZE || header_.publishedBytes > scan.validBytes ||
+                                checkpointBytes_ > scan.validBytes || (checkpoint &&
+                                    (checkpoint->shardId != header_.shardId || checkpoint->segmentId != header_.segmentId))) {
+                                closeFile(file_);
+                                throw std::runtime_error("WAL: published record prefix is missing or corrupt");
+                            }
                             if (scan.validHeader) {
                                 header_.firstSeq = scan.firstSeq;
                                 header_.lastSeq = scan.lastSeq;
@@ -461,14 +487,15 @@ namespace akkaradb::engine::wal {
                         currentSize_ = 0;
                         updateHeaderLocked();
                         currentSize_ = WalSegmentHeader::SIZE;
-                        std::fflush(file_);
+                        flushFile(file_);
                     }
 
                     void rotateLocked() {
                         updateHeaderLocked();
-                        std::fflush(file_);
+                        flushFile(file_);
                         if (options_.syncPolicy != WalSyncPolicy::NEVER) {
                             doFdatasync(file_);
+                            publishCheckpointLocked();
                             syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                         }
                         closeFile(file_);
@@ -479,12 +506,19 @@ namespace akkaradb::engine::wal {
 
                     void updateHeaderLocked() {
                         if (file_ == nullptr) { return; }
+                        header_.publishedBytes = std::max<uint64_t>(currentSize_, WalSegmentHeader::SIZE);
                         refreshSegmentCrc(header_);
                         uint8_t buf[WalSegmentHeader::SIZE]{};
                         header_.serialize(buf);
                         if (std::fseek(file_, 0, SEEK_SET) != 0) { throw std::runtime_error("WAL seek header failed"); }
                         writeAll(file_, buf, sizeof(buf));
                         if (std::fseek(file_, 0, SEEK_END) != 0) { throw std::runtime_error("WAL seek end failed"); }
+                    }
+
+                    void publishCheckpointLocked() {
+                        if (checkpointBytes_ == header_.publishedBytes) { return; }
+                        detail::publishCheckpoint(path_, header_);
+                        checkpointBytes_ = header_.publishedBytes;
                     }
 
                     void writeOneLocked(const PendingEntry& entry) {
@@ -541,12 +575,13 @@ namespace akkaradb::engine::wal {
                                         const bool forceSync = options_.syncPolicy == WalSyncPolicy::ALWAYS;
                                         bool needsSync = forceSync;
                                         for (const PendingEntry& entry : batch) { writeOneLocked(entry); }
-                                        std::fflush(file_);
-                                        batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
                                         for (const PendingEntry& entry : batch) {
                                             if (options_.syncPolicy == WalSyncPolicy::ON_SYNC_ACK && entry.ackMode ==
                                                 WalAppendAck::SYNCED) { needsSync = true; }
                                         }
+                                        if (needsSync) { updateHeaderLocked(); }
+                                        flushFile(file_);
+                                        batchesFlushed_.fetch_add(1, std::memory_order_relaxed);
                                         if (!forceSync) {
                                             for (const PendingEntry& entry : batch) {
                                                 if (entry.ack && entry.ackMode == WalAppendAck::WRITTEN) { entry.ack->set_value(); }
@@ -554,6 +589,7 @@ namespace akkaradb::engine::wal {
                                         }
                                         if (needsSync) {
                                             doFdatasync(file_);
+                                            publishCheckpointLocked();
                                             syncsExecuted_.fetch_add(1, std::memory_order_relaxed);
                                             for (const PendingEntry& entry : batch) {
                                                 if (entry.ack && entry.ackMode != WalAppendAck::WRITTEN) { entry.ack->set_value(); }
@@ -628,6 +664,7 @@ namespace akkaradb::engine::wal {
                     FILE* file_ = nullptr;
                     WalSegmentHeader header_{};
                     uint64_t currentSize_ = 0;
+                    uint64_t checkpointBytes_ = 0;
                     bool closed_ = false;
                     uint64_t injectedWriteFailureAfterEntries_ = 0;
                     uint64_t segmentBytes_ = SEGMENT_BYTES;

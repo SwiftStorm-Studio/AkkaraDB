@@ -94,6 +94,7 @@ namespace akkaradb::engine::wal {
         writeU16(out, 42, headerSize);
         writeU16(out, 44, shardId);
         writeU16(out, 46, flags);
+        writeU64(out, 48, publishedBytes);
     }
 
     WalSegmentHeader WalSegmentHeader::deserialize(const uint8_t in[SIZE]) noexcept {
@@ -108,6 +109,7 @@ namespace akkaradb::engine::wal {
         hdr.headerSize = readU16(in, 42);
         hdr.shardId = readU16(in, 44);
         hdr.flags = readU16(in, 46);
+        hdr.publishedBytes = readU64(in, 48);
         return hdr;
     }
 

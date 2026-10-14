@@ -154,7 +154,8 @@ namespace akkaradb::engine::memtable {
                 bool completionFirst,
                 uint64_t maxPinnedBytes,
                 uint32_t maxPinnedGenerations,
-                bool waitForAdmission = false
+                bool waitForAdmission = false,
+                bool waitForCapacity = true
             );
 
             [[nodiscard]] uint64_t nextSeq() noexcept;

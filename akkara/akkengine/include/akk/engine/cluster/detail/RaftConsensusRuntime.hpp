@@ -29,8 +29,13 @@ namespace akkaradb::engine::cluster {
                 ClusterConfig config,
                 uint64_t selfNodeId,
                 ClusterEngineCallbacks callbacks,
-                ClusterRuntimeOptions runtimeOptions
+                ClusterRuntimeOptions runtimeOptions,
+                std::vector<uint64_t> forwardClients = {}
             );
+            [[nodiscard]] static std::unique_ptr<RaftConsensusRuntime> createRequestClient(
+                ClusterConfig config, NodeInfo self, ClusterRuntimeOptions runtimeOptions);
+            void setRequestForwardClients(std::vector<uint64_t> nodes);
+            void setRequestForwardTargets(std::vector<NodeInfo> nodes);
 
             ~RaftConsensusRuntime();
 
@@ -41,6 +46,7 @@ namespace akkaradb::engine::cluster {
             void close();
             [[nodiscard]] RaftRuntimeStats stats() const;
             [[nodiscard]] NodeRole role() const noexcept;
+            [[nodiscard]] uint64_t leaderNodeId() const;
             [[nodiscard]] std::vector<NodeInfo> activeNodes() const;
             [[nodiscard]] const ClusterRouter& router() const noexcept;
 
@@ -56,12 +62,12 @@ namespace akkaradb::engine::cluster {
             void shipBlob(uint64_t seq, uint64_t blobId, std::span<const uint8_t> content);
             std::future<void> submitEntry(uint64_t seq, ReplOpType op, std::span<const uint8_t> key,
                 std::span<const uint8_t> value, uint8_t flags, uint64_t source);
-            ClusterMutationSubmission submitMutation(ClusterMutationFactory prepare);
+            ClusterMutationSubmission submitMutation(const ClusterMutationFactory& prepare, uint64_t expectedTerm = 0);
 
-            void linearizableReadBarrier();
+            uint64_t linearizableReadBarrier();
             ForwardResponse forwardTo(uint64_t nodeId, ForwardRequest request);
             std::shared_future<ClusterRequestResult> submitRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
-                ClusterMutationFactory);
+                const ClusterMutationFactory&, uint64_t expectedTerm = 0);
             ClusterRequestResult queryRequest(const ClusterRequestId&);
 
             void addVotingNode(const NodeInfo& node);

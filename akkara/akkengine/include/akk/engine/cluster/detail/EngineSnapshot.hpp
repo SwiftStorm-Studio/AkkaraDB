@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace akkaradb::engine::cluster::detail {
-    enum class SnapshotRecordKind : uint8_t { STATE = 0, HEAD = 1, HISTORY = 2 };
+    enum class SnapshotRecordKind : uint8_t { STATE = 0, HEAD = 1, HISTORY = 2, TRANSACTION = 3, TRANSACTION_DECISION = 4, TRANSACTION_RECEIPT = 5, TRANSACTION_PREPARE = 6 };
     struct SnapshotRecordKey {
         SnapshotRecordKind kind = SnapshotRecordKind::HEAD;
         uint8_t flags = 0;
@@ -25,7 +25,7 @@ namespace akkaradb::engine::cluster::detail {
     }
     inline SnapshotRecordKey decodeSnapshotKey(std::span<const uint8_t> bytes) {
         if (bytes.size() < 39 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'E' || bytes[3] != 'S' ||
-            bytes[4] != '1' || bytes[5] > 2 || (bytes[6] & ~uint8_t{0x0f}) != 0) {
+            bytes[4] != '1' || bytes[5] > 6 || (bytes[6] & ~uint8_t{0x0f}) != 0) {
             throw std::runtime_error("Cluster snapshot: invalid state record key");
         }
         const auto integer = [&](size_t offset) {

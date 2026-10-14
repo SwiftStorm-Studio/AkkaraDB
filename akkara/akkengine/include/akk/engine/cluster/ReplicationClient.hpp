@@ -78,6 +78,8 @@ uint64_t seq,
             ReplicationClient& operator=(const ReplicationClient&) = delete;
             void setApplyCallback(ApplyCallback callback);
             void setBlobCallbacks(BlobBeginCallback begin, BlobChunkCallback chunk, BlobEndCallback end);
+            // Required for DURABLE ACKs, including reconnect and duplicate entries.
+            // Throwing prevents acknowledgement and aborts the connection.
             void setForceDurableCallback(std::function<void()> callback);
             void setSnapshotCallbacks(
                 SnapshotBeginCallback begin,
@@ -92,7 +94,8 @@ uint64_t seq,
             /** Unix timestamp in microseconds of the latest accepted handshake or valid frame; zero before first contact. */
             [[nodiscard]] uint64_t lastSuccessfulContactAtUs() const noexcept;
             /** Total budget from API entry, including admission, sending and response waits. */
-            [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs);
+            [[nodiscard]] ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs,
+                ReadKeySpace keySpace = ReadKeySpace::PUBLIC);
             /** Total budget from API entry; a timed-out partial send disconnects the peer. */
             [[nodiscard]] StripeControlResponse stripeControl(StripeControlRequest request, uint32_t timeoutMs);
             [[nodiscard]] ForwardResponse forward(ForwardRequest request);

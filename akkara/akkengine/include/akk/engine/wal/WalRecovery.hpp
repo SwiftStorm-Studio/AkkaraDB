@@ -39,6 +39,8 @@ namespace akkaradb::engine::wal {
         uint64_t checkpointSeq = 0;
         size_t maxEntryBytes = 64ULL * 1024ULL * 1024ULL;
         bool truncateCorruptTail = false;
+        // Called after CRC/envelope validation, including records below the SST checkpoint.
+        std::function<void(std::span<const uint8_t>, uint64_t)> requestApplication{};
     };
 
     struct AKDB_API WalRecoveredEntry {

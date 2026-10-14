@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <atomic>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <optional>
 #include <span>
@@ -58,6 +59,7 @@ namespace akkaradb::engine::cluster {
                 uint64_t rebuildingReplicas = 0;
                 uint64_t queuedFrames = 0;
                 uint64_t queuedBytes = 0;
+                bool recoveryRequired = false;
                 std::vector<Peer> peers;
             };
             using HistoryProvider = std::function<std::optional<std::vector<ReplEntry>>(uint64_t afterSeq, uint64_t throughSeq)>;
@@ -138,6 +140,10 @@ namespace akkaradb::engine::cluster {
             void setReadCallback(ReadCallback callback);
             void setStripeControlCallback(StripeControlCallback callback);
             void setForwardCallback(ForwardCallback callback);
+            /** Install before start(); persist/report a terminal replication inconsistency. */
+            void setFatalFailureCallback(std::function<void(std::exception_ptr)> callback);
+            /** Rethrows a latched inconsistency; close()/start() cannot clear it. */
+            void checkHealth() const;
 
             /**
              * Ships a replicated key/value entry to all current replication targets.

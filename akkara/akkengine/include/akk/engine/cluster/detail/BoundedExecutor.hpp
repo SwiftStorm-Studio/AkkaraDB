@@ -37,7 +37,7 @@ namespace akkaradb::engine::cluster::detail {
         void forEach(size_t count, const std::function<void(size_t)>& task,
             std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
             const char group = 0;
-            const bool timed = deadline != std::chrono::steady_clock::time_point::max();
+            const auto timed = deadline != std::chrono::steady_clock::time_point::max();
             std::vector<std::future<void>> completions;
             completions.reserve(count);
             std::exception_ptr failure;

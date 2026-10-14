@@ -9,8 +9,8 @@
 
 // benchmarks/smoke/cluster_smoke_test.cpp
 #include "akk/engine/detail/ProtocolBulkWriter.hpp"
-#ifdef _WIN32
 #include "detail/CollectHistory.hpp"
+#ifdef _WIN32
 #include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -25,18 +25,25 @@
 
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/engine/cluster/detail/DiskResults.hpp"
 #include "akk/engine/blob/BlobManager.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
 #include "akk/engine/cluster/ClusterManager.hpp"
 #include "akk/engine/cluster/ClusterRuntime.hpp"
 #include "akk/engine/cluster/detail/RaftLogIndex.hpp"
 #include "akk/engine/cluster/detail/BoundedExecutor.hpp"
+#include "akk/engine/cluster/detail/TransactionProtocol.hpp"
+#include "akk/engine/cluster/detail/EngineSnapshot.hpp"
+#include "akk/engine/cluster/detail/ClusterPlacement.hpp"
 #include "akk/engine/cluster/ClusterRouter.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 #include "akk/engine/cluster/ReplicationClient.hpp"
 #include "akk/engine/cluster/ReplicationServer.hpp"
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
+#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
 #include "akk/engine/cluster/detail/ForwardDeadline.hpp"
+#include "akk/engine/cluster/detail/ClusterConnection.hpp"
+#include "akk/engine/cluster/detail/PeerLiveness.hpp"
 #include "akk/engine/erasure/ErasureCodec.hpp"
 #include "akk/engine/erasure/ErasureCodecExt.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
@@ -113,6 +120,7 @@ namespace {
             .replPort = replPort,
             .stripeMetadataPort = static_cast<uint16_t>(replPort + 1000),
             .capabilities = capabilities,
+            .hostId = {}, .siteId = {},
         };
     }
 
@@ -359,7 +367,7 @@ namespace {
         if (!in.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) { return 0; }
 #endif
         const std::string_view magic{reinterpret_cast<const char*>(bytes.data()), 5};
-        if (magic == "AKRL1" && offset + 8 <= bytes.size()) { return readU64Le(bytes, offset); }
+        if (magic == "AKRL2" && offset + 8 <= bytes.size()) { return readU64Le(bytes, offset); }
         return 0;
     }
 
@@ -546,12 +554,14 @@ namespace {
             response.value.assign(harness->lastValue.begin(), harness->lastValue.end());
             return response;
         };
+        callbacks.readLocalStorage = callbacks.read;
         callbacks.commitStripeMetadata = [harness = harness.get()](
             uint64_t, std::span<const uint8_t> key, std::span<const uint8_t> metadata
         ) {
             std::lock_guard lock{harness->stateMutex};
             harness->stripeMetadata[std::string{reinterpret_cast<const char*>(key.data()), key.size()}] =
                 std::vector<uint8_t>{metadata.begin(), metadata.end()};
+            return harness->lastSeq.load();
         };
         callbacks.readStripeMetadata = [harness = harness.get()](std::span<const uint8_t> key)
             -> std::optional<std::vector<uint8_t>> {
@@ -638,6 +648,11 @@ namespace {
         };
         callbacks.forceDurable = [harness = harness.get()] { harness->durableCount.fetch_add(1); };
         if (configure) { configure(callbacks); }
+        if (!callbacks.checkpointReplication) {
+            callbacks.checkpointReplication = [harness = harness.get(), durable = callbacks.forceDurable] {
+                durable(); return harness->lastSeq.load();
+            };
+        }
         harness->runtime = ClusterRuntime::create(dir, cfg, nodeId, std::move(callbacks), options);
         return harness;
     }
@@ -1638,8 +1653,8 @@ namespace {
             RaidOptions{.preset = RaidPreset::RAID10, .dataShards = 2, .hotSpareNodeId = 5},
             AckPolicy{},
         };
-        AKK_CLUSTER_CHECK(hotSpareConfig.stripeFailoverNode() != nullptr);
-        AKK_CLUSTER_CHECK(hotSpareConfig.stripeFailoverNode()->nodeId == 5);
+        AKK_CLUSTER_CHECK(!hotSpareConfig.stripeFailoverNodes().empty());
+        AKK_CLUSTER_CHECK(hotSpareConfig.stripeFailoverNodes().front().nodeId == 5);
         AKK_CLUSTER_CHECK(hotSpareConfig.stripePlacementNodes().size() == 4);
         const auto hotSpareTargets = ClusterRouter{hotSpareConfig}.stripeShardTargets(bytesOf("raid10-hot-spare-layout"));
         AKK_CLUSTER_CHECK(std::ranges::none_of(hotSpareTargets, [](const auto& target) { return target.node.nodeId == 5; }));
@@ -1769,14 +1784,14 @@ namespace {
         const auto dir = makeTempDir("raid10-hot-spare");
         const auto config = raid10HotSpareStorageConfig();
         AKK_CLUSTER_CHECK(config.raidPreset() == RaidPreset::RAID10);
-        AKK_CLUSTER_CHECK(config.stripeFailoverNode() != nullptr && config.stripeFailoverNode()->nodeId == 5);
+        AKK_CLUSTER_CHECK(!config.stripeFailoverNodes().empty() && config.stripeFailoverNodes().front().nodeId == 5);
         AKK_CLUSTER_CHECK(config.dataNodes().size() == 5);
         AKK_CLUSTER_CHECK(config.stripePlacementNodes().size() == 4);
 
         const auto configPath = dir / "cluster.cfg";
         ClusterConfig::save(configPath, config);
         const auto loaded = ClusterConfig::load(configPath);
-        AKK_CLUSTER_CHECK(loaded.stripeFailoverNode() != nullptr && loaded.stripeFailoverNode()->nodeId == 5);
+        AKK_CLUSTER_CHECK(!loaded.stripeFailoverNodes().empty() && loaded.stripeFailoverNodes().front().nodeId == 5);
 
         constexpr std::array<uint64_t, 4> secondaryFailurePlacement{1, 2, 3, 4};
         constexpr std::array<uint64_t, 4> ownerFailurePlacement{2, 1, 3, 4};
@@ -1952,12 +1967,28 @@ namespace {
                                            };
         if (!std::filesystem::exists(configPath)) { ClusterConfig::save(configPath, config); }
         ClusterEngineCallbacks callbacks;
-        callbacks.getLastSeq = [] { return uint64_t{0}; };
-        callbacks.getCurrentSeq = [] { return uint64_t{0}; };
-        callbacks.apply = [](uint64_t, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t, uint64_t) {};
-        callbacks.forceDurable = [] {};
+        // This log-focused fixture models a sequence-only control state machine. Its
+        // recovered watermark must agree with Raft's durable applied prefix.
+        const auto appliedPath = dir / "fixture-applied.seq";
+        uint64_t recovered = 0;
+        if (std::filesystem::exists(appliedPath)) {
+            std::ifstream in{appliedPath, std::ios::binary};
+            in.read(reinterpret_cast<char*>(&recovered), sizeof(recovered)); AKK_CLUSTER_CHECK(in.good());
+        }
+        auto applied = std::make_shared<std::atomic<uint64_t>>(recovered);
+        callbacks.getLastSeq = callbacks.getCurrentSeq = [applied] { return applied->load(); };
+        callbacks.apply = [applied](uint64_t seq, ReplOpType, std::span<const uint8_t>, std::span<const uint8_t>, uint8_t, uint64_t, uint64_t) {
+            applied->store(std::max(applied->load(), seq));
+        };
+        callbacks.forceDurable = [applied, appliedPath] {
+            const auto seq = applied->load(); std::ofstream out{appliedPath, std::ios::binary | std::ios::trunc};
+            out.write(reinterpret_cast<const char*>(&seq), sizeof(seq)); out.close(); AKK_CLUSTER_CHECK(out.good());
+        };
         ClusterRuntimeOptions options;
         options.transportMode = TransportMode::PLAIN;
+        // Large opaque commands exercise log rotation within the control-frame
+        // contract; data mutations have a separate 65,535-byte storage limit.
+        options.raftGroupKind = RaftGroupKind::PLACEMENT;
         options.raftLogRecoveryAction = recovery;
         return ClusterRuntime::create(dir, config, 1, std::move(callbacks), options);
     }
@@ -2054,7 +2085,7 @@ namespace {
 
     void testRaftOptionsRoundtripAndValidation() {
         AKK_CLUSTER_CHECK(ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE == 4u * 1024u * 1024u);
-        AKK_CLUSTER_CHECK(ClusterRuntimeOptions{}.raftMaxReceiveMemoryBytes == 64ull * 1024 * 1024);
+        AKK_CLUSTER_CHECK(ClusterRuntimeOptions{}.raftMaxReceiveMemoryBytes == 128ull * 1024 * 1024);
         const auto dir = makeTempDir("raft-options");
         const ClusterConfig cfg{
             {
@@ -2137,11 +2168,21 @@ namespace {
         insufficientReceiveMemory.raftMaxReceiveMemoryBytes = minimumRaftReceiveMemory - 1;
         AKK_CLUSTER_CHECK(rejectsRuntimeOptions(insufficientReceiveMemory));
         ClusterRuntimeOptions maximumRequestCapacity;
-        maximumRequestCapacity.requests.maxTrackedRequests = 32'768;
+        AKK_CLUSTER_CHECK(maximumRequestCapacity.requests.defaultRetentionMs == 600'000);
+        AKK_CLUSTER_CHECK(maximumRequestCapacity.requests.maxRetentionMs == 86'400'000);
+        AKK_CLUSTER_CHECK(maximumRequestCapacity.requests.maxPendingRequests == 6144);
+        AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(maximumRequestCapacity));
+        maximumRequestCapacity.requests.maxPendingRequests = 32'768;
         AKK_CLUSTER_CHECK(!rejectsRuntimeOptions(maximumRequestCapacity));
         ClusterRuntimeOptions excessiveRequestCapacity;
-        excessiveRequestCapacity.requests.maxTrackedRequests = 32'769;
+        excessiveRequestCapacity.requests.maxPendingRequests = 32'769;
         AKK_CLUSTER_CHECK(rejectsRuntimeOptions(excessiveRequestCapacity));
+        ClusterRuntimeOptions zeroDefaultRetention;
+        zeroDefaultRetention.requests.defaultRetentionMs = 0;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(zeroDefaultRetention));
+        ClusterRuntimeOptions excessiveDefaultRetention;
+        excessiveDefaultRetention.requests.defaultRetentionMs = excessiveDefaultRetention.requests.maxRetentionMs + 1;
+        AKK_CLUSTER_CHECK(rejectsRuntimeOptions(excessiveDefaultRetention));
         ClusterRuntimeOptions invalidMemorySnapshotBytes;
         invalidMemorySnapshotBytes.memoryOnlySnapshot.maxPinnedBytes = 1024;
         AKK_CLUSTER_CHECK(rejectsRuntimeOptions(invalidMemorySnapshotBytes));
@@ -2266,16 +2307,20 @@ namespace {
             .key = {1, 2, 3},
             .metadata = {4, 5, 6, 7},
         };
-        DecodedFrame requestFrame;
-        AKK_CLUSTER_CHECK(decodeFrame(encodeStripeControlRequest(request), requestFrame));
-        StripeControlRequest decodedRequest;
-        AKK_CLUSTER_CHECK(decodeStripeControlRequest(requestFrame.payload, decodedRequest));
-        AKK_CLUSTER_CHECK(decodedRequest.requestId == request.requestId);
-        AKK_CLUSTER_CHECK(decodedRequest.action == request.action);
-        AKK_CLUSTER_CHECK(decodedRequest.ownerNodeId == request.ownerNodeId);
-        AKK_CLUSTER_CHECK(decodedRequest.fenceToken == request.fenceToken);
-        AKK_CLUSTER_CHECK(decodedRequest.key == request.key);
-        AKK_CLUSTER_CHECK(decodedRequest.metadata == request.metadata);
+        for (const auto action : {StripeControlAction::COMMIT, StripeControlAction::RECLAIM_GENERATION,
+                                  StripeControlAction::GENERATION_RETAINED}) {
+            request.action = action;
+            DecodedFrame requestFrame;
+            AKK_CLUSTER_CHECK(decodeFrame(encodeStripeControlRequest(request), requestFrame));
+            StripeControlRequest decodedRequest;
+            AKK_CLUSTER_CHECK(decodeStripeControlRequest(requestFrame.payload, decodedRequest));
+            AKK_CLUSTER_CHECK(decodedRequest.requestId == request.requestId);
+            AKK_CLUSTER_CHECK(decodedRequest.action == request.action);
+            AKK_CLUSTER_CHECK(decodedRequest.ownerNodeId == request.ownerNodeId);
+            AKK_CLUSTER_CHECK(decodedRequest.fenceToken == request.fenceToken);
+            AKK_CLUSTER_CHECK(decodedRequest.key == request.key);
+            AKK_CLUSTER_CHECK(decodedRequest.metadata == request.metadata);
+        }
 
         StripeControlResponse response{
             .requestId = request.requestId,
@@ -2395,7 +2440,7 @@ namespace {
         AKK_CLUSTER_CHECK(loaded.mode() == ReplicationMode::STRIPE);
         AKK_CLUSTER_CHECK(loaded.stripe().dataShards == 3);
         AKK_CLUSTER_CHECK(loaded.stripe().parityShards == 2);
-        AKK_CLUSTER_CHECK(loaded.stripeFailoverNode() && loaded.stripeFailoverNode()->nodeId == 6);
+        AKK_CLUSTER_CHECK(!loaded.stripeFailoverNodes().empty() && loaded.stripeFailoverNodes().front().nodeId == 6);
 
         bool rejectedRaid6WithoutMetadataQuorum = false;
         try {
@@ -4309,17 +4354,42 @@ namespace {
         RaftTestSocket listener_;
         std::atomic<bool> stopping_{false}, failed_{false};
         std::atomic<bool> rejectMutations_{false};
+        std::atomic<bool> slowResponses_{false};
+        std::atomic<size_t> responseChunkBytes_{8};
+        std::atomic<uint32_t> responseDelayMs_{50};
+        std::atomic<bool> dropRequests_{false}, dropResponses_{false};
         bool inspectFrames_ = false;
         bool blocked_ = true;
         std::mutex mutex_;
         std::vector<std::shared_ptr<Connection>> connections_;
         std::vector<std::thread> workers_;
         std::thread acceptThread_;
-        static void pump(const RaftTestSocket& source, const RaftTestSocket& destination) {
+        void pump(const RaftTestSocket& source, const RaftTestSocket& destination) {
             std::array<uint8_t, 16384> buffer{};
             for (;;) {
                 const auto count = ::recv(source.handle, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
-                if (count <= 0 || !destination.send(std::span{buffer}.first(static_cast<size_t>(count)))) { break; }
+                if (count <= 0) { break; }
+                if (dropRequests_.load()) { continue; }
+                if (!destination.send(std::span{buffer}.first(static_cast<size_t>(count)))) { break; }
+            }
+            source.shutdown(); destination.shutdown();
+        }
+        void pumpResponses(const RaftTestSocket& source, const RaftTestSocket& destination) {
+            std::array<uint8_t, 16384> buffer{};
+            for (;;) {
+                const auto count = ::recv(source.handle, reinterpret_cast<char*>(buffer.data()), static_cast<int>(buffer.size()), 0);
+                if (count <= 0) { break; }
+                if (dropResponses_.load()) { continue; }
+                const auto received = std::span{buffer}.first(static_cast<size_t>(count));
+                bool sent = true;
+                for (size_t offset = 0; offset < received.size();) {
+                    const bool slow = slowResponses_.load();
+                    const size_t size = slow ? std::min<size_t>(responseChunkBytes_.load(), received.size() - offset) : received.size() - offset;
+                    if (slow) { std::this_thread::sleep_for(std::chrono::milliseconds{responseDelayMs_.load()}); }
+                    if (stopping_.load() || !destination.send(received.subspan(offset, size))) { sent = false; break; }
+                    offset += size;
+                }
+                if (!sent) { break; }
             }
             source.shutdown(); destination.shutdown();
         }
@@ -4389,7 +4459,7 @@ namespace {
                         workers_.emplace_back([this, connection] {
                             try {
                                 std::thread upload([this, connection] { pumpRequests(connection->client, connection->backend); });
-                                pump(connection->backend, connection->client);
+                                pumpResponses(connection->backend, connection->client);
                                 upload.join();
                             }
                             catch (...) { failed_.store(true); connection->client.shutdown(); connection->backend.shutdown(); }
@@ -4415,38 +4485,62 @@ namespace {
         }
         bool failed() const { return failed_.load(); }
         void rejectMutations(bool enabled) { rejectMutations_.store(enabled); }
+        void slowResponses(bool enabled, size_t chunkBytes = 8, uint32_t delayMs = 50) {
+            AKK_CLUSTER_CHECK(chunkBytes != 0);
+            responseChunkBytes_ = chunkBytes; responseDelayMs_ = delayMs; slowResponses_.store(enabled);
+        }
+        void blackhole(bool requests, bool responses) { dropRequests_.store(requests); dropResponses_.store(responses); }
     };
 
     void appendRaftTestInteger(std::vector<uint8_t>& bytes, uint64_t value, size_t width = 8) {
         for (size_t i = 0; i < width; ++i) { bytes.push_back(static_cast<uint8_t>(value >> (i * 8))); }
     }
 
-    void openRaftTestPeer(RaftTestSocket& socket, uint16_t port, uint64_t sender, const ClusterConfig& config, const char domain = '1') {
+    void openRaftTestPeer(RaftTestSocket& socket, uint16_t port, uint64_t sender, const ClusterConfig& config, const char domain = '3',
+                          const ClusterRuntimeOptions& options = {}, uint8_t channelKind = 0, uint8_t expectedStatus = 0) {
         AKK_CLUSTER_CHECK(socket.connect("127.0.0.1", port));
         // Independent wire fixture: changing the protocol must update this contract too.
         const auto consistency = config.consistency();
         const auto membership = config.raft().membership;
-        const std::vector<uint8_t> fingerprintInput{'A', 'K', 'R', 'P', static_cast<uint8_t>(domain),
+        std::vector<uint8_t> fingerprintInput{'A', 'K', 'R', 'P', static_cast<uint8_t>(domain),
             static_cast<uint8_t>(config.mode()), static_cast<uint8_t>(consistency.mode), static_cast<uint8_t>(config.failover()),
             static_cast<uint8_t>(consistency.writeConsistency), static_cast<uint8_t>(consistency.ackTimeoutAction),
             static_cast<uint8_t>(consistency.replicaLagAction), static_cast<uint8_t>(membership.mode),
             static_cast<uint8_t>(membership.allowOnlineVoterChanges), static_cast<uint8_t>(membership.allowLearners),
-            static_cast<uint8_t>(RaftBlobPolicy::REJECT), 1};
+            static_cast<uint8_t>(RaftBlobPolicy::REJECT), 1, static_cast<uint8_t>(ClusterTransactionMode::DISABLED)};
+        std::vector<uint8_t> domainPolicy{'F', 'A', 'U', 'L', 'T', 'D', 'O', 'M', 'A', 'I', 'N', 'S'};
+        appendRaftTestInteger(domainPolicy, config.faultDomains().minHosts, 4);
+        appendRaftTestInteger(domainPolicy, config.faultDomains().minSites, 4);
+        domainPolicy.push_back(config.faultDomains().requireSiteQuorum);
+        fingerprintInput.insert(fingerprintInput.begin() + 5, domainPolicy.begin(), domainPolicy.end());
+        appendRaftTestInteger(fingerprintInput, options.requests.maxRetainedResultBytes);
+        if (options.raftGroupKind == RaftGroupKind::DATA || options.raftGroupKind == RaftGroupKind::PARTITION_DATA) {
+            const std::string_view contract = "DATA-RECORD1";
+            fingerprintInput.insert(fingerprintInput.end(), contract.begin(), contract.end());
+        }
         const std::array parts{std::span<const uint8_t>{fingerprintInput}};
         const auto fingerprint = akkaradb::crypto::hash256(parts);
         std::vector<uint8_t> hello;
-        appendRaftTestInteger(hello, 1, 4);
+        appendRaftTestInteger(hello, 2, 4);
         appendRaftTestInteger(hello, sender);
         const auto clusterId = config.clusterId();
         hello.insert(hello.end(), clusterId.begin(), clusterId.end());
         hello.insert(hello.end(), fingerprint.begin(), fingerprint.end());
         hello.push_back(static_cast<uint8_t>(RaftBlobPolicy::REJECT)); hello.push_back(0);
         appendRaftTestInteger(hello, ClusterRuntimeOptions{}.requests.maxRetentionMs);
-        appendRaftTestInteger(hello, ClusterRuntimeOptions{}.requests.maxTrackedRequests, 4);
+        appendRaftTestInteger(hello, ClusterRuntimeOptions{}.requests.maxPendingRequests, 4);
+        std::vector<uint8_t> group{'A', 'K', 'R', 'G', '1'};
+        group.insert(group.end(), clusterId.begin(), clusterId.end());
+        appendRaftTestInteger(group, options.clusterGroupId);
+        group.push_back(static_cast<uint8_t>(options.raftGroupKind));
+        appendRaftTestInteger(group, options.raftPartitionIndex, 4);
+        const std::array groupParts{std::span<const uint8_t>{group}};
+        const auto identity = akkaradb::crypto::hash256(groupParts);
+        hello.insert(hello.end(), identity.begin(), identity.end()); hello.push_back(channelKind);
         AKK_CLUSTER_CHECK(socket.send(encodeFrame(ReplMsgType::RAFT_PEER_HELLO, hello)));
         const auto response = socket.receiveFrame();
         AKK_CLUSTER_CHECK(response.type == ReplMsgType::RAFT_PEER_HELLO_RESPONSE && response.payload.size() == 1);
-        AKK_CLUSTER_CHECK(response.payload[0] == (domain == '1' ? 0 : 3));
+        AKK_CLUSTER_CHECK(response.payload[0] == expectedStatus);
     }
 
     DecodedFrame probeRaftTestPeer(const RaftTestSocket& socket, uint64_t term, uint64_t candidate, uint64_t index, uint64_t logTerm,
@@ -4469,7 +4563,7 @@ namespace {
         RaftTestSocket voter, learner, oldProtocol;
         openRaftTestPeer(voter, 24711, 2, config);
         openRaftTestPeer(learner, 24711, 4, config);
-        openRaftTestPeer(oldProtocol, 24711, 3, config, '2');
+        openRaftTestPeer(oldProtocol, 24711, 3, config, '1', {}, 0, 3);
         auto check = [](const DecodedFrame& response, uint64_t term, bool granted) {
             AKK_CLUSTER_CHECK(response.type == ReplMsgType::RAFT_PRE_VOTE_RESPONSE && response.payload.size() == 9);
             AKK_CLUSTER_CHECK(readU64Le(response.payload, 0) == term && response.payload[8] == static_cast<uint8_t>(granted));
@@ -5135,6 +5229,12 @@ namespace {
         table->put(bytesOf("removed"), bytesOf("present"), 2);
 
         MemTable::KeyRange range;
+        auto reader = std::optional{table->pinnedIterator(range, [] { return uint64_t{2}; })};
+        auto deferred = std::async(std::launch::async, [&] {
+            return table->sealAndPinMemoryIterator(range, 2, true, 16 * 1024 * 1024, 1, false, false);
+        });
+        const auto returned = deferred.wait_for(std::chrono::seconds{1}) == std::future_status::ready;
+        reader.reset(); AKK_CLUSTER_CHECK(returned && !deferred.get());
         auto first = table->sealAndPinMemoryIterator(range, 2, true, 16 * 1024 * 1024, 1);
         AKK_CLUSTER_CHECK(first.has_value());
         table->put(bytesOf("key"), bytesOf("new"), 3);
@@ -5164,6 +5264,7 @@ namespace {
 
         auto blocker = table->sealAndPinMemoryIterator(range, 5, true, 16 * 1024 * 1024, 1);
         AKK_CLUSTER_CHECK(blocker.has_value());
+        AKK_CLUSTER_CHECK(!table->sealAndPinMemoryIterator(range, 5, true, 16 * 1024 * 1024, 1, false, false));
         auto waiting = std::async(std::launch::async, [&] {
             return table->sealAndPinMemoryIterator(range, 5, true, 16 * 1024 * 1024, 1);
         });
@@ -5282,7 +5383,7 @@ namespace {
         AKK_CLUSTER_CHECK(server->replicaCount() == 2);
         for (size_t i = 0; i < clients.size(); ++i) {
             AKK_CLUSTER_CHECK(clients[i]->connected());
-            AKK_CLUSTER_CHECK(clients[i]->lastSuccessfulContactAtUs() == initialContacts[i]);
+            AKK_CLUSTER_CHECK(clients[i]->lastSuccessfulContactAtUs() > initialContacts[i]);
         }
         server->shipEntry(1, ReplOpType::PUT, bytesOf("large"), bytesOf(value), 0, 1);
         AKK_CLUSTER_CHECK(applied.load() == 2);
@@ -5379,7 +5480,7 @@ namespace {
         local->runtime->start();
         AKK_CLUSTER_CHECK(waitUntil([&] { return peer->replicaCount() == 1; }));
         auto read = std::async(std::launch::async, [&] {
-            return local->runtime->readKeyFromNode(2, bytesOf("blocked"), 0);
+            return local->runtime->readLocalStorageFromNode(2, bytesOf("blocked"), 0);
         });
         AKK_CLUSTER_CHECK(enteredFuture.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
         auto stats = std::async(std::launch::async, [&] { return local->runtime->raftStats(); });
@@ -5541,7 +5642,7 @@ namespace {
         options.clusterGroupEpoch = 1;
         auto runtime = makeRuntime(dir / "n1", cfg, 1, options);
         runtime->runtime->start();
-        const auto response = runtime->runtime->readKeyFromNode(2, bytesOf("unreachable"), 0);
+        const auto response = runtime->runtime->readLocalStorageFromNode(2, bytesOf("unreachable"), 0);
         AKK_CLUSTER_CHECK(response.status == ReadStatus::ERROR_STATUS);
         const auto stats = runtime->runtime->raftStats();
         AKK_CLUSTER_CHECK(stats.health == akkaradb::engine::ClusterHealthState::DEGRADED);
@@ -5567,8 +5668,9 @@ namespace {
         options.cluster.config = ClusterConfig{{node(1, 23101, 23201)}, ReplicationMode::MIRROR, {},
             ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 2000}};
         options.cluster.runtime.requests.enabled = true;
-        options.cluster.runtime.requests.maxTrackedRequests = 2;
-        options.cluster.runtime.requests.maxRetentionMs = 60'000;
+        options.cluster.runtime.requests.maxPendingRequests = 3;
+        options.cluster.runtime.requests.maxRetainedResultBytes = 3 * 138;
+        options.cluster.runtime.requests.defaultRetentionMs = 60'000; options.cluster.runtime.requests.maxRetentionMs = 60'000;
         options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
         options.cluster.runtime.raftSnapshot.minLogEntries = 1;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
@@ -5605,7 +5707,7 @@ namespace {
         AKK_CLUSTER_CHECK(observed.cluster.configuredNodes.front().replPort == 23201);
         AKK_CLUSTER_CHECK(observed.cluster.raftEnabled && observed.cluster.raftTerm != 0 && observed.cluster.leaderNodeId == 1);
         AKK_CLUSTER_CHECK(observed.cluster.commitIndex >= first.logIndex && observed.cluster.appliedIndex >= first.logIndex);
-        AKK_CLUSTER_CHECK(observed.cluster.retainedRequestResults == 1 && observed.cluster.requestCapacity == 2);
+        AKK_CLUSTER_CHECK(observed.cluster.retainedRequestResults == 1 && observed.cluster.requestCapacity == 3);
         AKK_CLUSTER_CHECK(observed.cluster.requestJournalRecords >= 1 && observed.cluster.requestJournalBytes > 0);
         AKK_CLUSTER_CHECK(observed.cluster.requestJournalBytesWrittenTotal == observed.cluster.requestJournalBytes);
         bool conflict = false;
@@ -5631,7 +5733,7 @@ namespace {
         AKK_CLUSTER_CHECK(engine->removeWithRequest(removeId, bytesOf("once")).status == ClusterRequestStatus::APPLIED);
         AKK_CLUSTER_CHECK(engine->stats().removesTotal == 1);
         observed = engine->stats();
-        AKK_CLUSTER_CHECK(observed.cluster.retainedRequestResults == 2);
+        AKK_CLUSTER_CHECK(observed.cluster.retainedRequestResults == 3);
         AKK_CLUSTER_CHECK(observed.cluster.requestJournalRecords >= 2);
         AKK_CLUSTER_CHECK(observed.cluster.requestJournalBytesWrittenTotal < observed.cluster.requestJournalBytes * 2);
         bool full = false;
@@ -5651,7 +5753,7 @@ namespace {
         bool corruptRejected = false;
         try { (void)akkaradb::engine::AkkEngine::open(options); }
         catch (const std::runtime_error& error) {
-            corruptRejected = std::string_view{error.what()}.find("request journal") != std::string_view::npos;
+            corruptRejected = std::string_view{error.what()}.find("result checkpoint") != std::string_view::npos;
         }
         AKK_CLUSTER_CHECK(corruptRejected);
     }
@@ -5666,10 +5768,10 @@ namespace {
         };
         ClusterRuntimeOptions matching;
         matching.requests.enabled = true;
-        matching.requests.maxRetentionMs = 60'000;
-        matching.requests.maxTrackedRequests = 32;
+        matching.requests.defaultRetentionMs = 60'000; matching.requests.maxRetentionMs = 60'000;
+        matching.requests.maxPendingRequests = 32;
         auto mismatched = matching;
-        mismatched.requests.maxTrackedRequests = 33;
+        mismatched.requests.maxPendingRequests = 33;
         auto n1 = makeRuntime(root / "n1", cfg, 1, matching);
         auto n2 = makeRuntime(root / "n2", cfg, 2, matching);
         auto n3 = makeRuntime(root / "n3", cfg, 3, mismatched);
@@ -5792,8 +5894,8 @@ namespace {
         options.cluster.config = ClusterConfig{{node(1, 23311, 23411)}, ReplicationMode::MIRROR, {},
             ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 2000}};
         options.cluster.runtime.requests.enabled = true;
-        options.cluster.runtime.requests.maxTrackedRequests = 16;
-        options.cluster.runtime.requests.maxRetentionMs = 60'000;
+        options.cluster.runtime.requests.maxPendingRequests = 16;
+        options.cluster.runtime.requests.defaultRetentionMs = 60'000; options.cluster.runtime.requests.maxRetentionMs = 60'000;
         writeNodeIdFile(dir / "node.id", 1);
         auto engine = akkaradb::engine::AkkEngine::open(options);
         AKK_CLUSTER_CHECK(waitUntil([&] { return engine->stats().cluster.role == static_cast<uint32_t>(NodeRole::PRIMARY); }));
@@ -5912,10 +6014,15 @@ namespace {
         AKK_CLUSTER_CHECK(n3->queryRequest(id).status == ClusterRequestStatus::APPLIED);
         n1->close();
         n2->close();
-        const auto timedId = n3->newRequestId();
+        ClusterRequestId timedId;
         bool failed = false;
-        try { (void)n3->putWithRequest(timedId, bytesOf("timeout-once"), bytesOf("first")); }
-        catch (const std::runtime_error&) { failed = true; }
+        try { n3->put(bytesOf("timeout-once"), bytesOf("first")); }
+        catch (const ClusterRoutingError& error) {
+            AKK_CLUSTER_CHECK(error.outcomeUnknown() && error.requestId.has_value());
+            timedId = *error.requestId; failed = true;
+            const auto json = routingErrorJson(error);
+            AKK_CLUSTER_CHECK(json.find("expiresAtUnixMs") != std::string::npos && json.find("nonce") != std::string::npos);
+        }
         AKK_CLUSTER_CHECK(failed);
         bool queryFailed = false;
         try { (void)n3->queryRequest(timedId); }
@@ -7053,7 +7160,9 @@ namespace {
         );
         std::atomic<uint64_t> lastSeq{0};
         std::atomic<uint64_t> entryCount{0};
+        std::atomic<uint64_t> durableSeq{0};
         auto client = ReplicationClient::create("127.0.0.1", port, 2, [&] { return lastSeq.load(); }, ack, options);
+        client->setForceDurableCallback([&] { durableSeq.store(lastSeq.load()); });
         client->setSnapshotCallbacks(
             [&](uint64_t seq, uint64_t count) {
                 AKK_CLUSTER_CHECK(seq == 8);
@@ -7077,7 +7186,7 @@ namespace {
         server->start();
         client->start();
         AKK_CLUSTER_CHECK(waitUntil([&] {
-            return server->replicaCount() == 1 && lastSeq.load() == 8 && entryCount.load() == 8;
+            return server->replicaCount() == 1 && lastSeq.load() == 8 && entryCount.load() == 8 && durableSeq.load() == 8;
         }));
 
         client->close();
@@ -7400,7 +7509,8 @@ namespace {
         try {
             engine->put(bytesOf(key), bytesOf(value));
         }
-        catch (const std::runtime_error&) {
+        catch (const ClusterRoutingError& error) {
+            AKK_CLUSTER_CHECK(error.outcomeUnknown() && !error.requestId);
             rejected = true;
         }
         AKK_CLUSTER_CHECK(rejected);
@@ -8600,6 +8710,31 @@ namespace {
 #include "detail/cluster_log_retention_test.inc"
 #include "detail/cluster_mirror_recovery_test.inc"
 #include "detail/cluster_parallelism_test.inc"
+#include "detail/cluster_availability_options_test.inc"
+#include "detail/cluster_transactions_test.inc"
+#include "detail/cluster_transaction_concurrency_test.inc"
+#include "detail/cluster_transaction_scaling_test.inc"
+#include "detail/cluster_raft_contract_test.inc"
+#include "detail/cluster_storage_contract_test.inc"
+#include "detail/cluster_transaction_stripe_storage_test.inc"
+#include "detail/cluster_node_resources_test.inc"
+#include "detail/cluster_fault_domains_test.inc"
+#include "detail/cluster_nonraft_requests_test.inc"
+#include "detail/cluster_local_request_test.inc"
+#include "detail/cluster_global_queries_test.inc"
+#include "detail/cluster_retention_and_failure_test.inc"
+#include "detail/cluster_p1_regressions_test.inc"
+#include "detail/cluster_commit_visibility_test.inc"
+#include "detail/cluster_integrity_regressions_test.inc"
+#include "detail/cluster_recovery_history_test.inc"
+#include "detail/cluster_snapshot_boundary_test.inc"
+#include "detail/cluster_stripe_read_consistency_test.inc"
+#include "detail/cluster_connection_deadline_test.inc"
+#include "detail/cluster_nonraft_liveness_test.inc"
+#include "detail/cluster_p1_safety_test.inc"
+#include "detail/cluster_apply_recovery_test.inc"
+#include "detail/cluster_recovery_fencing_test.inc"
+#include "detail/cluster_reconnect_integrity_test.inc"
 
     void testRaftEngineLeadershipTransferApi() {
         const auto dir = makeTempDir("raft-engine-leader-transfer-api");
@@ -8967,11 +9102,47 @@ int main(int argc, char** argv) {
         akkaradb::test::installMsvcTestErrorHandlers();
         enableDeterministicRaftElection();
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
+        if (argc == 2 && std::string_view{argv[1]} == "--partition-recovery-safety") {
+            testPartitionRecoveryProgressSafety(false); testPartitionRecoveryProgressSafety(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--transaction-term-safety") {
+            testTransactionDecisionTermFence(true); testTransactionDecisionTermFence(false); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-storage-contract") { runRaftStorageContractTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--transaction-storage-contract") { runTransactionStorageTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-storage-contract") { runStripeStorageTests(); return 0; }
         if (argc == 4 && std::string_view{argv[1]} == "--retention-snapshot-receiver") { return runRetainedHistorySnapshotReceiver(argv[3], argv[2]); }
         if (argc == 4 && std::string_view{argv[1]} == "--stripe-crash-writer") { return runStripeCrashWriter(argv[2], argv[3]); }
+        if (argc == 4 && std::string_view{argv[1]} == "--cluster-transaction-crash-writer") { return runClusterTransactionCrashWriter(argv[2], argv[3]); }
         if (argc == 4 && std::string_view{argv[1]} == "--raft-log-crash-writer") { return runRaftLogCrashWriter(argv[2], argv[3]); }
+        if (argc == 4 && std::string_view{argv[1]} == "--local-request-crash-writer") { return runLocalRequestCrashWriter(argv[2], argv[3]); }
         if (argc == 4 && std::string_view{argv[1]} == "--retry-crash-writer") { return runRetryCrashWriter(argv[2], argv[3]); }
+        if (argc == 4 && std::string_view{argv[1]} == "--raft-apply-recovery-writer") { return runRaftApplyRecoveryWriter(argv[2], argv[3]); }
         const auto executable = std::filesystem::absolute(argv[0]);
+        if (argc == 2 && std::string_view{argv[1]} == "--nonraft-close-ack") { runNonRaftCloseAcknowledgementTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-apply-recovery") { testRaftApplyRecoveryHistory(executable); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-failure-retention") {
+            testDiskResultRetention(); testRaftFollowerApplyFailure(); testRaftDurabilityFailure(); testNativeApplyFailureRejectsReads(false); testNativeApplyFailureRejectsReads(true); testClosingCannotAcknowledgeSkippedApplication(); testMemorySnapshotDoesNotBlockConsensus(); testRetainedTransactionByteAdmission(); testRequestResultBytePolicy(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-retained-requests") { testRetainedRequestsBeyondPendingLimit(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-retained-transactions") { testRetainedTransactionsBeyondOldLimit(); return 0; }
+
+        if (argc == 2 && std::string_view{argv[1]} == "--global-query-conflicts") {
+            testGlobalQueryValidation(); testGlobalQuerySingleSourceWrites();
+            testGlobalQueryWriteBarrier(false); testGlobalQueryWriteBarrier(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--transaction-recovery-diagnostics") {
+            testClusterTransactionRecoveryDiagnostics(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-query-consistency") { runGlobalQueryConsistencyTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-query-delivery") { runGlobalQueryDeliveryTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-query-mirror") { runGlobalQueryMirrorTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-query-stripe") { runGlobalQueryStripeTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--global-queries") {
+            runGlobalQueryTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--authority-contract") {
             runClusterAuthorityContractTests();
             return 0;
@@ -9040,6 +9211,15 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view{argv[1]} == "--stripe-online") { testStripeOnlinePlacement(); testStripeOnlinePlacement(true); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--local-acceptance-loss") { testMirrorLocalAcceptanceLoss(); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--raid10-online") { testRaid10OnlineSpareReplacement(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-options") {
+            testClusterAvailabilityOptions();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-parity-plain") { testIndependentStripeMetadata(false, false); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-parity-secure") { testIndependentStripeMetadata(false, true); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-mirrors-plain") { testIndependentStripeMetadata(true, false); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-mirrors-secure") { testIndependentStripeMetadata(true, true); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--availability-multiple-spares") { testIndependentStripeMetadata(true, false, true); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--partition-query-parallelism") {
             testPartitionQueryQueueDeadline(); testPartitionQueryParallelism(); return 0;
         }
@@ -9088,6 +9268,21 @@ int main(int argc, char** argv) {
             testRaftEngineLargeBlobSnapshotCatchUp();
             std::fprintf(stderr, "[cluster] testRaftEngineSnapshotStagingCrcRejectsCorruption\n");
             testRaftEngineSnapshotStagingCrcRejectsCorruption();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-snapshot-boundary") {
+            runRaftSnapshotBoundaryTests();
+            testRaftSnapshotCompactionThresholds();
+            testRaftSnapshotInstallForCompactedFollower();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-read-consistency") {
+            testStripeOwnerReadRequiresQuorum(false);
+            testStripeOwnerReadRequiresQuorum(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-snapshot-integrity") {
+            runRaftSnapshotIntegrityTests();
             return 0;
         }
         if (argc == 4 && std::string_view{argv[1]} == "--soak") {
@@ -9221,6 +9416,71 @@ int main(int argc, char** argv) {
             testMirrorQuorumCompletionRecovery(false);
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-contract") {
+            runRaftContractTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-transaction-policy") {
+            testRaftTransactionApplyPolicy(false); testRaftTransactionApplyPolicy(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-p1-regressions") {
+            runClusterP1RegressionTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-recovery-fencing") {
+            runClusterRecoveryFencingTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--reconnect-durable-ack") {
+            testReconnectDurableAcknowledgement(false); testReconnectDurableAcknowledgement(true);
+            testReconnectDurableAcknowledgement(false, true); testAppliedHelloDoesNotAcknowledgeEarlierDurableWrites(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--rollback-catchup-history") {
+            testRollbackCatchupHistory(false); testRollbackCatchupHistory(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-sequence-gap") {
+            testRaftVisibilityAfterRejectedWrite(false); testRaftVisibilityAfterRejectedWrite(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-read-apply-order") {
+            testClusterReadsDuringTransactionApply(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-integrity") {
+            runClusterIntegrityRegressionTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--raft-state-recovery") {
+            testRaftEngineRecoveryIntegrity(); testRaftRecoveryRejectsShardLoss(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-state-recovery") { testStripeEngineRecoveryIntegrity(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--stripe-history-migration") {
+            testStripeMigrationRetainsPeerHistory(false); testStripeMigrationRetainsPeerHistory(true); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-connection-deadline") {
+            runClusterConnectionDeadlineTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--nonraft-liveness") {
+            runNonRaftLivenessTests(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--node-resources") { runClusterNodeResourceTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--node-resources-incoming") { testClusterNodeIncomingResources(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions") {
+            testClusterTransactions(false); testClusterTransactions(true); testClusterTransactions(true, true);
+            testClusterTransactionVisibility(); testClusterTransactionRecovery(executable); testClusterTransactionSnapshots(); return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-visibility") { testClusterTransactionVisibility(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-capacity") { testClusterTransactionCapacity(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-concurrency") { runClusterTransactionConcurrencyTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-concurrency-plain") { testClusterTransactionConcurrency(false); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-concurrency-secure") { testClusterTransactionConcurrency(true); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-reservations") { testClusterTransactionReservations(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-prepare-scaling") { testClusterTransactionPrepareScaling(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-recovery-fairness") { testClusterTransactionRecoveryFairness(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-prepared-snapshot") { testClusterTransactionPreparedSnapshot(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-prepare-integrity") { testClusterTransactionPrepareIntegrity(executable); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-expired-reservation") { testClusterTransactionExpiredReservationFence(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-unused-failure") { testClusterTransactionUnusedPartitionFailure(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-concurrent-capacity") { testClusterTransactionConcurrentCapacity(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-recovery") { testClusterTransactionRecovery(executable); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-snapshots") { testClusterTransactionSnapshots(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-transactions-basic") {
+            testClusterTransactions(false); testClusterTransactions(true); testClusterTransactions(true, true); return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--placement-options-secure") { testStripePlacementOptions(true); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--mirror-recovery") {
             testMirrorRecoveryValidation();
@@ -9269,11 +9529,27 @@ int main(int argc, char** argv) {
             testFileBackedSnapshotTransfer();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--node-resources-transfer") {
+            testChunkedTransferValidation(); testFileBackedSnapshotTransfer();
+            testLargeReplicationTransfer(false); testLargeReplicationTransfer(true); return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--memory-only-snapshot") {
             testRaftOptionsRoundtripAndValidation();
             testMemoryOnlySnapshotModes();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--fault-domains") { testClusterFaultDomains(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--local-request-application") { testLocalRequestApplication(executable); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--request-retention") {
+            testRaftOptionsRoundtripAndValidation();
+            testRetrySafeEngineWrites();
+            testNonRaftEngineRequests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--nonraft-request-storage") { testNonRaftEngineRequests(); testNonRaftRequestForwarding(ReplicationMode::STRIPE); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--request-authority-membership") { testIndependentRequestAuthority(false); testIndependentRequestAuthority(true); testRequestAuthorityRetiringPlacementCaller(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--nonraft-requests") { testNonRaftRequests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--write-outcomes") { testClusterWriteOutcomeContract(); return 0; }
         if (argc == 1 || (argc == 2 && std::string_view{argv[1]} == "--retry-transfer")) {
             std::fprintf(stderr, "[cluster] retry-safe requests\n");
             testRetrySafeEngineWrites();
@@ -9421,6 +9697,12 @@ int main(int argc, char** argv) {
         testNativeMirrorAckForwarding();
         testForwardTimeoutNeverReplays();
         testRaftForwardAdmissionBudget();
+        runClusterP1RegressionTests();
+        runClusterRecoveryFencingTests();
+        runClusterReconnectIntegrityTests();
+        runClusterIntegrityRegressionTests();
+        runClusterConnectionDeadlineTests();
+        runNonRaftLivenessTests();
         testPartitionedEngineOwnerLinearizableRead();
         std::fprintf(stderr, "[cluster] testPartitionedDistributedRollback\n");
         testPartitionedDistributedRollback();
@@ -9481,6 +9763,7 @@ int main(int argc, char** argv) {
         testRaftSnapshotCompactionThresholds();
         std::fprintf(stderr, "[cluster] testRaftSnapshotInstallForCompactedFollower\n");
         testRaftSnapshotInstallForCompactedFollower();
+        runRaftSnapshotBoundaryTests();
         std::fprintf(stderr, "[cluster] testRaftLeaderTransfer\n");
         testRaftLeaderTransfer();
         std::fprintf(stderr, "[cluster] testRaftOnlineMembershipChange\n");

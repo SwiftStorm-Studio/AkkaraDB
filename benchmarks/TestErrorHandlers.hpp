@@ -106,7 +106,12 @@ namespace akkaradb::test {
         routeCrtReportsToStderr();
         _set_invalid_parameter_handler(invalidParameterHandler);
         _set_purecall_handler(purecallHandler);
-        std::set_terminate([] { failFastExit("MSVC TERMINATE"); });
+        std::set_terminate([] {
+            try { if (const auto failure = std::current_exception()) { std::rethrow_exception(failure); } }
+            catch (const std::exception& error) { failFastExit("MSVC TERMINATE", error.what()); }
+            catch (...) { failFastExit("MSVC TERMINATE", "non-standard exception"); }
+            failFastExit("MSVC TERMINATE");
+        });
         std::signal(SIGABRT, signalHandler);
         _CrtSetReportHook(crtReportHook);
     }

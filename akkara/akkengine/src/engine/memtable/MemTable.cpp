@@ -661,12 +661,13 @@ namespace akkaradb::engine::memtable {
                 bool completionFirst,
                 uint64_t maxPinnedBytes,
                 uint32_t maxPinnedGenerations,
-                bool waitForAdmission
+                bool waitForAdmission,
+                bool waitForCapacity
             ) {
                 throwIfFlushFailed();
                 const uint64_t bytes = static_cast<uint64_t>(approxSize());
                 std::unique_lock snapshotLock{memorySnapshotMutex_, std::defer_lock};
-                if (completionFirst || waitForAdmission) { snapshotLock.lock(); }
+                if (waitForCapacity && (completionFirst || waitForAdmission)) { snapshotLock.lock(); }
                 else if (!snapshotLock.try_lock()) { return std::nullopt; }
                 startMemorySnapshotMaintenanceLocked();
 
@@ -676,7 +677,10 @@ namespace akkaradb::engine::memtable {
                     if (bytes > maxPinnedBytes) { return completionFirst && memorySnapshotPins_ == 0; }
                     return memorySnapshotPinnedBytes_ <= maxPinnedBytes - bytes;
                 };
-                if (completionFirst) { memorySnapshotCv_.wait(snapshotLock, hasCapacity); }
+                if (completionFirst && waitForCapacity) {
+                    memorySnapshotCv_.wait(snapshotLock, [&] { return memorySnapshotMaintenanceStopping_ || hasCapacity(); });
+                    if (memorySnapshotMaintenanceStopping_) { throw std::runtime_error("MemTable: snapshot capture cancelled by close"); }
+                }
                 else if (!hasCapacity()) { return std::nullopt; }
 
                 ++memorySnapshotPins_;
@@ -693,7 +697,13 @@ namespace akkaradb::engine::memtable {
                     std::vector<std::shared_ptr<const IMemTable>> sources;
                     while (true) {
                         locks.clear();
-                        for (const auto& shard : shards_) { locks.emplace_back(shard->mutex); }
+                        for (const auto& shard : shards_) {
+                            locks.emplace_back(shard->mutex, std::defer_lock);
+                            if (waitForCapacity) { locks.back().lock(); }
+                            else if (!locks.back().try_lock()) {
+                                locks.clear(); snapshotLock.unlock(); lease.reset(); return std::nullopt;
+                            }
+                        }
 
                         std::fill(needsReplacement.begin(), needsReplacement.end(), false);
                         bool retry = false;
@@ -1180,10 +1190,11 @@ namespace akkaradb::engine::memtable {
         bool completionFirst,
         uint64_t maxPinnedBytes,
         uint32_t maxPinnedGenerations,
-        bool waitForAdmission
+        bool waitForAdmission,
+        bool waitForCapacity
     ) {
         return impl_->sealAndPinMemoryIterator(
-            range, snapshotSeq, completionFirst, maxPinnedBytes, maxPinnedGenerations, waitForAdmission
+            range, snapshotSeq, completionFirst, maxPinnedBytes, maxPinnedGenerations, waitForAdmission, waitForCapacity
         );
     }
 

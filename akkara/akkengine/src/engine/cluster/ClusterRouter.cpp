@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <ranges>
 
 namespace akkaradb::engine::cluster {
     using detail::rendezvousScore;
@@ -37,11 +38,8 @@ namespace akkaradb::engine::cluster {
             case ReplicationMode::MIRROR: return dataNodes;
             case ReplicationMode::PARTITIONED: return partitionTargets(key);
             case ReplicationMode::STRIPE: {
-                std::vector<NodeInfo> out;
                 const auto targets = stripeShardTargets(key);
-                out.reserve(targets.size());
-                for (const auto& target : targets) { out.push_back(target.node); }
-                return out;
+                return targets | std::views::transform(&StripeShardTarget::node) | std::ranges::to<std::vector>();
             }
         }
         throw std::logic_error("ClusterRouter: invalid replication mode");
@@ -58,11 +56,8 @@ namespace akkaradb::engine::cluster {
             case ReplicationMode::MIRROR: return dataNodes;
             case ReplicationMode::PARTITIONED: return partitionTargets(key);
             case ReplicationMode::STRIPE: {
-                std::vector<NodeInfo> out;
                 const auto targets = stripeShardTargets(key);
-                out.reserve(targets.size());
-                for (const auto& target : targets) { out.push_back(target.node); }
-                return out;
+                return targets | std::views::transform(&StripeShardTarget::node) | std::ranges::to<std::vector>();
             }
         }
         throw std::logic_error("ClusterRouter: invalid replication mode");
@@ -72,9 +67,9 @@ namespace akkaradb::engine::cluster {
         const auto view = config_.load();
         const auto& config = *view;
         const auto dataNodes = config.mode() == ReplicationMode::STRIPE ? config.stripePlacementNodes() : config.dataNodes();
-        const uint16_t totalShards = config.stripe().totalShards();
-        const uint8_t copiesPerShard = config.stripe().copiesPerShard;
-        const uint16_t totalPlacements = config.stripe().totalPlacements();
+        const auto totalShards = config.stripe().totalShards();
+        const auto copiesPerShard = config.stripe().copiesPerShard;
+        const auto totalPlacements = config.stripe().totalPlacements();
         if (totalShards == 0) { throw std::runtime_error("ClusterRouter: invalid stripe shard count"); }
         if (dataNodes.size() < totalPlacements) { throw std::runtime_error("ClusterRouter: not enough data-bearing nodes for stripe"); }
 
@@ -84,18 +79,19 @@ namespace akkaradb::engine::cluster {
                 NodeInfo first;
                 NodeInfo second;
             };
+            const auto paired = detail::raidPairNodes(config);
             std::vector<MirrorPair> pairs;
             pairs.reserve(totalShards);
             for (uint16_t i = 0; i < totalShards; ++i) {
-                auto first = dataNodes[i * 2];
-                auto second = dataNodes[i * 2 + 1];
-                const uint64_t firstScore = rendezvousScore(key, first.nodeId);
-                const uint64_t secondScore = rendezvousScore(key, second.nodeId);
+                auto first = paired[i * 2];
+                auto second = paired[i * 2 + 1];
+                const auto firstScore = rendezvousScore(key, first.nodeId);
+                const auto secondScore = rendezvousScore(key, second.nodeId);
                 if (secondScore > firstScore || (secondScore == firstScore && second.nodeId < first.nodeId)) {
                     std::swap(first, second);
                 }
-                const auto pairIds = std::minmax(first.nodeId, second.nodeId);
-                pairs.push_back(MirrorPair{.score = rendezvousScore(key, pairIds.first, pairIds.second), .first = std::move(first), .second = std::move(second)});
+                const auto [firstId, secondId] = std::minmax(first.nodeId, second.nodeId);
+                pairs.push_back(MirrorPair{.score = rendezvousScore(key, firstId, secondId), .first = std::move(first), .second = std::move(second)});
             }
             std::ranges::sort(pairs, [](const auto& left, const auto& right) {
                 if (left.score != right.score) { return left.score > right.score; }
@@ -111,12 +107,12 @@ namespace akkaradb::engine::cluster {
             return out;
         }
 
-        const auto scored = rankNodes(key, dataNodes);
+        const auto selected = detail::placementNodes(key, dataNodes, totalShards, config.faultDomains());
 
         std::vector<StripeShardTarget> out;
         out.reserve(totalShards);
         for (uint16_t i = 0; i < totalShards; ++i) {
-            out.push_back(StripeShardTarget{.shardIndex = i, .replicaIndex = 0, .node = scored[i].second});
+            out.push_back(StripeShardTarget{.shardIndex = i, .replicaIndex = 0, .node = selected[i]});
         }
         return out;
     }

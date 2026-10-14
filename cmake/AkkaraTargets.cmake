@@ -59,6 +59,8 @@ set(AKKENGINE_API_TCP_SOURCES
         "${AKKSERVER_SRC_DIR}/tcp/ApiFraming.cpp"
 )
 set(AKKENGINE_CLUSTER_RUNTIME_SOURCES
+        "${AKKENGINE_SRC_DIR}/engine/cluster/CancellableSocketReader.cpp"
+        "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterConnection.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRuntime.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterManager.cpp"
         "${AKKENGINE_SRC_DIR}/engine/cluster/ClusterRouter.cpp"
@@ -287,7 +289,7 @@ target_include_directories(akkaradb_cluster PRIVATE
         ${AKKENGINE_INCLUDE_DIR}
         ${boost_pfr_SOURCE_DIR}/include
 )
-target_link_libraries(akkaradb_cluster PRIVATE akkaradb)
+target_link_libraries(akkaradb_cluster PRIVATE akkaradb ${CMAKE_DL_LIBS})
 target_compile_definitions(akkaradb_cluster PRIVATE
         AKKARADB_CLUSTER_RUNTIME_BUILD_SHARED
         AKKARADB_TLS_ENABLED

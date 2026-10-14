@@ -74,6 +74,8 @@ namespace akkaradb::engine::cluster {
         TRANSFER_END = 0x19,
         TRANSFER_READY = 0x1A,
         ///< Receiver's durable byte offset for a content-addressed transfer.
+        HEARTBEAT_PING = 0x1B,
+        HEARTBEAT_PONG = 0x1C,
         READ_REQUEST = 0x20,
         ///< Reserved point-in-time read request.
         READ_RESPONSE = 0x21,
@@ -114,7 +116,7 @@ namespace akkaradb::engine::cluster {
      * ReplOpType - Storage mutation represented by ReplEntry.
      */
     enum class ReplOpType : uint8_t {
-        PUT = 1, REMOVE = 2,
+        PUT = 1, REMOVE = 2, TRANSACTION = 3,
     };
 
     /**
@@ -166,6 +168,7 @@ namespace akkaradb::engine::cluster {
         bool forceSnapshot = false;
         ClusterId clusterId{};
         std::array<uint8_t, 32> configFingerprint{};
+        ReplicationLivenessOptions liveness{};
     };
 
     enum class StripeControlAction : uint8_t {
@@ -178,6 +181,8 @@ namespace akkaradb::engine::cluster {
         ROLLBACK_KEY = 6,
         ROLLBACK_STREAM = 7,
         ROLLBACK_APPLY = 8,
+        RECLAIM_GENERATION = 9,
+        GENERATION_RETAINED = 10,
     };
     enum class StripeControlStatus : uint8_t {
         GRANTED = 0, COMMITTED = 1, RELEASED = 2, BUSY = 3, REJECTED = 4, ERROR_STATUS = 5, FOUND = 6, NOT_FOUND = 7, RECONFIGURING = 8,
@@ -210,6 +215,7 @@ namespace akkaradb::engine::cluster {
         MirrorFencingMode mirrorFencingMode = MirrorFencingMode::STATIC;
         ClusterId clusterId{};
         std::array<uint8_t, 32> configFingerprint{};
+        ReplicationLivenessOptions liveness{};
     };
 
     /** Replicated key/value mutation payload. */
@@ -246,10 +252,13 @@ namespace akkaradb::engine::cluster {
         std::vector<uint8_t> value;
     };
 
-    /** Reserved point-in-time read request payload. */
+    enum class ReadKeySpace : uint8_t { PUBLIC = 0, LOCAL_STORAGE = 1 };
+
+    /** Point-in-time read with an explicit key namespace. */
     struct ReadRequest {
         uint64_t requestId = 0;
         uint64_t snapshotSeq = 0;
+        ReadKeySpace keySpace = ReadKeySpace::PUBLIC;
         std::vector<uint8_t> key;
     };
 
@@ -264,7 +273,10 @@ namespace akkaradb::engine::cluster {
 
     inline constexpr size_t MAX_FORWARD_PAYLOAD = ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE;
     inline constexpr size_t FORWARD_REQUEST_BASE_SIZE = 41;
-    enum class ForwardOperation : uint8_t { PUT, REMOVE, PUT_BATCH, GET, PUT_REQUEST, REMOVE_REQUEST, QUERY_REQUEST, READ_QUERY, CLUSTER_ADMIN };
+    enum class ForwardOperation : uint8_t { PUT, REMOVE, PUT_BATCH, GET, PUT_REQUEST, REMOVE_REQUEST, QUERY_REQUEST, READ_QUERY, CLUSTER_ADMIN, TRANSACTION };
+    inline bool forwardMayMutate(ForwardOperation operation) noexcept {
+        return operation != ForwardOperation::GET && operation != ForwardOperation::READ_QUERY && operation != ForwardOperation::QUERY_REQUEST;
+    }
     struct ForwardEntry { std::vector<uint8_t> key, value; };
     inline uint64_t forwardRequestMemoryBytes(std::span<const uint8_t> payload) noexcept {
         if (payload.size() < FORWARD_REQUEST_BASE_SIZE) { return payload.size(); }
@@ -313,6 +325,8 @@ namespace akkaradb::engine::cluster {
 
     /** Encodes a ClientHello frame. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeClientHello(const ClientHello& hello);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeHeartbeat(ReplMsgType type, uint64_t nonce);
+    [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API bool decodeHeartbeat(std::span<const uint8_t> payload, uint64_t& nonce);
 
     /** Encodes a ServerHello frame. */
     [[nodiscard]] AKKARADB_CLUSTER_RUNTIME_API std::vector<uint8_t> encodeServerHello(const ServerHello& hello);

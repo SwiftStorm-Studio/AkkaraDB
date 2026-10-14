@@ -24,7 +24,7 @@ namespace akkaradb::engine::cluster::detail {
     class AKKARADB_CLUSTER_RUNTIME_API TransferBudget : public std::enable_shared_from_this<TransferBudget> {
     public:
         enum class Resource { MEMORY, SPOOL, ACTIVE };
-        explicit TransferBudget(ReplicationTransferOptions options);
+        explicit TransferBudget(ReplicationTransferOptions options, std::shared_ptr<NodeResourceBudget> nodeBudget = {});
         std::shared_ptr<void> reserve(Resource resource, uint64_t amount);
         uint64_t used(Resource resource) const;
         struct Stats {
@@ -38,6 +38,7 @@ namespace akkaradb::engine::cluster::detail {
         const ReplicationTransferOptions options;
     private:
         struct Lease;
+        std::shared_ptr<NodeResourceBudget> nodeBudget_;
         mutable std::mutex mutex_;
         uint64_t memory_ = 0, spool_ = 0, active_ = 0, persistentRemaining_ = 0;
         uint64_t resumeAttempts_ = 0, resumedTransfers_ = 0, resumedBytes_ = 0, discardedPartials_ = 0;
@@ -129,7 +130,8 @@ namespace akkaradb::engine::cluster::detail {
         const std::shared_ptr<TransferBudget>& budget
     );
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr readResponseMessage(const ReadResponse& response, const std::shared_ptr<TransferBudget>& budget);
-    AKKARADB_CLUSTER_RUNTIME_API MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key, const std::shared_ptr<TransferBudget>& budget);
+    AKKARADB_CLUSTER_RUNTIME_API MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key,
+        const std::shared_ptr<TransferBudget>& budget, ReadKeySpace keySpace = ReadKeySpace::PUBLIC);
     AKKARADB_CLUSTER_RUNTIME_API MessagePtr blobMessage(uint64_t seq, uint64_t id, std::span<const uint8_t> value, const std::shared_ptr<TransferBudget>& budget);
 
     struct EntryView {

@@ -1,5 +1,5 @@
 // Snapshot stability, writer progress, quota release and lazy history lifetime.
-void testQueryDeliverySnapshots(bool streaming) {
+void testQueryDeliverySnapshots(bool streaming, bool global = false) {
     using Engine = akkaradb::engine::AkkEngine;
     using namespace std::chrono_literals;
     const auto dir = makeTempDir("query-delivery");
@@ -12,10 +12,12 @@ void testQueryDeliverySnapshots(bool streaming) {
     auto& policy = options.cluster.runtime;
     policy.transportMode = TransportMode::PLAIN;
     policy.queryResultMode = streaming ? QueryResultMode::STREAMING : QueryResultMode::PREPARED;
+    policy.queryConsistencyMode = global ? QueryConsistencyMode::GLOBAL_SNAPSHOT : QueryConsistencyMode::PER_PARTITION;
     policy.queryMaxSpoolBytes = streaming ? 64 : 1024 * 1024;
     policy.queryMaxPinnedSnapshots = 1;
     policy.querySnapshotAdmission = QuerySnapshotAdmission::REJECT;
-    policy.queryCursorIdleTimeoutMs = 1000;
+    // Writer progress is allowed three seconds before consuming the cursor.
+    policy.queryCursorIdleTimeoutMs = 5000;
     writeNodeIdFile(dir / "node.id", 1);
     auto engine = Engine::open(options);
     Engine* nodes[]{engine.get()};
@@ -67,7 +69,7 @@ void testQueryDeliverySnapshots(bool streaming) {
     }
 }
 
-void testPartitionQueryDelivery() {
+void testPartitionQueryDelivery(bool global = false) {
     using Engine = akkaradb::engine::AkkEngine;
     using namespace std::chrono_literals;
     const auto dir = makeTempDir("partition-query-delivery");
@@ -87,6 +89,7 @@ void testPartitionQueryDelivery() {
         options.cluster.runtime.routingMode = ClusterRoutingMode::FORWARD;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
         options.cluster.runtime.queryResultMode = QueryResultMode::STREAMING;
+        options.cluster.runtime.queryConsistencyMode = global ? QueryConsistencyMode::GLOBAL_SNAPSHOT : QueryConsistencyMode::PER_PARTITION;
         writeNodeIdFile(options.paths.dataDir / "node.id", i + 1);
         engines[i] = Engine::open(options);
     }

@@ -95,6 +95,9 @@ namespace akkaradb::engine::cluster {
         uint64_t clusterGroupId = 0;
         uint64_t clusterGroupEpoch = 0;
         ClusterHealthState health = ClusterHealthState::HEALTHY;
+        ClusterOperationAvailability quorumAvailability = ClusterOperationAvailability::UNKNOWN;
+        ClusterOperationAvailability writeAvailability = ClusterOperationAvailability::UNKNOWN;
+        ClusterOperationAvailability linearizableReadAvailability = ClusterOperationAvailability::UNKNOWN;
         ClusterFailureCode lastFailure = ClusterFailureCode::NONE;
         uint64_t lastFailureAtUs = 0;
         uint64_t currentTerm = 0;
@@ -116,10 +119,16 @@ namespace akkaradb::engine::cluster {
         bool mirrorWritePending = false;
         uint64_t outboundConnections = 0;
         uint64_t peerWorkers = 0;
+        uint64_t incomingConsensusConnections = 0, incomingForwardConnections = 0, incomingControlConnections = 0;
+        uint64_t forwardReceiveMemoryBytes = 0, controlReceiveMemoryBytes = 0;
+        uint64_t nodeRaftReceiveMemoryBytes = 0, nodeForwardReceiveMemoryBytes = 0;
+        uint64_t nodeOutgoingForwardRequests = 0, nodeIncomingForwardRequests = 0;
+        uint64_t nodeTransferMemoryBytes = 0, nodeActiveTransfers = 0;
         uint64_t proposalBatches = 0;
         uint64_t proposalQueueDepth = 0;
         uint64_t pendingProposals = 0;
         uint64_t retainedRequestResults = 0;
+        uint64_t retainedRequestResultBytes = 0, requestResultByteLimit = 0;
         uint64_t pendingRequests = 0;
         uint64_t requestCapacity = 0;
         uint64_t expiredRequests = 0;
@@ -147,9 +156,17 @@ namespace akkaradb::engine::cluster {
     };
 
     struct AKDB_API ClusterEngineCallbacks {
+        // Engine-derived 2PC apply contract.
+        uint64_t transactionMaxJournalBytes = 0; ///< Zero when 2PC is disabled.
+        uint64_t transactionBlobThresholdBytes = 0; ///< Effective Blob threshold; zero when Blob storage is disabled.
+        std::function<void(uint64_t sequence, std::span<const uint8_t>)> applyTransactionControl;
+        std::function<ClusterSnapshot(uint64_t)> exportTransactionSnapshot;
+        std::function<void(const ClusterSnapshot&)> installTransactionSnapshot;
         // Executes one public operation at its destination. Never forwards again.
         std::function<ForwardResponse(const ForwardRequest&)> forward;
         std::function<uint64_t()> getCurrentSeq;
+        // Highest recovered storage sequence; it does not replace Raft's durable
+        // application marker or prove that every application side effect is durable.
         std::function<uint64_t()> getLastSeq;
         // The leader of the stable per-key Raft group, or zero while unknown.
         std::function<uint64_t(std::span<const uint8_t>)> partitionLeader;
@@ -158,6 +175,7 @@ namespace akkaradb::engine::cluster {
         // Returns a complete, contiguous (afterSeq, throughSeq] mutation range,
         // or nullopt when the retained WAL cannot satisfy the request.
         std::function<std::optional<std::vector<ClusterHistoryEntry>>(uint64_t afterSeq, uint64_t throughSeq)> getEntries;
+        // Capture must not wait for pin or write admission; return nullopt to retry.
         std::function<std::optional<ClusterSnapshot>()> exportSnapshot;
         // Replaces only this owner's PARTITIONED keys using local storage sequences.
         // The completed producer is repeatable; return only after durable install.
@@ -173,6 +191,10 @@ namespace akkaradb::engine::cluster {
         std::function<void(uint64_t snapshotSeq, uint64_t entryCount)> finishSnapshot;
         std::function<void(uint64_t snapshotSeq)> recoverSnapshot;
         std::function<bool(uint64_t snapshotSeq)> isSnapshotDurable;
+        // Committed mutations may be replayed after interrupted application.
+        // Reapplication must preserve newer heads and repair missing side effects
+        // idempotently. Return normally only after actually applying the mutation;
+        // closed/rejected application must throw so no success ACK can follow.
         std::function<void(
             uint64_t seq,
             ReplOpType op,
@@ -183,19 +205,35 @@ namespace akkaradb::engine::cluster {
             uint64_t timestampNs
         )> apply;
         std::function<ReadResponse(std::span<const uint8_t> key, uint64_t snapshotSeq)> read;
+        // Physical keys, including STRIPE metadata/shards, require a separate callback.
+        std::function<ReadResponse(std::span<const uint8_t> key, uint64_t snapshotSeq)> readLocalStorage;
         // Applies an authoritative STRIPE metadata entry after the metadata
         // Raft leader validates its fencing token and reaches quorum commit.
-        std::function<void(uint64_t logicalSeq, std::span<const uint8_t> publicKey, std::span<const uint8_t> metadata)> commitStripeMetadata;
+        // Returns the durable local storage sequence containing this metadata.
+        std::function<uint64_t(uint64_t logicalSeq, std::span<const uint8_t> publicKey, std::span<const uint8_t> metadata)> commitStripeMetadata;
         std::function<std::optional<std::vector<uint8_t>>(std::span<const uint8_t> publicKey)> readStripeMetadata;
+        // Includes fixed query pins and locally retained metadata history.
+        std::function<std::optional<bool>(std::span<const uint8_t> publicKey, uint64_t generation)> stripeGenerationRetained;
+        // Executed only by the metadata leader under a fenced per-key reservation.
+        std::function<bool(std::span<const uint8_t> publicKey, std::span<const uint8_t> metadata,
+            const std::function<bool()>& retainedByPeers)> reclaimStripeGeneration;
         // Fixed cut of STRIPE metadata heads, retained revisions and placement aliases.
         std::function<std::optional<ClusterSnapshot>(uint64_t sequence)> exportStripeMetadataSnapshot;
-        std::function<void(const ClusterSnapshot&, uint64_t afterAuthoritySequence)> installStripeMetadataSnapshot;
+        // Returns the receiver's durable local storage sequence, never the sender's.
+        std::function<uint64_t(const ClusterSnapshot&, uint64_t afterAuthoritySequence)> installStripeMetadataSnapshot;
         // Node-to-node rollback/checkpoint control. The framing reuses the
         // bounded STRIPE control envelope and inherits the selected transport's
         // authentication properties; these actions are available to every
         // partition owner.
         std::function<StripeControlResponse(uint64_t requesterNodeId, const StripeControlRequest&)> rollbackControl;
         std::function<void()> forceDurable;
+        // Sync and capture the local applied sequence under storage write admission.
+        // Non-Raft PARTITIONED binds peer progress to this durable storage boundary.
+        std::function<uint64_t()> checkpointReplication;
+        // Latches a terminal state-machine failure; must not re-enter the runtime.
+        std::function<void(std::exception_ptr)> fatalFailure;
+        // Leave all Blob callbacks empty when storage is disabled. Data RAFT_LOG
+        // binds the complete begin/append/finish capability to peer and durable state compatibility.
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c)> beginBlob;
         std::function<void(uint64_t seq, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk)> appendBlobChunk;
         std::function<void(uint64_t seq, uint64_t blobId)> finishBlob;
@@ -251,6 +289,12 @@ namespace akkaradb::engine::cluster {
             virtual void queryReadBarrier() {
                 throw std::runtime_error("IClusterRuntime: cluster query read barrier is unsupported");
             }
+            [[nodiscard]] virtual uint64_t transactionLeaderNodeId() const { return 0; }
+            // The confirmed term fences validation until proposal admission.
+            virtual uint64_t transactionReadBarrier() { throw std::logic_error("IClusterRuntime: transactions are unsupported"); }
+            virtual ClusterMutationSubmission submitTransactionControl(ClusterMutationFactory, uint64_t) {
+                throw std::logic_error("IClusterRuntime: transactions are unsupported");
+            }
             [[nodiscard]] virtual uint64_t ownerNodeId(std::span<const uint8_t>) const { return 0; }
             [[nodiscard]] virtual uint64_t configurationEpoch() const noexcept { return 1; }
             [[nodiscard]] virtual uint64_t stripeMetadataLinearizableWatermark() {
@@ -262,8 +306,9 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] virtual ReadResponse readKey(std::span<const uint8_t>, uint64_t) {
                 throw std::runtime_error("IClusterRuntime: cluster reads are not supported");
             }
-            [[nodiscard]] virtual ReadResponse readKeyFromNode(uint64_t, std::span<const uint8_t>, uint64_t) {
-                throw std::runtime_error("IClusterRuntime: targeted cluster reads are not supported");
+            /** Physical storage read; STRIPE shard keys are never interpreted as public keys. */
+            [[nodiscard]] virtual ReadResponse readLocalStorageFromNode(uint64_t, std::span<const uint8_t>, uint64_t) {
+                throw std::runtime_error("IClusterRuntime: targeted local storage reads are not supported");
             }
             [[nodiscard]] virtual StripeOperationLease acquireStripeOperation(std::span<const uint8_t>, uint64_t ownerNodeId) {
                 return {.ownerNodeId = ownerNodeId, .authorityNodeId = ownerNodeId, .fenceToken = 0, .coordinated = false, .metadata = {}};
@@ -272,7 +317,7 @@ namespace akkaradb::engine::cluster {
                 throw std::runtime_error("IClusterRuntime: coordinated STRIPE metadata is not supported");
             }
             virtual void releaseStripeOperation(const StripeOperationLease&, std::span<const uint8_t>) noexcept {}
-            [[nodiscard]] virtual uint64_t stripeFailoverNodeId() const noexcept { return 0; }
+            [[nodiscard]] virtual uint64_t stripeFailoverNodeId(std::span<const uint8_t>) const noexcept { return 0; }
             [[nodiscard]] virtual uint64_t stripeMetadataLeaderNodeId() const noexcept { return 0; }
             [[nodiscard]] virtual bool stripeNodeReachable(uint64_t) const noexcept { return false; }
             [[nodiscard]] virtual std::optional<std::vector<uint8_t>> readStripeMetadata(std::span<const uint8_t>, uint64_t) {
@@ -280,6 +325,9 @@ namespace akkaradb::engine::cluster {
             }
             virtual bool repairStripeMetadata(std::span<const uint8_t>, uint64_t, std::span<const uint8_t>) {
                 throw std::runtime_error("IClusterRuntime: coordinated STRIPE metadata repair is not supported");
+            }
+            virtual bool reclaimStripeGeneration(std::span<const uint8_t>, std::span<const uint8_t>) {
+                throw std::runtime_error("IClusterRuntime: coordinated STRIPE reclamation is not supported");
             }
             virtual void shipEntry(
                 uint64_t seq,
@@ -296,14 +344,19 @@ namespace akkaradb::engine::cluster {
             ) { throw std::runtime_error("IClusterRuntime: async proposal admission is not supported"); }
             // Assigns the state-machine sequence, invokes prepare synchronously,
             // and commits its optional Blob and mutation in one Raft proposal.
-            virtual ClusterMutationSubmission submitMutation(ClusterMutationFactory) {
+            // A nonzero expectedTerm rejects stale validation before preparation or append.
+            virtual ClusterMutationSubmission submitMutation(ClusterMutationFactory, uint64_t = 0) {
                 throw std::runtime_error("IClusterRuntime: runtime-assigned mutation admission requires Raft");
             }
             virtual std::shared_future<ClusterRequestResult> submitRequest(
-                const ClusterRequestId&, const std::array<uint8_t, 32>&, ClusterMutationFactory
+                const ClusterRequestId&, const std::array<uint8_t, 32>&, ClusterMutationFactory, uint64_t = 0
             ) { throw std::runtime_error("IClusterRuntime: retry-safe requests require Raft"); }
             virtual ClusterRequestResult queryRequest(const ClusterRequestId&) {
                 throw std::runtime_error("IClusterRuntime: retry-safe requests require Raft");
+            }
+            virtual ClusterRequestResult executeRequest(const ClusterRequestId&, const std::array<uint8_t, 32>&,
+                const std::function<uint64_t()>&) {
+                throw std::logic_error("IClusterRuntime: non-Raft request authority is unavailable");
             }
             virtual void shipEntryTo(
                 uint64_t targetNodeId,
@@ -351,6 +404,9 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] virtual MirrorRecoveryMode mirrorRecoveryMode() const noexcept { return MirrorRecoveryMode::BLOCK; }
             virtual void transferMirrorAuthorityLeadership(uint64_t) {
                 throw std::runtime_error("IClusterRuntime: MIRROR authority quorum is not enabled");
+            }
+            virtual void reconfigureRequestAuthority(const std::vector<NodeInfo>&) {
+                throw std::logic_error("IClusterRuntime: non-Raft request authority is not enabled");
             }
             virtual void promoteRaftLearner(uint64_t) {
                 throw std::runtime_error("ClusterRuntimeProvider: Raft learners are unsupported");

@@ -20,12 +20,14 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "akk/crypto/Identity.hpp"
 
 namespace akkaradb::engine::cluster {
+    namespace detail { class NodeResourceBudget; }
     using ClusterId = std::array<uint8_t, 16>;
 
     /**
@@ -95,7 +97,8 @@ namespace akkaradb::engine::cluster {
         DATA_BEARING = 1u << 1,
         ///< Node can store key/value data and receive routed writes.
         STRIPE_FAILOVER_ELIGIBLE = 1u << 2,
-        ///< Sole STRIPE node allowed to replace an unavailable owner; RAID.10 uses it as its shared hot spare.
+        ///< STRIPE owner-failover candidate; RAID.10 excludes candidates from normal mirror pairs.
+        STRIPE_METADATA_VOTER = 1u << 5, ///< Explicit STRIPE metadata voter; may omit DATA_BEARING.
         PLACEMENT_STANDBY = 1u << 4, ///< STRIPE node joins as metadata learner without storing new placements.
         RAFT_LEARNER = 1u << 3,
         ///< Initial non-voting Raft member; committed membership controls subsequent promotion.
@@ -212,10 +215,15 @@ namespace akkaradb::engine::cluster {
         RaftMembershipOptions membership;
     };
 
+    enum class StripeMetadataPlacement : uint8_t { DATA_NODES, EXPLICIT_VOTERS };
+    enum class StripeFailoverPolicy : uint8_t { SINGLE_CANDIDATE, MULTIPLE_CANDIDATES };
+
     struct AKDB_API StripeOptions {
         uint8_t dataShards = 4;
         uint8_t parityShards = 2;
         uint8_t copiesPerShard = 1;
+        StripeMetadataPlacement metadataPlacement = StripeMetadataPlacement::DATA_NODES;
+        StripeFailoverPolicy failoverPolicy = StripeFailoverPolicy::SINGLE_CANDIDATE;
 
         [[nodiscard]] uint16_t totalShards() const noexcept {
             return static_cast<uint16_t>(dataShards) + static_cast<uint16_t>(parityShards);
@@ -224,6 +232,30 @@ namespace akkaradb::engine::cluster {
         [[nodiscard]] uint16_t totalPlacements() const noexcept {
             return static_cast<uint16_t>(totalShards() * copiesPerShard);
         }
+    };
+
+    struct FaultDomainOptions {
+        // Zero leaves the corresponding physical topology unconstrained.
+        uint16_t minHosts = 0;
+        uint16_t minSites = 0;
+        // Every Raft voter group must retain a majority after any one site fails.
+        bool requireSiteQuorum = false;
+        bool operator==(const FaultDomainOptions&) const = default;
+    };
+
+    enum class ClusterAvailabilityWarning : uint8_t {
+        EVEN_METADATA_VOTER_COUNT, METADATA_TOLERANCE_BELOW_DATA,
+        OWNER_FAILOVER_DISABLED, SINGLE_OWNER_FAILOVER_CANDIDATE, MIRROR_PAIR_FAILURE_DEPENDENT,
+    };
+    // Configuration facts only; live quorum and reachability are separate.
+    struct AKDB_API ClusterAvailability {
+        ReplicationMode mode = ReplicationMode::STANDALONE;
+        std::vector<uint64_t> dataNodes, metadataVoters, metadataLearners, failoverCandidates;
+        uint16_t metadataQuorum = 0, metadataFailureTolerance = 0, dataFailureTolerance = 0;
+        std::vector<ClusterAvailabilityWarning> warnings;
+        bool failureDomainsKnown = false;
+        bool singleSiteDataSurvival = false;
+        bool singleSiteQuorumSurvival = false;
     };
 
     struct AKDB_API PartitionOptions {
@@ -268,6 +300,8 @@ namespace akkaradb::engine::cluster {
         uint64_t primaryNodeId = 0;
         ///< Optional RAID.10 shared hot-spare node. Zero disables hot-spare replacement.
         uint64_t hotSpareNodeId = 0;
+        StripeMetadataPlacement metadataPlacement = StripeMetadataPlacement::DATA_NODES;
+        StripeFailoverPolicy failoverPolicy = StripeFailoverPolicy::SINGLE_CANDIDATE;
     };
 
     /**
@@ -295,9 +329,12 @@ namespace akkaradb::engine::cluster {
         std::string host; ///< Hostname or address used by peer nodes.
         uint16_t dataPort = 0; ///< Public data API port.
         uint16_t replPort = 0; ///< Replication listener port.
-        uint16_t stripeMetadataPort = 0; ///< STRIPE metadata Raft listener port; required for STRIPE data nodes.
+        uint16_t stripeMetadataPort = 0; ///< Required for STRIPE data nodes and dedicated metadata voters.
         uint32_t capabilities = DATA_BEARING; ///< OR-ed NodeCapability flags.
         uint16_t partitionReplBasePort = 0; ///< PARTITIONED Raft reserves partitionCount + 1 consecutive ports here.
+
+        std::string hostId; ///< Physical machine identity, independent of the network address.
+        std::string siteId; ///< Shared failure domain, e.g. site or availability zone.
 
         /** Returns true if this node may become primary. */
         [[nodiscard]] bool coordinatorEligible() const noexcept { return (capabilities & COORDINATOR_ELIGIBLE) != 0; }
@@ -342,10 +379,21 @@ namespace akkaradb::engine::cluster {
         uint64_t logIndex = 0;
     };
 
-    struct RaftRequestOptions {
+    struct ClusterRequestOptions {
         bool enabled = false;
+        /// Keep node-local proof of non-Raft data application in the mutation WAL.
+        bool persistLocalApplication = false;
+        /// Lifetime selected by newRequestId() and ordinary point writes, measured from ID creation.
+        uint64_t defaultRetentionMs = 10ull * 60 * 1000;
         uint64_t maxRetentionMs = 24ull * 60 * 60 * 1000;
-        uint32_t maxTrackedRequests = 4096;
+        /// Admission limit for unresolved requests; completed results do not occupy these slots.
+        uint32_t maxPendingRequests = 6144;
+        /// Logical retained-record budget per store (WAL/SST files and compaction require extra disk space).
+        uint64_t maxRetainedResultBytes = 1024ull * 1024 * 1024;
+        // Non-Raft data uses a separate, persistent Raft receipt authority.
+        // Select an independent subset of configured nodes with dedicated control replPorts.
+        // A joining participant starts with RAFT_LEARNER until explicitly promoted.
+        std::vector<NodeInfo> authorityNodes;
     };
 
     /** Bounds Raft log growth without rebuilding a full database snapshot for ordinary writes. */
@@ -477,10 +525,57 @@ namespace akkaradb::engine::cluster {
     };
 
     enum class QueryResultMode : uint8_t { PREPARED, STREAMING };
+    enum class QueryConsistencyMode : uint8_t { PER_PARTITION, GLOBAL_SNAPSHOT };
+    enum class GlobalSnapshotConflictPolicy : uint8_t { RETRY, BLOCK_WRITES };
     enum class QuerySnapshotAdmission : uint8_t { WAIT, REJECT };
+
+    enum class ClusterTransactionMode : uint8_t { DISABLED, TWO_PHASE_COMMIT };
+    enum class RaftGroupKind : uint8_t { DATA, PARTITION_DATA, PLACEMENT, MIRROR_AUTHORITY, REQUEST_AUTHORITY };
+    struct ClusterTransactionOptions {
+        // Opt-in durable 2PC for MIRROR/PARTITIONED Raft. Each transaction reserves
+        // accessed keys/ranges until completion, including within the same partition.
+        ClusterTransactionMode mode = ClusterTransactionMode::DISABLED;
+        uint32_t timeoutMs = 20'000;
+        uint32_t recoveryIntervalMs = 250;
+        /// Recovery runs independently of foreground requests; budgets may be tuned for WAN latency.
+        uint16_t recoveryConcurrency = 4;
+        uint32_t recoveryAttemptTimeoutMs = 2000;
+        /// Logical retained-record budget per store (WAL/SST files and compaction require extra disk space).
+        uint64_t maxRetainedResultBytes = 1024ull * 1024 * 1024;
+        bool participantOnly = false; ///< Filled internally for PARTITIONED child engines.
+    };
+
+    struct ClusterNodeResourceLimits {
+        // Aggregate limits for one Native root and all its partition/control runtimes.
+        // Memory counts transport reservations, not TCP buffers, caches, or total RSS.
+        uint64_t raftReceiveMemoryBytes = 128ull * 1024 * 1024;
+        uint64_t forwardReceiveMemoryBytes = 128ull * 1024 * 1024;
+        uint16_t outgoingForwardRequests = 128;
+        uint16_t incomingForwardRequests = 128;
+        uint64_t transferMemoryBytes = 8ull * 1024 * 1024;
+        // Non-Raft chunk-transfer transport; Raft frames use the receive budgets above.
+        uint32_t concurrentTransfers = 8;
+        bool operator==(const ClusterNodeResourceLimits&) const = default;
+    };
+
+    struct ReplicationLivenessOptions {
+        uint32_t heartbeatIntervalMs = 1000;
+        uint32_t peerTimeoutMs = 10000;
+        [[nodiscard]] bool valid() const noexcept {
+            return heartbeatIntervalMs >= 50 && heartbeatIntervalMs <= 60000 &&
+                peerTimeoutMs >= 3ull * heartbeatIntervalMs && peerTimeoutMs <= 300000;
+        }
+        void validate() const {
+            if (!valid()) { throw std::invalid_argument("Non-Raft liveness: interval must be 50-60000ms, timeout at least 3 intervals and at most 300000ms"); }
+        }
+        bool operator==(const ReplicationLivenessOptions&) const = default;
+    };
 
     /** Runtime-only cluster policy and network options. */
     struct AKDB_API ClusterRuntimeOptions {
+        ClusterNodeResourceLimits nodeResources;
+        // Internal lease domain, shared by the root and its partition/control runtimes.
+        std::shared_ptr<detail::NodeResourceBudget> nodeResourceBudget;
         // Filled from ClusterConfig by ClusterRuntime. Direct transport users
         // must supply the same contract at both endpoints.
         ClusterId replicationClusterId{};
@@ -489,6 +584,11 @@ namespace akkaradb::engine::cluster {
         uint32_t forwardingTimeoutMs = 5000;
         // Result delivery and fixed-source admission are independent policies.
         QueryResultMode queryResultMode = QueryResultMode::PREPARED;
+        // GLOBAL_SNAPSHOT validates a common cut before returning scan/count.
+        // Concurrent writes can force retries until forwardingTimeoutMs expires.
+        QueryConsistencyMode queryConsistencyMode = QueryConsistencyMode::PER_PARTITION;
+        /// BLOCK_WRITES requires MIRROR/PARTITIONED Raft with TWO_PHASE_COMMIT.
+        GlobalSnapshotConflictPolicy globalSnapshotConflictPolicy = GlobalSnapshotConflictPolicy::RETRY;
         QuerySnapshotAdmission querySnapshotAdmission = QuerySnapshotAdmission::REJECT;
         uint64_t queryMaxPinnedBytes = 512ull * 1024 * 1024;
         uint32_t queryMaxPinnedSnapshots = 64;
@@ -501,16 +601,23 @@ namespace akkaradb::engine::cluster {
         // NodeInfo::dataPort is the TCP port; other protocols remain unspecified.
         std::vector<ClusterApiEndpoint> apiEndpoints;
         ReplicationTransferOptions transfer;
+        ReplicationLivenessOptions replicationLiveness{};
+        ClusterTransactionOptions transactions;
+        // Internal Raft namespace; stable across membership/placement changes.
+        RaftGroupKind raftGroupKind = RaftGroupKind::DATA;
+        uint16_t raftPartitionIndex = 0;
         ClusterReconfigurationOptions reconfiguration;
-        uint16_t raftMaxForwardRequests = 64; ///< Active forwarding RPC channels per runtime (1-256); waiting consumes the original deadline.
-        RaftRequestOptions requests;
+        uint16_t raftMaxForwardRequests = 128; ///< Active forwarding RPC channels per runtime (1-256); waiting consumes the original deadline.
+        uint16_t raftMaxIncomingForwardRequests = 128; ///< Independent inbound forwarding channels (1-256).
+        uint64_t raftMaxForwardReceiveMemoryBytes = 128ull * 1024 * 1024; ///< Forwarding cannot consume consensus receive memory.
+        ClusterRequestOptions requests;
         TransportMode transportMode = TransportMode::SECURE;
         std::string replBindHost = "0.0.0.0"; ///< Local address used by the primary replication listener.
         NodeStartupRole startupRole = NodeStartupRole::AUTO; ///< Explicit startup role used for non-standalone modes.
         std::string primaryHost; ///< Replica-side configured primary host override.
         uint16_t primaryReplPort = 0; ///< Replica-side configured primary replication port override.
         uint64_t primaryNodeId = 0; ///< Replica-side configured primary node id override.
-        uint64_t clusterGroupId = 0; ///< Non-Raft group id; PARTITIONED and STRIPE require the same explicit nonzero value on every node.
+        uint64_t clusterGroupId = 0; ///< Stable group namespace; PARTITIONED and STRIPE require the same explicit nonzero value on every node.
         uint64_t clusterGroupEpoch = 0; ///< Non-Raft group epoch; primary defaults zero to epoch 1.
         std::filesystem::path clusterMembershipPath; ///< Persisted non-Raft group state for primary, membership for replica.
         bool resetClusterMembership = false; ///< Allows a replica to intentionally join a different non-Raft group.
@@ -522,7 +629,7 @@ namespace akkaradb::engine::cluster {
         RaftBlobPolicy raftBlobPolicy = RaftBlobPolicy::REJECT;
         uint32_t raftBlobChunkSizeBytes = 1024u * 1024u;
         uint32_t raftHeartbeatIntervalMs = 100; ///< Leader heartbeat interval; valid range is 10-1000 ms.
-        uint64_t raftMaxReceiveMemoryBytes = 64ull * 1024 * 1024; ///< Aggregate Raft frame receive/decode reservations across connections.
+        uint64_t raftMaxReceiveMemoryBytes = 128ull * 1024 * 1024; ///< Aggregate Raft frame receive/decode reservations across connections.
         ClusterReadMode readMode = ClusterReadMode::LOCAL_STALE_OK;
         StripeWriteCommitMode stripeWriteCommitMode = StripeWriteCommitMode::DATA_SHARDS;
         StripeReadCoordinatorMode stripeReadCoordinatorMode = StripeReadCoordinatorMode::OWNER;
@@ -568,7 +675,8 @@ namespace akkaradb::engine::cluster {
                 uint64_t primaryNodeId = 0,
                 ClusterId clusterId = {},
                 PartitionOptions partition = {},
-                FailoverPolicy failover = FailoverPolicy::DEFAULT
+                FailoverPolicy failover = FailoverPolicy::DEFAULT,
+                FaultDomainOptions faultDomains = {}
             );
 
             /**
@@ -581,7 +689,8 @@ namespace akkaradb::engine::cluster {
                 RaidOptions raid,
                 AckPolicy ackPolicy,
                 ConsistencyOptions consistency = {},
-                ClusterId clusterId = {}
+                ClusterId clusterId = {},
+                FaultDomainOptions faultDomains = {}
             );
 
             /**
@@ -628,6 +737,7 @@ namespace akkaradb::engine::cluster {
             [[nodiscard]] StripeOptions stripe() const noexcept { return stripe_; }
 
             [[nodiscard]] PartitionOptions partition() const noexcept { return partition_; }
+            [[nodiscard]] FaultDomainOptions faultDomains() const noexcept { return faultDomains_; }
             /** Effective number of holders for each PARTITIONED key, including its owner. */
             [[nodiscard]] uint16_t partitionCopies() const noexcept;
 
@@ -652,14 +762,18 @@ namespace akkaradb::engine::cluster {
             /** Returns nodes with NodeCapability::DATA_BEARING set. */
             [[nodiscard]] std::vector<NodeInfo> dataNodes() const;
 
-            /** Returns STRIPE placement nodes, excluding a RAID.10 hot spare. */
+            /** Returns STRIPE placement nodes, excluding RAID.10 hot spares. */
             [[nodiscard]] std::vector<NodeInfo> stripePlacementNodes() const;
 
             /** Returns nodes with NodeCapability::COORDINATOR_ELIGIBLE set. */
             [[nodiscard]] std::vector<NodeInfo> coordinatorNodes() const;
 
-            /** Returns the sole STRIPE failover candidate/RAID.10 hot spare, or nullptr when disabled. */
-            [[nodiscard]] const NodeInfo* stripeFailoverNode() const noexcept;
+            [[nodiscard]] std::vector<NodeInfo> stripeFailoverNodes() const;
+            [[nodiscard]] bool isStripeFailoverNode(uint64_t id) const noexcept;
+            /** Metadata group members, including data learners in explicit mode. */
+            [[nodiscard]] std::vector<NodeInfo> stripeMetadataNodes() const;
+            [[nodiscard]] bool isStripeMetadataVoter(const NodeInfo& node) const noexcept;
+            [[nodiscard]] ClusterAvailability availability() const;
 
             /** Returns true when the config should run without replication. */
             [[nodiscard]] bool isStandalone() const noexcept;
@@ -684,6 +798,7 @@ namespace akkaradb::engine::cluster {
             RaftOptions raft_{};
             StripeOptions stripe_{};
             PartitionOptions partition_{};
+            FaultDomainOptions faultDomains_{};
             uint64_t primaryNodeId_ = 0;
             ClusterId clusterId_{};
             uint16_t flags_ = 0;

@@ -8,7 +8,9 @@
  */
 
 // akkengine/src/engine/cluster/ClusterConfig.cpp
+#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
 #include "akk/engine/cluster/ClusterConfig.hpp"
+#include "akk/engine/cluster/detail/ClusterPlacement.hpp"
 #include "akk/crypto/Random.hpp"
 #include "akk/engine/cluster/ReplFraming.hpp"
 
@@ -24,6 +26,9 @@
 
 #include "akk/cpu/CRC32C.hpp"
 
+#include <ranges>
+#include <utility>
+
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
@@ -37,6 +42,7 @@ namespace akkaradb::engine::cluster {
     namespace {
         constexpr size_t HEADER_SIZE = 72;
         constexpr size_t MAX_HOST_BYTES = 1024;
+        constexpr uint16_t FAULT_DOMAIN_LAYOUT_FLAG = 0x8000;
 
         uint64_t nowUs() noexcept {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -45,7 +51,7 @@ namespace akkaradb::engine::cluster {
         }
 
         bool isZeroClusterId(const ClusterId& id) noexcept {
-            return std::all_of(id.begin(), id.end(), [](uint8_t value) { return value == 0; });
+            return std::ranges::all_of(id, [](uint8_t value) { return value == 0; });
         }
 
         void writeU16(uint8_t* b, size_t off, uint16_t v) noexcept {
@@ -65,7 +71,7 @@ namespace akkaradb::engine::cluster {
         }
 
         uint16_t readU16(const uint8_t* b, size_t off) noexcept {
-            return static_cast<uint16_t>(b[off]) | static_cast<uint16_t>(static_cast<uint16_t>(b[off + 1]) << 8);
+            return static_cast<uint16_t>(b[off] | (b[off + 1] << 8));
         }
 
         uint32_t readU32(const uint8_t* b, size_t off) noexcept {
@@ -79,22 +85,23 @@ namespace akkaradb::engine::cluster {
             return v;
         }
 
-        uint32_t crcFileImage(std::vector<uint8_t> bytes) {
+        uint32_t crcFileImage(std::span<const uint8_t> image) {
+            std::vector bytes(image.begin(), image.end());
             if (bytes.size() >= 28) { writeU32(bytes.data(), 24, 0); }
             return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         }
 
         void syncFile(const std::filesystem::path& path, const char* context) {
             #ifdef _WIN32
-            const int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+            const auto fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
             if (fd < 0) { throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync"); }
-            const int rc = _commit(fd);
-            const int closeRc = _close(fd);
+            const auto rc = _commit(fd);
+            const auto closeRc = _close(fd);
             if (rc != 0 || closeRc != 0) { throw std::runtime_error(std::string{context} + ": temp file sync failed"); }
             #else
-            const int fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
+            const auto fd = ::open(path.c_str(), O_RDONLY); if (fd < 0) {
                 throw std::runtime_error(std::string{context} + ": cannot reopen temp file for sync");
-            } const int rc = ::fsync(fd); const int closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
+            } const auto rc = ::fsync(fd); const auto closeRc = ::close(fd); if (rc != 0 || closeRc != 0) {
                 throw std::runtime_error(std::string{context} + ": temp file sync failed");
             }
             #endif
@@ -126,9 +133,9 @@ namespace akkaradb::engine::cluster {
         #ifdef O_DIRECTORY
         flags|= O_DIRECTORY;
         #endif
-        const int fd = ::open(parent.c_str(), flags);if (fd<0) {
+        const auto fd = ::open(parent.c_str(), flags);if (fd<0) {
             throw std::runtime_error("ClusterConfig: cannot open parent directory for sync");
-        } const int rc = ::fsync(fd); const int closeRc = ::close(fd);if (rc!= 0 || closeRc
+        } const auto rc = ::fsync(fd); const auto closeRc = ::close(fd);if (rc!= 0 || closeRc
 != 0) { throw std::runtime_error("ClusterConfig: parent directory sync failed"); }
         }
         #endif
@@ -155,26 +162,29 @@ namespace akkaradb::engine::cluster {
         }
 
         StripeOptions raidStripeOptions(const RaidOptions& raid) {
+            StripeOptions options{.dataShards = raid.dataShards,
+                .metadataPlacement = raid.metadataPlacement, .failoverPolicy = raid.failoverPolicy};
             switch (raid.preset) {
-                case RaidPreset::RAID0: return StripeOptions{.dataShards = raid.dataShards, .parityShards = 0};
+                case RaidPreset::RAID0: options.parityShards = 0; break;
                 case RaidPreset::RAID1: return {};
                 case RaidPreset::RAID5:
                     if (raid.dataShards < 2) {
                         throw std::invalid_argument("ClusterConfig: RAID.5 requires at least two data shards");
                     }
-                    return StripeOptions{.dataShards = raid.dataShards, .parityShards = 1};
+                    options.parityShards = 1; break;
                 case RaidPreset::RAID6:
                     if (raid.dataShards < 2) {
                         throw std::invalid_argument("ClusterConfig: RAID.6 requires at least two data shards");
                     }
-                    return StripeOptions{.dataShards = raid.dataShards, .parityShards = 2};
+                    options.parityShards = 2; break;
                 case RaidPreset::RAID10:
                     if (raid.dataShards < 2) {
                         throw std::invalid_argument("ClusterConfig: RAID.10 requires at least two mirrored data shards");
                     }
-                    return StripeOptions{.dataShards = raid.dataShards, .parityShards = 0, .copiesPerShard = 2};
+                    options.parityShards = 0; options.copiesPerShard = 2; break;
+                default: throw std::invalid_argument("ClusterConfig: unknown RAID preset");
             }
-            throw std::invalid_argument("ClusterConfig: unknown RAID preset");
+            return options;
         }
 
         std::vector<NodeInfo> raidNodes(std::vector<NodeInfo> nodes, const RaidOptions& raid) {
@@ -243,7 +253,8 @@ namespace akkaradb::engine::cluster {
         uint64_t primaryNodeId,
         ClusterId clusterId,
         PartitionOptions partition,
-        FailoverPolicy failover
+        FailoverPolicy failover,
+        FaultDomainOptions faultDomains
     )
         : nodes_{std::move(nodes)},
           mode_{mode},
@@ -253,6 +264,7 @@ namespace akkaradb::engine::cluster {
           raft_{raft},
           stripe_{stripe},
           partition_{partition},
+          faultDomains_{faultDomains},
           primaryNodeId_{primaryNodeId},
           clusterId_{clusterId} {
         if (isZeroClusterId(clusterId_)) { crypto::secureRandom(clusterId_); }
@@ -272,7 +284,8 @@ namespace akkaradb::engine::cluster {
         RaidOptions raid,
         AckPolicy ackPolicy,
         ConsistencyOptions consistency,
-        ClusterId clusterId
+        ClusterId clusterId,
+        FaultDomainOptions faultDomains
     )
         : ClusterConfig(
               raidNodes(std::move(nodes), raid),
@@ -282,7 +295,7 @@ namespace akkaradb::engine::cluster {
               {},
               raidStripeOptions(raid),
               raidPrimaryNodeId(raid),
-              clusterId
+              clusterId, {}, FailoverPolicy::DEFAULT, faultDomains
           ) {}
 
     ClusterConfig ClusterConfig::load(const std::filesystem::path& path) {
@@ -293,23 +306,23 @@ namespace akkaradb::engine::cluster {
         return decode(bytes);
     }
 
-    ClusterConfig ClusterConfig::decode(std::span<const uint8_t> image) {
-        std::vector<uint8_t> bytes(image.begin(), image.end());
+    ClusterConfig ClusterConfig::decode(std::span<const uint8_t> bytes) {
         if (bytes.size() < HEADER_SIZE) { throw std::runtime_error("ClusterConfig: file too short"); }
 
-        const uint32_t magic = readU32(bytes.data(), 0);
-        const uint16_t version = readU16(bytes.data(), 4);
+        const auto magic = readU32(bytes.data(), 0);
+        const auto version = readU16(bytes.data(), 4);
         if (magic != MAGIC) { throw std::runtime_error("ClusterConfig: bad magic"); }
         if (version != VERSION) { throw std::runtime_error("ClusterConfig: unsupported version"); }
 
-        const uint32_t storedCrc = readU32(bytes.data(), 24);
+        const auto storedCrc = readU32(bytes.data(), 24);
         if (storedCrc != crcFileImage(bytes)) { throw std::runtime_error("ClusterConfig: CRC mismatch"); }
-        if (bytes[38] > 1 || bytes[39] > 1 || bytes[43] > static_cast<uint8_t>(FailoverPolicy::ALLOW_ACKNOWLEDGED_LOSS)) {
+        if (bytes[38] > 1 || bytes[39] > 1 || bytes[43] > std::to_underlying(FailoverPolicy::ALLOW_ACKNOWLEDGED_LOSS)) {
             throw std::runtime_error("ClusterConfig: invalid membership flags or failover policy");
         }
 
-        const uint16_t flags = readU16(bytes.data(), 6);
-        const uint16_t nodeCount = readU16(bytes.data(), 8);
+        const auto flags = readU16(bytes.data(), 6);
+        if (!(flags & FAULT_DOMAIN_LAYOUT_FLAG)) { throw std::runtime_error("ClusterConfig: missing physical fault-domain layout; recreate the pre-release configuration"); }
+        const auto nodeCount = readU16(bytes.data(), 8);
         auto mode = static_cast<ReplicationMode>(bytes[10]);
         AckPolicy ack{};
         ack.mode = static_cast<AckPolicyMode>(bytes[11]);
@@ -330,13 +343,17 @@ namespace akkaradb::engine::cluster {
         stripe.dataShards = bytes[40];
         stripe.parityShards = bytes[41];
         stripe.copiesPerShard = bytes[42];
+        stripe.metadataPlacement = static_cast<StripeMetadataPlacement>(bytes[13]);
+        stripe.failoverPolicy = static_cast<StripeFailoverPolicy>(bytes[31]);
         PartitionOptions partition{.replicationFactor = readU16(bytes.data(), 44)};
         partition.partitionCount = readU16(bytes.data(), 46);
-        const uint64_t primaryNodeId = readU64(bytes.data(), 48);
+        const auto primaryNodeId = readU64(bytes.data(), 48);
         ClusterId clusterId{};
         std::copy_n(bytes.data() + 56, clusterId.size(), clusterId.begin());
 
-        size_t cursor = HEADER_SIZE;
+        if (bytes.size() < HEADER_SIZE + 5 || bytes[HEADER_SIZE + 4] > 1) { throw std::runtime_error("ClusterConfig: truncated or invalid fault-domain policy"); }
+        const FaultDomainOptions domains{readU16(bytes.data(), HEADER_SIZE), readU16(bytes.data(), HEADER_SIZE + 2), bytes[HEADER_SIZE + 4] != 0};
+        size_t cursor = HEADER_SIZE + 5;
         std::vector<NodeInfo> nodes;
         nodes.reserve(nodeCount);
         for (uint16_t i = 0; i < nodeCount; ++i) {
@@ -348,18 +365,26 @@ namespace akkaradb::engine::cluster {
             node.replPort = readU16(bytes.data(), cursor + 14);
             node.stripeMetadataPort = readU16(bytes.data(), cursor + 16);
             node.partitionReplBasePort = readU16(bytes.data(), cursor + 18);
-            const uint16_t hostLen = readU16(bytes.data(), cursor + 20);
+            const auto hostLen = readU16(bytes.data(), cursor + 20);
             cursor += 22;
             if (hostLen > MAX_HOST_BYTES) { throw std::runtime_error("ClusterConfig: host name too long"); }
             if (cursor + hostLen > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated host"); }
             node.host.assign(reinterpret_cast<const char*>(bytes.data() + cursor), hostLen);
             cursor += hostLen;
+            const auto label = [&]() {
+                if (cursor + 2 > bytes.size()) { throw std::runtime_error("ClusterConfig: truncated domain length"); }
+                const auto length = readU16(bytes.data(), cursor); cursor += 2;
+                if (length > MAX_HOST_BYTES || cursor + length > bytes.size()) { throw std::runtime_error("ClusterConfig: invalid domain label"); }
+                std::string value(reinterpret_cast<const char*>(bytes.data() + cursor), length); cursor += length;
+                return value;
+            };
+            node.hostId = label(); node.siteId = label();
             nodes.push_back(std::move(node));
         }
         if (cursor != bytes.size()) { throw std::runtime_error("ClusterConfig: trailing bytes"); }
 
-        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe, primaryNodeId, clusterId, partition, static_cast<FailoverPolicy>(bytes[43])};
-        cfg.flags_ = flags;
+        ClusterConfig cfg{std::move(nodes), mode, ack, consistency, raft, stripe, primaryNodeId, clusterId, partition, static_cast<FailoverPolicy>(bytes[43]), domains};
+        cfg.flags_ = flags & ~FAULT_DOMAIN_LAYOUT_FLAG;
         cfg.validate();
         return cfg;
     }
@@ -371,37 +396,41 @@ namespace akkaradb::engine::cluster {
         std::vector<uint8_t> bytes(HEADER_SIZE);
         writeU32(bytes.data(), 0, MAGIC);
         writeU16(bytes.data(), 4, VERSION);
-        writeU16(bytes.data(), 6, config.flags_);
+        writeU16(bytes.data(), 6, config.flags_ | FAULT_DOMAIN_LAYOUT_FLAG);
         writeU16(bytes.data(), 8, static_cast<uint16_t>(config.nodes_.size()));
-        bytes[10] = static_cast<uint8_t>(config.mode_);
-        bytes[11] = static_cast<uint8_t>(config.ackPolicy_.mode);
-        bytes[12] = static_cast<uint8_t>(config.ackPolicy_.stage);
-        bytes[13] = 0;
+        bytes[10] = std::to_underlying(config.mode_);
+        bytes[11] = std::to_underlying(config.ackPolicy_.mode);
+        bytes[12] = std::to_underlying(config.ackPolicy_.stage);
+        bytes[13] = std::to_underlying(config.stripe_.metadataPlacement);
         writeU16(bytes.data(), 14, config.ackPolicy_.quorum);
         writeU64(bytes.data(), 16, nowUs());
         writeU32(bytes.data(), 24, 0);
-        bytes[28] = static_cast<uint8_t>(config.consistency_.writeConsistency);
-        bytes[29] = static_cast<uint8_t>(config.consistency_.ackTimeoutAction);
-        bytes[30] = static_cast<uint8_t>(config.consistency_.replicaLagAction);
-        bytes[31] = 0;
+        bytes[28] = std::to_underlying(config.consistency_.writeConsistency);
+        bytes[29] = std::to_underlying(config.consistency_.ackTimeoutAction);
+        bytes[30] = std::to_underlying(config.consistency_.replicaLagAction);
+        bytes[31] = std::to_underlying(config.stripe_.failoverPolicy);
         writeU32(bytes.data(), 32, config.consistency_.ackTimeoutMs);
-        bytes[36] = static_cast<uint8_t>(config.consistency_.mode);
-        bytes[37] = static_cast<uint8_t>(config.raft_.membership.mode);
+        bytes[36] = std::to_underlying(config.consistency_.mode);
+        bytes[37] = std::to_underlying(config.raft_.membership.mode);
         bytes[38] = config.raft_.membership.allowOnlineVoterChanges ? 1 : 0;
         bytes[39] = config.raft_.membership.allowLearners ? 1 : 0;
         bytes[40] = config.stripe_.dataShards;
         bytes[41] = config.stripe_.parityShards;
         bytes[42] = config.stripe_.copiesPerShard;
-        bytes[43] = static_cast<uint8_t>(config.failover_);
+        bytes[43] = std::to_underlying(config.failover_);
         writeU16(bytes.data(), 44, config.partition_.replicationFactor);
         writeU16(bytes.data(), 46, config.partition_.partitionCount);
         writeU64(bytes.data(), 48, config.primaryNodeId_);
-        std::copy(config.clusterId_.begin(), config.clusterId_.end(), bytes.begin() + 56);
+        std::ranges::copy(config.clusterId_, bytes.begin() + 56);
 
+        bytes.resize(HEADER_SIZE + 5);
+        writeU16(bytes.data(), HEADER_SIZE, config.faultDomains_.minHosts);
+        writeU16(bytes.data(), HEADER_SIZE + 2, config.faultDomains_.minSites);
+        bytes[HEADER_SIZE + 4] = config.faultDomains_.requireSiteQuorum;
         for (const auto& node : config.nodes_) {
             if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
             const auto hostLen = static_cast<uint16_t>(node.host.size());
-            const size_t off = bytes.size();
+            const auto off = bytes.size();
             bytes.resize(off + 22 + hostLen);
             writeU64(bytes.data(), off, node.nodeId);
             writeU32(bytes.data(), off + 8, node.capabilities);
@@ -411,6 +440,11 @@ namespace akkaradb::engine::cluster {
             writeU16(bytes.data(), off + 18, node.partitionReplBasePort);
             writeU16(bytes.data(), off + 20, hostLen);
             std::memcpy(bytes.data() + off + 22, node.host.data(), hostLen);
+            for (const auto label : {std::string_view{node.hostId}, std::string_view{node.siteId}}) {
+                const auto position = bytes.size(); bytes.resize(position + 2 + label.size());
+                writeU16(bytes.data(), position, static_cast<uint16_t>(label.size()));
+                std::memcpy(bytes.data() + position + 2, label.data(), label.size());
+            }
         }
 
         writeU32(bytes.data(), 24, crcFileImage(bytes));
@@ -419,7 +453,7 @@ namespace akkaradb::engine::cluster {
 
     void ClusterConfig::validatePlacementChange(const ClusterConfig& target) const {
         auto before = encode(), after = target.encode();
-        before.resize(HEADER_SIZE); after.resize(HEADER_SIZE);
+        before.resize(HEADER_SIZE + 5); after.resize(HEADER_SIZE + 5);
         std::fill(before.begin() + 16, before.begin() + 28, 0);
         std::fill(after.begin() + 16, after.begin() + 28, 0);
         after[8] = before[8]; after[9] = before[9];
@@ -428,7 +462,8 @@ namespace akkaradb::engine::cluster {
         for (const auto& node : nodes_) {
             if (const auto* replacement = target.findById(node.nodeId)) {
                 if (node.host != replacement->host || node.dataPort != replacement->dataPort || node.replPort != replacement->replPort ||
-                    node.stripeMetadataPort != replacement->stripeMetadataPort || node.partitionReplBasePort != replacement->partitionReplBasePort) {
+                    node.stripeMetadataPort != replacement->stripeMetadataPort || node.partitionReplBasePort != replacement->partitionReplBasePort ||
+                    node.hostId != replacement->hostId || node.siteId != replacement->siteId) {
                     throw std::invalid_argument("ClusterConfig: placement change cannot alter an existing node endpoint");
                 }
             }
@@ -452,43 +487,50 @@ namespace akkaradb::engine::cluster {
     }
 
     const NodeInfo* ClusterConfig::findById(uint64_t nodeId) const noexcept {
-        for (const auto& node : nodes_) { if (node.nodeId == nodeId) { return &node; } }
-        return nullptr;
+        const auto node = std::ranges::find(nodes_, nodeId, &NodeInfo::nodeId);
+        return node == nodes_.end() ? nullptr : &*node;
     }
 
     std::array<uint8_t, 32> ClusterConfig::replicationFingerprint() const {
         validate();
-        std::vector<uint8_t> bytes{'A', 'K', 'N', 'P', '1'};
+        std::vector<uint8_t> bytes{'A', 'K', 'N', 'P', '5'};
         const auto integer = [&](uint64_t value, size_t width) {
             for (size_t i = 0; i < width; ++i) { bytes.push_back(static_cast<uint8_t>(value >> (8 * i))); }
         };
         bytes.insert(bytes.end(), clusterId_.begin(), clusterId_.end());
         integer(flags_, 2);
-        integer(static_cast<uint8_t>(mode_), 1);
+        integer(std::to_underlying(mode_), 1);
         integer(primaryNodeId_, 8);
-        integer(static_cast<uint8_t>(ackPolicy_.mode), 1);
-        integer(static_cast<uint8_t>(ackPolicy_.stage), 1);
+        integer(std::to_underlying(ackPolicy_.mode), 1);
+        integer(std::to_underlying(ackPolicy_.stage), 1);
         integer(ackPolicy_.quorum, 2);
-        integer(static_cast<uint8_t>(consistency_.mode), 1);
-        integer(static_cast<uint8_t>(failover_), 1);
-        integer(static_cast<uint8_t>(consistency_.writeConsistency), 1);
-        integer(static_cast<uint8_t>(consistency_.ackTimeoutAction), 1);
-        integer(static_cast<uint8_t>(consistency_.replicaLagAction), 1);
+        integer(std::to_underlying(consistency_.mode), 1);
+        integer(std::to_underlying(failover_), 1);
+        integer(std::to_underlying(consistency_.writeConsistency), 1);
+        integer(std::to_underlying(consistency_.ackTimeoutAction), 1);
+        integer(std::to_underlying(consistency_.replicaLagAction), 1);
         integer(consistency_.ackTimeoutMs, 4);
-        integer(static_cast<uint8_t>(raft_.membership.mode), 1);
+        integer(std::to_underlying(raft_.membership.mode), 1);
         integer(raft_.membership.allowOnlineVoterChanges, 1);
         integer(raft_.membership.allowLearners, 1);
         integer(stripe_.dataShards, 1);
         integer(stripe_.parityShards, 1);
         integer(stripe_.copiesPerShard, 1);
+        integer(std::to_underlying(stripe_.metadataPlacement), 1);
+        integer(std::to_underlying(stripe_.failoverPolicy), 1);
         if (mode_ != ReplicationMode::PARTITIONED || !usesDataConsensus()) {
             integer(partition_.replicationFactor, 2);
         }
         integer(partition_.partitionCount, 2);
+        integer(faultDomains_.minHosts, 2); integer(faultDomains_.minSites, 2); integer(faultDomains_.requireSiteQuorum, 1);
         // Placement is part of the admission contract, including the score algorithm.
         const std::string_view placement = "BLAKE2b-256-HRW1";
         bytes.insert(bytes.end(), placement.begin(), placement.end());
         if (mode_ == ReplicationMode::STRIPE) {
+            const std::string_view reclamation = "GC-AUTHORITY1";
+            bytes.insert(bytes.end(), reclamation.begin(), reclamation.end());
+            const std::string_view historyMigration = "HISTORY-UNION1";
+            bytes.insert(bytes.end(), historyMigration.begin(), historyMigration.end());
             const std::array parts{std::span<const uint8_t>{bytes}};
             return crypto::hash256(parts);
         }
@@ -504,15 +546,14 @@ namespace akkaradb::engine::cluster {
             integer(node.replPort, 2);
             integer(node.stripeMetadataPort, 2);
             integer(node.partitionReplBasePort, 2);
+            for (const auto label : {std::string_view{node.hostId}, std::string_view{node.siteId}}) { integer(label.size(), 2); bytes.insert(bytes.end(), label.begin(), label.end()); }
         }
         const std::array parts{std::span<const uint8_t>{bytes}};
         return crypto::hash256(parts);
     }
 
     std::vector<NodeInfo> ClusterConfig::dataNodes() const {
-        std::vector<NodeInfo> result;
-        for (const auto& node : nodes_) { if (node.dataBearing()) { result.push_back(node); } }
-        return result;
+        return nodes_ | std::views::filter(&NodeInfo::dataBearing) | std::ranges::to<std::vector>();
     }
 
     uint16_t ClusterConfig::partitionCopies() const noexcept {
@@ -521,21 +562,14 @@ namespace akkaradb::engine::cluster {
     }
 
     std::vector<NodeInfo> ClusterConfig::stripePlacementNodes() const {
-        std::vector<NodeInfo> result;
-        for (const auto& node : nodes_) {
-            if (!node.dataBearing() || node.placementStandby()) { continue; }
-            if (mode_ == ReplicationMode::STRIPE && stripe_.copiesPerShard == 2 && node.stripeFailoverEligible()) {
-                continue;
-            }
-            result.push_back(node);
-        }
-        return result;
+        return nodes_ | std::views::filter([this](const NodeInfo& node) {
+            return node.dataBearing() && !node.placementStandby() &&
+                !(mode_ == ReplicationMode::STRIPE && stripe_.copiesPerShard == 2 && node.stripeFailoverEligible());
+        }) | std::ranges::to<std::vector>();
     }
 
     std::vector<NodeInfo> ClusterConfig::coordinatorNodes() const {
-        std::vector<NodeInfo> result;
-        for (const auto& node : nodes_) { if (node.coordinatorEligible()) { result.push_back(node); } }
-        return result;
+        return nodes_ | std::views::filter(&NodeInfo::coordinatorEligible) | std::ranges::to<std::vector>();
     }
 
     std::optional<RaidPreset> ClusterConfig::raidPreset() const noexcept {
@@ -565,9 +599,94 @@ namespace akkaradb::engine::cluster {
         return std::nullopt;
     }
 
-    const NodeInfo* ClusterConfig::stripeFailoverNode() const noexcept {
-        for (const auto& node : nodes_) { if (node.stripeFailoverEligible()) { return &node; } }
-        return nullptr;
+    std::vector<NodeInfo> ClusterConfig::stripeFailoverNodes() const {
+        return nodes_ | std::views::filter(&NodeInfo::stripeFailoverEligible) | std::ranges::to<std::vector>();
+    }
+
+    bool ClusterConfig::isStripeFailoverNode(uint64_t id) const noexcept {
+        const auto* node = findById(id);
+        return mode_ == ReplicationMode::STRIPE && node && node->stripeFailoverEligible();
+    }
+
+    bool ClusterConfig::isStripeMetadataVoter(const NodeInfo& node) const noexcept {
+        if (mode_ != ReplicationMode::STRIPE || node.placementStandby()) { return false; }
+        return stripe_.metadataPlacement == StripeMetadataPlacement::DATA_NODES
+            ? node.dataBearing() : (node.capabilities & STRIPE_METADATA_VOTER) != 0;
+    }
+
+    std::vector<NodeInfo> ClusterConfig::stripeMetadataNodes() const {
+        if (mode_ != ReplicationMode::STRIPE) { return {}; }
+        return nodes_ | std::views::filter([this](const NodeInfo& node) {
+            return node.dataBearing() || isStripeMetadataVoter(node);
+        }) | std::ranges::to<std::vector>();
+    }
+
+    ClusterAvailability ClusterConfig::availability() const {
+        ClusterAvailability result; result.mode = mode_;
+        for (const auto& node : nodes_) {
+            if (node.dataBearing()) { result.dataNodes.push_back(node.nodeId); }
+            if (node.stripeFailoverEligible()) { result.failoverCandidates.push_back(node.nodeId); }
+        }
+        if (mode_ == ReplicationMode::STRIPE) {
+            for (const auto& node : stripeMetadataNodes()) {
+                (isStripeMetadataVoter(node) ? result.metadataVoters : result.metadataLearners).push_back(node.nodeId);
+            }
+            const auto voters = result.metadataVoters.size();
+            result.metadataQuorum = static_cast<uint16_t>(voters / 2 + 1);
+            result.metadataFailureTolerance = static_cast<uint16_t>((voters - 1) / 2);
+            result.dataFailureTolerance = stripe_.copiesPerShard == 2 ? 1 : stripe_.parityShards;
+            if (voters % 2 == 0) { result.warnings.push_back(ClusterAvailabilityWarning::EVEN_METADATA_VOTER_COUNT); }
+            if (result.metadataFailureTolerance < result.dataFailureTolerance) {
+                result.warnings.push_back(ClusterAvailabilityWarning::METADATA_TOLERANCE_BELOW_DATA);
+            }
+            if (result.failoverCandidates.empty()) { result.warnings.push_back(ClusterAvailabilityWarning::OWNER_FAILOVER_DISABLED); }
+            else if (result.failoverCandidates.size() == 1) { result.warnings.push_back(ClusterAvailabilityWarning::SINGLE_OWNER_FAILOVER_CANDIDATE); }
+            if (stripe_.copiesPerShard == 2) { result.warnings.push_back(ClusterAvailabilityWarning::MIRROR_PAIR_FAILURE_DEPENDENT); }
+        } else if (mode_ == ReplicationMode::PARTITIONED) {
+            result.dataFailureTolerance = static_cast<uint16_t>(partitionCopies() - 1);
+        } else if (mode_ == ReplicationMode::MIRROR && !result.dataNodes.empty()) {
+            result.dataFailureTolerance = static_cast<uint16_t>(result.dataNodes.size() - 1);
+        }
+        result.failureDomainsKnown = !nodes_.empty() && std::ranges::all_of(nodes_, [](const auto& n) { return !n.hostId.empty() && !n.siteId.empty(); });
+        if (result.failureDomainsKnown) {
+            auto data = dataNodes();
+            std::map<std::string, size_t> counts;
+            for (const auto& n : data) { ++counts[n.siteId]; }
+            if (mode_ == ReplicationMode::MIRROR) {
+                result.singleSiteDataSurvival = counts.size() > 1;
+                std::erase_if(data, [](const auto& n) { return n.raftLearner(); });
+                result.singleSiteQuorumSurvival = usesDataConsensus() && detail::siteQuorumSurvives(data);
+            } else if (mode_ == ReplicationMode::PARTITIONED) {
+                if (usesDataConsensus()) {
+                    std::erase_if(data, [](const auto& n) { return n.raftLearner(); });
+                    result.singleSiteQuorumSurvival = detail::siteQuorumSurvives(data);
+                    result.singleSiteDataSurvival = true;
+                    for (uint16_t i = 0; i < partition_.partitionCount; ++i) {
+                        const std::array<uint8_t, 2> key{static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8)};
+                        const auto holders = detail::placementNodes(key, data, partitionCopies(), faultDomains_, true);
+                        std::set<std::string> sites; for (const auto& n : holders) { sites.insert(n.siteId); }
+                        result.singleSiteDataSurvival &= sites.size() > 1;
+                        result.singleSiteQuorumSurvival &= detail::siteQuorumSurvives(holders);
+                    }
+                } else {
+                    result.singleSiteDataSurvival = faultDomains_.minSites > 1 || std::ranges::all_of(counts, [&](const auto& e) { return e.second < partitionCopies(); });
+                }
+            } else if (mode_ == ReplicationMode::STRIPE) {
+                auto metadata = stripeMetadataNodes(); std::erase_if(metadata, [this](const auto& n) { return !isStripeMetadataVoter(n); });
+                result.singleSiteQuorumSurvival = detail::siteQuorumSurvives(metadata);
+                counts.clear(); for (const auto& n : stripePlacementNodes()) { ++counts[n.siteId]; }
+                if (stripe_.copiesPerShard == 2) {
+                    const auto pairs = detail::raidPairNodes(*this); result.singleSiteDataSurvival = true;
+                    for (size_t i = 0; i + 1 < pairs.size(); i += 2) { result.singleSiteDataSurvival &= pairs[i].siteId != pairs[i + 1].siteId; }
+                } else {
+                    const size_t cap = stripe_.totalShards() - (std::max<uint16_t>(1, faultDomains_.minSites) - 1);
+                    result.singleSiteDataSurvival = std::ranges::all_of(counts, [&](const auto& e) { return std::min(e.second, cap) <= stripe_.parityShards; });
+                }
+            }
+        }
+        std::ranges::sort(result.dataNodes); std::ranges::sort(result.metadataVoters);
+        std::ranges::sort(result.metadataLearners); std::ranges::sort(result.failoverCandidates);
+        return result;
     }
 
     bool ClusterConfig::isStandalone() const noexcept { return mode_ == ReplicationMode::STANDALONE || nodes_.size() <= 1; }
@@ -634,7 +753,7 @@ namespace akkaradb::engine::cluster {
         if (usesDataConsensus() && mode_ == ReplicationMode::STRIPE) {
             throw std::invalid_argument("ClusterConfig: STRIPE uses its separate metadata quorum");
         }
-        const bool fixedMirrorPrimary = mode_ == ReplicationMode::MIRROR && !usesDataConsensus();
+        const auto fixedMirrorPrimary = mode_ == ReplicationMode::MIRROR && !usesDataConsensus();
         if (!fixedMirrorPrimary && primaryNodeId_ != 0) {
             throw std::invalid_argument("ClusterConfig: primaryNodeId is only valid for non-Raft MIRROR placement");
         }
@@ -645,11 +764,24 @@ namespace akkaradb::engine::cluster {
         bool hasCoordinator = false;
         size_t dataNodeCount = 0;
         size_t stripeFailoverCount = 0;
+        std::map<std::string, std::string> physicalHosts;
         for (const auto& node : nodes_) {
             if (node.nodeId == 0) { throw std::invalid_argument("ClusterConfig: nodeId 0 is reserved"); }
             if (!ids.insert(node.nodeId).second) { throw std::invalid_argument("ClusterConfig: duplicate nodeId"); }
             if (node.host.empty()) { throw std::invalid_argument("ClusterConfig: empty host"); }
             if (node.host.size() > MAX_HOST_BYTES) { throw std::invalid_argument("ClusterConfig: host name too long"); }
+            for (const auto label : {std::string_view{node.hostId}, std::string_view{node.siteId}}) {
+                if (label.size() > MAX_HOST_BYTES || std::ranges::any_of(label, [](unsigned char b) { return b <= 32 || b == 127; })) {
+                    throw std::invalid_argument("ClusterConfig: invalid physical fault-domain label");
+                }
+            }
+            if (!node.hostId.empty()) {
+                const auto [it, inserted] = physicalHosts.emplace(node.hostId, node.siteId);
+                if (!inserted && it->second != node.siteId) { throw std::invalid_argument("ClusterConfig: one physical host cannot belong to multiple sites"); }
+            }
+            if ((faultDomains_.minHosts && node.hostId.empty()) || ((faultDomains_.minSites || faultDomains_.requireSiteQuorum) && node.siteId.empty())) {
+                throw std::invalid_argument("ClusterConfig: fault-domain policy requires explicit node labels");
+            }
             std::string endpointHost = node.host;
             for (auto& ch : endpointHost) {
                 if (static_cast<unsigned char>(ch) <= 32 || static_cast<unsigned char>(ch) == 127) {
@@ -667,8 +799,8 @@ namespace akkaradb::engine::cluster {
                     throw std::invalid_argument("ClusterConfig: duplicate replication endpoint");
                 }
             }
-            if (mode_ == ReplicationMode::STRIPE && node.dataBearing() && node.stripeMetadataPort == 0) {
-                throw std::invalid_argument("ClusterConfig: STRIPE metadata Raft port must be nonzero on every data node");
+            if (mode_ == ReplicationMode::STRIPE && (node.dataBearing() || isStripeMetadataVoter(node)) && node.stripeMetadataPort == 0) {
+                throw std::invalid_argument("ClusterConfig: STRIPE metadata Raft port must be nonzero on every metadata participant");
             }
             if (node.stripeMetadataPort != 0) {
                 const auto endpoint = endpointHost + ":" + std::to_string(node.stripeMetadataPort);
@@ -676,7 +808,7 @@ namespace akkaradb::engine::cluster {
                     throw std::invalid_argument("ClusterConfig: duplicate STRIPE metadata endpoint");
                 }
             }
-            if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING | STRIPE_FAILOVER_ELIGIBLE | RAFT_LEARNER | PLACEMENT_STANDBY)) != 0) {
+            if ((node.capabilities & ~(COORDINATOR_ELIGIBLE | DATA_BEARING | STRIPE_FAILOVER_ELIGIBLE | RAFT_LEARNER | PLACEMENT_STANDBY | STRIPE_METADATA_VOTER)) != 0) {
                 throw std::invalid_argument("ClusterConfig: unknown node capability");
             }
             if (node.placementStandby() && (mode_ != ReplicationMode::STRIPE || !node.dataBearing())) {
@@ -691,6 +823,14 @@ namespace akkaradb::engine::cluster {
                 if (!node.dataBearing() || !node.coordinatorEligible()) {
                     throw std::invalid_argument("ClusterConfig: STRIPE failover candidate must be coordinator-eligible and data-bearing");
                 }
+            }
+            if ((node.capabilities & STRIPE_METADATA_VOTER) != 0 &&
+                (mode_ != ReplicationMode::STRIPE || stripe_.metadataPlacement != StripeMetadataPlacement::EXPLICIT_VOTERS ||
+                 !node.coordinatorEligible() || node.placementStandby())) {
+                throw std::invalid_argument("ClusterConfig: explicit metadata voter requires EXPLICIT_VOTERS, coordinator eligibility and no standby role");
+            }
+            if (mode_ == ReplicationMode::STRIPE && !node.dataBearing() && !isStripeMetadataVoter(node)) {
+                throw std::invalid_argument("ClusterConfig: STRIPE participant must store data or vote on metadata");
             }
             if (node.dataBearing()) { ++dataNodeCount; }
             hasDataNode = hasDataNode || node.dataBearing();
@@ -708,7 +848,7 @@ namespace akkaradb::engine::cluster {
         if (usesDataConsensus() && dataNodeCount > 512) {
             throw std::invalid_argument("ClusterConfig: RAFT_QUORUM supports at most 512 members (voters plus learners)");
         }
-        if (stripeFailoverCount > 1) {
+        if (stripeFailoverCount > 1 && stripe_.failoverPolicy != StripeFailoverPolicy::MULTIPLE_CANDIDATES) {
             throw std::invalid_argument("ClusterConfig: at most one STRIPE failover candidate may be configured");
         }
         if (stripeFailoverCount != 0 && mode_ != ReplicationMode::STRIPE) {
@@ -761,6 +901,14 @@ namespace akkaradb::engine::cluster {
             throw std::invalid_argument("ClusterConfig: RAID.1 requires at least two nodes and every node must be data-bearing");
         }
         if (mode_ == ReplicationMode::STRIPE) {
+            if (stripe_.metadataPlacement > StripeMetadataPlacement::EXPLICIT_VOTERS ||
+                stripe_.failoverPolicy > StripeFailoverPolicy::MULTIPLE_CANDIDATES) {
+                throw std::invalid_argument("ClusterConfig: invalid STRIPE metadata/failover policy");
+            }
+            if (std::ranges::none_of(nodes_, [this](const auto& node) { return isStripeMetadataVoter(node); })) {
+                throw std::invalid_argument("ClusterConfig: STRIPE metadata requires at least one voter");
+            }
+            if (stripeMetadataNodes().size() > 512) { throw std::invalid_argument("ClusterConfig: metadata supports at most 512 voters and learners"); }
             if (stripe_.dataShards == 0) { throw std::invalid_argument("ClusterConfig: stripe dataShards must be > 0"); }
             if (stripe_.copiesPerShard != 1 && stripe_.copiesPerShard != 2) {
                 throw std::invalid_argument("ClusterConfig: stripe copiesPerShard must be 1 or 2");
@@ -775,14 +923,14 @@ namespace akkaradb::engine::cluster {
             if (stripePlacementNodes().size() < stripe_.totalPlacements()) {
                 throw std::invalid_argument("ClusterConfig: stripe mode requires enough data-bearing nodes for every shard placement");
             }
-            const size_t stripePlacementNodeCount = stripePlacementNodes().size();
+            const auto stripePlacementNodeCount = stripePlacementNodes().size();
             if (stripe_.copiesPerShard == 2 && stripePlacementNodeCount != stripe_.totalPlacements()) {
                 throw std::invalid_argument(
-                    "ClusterConfig: RAID.10 requires exactly two placement nodes per mirrored shard and at most one hot spare"
+                    "ClusterConfig: RAID.10 requires exactly two normal placement nodes per mirrored shard"
                 );
             }
-            if (stripe_.parityShards >= 2) {
-                const size_t metadataVotersRequired = static_cast<size_t>(stripe_.parityShards) * 2 + 1;
+            if (stripe_.parityShards >= 2 && stripe_.metadataPlacement == StripeMetadataPlacement::DATA_NODES) {
+                const auto metadataVotersRequired = static_cast<size_t>(stripe_.parityShards) * 2 + 1;
                 const auto metadataVoters = std::ranges::count_if(nodes_, [](const auto& node) { return node.dataBearing() && !node.placementStandby(); });
                 if (static_cast<size_t>(metadataVoters) < metadataVotersRequired) {
                     throw std::invalid_argument(
@@ -791,8 +939,33 @@ namespace akkaradb::engine::cluster {
                     );
                 }
             }
-            if (stripeFailoverCount == 1 && dataNodeCount <= stripe_.totalPlacements()) {
+            if (stripeFailoverCount != 0 && dataNodeCount <= stripe_.totalPlacements()) {
                 throw std::invalid_argument("ClusterConfig: STRIPE owner failover requires one spare data-bearing node");
+            }
+        }
+        if (faultDomains_.minHosts || faultDomains_.minSites || faultDomains_.requireSiteQuorum) {
+            if (mode_ == ReplicationMode::PARTITIONED) {
+                auto candidates = dataNodes();
+                if (usesDataConsensus()) { std::erase_if(candidates, [](const auto& n) { return n.raftLearner(); }); }
+                if (usesDataConsensus()) { detail::validateFaultDomains(candidates, faultDomains_, true); }
+                const uint16_t groups = usesDataConsensus() ? partition_.partitionCount : 1;
+                for (uint16_t i = 0; i < groups; ++i) {
+                    const std::array<uint8_t, 2> key{static_cast<uint8_t>(i), static_cast<uint8_t>(i >> 8)};
+                    (void)detail::placementNodes(key, candidates, partitionCopies(), faultDomains_, usesDataConsensus());
+                }
+            } else if (mode_ == ReplicationMode::MIRROR || (mode_ == ReplicationMode::STANDALONE && usesDataConsensus())) {
+                auto voters = dataNodes(); std::erase_if(voters, [](const auto& n) { return n.raftLearner(); });
+                detail::validateFaultDomains(voters, faultDomains_, usesDataConsensus());
+            } else if (mode_ == ReplicationMode::STRIPE) {
+                auto metadata = stripeMetadataNodes();
+                std::erase_if(metadata, [this](const auto& n) { return !isStripeMetadataVoter(n); });
+                detail::validateFaultDomains(metadata, faultDomains_, true);
+                if (stripe_.copiesPerShard == 2) {
+                    std::vector<uint64_t> ids; for (const auto& n : detail::raidPairNodes(*this)) { ids.push_back(n.nodeId); }
+                    detail::validateStripeFaultDomains(*this, ids);
+                } else { (void)detail::placementNodes({}, stripePlacementNodes(), stripe_.totalShards(), faultDomains_); }
+            } else {
+                throw std::invalid_argument("ClusterConfig: fault-domain placement requires a cluster mode");
             }
         }
     }
@@ -820,10 +993,31 @@ namespace akkaradb::engine::cluster {
     }
 
     void ClusterConfig::validateRuntime(uint64_t selfNodeId, const ClusterRuntimeOptions& options) const {
+        options.replicationLiveness.validate();
         validate();
         options.transfer.validate();
+        detail::validateNodeResourceLimits(options.nodeResources);
+        if (options.transactions.mode != ClusterTransactionMode::DISABLED && options.transactions.mode != ClusterTransactionMode::TWO_PHASE_COMMIT) {
+            throw std::invalid_argument("ClusterConfig: invalid transaction mode");
+        }
+        if (options.transactions.mode == ClusterTransactionMode::TWO_PHASE_COMMIT &&
+            (!usesDataConsensus() || (mode() != ReplicationMode::MIRROR && mode() != ReplicationMode::PARTITIONED) ||
+             options.readMode != ClusterReadMode::OWNER_LINEARIZABLE || options.transactions.timeoutMs == 0 || options.transactions.timeoutMs > 300'000 ||
+             options.transactions.recoveryIntervalMs == 0 || options.transactions.recoveryIntervalMs > 60'000 ||
+             options.transactions.recoveryConcurrency == 0 || options.transactions.recoveryConcurrency > 32 ||
+             options.transactions.recoveryAttemptTimeoutMs == 0 || options.transactions.recoveryAttemptTimeoutMs > 300'000)) {
+            throw std::invalid_argument("ClusterConfig: TWO_PHASE_COMMIT requires MIRROR/PARTITIONED Raft, OWNER_LINEARIZABLE reads and valid transaction timeouts");
+        }
         if (options.raftMaxForwardRequests == 0 || options.raftMaxForwardRequests > 256) {
             throw std::invalid_argument("ClusterConfig: Raft forward concurrency must be 1-256");
+        }
+        constexpr uint64_t minReceiveBytes = 3ull * (ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE);
+        if (options.raftGroupKind > RaftGroupKind::REQUEST_AUTHORITY ||
+            (options.raftGroupKind != RaftGroupKind::PARTITION_DATA && options.raftPartitionIndex != 0) ||
+            options.raftMaxIncomingForwardRequests == 0 || options.raftMaxIncomingForwardRequests > 256 ||
+            options.raftMaxForwardReceiveMemoryBytes < minReceiveBytes ||
+            options.raftMaxForwardReceiveMemoryBytes > 64ull * 1024 * 1024 * 1024) {
+            throw std::invalid_argument("ClusterConfig: invalid Raft namespace or inbound forwarding limits");
         }
         if ((options.reconfiguration.writePolicy != ReconfigurationWritePolicy::WAIT &&
             options.reconfiguration.writePolicy != ReconfigurationWritePolicy::REJECT) ||
@@ -848,6 +1042,8 @@ namespace akkaradb::engine::cluster {
             throw std::invalid_argument("ClusterConfig: forwarding timeout must be 1-300000 ms");
         }
         if ((options.queryResultMode != QueryResultMode::PREPARED && options.queryResultMode != QueryResultMode::STREAMING) ||
+            (options.queryConsistencyMode != QueryConsistencyMode::PER_PARTITION && options.queryConsistencyMode != QueryConsistencyMode::GLOBAL_SNAPSHOT) ||
+            (options.globalSnapshotConflictPolicy != GlobalSnapshotConflictPolicy::RETRY && options.globalSnapshotConflictPolicy != GlobalSnapshotConflictPolicy::BLOCK_WRITES) ||
             (options.querySnapshotAdmission != QuerySnapshotAdmission::WAIT && options.querySnapshotAdmission != QuerySnapshotAdmission::REJECT) ||
             options.queryMaxPinnedBytes < 1024ull * 1024 || options.queryMaxPinnedBytes > 1024ull * 1024 * 1024 * 1024 ||
             options.queryMaxPinnedSnapshots == 0 || options.queryMaxPinnedSnapshots > 1024 ||
@@ -859,6 +1055,12 @@ namespace akkaradb::engine::cluster {
             options.queryCursorIdleTimeoutMs == 0 || options.queryCursorIdleTimeoutMs > 300'000) {
             throw std::invalid_argument("ClusterConfig: invalid cluster query limits");
         }
+        if (options.globalSnapshotConflictPolicy == GlobalSnapshotConflictPolicy::BLOCK_WRITES &&
+            (options.queryConsistencyMode != QueryConsistencyMode::GLOBAL_SNAPSHOT || !usesDataConsensus() ||
+             (mode() != ReplicationMode::MIRROR && mode() != ReplicationMode::PARTITIONED) ||
+             options.transactions.mode != ClusterTransactionMode::TWO_PHASE_COMMIT)) {
+            throw std::invalid_argument("ClusterConfig: BLOCK_WRITES requires GLOBAL_SNAPSHOT and MIRROR/PARTITIONED Raft TWO_PHASE_COMMIT");
+        }
         std::unordered_set<uint64_t> endpointIds;
         for (const auto& endpoint : options.apiEndpoints) {
             if (!findById(endpoint.nodeId) || !endpointIds.insert(endpoint.nodeId).second) {
@@ -868,7 +1070,7 @@ namespace akkaradb::engine::cluster {
         if (options.transportMode != TransportMode::PLAIN && options.transportMode != TransportMode::SECURE) {
             throw std::invalid_argument("ClusterConfig: invalid transport mode");
         }
-        const bool raft = usesDataConsensus();
+        const auto raft = usesDataConsensus();
         const auto fencing = options.mirrorFencing.mode;
         if (fencing != MirrorFencingMode::STATIC && fencing != MirrorFencingMode::QUORUM_FENCED && fencing != MirrorFencingMode::EXTERNAL_FENCED) {
             throw std::invalid_argument("ClusterConfig: invalid MIRROR fencing mode");
@@ -923,9 +1125,15 @@ namespace akkaradb::engine::cluster {
                 throw std::invalid_argument("ClusterConfig: MIRROR authority corruption must fail startup");
             }
         }
-        if (options.requests.maxRetentionMs == 0 || options.requests.maxRetentionMs > 365ull * 24 * 60 * 60 * 1000 ||
-            options.requests.maxTrackedRequests == 0 || options.requests.maxTrackedRequests > 32'768) {
+        if (options.requests.defaultRetentionMs == 0 || options.requests.defaultRetentionMs > options.requests.maxRetentionMs ||
+            options.requests.maxRetentionMs == 0 || options.requests.maxRetentionMs > 365ull * 24 * 60 * 60 * 1000 ||
+            options.requests.maxPendingRequests == 0 || options.requests.maxPendingRequests > 32'768 ||
+            options.requests.maxRetainedResultBytes == 0 || options.requests.maxRetainedResultBytes > (1ull << 40) ||
+            options.transactions.maxRetainedResultBytes == 0 || options.transactions.maxRetainedResultBytes > (1ull << 40)) {
             throw std::invalid_argument("ClusterConfig: invalid request retention or result capacity");
+        }
+        if (options.requests.persistLocalApplication && (!options.requests.enabled || usesDataConsensus() || mode() == ReplicationMode::STRIPE)) {
+            throw std::invalid_argument("ClusterConfig: local request application requires non-Raft MIRROR, PARTITIONED or STANDALONE data");
         }
         if (raft && (options.raftSnapshot.minLogEntries == 0 || options.raftSnapshot.minLogEntries > 1'000'000'000ull ||
             options.raftSnapshot.minLogBytes == 0 || options.raftSnapshot.minLogBytes > 1024ull * 1024 * 1024 * 1024 ||
@@ -948,7 +1156,41 @@ namespace akkaradb::engine::cluster {
             options.memoryOnlySnapshot.maxPinnedGenerations == 0 || options.memoryOnlySnapshot.maxPinnedGenerations > 64) {
             throw std::invalid_argument("ClusterConfig: invalid memory-only snapshot policy");
         }
-        if (options.requests.enabled && consistency_.mode != ConsistencyMode::RAFT_QUORUM) { throw std::invalid_argument("ClusterConfig: retry-safe requests require RAFT_QUORUM"); }
+        if (!options.requests.authorityNodes.empty() && (!options.requests.enabled || usesDataConsensus())) {
+            throw std::invalid_argument("ClusterConfig: request authority nodes are only used by enabled non-Raft requests");
+        }
+        if (options.requests.enabled && !usesDataConsensus()) {
+            if (options.requests.authorityNodes.empty() || options.requests.authorityNodes.size() > 512 || options.resetClusterMembership ||
+                options.corruptStateAction != CorruptClusterStateAction::FAIL_STARTUP) {
+                throw std::invalid_argument("ClusterConfig: non-Raft requests require an authority group and fail-closed persistent state");
+            }
+            std::unordered_set<uint64_t> ids;
+            std::unordered_set<std::string> endpoints;
+            for (const auto& authority : options.requests.authorityNodes) {
+                const auto* node = findById(authority.nodeId);
+                if (!node || !ids.insert(authority.nodeId).second || authority.host != node->host || !authority.replPort ||
+                    (authority.capabilities != (COORDINATOR_ELIGIBLE | DATA_BEARING) && authority.capabilities != (COORDINATOR_ELIGIBLE | DATA_BEARING | RAFT_LEARNER)) ||
+                    !endpoints.insert(authority.host + ":" + std::to_string(authority.replPort)).second) {
+                    throw std::invalid_argument("ClusterConfig: invalid request authority participant");
+                }
+                for (const auto& peer : nodes_) {
+                    if (peer.host == authority.host && (peer.replPort == authority.replPort || peer.dataPort == authority.replPort ||
+                        peer.stripeMetadataPort == authority.replPort ||
+                        (peer.partitionReplBasePort && authority.replPort >= peer.partitionReplBasePort &&
+                         uint32_t{authority.replPort} <= uint32_t{peer.partitionReplBasePort} + partition_.partitionCount))) {
+                        throw std::invalid_argument("ClusterConfig: request authority port conflicts with data or placement");
+                    }
+                }
+                for (const auto& peer : options.mirrorFencing.authorityNodes) {
+                    if (peer.host == authority.host && peer.replPort == authority.replPort) {
+                        throw std::invalid_argument("ClusterConfig: request authority port conflicts with MIRROR authority");
+                    }
+                }
+            }
+            if (std::ranges::none_of(options.requests.authorityNodes, [](const auto& node) { return !node.raftLearner(); })) {
+                throw std::invalid_argument("ClusterConfig: request authority requires a voter");
+            }
+        }
         if (options.mirrorPromotion.enabled) {
             if (raft || mode_ != ReplicationMode::MIRROR) {
                 throw std::invalid_argument("ClusterConfig: offline Primary promotion is only valid for non-Raft MIRROR");
@@ -989,7 +1231,7 @@ namespace akkaradb::engine::cluster {
         std::vector<uint64_t> required;
         if (options.transportMode == TransportMode::SECURE && (!isStandalone() || raft)) {
             for (const auto& peer : nodes_) {
-                if (peer.nodeId == selfNodeId || (!peer.dataBearing() && fencing != MirrorFencingMode::QUORUM_FENCED)) { continue; }
+                if (peer.nodeId == selfNodeId || (!peer.dataBearing() && !isStripeMetadataVoter(peer) && fencing != MirrorFencingMode::QUORUM_FENCED)) { continue; }
                 if (!raft && fencing != MirrorFencingMode::QUORUM_FENCED && mode_ == ReplicationMode::MIRROR && selfNodeId != primaryNodeId_ && peer.nodeId != primaryNodeId_) { continue; }
                 required.push_back(peer.nodeId);
             }

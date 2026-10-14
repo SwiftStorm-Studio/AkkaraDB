@@ -113,7 +113,7 @@ namespace akkaradb::engine::cluster {
             }
 
             void close() {
-                const bool wasRunning = running_.exchange(false);
+                const auto wasRunning = running_.exchange(false);
                 stopLeaseRenewal();
                 if (wasRunning) { recordSelfLeave(); }
             }
@@ -167,7 +167,7 @@ namespace akkaradb::engine::cluster {
 
         private:
             void setRole(NodeRole role) {
-                const NodeRole old = role_.exchange(role);
+                const auto old = role_.exchange(role);
                 if (old == role) { return; }
                 RoleChangeCallback cb;
                 {
@@ -198,7 +198,7 @@ namespace akkaradb::engine::cluster {
                 if (!lease.has_value() || lease->leaseUntilUs <= nowUs()) { return false; }
                 if (manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) { return false; }
 
-                const uint64_t configuredPrimaryNodeId = config_.primaryNodeId();
+                const auto configuredPrimaryNodeId = config_.primaryNodeId();
                 if (configuredPrimaryNodeId != 0 && lease->nodeId != configuredPrimaryNodeId) {
                     throw std::runtime_error("ClusterManager: persisted Primary lease conflicts with ClusterConfig");
                 }
@@ -338,7 +338,7 @@ namespace akkaradb::engine::cluster {
                     setRole(NodeRole::REPLICA);
                     return;
                 }
-                const uint64_t now = nowUs();
+                const auto now = nowUs();
                 const auto lease = clusterManifest_->lastPrimaryLease();
                 if (lease.has_value() && lease->nodeId != selfNodeId_ && lease->leaseUntilUs > now && !manifestNodeLeftAfter(lease->nodeId, lease->tsUs)) {
                     running_.store(false, std::memory_order_release);
@@ -353,8 +353,8 @@ namespace akkaradb::engine::cluster {
                 std::string primaryHost = runtimeOptions_.primaryHost;
                 uint16_t primaryReplPort = runtimeOptions_.primaryReplPort;
 
-                const uint64_t securePrimaryNodeId = runtimeOptions_.secure.expectedPrimaryNodeId;
-                const uint64_t configuredPrimaryNodeId = config_.primaryNodeId();
+                const auto securePrimaryNodeId = runtimeOptions_.secure.expectedPrimaryNodeId;
+                const auto configuredPrimaryNodeId = config_.primaryNodeId();
                 if (configuredPrimaryNodeId != 0) {
                     if (primaryNodeId != 0 && primaryNodeId != configuredPrimaryNodeId) {
                         throw std::runtime_error("ClusterManager: primaryNodeId conflicts with configured MIRROR Primary");

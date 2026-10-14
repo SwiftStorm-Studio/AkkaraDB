@@ -13,15 +13,19 @@
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/wal/WalRecovery.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
+#include "akk/engine/wal/WalFraming.hpp"
+#include "akk/cpu/CRC32C.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -232,6 +236,62 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    void testRecoveryChecksPublishedRecordBoundary() {
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_wal_published_boundary_smoke";
+        for (const auto execution : {wal::WalExecutionMode::INLINE, wal::WalExecutionMode::ASYNC}) {
+            std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+            wal::WalOptions options; options.execution = execution; options.syncPolicy = wal::WalSyncPolicy::ON_SYNC_ACK; options.shardCount = 1;
+            auto writer = wal::WalWriter::create(dir, options);
+            const std::vector<uint8_t> first{'a'}, second{'b'}, value{'v'};
+            writer->append(first, value, 7, 0, 0, wal::WalAppendAck::SYNCED);
+            const auto path = findWalSegments(dir).front();
+            const auto firstBytes = fs::file_size(path);
+            std::array<uint8_t, wal::WalSegmentHeader::SIZE> prefix{};
+            { std::ifstream input{path, std::ios::binary}; input.read(reinterpret_cast<char*>(prefix.data()), prefix.size()); require(bool(input), "failed to read synced WAL header"); }
+            // Identical sequences cannot reveal loss through a maximum-sequence check.
+            writer->append(second, value, 7, 0, 0, wal::WalAppendAck::SYNCED);
+            { std::array<uint8_t, wal::WalSegmentHeader::SIZE> current{};
+                std::ifstream input{path, std::ios::binary}; input.read(reinterpret_cast<char*>(current.data()), current.size());
+                require(wal::WalSegmentHeader::deserialize(current.data()).publishedBytes == fs::file_size(path), "SYNCED ack did not publish its complete record boundary"); }
+            writer->close(); writer.reset();
+            const auto complete = wal::WalRecovery::recover({.walDir = dir}, [](const auto&) {});
+            require(complete.corruptSegments == 0 && complete.entriesReplayed == 2, "valid same-sequence WAL recovery failed");
+            fs::resize_file(path, firstBytes);
+            const auto lost = wal::WalRecovery::recover({.walDir = dir, .checkpointSeq = 7}, [](const auto&) {});
+            require(lost.corruptSegments == 1, "record-aligned loss below the checkpoint was accepted");
+            const auto repaired = wal::WalRecovery::recover({.walDir = dir, .truncateCorruptTail = true}, [](const auto&) {});
+            require(repaired.corruptSegments == 1 && repaired.segmentsTruncated == 1, "explicit valid-prefix truncation did not update the published boundary");
+            const auto clean = wal::WalRecovery::recover({.walDir = dir}, [](const auto&) {});
+            require(clean.corruptSegments == 0 && clean.entriesReplayed == 1, "recovery still rejected the explicitly repaired prefix");
+            // A crash can leave a stale header followed by additional valid records.
+            writer = wal::WalWriter::create(dir, options); writer->append(second, value, 7, 0, 0, wal::WalAppendAck::SYNCED); writer->close(); writer.reset();
+            { std::fstream output{path, std::ios::binary | std::ios::in | std::ios::out}; output.write(reinterpret_cast<const char*>(prefix.data()), prefix.size()); }
+            const auto stale = wal::WalRecovery::recover({.walDir = dir}, [](const auto&) {});
+            require(stale.corruptSegments == 0 && stale.entriesReplayed == 2, "valid records after a stale published boundary were rejected");
+            fs::remove_all(dir, ec);
+        }
+    }
+
+    void testLegacyWalRequiresRecreation() {
+        const fs::path dir = fs::temp_directory_path() / "akkaradb_wal_legacy_header_smoke";
+        std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+        auto header = wal::WalSegmentHeader::build(0, 0, 0); header.version = 1; header.headerSize = 48; header.crc32c = 0;
+        std::array<uint8_t, wal::WalSegmentHeader::SIZE> bytes{}; header.serialize(bytes.data());
+        const auto crc = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), 48);
+        for (unsigned n = 0; n < 4; ++n) { bytes[36 + n] = static_cast<uint8_t>(crc >> (8 * n)); }
+        const auto path = dir / "0000_0000000000000000.akwal";
+        { std::ofstream output{path, std::ios::binary}; output.write(reinterpret_cast<const char*>(bytes.data()), 48); }
+        bool rejected = false;
+        try { (void)wal::WalRecovery::recover({.walDir = dir}, [](const auto&) {}); }
+        catch (const std::runtime_error& error) { rejected = std::string_view{error.what()}.find("incompatible v1") != std::string_view::npos; }
+        require(rejected, "legacy WAL was silently accepted");
+        rejected = false;
+        try { (void)wal::WalWriter::create(dir, {.execution = wal::WalExecutionMode::INLINE, .shardCount = 1}); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && fs::file_size(path) == 48, "legacy WAL writer did not preserve the original file");
+        fs::remove_all(dir, ec);
+    }
+
     void testWriterTruncatesCorruptTailBeforeAppending() {
         const fs::path dir = fs::temp_directory_path() / "akkaradb_wal_truncate_corrupt_tail_smoke";
         std::error_code ec;
@@ -361,6 +421,8 @@ int main() {
     try {
         testAsyncRotationFailurePoisonsWriter();
         testRecoveryStopsAfterCorruptSegmentWithinShard();
+        testRecoveryChecksPublishedRecordBoundary();
+        testLegacyWalRequiresRecreation();
         testWriterTruncatesCorruptTailBeforeAppending();
         testEnginePropagatesAsyncWalFailure();
         return 0;

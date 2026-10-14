@@ -10,6 +10,7 @@
 // akkengine/include/akk/engine/AkkEngine.hpp
 #pragma once
 #include "akk/engine/cluster/ClusterRouting.hpp"
+#include "akk/engine/cluster/ClusterTransaction.hpp"
 
 #include "akkaradb/Export.hpp"
 
@@ -31,6 +32,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace akkaradb::engine {
@@ -39,9 +41,17 @@ namespace akkaradb::engine {
 
     enum class TransactionIsolation : uint8_t { SERIALIZABLE, SNAPSHOT_ISOLATION };
     struct TransactionOptions { TransactionIsolation isolation = TransactionIsolation::SERIALIZABLE; };
+    class TransactionSnapshotUnavailable : public std::runtime_error { public: using std::runtime_error::runtime_error; };
     class TransactionConflict : public std::runtime_error { public: using std::runtime_error::runtime_error; };
     // A storage error after the commit decision may require recovery to determine the outcome.
-    class TransactionOutcomeUnknown : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+    class TransactionOutcomeUnknown : public std::runtime_error {
+        std::optional<cluster::ClusterTransactionId> id_;
+    public:
+        using std::runtime_error::runtime_error;
+        TransactionOutcomeUnknown(std::string message, cluster::ClusterTransactionId id)
+            : std::runtime_error(std::move(message)), id_{id} {}
+        [[nodiscard]] const std::optional<cluster::ClusterTransactionId>& transactionId() const noexcept { return id_; }
+    };
 
     /** Logical position in one mutation stream. */
     struct AKDB_API Revision {
@@ -373,7 +383,7 @@ namespace akkaradb::engine {
 
             void put(std::span<const uint8_t> key, std::span<const uint8_t> value);
             void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey);
-            // Standalone, move-only session. Concurrent use is unsupported; sequential
+            // Move-only Native session. Concurrent use is unsupported; sequential
             // handoff to another thread is supported. Finish sessions/cursors before close().
             class AKDB_API Transaction {
                 public:
@@ -394,23 +404,35 @@ namespace akkaradb::engine {
                     void end();
                     void rollback() noexcept;
                     [[nodiscard]] bool active() const noexcept;
+                    [[nodiscard]] std::optional<cluster::ClusterTransactionId> clusterId() const noexcept;
                 private:
                     friend class AkkEngine;
                     class Impl;
                     explicit Transaction(std::shared_ptr<Impl> impl);
                     std::shared_ptr<Impl> impl_;
             };
-            // Native standalone transactions; independent of VersionLog enablement.
+            // Native transactions; Cluster requires runtime.transactions.mode = TWO_PHASE_COMMIT.
+            // Cluster reserves each partition on first access; both isolation options
+            // are serializable, without a snapshot fixed at begin(). Overlap aborts the requester.
+            // Consume Cluster transaction scan cursors before end/rollback.
             // Transactions and their cursors must finish before closing the engine.
             [[nodiscard]] Transaction begin(TransactionOptions options = {});
+            [[nodiscard]] cluster::ClusterTransactionResult transactionOutcome(const cluster::ClusterTransactionId& id);
             void remove(std::span<const uint8_t> key);
+            // With requests.enabled, ordinary Cluster point writes also retain an ID.
+            // OUTCOME_UNKNOWN carries that ID for queryRequest or same-ID retry.
+            // Bulk/transaction writes use their own contract. Non-Raft uncertain
+            // attempts remain PENDING and are never automatically reapplied.
+            // Zero selects requests.defaultRetentionMs; explicit retention must not exceed maxRetentionMs.
             [[nodiscard]] cluster::ClusterRequestId newRequestId(uint64_t retentionMs = 0) const;
             cluster::ClusterRequestResult putWithRequest(const cluster::ClusterRequestId& id,
                 std::span<const uint8_t> key, std::span<const uint8_t> value);
             cluster::ClusterRequestResult removeWithRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key);
             [[nodiscard]] cluster::ClusterRequestResult queryRequest(const cluster::ClusterRequestId& id);
-            // PARTITIONED request identities and results belong to the key's
-            // stable partition stream. Use the same key when resolving a retry.
+            // Node-local durable application only; never proves replica ACK completion and never forwards.
+            [[nodiscard]] cluster::ClusterRequestResult queryLocalRequest(const cluster::ClusterRequestId& id) const;
+            // PARTITIONED queries require the original key. Raft receipts belong
+            // to its stable stream; non-Raft receipts use the shared authority.
             [[nodiscard]] cluster::ClusterRequestResult queryRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key);
             void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey);
 
@@ -420,9 +442,9 @@ namespace akkaradb::engine {
             [[nodiscard]] bool exists(std::span<const uint8_t> key) const;
             [[nodiscard]] bool getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const;
             [[nodiscard]] bool getIntoArena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const;
-            // Cluster-wide public-key range reads. PARTITIONED captures one cut
-            // per owner, not a globally atomic transaction snapshot. MIRROR
-            // honors readMode; STRIPE uses a metadata-quorum read barrier.
+            // Cluster-wide public-key range reads. queryConsistencyMode selects
+            // independent owner cuts or a validated GLOBAL_SNAPSHOT. The latter
+            // routes to authorities and can time out under concurrent writes.
             [[nodiscard]] size_t count(std::span<const uint8_t> startKey = {}, std::span<const uint8_t> endKey = {}) const;
             [[nodiscard]] core::ArenaGenerator<ScanRecordView> scan(
                 core::BufferArena& arena,
@@ -475,6 +497,8 @@ namespace akkaradb::engine {
             void removeClusterVotingNode(uint64_t nodeId);
             void transferClusterLeadership(uint64_t targetNodeId);
             void transferMirrorAuthorityLeadership(uint64_t targetNodeId);
+            /** Replaces the independent non-Raft request-authority membership after learner catch-up. */
+            void reconfigureRequestAuthority(const std::vector<cluster::NodeInfo>& nodes);
             /** Explicitly attempts recovery of an unresolved MIRROR write grant. */
             bool recoverMirrorWrite();
             /** Starts an explicit election; PARTITIONED requires a stable revision stream id. */
@@ -491,6 +515,8 @@ namespace akkaradb::engine {
             bool cancelClusterReconfiguration();
             [[nodiscard]] ClusterReconfigurationStatus clusterReconfigurationStatus() const;
             [[nodiscard]] std::vector<ClusterPartitionStats> clusterPartitionStats() const;
+            /// Configured topology/tolerance facts for management clients; not a live-health promise.
+            [[nodiscard]] cluster::ClusterAvailability clusterAvailability() const;
 
             void forceSync();
             void forceFlush();

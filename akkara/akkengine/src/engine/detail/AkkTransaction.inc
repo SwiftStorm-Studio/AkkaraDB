@@ -7,7 +7,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/detail/TransactionApi.inc
+// akkengine/src/engine/detail/AkkTransaction.inc
 // Included at namespace scope after AkkEngine::Impl is complete.
 class AkkEngine::Transaction::Impl {
     public:
@@ -24,12 +24,22 @@ class AkkEngine::Transaction::Impl {
         Writes writes;
         std::set<std::vector<uint8_t>> reads;
         std::vector<Range> ranges;
+        std::optional<cluster::ClusterTransactionId> distributedId;
+        std::shared_ptr<Engine::OperationGuard> operation;
+        std::vector<uint16_t> participants;
+        bool distributedDecided = false;
+
+        Impl(Engine& owner, TransactionIsolation mode, std::shared_ptr<Engine::OperationGuard> guard,
+             cluster::ClusterTransactionId token)
+            : engine{&owner}, isolation{mode}, registry{owner.transactions},
+              expires{std::chrono::steady_clock::now() + std::chrono::milliseconds{owner.opts.transactions.maxLifetimeMs}},
+              distributedId{token}, operation{std::move(guard)} {}
 
         Impl(Engine& owner, TransactionIsolation mode, std::shared_ptr<Engine::TransactionReadSnapshot> source)
             : engine{&owner}, isolation{mode}, snapshot{std::move(source)}, registry{owner.transactions},
               expires{std::chrono::steady_clock::now() + std::chrono::milliseconds{owner.opts.transactions.maxLifetimeMs}} {
             std::lock_guard lock{registry->mutex};
-            if (registry->cuts.size() >= owner.opts.transactions.maxOpen) { throw std::runtime_error("AkkEngine: transaction limit exceeded"); }
+            if (registry->cuts.size() >= owner.opts.transactions.maxOpen) { throw TransactionSnapshotUnavailable("AkkEngine: transaction limit exceeded"); }
             id = ++registry->nextId; cut = registry->revision; generation = registry->generation;
             registry->cuts.emplace(id, cut); registry->active.store(static_cast<uint32_t>(registry->cuts.size()), std::memory_order_release);
         }
@@ -37,6 +47,15 @@ class AkkEngine::Transaction::Impl {
         void finish() noexcept {
             if (!active) { return; }
             active = false;
+            if (distributedId) {
+                if (!distributedDecided) {
+                    try {
+                        cluster::detail::ReconfigurationDeadline budget{engine->opts.cluster.runtime.transactions.timeoutMs, [&] { return engine->placementClosing(); }};
+                        engine->abortDistributed(*distributedId);
+                    } catch (...) { /* The replicated expiry causes eventual abort; never assume commit failed. */ }
+                }
+                writes.clear(); reads.clear(); ranges.clear(); operation.reset(); return;
+            }
             {
                 std::lock_guard lock{registry->mutex}; registry->cuts.erase(id);
                 registry->active.store(static_cast<uint32_t>(registry->cuts.size()), std::memory_order_release);
@@ -60,6 +79,7 @@ class AkkEngine::Transaction::Impl {
             engine->throwIfBackgroundFailed();
         }
         void trackRead(std::span<const uint8_t> key) {
+            if (distributedId) { return; }
             if (isolation != TransactionIsolation::SERIALIZABLE) { return; }
             std::vector<uint8_t> owned{key.begin(), key.end()};
             if (reads.contains(owned)) { return; }
@@ -69,10 +89,23 @@ class AkkEngine::Transaction::Impl {
         }
         void trackRange(std::span<const uint8_t> start, std::span<const uint8_t> end) {
             if (!end.empty() && compareKey(start, end) > 0) { throw std::invalid_argument("AkkEngine: inverted transaction range"); }
-            if (isolation != TransactionIsolation::SERIALIZABLE || (!end.empty() && compareKey(start, end) == 0)) { return; }
+            if ((!distributedId && isolation != TransactionIsolation::SERIALIZABLE) || (!end.empty() && compareKey(start, end) == 0)) { return; }
             const auto charge = start.size() + end.size() + 64;
             if (charge > engine->opts.transactions.maxReadSetBytes - readBytes) { throw std::length_error("AkkEngine: transaction read-set limit exceeded"); }
             ranges.push_back({{start.begin(), start.end()}, {end.begin(), end.end()}}); readBytes += charge;
+        }
+        void enlist(uint16_t participant) {
+            check();
+            if (std::ranges::binary_search(participants, participant)) { return; }
+            try {
+                cluster::detail::ReconfigurationDeadline budget{engine->opts.cluster.runtime.transactions.timeoutMs};
+                (void)engine->distributedRpc({.action = Engine::DistributedAction::ENLIST, .id = *distributedId, .participant = participant});
+                participants.insert(std::ranges::lower_bound(participants, participant), participant);
+            } catch (...) {
+                // A competing partition reservation is never waited on: abort
+                // the whole transaction and release its existing reservations.
+                const auto failure = std::current_exception(); finish(); std::rethrow_exception(failure);
+            }
         }
         void stage(std::span<const uint8_t> key, std::optional<std::span<const uint8_t>> value) {
             check();
@@ -88,9 +121,10 @@ class AkkEngine::Transaction::Impl {
             const auto storedSize = value && engine->blobManager && value->size() >= engine->blobManager->threshold()
                 ? blob::BLOB_REF_SIZE : (value ? value->size() : 0);
             if (value && value->size() > UINT32_MAX) { throw std::length_error("AkkEngine: transaction value is too large"); }
-            if (key.size() + storedSize + 64 >= 32ull * 1024 * 1024) { throw std::length_error("AkkEngine: transaction record is too large"); }
+            Engine::validateStoredRecord(key.size(), storedSize);
             std::optional<std::vector<uint8_t>> staged;
             if (value) { staged.emplace(value->begin(), value->end()); }
+            if (distributedId) { reserveKey(key, engine->usesPartitionRaft() ? engine->partitionIndex(key) : uint16_t{0}); }
             writes.insert_or_assign(std::move(owned), std::move(staged)); writeBytes = writeBytes - oldCharge + newCharge;
         }
         void validate() {
@@ -127,6 +161,108 @@ class AkkEngine::Transaction::Impl {
             }
             records = {}; overlay.clear(); snapshot.reset();
         }
+        void reserveKey(std::span<const uint8_t> key, uint16_t participant) {
+            if (key.size() > UINT16_MAX) { throw std::length_error("Cluster transaction: oversized reservation key"); }
+            const std::vector<uint8_t> owned{key.begin(), key.end()};
+            if (reads.contains(owned)) { return; }
+            const auto charge = owned.size() + 64;
+            if (charge > engine->opts.transactions.maxReadSetBytes - readBytes) { throw std::length_error("Cluster transaction: reservation set capacity exceeded"); }
+            enlist(participant);
+            try {
+                cluster::detail::ReconfigurationDeadline budget{engine->opts.cluster.runtime.transactions.timeoutMs};
+                (void)engine->distributedRpc({.action = Engine::DistributedAction::LOCK_KEY, .id = *distributedId,
+                    .participant = participant, .payload = {key.begin(), key.end()}});
+                reads.insert(owned);
+                readBytes += charge;
+            } catch (...) { const auto failure = std::current_exception(); finish(); std::rethrow_exception(failure); }
+        }
+        void reserveRange(std::span<const uint8_t> start, std::span<const uint8_t> end, uint16_t participant) {
+            enlist(participant);
+            try {
+                cluster::detail::ReconfigurationDeadline budget{engine->opts.cluster.runtime.transactions.timeoutMs};
+                Engine::DistributedMessage message{.action = Engine::DistributedAction::LOCK_RANGE, .id = *distributedId, .participant = participant};
+                cluster::detail::transactionBytes(message.payload, start); cluster::detail::transactionBytes(message.payload, end);
+                (void)engine->distributedRpc(message);
+            } catch (...) { const auto failure = std::current_exception(); finish(); std::rethrow_exception(failure); }
+        }
+        std::optional<std::vector<uint8_t>> distributedGet(std::span<const uint8_t> key, uint16_t participant) {
+            reserveKey(key, participant);
+            if (key.size() > UINT16_MAX) { throw std::length_error("Cluster transaction: oversized read key"); }
+            cluster::detail::ReconfigurationDeadline budget{engine->opts.cluster.runtime.transactions.timeoutMs};
+            std::vector<uint8_t> value; uint64_t expected = UINT64_MAX;
+            do {
+                check();
+                auto response = engine->distributedRpc({.action = Engine::DistributedAction::GET, .id = *distributedId,
+                    .participant = participant, .argument = value.size(), .payload = {key.begin(), key.end()}});
+                if (!response.found) { if (expected != UINT64_MAX) { throw std::runtime_error("Cluster transaction: value vanished during read"); } return {}; }
+                cluster::detail::TransactionReader reader{response.value}; const auto size = reader.integer();
+                const auto chunk = std::span<const uint8_t>{response.value}.subspan(8);
+                if (size > UINT32_MAX || size < value.size() || (expected != UINT64_MAX && expected != size) || chunk.size() > size - value.size() || (chunk.empty() && value.size() != size)) { throw std::runtime_error("Cluster transaction: invalid read chunk"); }
+                expected = size; value.insert(value.end(), chunk.begin(), chunk.end());
+            } while (value.size() != expected);
+            return value;
+        }
+        static core::ArenaGenerator<ScanRecordView> distributedRows(std::shared_ptr<Impl> state, Writes overlay,
+            std::vector<uint8_t> start, std::vector<uint8_t> end, core::BufferArena& arena) {
+            if (!end.empty() && start == end) { co_return; }
+            struct Cursor {
+                uint16_t participant;
+                std::vector<std::pair<std::vector<uint8_t>, std::optional<std::vector<uint8_t>>>> rows{};
+                std::vector<uint8_t> after;
+                size_t position = 0;
+                bool exclusive = false, more = true;
+            };
+            std::vector<Cursor> cursors;
+            for (auto index : state->participants) { cursors.push_back(Cursor{.participant = index, .after = start}); }
+            auto staged = overlay.lower_bound(start);
+            while (true) {
+                state->check();
+                for (auto& cursor : cursors) {
+                    if (cursor.position < cursor.rows.size() || !cursor.more) { continue; }
+                    cluster::detail::TransactionMessage request{.action = Engine::DistributedAction::SCAN, .id = *state->distributedId,
+                        .participant = cursor.participant, .argument = static_cast<uint64_t>(cursor.exclusive)};
+                    cluster::detail::transactionBytes(request.payload, cursor.after); cluster::detail::transactionBytes(request.payload, end);
+                    cluster::detail::ReconfigurationDeadline budget{state->engine->opts.cluster.runtime.transactions.timeoutMs};
+                    auto response = state->engine->distributedRpc(request);
+                    cluster::detail::TransactionReader reader{response.value}; const auto more = reader.integer(1); const auto count = reader.count(9);
+                    if (more > 1 || (more && !count)) { throw std::runtime_error("Cluster transaction: invalid scan page"); }
+                    cursor.rows.clear(); cursor.position = 0; cursor.more = more != 0;
+                    for (uint32_t i = 0; i < count; ++i) {
+                        auto key = reader.field(); const auto inlineValue = reader.integer(1); auto value = reader.field();
+                        if (inlineValue > 1 || (!inlineValue && !value.empty())) { throw std::runtime_error("Cluster transaction: invalid scan value"); }
+                        if (key < cursor.after || (cursor.exclusive && key == cursor.after) || (!end.empty() && key >= end) ||
+                            (!cursor.rows.empty() && cursor.rows.back().first >= key)) { throw std::runtime_error("Cluster transaction: invalid scan ordering"); }
+                        std::optional<std::vector<uint8_t>> stored;
+                        if (inlineValue) { stored = std::move(value); }
+                        cursor.rows.emplace_back(std::move(key), std::move(stored));
+                    }
+                    reader.finish();
+                    if (!cursor.rows.empty()) { cursor.after = cursor.rows.back().first; cursor.exclusive = true; }
+                }
+                Cursor* next = nullptr;
+                for (auto& cursor : cursors) {
+                    if (cursor.position < cursor.rows.size() && (!next || cursor.rows[cursor.position].first < next->rows[next->position].first)) { next = &cursor; }
+                }
+                const bool hasStaged = staged != overlay.end() && (end.empty() || staged->first < end);
+                if (!next && !hasStaged) { break; }
+                if (hasStaged && (!next || staged->first <= next->rows[next->position].first)) {
+                    if (next && staged->first == next->rows[next->position].first) { ++next->position; }
+                    if (staged->second) { co_yield ScanRecordView{copySpanToArena(staged->first, arena), copySpanToArena(*staged->second, arena)}; }
+                    ++staged;
+                } else {
+                    const auto& row = next->rows[next->position++];
+                    // Large values are fetched only when yielded, so a page of
+                    // Blob keys cannot materialize all Blob payloads at once.
+                    std::optional<std::vector<uint8_t>> fetched;
+                    if (!row.second) {
+                        fetched = state->distributedGet(row.first, next->participant);
+                        if (!fetched) { throw std::runtime_error("Cluster transaction: scan value disappeared"); }
+                    }
+                    const auto& value = row.second ? *row.second : *fetched;
+                    co_yield ScanRecordView{copySpanToArena(row.first, arena), copySpanToArena(value, arena)};
+                }
+            }
+        }
 };
 
 AkkEngine::Transaction::Transaction(std::shared_ptr<Impl> impl) : impl_{std::move(impl)} {}
@@ -134,12 +270,16 @@ AkkEngine::Transaction::~Transaction() = default;
 AkkEngine::Transaction::Transaction(Transaction&&) noexcept = default;
 AkkEngine::Transaction& AkkEngine::Transaction::operator=(Transaction&&) noexcept = default;
 bool AkkEngine::Transaction::active() const noexcept { return impl_ && impl_->active; }
+std::optional<cluster::ClusterTransactionId> AkkEngine::Transaction::clusterId() const noexcept { return impl_ ? impl_->distributedId : std::nullopt; }
 void AkkEngine::Transaction::rollback() noexcept { if (impl_) { impl_->finish(); } }
 std::optional<std::vector<uint8_t>> AkkEngine::Transaction::get(std::span<const uint8_t> key) {
     if (!impl_) { throw std::logic_error("AkkEngine: moved transaction"); }
     impl_->check(); impl_->trackRead(key);
     const auto staged = impl_->writes.find(std::vector<uint8_t>{key.begin(), key.end()});
     if (staged != impl_->writes.end()) { return staged->second; }
+    if (impl_->distributedId) {
+        return impl_->distributedGet(key, impl_->engine->usesPartitionRaft() ? impl_->engine->partitionIndex(key) : uint16_t{0});
+    }
     const auto& source = impl_->snapshot->source;
     auto mt = source.memtable.get(key);
     auto st = source.sst.get(key);
@@ -171,6 +311,14 @@ core::ArenaGenerator<AkkEngine::ScanRecordView> AkkEngine::Transaction::scan(cor
     std::span<const uint8_t> start, std::span<const uint8_t> end) {
     if (!impl_) { throw std::logic_error("AkkEngine: moved transaction"); }
     impl_->check(); impl_->trackRange(start, end);
+    if (impl_->distributedId) {
+        if (start.size() > UINT16_MAX || end.size() > UINT16_MAX) { throw std::length_error("Cluster transaction: oversized range boundary"); }
+        if (!end.empty() && compareKey(start, end) == 0) { return Impl::distributedRows(impl_, impl_->writes, {start.begin(), start.end()}, {end.begin(), end.end()}, arena); }
+        // Hash partitioning cannot exclude a partition from a key range.
+        const auto count = impl_->engine->usesPartitionRaft() ? impl_->engine->clusterConfig.partition().partitionCount : 1;
+        for (uint16_t index = 0; index < count; ++index) { impl_->reserveRange(start, end, index); }
+        return Impl::distributedRows(impl_, impl_->writes, {start.begin(), start.end()}, {end.begin(), end.end()}, arena);
+    }
     return Impl::scanRows(impl_->snapshot, impl_->writes, {start.begin(), start.end()}, {end.begin(), end.end()}, arena);
 }
 size_t AkkEngine::Transaction::count(std::span<const uint8_t> start, std::span<const uint8_t> end) {
@@ -181,7 +329,23 @@ size_t AkkEngine::Transaction::count(std::span<const uint8_t> start, std::span<c
 AkkEngine::Transaction AkkEngine::begin(TransactionOptions options) {
     if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
     auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
-    if (impl_->opts.components.clusterEnabled) { throw std::logic_error("AkkEngine: transactions currently require standalone mode"); }
+    if (impl_->opts.components.clusterEnabled) {
+        if (!impl_->distributedTransactionsEnabled() || impl_->opts.cluster.runtime.transactions.participantOnly) { throw std::logic_error("AkkEngine: enable TWO_PHASE_COMMIT on the Cluster root to begin transactions"); }
+        if (options.isolation != TransactionIsolation::SERIALIZABLE && options.isolation != TransactionIsolation::SNAPSHOT_ISOLATION) { throw std::invalid_argument("AkkEngine: invalid transaction isolation"); }
+        cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.transactions.timeoutMs};
+        Impl::DistributedId token{}; crypto::secureRandom(token);
+        for (unsigned i = 0; i < 8; ++i) { token[i] = static_cast<uint8_t>(impl_->nodeId >> (8 * i)); }
+        Impl::DistributedMessage create{.action = Impl::DistributedAction::CREATE, .id = token,
+            .argument = impl_->opts.transactions.maxLifetimeMs};
+        try {
+            (void)impl_->distributedRpc(create);
+            return Transaction{std::make_shared<Transaction::Impl>(*impl_, options.isolation, std::move(operation), token)};
+        } catch (...) {
+            const auto failure = std::current_exception();
+            try { impl_->abortDistributed(token); } catch (...) {}
+            std::rethrow_exception(failure);
+        }
+    }
     if (impl_->opts.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
         throw std::invalid_argument("AkkEngine: transactions require GLOBAL_ATOMIC sequence allocation");
     }
@@ -201,6 +365,52 @@ AkkEngine::Transaction AkkEngine::begin(TransactionOptions options) {
 void AkkEngine::Transaction::end() {
     if (!impl_) { throw std::logic_error("AkkEngine: moved transaction"); }
     auto& state = *impl_; state.check();
+    if (state.distributedId) {
+        auto operation = state.operation;
+        auto& engine = *state.engine;
+        cluster::detail::ReconfigurationDeadline budget{engine.opts.cluster.runtime.transactions.timeoutMs};
+        bool deciding = false;
+        const char* phase = "prepare";
+        try {
+            (void)engine.distributedRpc({.action = Impl::Engine::DistributedAction::START_PREPARE, .id = *state.distributedId});
+            std::map<uint16_t, Impl::Engine::DistributedPrepare> prepared;
+            for (const auto& [key, value] : state.writes) {
+                const auto index = engine.usesPartitionRaft() ? engine.partitionIndex(key) : uint16_t{0};
+                prepared[index].writes.push_back({key, value});
+            }
+            for (auto index : state.participants) {
+                const auto bytes = cluster::detail::encodeTransactionPrepare(prepared[index]);
+                Impl::Engine::DistributedMessage header{.action = Impl::Engine::DistributedAction::PREPARE, .id = *state.distributedId,
+                    .participant = index, .argument = bytes.size()};
+                cluster::detail::transactionInteger(header.payload, nowNs());
+                (void)engine.distributedRpc(header);
+                for (size_t offset = 0; offset < bytes.size();) {
+                    const auto size = std::min<size_t>(1024 * 1024, bytes.size() - offset);
+                    (void)engine.distributedRpc({.action = Impl::Engine::DistributedAction::APPEND, .id = *state.distributedId, .participant = index,
+                        .argument = offset, .payload = {bytes.begin() + static_cast<ptrdiff_t>(offset), bytes.begin() + static_cast<ptrdiff_t>(offset + size)}});
+                    offset += size;
+                }
+                (void)engine.distributedRpc({.action = Impl::Engine::DistributedAction::SEAL, .id = *state.distributedId, .participant = index});
+            }
+            deciding = true;
+            phase = "decision";
+            crashAtTestPoint("cluster_transaction.before_decision");
+            (void)engine.distributedRpc({.action = Impl::Engine::DistributedAction::DECIDE_COMMIT, .id = *state.distributedId});
+            state.distributedDecided = true;
+            phase = "completion";
+            crashAtTestPoint("cluster_transaction.after_decision");
+            engine.completeDistributed(*state.distributedId); state.finish(); return;
+        } catch (...) {
+            const auto failure = std::current_exception();
+            if (deciding) {
+                state.distributedDecided = true; state.finish();
+                std::string reason;
+                try { std::rethrow_exception(failure); } catch (const std::exception& error) { reason = error.what(); } catch (...) { reason = "unknown failure"; }
+                throw TransactionOutcomeUnknown("AkkEngine: Cluster transaction requires transactionOutcome(id); " + std::string{phase} + ": " + reason, *state.distributedId);
+            }
+            state.finish(); std::rethrow_exception(failure);
+        }
+    }
     // Keep Engine mutexes alive until admission/publication locks are released,
     // even when finish() drops the session's final snapshot lease.
     auto operation = state.snapshot->operation;
@@ -263,4 +473,12 @@ void AkkEngine::Transaction::end() {
         engine.transactionJournalPending.store(!engine.transactionJournals.empty(), std::memory_order_release);
         state.finish(); std::rethrow_exception(failure);
     }
+}
+
+cluster::ClusterTransactionResult AkkEngine::transactionOutcome(const cluster::ClusterTransactionId& id) {
+    if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+    Impl::OperationGuard operation{*impl_};
+    if (!impl_->distributedTransactionsEnabled() || impl_->opts.cluster.runtime.transactions.participantOnly) { throw std::logic_error("AkkEngine: Cluster transactions are disabled"); }
+    cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.transactions.timeoutMs};
+    const auto record = impl_->distributedRecord(id); return {record.status, record.finished};
 }

@@ -57,7 +57,7 @@ cluster::ForwardResponse partitionRpcLeader(uint16_t index, std::vector<uint8_t>
         cluster::detail::ReconfigurationDeadline::check();
         for (const auto& node : candidates) {
             if (std::chrono::steady_clock::now() >= deadline) { break; }
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
             try { return partitionRpc(node.nodeId, command, static_cast<uint32_t>(std::min<int64_t>(remaining, 20000))); }
             catch (const cluster::ClusterRoutingError& error) {
                 if (command[0] == static_cast<uint8_t>(PartitionAdmin::ROLLBACK) && error.outcomeUnknown()) { throw; }
@@ -204,6 +204,7 @@ bool cancelPlacement(uint64_t expected = 0) {
 }
 
 void reconfigurePlacement(cluster::ClusterConfig target, bool recovery = false) {
+    std::unique_lock<std::timed_mutex> transactionsAdmission;
     cluster::detail::ReconfigurationDeadline budget{opts.cluster.runtime.reconfiguration.timeoutMs, [this] { return placementClosing(); }};
     std::unique_lock serialization{clusterReconfigurationMu, std::defer_lock};
     if (recovery) { if (!serialization.try_lock()) { return; } }
@@ -227,6 +228,7 @@ void reconfigurePlacement(cluster::ClusterConfig target, bool recovery = false) 
             target.mode() != clusterConfig.mode() || target.clusterId() != clusterConfig.clusterId()) {
             throw std::invalid_argument("AkkEngine: online placement requires PARTITIONED Raft or MIRROR Raft membership replacement");
         }
+        transactionsAdmission = distributedConfigurationAdmission();
         clusterRuntime->reconfigure(target);
         cluster::ClusterConfig::save(opts.paths.clusterConfigPath, target);
         return;
@@ -242,6 +244,7 @@ void reconfigurePlacement(cluster::ClusterConfig target, bool recovery = false) 
         (void)partitionRpc(state.leaderNodeId, std::move(command), opts.cluster.runtime.reconfiguration.timeoutMs);
         return;
     }
+    transactionsAdmission = distributedConfigurationAdmission();
     const auto active = cluster::ClusterConfig::decode(state.activeConfig);
     active.validatePlacementChange(target);
     if (!target.raft().membership.allowLearners || !target.raft().membership.allowOnlineVoterChanges) {
@@ -348,10 +351,10 @@ cluster::ClusterConfig partitionConfig(const cluster::ClusterConfig& placement, 
         const std::array<uint8_t, 2> group{static_cast<uint8_t>(index), static_cast<uint8_t>(index >> 8)};
         auto candidates = placement.dataNodes();
         std::erase_if(candidates, [](const auto& member) { return member.raftLearner(); });
-        auto ranked = cluster::detail::rankNodes(group, candidates);
+        auto ranked = cluster::detail::placementNodes(group, candidates, placement.partitionCopies(), placement.faultDomains(), true);
         std::vector<cluster::NodeInfo> members;
         for (size_t i = 0; i < placement.partitionCopies(); ++i) {
-            auto node = ranked[i].second;
+            auto node = ranked[i];
             node.replPort = static_cast<uint16_t>(node.partitionReplBasePort + index);
             node.stripeMetadataPort = 0;
             node.partitionReplBasePort = 0;
@@ -374,7 +377,7 @@ cluster::ClusterConfig partitionConfig(const cluster::ClusterConfig& placement, 
             throw std::invalid_argument("AkkEngine: every partition requires a coordinator-eligible holder");
         }
         return cluster::ClusterConfig{std::move(members), cluster::ReplicationMode::MIRROR,
-            placement.ackPolicy(), placement.consistency(), placement.raft(), {}, 0, placement.clusterId(), {}, placement.failover()};
+            placement.ackPolicy(), placement.consistency(), placement.raft(), {}, 0, placement.clusterId(), {}, placement.failover(), placement.faultDomains()};
 }
 
 std::shared_ptr<AkkEngine> openPartition(uint16_t index, const cluster::ClusterConfig& bootstrap, bool joining) {
@@ -396,6 +399,9 @@ std::shared_ptr<AkkEngine> openPartition(uint16_t index, const cluster::ClusterC
         child.cluster.runtime.mirrorPromotion = {};
         child.cluster.runtime.mirrorFencing = {};
         child.cluster.runtime.mirrorRecovery = {};
+        child.cluster.runtime.transactions.participantOnly = true;
+        child.cluster.runtime.raftGroupKind = cluster::RaftGroupKind::PARTITION_DATA;
+        child.cluster.runtime.raftPartitionIndex = index;
         child.cluster.runtime.reconfiguration.stripeMigrationMode = cluster::StripeMigrationMode::FREEZE;
         child.cluster.runtime.reconfiguration.stripeInterruptionPolicy = cluster::StripeInterruptionPolicy::RETAIN;
         child.cluster.runtime.transfer.spoolDirectory = child.paths.dataDir / "transfer-spool";
@@ -555,7 +561,8 @@ std::vector<PartitionRangeTarget> rangeQueryPlan(std::span<const uint8_t> key) {
         const auto index = static_cast<uint16_t>(slot);
         const auto response = partitionRpcLeader(index, partitionAdminHeader(PartitionAdmin::STATUS, index, 0), *placement, deadline);
         const auto target = response.target.nodeId;
-        if (opts.cluster.runtime.readMode == cluster::ClusterReadMode::OWNER_ONLY && target != nodeId) {
+        if (opts.cluster.runtime.queryConsistencyMode != cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT &&
+            opts.cluster.runtime.readMode == cluster::ClusterReadMode::OWNER_ONLY && target != nodeId) {
             cluster::ClusterRouteTarget destination; destination.nodeId = target;
             throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::NOT_OWNER, destination);
         }

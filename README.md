@@ -17,6 +17,15 @@ Choose the entry point that matches your application:
 | Kotlin/JVM integration | JNI wrapper with `ByteBufferL` |
 | Remote access over HTTP/TCP/gRPC | `akkara/akkserver/` backends |
 
+## Cluster Deployment Intent
+
+Native Cluster primarily targets separate physical machines within a LAN or
+across a WAN. Same-machine loopback tests do not establish real LAN/WAN
+performance. A smaller AkkaraDB specifically for deployment as a Cluster node
+is under consideration; its feature set and packaging are not yet defined.
+See [AGENTS.md](AGENTS.md) for this design context and [SPEC.md](SPEC.md#15-cluster-and-replication)
+for the current Cluster contracts.
+
 ## Why AkkaraDB
 
 - Embedded-first: use it as a local native database without deploying a separate server.

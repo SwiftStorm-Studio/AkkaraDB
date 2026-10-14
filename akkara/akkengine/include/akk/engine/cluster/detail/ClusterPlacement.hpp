@@ -3,9 +3,11 @@
 #pragma once
 
 #include "akk/engine/cluster/ClusterConfig.hpp"
+#include "akk/engine/cluster/detail/FaultDomains.hpp"
 #include "akk/crypto/Random.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <ranges>
 
 namespace akkaradb::engine::cluster::detail {
     inline uint16_t partitionForKey(std::span<const uint8_t> key, uint16_t count) {
@@ -13,7 +15,7 @@ namespace akkaradb::engine::cluster::detail {
         constexpr std::array<uint8_t, 5> domain{'A', 'K', 'P', 'T', '1'};
         const std::array parts{std::span<const uint8_t>{domain}, key};
         const auto digest = crypto::hash256(parts);
-        const uint32_t hash = static_cast<uint32_t>(digest[0]) | (static_cast<uint32_t>(digest[1]) << 8) |
+        const auto hash = static_cast<uint32_t>(digest[0]) | (static_cast<uint32_t>(digest[1]) << 8) |
             (static_cast<uint32_t>(digest[2]) << 16) | (static_cast<uint32_t>(digest[3]) << 24);
         return static_cast<uint16_t>(hash % count);
     }
@@ -45,6 +47,12 @@ namespace akkaradb::engine::cluster::detail {
         return ranked;
     }
 
+    inline std::vector<NodeInfo> placementNodes(std::span<const uint8_t> key, const std::vector<NodeInfo>& candidates,
+        size_t count, FaultDomainOptions options, bool voters = false) {
+        const auto ranked = rankNodes(key, candidates) | std::views::values | std::ranges::to<std::vector>();
+        return selectFaultDomainNodes(ranked, count, options, voters);
+    }
+
     inline std::vector<NodeInfo> partitionTargets(const ClusterConfig& config, std::span<const uint8_t> key) {
         std::array<uint8_t, 2> group{};
         if (config.usesDataConsensus()) {
@@ -54,11 +62,6 @@ namespace akkaradb::engine::cluster::detail {
         }
         auto members = config.dataNodes();
         if (config.usesDataConsensus()) { std::erase_if(members, [](const auto& node) { return node.raftLearner(); }); }
-        const auto ranked = rankNodes(key, members);
-        std::vector<NodeInfo> targets;
-        const auto copies = config.partitionCopies();
-        targets.reserve(copies);
-        for (size_t i = 0; i < copies; ++i) { targets.push_back(ranked[i].second); }
-        return targets;
+        return placementNodes(key, members, config.partitionCopies(), config.faultDomains(), config.usesDataConsensus());
     }
 }

@@ -19,14 +19,17 @@
 #include "akkaradb/Export.hpp"
 
 namespace akkaradb::engine::wal {
+    static constexpr uint16_t WAL_FLAG_ROLLBACK = 0x1000; // Mutation source is ROLLBACK_NODE; not a MemHdr16 flag.
+    static constexpr uint16_t WAL_FLAG_REQUEST_APPLICATION = 0x2000;
+    static constexpr size_t WAL_REQUEST_METADATA_SIZE = 56; // nonce, expiry, mutation fingerprint
     static constexpr uint16_t WAL_FLAG_SNAPSHOT_RECORD = 0x4000;
     static constexpr uint16_t WAL_FLAG_SNAPSHOT_COMMIT = 0x8000;
     static constexpr uint16_t WAL_FLAG_SNAPSHOT_MASK = WAL_FLAG_SNAPSHOT_RECORD | WAL_FLAG_SNAPSHOT_COMMIT;
 
     struct AKDB_API WalSegmentHeader {
         static constexpr uint32_t MAGIC = 0x414B5741; // "AKWA"
-        static constexpr uint16_t VERSION = 0x0001;
-        static constexpr uint16_t SIZE = 48;
+        static constexpr uint16_t VERSION = 0x0002;
+        static constexpr uint16_t SIZE = 56;
 
         uint64_t segmentId = 0;
         uint64_t createdUs = 0;
@@ -38,6 +41,8 @@ namespace akkaradb::engine::wal {
         uint16_t headerSize = SIZE;
         uint16_t shardId = 0;
         uint16_t flags = 0;
+        // CRC-covered lower bound on the complete record prefix published by the writer.
+        uint64_t publishedBytes = SIZE;
 
         [[nodiscard]] bool verifyMagic() const noexcept { return magic == MAGIC; }
         [[nodiscard]] bool verifyVersion() const noexcept { return version == VERSION && headerSize == SIZE; }
@@ -47,7 +52,7 @@ namespace akkaradb::engine::wal {
         [[nodiscard]] static WalSegmentHeader deserialize(const uint8_t in[SIZE]) noexcept;
     };
 
-    static_assert(sizeof(WalSegmentHeader) == WalSegmentHeader::SIZE, "WalSegmentHeader must be 48 bytes");
+    static_assert(sizeof(WalSegmentHeader) == WalSegmentHeader::SIZE, "WalSegmentHeader must be 56 bytes");
     static_assert(alignof(WalSegmentHeader) == 8, "WalSegmentHeader must be 8-byte aligned");
     static_assert(std::is_standard_layout_v<WalSegmentHeader>);
     static_assert(std::is_trivially_copyable_v<WalSegmentHeader>);

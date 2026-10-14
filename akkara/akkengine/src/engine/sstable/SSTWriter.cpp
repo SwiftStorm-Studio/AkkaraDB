@@ -329,7 +329,10 @@ namespace akkaradb::engine::sst {
             result.minSeq = std::min(result.minSeq, rec.seq());
             result.maxSeq = std::max(result.maxSeq, rec.seq());
             result.lastKey.assign(rec.key().begin(), rec.key().end());
-            result.blobRefs.push_back(blobRefEntryFromRecord(rec));
+            if (options.trackBlobReferences) { result.blobRefs.push_back(blobRefEntryFromRecord(rec)); }
+            else if ((rec.flags() & SST_RECORD_FLAG_BLOB) != 0) {
+                throw std::invalid_argument("SSTWriter: disabled Blob tracking requires Blob-free records");
+            }
             ++result.entryCount;
 
             const uint64_t estimated = alignUpU64(32 + rec.keySize() + rec.valueSize(), 8);

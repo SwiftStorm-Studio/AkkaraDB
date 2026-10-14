@@ -13,8 +13,11 @@
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
 #include "akk/engine/wal/WalFraming.hpp"
+#include "akk/cpu/CRC32C.hpp"
+#include "WalCheckpoint.hpp"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <optional>
 #include <stdexcept>
@@ -38,6 +41,7 @@ namespace akkaradb::engine::wal {
             bool clean = true;
             bool replayedAny = false;
             uint64_t validBytes = WalSegmentHeader::SIZE;
+            uint64_t firstSeq = 0, lastSeq = 0;
         };
 
         [[nodiscard]] bool readExact(std::ifstream& file, uint8_t* out, size_t len) {
@@ -46,10 +50,22 @@ namespace akkaradb::engine::wal {
             return file.good() || file.gcount() == static_cast<std::streamsize>(len);
         }
 
-        [[nodiscard]] std::vector<SegmentFile> listSegments(const fs::path& walDir, WalRecoveryResult& result) {
+        [[nodiscard]] std::vector<SegmentFile> listSegments(const WalRecoveryOptions& options, WalRecoveryResult& result) {
+            const auto& walDir = options.walDir;
             std::vector<SegmentFile> files;
             if (!fs::exists(walDir)) { return files; }
             if (!fs::is_directory(walDir)) { throw std::runtime_error("WAL recovery path is not a directory: " + walDir.string()); }
+
+            for (const auto& entry : fs::directory_iterator(walDir)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".checkpoint") { continue; }
+                auto segment = entry.path(); segment.replace_extension();
+                if (segment.extension() != ".akwal") { continue; }
+                const auto checkpoint = detail::readCheckpoint(segment);
+                if (checkpoint && !fs::exists(segment)) {
+                    ++result.corruptSegments;
+                    if (options.truncateCorruptTail) { detail::retireCheckpoint(segment); }
+                }
+            }
 
             for (const auto& entry : fs::directory_iterator(walDir)) {
                 if (!entry.is_regular_file() || entry.path().extension() != ".akwal") { continue; }
@@ -59,15 +75,32 @@ namespace akkaradb::engine::wal {
                 if (!file) { throw std::runtime_error("WAL recovery failed to open segment: " + entry.path().string()); }
 
                 uint8_t hdrBuf[WalSegmentHeader::SIZE]{};
-                if (!readExact(file, hdrBuf, WalSegmentHeader::SIZE)) {
+                // Inspect the common prefix before reading the larger v2 header.
+                constexpr size_t prefixSize = 48;
+                if (!readExact(file, hdrBuf, prefixSize)) {
+                    ++result.corruptSegments;
+                    continue;
+                }
+                const auto version = static_cast<uint16_t>(hdrBuf[40] | (uint16_t{hdrBuf[41]} << 8));
+                if (version == 1) {
+                    throw std::runtime_error("WAL recovery: incompatible v1 segment; recreate the pre-release database");
+                }
+                if (!readExact(file, hdrBuf + prefixSize, WalSegmentHeader::SIZE - prefixSize)) {
                     ++result.corruptSegments;
                     continue;
                 }
 
-                const WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdrBuf);
+                WalSegmentHeader hdr = WalSegmentHeader::deserialize(hdrBuf);
                 if (!hdr.verifyMagic() || !hdr.verifyVersion() || !hdr.verifyChecksum()) {
                     ++result.corruptSegments;
                     continue;
+                }
+
+                if (const auto checkpoint = detail::readCheckpoint(entry.path())) {
+                    if (checkpoint->shardId != hdr.shardId || checkpoint->segmentId != hdr.segmentId) {
+                        throw std::runtime_error("WAL recovery: foreign segment checkpoint");
+                    }
+                    hdr.publishedBytes = std::max(hdr.publishedBytes, checkpoint->publishedBytes);
                 }
 
                 files.push_back(SegmentFile{entry.path(), hdr});
@@ -95,6 +128,7 @@ namespace akkaradb::engine::wal {
             file.seekg(WalSegmentHeader::SIZE, std::ios::beg);
 
             SegmentRecoveryStatus status;
+            bool publishedBoundary = segment.header.publishedBytes == WalSegmentHeader::SIZE;
             std::vector<uint8_t> key;
             std::vector<uint8_t> value;
 
@@ -135,15 +169,28 @@ namespace akkaradb::engine::wal {
                 ++result.entriesSeen;
                 result.maxSeq = std::max(result.maxSeq, ehdr.seq);
                 status.validBytes += ehdr.entryLen;
+                if (status.firstSeq == 0 || ehdr.seq < status.firstSeq) { status.firstSeq = ehdr.seq; }
+                status.lastSeq = std::max(status.lastSeq, ehdr.seq);
+                if (status.validBytes == segment.header.publishedBytes) { publishedBoundary = true; }
 
+                std::span<const uint8_t> storedValue = valueSpan;
+                if ((ehdr.flags & WAL_FLAG_REQUEST_APPLICATION) != 0) {
+                    constexpr size_t prefix = 5 + WAL_REQUEST_METADATA_SIZE;
+                    if ((ehdr.flags & WAL_FLAG_SNAPSHOT_MASK) != 0 || value.size() < prefix ||
+                        !std::equal(value.begin(), value.begin() + 5, "AKLA1")) {
+                        throw std::runtime_error("WAL recovery found invalid request application envelope");
+                    }
+                    if (options.requestApplication) { options.requestApplication(valueSpan.subspan(5, WAL_REQUEST_METADATA_SIZE), ehdr.seq); }
+                    storedValue = valueSpan.subspan(prefix);
+                }
                 if (ehdr.seq <= options.checkpointSeq) { continue; }
 
                 WalRecoveredEntry out;
                 out.key = key;
-                out.value = value;
+                out.value.assign(storedValue.begin(), storedValue.end());
                 out.seq = ehdr.seq;
                 out.keyFp64 = ehdr.keyFp64;
-                out.flags = ehdr.flags;
+                out.flags = static_cast<uint16_t>(ehdr.flags & ~WAL_FLAG_REQUEST_APPLICATION);
                 out.shardId = segment.header.shardId;
                 out.segmentId = segment.header.segmentId;
                 callback(out);
@@ -151,6 +198,12 @@ namespace akkaradb::engine::wal {
                 status.replayedAny = true;
             }
 
+            // A record-aligned EOF is still loss if the CRC-covered header
+            // published a longer prefix. Another shard's maximum seq cannot prove it.
+            if (status.clean && (!publishedBoundary || segment.header.publishedBytes > status.validBytes)) {
+                ++result.corruptSegments;
+                status.clean = false;
+            }
             if (status.replayedAny) { ++result.segmentsReplayed; }
             return status;
         }
@@ -159,8 +212,20 @@ namespace akkaradb::engine::wal {
             const uint64_t currentSize = fs::file_size(segment.path);
             if (status.validBytes < currentSize) {
                 fs::resize_file(segment.path, status.validBytes);
-                ++result.segmentsTruncated;
             }
+            auto header = segment.header;
+            header.firstSeq = status.firstSeq; header.lastSeq = status.lastSeq;
+            header.publishedBytes = status.validBytes; header.crc32c = 0;
+            std::array<uint8_t, WalSegmentHeader::SIZE> bytes{}; header.serialize(bytes.data());
+            header.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+            header.serialize(bytes.data());
+            std::fstream output{segment.path, std::ios::binary | std::ios::in | std::ios::out};
+            output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()); output.flush();
+            if (!output) { throw std::runtime_error("WAL recovery failed to publish truncated prefix: " + segment.path.string()); }
+            output.close();
+            detail::syncRepairedSegment(segment.path);
+            detail::publishCheckpoint(segment.path, header);
+            ++result.segmentsTruncated;
         }
 
         [[nodiscard]] std::optional<uint64_t> decodeSnapshotCommitCount(std::span<const uint8_t> value) noexcept {
@@ -177,12 +242,15 @@ namespace akkaradb::engine::wal {
     WalRecoveryResult WalRecovery::recover(const WalRecoveryOptions& options, const Callback& callback) {
         if (!callback) { throw std::invalid_argument("WAL recovery callback is empty"); }
         WalRecoveryResult result{};
-        const std::vector<SegmentFile> files = listSegments(options.walDir, result);
+        const std::vector<SegmentFile> files = listSegments(options, result);
         bool skipShard = false;
         uint16_t skippedShard = 0;
         for (const SegmentFile& segment : files) {
             if (skipShard && segment.header.shardId == skippedShard) {
-                if (options.truncateCorruptTail && fs::remove(segment.path)) { ++result.segmentsRemoved; }
+                if (options.truncateCorruptTail) {
+                    detail::retireCheckpoint(segment.path);
+                    if (fs::remove(segment.path)) { ++result.segmentsRemoved; }
+                }
                 continue;
             }
             if (skipShard && segment.header.shardId != skippedShard) { skipShard = false; }

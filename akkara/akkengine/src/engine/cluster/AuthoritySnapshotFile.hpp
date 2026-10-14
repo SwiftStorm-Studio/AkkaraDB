@@ -33,7 +33,7 @@ namespace akkaradb::engine::cluster::detail {
         }
     public:
         explicit AuthoritySnapshotFile(std::filesystem::path path) : path_{std::move(path)} {}
-        const auto& path() const { return path_; }
+        [[nodiscard]] const auto& path() const { return path_; }
         void begin(uint64_t seq) {
             if (out_.is_open()) { out_.close(); }
             std::filesystem::create_directories(path_.parent_path());
@@ -70,7 +70,7 @@ namespace akkaradb::engine::cluster::detail {
             if (!out_) { throw std::runtime_error("Authority snapshot: flush failed"); }
             out_.close();
         }
-        bool replay(uint64_t seq, const SnapshotEntryVisitor& visitor) const {
+        [[nodiscard]] bool replay(uint64_t seq, const SnapshotEntryVisitor& visitor) const {
             std::ifstream in{path_, std::ios::binary};
             if (integer(in, 8) != seq) { throw std::runtime_error("Authority snapshot: sequence mismatch"); }
             const auto count = integer(in, 8);
@@ -78,7 +78,7 @@ namespace akkaradb::engine::cluster::detail {
                 const auto keySize = integer(in, 8), valueSize = integer(in, 8);
                 const auto keyCrc = integer(in, 4), valueCrc = integer(in, 4);
                 if (keySize > MAX_ENTRY || valueSize > MAX_ENTRY) { throw std::runtime_error("Authority snapshot: oversized entry"); }
-                std::vector<uint8_t> key(static_cast<size_t>(keySize)), value(static_cast<size_t>(valueSize));
+                std::vector<uint8_t> key(keySize), value(valueSize);
                 in.read(reinterpret_cast<char*>(key.data()), static_cast<std::streamsize>(key.size()));
                 in.read(reinterpret_cast<char*>(value.data()), static_cast<std::streamsize>(value.size()));
                 if (!in || crc(key) != keyCrc || crc(value) != valueCrc) { throw std::runtime_error("Authority snapshot: corrupt staging entry"); }

@@ -100,7 +100,7 @@ void testStripeMetadataParallelism(bool secure) {
         const auto apply = callbacks.commitStripeMetadata;
         callbacks.commitStripeMetadata = [&, apply](auto seq, auto receivedKey, auto metadata) {
             if (textOf(receivedKey) == key) { gate.pause(); }
-            apply(seq, receivedKey, metadata);
+            return apply(seq, receivedKey, metadata);
         };
     });
     auto spare = makeRuntime(dir / "n3", config, 3, spareOptions, secure);
@@ -108,6 +108,7 @@ void testStripeMetadataParallelism(bool secure) {
     AKK_CLUSTER_CHECK(waitUntil([&] { return leader->runtime->stripeMetadataLeaderNodeId() == 2 &&
         runtimePeerConnected(*leader->runtime, 3) && runtimePeerConnected(*spare->runtime, 2); }, std::chrono::seconds{20}));
     const auto lease = spare->runtime->acquireStripeOperation(bytesOf(key), 1);
+    const auto otherLease = spare->runtime->acquireStripeOperation(bytesOf(otherKey), 1);
     std::vector<uint8_t> metadata(62, 0); std::memcpy(metadata.data(), "AKSM1", 5);
     for (const auto [offset, value] : {std::pair{6u, lease.fenceToken}, {14u, lease.ownerNodeId},
             {22u, lease.authorityNodeId}, {30u, lease.fenceToken}}) {
@@ -116,9 +117,9 @@ void testStripeMetadataParallelism(bool secure) {
     auto commit = std::async(std::launch::async, [&] { spare->runtime->commitStripeMetadata(lease, bytesOf(key), metadata); });
     ReleaseParallelismGate release{gate};
     AKK_CLUSTER_CHECK(gate.await());
-    auto other = std::async(std::launch::async, [&] { return spare->runtime->acquireStripeOperation(bytesOf(otherKey), 1); });
+    auto other = std::async(std::launch::async, [&] { spare->runtime->releaseStripeOperation(otherLease, bytesOf(otherKey)); });
     AKK_CLUSTER_CHECK(other.wait_for(std::chrono::milliseconds{1500}) == std::future_status::ready);
-    const auto otherLease = other.get(); spare->runtime->releaseStripeOperation(otherLease, bytesOf(otherKey));
+    other.get();
     AKK_CLUSTER_CHECK(commit.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
     spare->runtime->releaseStripeOperation(lease, bytesOf(key));
     auto ownerOptions = options; ownerOptions.secure.identitySeedPath = dir / "identity-1";
@@ -133,12 +134,12 @@ void testStripeMetadataParallelism(bool secure) {
     owner->runtime->releaseStripeOperation(ownerLease, bytesOf(otherKey));
     AKK_CLUSTER_CHECK(spare->runtime->readStripeMetadata(bytesOf(key), 1) == metadata);
     const auto next = owner->runtime->acquireStripeOperation(bytesOf(key), 1);
-    AKK_CLUSTER_CHECK(next.fenceToken != lease.fenceToken);
+    AKK_CLUSTER_CHECK(next.fenceToken != lease.fenceToken && next.metadata == metadata);
     bool fenced = false;
     try { spare->runtime->commitStripeMetadata(lease, bytesOf(key), metadata); } catch (const std::runtime_error&) { fenced = true; }
     AKK_CLUSTER_CHECK(fenced); owner->runtime->releaseStripeOperation(next, bytesOf(key));
     owner->runtime->close(); spare->runtime->close(); leader->runtime->close();
-    std::fprintf(stderr, "[parallelism] independent RPC proceeds; pending commit blocks owner handoff (%s)\n", secure ? "SECURE" : "PLAIN");
+    std::fprintf(stderr, "[parallelism] release RPC proceeds; fresh acquisition waits for applied commit (%s)\n", secure ? "SECURE" : "PLAIN");
 }
 
 void testStripeEngineIndependentKeys(bool secure) {
@@ -157,6 +158,9 @@ void testStripeEngineIndependentKeys(bool secure) {
     const auto optionsFor = [&](uint64_t id) {
         akkaradb::engine::AkkEngineOptions options; options.paths.dataDir = dir / ("n" + std::to_string(id));
         options.components.clusterEnabled = true; options.components.blobEnabled = false;
+        // Keep the warm-up generation retained: waiting for its reclamation on
+        // the deliberately blocked peer is a different contract from shard I/O.
+        options.components.versionLogEnabled = true;
         options.cluster.config = config; options.cluster.runtime = runtime;
         options.cluster.runtime.secure.identitySeedPath = dir / ("identity-" + std::to_string(id));
         options.cluster.runtime.stripeWriteCommitMode = StripeWriteCommitMode::ALL_SHARDS;
@@ -176,6 +180,10 @@ void testStripeEngineIndependentKeys(bool secure) {
     auto one = Engine::open(optionsFor(1));
     auto peerOptions = runtime; peerOptions.secure.identitySeedPath = dir / "identity-2";
     auto slowPeer = makeRuntime(dir / "n2", config, 2, peerOptions, secure, {}, [&](auto& callbacks) {
+        callbacks.stripeGenerationRetained = [read = callbacks.readStripeMetadata](auto key, uint64_t generation) -> std::optional<bool> {
+            const auto metadata = read(key);
+            return metadata && metadata->size() >= 14 && readU64Le(*metadata, 6) == generation;
+        };
         const auto apply = callbacks.apply;
         callbacks.apply = [&, apply](auto seq, auto op, auto key, auto value, auto flags, auto source, auto timestamp) {
             if (enabled.load()) { gate.pause(); }

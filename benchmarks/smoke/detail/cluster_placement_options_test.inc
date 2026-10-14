@@ -14,6 +14,9 @@ void testReconfigurationDeadlineBudget() {
         const auto deadline = Budget::current().deadline;
         Budget nested{30000};
         AKK_CLUSTER_CHECK(Budget::current().deadline == deadline);
+        bool zeroRejected = false;
+        try { (void)Budget::remaining(0); } catch (const std::invalid_argument&) { zeroRejected = true; }
+        AKK_CLUSTER_CHECK(zeroRejected && Budget::remaining(1) == 1);
         try { auto lock = Budget::lock(mutex); } catch (const std::runtime_error&) { expired = true; }
     }
     release.set_value(); holder.get();

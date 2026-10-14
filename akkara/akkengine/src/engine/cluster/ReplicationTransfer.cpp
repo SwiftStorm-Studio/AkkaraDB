@@ -8,6 +8,7 @@
  */
 
 #include "akk/engine/cluster/detail/ReplicationTransfer.hpp"
+#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
 #include "akk/cpu/CRC32C.hpp"
 #include "akk/crypto/Random.hpp"
 #include <algorithm>
@@ -111,7 +112,7 @@ namespace akkaradb::engine::cluster::detail {
                 return crypto::hash256(parts);
             }
 
-            const size_t bufferSize = static_cast<size_t>(std::min<uint64_t>(1024u * 1024u, message.payloadSize()));
+            const auto bufferSize = static_cast<size_t>(std::min<uint64_t>(1024u * 1024u, message.payloadSize()));
             auto memory = budget->reserve(TransferBudget::Resource::MEMORY, bufferSize);
             return crypto::hash256StreamedSecondPart(metadata, message.payloadSize(),
                 [&](uint64_t offset, std::span<uint8_t> destination) {
@@ -232,13 +233,13 @@ namespace akkaradb::engine::cluster::detail {
                 if (offset > 8 + dataSize_ || destination.size() > 8 + dataSize_ - offset) { return false; }
                 size_t copied = 0;
                 if (offset < prefix_.size()) {
-                    const size_t count = std::min(destination.size(), prefix_.size() - static_cast<size_t>(offset));
+                    const auto count = std::min(destination.size(), prefix_.size() - static_cast<size_t>(offset));
                     std::memcpy(destination.data(), prefix_.data() + static_cast<size_t>(offset), count);
                     copied = count;
                     offset += count;
                 }
                 if (copied == destination.size()) { return true; }
-                const uint64_t fileOffset = dataOffset_ + offset - prefix_.size();
+                const auto fileOffset = dataOffset_ + offset - prefix_.size();
                 std::lock_guard lock{mutex_};
                 in_.clear();
                 in_.seekg(static_cast<std::streamoff>(fileOffset));
@@ -290,7 +291,7 @@ namespace akkaradb::engine::cluster::detail {
                 throw std::runtime_error("replication: invalid snapshot value chunk");
             }
             append(chunk);
-            valueOffset_ += static_cast<uint64_t>(chunk.size());
+            valueOffset_ += chunk.size();
         }
 
         MessagePtr finish() {
@@ -443,7 +444,7 @@ namespace akkaradb::engine::cluster::detail {
                 written_ += static_cast<uint64_t>(count);
                 {
                     std::lock_guard lock{budget_->mutex_};
-                    const auto consumed = std::min<uint64_t>(reservedRemaining_, static_cast<uint64_t>(count));
+                    const auto consumed = std::min(reservedRemaining_, static_cast<uint64_t>(count));
                     reservedRemaining_ -= consumed;
                     budget_->persistentRemaining_ -= consumed;
                 }
@@ -534,10 +535,12 @@ namespace akkaradb::engine::cluster::detail {
         Resource resource;
         uint64_t amount;
         bool active = false;
+        std::shared_ptr<void> nodeLease;
         ~Lease() { if (active) { std::lock_guard lock{budget->mutex_}; budget->counter(resource) -= amount; } }
     };
 
-    TransferBudget::TransferBudget(ReplicationTransferOptions value) : options{std::move(value)} {
+    TransferBudget::TransferBudget(ReplicationTransferOptions value, std::shared_ptr<NodeResourceBudget> nodeBudget)
+        : options{std::move(value)}, nodeBudget_{std::move(nodeBudget)} {
         validateTransferOptions(options);
         if (!options.resumeEnabled) { return; }
         std::error_code ec;
@@ -577,6 +580,9 @@ namespace akkaradb::engine::cluster::detail {
         const auto extra = resource == Resource::SPOOL ? persistentRemaining_ + diskUsage(*this) : 0;
         if (amount > limit || extra > limit - amount || current > limit - amount - extra) {
             throw std::runtime_error("replication: transfer resource limit exceeded");
+        }
+        if (nodeBudget_ && resource != Resource::SPOOL) {
+            lease->nodeLease = (resource == Resource::MEMORY ? nodeBudget_->transferMemory : nodeBudget_->transfers)->reserve(amount);
         }
         current += amount; lease->active = true;
         return lease;
@@ -653,7 +659,7 @@ namespace akkaradb::engine::cluster::detail {
     }
     bool sendMessage(const TransferMessage& message, const std::shared_ptr<TransferBudget>& budget,
         const std::shared_ptr<TransferSession>& session, const SendFrame& send) {
-        const uint64_t payloadSize = message.payloadSize();
+        const auto payloadSize = message.payloadSize();
         if (!transferable(message.type) || payloadSize <= budget->options.thresholdBytes) {
             if (payloadSize > TRANSFER_FRAME_LIMIT) { throw std::length_error("replication: physical frame too large"); }
             if (!message.readExternalPayload) { return sendEncoded(message.type, message.payload, budget, send); }
@@ -684,7 +690,7 @@ namespace akkaradb::engine::cluster::detail {
             std::vector<uint8_t> chunk;
             chunk.resize(8 + count);
             for (size_t i = 0; i < 8; ++i) { chunk[i] = static_cast<uint8_t>(offset >> (i * 8)); }
-            if (!readPayload(message, offset, std::span<uint8_t>{chunk}.subspan(8))) { return false; }
+            if (!readPayload(message, offset, std::span{chunk}.subspan(8))) { return false; }
             if (!sendEncoded(ReplMsgType::TRANSFER_CHUNK, chunk, budget, send)) { return false; }
             offset += count;
         }
@@ -726,8 +732,8 @@ namespace akkaradb::engine::cluster::detail {
         }
         if (first->flags != 0 || first->payload.size() != TRANSFER_BEGIN_SIZE) { return {}; }
         result->type = static_cast<ReplMsgType>(first->payload[0]); result->flags = first->payload[1];
-        const uint64_t size = readLe(first->payload, 2, 8);
-        const uint32_t expectedCrc = static_cast<uint32_t>(readLe(first->payload, 10, 4));
+        const auto size = readLe(first->payload, 2, 8);
+        const auto expectedCrc = static_cast<uint32_t>(readLe(first->payload, 10, 4));
         TransferId id{};
         std::copy_n(first->payload.begin() + 14, id.size(), id.begin());
         if (!transferable(result->type) || size == 0 || size > logicalPayloadLimit(result->type) || result->flags != 0) { return {}; }
@@ -819,9 +825,14 @@ namespace akkaradb::engine::cluster::detail {
         message->storage = std::move(file);
         return message;
     }
-    MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key, const std::shared_ptr<TransferBudget>& budget) {
+    MessagePtr readRequestMessage(uint64_t id, uint64_t snapshotSeq, std::span<const uint8_t> key,
+        const std::shared_ptr<TransferBudget>& budget, ReadKeySpace keySpace) {
+        if (keySpace != ReadKeySpace::PUBLIC && keySpace != ReadKeySpace::LOCAL_STORAGE) {
+            throw std::invalid_argument("replication: invalid read key namespace");
+        }
         if (key.size() > UINT32_MAX) { throw std::length_error("replication: oversized read key"); }
         std::vector<uint8_t> prefix; appendLe(prefix, id, 8); appendLe(prefix, snapshotSeq, 8); appendLe(prefix, key.size(), 4);
+        prefix.push_back(static_cast<uint8_t>(keySpace));
         const std::array<std::span<const uint8_t>, 2> parts{prefix, key};
         return makeMessage(ReplMsgType::READ_REQUEST, parts, budget);
     }

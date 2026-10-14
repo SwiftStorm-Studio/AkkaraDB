@@ -5,11 +5,13 @@ class PlacementAuthority {
         uint64_t generation = 1;
         uint64_t pending = 0;
         uint64_t lastGeneration = 1;
+        uint64_t storageSequence = 0;
         bool frozen = false, activating = false, cancelOnInterruption = false;
         std::vector<uint8_t> activeImage;
         std::vector<uint8_t> pendingImage;
     };
     std::mutex stateMu_;
+    std::mutex snapshotCutMu_;
     std::timed_mutex proposalMu_;
     State state_;
     std::filesystem::path path_;
@@ -21,22 +23,27 @@ class PlacementAuthority {
     ClusterReconfigurationOptions options_;
 
     void installSnapshot(uint64_t sequence) {
+        std::lock_guard cutLock{snapshotCutMu_};
         uint64_t after;
         { std::lock_guard lock{stateMu_}; after = state_.applied; }
         if (after >= sequence) {
-            std::error_code ignored;
+            auto ignored = std::error_code{};
             std::filesystem::remove(snapshotFile_.path(), ignored);
             return;
         }
-        std::optional<State> restored;
-        std::vector<uint8_t> stateBytes;
-        bool stateEntry = false;
-        uint64_t ordinal = 0;
+        auto restored = std::optional<State>{};
+        auto stateBytes = std::vector<uint8_t>{};
+        auto stateEntry = false;
+        auto transactionEntry = false, sawTransaction = false;
+        auto ordinal = uint64_t{0};
         // Validate the entire durable spool before changing the state machine.
         SnapshotEntryVisitor validate;
         validate.beginEntry = [&](auto key, uint64_t size, uint32_t) {
             const auto record = detail::decodeSnapshotKey(key);
             stateEntry = record.kind == detail::SnapshotRecordKind::STATE;
+            transactionEntry = record.kind == detail::SnapshotRecordKind::TRANSACTION;
+            if (transactionEntry && (sawTransaction || !record.key.empty() || record.flags || record.sequence || record.source || record.timestamp || size > 4 * 1024 * 1024 || !callbacks_.installTransactionSnapshot)) { throw std::runtime_error("Cluster placement: invalid transaction snapshot entry"); }
+            if (transactionEntry) { sawTransaction = true; }
             if (stateEntry != (ordinal++ == 0) || (stateEntry && (!record.key.empty() || size > 4 * 1024 * 1024))) {
                 throw std::runtime_error("Cluster placement: invalid snapshot state entry");
             }
@@ -52,12 +59,28 @@ class PlacementAuthority {
             throw std::runtime_error("Cluster placement: incomplete authority snapshot");
         }
         ClusterConfig::decode(state_.activeImage).validatePlacementChange(ClusterConfig::decode(restored->activeImage));
+        if (callbacks_.installTransactionSnapshot) {
+            if (!sawTransaction) { throw std::runtime_error("Cluster placement: missing transaction snapshot state"); }
+            ClusterSnapshot transactions; transactions.seq = sequence;
+            transactions.forEachEntry = [&](const SnapshotEntryVisitor& visitor) {
+                auto selected = false;
+                SnapshotEntryVisitor filter;
+                filter.beginEntry = [&](auto key, uint64_t size, uint32_t crc) {
+                    selected = detail::decodeSnapshotKey(key).kind >= detail::SnapshotRecordKind::TRANSACTION;
+                    return !selected || visitor.beginEntry(key, size, crc);
+                };
+                filter.appendValueChunk = [&](uint64_t offset, auto bytes) { return !selected || visitor.appendValueChunk(offset, bytes); };
+                filter.finishEntry = [&] { return !selected || visitor.finishEntry(); };
+                return snapshotFile_.replay(sequence, filter);
+            };
+            callbacks_.installTransactionSnapshot(transactions);
+        }
         if (stripe_) {
             if (!callbacks_.installStripeMetadataSnapshot) { throw std::logic_error("Cluster placement: metadata snapshot callback unavailable"); }
             ClusterSnapshot metadata;
             metadata.seq = sequence;
             metadata.forEachEntry = [&](const SnapshotEntryVisitor& visitor) {
-                bool skip = false;
+                auto skip = false;
                 SnapshotEntryVisitor filter;
                 filter.beginEntry = [&](auto key, uint64_t size, uint32_t crc) {
                     skip = detail::decodeSnapshotKey(key).kind == detail::SnapshotRecordKind::STATE;
@@ -67,11 +90,13 @@ class PlacementAuthority {
                 filter.finishEntry = [&] { return skip || visitor.finishEntry(); };
                 return snapshotFile_.replay(sequence, filter);
             };
-            callbacks_.installStripeMetadataSnapshot(metadata, after);
+            // The source's storage sequence belongs to another node. Bind the
+            // installed image to this receiver's durable local storage instead.
+            restored->storageSequence = callbacks_.installStripeMetadataSnapshot(metadata, after);
         }
         persist(*restored);
         { std::lock_guard lock{stateMu_}; state_ = *restored; }
-        std::error_code ignored;
+        auto ignored = std::error_code{};
         std::filesystem::remove(snapshotFile_.path(), ignored);
         if (callbacks_.placementChanged) { callbacks_.placementChanged(ClusterConfig::decode(restored->activeImage), restored->generation); }
     }
@@ -84,7 +109,7 @@ class PlacementAuthority {
         return left == right;
     }
     static std::vector<uint8_t> encodeState(const State& state) {
-        std::vector<uint8_t> bytes{'A', 'K', 'P', 'C', '2'};
+        auto bytes = std::vector<uint8_t>{'A', 'K', 'P', 'C', '3'};
         writeLe64(bytes, state.applied); writeLe64(bytes, state.generation); writeLe64(bytes, state.pending);
         writeLe64(bytes, state.lastGeneration);
         bytes.push_back(static_cast<uint8_t>((state.frozen ? 1 : 0) | (state.activating ? 2 : 0) | (state.cancelOnInterruption ? 4 : 0)));
@@ -92,11 +117,12 @@ class PlacementAuthority {
         bytes.insert(bytes.end(), state.activeImage.begin(), state.activeImage.end());
         writeLe32(bytes, static_cast<uint32_t>(state.pendingImage.size()));
         bytes.insert(bytes.end(), state.pendingImage.begin(), state.pendingImage.end());
+        writeLe64(bytes, state.storageSequence);
         writeLe32(bytes, cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
         return bytes;
     }
     static State decodeState(std::span<const uint8_t> bytes) {
-        if (bytes.size() < 50 || !std::equal(bytes.begin(), bytes.begin() + 5, "AKPC2") ||
+        if (bytes.size() < 58 || !std::ranges::starts_with(bytes, std::string_view{"AKPC3"}) ||
             readLe32(bytes, bytes.size() - 4) != cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size() - 4)) {
             throw std::runtime_error("Cluster placement: invalid authority state");
         }
@@ -108,10 +134,10 @@ class PlacementAuthority {
         state.cancelOnInterruption = (bytes[37] & 4) != 0;
         const auto activeSize = readLe32(bytes, 38);
         size_t cursor = 42;
-        if (activeSize > bytes.size() - cursor - 8) { throw std::runtime_error("Cluster placement: truncated active config"); }
+        if (activeSize > bytes.size() - cursor - 16) { throw std::runtime_error("Cluster placement: truncated active config"); }
         state.activeImage.assign(bytes.begin() + cursor, bytes.begin() + cursor + activeSize); cursor += activeSize;
         const auto pendingSize = readLe32(bytes, cursor); cursor += 4;
-        if (pendingSize != bytes.size() - cursor - 4 || state.generation == 0 ||
+        if (pendingSize != bytes.size() - cursor - 12 || state.generation == 0 ||
             (state.pending == 0) != (pendingSize == 0) || state.lastGeneration < state.generation ||
             (state.pending != 0 && (state.pending <= state.generation || state.pending != state.lastGeneration)) ||
             (state.pending == 0 && (state.frozen || state.activating || state.cancelOnInterruption)) ||
@@ -119,6 +145,7 @@ class PlacementAuthority {
             throw std::runtime_error("Cluster placement: malformed pending config");
         }
         state.pendingImage.assign(bytes.begin() + cursor, bytes.begin() + cursor + pendingSize);
+        state.storageSequence = readLe64(bytes, cursor + pendingSize);
         (void)ClusterConfig::decode(state.activeImage);
         if (state.pending != 0) { (void)ClusterConfig::decode(state.pendingImage); }
         return state;
@@ -139,8 +166,8 @@ class PlacementAuthority {
     void apply(uint64_t sequence, std::span<const uint8_t> command) {
         if (command.size() < 9 || command[0] > 5) { throw std::runtime_error("Cluster placement: malformed command"); }
         const auto expected = readLe64(command, 1);
-        std::optional<ClusterConfig> changed;
-        uint64_t generation = 0;
+        auto changed = std::optional<ClusterConfig>{};
+        auto generation = uint64_t{0};
         {
             std::lock_guard lock{stateMu_};
             if (sequence <= state_.applied) { return; }
@@ -219,24 +246,27 @@ class PlacementAuthority {
         }
         return ClusterConfig{std::move(nodes), ReplicationMode::MIRROR, {},
             ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = config.consistency().ackTimeoutMs},
-            config.raft(), {}, 0, config.clusterId()};
+            config.raft(), {}, 0, config.clusterId(), {}, FailoverPolicy::DEFAULT, config.faultDomains()};
     }
-    void appliedMetadata(uint64_t sequence, const std::function<void()>& apply) {
+    void appliedMetadata(uint64_t sequence, const std::function<uint64_t()>& apply) {
+        std::lock_guard cutLock{snapshotCutMu_};
         {
             std::lock_guard lock{stateMu_};
             if (sequence <= state_.applied) { return; }
         }
         // Raft serializes application. Storage I/O must not hold the placement
         // view lock, which independent keys need while publication is pending.
-        apply();
+        const auto storageSequence = apply();
         std::lock_guard lock{stateMu_};
-        auto next = state_; next.applied = sequence; persist(next); state_ = std::move(next);
+        auto next = state_; next.applied = sequence;
+        if (stripe_) { next.storageSequence = std::max(next.storageSequence, storageSequence); }
+        persist(next); state_ = std::move(next);
     }
     void commitGenesis(const std::vector<uint8_t>& active) {
         bool needsGenesis;
         { std::lock_guard lock{stateMu_}; needsGenesis = state_.applied == 0; }
         if (!needsGenesis) { return; }
-        std::vector<uint8_t> command{2}; writeLe64(command, 1);
+        auto command = std::vector<uint8_t>{2}; writeLe64(command, 1);
         command.insert(command.end(), active.begin(), active.end());
         auto proposal = raft_->submitMutation([&](uint64_t) {
             ClusterMutation mutation; mutation.key = {0}; mutation.value = command; return mutation;
@@ -254,6 +284,7 @@ public:
         ClusterRuntimeOptions options, ClusterEngineCallbacks callbacks)
         : path_{dir / "placement-authority" / "state.akpc"}, self_{self}, callbacks_{std::move(callbacks)},
           snapshotFile_{path_.parent_path() / "state.snapshot"}, stripe_{config.mode() == ReplicationMode::STRIPE} {
+        if (stripe_ && !callbacks_.getLastSeq) { throw std::invalid_argument("Cluster placement: STRIPE requires a recovered storage sequence callback"); }
         state_.activeImage = config.encode();
         if (std::filesystem::exists(path_)) {
             std::ifstream in(path_, std::ios::binary);
@@ -263,38 +294,56 @@ public:
             if (ClusterConfig::decode(state_.activeImage).clusterId() != config.clusterId()) {
                 throw std::runtime_error("Cluster placement: foreign persisted cluster");
             }
+            if (stripe_ && callbacks_.getLastSeq() < state_.storageSequence) {
+                throw std::runtime_error("Cluster placement: recovered STRIPE storage is behind its authority checkpoint; restore storage before reopening");
+            }
         }
-        ClusterEngineCallbacks control;
+        auto control = ClusterEngineCallbacks{};
+        control.fatalFailure = callbacks_.fatalFailure;
+        control.transactionMaxJournalBytes = callbacks_.transactionMaxJournalBytes;
+        control.transactionBlobThresholdBytes = callbacks_.transactionBlobThresholdBytes;
+        if (stripe_) { control.reclaimStripeGeneration = callbacks_.reclaimStripeGeneration; }
         control.getCurrentSeq = control.getLastSeq = [this] { std::lock_guard lock{stateMu_}; return state_.applied; };
         control.apply = [this](uint64_t seq, ReplOpType op, auto key, auto value, uint8_t flags, uint64_t, uint64_t) {
+            if (op == ReplOpType::PUT && key.size() == 1 && key[0] == 'G' && value.empty() && flags == 0 && stripe_) {
+                // Commit an ordering barrier before proving a generation unreferenced.
+                // An earlier publication whose response timed out may still commit.
+                appliedMetadata(seq, [] { return uint64_t{0}; }); return;
+            }
+            if (op == ReplOpType::TRANSACTION && key.empty() && flags == 0 && callbacks_.applyTransactionControl) {
+                appliedMetadata(seq, [&] { callbacks_.applyTransactionControl(seq, value); return uint64_t{0}; }); return;
+            }
             if (op == ReplOpType::PUT && !key.empty() && (key[0] == 'M' || key[0] == 'H') && callbacks_.commitStripeMetadata) {
                 if ((key[0] == 'M' && flags > 1) || (key[0] == 'H' && flags != 1)) {
                     throw std::runtime_error("Cluster placement: malformed metadata flags");
                 }
                 appliedMetadata(seq, [&] {
-                    callbacks_.commitStripeMetadata(key[0] == 'H' ? UINT64_MAX - 1 : flags == 1 ? 0 : seq, key.subspan(1), value);
+                    return callbacks_.commitStripeMetadata(key[0] == 'H' ? UINT64_MAX - 1 : flags == 1 ? 0 : seq, key.subspan(1), value);
                 });
                 return;
             }
             if (op != ReplOpType::PUT || key.size() != 1 || key[0] != 0 || flags != 0) {
                 throw std::runtime_error("Cluster placement: invalid authority mutation");
             }
-            apply(seq, value);
+            std::lock_guard cutLock{snapshotCutMu_}; apply(seq, value);
         };
         control.forceDurable = [] {};
         control.exportSnapshot = [this]() -> std::optional<ClusterSnapshot> {
+            std::lock_guard cutLock{snapshotCutMu_};
             State state;
             { std::lock_guard lock{stateMu_}; state = state_; }
             auto metadata = stripe_ && callbacks_.exportStripeMetadataSnapshot
                 ? callbacks_.exportStripeMetadataSnapshot(state.applied) : std::optional<ClusterSnapshot>{};
             if (stripe_ && !metadata) { return std::nullopt; }
             const auto image = encodeState(state);
+            const auto transactions = callbacks_.exportTransactionSnapshot ? std::optional{callbacks_.exportTransactionSnapshot(state.applied)} : std::nullopt;
             ClusterSnapshot snapshot;
             snapshot.seq = state.applied;
-            snapshot.forEachEntry = [image, metadata](const SnapshotEntryVisitor& visitor) {
+            snapshot.forEachEntry = [image, metadata, transactions](const SnapshotEntryVisitor& visitor) {
                 const auto key = detail::encodeSnapshotKey({detail::SnapshotRecordKind::STATE, 0, 0, 0, 0, {}});
                 const auto crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(image.data()), image.size());
                 if (!visitor.beginEntry(key, image.size(), crc) || !visitor.appendValueChunk(0, image) || !visitor.finishEntry()) { return false; }
+                if (transactions && !transactions->forEachEntry(visitor)) { return false; }
                 return !metadata || metadata->forEachEntry(visitor);
             };
             return snapshot;
@@ -317,7 +366,7 @@ public:
                 request.entries[0].key.empty() && request.entries[0].value.empty()) {
                 detail::ReconfigurationDeadline budget{request.timeoutMs};
                 requireLeader(); raft_->linearizableReadBarrier();
-                ForwardResponse result;
+                auto result = ForwardResponse{};
                 result.success = true; result.value = wireState(); return result;
             }
             if (!callbacks_.forward) { throw std::logic_error("Cluster placement: forwarding callback unavailable"); }
@@ -326,7 +375,7 @@ public:
         options_ = options.reconfiguration;
         options.reconfiguration.stripeMigrationMode = StripeMigrationMode::FREEZE;
         options.reconfiguration.stripeInterruptionPolicy = StripeInterruptionPolicy::RETAIN;
-        options.requests.enabled = false;
+        options.requests.enabled = false; options.requests.persistLocalApplication = false; options.requests.authorityNodes.clear();
         options.raftBlobPolicy = RaftBlobPolicy::REJECT;
         options.clusterMembershipPath.clear();
         options.resetClusterMembership = false;
@@ -336,6 +385,8 @@ public:
         options.secure.expectedPrimaryNodeId = 0;
         options.transfer.spoolDirectory = path_.parent_path() / "transfer-spool";
         const auto controlConfig = authorityConfig(config);
+        options.raftGroupKind = RaftGroupKind::PLACEMENT;
+        options.raftPartitionIndex = 0;
         raft_ = RaftConsensusRuntime::create(path_.parent_path(), controlConfig, self_, std::move(control), options);
         if (callbacks_.placementChanged) { callbacks_.placementChanged(ClusterConfig::decode(state_.activeImage), state_.generation); }
     }
@@ -356,7 +407,7 @@ public:
             if (leader == self_) { raft_->linearizableReadBarrier(); }
             else {
                 if (leader == 0) { throw std::runtime_error("Cluster placement: authority unavailable"); }
-                ForwardRequest request;
+                auto request = ForwardRequest{};
                 request.operation = ForwardOperation::CLUSTER_ADMIN;
                 request.timeoutMs = detail::ReconfigurationDeadline::remaining(5000);
                 request.entries.emplace_back();
@@ -382,11 +433,11 @@ public:
         commitGenesis(current.activeConfig);
         const auto members = raft_->activeNodes();
         for (auto node : authorityConfig(target).dataNodes()) {
-            if (std::ranges::any_of(members, [&](const auto& member) { return member.nodeId == node.nodeId; })) { continue; }
+            if (std::ranges::contains(members, node.nodeId, &NodeInfo::nodeId)) { continue; }
             node.capabilities |= RAFT_LEARNER;
             raft_->addLearner(node);
         }
-        std::vector<uint8_t> command{0}; writeLe64(command, current.generation);
+        auto command = std::vector<uint8_t>{0}; writeLe64(command, current.generation);
         command.push_back(static_cast<uint8_t>((!stripe_ || options_.stripeMigrationMode == StripeMigrationMode::FREEZE ? 1 : 0) |
             (stripe_ && options_.stripeInterruptionPolicy == StripeInterruptionPolicy::CANCEL ? 2 : 0)));
         command.insert(command.end(), image.begin(), image.end());
@@ -399,7 +450,7 @@ public:
         return current.pendingGeneration;
     }
     void commitPhase(uint8_t action, uint64_t generation) {
-        std::vector<uint8_t> command{action}; writeLe64(command, generation);
+        auto command = std::vector{action}; writeLe64(command, generation);
         auto submission = raft_->submitMutation([command = std::move(command)](uint64_t) {
             ClusterMutation mutation; mutation.key = {0}; mutation.value = command; return mutation;
         });
@@ -435,7 +486,7 @@ public:
         // successor resumes the migration and commits the activation.
         raft_->reconfigure(authorityConfig(ClusterConfig::decode(current.pendingConfig)));
         requireLeader();
-        std::vector<uint8_t> command{1}; writeLe64(command, generation);
+        auto command = std::vector<uint8_t>{1}; writeLe64(command, generation);
         auto submission = raft_->submitMutation([&](uint64_t) {
             ClusterMutation mutation; mutation.key = {0}; mutation.value = command; return mutation;
         });

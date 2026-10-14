@@ -8,11 +8,15 @@
  */
 
 // akkengine/src/engine/AkkEngine.cpp
+#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
+#include "akk/engine/cluster/detail/DiskResults.hpp"
+#include "akk/engine/cluster/detail/ClusterHealth.hpp"
 #include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akk/crypto/Random.hpp"
 #include "akk/engine/cluster/detail/ClusterPlacement.hpp"
+#include "akk/engine/cluster/detail/TransactionProtocol.hpp"
 #include "akk/engine/cluster/detail/KeyedMutex.hpp"
 #include "akk/engine/cluster/detail/BoundedExecutor.hpp"
 #include "akk/engine/cluster/detail/EngineSnapshot.hpp"
@@ -50,6 +54,7 @@
 #include <string_view>
 #include <thread>
 #include <map>
+#include <ranges>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,12 +81,8 @@ namespace akkaradb::engine {
         }
 
         void validateRollbackOptions(RollbackOptions options) {
-            if (options.execution > RollbackExecutionMode::NEXT_STARTUP) {
-                throw std::invalid_argument("AkkEngine: invalid rollback execution mode");
-            }
-            if (options.conflict > RollbackConflictPolicy::OVERWRITE_LATEST) {
-                throw std::invalid_argument("AkkEngine: invalid rollback conflict policy");
-            }
+            if (options.execution > RollbackExecutionMode::NEXT_STARTUP) { throw std::invalid_argument("AkkEngine: invalid rollback execution mode"); }
+            if (options.conflict > RollbackConflictPolicy::OVERWRITE_LATEST) { throw std::invalid_argument("AkkEngine: invalid rollback conflict policy"); }
         }
 
         void writeFileAtomicallyDurable(const fs::path& path, std::span<const uint8_t> bytes) {
@@ -96,10 +97,15 @@ namespace akkaradb::engine {
                 out.flush();
                 if (!out) { throw std::runtime_error("AkkEngine: failed to flush durable journal"); }
             }
-#ifdef _WIN32
+            #ifdef _WIN32
             const HANDLE file = ::CreateFileW(
-                temporary.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr
+                temporary.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                nullptr
             );
             if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
                 if (file != INVALID_HANDLE_VALUE) { ::CloseHandle(file); }
@@ -109,22 +115,16 @@ namespace akkaradb::engine {
             if (!::MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                 throw std::runtime_error("AkkEngine: failed to publish durable journal");
             }
-#else
-            const int fd = ::open(temporary.c_str(), O_RDONLY);
-            if (fd < 0 || ::fsync(fd) != 0) {
+            #else
+            const int fd = ::open(temporary.c_str(), O_RDONLY); if (fd < 0 || ::fsync(fd) != 0) {
                 if (fd >= 0) { ::close(fd); }
                 throw std::runtime_error("AkkEngine: failed to sync durable journal");
-            }
-            ::close(fd);
-            fs::rename(temporary, path);
-            const fs::path parentPath = path.parent_path().empty() ? fs::path{"."} : path.parent_path();
-            const int parent = ::open(parentPath.c_str(), O_RDONLY | O_DIRECTORY);
-            if (parent < 0 || ::fsync(parent) != 0) {
+            } ::close(fd); fs::rename(temporary, path); const fs::path parentPath = path.parent_path().empty() ? fs::path{"."} : path.parent_path(); const int
+                parent = ::open(parentPath.c_str(), O_RDONLY | O_DIRECTORY); if (parent < 0 || ::fsync(parent) != 0) {
                 if (parent >= 0) { ::close(parent); }
                 throw std::runtime_error("AkkEngine: failed to sync durable journal directory");
-            }
-            ::close(parent);
-#endif
+            } ::close(parent);
+            #endif
         }
 
         using cluster::detail::rendezvousScore;
@@ -149,7 +149,7 @@ namespace akkaradb::engine {
             std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
             if (!file) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for test corruption"); }
 
-            constexpr std::streamoff firstRecordHeaderOffset = static_cast<std::streamoff>(5 + sizeof(uint64_t) + sizeof(uint64_t));
+            constexpr auto firstRecordHeaderOffset = static_cast<std::streamoff>(5 + sizeof(uint64_t) + sizeof(uint64_t));
             file.seekg(firstRecordHeaderOffset);
             std::array<uint8_t, sizeof(uint32_t)> keyLenBytes{};
             std::array<uint8_t, sizeof(uint64_t)> valueLenBytes{};
@@ -160,12 +160,10 @@ namespace akkaradb::engine {
             for (size_t i = 0; i < keyLenBytes.size(); ++i) { keyLen |= static_cast<uint32_t>(keyLenBytes[i]) << (i * 8); }
             uint64_t valueLen = 0;
             for (size_t i = 0; i < valueLenBytes.size(); ++i) { valueLen |= static_cast<uint64_t>(valueLenBytes[i]) << (i * 8); }
-            if (valueLen == 0) {
-                throw std::runtime_error("AkkEngine: replication snapshot staging value is empty at test corruption point");
-            }
+            if (valueLen == 0) { throw std::runtime_error("AkkEngine: replication snapshot staging value is empty at test corruption point"); }
 
-            const std::streamoff firstValueByteOffset = firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(
-                uint64_t) + sizeof(uint32_t) + keyLen);
+            const std::streamoff firstValueByteOffset = firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(uint64_t) + sizeof(
+                uint32_t) + keyLen);
             file.seekg(firstValueByteOffset);
             char byte = 0;
             file.get(byte);
@@ -199,9 +197,7 @@ namespace akkaradb::engine {
             constexpr uint64_t SEQ_BITS = 46;
             constexpr uint64_t SEQ_MASK = (1ULL << SEQ_BITS) - 1ULL;
             constexpr uint64_t MAX_NODE_ID = (1ULL << (BLOB_ID_PAYLOAD_BITS - SEQ_BITS)) - 1ULL;
-            if (nodeId == 0 || nodeId > MAX_NODE_ID) {
-                throw std::invalid_argument("AkkEngine: RAFT_LOG Blob nodeId is outside encodable range");
-            }
+            if (nodeId == 0 || nodeId > MAX_NODE_ID) { throw std::invalid_argument("AkkEngine: RAFT_LOG Blob nodeId is outside encodable range"); }
             if (seq == 0 || seq > SEQ_MASK) { throw std::overflow_error("AkkEngine: RAFT_LOG Blob sequence is outside encodable range"); }
             return BLOB_ID_NAMESPACE_RAFT_LOG | (nodeId << SEQ_BITS) | seq;
         }
@@ -211,9 +207,7 @@ namespace akkaradb::engine {
             constexpr uint64_t ORDINAL_MASK = (1ULL << ORDINAL_BITS) - 1ULL;
             constexpr uint64_t SEQ_MASK = (1ULL << (BLOB_ID_PAYLOAD_BITS - ORDINAL_BITS)) - 1ULL;
             if (seq == 0 || seq > SEQ_MASK) { throw std::overflow_error("AkkEngine: snapshot Blob sequence is outside encodable range"); }
-            if (ordinal == 0 || ordinal > ORDINAL_MASK) {
-                throw std::overflow_error("AkkEngine: snapshot Blob ordinal is outside encodable range");
-            }
+            if (ordinal == 0 || ordinal > ORDINAL_MASK) { throw std::overflow_error("AkkEngine: snapshot Blob ordinal is outside encodable range"); }
             return BLOB_ID_NAMESPACE_SNAPSHOT | (seq << ORDINAL_BITS) | ordinal;
         }
 
@@ -252,9 +246,7 @@ namespace akkaradb::engine {
         void normalizeWalOptions(wal::WalOptions& options) noexcept {
             options.execution = resolveWalExecutionMode(options);
             options.syncPolicy = resolveWalSyncPolicy(options);
-            if (options.syncPolicy == wal::WalSyncPolicy::NEVER && options.syncMode == wal::WalSyncMode::SYNC) {
-                options.syncMode = wal::WalSyncMode::OFF;
-            }
+            if (options.syncPolicy == wal::WalSyncPolicy::NEVER && options.syncMode == wal::WalSyncMode::SYNC) { options.syncMode = wal::WalSyncMode::OFF; }
             else if (options.execution == wal::WalExecutionMode::ASYNC) { options.syncMode = wal::WalSyncMode::ASYNC; }
             else if (options.syncPolicy == wal::WalSyncPolicy::NEVER) { options.syncMode = wal::WalSyncMode::OFF; }
             else { options.syncMode = wal::WalSyncMode::SYNC; }
@@ -270,9 +262,7 @@ namespace akkaradb::engine {
 
         void normalizeSstOptions(sst::SSTManager::Options& options) noexcept {
             if (options.compactionMode == sst::SSTCompactionMode::AUTO) {
-                options.compactionMode = options.compactThreads == 0
-                                             ? sst::SSTCompactionMode::DISABLED
-                                             : sst::SSTCompactionMode::BACKGROUND;
+                options.compactionMode = options.compactThreads == 0 ? sst::SSTCompactionMode::DISABLED : sst::SSTCompactionMode::BACKGROUND;
             }
         }
 
@@ -296,17 +286,15 @@ namespace akkaradb::engine {
         void resolveWritePolicy(AkkEngineOptions& options) {
             switch (options.runtime.writePolicy) {
                 case AkkEngineOptions::WritePolicyPreset::CUSTOM: break;
-                case AkkEngineOptions::WritePolicyPreset::SAFE: options.runtime.writeDurability =
-                        AkkEngineOptions::WriteDurabilityMode::SYNCED;
+                case AkkEngineOptions::WritePolicyPreset::SAFE: options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::SYNCED;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
                     break;
-                case AkkEngineOptions::WritePolicyPreset::BALANCED: options.runtime.writeDurability =
-                        AkkEngineOptions::WriteDurabilityMode::WRITTEN;
+                case AkkEngineOptions::WritePolicyPreset::BALANCED: options.runtime.writeDurability = AkkEngineOptions::WriteDurabilityMode::WRITTEN;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
                     break;
                 case AkkEngineOptions::WritePolicyPreset::FAST: options.runtime.writeDurability = options.components.walEnabled
-                        ? AkkEngineOptions::WriteDurabilityMode::ENQUEUED
-                        : AkkEngineOptions::WriteDurabilityMode::MEMORY;
+                                                                                                      ? AkkEngineOptions::WriteDurabilityMode::ENQUEUED
+                                                                                                      : AkkEngineOptions::WriteDurabilityMode::MEMORY;
                     options.runtime.writeVisibility = AkkEngineOptions::WriteVisibilityMode::APPLIED;
                     break;
             }
@@ -317,31 +305,26 @@ namespace akkaradb::engine {
         }
 
         void validateRuntimeOptions(const AkkEngineOptions& options) {
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.
-                writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.writeVisibility ==
+                AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
                 throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires readVisibility=APPLIED");
             }
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && (options.components.
-                clusterEnabled || options.components.versionLogEnabled)) {
-                throw std::invalid_argument(
-                    "AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires cluster and version log to be disabled"
-                );
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && (options.components.clusterEnabled ||
+                options.components.versionLogEnabled)) {
+                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES sequence allocation requires cluster and version log to be disabled");
             }
-            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.
-                sequence.threadLocalRangeSize <= 1) {
-                throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES requires sequence.threadLocalRangeSize > 1");
-            }
-            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.sequence.
-                allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
+            if (options.runtime.sequence.allocation == AkkEngineOptions::SequenceAllocationMode::THREAD_LOCAL_RANGES && options.runtime.sequence.
+                threadLocalRangeSize <= 1) { throw std::invalid_argument("AkkEngine: THREAD_LOCAL_RANGES requires sequence.threadLocalRangeSize > 1"); }
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.sequence.allocation !=
+                AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
                 throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires sequence.allocation=GLOBAL_ATOMIC");
             }
-            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.
-                writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+            if (options.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE && options.runtime.writeVisibility !=
+                AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
                 throw std::invalid_argument("AkkEngine: parallelWriteOrder=KEY_SEQUENCE requires readVisibility=COMMIT_ORDER");
             }
-            if (options.components.sstEnabled && options.runtime.backpressure.maxSstL0Files > 0 && options.runtime.backpressure.
-                sstCompactionBacklog == AkkEngineOptions::BackpressureMode::BLOCK && options.sst.compactionMode ==
-                sst::SSTCompactionMode::DISABLED) {
+            if (options.components.sstEnabled && options.runtime.backpressure.maxSstL0Files > 0 && options.runtime.backpressure.sstCompactionBacklog ==
+                AkkEngineOptions::BackpressureMode::BLOCK && options.sst.compactionMode == sst::SSTCompactionMode::DISABLED) {
                 throw std::invalid_argument("AkkEngine: blocking SST backpressure requires background compaction or fail-fast mode");
             }
         }
@@ -392,15 +375,13 @@ namespace akkaradb::engine {
 
         class Crc32cStream {
             public:
-                void update(std::span<const uint8_t> bytes) noexcept {
-                    for (const auto byte : bytes) { crc_ = (crc_ >> 8u) ^ table()[(crc_ ^ byte) & 0xffu]; }
-                }
+                void update(std::span<const uint8_t> bytes) noexcept { for (const auto byte : bytes) { crc_ = (crc_ >> 8u) ^ table()[(crc_ ^ byte) & 0xffu]; } }
 
                 [[nodiscard]] uint32_t finish() const noexcept { return ~crc_; }
 
             private:
                 static const std::array<uint32_t, 256>& table() noexcept {
-                    static const std::array<uint32_t, 256> values = [] {
+                    static constexpr std::array<uint32_t, 256> values = [] {
                         std::array<uint32_t, 256> out{};
                         for (uint32_t i = 0; i < out.size(); ++i) {
                             uint32_t crc = i;
@@ -458,8 +439,7 @@ namespace akkaradb::engine {
                 using EntryVisitor = cluster::ClusterSnapshot::EntryVisitor;
                 using Producer = std::function<bool(const EntryVisitor&)>;
 
-                ClusterSnapshotExportFile(fs::path path, uint64_t seq, Producer producer)
-                    : path_{std::move(path)}, seq_{seq}, producer_{std::move(producer)} {}
+                ClusterSnapshotExportFile(fs::path path, uint64_t seq, Producer producer) : path_{std::move(path)}, seq_{seq}, producer_{std::move(producer)} {}
                 ~ClusterSnapshotExportFile() { removeFileIfExists(path_); }
 
                 ClusterSnapshotExportFile(const ClusterSnapshotExportFile&) = delete;
@@ -467,6 +447,7 @@ namespace akkaradb::engine {
 
                 [[nodiscard]] uint64_t seq() const noexcept { return seq_; }
                 [[nodiscard]] const fs::path& path() const noexcept { return path_; }
+
                 [[nodiscard]] bool reusable() const {
                     std::lock_guard lock{mutex_};
                     return state_ != State::FAILED;
@@ -538,16 +519,16 @@ namespace akkaradb::engine {
                 }
 
             private:
-                enum class State : uint8_t { PENDING, GENERATING, COMPLETE, FAILED };
+                enum class State : uint8_t {
+                    PENDING, GENERATING, COMPLETE, FAILED
+                };
 
                 bool readEntry(std::istream& in, const EntryVisitor& visitor) const {
                     const auto recordStart = in.tellg();
                     auto header = readSnapshotStagingEntryHeader(in);
-                    const bool wireSizeValid = header.key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull &&
-                        header.valueSize <= UINT32_MAX &&
+                    const bool wireSizeValid = header.key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull && header.valueSize <= UINT32_MAX &&
                         header.valueSize <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - header.key.size();
-                    const bool fileBacked = visitor.fileEntry && wireSizeValid &&
-                        8ull + header.key.size() + header.valueSize > visitor.fileEntryThresholdBytes;
+                    const bool fileBacked = visitor.fileEntry && wireSizeValid && 8ull + header.key.size() + header.valueSize > visitor.fileEntryThresholdBytes;
                     Crc32cStream payloadCrc;
                     if (fileBacked) {
                         updateCrcU32Le(payloadCrc, static_cast<uint32_t>(header.key.size()));
@@ -575,14 +556,16 @@ namespace akkaradb::engine {
                     }
                     if (!fileBacked) { return visitor.finishEntry(); }
                     if (recordStart < 0) { throw std::runtime_error("AkkEngine: invalid cluster snapshot export offset"); }
-                    return visitor.fileEntry(cluster::SnapshotFileEntry{
-                        .path = path_,
-                        .dataOffset = static_cast<uint64_t>(recordStart) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t),
-                        .keySize = static_cast<uint32_t>(header.key.size()),
-                        .valueSize = header.valueSize,
-                        .payloadCrc32c = payloadCrc.finish(),
-                        .storage = shared_from_this(),
-                    });
+                    return visitor.fileEntry(
+                        cluster::SnapshotFileEntry{
+                            .path = path_,
+                            .dataOffset = static_cast<uint64_t>(recordStart) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t),
+                            .keySize = static_cast<uint32_t>(header.key.size()),
+                            .valueSize = header.valueSize,
+                            .payloadCrc32c = payloadCrc.finish(),
+                            .storage = shared_from_this(),
+                        }
+                    );
                 }
 
                 void readHeader(std::istream& in, std::optional<uint64_t> expectedEntryCount) const {
@@ -599,9 +582,7 @@ namespace akkaradb::engine {
                     std::ifstream in{path_, std::ios::binary};
                     if (!in) { throw std::runtime_error("AkkEngine: failed to open cluster snapshot export"); }
                     readHeader(in, expectedEntryCount);
-                    for (uint64_t index = 0; index < expectedEntryCount; ++index) {
-                        if (!readEntry(in, visitor)) { return false; }
-                    }
+                    for (uint64_t index = 0; index < expectedEntryCount; ++index) { if (!readEntry(in, visitor)) { return false; } }
                     char trailing = 0;
                     if (in.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in cluster snapshot export"); }
                     return true;
@@ -617,9 +598,7 @@ namespace akkaradb::engine {
                         std::exception_ptr failure;
                         {
                             std::unique_lock lock{mutex_};
-                            completionCv_.wait(lock, [&] {
-                                return publishedEntries_ > consumedEntries || state_ != State::GENERATING;
-                            });
+                            completionCv_.wait(lock, [&] { return publishedEntries_ > consumedEntries || state_ != State::GENERATING; });
                             availableEntries = publishedEntries_;
                             completedEntryCount = entryCount_;
                             state = state_;
@@ -650,12 +629,7 @@ namespace akkaradb::engine {
                     }
                 }
 
-                bool produce(
-                    const Producer& producer,
-                    const EntryVisitor& visitor,
-                    uint64_t& producedEntries,
-                    bool& primaryVisitorComplete
-                ) {
+                bool produce(const Producer& producer, const EntryVisitor& visitor, uint64_t& producedEntries, bool& primaryVisitorComplete) {
                     std::ofstream out{path_, std::ios::binary | std::ios::trunc};
                     if (!out) { throw std::runtime_error("AkkEngine: failed to create cluster snapshot export"); }
                     out.write(MAGIC.data(), MAGIC.size());
@@ -685,14 +659,11 @@ namespace akkaradb::engine {
                     const EntryVisitor spoolVisitor{
                         .beginEntry = [&](std::span<const uint8_t> key, uint64_t valueSize, uint32_t valueCrc32c) {
                             if (entryActive) { throw std::runtime_error("AkkEngine: nested cluster snapshot entry"); }
-                            if (producedEntries == UINT64_MAX) {
-                                throw std::overflow_error("AkkEngine: cluster snapshot has too many entries");
-                            }
+                            if (producedEntries == UINT64_MAX) { throw std::overflow_error("AkkEngine: cluster snapshot has too many entries"); }
                             if (key.size() > UINT32_MAX) { throw std::runtime_error("AkkEngine: cluster snapshot key is too large"); }
                             const uint32_t keySize = static_cast<uint32_t>(key.size());
-                            const bool wireSizeValid = key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull &&
-                                valueSize <= UINT32_MAX &&
-                                valueSize <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - key.size();
+                            const bool wireSizeValid = key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull && valueSize <= UINT32_MAX && valueSize
+                                <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - key.size();
                             const uint64_t wireSize = wireSizeValid ? 8ull + key.size() + valueSize : 0;
                             entryActive = true;
                             sawChunk = false;
@@ -700,8 +671,7 @@ namespace akkaradb::engine {
                             entryValueOffset = 0;
                             entryValueChecksum = valueCrc32c;
                             entryKeySize = keySize;
-                            entryFileBacked = visitor.fileEntry && wireSizeValid &&
-                                wireSize > visitor.fileEntryThresholdBytes;
+                            entryFileBacked = visitor.fileEntry && wireSizeValid && wireSize > visitor.fileEntryThresholdBytes;
                             entryValueCrc = Crc32cStream{};
                             entryRecordCrc = Crc32cStream{};
                             entryPayloadCrc = Crc32cStream{};
@@ -715,9 +685,7 @@ namespace akkaradb::engine {
                             const auto dataOffset = out.tellp();
                             if (dataOffset < 0) { throw std::runtime_error("AkkEngine: invalid cluster snapshot export offset"); }
                             entryDataOffset = static_cast<uint64_t>(dataOffset);
-                            if (!key.empty()) {
-                                out.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size()));
-                            }
+                            if (!key.empty()) { out.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
                             if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot export header"); }
                             addUnpublished(sizeof(uint32_t) * 2 + sizeof(uint64_t) + key.size());
                             if (entryFileBacked) {
@@ -725,34 +693,25 @@ namespace akkaradb::engine {
                                 updateCrcU32Le(entryPayloadCrc, static_cast<uint32_t>(valueSize));
                                 entryPayloadCrc.update(key);
                             }
-                            else if (primaryVisitorComplete && !visitor.beginEntry(key, valueSize, valueCrc32c)) {
-                                primaryVisitorComplete = false;
-                            }
+                            else if (primaryVisitorComplete && !visitor.beginEntry(key, valueSize, valueCrc32c)) { primaryVisitorComplete = false; }
                             return hasConsumer();
                         },
                         .appendValueChunk = [&](uint64_t offset, std::span<const uint8_t> chunk) {
-                            if (!entryActive || offset != entryValueOffset || chunk.size() > entryValueSize - entryValueOffset ||
-                                (chunk.empty() && (entryValueSize != 0 || sawChunk))) {
-                                throw std::runtime_error("AkkEngine: invalid cluster snapshot value chunk");
-                            }
+                            if (!entryActive || offset != entryValueOffset || chunk.size() > entryValueSize - entryValueOffset || (chunk.empty() && (
+                                entryValueSize != 0 || sawChunk))) { throw std::runtime_error("AkkEngine: invalid cluster snapshot value chunk"); }
                             sawChunk = true;
-                            if (!chunk.empty()) {
-                                out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
-                            }
+                            if (!chunk.empty()) { out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size())); }
                             if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot value chunk"); }
                             entryValueCrc.update(chunk);
                             entryRecordCrc.update(chunk);
                             if (entryFileBacked) { entryPayloadCrc.update(chunk); }
                             addUnpublished(chunk.size());
-                            if (!entryFileBacked && primaryVisitorComplete && !visitor.appendValueChunk(offset, chunk)) {
-                                primaryVisitorComplete = false;
-                            }
+                            if (!entryFileBacked && primaryVisitorComplete && !visitor.appendValueChunk(offset, chunk)) { primaryVisitorComplete = false; }
                             entryValueOffset += static_cast<uint64_t>(chunk.size());
                             return hasConsumer();
                         },
                         .finishEntry = [&] {
-                            if (!entryActive || !sawChunk || entryValueOffset != entryValueSize ||
-                                entryValueCrc.finish() != entryValueChecksum) {
+                            if (!entryActive || !sawChunk || entryValueOffset != entryValueSize || entryValueCrc.finish() != entryValueChecksum) {
                                 throw std::runtime_error("AkkEngine: incomplete cluster snapshot entry");
                             }
                             writeU32Le(out, entryRecordCrc.finish());
@@ -769,20 +728,18 @@ namespace akkaradb::engine {
                             if (entryFileBacked && primaryVisitorComplete) {
                                 out.flush();
                                 if (!out) { throw std::runtime_error("AkkEngine: failed to publish cluster snapshot export entry"); }
-                                if (!visitor.fileEntry(cluster::SnapshotFileEntry{
+                                if (!visitor.fileEntry(
+                                    cluster::SnapshotFileEntry{
                                         .path = path_,
                                         .dataOffset = entryDataOffset,
                                         .keySize = entryKeySize,
                                         .valueSize = entryValueSize,
                                         .payloadCrc32c = entryPayloadCrc.finish(),
                                         .storage = shared_from_this(),
-                                    })) {
-                                    primaryVisitorComplete = false;
-                                }
+                                    }
+                                )) { primaryVisitorComplete = false; }
                             }
-                            else if (!entryFileBacked && primaryVisitorComplete && !visitor.finishEntry()) {
-                                primaryVisitorComplete = false;
-                            }
+                            else if (!entryFileBacked && primaryVisitorComplete && !visitor.finishEntry()) { primaryVisitorComplete = false; }
                             return hasConsumer();
                         },
                         .fileEntryThresholdBytes = UINT64_MAX,
@@ -813,10 +770,10 @@ namespace akkaradb::engine {
                     if (followers_ != 0) { --followers_; }
                 }
 
-                void failGeneration(std::exception_ptr failure) {
+                void failGeneration(const std::exception_ptr& failure) {
                     {
                         std::lock_guard lock{mutex_};
-                        failure_ = std::move(failure);
+                        failure_ = failure;
                         state_ = State::FAILED;
                     }
                     completionCv_.notify_all();
@@ -924,7 +881,8 @@ namespace akkaradb::engine {
                 // flush publication. Resolve versions before hiding tombstones.
                 if (memtableCur->seq() >= sstCur->seq) {
                     if (!memtableCur->isTombstone()) { co_yield StoredScanRecordView{memtableCur->key(), memtableCur->value(), memtableCur->flags()}; }
-                } else if (!sstCur->isTombstone()) { co_yield StoredScanRecordView{sstCur->key, sstCur->value, sstCur->flags}; }
+                }
+                else if (!sstCur->isTombstone()) { co_yield StoredScanRecordView{sstCur->key, sstCur->value, sstCur->flags}; }
                 memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
                 sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{};
             }
@@ -942,24 +900,23 @@ namespace akkaradb::engine {
         }
     }
 
-    [[nodiscard]] core::ArenaGenerator<AkkEngine::ScanRecordView> scanGenerator(
-        core::BufferArena& arena,
+    [[nodiscard]] ArenaGenerator<AkkEngine::ScanRecordView> scanGenerator(
+        BufferArena& arena,
         memtable::MemTable::RangeIterator memtableIter,
         sst::SSTManager::Iterator sstIter,
         blob::BlobManager* blobManager,
         std::shared_ptr<void> operationLifetime = {}
     ) {
-        for (const auto& record : storedScanGenerator(
-                 std::move(memtableIter), std::move(sstIter), std::move(operationLifetime)
-             )) {
-            auto value = resolveScanValue(record.flags, record.value, blobManager, arena);
-            if (value) { co_yield AkkEngine::ScanRecordView{record.key, *value}; }
+        for (const auto& [key, value, flags] : storedScanGenerator(std::move(memtableIter), std::move(sstIter), std::move(operationLifetime))) {
+            auto v = resolveScanValue(flags, value, blobManager, arena);
+            if (v) { co_yield AkkEngine::ScanRecordView{.key = key, .value = *v}; }
         }
     }
 
     class AkkEngine::Impl {
         public:
             using BatchPutEntry = detail::BulkPutEntry;
+
             template <typename T>
             class StorageSlot {
                 public:
@@ -1019,8 +976,7 @@ namespace akkaradb::engine {
 
             explicit Impl(AkkEngineOptions optionsIn)
                 : opts{std::move(optionsIn)},
-                  writeBackpressureEnabled
-                  {opts.runtime.backpressure.maxMemtableImmutableTables != 0 || opts.runtime.backpressure.maxSstL0Files != 0},
+                  writeBackpressureEnabled{opts.runtime.backpressure.maxMemtableImmutableTables != 0 || opts.runtime.backpressure.maxSstL0Files != 0},
                   commitWindowSize{resolveCommitWindowSize(opts.runtime.sequence.commitWindowSize)},
                   storage{std::make_shared<StorageState>()},
                   manifest{&storage->manifest},
@@ -1033,7 +989,7 @@ namespace akkaradb::engine {
                       opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE
                           ? std::make_unique<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>>()
                           : nullptr
-                  } {}
+                  } { if (opts.components.clusterEnabled) { cluster::detail::ensureNodeResourceBudget(opts.cluster.runtime); } }
 
             static constexpr size_t KEY_SEQUENCE_ORDER_STRIPES = 256;
 
@@ -1085,6 +1041,7 @@ namespace akkaradb::engine {
                 RollbackConflictPolicy conflict = RollbackConflictPolicy::FAIL_IF_CHANGED;
                 std::vector<uint8_t> key;
             };
+
             std::array<uint8_t, 16> rollbackStartupId{};
             mutable std::mutex rollbackJournalMu;
             std::vector<DeferredRollbackTask> deferredRollbacks;
@@ -1119,6 +1076,9 @@ namespace akkaradb::engine {
             mutable std::atomic<uint64_t> backpressureWaitMicrosTotal{0};
             mutable std::atomic<uint64_t> backpressureWaitMicrosMax{0};
             std::atomic<uint64_t> committedSeq{0};
+            // Static PARTITIONED replication excludes allocator gaps and read visibility.
+            // Writers hold writeMu; peer handshakes sample the stored cut atomically.
+            std::atomic<uint64_t> replicationStorageSeq{0};
             mutable std::mutex commitMu;
             mutable std::condition_variable commitCv;
             // A failed write after it reserved a sequence leaves a permanent
@@ -1160,13 +1120,16 @@ namespace akkaradb::engine {
                 return nextSeq > 0 ? nextSeq - 1 : 0;
             }
 
+            [[nodiscard]] uint64_t clusterReplicationSeq() const noexcept {
+                return clusterReplicationMode == cluster::ReplicationMode::PARTITIONED && !clusterConfig.usesDataConsensus()
+                           ? replicationStorageSeq.load(std::memory_order_acquire) : snapshotSeq();
+            }
+
             void markWriteCommitted(uint64_t seq, bool knownContiguous = false) {
                 if (opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::APPLIED) { return; }
                 if (knownContiguous && seq == committedSeq.load(std::memory_order_acquire) + 1u) {
                     committedSeq.store(seq, std::memory_order_release);
-                    if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) {
-                        commitCv.notify_all();
-                    }
+                    if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) { commitCv.notify_all(); }
                     return;
                 }
                 bool advanced = false;
@@ -1207,8 +1170,8 @@ namespace akkaradb::engine {
             }
 
             void waitForKeySequenceReadVisibility() const {
-                if (opts.runtime.parallelWriteOrder != AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE || opts.runtime.
-                    writeVisibility != AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER || !memtable) { return; }
+                if (opts.runtime.parallelWriteOrder != AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE || opts.runtime.writeVisibility !=
+                    AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER || !memtable) { return; }
                 const uint64_t nextSeq = memtable->lastSeq();
                 const uint64_t target = nextSeq > 0 ? nextSeq - 1 : 0;
                 if (committedSeq.load(std::memory_order_acquire) >= target) { return; }
@@ -1217,9 +1180,7 @@ namespace akkaradb::engine {
                 commitCv.wait(
                     lock,
                     [this, target] {
-                        return committedSeq.load(std::memory_order_acquire) >= target || keySequenceFailure || closed.load(
-                            std::memory_order_acquire
-                        );
+                        return committedSeq.load(std::memory_order_acquire) >= target || keySequenceFailure || closed.load(std::memory_order_acquire);
                     }
                 );
                 const std::exception_ptr failure = keySequenceFailure;
@@ -1227,10 +1188,10 @@ namespace akkaradb::engine {
                 if (failure) { std::rethrow_exception(failure); }
             }
 
-            void markKeySequenceFailure(std::exception_ptr failure) {
+            void markKeySequenceFailure(const std::exception_ptr& failure) {
                 {
                     std::lock_guard lock{commitMu};
-                    if (!keySequenceFailure) { keySequenceFailure = std::move(failure); }
+                    if (!keySequenceFailure) { keySequenceFailure = failure; }
                 }
                 commitCv.notify_all();
             }
@@ -1242,10 +1203,24 @@ namespace akkaradb::engine {
                 completedSeqOverflow.clear();
             }
 
+            void publishRaftAppliedSequence(uint64_t sequence) {
+                if (!clusterConfig.usesDataConsensus()) { return; }
+                // Raft applies the committed log in order. Rejected preparations
+                // and discarded proposals can leave unused sequence numbers.
+                memtable->advanceSeq(sequence);
+                const auto visible = std::max(snapshotSeq(), sequence);
+                resetCommittedSeq(visible);
+                if (versionLog) { versionLog->seedCommittedSeq(visible); }
+                commitCv.notify_all();
+            }
+
             void ensureCompletedSeqRing() { if (completedSeqRing.empty()) { completedSeqRing.resize(commitWindowSize); } }
 
             void throwIfBackgroundFailed() const {
-                { std::lock_guard lock{transactionFailureMu}; if (transactionFailure) { std::rethrow_exception(transactionFailure); } }
+                {
+                    std::lock_guard lock{transactionFailureMu};
+                    if (transactionFailure) { std::rethrow_exception(transactionFailure); }
+                }
                 if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) {
                     std::exception_ptr failure;
                     {
@@ -1301,9 +1276,7 @@ namespace akkaradb::engine {
                     if ((state & LIFECYCLE_OPERATION_MASK) == LIFECYCLE_OPERATION_MASK) {
                         throw std::runtime_error("AkkEngine: too many in-flight operations");
                     }
-                    if (lifecycleState.compare_exchange_weak(state, state + 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                        return true;
-                    }
+                    if (lifecycleState.compare_exchange_weak(state, state + 1u, std::memory_order_acq_rel, std::memory_order_acquire)) { return true; }
                 }
                 return false;
             }
@@ -1327,10 +1300,7 @@ namespace akkaradb::engine {
                 if (clusterRuntime) { clusterRuntime->cancelMirrorRecovery(); }
                 if (walWriter) { walWriter->requestClose(); }
                 lock.lock();
-                lifecycleCv.wait(
-                    lock,
-                    [this]() { return (lifecycleState.load(std::memory_order_acquire) & LIFECYCLE_OPERATION_MASK) == 0; }
-                );
+                lifecycleCv.wait(lock, [this]() { return (lifecycleState.load(std::memory_order_acquire) & LIFECYCLE_OPERATION_MASK) == 0; });
                 return true;
             }
 
@@ -1377,22 +1347,34 @@ namespace akkaradb::engine {
                 uint64_t fp64 = 0;
                 uint64_t miniKey = 0;
                 bool history = false;
+                bool transaction = false;
+                cluster::detail::SnapshotRecordKind transactionKind = cluster::detail::SnapshotRecordKind::TRANSACTION;
                 uint64_t sequence = 0, source = 0, timestamp = 0;
                 uint64_t blobId = 0;
                 bool historyPresent = false;
             };
 
-            static bool streamSnapshotValue(const cluster::SnapshotEntryVisitor& visitor, std::span<const uint8_t> key,
-                std::span<const uint8_t> value, uint8_t flags, blob::BlobManager* blobs) {
+            static bool streamSnapshotValue(
+                const cluster::SnapshotEntryVisitor& visitor,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint8_t flags,
+                blob::BlobManager* blobs
+            ) {
                 if ((flags & MemHdr16::FLAG_BLOB) != 0) {
                     if (!blobs || value.size() != blob::BLOB_REF_SIZE) { throw std::runtime_error("AkkEngine: missing snapshot Blob"); }
                     const auto ref = blob::decodeBlobRef(value.data());
                     if (!visitor.beginEntry(key, ref.totalSize, ref.contentCrc32c)) { return false; }
-                    if (!blobs->streamRead(ref.blobId, ref.contentCrc32c, ClusterSnapshotExportFile::REPLAY_CHUNK_BYTES,
-                        [&](uint64_t offset, auto chunk) { return visitor.appendValueChunk(offset, chunk); })) { return false; }
+                    if (!blobs->streamRead(
+                        ref.blobId,
+                        ref.contentCrc32c,
+                        ClusterSnapshotExportFile::REPLAY_CHUNK_BYTES,
+                        [&](uint64_t offset, auto chunk) { return visitor.appendValueChunk(offset, chunk); }
+                    )) { return false; }
                     return visitor.finishEntry();
                 }
-                Crc32cStream crc; crc.update(value);
+                Crc32cStream crc;
+                crc.update(value);
                 if (!visitor.beginEntry(key, value.size(), crc.finish())) { return false; }
                 if (value.empty() && !visitor.appendValueChunk(0, {})) { return false; }
                 for (size_t offset = 0; offset < value.size();) {
@@ -1409,74 +1391,87 @@ namespace akkaradb::engine {
                 return blob::decodeBlobRef(value.data()).blobId;
             }
 
-            [[nodiscard]] StagedSnapshotRecord readStagedSnapshotRecord(std::istream& in, uint64_t seq, uint64_t ordinal, bool writeBlob,
-                uint64_t storedHistoryThrough = 0) {
-                auto header = readSnapshotStagingEntryHeader(in);
-                Crc32cStream valueCrc;
+            [[nodiscard]] StagedSnapshotRecord readStagedSnapshotRecord(
+                std::istream& in,
+                uint64_t seq,
+                uint64_t ordinal,
+                bool writeBlob,
+                uint64_t storedHistoryThrough = 0
+            ) {
+                auto [key, valueSize, valueCrc32c, recordCrc] = readSnapshotStagingEntryHeader(in);
                 StagedSnapshotRecord record;
-                record.key = std::move(header.key);
+                record.key = std::move(key);
                 if (clusterConfig.usesDataConsensus()) {
                     const auto decoded = cluster::detail::decodeSnapshotKey(record.key);
-                    if (decoded.kind == cluster::detail::SnapshotRecordKind::STATE ||
-                        (decoded.kind == cluster::detail::SnapshotRecordKind::HISTORY &&
-                         (decoded.sequence == 0 || decoded.sequence > seq))) {
-                        throw std::runtime_error("AkkEngine: invalid history snapshot record");
-                    }
+                    if (decoded.kind == cluster::detail::SnapshotRecordKind::STATE || (decoded.kind == cluster::detail::SnapshotRecordKind::HISTORY && (decoded.
+                        sequence == 0 || decoded.sequence > seq))) { throw std::runtime_error("AkkEngine: invalid history snapshot record"); }
                     record.history = decoded.kind == cluster::detail::SnapshotRecordKind::HISTORY;
-                    record.sequence = decoded.sequence; record.source = decoded.source; record.timestamp = decoded.timestamp;
+                    record.transaction = decoded.kind >= cluster::detail::SnapshotRecordKind::TRANSACTION;
+                    record.transactionKind = decoded.kind;
+                    if (record.transaction && (!distributedTransactionsEnabled() || decoded.flags || decoded.timestamp || decoded.blobId || (
+                            decoded.kind == cluster::detail::SnapshotRecordKind::TRANSACTION
+                                ? !decoded.key.empty() || decoded.sequence || decoded.source
+                                : decoded.key.size() != 16 || !decoded.sequence || decoded.sequence > seq || (decoded.kind !=
+                                    cluster::detail::SnapshotRecordKind::TRANSACTION_PREPARE && !decoded.source)) || valueSize > opts.transactions.
+                        maxJournalBytes || (decoded.kind == cluster::detail::SnapshotRecordKind::TRANSACTION_PREPARE && valueSize > 1024 * 1024))) {
+                        throw std::runtime_error("AkkEngine: invalid transaction snapshot record");
+                    }
+                    record.sequence = decoded.sequence;
+                    record.source = decoded.source;
+                    record.timestamp = decoded.timestamp;
                     record.blobId = decoded.blobId;
                     record.flags = decoded.flags & static_cast<uint8_t>(~MemHdr16::FLAG_BLOB);
                     record.key = std::vector<uint8_t>{decoded.key.begin(), decoded.key.end()};
                     if (record.history) {
-                        record.historyPresent = record.sequence <= snapshotSeq() ||
-                            (writeBlob && versionLog && record.sequence <= storedHistoryThrough &&
-                             versionLog->containsStoredRecord(record.key, record.sequence, record.source, record.timestamp, record.flags));
+                        record.historyPresent = record.sequence <= snapshotSeq() || (writeBlob && versionLog && record.sequence <= storedHistoryThrough &&
+                            versionLog->containsStoredRecord(record.key, record.sequence, record.source, record.timestamp, record.flags));
                         if (record.historyPresent) { writeBlob = false; }
                     }
                 }
-                record.fp64 = core::computeKeyFp64(record.key);
-                record.miniKey = core::buildMiniKey(record.key);
+                record.fp64 = computeKeyFp64(record.key);
+                record.miniKey = buildMiniKey(record.key);
 
-                const bool externalize = blobManager && header.valueSize >= blobManager->threshold();
+                const bool externalize = !record.transaction && blobManager && valueSize >= blobManager->threshold();
                 uint64_t blobId = 0;
-                bool blobStarted = false;
+                auto blobStarted = false;
                 try {
+                    Crc32cStream valueCrc;
                     if (externalize) {
                         blobId = record.blobId != 0 ? record.blobId : snapshotBlobId(seq, ordinal);
                         record.storedValue.resize(blob::BLOB_REF_SIZE);
-                        blob::encodeBlobRef(record.storedValue.data(), blob::BlobRef{blobId, header.valueSize, header.valueCrc32c});
+                        blob::encodeBlobRef(record.storedValue.data(), blob::BlobRef{blobId, valueSize, valueCrc32c});
                         record.flags |= MemHdr16::FLAG_BLOB;
                         if (writeBlob) {
                             blobManager->abortWrite(blobId);
-                            blobManager->beginWrite(blobId, header.valueSize, header.valueCrc32c);
+                            blobManager->beginWrite(blobId, valueSize, valueCrc32c);
                             blobStarted = true;
                         }
 
                         std::vector<uint8_t> buffer;
-                        buffer.resize(static_cast<size_t>(std::min<uint64_t>(SNAPSHOT_STAGING_VALUE_CHUNK_BYTES, header.valueSize)));
+                        buffer.resize(static_cast<size_t>(std::min<uint64_t>(SNAPSHOT_STAGING_VALUE_CHUNK_BYTES, valueSize)));
                         uint64_t offset = 0;
-                        while (offset < header.valueSize) {
-                            const size_t chunkSize = static_cast<size_t>(std::min<uint64_t>(buffer.size(), header.valueSize - offset));
+                        while (offset < valueSize) {
+                            const size_t chunkSize = static_cast<size_t>(std::min<uint64_t>(buffer.size(), valueSize - offset));
                             readExact(in, buffer.data(), chunkSize, "entry value chunk");
                             const std::span<const uint8_t> chunk{buffer.data(), chunkSize};
-                            header.recordCrc.update(chunk);
+                            recordCrc.update(chunk);
                             valueCrc.update(chunk);
                             if (writeBlob) { blobManager->appendWriteChunk(blobId, offset, chunk); }
                             offset += static_cast<uint64_t>(chunkSize);
                         }
                     }
                     else {
-                        if (header.valueSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                        if (valueSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
                             throw std::runtime_error("AkkEngine: replication snapshot staged value is too large");
                         }
-                        record.storedValue.resize(static_cast<size_t>(header.valueSize));
+                        record.storedValue.resize(static_cast<size_t>(valueSize));
                         readExact(in, record.storedValue.data(), record.storedValue.size(), "entry value");
-                        header.recordCrc.update(record.storedValue);
+                        recordCrc.update(record.storedValue);
                         valueCrc.update(record.storedValue);
                     }
 
                     const uint32_t storedRecordCrc = readU32Le(in, "entry crc");
-                    if (header.recordCrc.finish() != storedRecordCrc || valueCrc.finish() != header.valueCrc32c) {
+                    if (recordCrc.finish() != storedRecordCrc || valueCrc.finish() != valueCrc32c) {
                         throw std::runtime_error("AkkEngine: replication snapshot staging entry CRC mismatch");
                     }
                     if (blobStarted) {
@@ -1489,6 +1484,16 @@ namespace akkaradb::engine {
                     throw;
                 }
 
+                if (record.transactionKind == cluster::detail::SnapshotRecordKind::TRANSACTION && record.transaction) {
+                    (void)decodeDistributedState(record.storedValue);
+                }
+                if (record.transactionKind == cluster::detail::SnapshotRecordKind::TRANSACTION_DECISION) {
+                    const auto result = decodeDistributedRecord(record.storedValue);
+                    if (!result.finished || result.expires != record.source) { throw std::runtime_error("AkkEngine: invalid archived transaction decision"); }
+                }
+                if (record.transactionKind == cluster::detail::SnapshotRecordKind::TRANSACTION_RECEIPT && !record.storedValue.empty()) {
+                    throw std::runtime_error("AkkEngine: invalid archived transaction receipt");
+                }
                 return record;
             }
 
@@ -1502,9 +1507,7 @@ namespace akkaradb::engine {
                     return PreparedRaftValue{.stored = {value.begin(), value.end()}, .blob = std::nullopt};
                 }
 
-                const uint64_t blobId = opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG
-                                            ? raftLogBlobId(nodeId, seq)
-                                            : seq;
+                const uint64_t blobId = opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG ? raftLogBlobId(nodeId, seq) : seq;
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
                 blob::encodeBlobRef(ref.data(), blob::BlobRef{blobId, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
                 flags |= MemHdr16::FLAG_BLOB;
@@ -1599,20 +1602,23 @@ namespace akkaradb::engine {
 
             static std::vector<uint8_t> stripeHistoryPlacementKey(std::span<const uint8_t> key, uint64_t sequence, uint64_t generation) {
                 std::vector<uint8_t> out{0, 'A', 'K', 'S', 'H', '2'};
-                pushU64(out, generation); pushU64(out, sequence); out.insert(out.end(), key.begin(), key.end()); return out;
+                pushU64(out, generation);
+                pushU64(out, sequence);
+                out.insert(out.end(), key.begin(), key.end());
+                return out;
             }
+
             StripeMetadata effectiveStripeMetadata(std::span<const uint8_t> key, const StripeMetadata& original) {
                 const auto active = activePlacementGeneration.load(std::memory_order_acquire);
                 const auto value = getValueInternal(stripeHistoryPlacementKey(key, original.logicalSeq, active), false);
                 if (!value) { return original; }
-                size_t cursor = 0; uint64_t generation = 0;
+                size_t cursor = 0;
+                uint64_t generation = 0;
                 if (!pullU64(*value, cursor, generation)) { throw std::runtime_error("AkkEngine: malformed stripe placement alias"); }
                 if (generation != active) { throw std::runtime_error("AkkEngine: stripe alias placement generation mismatch"); }
                 auto metadata = decodeStripeMetadata(std::span{*value}.subspan(cursor));
-                if (!metadata || metadata->logicalSeq != original.logicalSeq || metadata->version != original.version ||
-                    metadata->originNodeId != original.originNodeId || metadata->timestampNs != original.timestampNs) {
-                    throw std::runtime_error("AkkEngine: invalid stripe placement alias");
-                }
+                if (!metadata || metadata->logicalSeq != original.logicalSeq || metadata->version != original.version || metadata->originNodeId != original.
+                    originNodeId || metadata->timestampNs != original.timestampNs) { throw std::runtime_error("AkkEngine: invalid stripe placement alias"); }
                 return *metadata;
             }
 
@@ -1626,16 +1632,12 @@ namespace akkaradb::engine {
             }
 
             static bool isStripeInternalKey(std::span<const uint8_t> key) {
-                return key.size() >= 6 && key[0] == 0 && key[1] == 'A' && key[2] == 'K' && key[3] == 'S' &&
-                       ((key[4] == 'M' && key[5] == '1') ||
-                        ((key[4] == 'S' || key[4] == 'T') && key[5] == '1') || (key[4] == 'H' && key[5] == '2'));
+                return key.size() >= 6 && key[0] == 0 && key[1] == 'A' && key[2] == 'K' && key[3] == 'S' && ((key[4] == 'M' && key[5] == '1') || ((key[4] == 'S'
+                    || key[4] == 'T') && key[5] == '1') || (key[4] == 'H' && key[5] == '2'));
             }
 
             static std::optional<std::vector<uint8_t>> publicKeyFromStripeMetaKey(std::span<const uint8_t> key) {
-                if (key.size() < 6 || key[0] != 0 || key[1] != 'A' || key[2] != 'K' || key[3] != 'S' || key[4] != 'M' ||
-                    key[5] != '1') {
-                    return std::nullopt;
-                }
+                if (key.size() < 6 || key[0] != 0 || key[1] != 'A' || key[2] != 'K' || key[3] != 'S' || key[4] != 'M' || key[5] != '1') { return std::nullopt; }
                 std::vector<uint8_t> out;
                 out.assign(key.begin() + 6, key.end());
                 return out;
@@ -1662,26 +1664,23 @@ namespace akkaradb::engine {
             }
 
             static std::optional<StripeMetadata> decodeStripeMetadata(std::span<const uint8_t> bytes) {
-                if (bytes.size() < 62 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'M' || bytes[4] != '1') {
-                    return std::nullopt;
-                }
+                if (bytes.size() < 62 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'M' || bytes[4] != '1') { return std::nullopt; }
                 size_t cursor = 5;
                 StripeMetadata metadata;
                 const uint8_t flags = bytes[cursor++];
                 if ((flags & ~uint8_t{3}) != 0) { return std::nullopt; }
                 metadata.tombstone = (flags & 1U) != 0;
                 metadata.rollback = (flags & 2U) != 0;
-                if (!pullU64(bytes, cursor, metadata.version) || !pullU64(bytes, cursor, metadata.ownerNodeId) ||
-                    !pullU64(bytes, cursor, metadata.authorityNodeId) || !pullU64(bytes, cursor, metadata.fenceToken) ||
-                    !pullU64(bytes, cursor, metadata.originalSize) ||
-                    !pullU16(bytes, cursor, metadata.layout.dataShards) || !pullU16(bytes, cursor, metadata.layout.parityShards)) {
-                    return std::nullopt;
-                }
+                if (!pullU64(bytes, cursor, metadata.version) || !pullU64(bytes, cursor, metadata.ownerNodeId) || !
+                    pullU64(bytes, cursor, metadata.authorityNodeId) || !pullU64(bytes, cursor, metadata.fenceToken) || !
+                    pullU64(bytes, cursor, metadata.originalSize) || !pullU16(bytes, cursor, metadata.layout.dataShards) || !pullU16(
+                        bytes,
+                        cursor,
+                        metadata.layout.parityShards
+                    )) { return std::nullopt; }
                 uint16_t nodeCount = 0;
                 const uint16_t logicalShards = metadata.layout.totalShards();
-                if (!pullU16(bytes, cursor, nodeCount) || logicalShards == 0 || nodeCount % logicalShards != 0) {
-                    return std::nullopt;
-                }
+                if (!pullU16(bytes, cursor, nodeCount) || logicalShards == 0 || nodeCount % logicalShards != 0) { return std::nullopt; }
                 const uint16_t copiesPerShard = nodeCount / logicalShards;
                 if (copiesPerShard != 1 && copiesPerShard != 2) { return std::nullopt; }
                 metadata.copiesPerShard = static_cast<uint8_t>(copiesPerShard);
@@ -1692,17 +1691,18 @@ namespace akkaradb::engine {
                     metadata.nodeIds.push_back(nodeId);
                 }
                 uint16_t presenceCount = 0;
-                if (!pullU16(bytes, cursor, presenceCount) || presenceCount != nodeCount || presenceCount > bytes.size() - cursor) {
-                    return std::nullopt;
-                }
+                if (!pullU16(bytes, cursor, presenceCount) || presenceCount != nodeCount || presenceCount > bytes.size() - cursor) { return std::nullopt; }
                 metadata.shardPresent.assign(
                     bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
                     bytes.begin() + static_cast<std::ptrdiff_t>(cursor + presenceCount)
                 );
                 if (std::ranges::any_of(metadata.shardPresent, [](uint8_t present) { return present > 1; })) { return std::nullopt; }
                 cursor += presenceCount;
-                if (!pullU64(bytes, cursor, metadata.logicalSeq) || !pullU64(bytes, cursor, metadata.originNodeId) ||
-                    !pullU64(bytes, cursor, metadata.timestampNs) || metadata.originNodeId == 0 || metadata.timestampNs == 0) { return std::nullopt; }
+                if (!pullU64(bytes, cursor, metadata.logicalSeq) || !pullU64(bytes, cursor, metadata.originNodeId) || !pullU64(
+                    bytes,
+                    cursor,
+                    metadata.timestampNs
+                ) || metadata.originNodeId == 0 || metadata.timestampNs == 0) { return std::nullopt; }
                 return cursor == bytes.size() ? std::optional<StripeMetadata>{std::move(metadata)} : std::nullopt;
             }
 
@@ -1720,9 +1720,7 @@ namespace akkaradb::engine {
             }
 
             static std::optional<erasure::ErasureShard> decodeStripeShard(std::span<const uint8_t> bytes, uint64_t version, erasure::ErasureLayout layout) {
-                if (bytes.size() < 33 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'S' || bytes[4] != '1') {
-                    return std::nullopt;
-                }
+                if (bytes.size() < 33 || bytes[0] != 'A' || bytes[1] != 'K' || bytes[2] != 'S' || bytes[3] != 'S' || bytes[4] != '1') { return std::nullopt; }
                 size_t cursor = 5;
                 uint64_t storedVersion = 0;
                 uint16_t index = 0;
@@ -1730,11 +1728,9 @@ namespace akkaradb::engine {
                 erasure::ErasureLayout storedLayout;
                 uint32_t crc = 0;
                 uint32_t payloadSize = 0;
-                if (!pullU64(bytes, cursor, storedVersion) || !pullU16(bytes, cursor, index) || !pullU64(bytes, cursor, originalSize) ||
-                    !pullU16(bytes, cursor, storedLayout.dataShards) || !pullU16(bytes, cursor, storedLayout.parityShards) ||
-                    !pullU32(bytes, cursor, crc) || !pullU32(bytes, cursor, payloadSize)) {
-                    return std::nullopt;
-                }
+                if (!pullU64(bytes, cursor, storedVersion) || !pullU16(bytes, cursor, index) || !pullU64(bytes, cursor, originalSize) || !
+                    pullU16(bytes, cursor, storedLayout.dataShards) || !pullU16(bytes, cursor, storedLayout.parityShards) || !pullU32(bytes, cursor, crc) || !
+                    pullU32(bytes, cursor, payloadSize)) { return std::nullopt; }
                 if (storedVersion != version || storedLayout.dataShards != layout.dataShards || storedLayout.parityShards != layout.parityShards) {
                     return std::nullopt;
                 }
@@ -1743,9 +1739,7 @@ namespace akkaradb::engine {
                 shard.originalSize = originalSize;
                 shard.codec = erasure::ErasureCodecKind::RS;
                 shard.crc32c = crc;
-                if (!pullBytes(bytes, cursor, payloadSize, shard.payload) || cursor != bytes.size() || !shard.verifyCrc()) {
-                    return std::nullopt;
-                }
+                if (!pullBytes(bytes, cursor, payloadSize, shard.payload) || cursor != bytes.size() || !shard.verifyCrc()) { return std::nullopt; }
                 return shard;
             }
 
@@ -1760,11 +1754,11 @@ namespace akkaradb::engine {
                 }
                 throwIfBackgroundFailed();
                 if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
+                auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
 
-                auto pinned = memtable->getPinned(key, seq);
-                if (pinned) {
+                if (auto pinned = memtable->getPinned(key, seq)) {
                     const auto& view = pinned->view;
                     if (view.isTombstone()) {
                         getsMiss.fetch_add(1, std::memory_order_relaxed);
@@ -1797,14 +1791,14 @@ namespace akkaradb::engine {
             }
 
             [[nodiscard]] erasure::ErasureLayout stripeLayoutFor(const cluster::ClusterConfig& config) const {
-                return erasure::ErasureLayout{
-                    .dataShards = config.stripe().dataShards,
-                    .parityShards = config.stripe().parityShards,
-                };
+                return erasure::ErasureLayout{.dataShards = config.stripe().dataShards, .parityShards = config.stripe().parityShards,};
             }
 
             [[nodiscard]] std::vector<uint64_t> stripeNodeIdsFor(
-                const cluster::ClusterConfig& config, std::span<const uint8_t> key, uint64_t excludedNodeId = 0
+                const cluster::ClusterConfig& config,
+                std::span<const uint8_t> key,
+                uint64_t excludedNodeId = 0,
+                uint64_t replacementNodeId = 0
             ) const {
                 const uint16_t totalShards = config.stripe().totalShards();
                 const uint16_t totalPlacements = config.stripe().totalPlacements();
@@ -1818,21 +1812,25 @@ namespace akkaradb::engine {
                         uint64_t first = 0;
                         uint64_t second = 0;
                     };
+                    const auto paired = cluster::detail::raidPairNodes(config);
                     std::vector<MirrorPair> pairs;
                     pairs.reserve(totalShards);
                     for (uint16_t i = 0; i < totalShards; ++i) {
-                        uint64_t first = dataNodes[i * 2].nodeId;
-                        uint64_t second = dataNodes[i * 2 + 1].nodeId;
+                        uint64_t first = paired[i * 2].nodeId;
+                        uint64_t second = paired[i * 2 + 1].nodeId;
                         const uint64_t firstScore = rendezvousScore(key, first);
                         const uint64_t secondScore = rendezvousScore(key, second);
                         if (secondScore > firstScore || (secondScore == firstScore && second < first)) { std::swap(first, second); }
                         const auto pairIds = std::minmax(first, second);
                         pairs.push_back(MirrorPair{.score = rendezvousScore(key, pairIds.first, pairIds.second), .first = first, .second = second});
                     }
-                    std::ranges::sort(pairs, [](const auto& left, const auto& right) {
-                        if (left.score != right.score) { return left.score > right.score; }
-                        return std::min(left.first, left.second) < std::min(right.first, right.second);
-                    });
+                    std::ranges::sort(
+                        pairs,
+                        [](const auto& left, const auto& right) {
+                            if (left.score != right.score) { return left.score > right.score; }
+                            return std::min(left.first, left.second) < std::min(right.first, right.second);
+                        }
+                    );
                     std::vector<uint64_t> ids;
                     ids.reserve(totalPlacements);
                     for (const auto& pair : pairs) {
@@ -1840,33 +1838,23 @@ namespace akkaradb::engine {
                         ids.push_back(pair.second);
                     }
                     if (excludedNodeId != 0) {
-                        const auto* spare = config.stripeFailoverNode();
+                        if (replacementNodeId == 0 && clusterRuntime) { replacementNodeId = clusterRuntime->stripeFailoverNodeId(key); }
                         const auto replaced = std::ranges::find(ids, excludedNodeId);
-                        if (spare == nullptr || replaced == ids.end()) {
+                        if (!config.isStripeFailoverNode(replacementNodeId) || replaced == ids.end()) {
                             throw std::runtime_error("AkkEngine: RAID.10 hot spare cannot replace the unavailable owner");
                         }
-                        *replaced = spare->nodeId;
+                        *replaced = replacementNodeId;
                     }
+                    cluster::detail::validateStripeFaultDomains(config, ids);
                     return ids;
                 }
 
-                std::vector<std::pair<uint64_t, uint64_t>> scored;
-                scored.reserve(dataNodes.size());
-                for (const auto& target : dataNodes) {
-                    if (target.nodeId != excludedNodeId) { scored.emplace_back(rendezvousScore(key, target.nodeId), target.nodeId); }
-                }
-                if (scored.size() < totalShards) { throw std::runtime_error("AkkEngine: no spare STRIPE node for owner failover"); }
-                std::ranges::sort(
-                    scored,
-                    [](const auto& left, const auto& right) {
-                        if (left.first != right.first) { return left.first > right.first; }
-                        return left.second < right.second;
-                    }
-                );
-
+                auto candidates = dataNodes;
+                std::erase_if(candidates, [&](const auto& target) { return target.nodeId == excludedNodeId; });
+                const auto selected = cluster::detail::placementNodes(key, candidates, totalShards, config.faultDomains());
                 std::vector<uint64_t> ids;
-                ids.reserve(totalPlacements);
-                for (uint16_t i = 0; i < totalShards; ++i) { ids.push_back(scored[i].second); }
+                for (const auto& target : selected) { ids.push_back(target.nodeId); }
+                cluster::detail::validateStripeFaultDomains(config, ids);
                 return ids;
             }
 
@@ -1896,20 +1884,19 @@ namespace akkaradb::engine {
             }
 
             uint64_t writeStripeLocal(
-                std::span<const uint8_t> key, std::span<const uint8_t> value,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
                 cluster::ReplOpType op = cluster::ReplOpType::PUT,
                 uint64_t seq = 0,
                 uint64_t sourceNodeId = 0,
                 uint8_t versionLogFlags = 0xFF
             ) {
+                validateStoredRecord(key.size(), value.size());
                 std::lock_guard lock{writeMu};
                 try {
                     if (seq == 0) { seq = memtable->reserveSeq(1); }
                     const uint8_t flags = op == cluster::ReplOpType::REMOVE ? MemHdr16::FLAG_TOMBSTONE : MemHdr16::FLAG_NORMAL;
-                    appendAll(
-                        seq, key, value, flags, sourceNodeId == 0 ? nodeId : sourceNodeId,
-                        0, 0, versionLogFlags, true
-                    );
+                    appendAll(seq, key, value, flags, sourceNodeId == 0 ? nodeId : sourceNodeId, 0, 0, versionLogFlags, true);
                     forceClusterLocalDurable();
                     return seq;
                 }
@@ -1920,16 +1907,25 @@ namespace akkaradb::engine {
             }
 
             void writeStripeRecordToNode(
-                uint64_t targetNodeId, std::span<const uint8_t> key, std::span<const uint8_t> value,
-                uint64_t version, cluster::ReplOpType op = cluster::ReplOpType::PUT,
+                uint64_t targetNodeId,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value,
+                uint64_t version,
+                cluster::ReplOpType op = cluster::ReplOpType::PUT,
                 uint64_t logicalSourceNodeId = 0
             ) {
+                validateStoredRecord(key.size(), value.size());
                 cluster::detail::ReconfigurationDeadline::check();
-                if (targetNodeId == nodeId) { writeStripeLocal(key, value, op); cluster::detail::ReconfigurationDeadline::check(); return; }
+                if (targetNodeId == nodeId) {
+                    writeStripeLocal(key, value, op);
+                    cluster::detail::ReconfigurationDeadline::check();
+                    return;
+                }
                 if (!clusterRuntime) { throw std::runtime_error("AkkEngine: STRIPE write requires cluster runtime"); }
                 const uint64_t sourceNodeId = logicalSourceNodeId == 0 ? nodeId : logicalSourceNodeId;
-                const auto deadline = cluster::detail::ReconfigurationDeadline::cap(std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds{std::max<uint32_t>(1, clusterConfig.consistency().ackTimeoutMs)});
+                const auto deadline = cluster::detail::ReconfigurationDeadline::cap(
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds{std::max<uint32_t>(1, clusterConfig.consistency().ackTimeoutMs)}
+                );
                 while (true) {
                     try {
                         clusterRuntime->shipEntryTo(targetNodeId, version, op, key, value, MemHdr16::FLAG_NORMAL, sourceNodeId);
@@ -1946,11 +1942,12 @@ namespace akkaradb::engine {
             [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeRecordFromNode(uint64_t targetNodeId, std::span<const uint8_t> key) {
                 if (targetNodeId == nodeId) { return getValueInternal(key, false); }
                 if (!clusterRuntime) { throw std::runtime_error("AkkEngine: STRIPE read requires cluster runtime"); }
-                const auto response = clusterRuntime->readKeyFromNode(targetNodeId, key, 0);
+                const auto response = clusterRuntime->readLocalStorageFromNode(targetNodeId, key, 0);
                 if (response.status == cluster::ReadStatus::NOT_FOUND) { return std::nullopt; }
                 if (response.status != cluster::ReadStatus::FOUND) {
-                    throw std::runtime_error("AkkEngine: STRIPE node read failed: " + std::to_string(targetNodeId) + "/" +
-                        std::to_string(static_cast<unsigned>(response.status)));
+                    throw std::runtime_error(
+                        "AkkEngine: STRIPE node read failed: " + std::to_string(targetNodeId) + "/" + std::to_string(static_cast<unsigned>(response.status))
+                    );
                 }
                 return response.value;
             }
@@ -1962,42 +1959,48 @@ namespace akkaradb::engine {
                 const auto value = clusterRuntime->readStripeMetadata(publicKey, owner);
                 if (!value) { return std::nullopt; }
                 auto metadata = decodeStripeMetadata(*value);
-                const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
-                if (!metadata || metadata->version == 0 || metadata->ownerNodeId != owner || metadata->authorityNodeId == 0 ||
-                    metadata->fenceToken == 0 || metadata->nodeIds.empty() || metadata->shardPresent.size() != metadata->nodeIds.size() ||
-                    metadata->layout.dataShards != currentPlacement().stripe().dataShards ||
-                    metadata->layout.parityShards != currentPlacement().stripe().parityShards ||
-                    metadata->copiesPerShard != currentPlacement().stripe().copiesPerShard ||
-                    (metadata->authorityNodeId != owner && metadata->authorityNodeId != failoverNode)) {
-                    throw std::runtime_error("AkkEngine: corrupt STRIPE metadata");
-                }
+                if (!metadata || metadata->version == 0 || metadata->ownerNodeId != owner || metadata->authorityNodeId == 0 || metadata->fenceToken == 0 ||
+                    metadata->nodeIds.empty() || metadata->shardPresent.size() != metadata->nodeIds.size() || metadata->layout.dataShards != currentPlacement().
+                    stripe().dataShards || metadata->layout.parityShards != currentPlacement().stripe().parityShards || metadata->copiesPerShard !=
+                    currentPlacement().stripe().copiesPerShard || (metadata->authorityNodeId != owner && !currentPlacement().isStripeFailoverNode(
+                        metadata->authorityNodeId
+                    ))) { throw std::runtime_error("AkkEngine: corrupt STRIPE metadata"); }
                 const auto expectedNodes = stripeNodeIdsFor(
-                    currentPlacement(), publicKey, metadata->authorityNodeId == owner ? 0 : owner
+                    currentPlacement(),
+                    publicKey,
+                    metadata->authorityNodeId == owner ? 0 : owner,
+                    metadata->authorityNodeId
                 );
                 bool validPlacement = metadata->nodeIds == expectedNodes;
-                if (!validPlacement && metadata->copiesPerShard == 2 && metadata->authorityNodeId == owner &&
-                    metadata->nodeIds.size() == expectedNodes.size()) {
+                if (!validPlacement && metadata->copiesPerShard == 2 && metadata->nodeIds.size() == expectedNodes.size()) {
                     const auto placementView = currentPlacement();
-                    const auto* spare = placementView.stripeFailoverNode();
                     size_t replacements = 0;
-                    validPlacement = spare != nullptr;
+                    std::unordered_set<uint64_t> used;
+                    validPlacement = true;
                     for (size_t i = 0; validPlacement && i < expectedNodes.size(); ++i) {
+                        if (!used.insert(metadata->nodeIds[i]).second) {
+                            validPlacement = false;
+                            break;
+                        }
                         if (metadata->nodeIds[i] == expectedNodes[i]) { continue; }
-                        validPlacement = metadata->nodeIds[i] == spare->nodeId && ++replacements == 1;
+                        validPlacement = placementView.isStripeFailoverNode(metadata->nodeIds[i]);
+                        ++replacements;
                     }
-                    validPlacement = validPlacement && replacements == 1;
+                    validPlacement = validPlacement && replacements != 0;
                 }
                 if (!validPlacement) { throw std::runtime_error("AkkEngine: invalid STRIPE shard placement metadata"); }
+                cluster::detail::validateStripeFaultDomains(currentPlacement(), metadata->nodeIds);
                 return metadata;
             }
 
             void repairStripeShards(
-                std::span<const uint8_t> publicKey, const StripeMetadata& metadata,
-                const std::vector<erasure::ErasureShard>& available, const std::vector<bool>& present
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata,
+                const std::vector<erasure::ErasureShard>& available,
+                const std::vector<bool>& present
             ) {
-                if (!opts.cluster.runtime.stripeReadRepair ||
-                    (metadata.layout.parityShards == 0 && metadata.copiesPerShard == 1) ||
-                    metadata.tombstone || metadata.authorityNodeId != nodeId) { return; }
+                if (!opts.cluster.runtime.stripeReadRepair || (metadata.layout.parityShards == 0 && metadata.copiesPerShard == 1) || metadata.tombstone ||
+                    metadata.authorityNodeId != nodeId) { return; }
                 // Only the owner repairs, under the key lock, so repair cannot
                 // resurrect a retired generation after the owner's GC.
                 for (uint16_t placement = 0; placement < metadata.nodeIds.size(); ++placement) {
@@ -2016,8 +2019,10 @@ namespace akkaradb::engine {
                         }
                         else { repaired = erasure::RsErasureCodec::repairOne(shardIndex, available, metadata.layout); }
                         writeStripeRecordToNode(
-                            metadata.nodeIds[placement], stripeShardKey(publicKey, metadata.version, shardIndex),
-                            encodeStripeShard(metadata.version, repaired, metadata.layout), metadata.version
+                            metadata.nodeIds[placement],
+                            stripeShardKey(publicKey, metadata.version, shardIndex),
+                            encodeStripeShard(metadata.version, repaired, metadata.layout),
+                            metadata.version
                         );
                         std::lock_guard lock{stripeRepairStatsMu};
                         ++stripeRepairStats.succeeded;
@@ -2036,7 +2041,8 @@ namespace akkaradb::engine {
             };
 
             [[nodiscard]] StripeShardSet readStripeShards(
-                std::span<const uint8_t> publicKey, const StripeMetadata& metadata,
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata,
                 cluster::detail::BoundedExecutor* migrationExecutor = nullptr
             ) {
                 StripeShardSet out;
@@ -2044,21 +2050,19 @@ namespace akkaradb::engine {
                 std::vector<std::optional<erasure::ErasureShard>> decoded(metadata.nodeIds.size());
                 const auto budget = cluster::detail::ReconfigurationDeadline::current();
                 auto* executor = migrationExecutor ? migrationExecutor : stripeExecutor.get();
-                executor->forEach(metadata.nodeIds.size(), [&](size_t placement) {
-                    cluster::detail::ReconfigurationDeadline scope{budget};
-                    const uint16_t shardIndex = static_cast<uint16_t>(placement / metadata.copiesPerShard);
-                    std::optional<std::vector<uint8_t>> stored;
-                    try {
-                        stored = readStripeRecordFromNode(
-                            metadata.nodeIds[placement], stripeShardKey(publicKey, metadata.version, shardIndex));
+                executor->forEach(
+                    metadata.nodeIds.size(),
+                    [&](size_t placement) {
+                        cluster::detail::ReconfigurationDeadline scope{budget};
+                        const uint16_t shardIndex = static_cast<uint16_t>(placement / metadata.copiesPerShard);
+                        std::optional<std::vector<uint8_t>> stored;
+                        try { stored = readStripeRecordFromNode(metadata.nodeIds[placement], stripeShardKey(publicKey, metadata.version, shardIndex)); }
+                        catch (const std::runtime_error&) { return; }
+                        if (!stored) { return; }
+                        auto shard = decodeStripeShard(*stored, metadata.version, metadata.layout);
+                        if (shard && shard->index == shardIndex && shard->originalSize == metadata.originalSize) { decoded[placement] = std::move(shard); }
                     }
-                    catch (const std::runtime_error&) { return; }
-                    if (!stored) { return; }
-                    auto shard = decodeStripeShard(*stored, metadata.version, metadata.layout);
-                    if (shard && shard->index == shardIndex && shard->originalSize == metadata.originalSize) {
-                        decoded[placement] = std::move(shard);
-                    }
-                });
+                );
                 std::vector<bool> logicalPresent(metadata.layout.totalShards(), false);
                 for (size_t placement = 0; placement < decoded.size(); ++placement) {
                     if (!decoded[placement]) { continue; }
@@ -2073,7 +2077,9 @@ namespace akkaradb::engine {
             }
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> readStripeValueFromMetadata(
-                std::span<const uint8_t> publicKey, const StripeMetadata& metadata, bool repair,
+                std::span<const uint8_t> publicKey,
+                const StripeMetadata& metadata,
+                bool repair,
                 cluster::detail::BoundedExecutor* migrationExecutor = nullptr
             ) {
                 if (metadata.tombstone) { return std::nullopt; }
@@ -2093,15 +2099,17 @@ namespace akkaradb::engine {
                 auto keyLock = stripeKeys.lock(publicKey);
                 checkStripeHealthy();
                 const uint64_t originalOwner = stripeOwnerFor(currentPlacement(), publicKey);
-                const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
-                const bool coordinatedRead = clusterRuntime &&
-                    (nodeId == originalOwner || (nodeId == failoverNode && !clusterRuntime->stripeNodeReachable(originalOwner)));
+                const bool coordinatedRead = clusterRuntime && (nodeId == originalOwner || (currentPlacement().isStripeFailoverNode(nodeId) && !clusterRuntime->
+                    stripeNodeReachable(originalOwner)));
                 auto lease = coordinatedRead
                                  ? clusterRuntime->acquireStripeOperation(publicKey, originalOwner)
                                  : cluster::StripeOperationLease{
-                                       .ownerNodeId = originalOwner, .authorityNodeId = originalOwner,
-                                       .fenceToken = 0, .coordinated = false, .metadata = {},
-                                   };
+                                     .ownerNodeId = originalOwner,
+                                     .authorityNodeId = originalOwner,
+                                     .fenceToken = 0,
+                                     .coordinated = false,
+                                     .metadata = {},
+                                 };
                 if (!lease.coordinated) {
                     for (unsigned attempt = 0; attempt < 8; ++attempt) {
                         const auto metadata = readStripeMetadata(publicKey);
@@ -2119,12 +2127,8 @@ namespace akkaradb::engine {
                 }
                 try {
                     auto metadata = lease.metadata.empty() ? std::optional<StripeMetadata>{} : decodeStripeMetadata(lease.metadata);
-                    if (!lease.metadata.empty() && !metadata) {
-                        throw std::runtime_error("AkkEngine: corrupt fenced STRIPE metadata");
-                    }
-                    if (metadata && metadata->ownerNodeId != originalOwner) {
-                        throw std::runtime_error("AkkEngine: fenced STRIPE metadata owner mismatch");
-                    }
+                    if (!lease.metadata.empty() && !metadata) { throw std::runtime_error("AkkEngine: corrupt fenced STRIPE metadata"); }
+                    if (metadata && metadata->ownerNodeId != originalOwner) { throw std::runtime_error("AkkEngine: fenced STRIPE metadata owner mismatch"); }
                     if (!metadata || metadata->tombstone) {
                         if (clusterRuntime) { clusterRuntime->releaseStripeOperation(lease, publicKey); }
                         return std::nullopt;
@@ -2144,10 +2148,7 @@ namespace akkaradb::engine {
                 std::optional<StripeMetadata> previous;
             };
 
-            static std::vector<uint8_t> encodeStripeTransaction(
-                const StripeMetadata& next,
-                const std::optional<StripeMetadata>& previous
-            ) {
+            static std::vector<uint8_t> encodeStripeTransaction(const StripeMetadata& next, const std::optional<StripeMetadata>& previous) {
                 std::vector<uint8_t> out{'A', 'K', 'S', 'T', '1'};
                 const auto nextBytes = encodeStripeMetadata(next);
                 const auto previousBytes = previous ? encodeStripeMetadata(*previous) : std::vector<uint8_t>{};
@@ -2159,16 +2160,16 @@ namespace akkaradb::engine {
             }
 
             static std::optional<StripeTransaction> decodeStripeTransaction(
-                std::span<const uint8_t> bytes, uint64_t expectedVersion, uint64_t expectedAuthority
+                std::span<const uint8_t> bytes,
+                uint64_t expectedVersion,
+                uint64_t expectedAuthority
             ) {
                 if (bytes.size() < 13 || std::memcmp(bytes.data(), "AKST1", 5) != 0) { return std::nullopt; }
                 size_t cursor = 5;
                 StripeTransaction out;
                 for (int n = 0; n < 2; ++n) {
                     uint32_t length = 0;
-                    if (!pullU32(bytes, cursor, length) || length > bytes.size() - cursor || (n == 0 && length == 0)) {
-                        return std::nullopt;
-                    }
+                    if (!pullU32(bytes, cursor, length) || length > bytes.size() - cursor || (n == 0 && length == 0)) { return std::nullopt; }
                     if (length != 0) {
                         auto metadata = decodeStripeMetadata(bytes.subspan(cursor, length));
                         if (!metadata) { return std::nullopt; }
@@ -2177,19 +2178,20 @@ namespace akkaradb::engine {
                     }
                     cursor += length;
                 }
-                if (out.next.nodeIds.empty() || out.next.version != expectedVersion || out.next.authorityNodeId != expectedAuthority ||
-                    cursor != bytes.size()) {
-                    return std::nullopt;
-                }
+                if (out.next.nodeIds.empty() || out.next.version != expectedVersion || out.next.authorityNodeId != expectedAuthority || cursor != bytes.
+                    size()) { return std::nullopt; }
                 return out;
             }
 
-            void writeStripeValue(
-                std::span<const uint8_t> publicKey,
-                std::span<const uint8_t> value,
-                bool tombstone = false,
-                bool rollback = false
-            ) {
+            static void validateStripeShardStorage(size_t keySize, size_t valueSize, erasure::ErasureLayout layout) {
+                // The shard key adds 20 bytes; the encoded value header adds 35.
+                validateStoredRecord(keySize, 55);
+                validateStoredRecord(keySize + 55, erasure::RsErasureCodec::shardPayloadSize(valueSize, layout.dataShards));
+            }
+
+            void writeStripeValue(std::span<const uint8_t> publicKey, std::span<const uint8_t> value, bool tombstone = false, bool rollback = false) {
+                validateStoredRecord(publicKey.size(), 20);
+                if (!tombstone) { validateStripeShardStorage(publicKey.size(), value.size(), stripeLayoutFor(currentPlacement())); }
                 requireOwnsWriteKey(publicKey);
                 auto keyLock = stripeKeys.lock(publicKey);
                 checkStripeHealthy();
@@ -2197,19 +2199,17 @@ namespace akkaradb::engine {
                 auto lease = clusterRuntime
                                  ? clusterRuntime->acquireStripeOperation(publicKey, originalOwner)
                                  : cluster::StripeOperationLease{
-                                       .ownerNodeId = originalOwner, .authorityNodeId = originalOwner,
-                                       .fenceToken = 0, .coordinated = false, .metadata = {},
-                                   };
+                                     .ownerNodeId = originalOwner,
+                                     .authorityNodeId = originalOwner,
+                                     .fenceToken = 0,
+                                     .coordinated = false,
+                                     .metadata = {},
+                                 };
+                bool publishing = false;
                 try {
-                    auto previous = lease.coordinated && !lease.metadata.empty()
-                                        ? decodeStripeMetadata(lease.metadata)
-                                        : readStripeMetadata(publicKey);
-                    if (lease.coordinated && !lease.metadata.empty() && !previous) {
-                        throw std::runtime_error("AkkEngine: corrupt fenced STRIPE metadata");
-                    }
-                    if (previous && previous->ownerNodeId != originalOwner) {
-                        throw std::runtime_error("AkkEngine: fenced STRIPE metadata owner mismatch");
-                    }
+                    auto previous = lease.coordinated && !lease.metadata.empty() ? decodeStripeMetadata(lease.metadata) : readStripeMetadata(publicKey);
+                    if (lease.coordinated && !lease.metadata.empty() && !previous) { throw std::runtime_error("AkkEngine: corrupt fenced STRIPE metadata"); }
+                    if (previous && previous->ownerNodeId != originalOwner) { throw std::runtime_error("AkkEngine: fenced STRIPE metadata owner mismatch"); }
                     StripeMetadata next;
                     next.tombstone = tombstone;
                     next.rollback = rollback;
@@ -2217,25 +2217,40 @@ namespace akkaradb::engine {
                     next.ownerNodeId = originalOwner;
                     next.authorityNodeId = lease.authorityNodeId;
                     next.originNodeId = lease.authorityNodeId;
-                    next.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+                    next.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()
+                    ).count());
                     next.fenceToken = lease.coordinated ? lease.fenceToken : 1;
                     next.originalSize = value.size();
                     next.layout = stripeLayoutFor(currentPlacement());
                     next.copiesPerShard = currentPlacement().stripe().copiesPerShard;
                     const uint64_t excludedOwner = lease.authorityNodeId == originalOwner ? 0 : originalOwner;
-                    next.nodeIds = stripeNodeIdsFor(currentPlacement(), publicKey, excludedOwner);
+                    next.nodeIds = stripeNodeIdsFor(currentPlacement(), publicKey, excludedOwner, lease.authorityNodeId);
                     if (next.copiesPerShard == 2 && previous && previous->nodeIds.size() == next.nodeIds.size()) {
                         const auto placementView = currentPlacement();
-                        const auto* spare = placementView.stripeFailoverNode();
-                        if (spare != nullptr && !std::ranges::contains(next.nodeIds, spare->nodeId)) {
-                            const auto previousSpare = std::ranges::find(previous->nodeIds, spare->nodeId);
-                            if (previousSpare != previous->nodeIds.end()) {
-                                const auto position = static_cast<size_t>(std::distance(previous->nodeIds.begin(), previousSpare));
-                                next.nodeIds[position] = spare->nodeId;
-                            }
+                        const auto normal = stripeNodeIdsFor(placementView, publicKey);
+                        // A reachable owner replacement may differ from the
+                        // current authority, which can already hold another shard.
+                        const auto ownerPosition = std::ranges::find(normal, excludedOwner);
+                        if (ownerPosition != normal.end()) {
+                            const auto position = static_cast<size_t>(ownerPosition - normal.begin());
+                            const auto spare = previous->nodeIds[position];
+                            if (placementView.isStripeFailoverNode(spare) && clusterRuntime->stripeNodeReachable(spare)) { next.nodeIds[position] = spare; }
+                        }
+                        for (size_t position = 0; position < previous->nodeIds.size(); ++position) {
+                            const auto spare = previous->nodeIds[position];
+                            if (placementView.isStripeFailoverNode(spare) && !std::ranges::contains(next.nodeIds, spare) && (excludedOwner == 0 || normal[
+                                position] != excludedOwner)) { next.nodeIds[position] = spare; }
                         }
                     }
+                    cluster::detail::validateStripeFaultDomains(currentPlacement(), next.nodeIds);
                     next.shardPresent.assign(next.nodeIds.size(), 0);
+                    // Placement may have changed while the lease was acquired.
+                    if (!tombstone) { validateStripeShardStorage(publicKey.size(), value.size(), next.layout); }
+                    const auto metadataSize = encodeStripeMetadata(next).size();
+                    validateStoredRecord(stripeMetaKey(publicKey).size(), metadataSize);
+                    validateStoredRecord(stripeHistoryPlacementKey(publicKey, 0, 0).size(), metadataSize + 8);
+                    validateStoredRecord(stripeTransactionKey(publicKey, next.version).size(), encodeStripeTransaction(next, previous).size());
                     // The fencing token is also the immutable generation id.
                     // Local WAL ordering continues to use a local storage seq.
                     {
@@ -2250,25 +2265,35 @@ namespace akkaradb::engine {
                             std::lock_guard stateLock{stripeStateMu};
                             stripePending[intentKey] = intentValue;
                         }
-                        catch (...) { failStripe(std::current_exception()); throw; }
+                        catch (...) {
+                            failStripe(std::current_exception());
+                            throw;
+                        }
                     }
                     crashAtTestPoint("stripe.after_intent");
                     if (!tombstone) {
                         uint16_t durablePlacements = 0;
                         std::vector<uint8_t> durableCopies(next.layout.totalShards(), 0);
                         const auto shards = erasure::RsErasureCodec::encode(value, next.layout);
-                        stripeExecutor->forEach(next.nodeIds.size(), [&](size_t placement) {
-                            const auto shardIndex = static_cast<uint16_t>(placement / next.copiesPerShard);
-                            const auto targetNodeId = next.nodeIds[placement];
-                            try {
-                                if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) { return; }
-                                writeStripeRecordToNode(targetNodeId, stripeShardKey(publicKey, next.version, shardIndex),
-                                    encodeStripeShard(next.version, shards[shardIndex], next.layout), next.version);
-                                next.shardPresent[placement] = 1;
-                                crashAtTestPoint("stripe.after_shard");
+                        stripeExecutor->forEach(
+                            next.nodeIds.size(),
+                            [&](size_t placement) {
+                                const auto shardIndex = static_cast<uint16_t>(placement / next.copiesPerShard);
+                                const auto targetNodeId = next.nodeIds[placement];
+                                try {
+                                    if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) { return; }
+                                    writeStripeRecordToNode(
+                                        targetNodeId,
+                                        stripeShardKey(publicKey, next.version, shardIndex),
+                                        encodeStripeShard(next.version, shards[shardIndex], next.layout),
+                                        next.version
+                                    );
+                                    next.shardPresent[placement] = 1;
+                                    crashAtTestPoint("stripe.after_shard");
+                                }
+                                catch (const std::runtime_error&) {}
                             }
-                            catch (const std::runtime_error&) {}
-                        });
+                        );
                         for (size_t placement = 0; placement < next.shardPresent.size(); ++placement) {
                             if (next.shardPresent[placement] != 0) {
                                 ++durablePlacements;
@@ -2289,8 +2314,8 @@ namespace akkaradb::engine {
                         }
                         if (!sufficient) {
                             throw std::runtime_error(
-                                "AkkEngine: insufficient durable STRIPE placements (durable=" +
-                                std::to_string(durablePlacements) + ", required=" + std::to_string(requiredPlacements) + ")"
+                                "AkkEngine: insufficient durable STRIPE placements (durable=" + std::to_string(durablePlacements) + ", required=" +
+                                std::to_string(requiredPlacements) + ")"
                             );
                         }
                         if (durablePlacements < next.nodeIds.size()) {
@@ -2300,6 +2325,7 @@ namespace akkaradb::engine {
                     }
                     crashAtTestPoint("stripe.before_publish");
                     const auto encoded = encodeStripeMetadata(next);
+                    publishing = true;
                     if (lease.coordinated) { clusterRuntime->commitStripeMetadata(lease, publicKey, encoded); }
                     else { writeStripeLocal(stripeMetaKey(publicKey), encoded); }
                     crashAtTestPoint("stripe.after_publish");
@@ -2307,8 +2333,16 @@ namespace akkaradb::engine {
                     else { putsTotal.fetch_add(1, std::memory_order_relaxed); }
                 }
                 catch (...) {
+                    const auto failure = std::current_exception();
                     if (clusterRuntime) { clusterRuntime->releaseStripeOperation(lease, publicKey); }
-                    throw;
+                    if (publishing) {
+                        throw cluster::ClusterRoutingError(
+                            cluster::ClusterRoutingCode::OUTCOME_UNKNOWN,
+                            {},
+                            "AkkEngine: STRIPE metadata publication outcome is unknown"
+                        );
+                    }
+                    std::rethrow_exception(failure);
                 }
             }
 
@@ -2317,8 +2351,45 @@ namespace akkaradb::engine {
             bool stripePlacementProtected() const {
                 if (!clusterRuntime) { return false; }
                 const auto state = clusterRuntime->placementState(false);
-                return state.pendingGeneration != 0 ||
-                    stripeProtectionGeneration.load(std::memory_order_acquire) > state.lastIssuedGeneration;
+                return state.pendingGeneration != 0 || stripeProtectionGeneration.load(std::memory_order_acquire) > state.lastIssuedGeneration;
+            }
+
+            bool stripeGenerationRetainedLocal(std::span<const uint8_t> publicKey, uint64_t generation) {
+                const auto metadataKey = stripeMetaKey(publicKey);
+                const auto retained = [&](std::span<const uint8_t> bytes) {
+                    const auto metadata = decodeStripeMetadata(bytes);
+                    if (!metadata) { throw std::runtime_error("AkkEngine: corrupt retained STRIPE metadata"); }
+                    return metadata->version == generation;
+                };
+                if (const auto current = getValueInternal(metadataKey, false); current && retained(*current)) { return true; }
+                if (versionLog) { for (const auto& entry : versionLog->history(metadataKey)) { if (retained(entry.value)) { return true; } } }
+                return false;
+            }
+
+            bool reclaimStripeGeneration(std::span<const uint8_t> publicKey, std::span<const uint8_t> encoded, const std::function<bool()>& retainedByPeers) {
+                // The authority reservation already serializes this key. A local
+                // writer can hold stripeKeys while waiting for that reservation.
+                std::unique_lock reclamationLock{stripeGcEpochMu};
+                if (stripePlacementProtected() || stripeQueryPins->load(std::memory_order_acquire) != 0) { return false; }
+                const auto candidate = decodeStripeMetadata(encoded);
+                if (!candidate || !candidate->version || candidate->ownerNodeId != stripeOwnerFor(currentPlacement(), publicKey) || candidate->layout.dataShards
+                    != currentPlacement().stripe().dataShards || candidate->layout.parityShards != currentPlacement().stripe().parityShards || candidate->
+                    copiesPerShard != currentPlacement().stripe().copiesPerShard) {
+                    throw std::runtime_error("AkkEngine: invalid STRIPE reclamation candidate");
+                }
+                if (candidate->tombstone || stripeGenerationRetainedLocal(publicKey, candidate->version) || retainedByPeers()) { return true; }
+                for (uint16_t placement = 0; placement < candidate->nodeIds.size(); ++placement) {
+                    const uint16_t shardIndex = placement / candidate->copiesPerShard;
+                    writeStripeRecordToNode(
+                        candidate->nodeIds[placement],
+                        stripeShardKey(publicKey, candidate->version, shardIndex),
+                        {},
+                        candidate->version,
+                        cluster::ReplOpType::REMOVE,
+                        candidate->authorityNodeId
+                    );
+                }
+                return true;
             }
 
             void collectStripeGarbage() {
@@ -2335,15 +2406,20 @@ namespace akkaradb::engine {
                     for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                         if (isStripeInternalKey(record.key) && record.key[4] == 'T') {
                             std::lock_guard stateLock{stripeStateMu};
-                            stripePending[std::vector<uint8_t>{record.key.begin(), record.key.end()}] =
-                                std::vector<uint8_t>{record.value.begin(), record.value.end()};
+                            stripePending[std::vector<uint8_t>{record.key.begin(), record.key.end()}] = std::vector<uint8_t>{
+                                record.value.begin(),
+                                record.value.end()
+                            };
                         }
                     }
                     stripeGcLoaded = true;
                 }
                 std::vector<uint8_t> previousIntent;
                 for (;;) {
-                    struct PendingView { std::vector<uint8_t> key; std::vector<uint8_t> value; };
+                    struct PendingView {
+                        std::vector<uint8_t> key;
+                        std::vector<uint8_t> value;
+                    };
                     PendingView item;
                     {
                         std::lock_guard stateLock{stripeStateMu};
@@ -2354,50 +2430,26 @@ namespace akkaradb::engine {
                     previousIntent = item.key;
                     size_t cursor = 6;
                     uint32_t keySize = 0;
-                    if (!pullU32(item.key, cursor, keySize) || item.key.size() - cursor < 8 ||
-                        keySize != item.key.size() - cursor - 8) { throw std::runtime_error("AkkEngine: corrupt STRIPE intent key"); }
+                    if (!pullU32(item.key, cursor, keySize) || item.key.size() - cursor < 8 || keySize != item.key.size() - cursor - 8) {
+                        throw std::runtime_error("AkkEngine: corrupt STRIPE intent key");
+                    }
                     const auto publicKey = std::span<const uint8_t>{item.key.data() + cursor, keySize};
                     cursor += keySize;
                     uint64_t version = 0;
                     const uint64_t originalOwner = stripeOwnerFor(currentPlacement(), publicKey);
-                    const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
-                    if (!pullU64(item.key, cursor, version)) {
-                        throw std::runtime_error("AkkEngine: corrupt STRIPE intent version");
-                    }
+                    if (!pullU64(item.key, cursor, version)) { throw std::runtime_error("AkkEngine: corrupt STRIPE intent version"); }
                     auto transaction = decodeStripeTransaction(item.value, version, nodeId);
                     if (!transaction) { throw std::runtime_error("AkkEngine: corrupt STRIPE intent"); }
                     // Placement can retire the writer while its valid intent is
                     // still awaiting cleanup. Its source storage stays retained.
-                    if (originalOwner != nodeId && failoverNode != nodeId) { continue; }
-                    auto keyLock = stripeKeys.lock(publicKey);
-                    const auto current = readStripeMetadata(publicKey);
-                    std::unordered_set<uint64_t> retainedGenerations;
-                    if (versionLog) {
-                        for (const auto& entry : versionLog->history(stripeMetaKey(publicKey))) {
-                            if (auto metadata = decodeStripeMetadata(entry.value)) {
-                                retainedGenerations.insert(metadata->version);
-                            }
-                        }
-                    }
+                    if (originalOwner != nodeId && !currentPlacement().isStripeFailoverNode(nodeId)) { continue; }
                     std::vector<StripeMetadata> candidates;
                     candidates.push_back(transaction->next);
                     if (transaction->previous) { candidates.push_back(*transaction->previous); }
-                    std::unique_lock reclamationLock{stripeGcEpochMu};
-                    if (stripeQueryPins->load(std::memory_order_acquire) != 0) { continue; }
                     bool complete = true;
                     for (const auto& candidate : candidates) {
-                        if (candidate.tombstone || (current && candidate.version == current->version) ||
-                            retainedGenerations.contains(candidate.version)) { continue; }
-                        for (uint16_t placement = 0; placement < candidate.nodeIds.size(); ++placement) {
-                            const uint16_t shardIndex = placement / candidate.copiesPerShard;
-                            try {
-                                writeStripeRecordToNode(
-                                    candidate.nodeIds[placement], stripeShardKey(publicKey, candidate.version, shardIndex), {},
-                                    candidate.version, cluster::ReplOpType::REMOVE
-                                );
-                            }
-                            catch (...) { complete = false; }
-                        }
+                        if (candidate.tombstone) { continue; }
+                        if (!clusterRuntime->reclaimStripeGeneration(publicKey, encodeStripeMetadata(candidate))) { complete = false; }
                     }
                     if (complete) {
                         writeStripeLocal(item.key, {}, cluster::ReplOpType::REMOVE);
@@ -2409,8 +2461,8 @@ namespace akkaradb::engine {
 
             void rebuildStripeShardsBatch() {
                 if (stripePlacementProtected()) { return; }
-                if (!opts.cluster.runtime.stripeAutoRebuild ||
-                    (currentPlacement().stripe().parityShards == 0 && currentPlacement().stripe().copiesPerShard == 1)) { return; }
+                if (!opts.cluster.runtime.stripeAutoRebuild || (currentPlacement().stripe().parityShards == 0 && currentPlacement().stripe().copiesPerShard ==
+                    1)) { return; }
                 struct Candidate {
                     std::vector<uint8_t> key;
                     StripeMetadata metadata;
@@ -2443,10 +2495,8 @@ namespace akkaradb::engine {
                         auto metadata = decodeStripeMetadata(record.value);
                         if (!metadata) { throw std::runtime_error("AkkEngine: corrupt STRIPE rebuild metadata"); }
                         *metadata = effectiveStripeMetadata(*publicKey, *metadata);
-                        const bool localMetadataStore = clusterRuntime &&
-                            clusterRuntime->stripeMetadataLeaderNodeId() == nodeId;
-                        if (!metadata->tombstone &&
-                            (metadata->layout.parityShards != 0 || metadata->copiesPerShard == 2) && localMetadataStore) {
+                        const bool localMetadataStore = clusterRuntime && clusterRuntime->stripeMetadataLeaderNodeId() == nodeId;
+                        if (!metadata->tombstone && (metadata->layout.parityShards != 0 || metadata->copiesPerShard == 2) && localMetadataStore) {
                             candidates.push_back(Candidate{.key = std::move(*publicKey), .metadata = std::move(*metadata)});
                         }
                         if (metadataKeysVisited >= opts.cluster.runtime.stripeRebuildBatchKeys) { break; }
@@ -2464,8 +2514,7 @@ namespace akkaradb::engine {
                     const auto latestBytes = getValueInternal(stripeMetaKey(candidate.key), false);
                     auto latest = latestBytes ? decodeStripeMetadata(*latestBytes) : std::nullopt;
                     if (latest) { *latest = effectiveStripeMetadata(candidate.key, *latest); }
-                    if (!latest || latest->version != candidate.metadata.version ||
-                        latest->authorityNodeId != candidate.metadata.authorityNodeId) { continue; }
+                    if (!latest || latest->version != candidate.metadata.version || latest->authorityNodeId != candidate.metadata.authorityNodeId) { continue; }
                     auto shards = readStripeShards(candidate.key, candidate.metadata);
                     bool missing = false;
                     std::vector<uint8_t> observed(candidate.metadata.nodeIds.size(), 0);
@@ -2477,20 +2526,28 @@ namespace akkaradb::engine {
                         std::lock_guard statsLock{stripeRebuildStatsMu};
                         stripeRebuildStats.active = true;
                     }
+                    const auto originalNodes = candidate.metadata.nodeIds;
                     for (uint16_t placement = 0; placement < observed.size(); ++placement) {
                         if (observed[placement] != 0) { continue; }
                         const uint16_t shardIndex = placement / candidate.metadata.copiesPerShard;
                         uint64_t targetNodeId = candidate.metadata.nodeIds[placement];
                         if (candidate.metadata.copiesPerShard == 2) {
                             const auto placementView = currentPlacement();
-                            const auto* spare = placementView.stripeFailoverNode();
-                            const bool targetReachable = targetNodeId == nodeId ||
-                                (clusterRuntime && clusterRuntime->stripeNodeReachable(targetNodeId));
-                            if (!targetReachable && spare != nullptr &&
-                                !std::ranges::contains(candidate.metadata.nodeIds, spare->nodeId) &&
-                                (spare->nodeId == nodeId || (clusterRuntime && clusterRuntime->stripeNodeReachable(spare->nodeId)))) {
-                                targetNodeId = spare->nodeId;
-                                candidate.metadata.nodeIds[placement] = targetNodeId;
+                            const bool targetReachable = targetNodeId == nodeId || (clusterRuntime && clusterRuntime->stripeNodeReachable(targetNodeId));
+                            if (!targetReachable) {
+                                for (const auto& [score, spare] : cluster::detail::rankNodes(candidate.key, placementView.stripeFailoverNodes())) {
+                                    (void)score;
+                                    if (!std::ranges::contains(candidate.metadata.nodeIds, spare.nodeId) && (spare.nodeId == nodeId || (clusterRuntime &&
+                                        clusterRuntime->stripeNodeReachable(spare.nodeId)))) {
+                                        auto proposed = candidate.metadata.nodeIds;
+                                        proposed[placement] = spare.nodeId;
+                                        try { cluster::detail::validateStripeFaultDomains(placementView, proposed); }
+                                        catch (const std::invalid_argument&) { continue; }
+                                        targetNodeId = spare.nodeId;
+                                        candidate.metadata.nodeIds = std::move(proposed);
+                                        break;
+                                    }
+                                }
                             }
                         }
                         if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) { continue; }
@@ -2504,29 +2561,22 @@ namespace akkaradb::engine {
                             }
                             erasure::ErasureShard repaired;
                             if (candidate.metadata.copiesPerShard == 2) {
-                                const auto source = std::ranges::find(
-                                    shards.available, shardIndex, &erasure::ErasureShard::index
-                                );
-                                if (source == shards.available.end()) {
-                                    throw std::runtime_error("AkkEngine: missing RAID.10 mirror source for rebuild");
-                                }
+                                const auto source = std::ranges::find(shards.available, shardIndex, &erasure::ErasureShard::index);
+                                if (source == shards.available.end()) { throw std::runtime_error("AkkEngine: missing RAID.10 mirror source for rebuild"); }
                                 repaired = *source;
                             }
-                            else {
-                                repaired = erasure::RsErasureCodec::repairOne(
-                                    shardIndex, shards.available, candidate.metadata.layout
-                                );
-                            }
+                            else { repaired = erasure::RsErasureCodec::repairOne(shardIndex, shards.available, candidate.metadata.layout); }
                             writeStripeRecordToNode(
-                                targetNodeId, stripeShardKey(candidate.key, candidate.metadata.version, shardIndex),
+                                targetNodeId,
+                                stripeShardKey(candidate.key, candidate.metadata.version, shardIndex),
                                 encodeStripeShard(candidate.metadata.version, repaired, candidate.metadata.layout),
-                                candidate.metadata.version, cluster::ReplOpType::PUT, candidate.metadata.authorityNodeId
+                                candidate.metadata.version,
+                                cluster::ReplOpType::PUT,
+                                candidate.metadata.authorityNodeId
                             );
                             observed[placement] = 1;
                             shards.present[placement] = true;
-                            if (candidate.metadata.copiesPerShard == 1) {
-                                shards.available.push_back(std::move(repaired));
-                            }
+                            if (candidate.metadata.copiesPerShard == 1) { shards.available.push_back(std::move(repaired)); }
                             std::lock_guard statsLock{stripeRebuildStatsMu};
                             ++stripeRebuildStats.succeeded;
                         }
@@ -2537,12 +2587,14 @@ namespace akkaradb::engine {
                         }
                     }
 
-                    if (observed == candidate.metadata.shardPresent) { continue; }
+                    if (observed == candidate.metadata.shardPresent && candidate.metadata.nodeIds == originalNodes) { continue; }
                     checkStripeHealthy();
                     const auto currentBytes = getValueInternal(stripeMetaKey(candidate.key), false);
                     const auto current = currentBytes ? decodeStripeMetadata(*currentBytes) : std::nullopt;
-                    if (!current || current->version != candidate.metadata.version ||
-                        current->authorityNodeId != candidate.metadata.authorityNodeId) { continue; }
+                    if (!current || current->version != candidate.metadata.version || current->authorityNodeId != candidate.metadata.authorityNodeId) {
+                        continue;
+                    }
+                    cluster::detail::validateStripeFaultDomains(currentPlacement(), candidate.metadata.nodeIds);
                     candidate.metadata.shardPresent = std::move(observed);
                     const auto encoded = encodeStripeMetadata(candidate.metadata);
                     (void)clusterRuntime->repairStripeMetadata(candidate.key, candidate.metadata.version, encoded);
@@ -2551,43 +2603,43 @@ namespace akkaradb::engine {
 
             void startStripeGarbageCollector() {
                 if (clusterReplicationMode != cluster::ReplicationMode::STRIPE) { return; }
-                stripeGcThread = std::jthread([this](std::stop_token stop) {
-                    auto nextGarbageCollection = std::chrono::steady_clock::now();
-                    auto nextRebuild = std::chrono::steady_clock::now();
-                    while (!stop.stop_requested()) {
-                        try { collectStripeGarbage(); }
-                        catch (const cluster::StripeMetadataUnavailable&) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds{50});
-                            continue;
-                        }
-                        catch (...) {
-                            failStripe(std::current_exception());
-                            return;
-                        }
-                        const auto now = std::chrono::steady_clock::now();
-                        if (now >= nextRebuild) {
-                            try { rebuildStripeShardsBatch(); }
+                stripeGcThread = std::jthread(
+                    [this](const std::stop_token& stop) {
+                        auto nextGarbageCollection = std::chrono::steady_clock::now();
+                        auto nextRebuild = std::chrono::steady_clock::now();
+                        while (!stop.stop_requested()) {
+                            try { collectStripeGarbage(); }
                             catch (const cluster::StripeMetadataUnavailable&) {
-                                nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
+                                std::this_thread::sleep_for(std::chrono::milliseconds{50});
                                 continue;
                             }
                             catch (...) {
                                 failStripe(std::current_exception());
                                 return;
                             }
-                            nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
-                        }
-                        nextGarbageCollection = now + std::chrono::milliseconds{500};
-                        while (!stop.stop_requested() && std::chrono::steady_clock::now() < nextGarbageCollection) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now >= nextRebuild) {
+                                try { rebuildStripeShardsBatch(); }
+                                catch (const cluster::StripeMetadataUnavailable&) {
+                                    nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
+                                    continue;
+                                }
+                                catch (...) {
+                                    failStripe(std::current_exception());
+                                    return;
+                                }
+                                nextRebuild = now + std::chrono::milliseconds{opts.cluster.runtime.stripeRebuildIntervalMs};
+                            }
+                            nextGarbageCollection = now + std::chrono::milliseconds{500};
+                            while (!stop.stop_requested() && std::chrono::steady_clock::now() < nextGarbageCollection) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                            }
                         }
                     }
-                });
+                );
             }
 
-            void reconfigureCluster(cluster::ClusterConfig config) {
-                reconfigurePlacement(std::move(config));
-            }
+            void reconfigureCluster(cluster::ClusterConfig config) { reconfigurePlacement(std::move(config)); }
 
             [[nodiscard]] cluster::ReadResponse readLocalForCluster(std::span<const uint8_t> key, uint64_t requestedSnapshot) {
                 if (usesPartitionRaft()) {
@@ -2602,15 +2654,7 @@ namespace akkaradb::engine {
                     }
                     return child->impl_->readLocalForCluster(key, requestedSnapshot);
                 }
-                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE && isStripeInternalKey(key) && key[4] == 'M') {
-                    checkStripeHealthy();
-                    const auto publicKey = publicKeyFromStripeMetaKey(key);
-                    const uint64_t metadataAuthority = clusterRuntime ? clusterRuntime->stripeMetadataLeaderNodeId() : 0;
-                    if (!publicKey || metadataAuthority != nodeId) {
-                        throw std::runtime_error("AkkEngine: STRIPE metadata must be read from its authority node");
-                    }
-                }
-                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE && !isStripeInternalKey(key)) {
+                if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
                     cluster::ReadResponse response;
                     const auto value = readStripeValue(key);
                     response.seq = snapshotSeq();
@@ -2635,27 +2679,44 @@ namespace akkaradb::engine {
                 return response;
             }
 
+            [[nodiscard]] cluster::ReadResponse readLocalStorageForCluster(std::span<const uint8_t> key, uint64_t requestedSnapshot) {
+                if (clusterReplicationMode != cluster::ReplicationMode::STRIPE) { return readLocalForCluster(key, requestedSnapshot); }
+                if (isStripeInternalKey(key) && key[4] == 'M') {
+                    checkStripeHealthy();
+                    if (!clusterRuntime || clusterRuntime->stripeMetadataLeaderNodeId() != nodeId) {
+                        throw std::runtime_error("AkkEngine: STRIPE metadata must be read from its authority node");
+                    }
+                }
+                const auto snapshot = requestedSnapshot == 0 ? std::optional<uint64_t>{} : std::optional<uint64_t>{requestedSnapshot};
+                const auto value = getValueInternal(key, false, snapshot);
+                cluster::ReadResponse response;
+                response.seq = requestedSnapshot == 0 ? snapshotSeq() : requestedSnapshot;
+                response.status = value ? cluster::ReadStatus::FOUND : cluster::ReadStatus::NOT_FOUND;
+                if (value) { response.value = *value; }
+                return response;
+            }
+
             [[nodiscard]] bool clusterReadMustRoute() const noexcept {
-                return clusterRuntime && (clusterReplicationMode == cluster::ReplicationMode::STRIPE ||
-                                          opts.cluster.runtime.readMode != cluster::ClusterReadMode::LOCAL_STALE_OK);
+                return clusterRuntime && (clusterReplicationMode == cluster::ReplicationMode::STRIPE || opts.cluster.runtime.readMode !=
+                    cluster::ClusterReadMode::LOCAL_STALE_OK);
             }
 
             void requireClusterDisabledOperation(std::string_view operation) const {
-                if (clusterRuntime) {
-                    throw std::runtime_error(
-                        "AkkEngine: " + std::string{operation} + " is not supported while cluster runtime is enabled"
-                    );
-                }
+                if (clusterRuntime) { throw std::runtime_error("AkkEngine: " + std::string{operation} + " is not supported while cluster runtime is enabled"); }
             }
 
             [[nodiscard]] std::optional<std::vector<uint8_t>> getValueClusterAware(std::span<const uint8_t> key, bool countStats = true) {
                 if (!clusterReadMustRoute()) { return getValueInternal(key, countStats); }
-                const bool localStripeCoordinator = clusterReplicationMode == cluster::ReplicationMode::STRIPE &&
-                    opts.cluster.runtime.stripeReadCoordinatorMode == cluster::StripeReadCoordinatorMode::LOCAL_COORDINATOR &&
-                    opts.cluster.runtime.readMode != cluster::ClusterReadMode::OWNER_ONLY;
-                if (!localStripeCoordinator && !(clusterReplicationMode == cluster::ReplicationMode::STRIPE && isStripeInternalKey(key))) {
-                    if (auto forwarded = tryForwardPoint(cluster::ForwardOperation::GET, key, {}, {},
-                        opts.cluster.runtime.readMode != cluster::ClusterReadMode::OWNER_ONLY)) {
+                const bool localStripeCoordinator = clusterReplicationMode == cluster::ReplicationMode::STRIPE && opts.cluster.runtime.stripeReadCoordinatorMode
+                    == cluster::StripeReadCoordinatorMode::LOCAL_COORDINATOR && opts.cluster.runtime.readMode != cluster::ClusterReadMode::OWNER_ONLY;
+                if (!localStripeCoordinator) {
+                    if (auto forwarded = tryForwardPoint(
+                        cluster::ForwardOperation::GET,
+                        key,
+                        {},
+                        {},
+                        opts.cluster.runtime.readMode != cluster::ClusterReadMode::OWNER_ONLY
+                    )) {
                         if (countStats) {
                             getsTotal.fetch_add(1, std::memory_order_relaxed);
                             if (!forwarded->found) { getsMiss.fetch_add(1, std::memory_order_relaxed); }
@@ -2666,7 +2727,6 @@ namespace akkaradb::engine {
                 }
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
-                    if (isStripeInternalKey(key)) { return getValueInternal(key, false); }
                     if (opts.cluster.runtime.readMode == cluster::ClusterReadMode::OWNER_ONLY && !clusterRuntime->ownsWriteKey(key)) {
                         throw std::runtime_error("AkkEngine: cluster owner read failed");
                     }
@@ -2677,9 +2737,7 @@ namespace akkaradb::engine {
                     else {
                         const auto response = clusterRuntime->readKey(key, 0);
                         if (response.status == cluster::ReadStatus::FOUND) { value = response.value; }
-                        else if (response.status != cluster::ReadStatus::NOT_FOUND) {
-                            throw std::runtime_error("AkkEngine: cluster owner read failed");
-                        }
+                        else if (response.status != cluster::ReadStatus::NOT_FOUND) { throw std::runtime_error("AkkEngine: cluster owner read failed"); }
                     }
                     if (!value) {
                         if (countStats) { getsMiss.fetch_add(1, std::memory_order_relaxed); }
@@ -2693,9 +2751,7 @@ namespace akkaradb::engine {
                     if (countStats) { getsMiss.fetch_add(1, std::memory_order_relaxed); }
                     return std::nullopt;
                 }
-                if (response.status != cluster::ReadStatus::FOUND) {
-                    throw std::runtime_error("AkkEngine: cluster owner read failed");
-                }
+                if (response.status != cluster::ReadStatus::FOUND) { throw std::runtime_error("AkkEngine: cluster owner read failed"); }
                 if (countStats) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
                 return response.value;
             }
@@ -2714,7 +2770,11 @@ namespace akkaradb::engine {
             }
 
             template <typename EntryRange>
-            [[nodiscard]] std::optional<cluster::ClusterRouteTarget> resolveForwardEntries(const EntryRange& entries, bool allowForward, bool queryRequest = false) {
+            [[nodiscard]] std::optional<cluster::ClusterRouteTarget> resolveForwardEntries(
+                const EntryRange& entries,
+                bool allowForward,
+                bool queryRequest = false
+            ) {
                 if (!clusterRuntime) { return std::nullopt; }
                 cluster::ClusterRouteTarget target;
                 uint64_t destination = 0;
@@ -2726,10 +2786,14 @@ namespace akkaradb::engine {
                         throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::NO_TARGET, candidate, "No writable owner is currently available");
                     }
                     if (destination != 0 && destination != owner) {
-                        throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::CROSS_OWNER_BATCH, {},
-                            "Batch spans multiple owners; no entries were applied and the batch was not split");
+                        throw cluster::ClusterRoutingError(
+                            cluster::ClusterRoutingCode::CROSS_OWNER_BATCH,
+                            {},
+                            "Batch spans multiple owners; no entries were applied and the batch was not split"
+                        );
                     }
-                    destination = owner; target = std::move(candidate);
+                    destination = owner;
+                    target = std::move(candidate);
                 };
                 if (queryRequest) { inspect({}); }
                 else { for (const auto& entry : entries) { inspect(entry.key); } }
@@ -2744,7 +2808,11 @@ namespace akkaradb::engine {
             }
 
             [[nodiscard]] std::optional<cluster::ClusterRouteTarget> resolveForwardTarget(const cluster::ForwardRequest& request, bool allowForward) {
-                return resolveForwardEntries(request.entries, allowForward, request.operation == cluster::ForwardOperation::QUERY_REQUEST && !usesPartitionRaft());
+                return resolveForwardEntries(
+                    request.entries,
+                    allowForward,
+                    request.operation == cluster::ForwardOperation::QUERY_REQUEST && clusterReplicationMode != cluster::ReplicationMode::PARTITIONED
+                );
             }
 
             [[nodiscard]] std::optional<cluster::ForwardResponse> tryForward(cluster::ForwardRequest request, bool allowForward = true) {
@@ -2759,17 +2827,25 @@ namespace akkaradb::engine {
                         throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, target);
                     }
                     payloadSize += 8 + entry.key.size() + entry.value.size();
-                    if (payloadSize > cluster::MAX_FORWARD_PAYLOAD) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, target); }
+                    if (payloadSize > cluster::MAX_FORWARD_PAYLOAD) {
+                        throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, target);
+                    }
                 }
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
                 if (remaining <= 0) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::FORWARD_UNAVAILABLE, target); }
                 request.timeoutMs = static_cast<uint32_t>(remaining);
                 const std::optional<uint16_t> partition = usesPartitionRaft() && !request.entries.empty()
-                    ? std::optional{partitionIndex(request.entries.front().key)} : std::nullopt;
+                                                              ? std::optional{partitionIndex(request.entries.front().key)}
+                                                              : std::nullopt;
                 try {
                     auto response = clusterRuntime->forwardTo(target.nodeId, std::move(request));
-                    if (!response.success) { throw cluster::ClusterRoutingError(response.errorCode,
-                        response.target.nodeId == 0 ? target : response.target, response.message.empty() ? "Forward operation failed" : response.message); }
+                    if (!response.success) {
+                        throw cluster::ClusterRoutingError(
+                            response.errorCode,
+                            response.target.nodeId == 0 ? target : response.target,
+                            response.message.empty() ? "Forward operation failed" : response.message
+                        );
+                    }
                     return response;
                 }
                 catch (cluster::ClusterRoutingError& error) {
@@ -2783,25 +2859,33 @@ namespace akkaradb::engine {
                 }
             }
 
-            [[nodiscard]] std::optional<cluster::ForwardResponse> tryForwardPoint(cluster::ForwardOperation operation,
-                std::span<const uint8_t> key, std::span<const uint8_t> value = {},
-                const cluster::ClusterRequestId& requestId = {}, bool allowForward = true) {
+            [[nodiscard]] std::optional<cluster::ForwardResponse> tryForwardPoint(
+                cluster::ForwardOperation operation,
+                std::span<const uint8_t> key,
+                std::span<const uint8_t> value = {},
+                const cluster::ClusterRequestId& requestId = {},
+                bool allowForward = true
+            ) {
                 if (!clusterRuntime || clusterRuntime->ownsWriteKey(key)) { return std::nullopt; }
-                if (usesPartitionRaft() && opts.cluster.runtime.routingMode == cluster::ClusterRoutingMode::FORWARD &&
-                    currentPartitionLeader(key) == 0) {
+                if (usesPartitionRaft() && opts.cluster.runtime.routingMode == cluster::ClusterRoutingMode::FORWARD && currentPartitionLeader(key) == 0) {
                     const auto index = partitionIndex(key);
                     const auto placement = livePlacement.load();
-                    const auto response = partitionRpcLeader(index, partitionAdminHeader(PartitionAdmin::STATUS, index, 0), *placement,
-                        std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.forwardingTimeoutMs});
+                    const auto response = partitionRpcLeader(
+                        index,
+                        partitionAdminHeader(PartitionAdmin::STATUS, index, 0),
+                        *placement,
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds{opts.cluster.runtime.forwardingTimeoutMs}
+                    );
                     partitionLeaderHints[index].store(response.target.nodeId, std::memory_order_release);
                 }
                 const bool forwarding = allowForward && opts.cluster.runtime.routingMode == cluster::ClusterRoutingMode::FORWARD;
-                if (forwarding && (key.size() > cluster::MAX_FORWARD_PAYLOAD || value.size() > cluster::MAX_FORWARD_PAYLOAD ||
-                    key.size() + value.size() + cluster::FORWARD_REQUEST_BASE_SIZE + 8 > cluster::MAX_FORWARD_PAYLOAD)) {
+                if (forwarding && (key.size() > cluster::MAX_FORWARD_PAYLOAD || value.size() > cluster::MAX_FORWARD_PAYLOAD || key.size() + value.size() +
+                    cluster::FORWARD_REQUEST_BASE_SIZE + 8 > cluster::MAX_FORWARD_PAYLOAD)) {
                     throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, clusterRuntime->routeTarget(key));
                 }
                 cluster::ForwardRequest request;
-                request.operation = operation; request.deduplicationId = requestId;
+                request.operation = operation;
+                request.deduplicationId = requestId;
                 request.entries.push_back({{key.begin(), key.end()}, {}});
                 if (forwarding) { request.entries.back().value.assign(value.begin(), value.end()); }
                 return tryForward(std::move(request), allowForward);
@@ -2818,6 +2902,7 @@ namespace akkaradb::engine {
                 if (std::chrono::steady_clock::now() >= deadline) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::FORWARD_UNAVAILABLE); }
                 if (request.operation == cluster::ForwardOperation::READ_QUERY) { return receiveReadQuery(request); }
                 if (request.operation == cluster::ForwardOperation::CLUSTER_ADMIN) { return receivePartitionAdmin(request); }
+                if (request.operation == cluster::ForwardOperation::TRANSACTION) { return receiveClusterTransaction(request); }
                 // Destination revalidates every key before taking a fencing grant
                 // or mutating storage. It never follows another redirect.
                 (void)resolveForwardTarget(request, false);
@@ -2825,13 +2910,16 @@ namespace akkaradb::engine {
                 response.success = true;
                 if (request.operation == cluster::ForwardOperation::QUERY_REQUEST) {
                     response.requestResult = usesPartitionRaft()
-                        ? requireLocalPartition(request.entries.front().key).impl_->clusterRuntime->queryRequest(request.deduplicationId)
-                        : clusterRuntime->queryRequest(request.deduplicationId);
+                                                 ? requireLocalPartition(request.entries.front().key).impl_->clusterRuntime->queryRequest(
+                                                     request.deduplicationId
+                                                 )
+                                                 : clusterRuntime->queryRequest(request.deduplicationId);
                 }
                 else if (request.operation == cluster::ForwardOperation::GET) {
                     const auto result = clusterRuntime->linearizableReadKey(request.entries.front().key);
                     if (result.status == cluster::ReadStatus::ERROR_STATUS) { throw std::runtime_error("Forwarded owner read failed"); }
-                    response.found = result.status == cluster::ReadStatus::FOUND; response.value = result.value;
+                    response.found = result.status == cluster::ReadStatus::FOUND;
+                    response.value = result.value;
                 }
                 else {
                     std::shared_lock epochLock{mutationEpochMu};
@@ -2844,13 +2932,18 @@ namespace akkaradb::engine {
                     else {
                         const auto& entry = request.entries.front();
                         switch (request.operation) {
-                            case cluster::ForwardOperation::PUT: writeCoordinator->put(entry.key, entry.value); break;
-                            case cluster::ForwardOperation::REMOVE: writeCoordinator->remove(entry.key); break;
+                            case cluster::ForwardOperation::PUT: writeCoordinator->put(entry.key, entry.value);
+                                break;
+                            case cluster::ForwardOperation::REMOVE: writeCoordinator->remove(entry.key);
+                                break;
                             case cluster::ForwardOperation::PUT_REQUEST:
-                            case cluster::ForwardOperation::REMOVE_REQUEST:
-                                response.requestResult = writeCoordinator->writeWithRequest(request.deduplicationId,
+                            case cluster::ForwardOperation::REMOVE_REQUEST: response.requestResult = writeCoordinator->writeWithRequest(
+                                    request.deduplicationId,
                                     request.operation == cluster::ForwardOperation::PUT_REQUEST ? cluster::ReplOpType::PUT : cluster::ReplOpType::REMOVE,
-                                    entry.key, entry.value); break;
+                                    entry.key,
+                                    entry.value
+                                );
+                                break;
                             default: throw std::invalid_argument("Unsupported forward operation");
                         }
                     }
@@ -2859,11 +2952,12 @@ namespace akkaradb::engine {
             }
 
             #include "detail/ClusterQueries.inc"
-            #include "detail/Transactions.inc"
+            #include "detail/AkkTransactionState.inc"
+            #include "detail/ClusterTransactionState.inc"
+            #include "detail/ClusterTransactions.inc"
+            #include "detail/LocalRequestApplication.inc"
 
-            void requireOwnsWriteBatch(std::span<const BatchPutEntry> entries) const {
-                for (const auto& entry : entries) { requireOwnsWriteKey(entry.key); }
-            }
+            void requireOwnsWriteBatch(std::span<const BatchPutEntry> entries) const { for (const auto& entry : entries) { requireOwnsWriteKey(entry.key); } }
 
             [[nodiscard]] bool getIntoInternal(
                 std::span<const uint8_t> key,
@@ -2884,6 +2978,7 @@ namespace akkaradb::engine {
                     return true;
                 }
 
+                auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
                 if (const auto mt = memtable->getInto(key, seq, out); mt.has_value()) {
@@ -2909,12 +3004,7 @@ namespace akkaradb::engine {
                 return false;
             }
 
-            [[nodiscard]] bool getIntoArenaInternal(
-                std::span<const uint8_t> key,
-                core::BufferArena& arena,
-                std::span<const uint8_t>& out,
-                bool countStats
-            ) {
+            [[nodiscard]] bool getIntoArenaInternal(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out, bool countStats) {
                 if (usesPartitionRaft()) {
                     auto* child = localPartition(key);
                     out = {};
@@ -2930,10 +3020,10 @@ namespace akkaradb::engine {
                     return true;
                 }
 
+                auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = snapshotSeq();
-                auto pinned = memtable->getPinned(key, seq);
-                if (pinned) {
+                if (auto pinned = memtable->getPinned(key, seq)) {
                     const auto& view = pinned->view;
                     if (view.isTombstone()) {
                         getsMiss.fetch_add(1, std::memory_order_relaxed);
@@ -2963,7 +3053,9 @@ namespace akkaradb::engine {
                 return false;
             }
 
-            [[nodiscard]] bool canRunBlobGc() const noexcept { return blobManager != nullptr && versionLog == nullptr && !transactionJournalPending.load(std::memory_order_acquire); }
+            [[nodiscard]] bool canRunBlobGc() const noexcept {
+                return blobManager != nullptr && versionLog == nullptr && !transactionJournalPending.load(std::memory_order_acquire);
+            }
 
             void waitForVersionLogRecovery() const { if (versionLog) { versionLog->waitUntilReady(); } }
 
@@ -2979,8 +3071,7 @@ namespace akkaradb::engine {
             }
 
             [[nodiscard]] bool usesKeySequenceOrder() const noexcept {
-                return canUseParallelWriteAdmission() && opts.runtime.parallelWriteOrder ==
-                    AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE;
+                return canUseParallelWriteAdmission() && opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE;
             }
 
             [[nodiscard]] std::mutex& keySequenceOrderMutex(uint64_t fp64, size_t keySize) noexcept {
@@ -2991,13 +3082,13 @@ namespace akkaradb::engine {
             [[nodiscard]] std::vector<std::unique_lock<std::mutex>> lockKeySequenceOrderStripes(std::span<const BatchPutEntry> entries) {
                 std::vector<size_t> stripes;
                 stripes.reserve(entries.size());
-                for (const auto& entry : entries) {
-                    const uint64_t fp64 = entry.key.empty() ? 0 : core::computeKeyFp64(entry.key.data(), entry.key.size());
-                    const uint64_t route = fp64 ^ (static_cast<uint64_t>(entry.key.size()) * 0x9E3779B97F4A7C15ULL);
+                for (const auto& [key, value] : entries) {
+                    const uint64_t fp64 = key.empty() ? 0 : computeKeyFp64(key.data(), key.size());
+                    const uint64_t route = fp64 ^ (key.size() * 0x9E3779B97F4A7C15ULL);
                     stripes.push_back(static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u));
                 }
                 std::ranges::sort(stripes);
-                stripes.erase(std::unique(stripes.begin(), stripes.end()), stripes.end());
+                stripes.erase(std::ranges::unique(stripes).begin(), stripes.end());
 
                 std::vector<std::unique_lock<std::mutex>> locks;
                 locks.reserve(stripes.size());
@@ -3020,10 +3111,7 @@ namespace akkaradb::engine {
             }
 
             void recordBackpressureWait(std::chrono::steady_clock::duration elapsed) const noexcept {
-                const uint64_t micros = static_cast<uint64_t>(std::max<int64_t>(
-                    0,
-                    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()
-                ));
+                const uint64_t micros = static_cast<uint64_t>(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
                 backpressureWaitMicrosTotal.fetch_add(micros, std::memory_order_relaxed);
                 uint64_t observed = backpressureWaitMicrosMax.load(std::memory_order_relaxed);
                 while (observed < micros && !backpressureWaitMicrosMax.compare_exchange_weak(
@@ -3151,9 +3239,7 @@ namespace akkaradb::engine {
                     }
                     else {
                         const auto record = std::move(*sstCur);
-                        if (!record.isTombstone()) {
-                            if (const auto blobId = decodeBlobIdIfReference(record.flags, record.value)) { live.insert(*blobId); }
-                        }
+                        if (!record.isTombstone()) { if (const auto blobId = decodeBlobIdIfReference(record.flags, record.value)) { live.insert(*blobId); } }
                         sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
                     }
                 }
@@ -3169,7 +3255,7 @@ namespace akkaradb::engine {
 
                 std::unordered_map<std::string, LatestBlobReference> latestByKey;
                 for (const auto& refs : manifest->sstBlobRefs()) {
-                    if (liveSstFiles.find(refs.file) == liveSstFiles.end()) { continue; }
+                    if (!liveSstFiles.contains(refs.file)) { continue; }
                     for (const auto& entry : refs.entries) { recordLatestBlobReference(latestByKey, entry.key, entry.seq, entry.blobId); }
                 }
 
@@ -3185,7 +3271,7 @@ namespace akkaradb::engine {
                 }
 
                 std::unordered_set<uint64_t> live;
-                for (const auto& [_, latest] : latestByKey) { if (latest.blobId.has_value()) { live.insert(*latest.blobId); } }
+                for (const auto& latest : latestByKey | std::views::values) { if (latest.blobId.has_value()) { live.insert(*latest.blobId); } }
                 return live;
             }
 
@@ -3199,7 +3285,13 @@ namespace akkaradb::engine {
                 std::unique_lock planning{blobGcPlanMu, std::try_to_lock};
                 if (!planning.owns_lock() || !canRunBlobGc()) { return; }
                 const auto live = collectReferencedBlobIds();
-                blobManager->scanOrphans([&live](uint64_t blobId) { return live.find(blobId) != live.end(); });
+                blobManager->scanOrphans([&live](uint64_t blobId) { return live.contains(blobId); });
+            }
+
+            static void validateStoredRecord(size_t keySize, size_t storedSize) {
+                if (keySize > UINT16_MAX || storedSize > UINT16_MAX - keySize) {
+                    throw std::length_error("AkkEngine: key and stored value exceed the 65535-byte storage limit");
+                }
             }
 
             void appendAll(
@@ -3212,27 +3304,69 @@ namespace akkaradb::engine {
                 uint64_t precomputedMiniKey = 0,
                 uint8_t versionLogFlags = 0xFF,
                 bool knownContiguousCommit = false,
-                uint64_t timestampNs = 0
+                uint64_t timestampNs = 0,
+                const LocalRequestApplication* request = nullptr
             ) {
+                validateStoredRecord(key.size(), storedValue.size());
                 throwIfBackgroundFailed();
+                if (localRequestRecoveryRequired) { throw std::runtime_error("Local request: reopen is required after interrupted publication"); }
                 waitForVersionLogRecovery();
                 memtable->throwIfFlushFailed();
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
                 const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
-                if (walWriter) { walWriter->append(key, storedValue, seq, flags, fp64, walAckForWriteDurability()); }
+                const bool replayingRaft = clusterConfig.usesDataConsensus() && seq <= snapshotSeq();
+                const auto walFlags = static_cast<uint16_t>(flags | (sourceNodeId == vlog::ROLLBACK_NODE ? wal::WAL_FLAG_ROLLBACK : 0));
+                bool applyHead = true;
+                if (replayingRaft) {
+                    // A crash can leave later KV heads durable before Raft records
+                    // completion of the batch. Replay must repair missing history
+                    // without replacing those heads with earlier mutations.
+                    const auto head = memtable->getPinned(key, UINT64_MAX);
+                    if (head && head->view.seq() >= seq) { applyHead = false; }
+                    if (applyHead && sstManager) {
+                        const auto head = sstManager->get(key);
+                        if (head && head->seq >= seq) { applyHead = false; }
+                    }
+                }
+                if (request) {
+                    reserveLocalRequest(*request);
+                    const auto metadata = localRequestMetadata(*request);
+                    std::vector<uint8_t> envelope{'A', 'K', 'L', 'A', '1'};
+                    envelope.insert(envelope.end(), metadata.begin(), metadata.end());
+                    envelope.insert(envelope.end(), storedValue.begin(), storedValue.end());
+                    if (envelope.size() + key.size() + wal::WalEntryHeader::SIZE > 64ull * 1024 * 1024) {
+                        throw std::invalid_argument("Local request: mutation exceeds WAL recovery record limit");
+                    }
+                    localRequestRecoveryRequired = true;
+                    walWriter->append(key, envelope, seq, static_cast<uint16_t>(walFlags | wal::WAL_FLAG_REQUEST_APPLICATION), fp64, wal::WalAppendAck::SYNCED);
+                    crashAtTestPoint("request.local.after_wal");
+                    recordLocalRequest(metadata, seq);
+                    crashAtTestPoint("request.local.after_checkpoint");
+                }
+                else if (walWriter && applyHead) { walWriter->append(key, storedValue, seq, walFlags, fp64, walAckForWriteDurability()); }
                 if (versionLog) {
-                    const uint8_t defaultVlogFlags = sourceNodeId == vlog::ROLLBACK_NODE
-                                                         ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK)
-                                                         : flags;
+                    const uint8_t defaultVlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK) : flags;
                     const uint8_t vlogFlags = versionLogFlags == 0xFF ? defaultVlogFlags : versionLogFlags;
-                    versionLog->appendDeferred(key, seq, sourceNodeId, timestampNs == 0 ? nowNs() : timestampNs, vlogFlags, storedValue);
+                    const auto timestamp = timestampNs == 0 ? nowNs() : timestampNs;
+                    if (!replayingRaft || !versionLog->containsStoredRecord(key, seq, sourceNodeId, timestamp, vlogFlags)) {
+                        versionLog->appendDeferred(key, seq, sourceNodeId, timestamp, vlogFlags, storedValue);
+                    }
                 }
 
-                if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
-                else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
-                noteTransactionMutation(key);
-                markWriteCommitted(seq, knownContiguousCommit);
-                if (versionLog) { versionLog->markCommitted(seq); }
+                if (applyHead) {
+                    if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
+                    else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
+                    noteTransactionMutation(key);
+                }
+                if (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED && !clusterConfig.usesDataConsensus()) {
+                    replicationStorageSeq.store(std::max(replicationStorageSeq.load(std::memory_order_relaxed), seq), std::memory_order_release);
+                }
+                if (clusterConfig.usesDataConsensus()) { publishRaftAppliedSequence(seq); }
+                else {
+                    markWriteCommitted(seq, knownContiguousCommit);
+                    if (versionLog) { versionLog->markCommitted(seq); }
+                }
+                if (request) { localRequestRecoveryRequired = false; }
             }
 
             [[nodiscard]] wal::WalAppendAck snapshotCommitWalAck() const noexcept {
@@ -3248,14 +3382,7 @@ namespace akkaradb::engine {
             ) {
                 if (!walWriter) { return; }
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
-                walWriter->append(
-                    key,
-                    storedValue,
-                    seq,
-                    static_cast<uint16_t>(flags) | wal::WAL_FLAG_SNAPSHOT_RECORD,
-                    fp64,
-                    wal::WalAppendAck::WRITTEN
-                );
+                walWriter->append(key, storedValue, seq, static_cast<uint16_t>(flags) | wal::WAL_FLAG_SNAPSHOT_RECORD, fp64, wal::WalAppendAck::WRITTEN);
             }
 
             void appendSnapshotWalCommit(uint64_t seq, uint64_t recordCount) {
@@ -3273,6 +3400,7 @@ namespace akkaradb::engine {
                 uint64_t precomputedFp64 = 0,
                 uint64_t precomputedMiniKey = 0
             ) {
+                ++querySnapshotGeneration;
                 const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
                 const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
                 if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
@@ -3288,7 +3416,8 @@ namespace akkaradb::engine {
                 std::span<const uint8_t> value,
                 uint64_t fp64 = 0,
                 uint64_t miniKey = 0,
-                uint64_t sourceNodeId = 0
+                uint64_t sourceNodeId = 0,
+                const LocalRequestApplication* request = nullptr
             ) {
                 AppliedWrite write;
                 write.key = key;
@@ -3301,7 +3430,7 @@ namespace akkaradb::engine {
                     write.stored = maybeExternalize(write.seq, value, write.flags);
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
                     if ((write.flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
-                    appendAll(write.seq, key, write.stored, write.flags, write.sourceNodeId, fp64, miniKey);
+                    appendAll(write.seq, key, write.stored, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, false, 0, request);
                 }
                 return write;
             }
@@ -3318,8 +3447,7 @@ namespace akkaradb::engine {
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
                     const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey =
-                        miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -3418,7 +3546,8 @@ namespace akkaradb::engine {
                 std::span<const uint8_t> key,
                 uint64_t fp64 = 0,
                 uint64_t miniKey = 0,
-                uint64_t sourceNodeId = 0
+                uint64_t sourceNodeId = 0,
+                const LocalRequestApplication* request = nullptr
             ) {
                 AppliedWrite write;
                 write.key = key;
@@ -3430,23 +3559,17 @@ namespace akkaradb::engine {
                     std::lock_guard lock(writeMu);
                     write.seq = reserveWriteSeq(1);
                     removesTotal.fetch_add(1, std::memory_order_relaxed);
-                    appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey);
+                    appendAll(write.seq, key, {}, write.flags, write.sourceNodeId, fp64, miniKey, 0xFF, false, 0, request);
                 }
                 return write;
             }
 
-            void applyLocalRemoveUnreplicated(
-                std::span<const uint8_t> key,
-                uint64_t fp64 = 0,
-                uint64_t miniKey = 0,
-                uint64_t sourceNodeId = 0
-            ) {
+            void applyLocalRemoveUnreplicated(std::span<const uint8_t> key, uint64_t fp64 = 0, uint64_t miniKey = 0, uint64_t sourceNodeId = 0) {
                 const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
                     const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey =
-                        miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -3473,22 +3596,14 @@ namespace akkaradb::engine {
             }
 
             void replicateCommitted(const AppliedWrite& write) {
-                if (clusterRuntime) {
-                    clusterRuntime->shipEntry(write.seq, write.op, write.key, write.stored, write.flags, write.sourceNodeId);
-                }
+                if (clusterRuntime) { clusterRuntime->shipEntry(write.seq, write.op, write.key, write.stored, write.flags, write.sourceNodeId); }
             }
 
-            [[nodiscard]] bool strictPrimaryAckFailWrite() const noexcept {
-                return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE;
-            }
+            [[nodiscard]] bool strictPrimaryAckFailWrite() const noexcept { return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE; }
 
             void recordCommittedRaftMutationStats(cluster::ReplOpType op, uint8_t recordFlags) {
-                const uint8_t flags = op == cluster::ReplOpType::REMOVE
-                                          ? static_cast<uint8_t>(recordFlags | MemHdr16::FLAG_TOMBSTONE)
-                                          : recordFlags;
-                if (op == cluster::ReplOpType::REMOVE) {
-                    removesTotal.fetch_add(1, std::memory_order_relaxed);
-                }
+                const uint8_t flags = op == cluster::ReplOpType::REMOVE ? static_cast<uint8_t>(recordFlags | MemHdr16::FLAG_TOMBSTONE) : recordFlags;
+                if (op == cluster::ReplOpType::REMOVE) { removesTotal.fetch_add(1, std::memory_order_relaxed); }
                 else {
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
                     if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
@@ -3509,28 +3624,25 @@ namespace akkaradb::engine {
                 uint64_t sourceNodeId,
                 uint64_t timestampNs
             ) {
+                validateStoredRecord(key.size(), value.size());
                 std::lock_guard lock(writeMu);
                 uint8_t flags = recordFlags;
                 if (op == cluster::ReplOpType::REMOVE) { flags |= MemHdr16::FLAG_TOMBSTONE; }
-                const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE
-                                              ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK)
-                                              : flags;
-                const bool partitionedRemote =
-                    (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED || clusterReplicationMode == cluster::ReplicationMode::STRIPE) &&
-                    sourceNodeId != 0 && sourceNodeId != nodeId;
+                const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK) : flags;
+                const bool partitionedRemote = (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED || clusterReplicationMode ==
+                    cluster::ReplicationMode::STRIPE) && sourceNodeId != 0 && sourceNodeId != nodeId;
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
                     if (!isStripeInternalKey(key) || key[4] != 'S') { throw std::runtime_error("AkkEngine: invalid remote STRIPE key"); }
                     size_t cursor = 6;
                     uint64_t generation = 0;
                     uint16_t index = 0;
                     uint32_t keyLength = 0;
-                    if (!pullU64(key, cursor, generation) || !pullU16(key, cursor, index) || !pullU32(key, cursor, keyLength) ||
-                        keyLength != key.size() - cursor) { throw std::runtime_error("AkkEngine: invalid remote STRIPE shard key"); }
+                    if (!pullU64(key, cursor, generation) || !pullU16(key, cursor, index) || !pullU32(key, cursor, keyLength) || keyLength != key.size() -
+                        cursor) { throw std::runtime_error("AkkEngine: invalid remote STRIPE shard key"); }
                     const auto accepts = [&](const cluster::ClusterConfig& placement) {
                         const uint64_t originalOwner = stripeOwnerFor(placement, key.subspan(cursor));
-                        const uint64_t failoverNode = clusterRuntime ? clusterRuntime->stripeFailoverNodeId() : 0;
                         const bool fromOwner = sourceNodeId == originalOwner;
-                        const bool fromFailover = failoverNode != 0 && sourceNodeId == failoverNode;
+                        const bool fromFailover = placement.isStripeFailoverNode(sourceNodeId);
                         const auto ownerIds = stripeNodeIdsFor(placement, key.subspan(cursor));
                         const uint8_t copiesPerShard = placement.stripe().copiesPerShard;
                         const auto targetsShard = [&](const std::vector<uint64_t>& placements) {
@@ -3542,14 +3654,14 @@ namespace akkaradb::engine {
                             );
                         };
                         const bool ownerTarget = targetsShard(ownerIds);
-                        const bool hotSpareTarget = copiesPerShard == 2 && failoverNode == nodeId;
+                        const bool hotSpareTarget = copiesPerShard == 2 && placement.isStripeFailoverNode(nodeId);
                         bool failoverTarget = false;
                         if (fromFailover && !fromOwner) {
-                            const auto failoverIds = stripeNodeIdsFor(placement, key.subspan(cursor), originalOwner);
+                            const auto failoverIds = stripeNodeIdsFor(placement, key.subspan(cursor), originalOwner, sourceNodeId);
                             failoverTarget = targetsShard(failoverIds);
                         }
-                        return (fromOwner || fromFailover) && (!fromOwner || ownerTarget || hotSpareTarget) &&
-                            (!fromFailover || ownerTarget || failoverTarget);
+                        return (fromOwner || fromFailover) && (!fromOwner || ownerTarget || hotSpareTarget) && (!fromFailover || ownerTarget || failoverTarget
+                            || hotSpareTarget);
                     };
                     bool accepted = accepts(currentPlacement());
                     if (!accepted && clusterRuntime) {
@@ -3558,22 +3670,21 @@ namespace akkaradb::engine {
                     }
                     if (!accepted) { throw std::runtime_error("AkkEngine: remote STRIPE write is not from its owner or targets the wrong shard"); }
                 }
-                const uint64_t storageSeq = clusterReplicationMode == cluster::ReplicationMode::STRIPE ? memtable->reserveSeq(1) :
-                    partitionedRemote ? reserveWriteSeq(1) : seq;
+                const uint64_t storageSeq = clusterReplicationMode == cluster::ReplicationMode::STRIPE
+                                                ? memtable->reserveSeq(1)
+                                                : partitionedRemote
+                                                ? reserveWriteSeq(1)
+                                                : seq;
                 appendAll(storageSeq, key, value, flags, sourceNodeId, 0, 0, vlogFlags, false, timestampNs);
                 memtable->advanceSeq(storageSeq);
             }
 
             [[nodiscard]] fs::path replicaSnapshotStagingPath() const {
-                return opts.paths.dataDir.empty()
-                           ? fs::path{"replication-snapshot.staging"}
-                           : opts.paths.dataDir / "replication-snapshot.staging";
+                return opts.paths.dataDir.empty() ? fs::path{"replication-snapshot.staging"} : opts.paths.dataDir / "replication-snapshot.staging";
             }
 
             [[nodiscard]] fs::path clusterSnapshotExportDirectory() const {
-                return opts.paths.dataDir.empty()
-                           ? fs::path{"cluster-snapshot-exports"}
-                           : opts.paths.dataDir / "cluster-snapshot-exports";
+                return opts.paths.dataDir.empty() ? fs::path{"cluster-snapshot-exports"} : opts.paths.dataDir / "cluster-snapshot-exports";
             }
 
             [[nodiscard]] fs::path newClusterSnapshotExportPath() const {
@@ -3602,9 +3713,9 @@ namespace akkaradb::engine {
                 return {stagedSeq, stagedEntryCount};
             }
 
-            void resetReplicaSnapshotStagingLocked() {
+            void resetReplicaSnapshotStagingLocked(bool preserveRecovery = false) {
                 if (pendingSnapshotOut.is_open()) { pendingSnapshotOut.close(); }
-                removeFileIfExists(replicaSnapshotStagingPath());
+                if (!preserveRecovery) { removeFileIfExists(replicaSnapshotStagingPath()); }
                 snapshotInProgress = false;
                 pendingSnapshotSeq = 0;
                 pendingSnapshotEntryCount = 0;
@@ -3622,9 +3733,8 @@ namespace akkaradb::engine {
                 if (clusterConfig.usesDataConsensus()) {
                     const auto record = cluster::detail::decodeSnapshotKey(key);
                     if (record.kind == cluster::detail::SnapshotRecordKind::HISTORY) { return; }
-                    if (record.kind != cluster::detail::SnapshotRecordKind::HEAD) {
-                        throw std::runtime_error("AkkEngine: invalid data snapshot record kind");
-                    }
+                    if (record.kind >= cluster::detail::SnapshotRecordKind::TRANSACTION) { return; }
+                    if (record.kind != cluster::detail::SnapshotRecordKind::HEAD) { throw std::runtime_error("AkkEngine: invalid data snapshot record kind"); }
                     key = record.key;
                 }
                 const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(key.data()), key.size());
@@ -3649,7 +3759,7 @@ namespace akkaradb::engine {
                 pendingSnapshotKeys.clear();
                 for (uint64_t i = 0; i < stagedEntryCount; ++i) {
                     const auto entry = readStagedSnapshotRecord(staged, seq, i + 1, false);
-                    if (!entry.history) {
+                    if (!entry.history && !entry.transaction) {
                         const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
                         if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate heads"); }
                     }
@@ -3703,9 +3813,7 @@ namespace akkaradb::engine {
                 writeU32Le(pendingSnapshotOut, keyLen);
                 writeU64Le(pendingSnapshotOut, valueSize);
                 writeU32Le(pendingSnapshotOut, valueCrc32c);
-                if (!key.empty()) {
-                    pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size()));
-                }
+                if (!key.empty()) { pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
                 if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot staging entry"); }
 
                 pendingSnapshotEntryInProgress = true;
@@ -3725,8 +3833,9 @@ namespace akkaradb::engine {
                 if (!snapshotInProgress || !pendingSnapshotOut.is_open() || !pendingSnapshotEntryInProgress) {
                     throw std::runtime_error("AkkEngine: received replication snapshot chunk without active entry");
                 }
-                if (offset != pendingSnapshotEntryValueOffset || chunk.size() > pendingSnapshotEntryValueSize -
-                    pendingSnapshotEntryValueOffset) { throw std::runtime_error("AkkEngine: invalid replication snapshot chunk"); }
+                if (offset != pendingSnapshotEntryValueOffset || chunk.size() > pendingSnapshotEntryValueSize - pendingSnapshotEntryValueOffset) {
+                    throw std::runtime_error("AkkEngine: invalid replication snapshot chunk");
+                }
                 if (!chunk.empty()) {
                     pendingSnapshotOut.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
                     if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot chunk"); }
@@ -3742,9 +3851,7 @@ namespace akkaradb::engine {
                     throw std::runtime_error("AkkEngine: finished replication snapshot entry without active entry");
                 }
                 if (pendingSnapshotEntryValueOffset != pendingSnapshotEntryValueSize || pendingSnapshotEntryValueCrc.finish() !=
-                    pendingSnapshotEntryValueCrc32c) {
-                    throw std::runtime_error("AkkEngine: replication snapshot entry checksum or size mismatch");
-                }
+                    pendingSnapshotEntryValueCrc32c) { throw std::runtime_error("AkkEngine: replication snapshot entry checksum or size mismatch"); }
                 writeU32Le(pendingSnapshotOut, pendingSnapshotEntryRecordCrc.finish());
                 ++pendingSnapshotAppliedEntries;
                 pendingSnapshotEntryInProgress = false;
@@ -3756,8 +3863,7 @@ namespace akkaradb::engine {
             }
 
             void prepareReplicaSnapshotLocked(uint64_t seq, uint64_t entryCount) {
-                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotEntryInProgress ||
-                    pendingSnapshotAppliedEntries != entryCount) {
+                if (!snapshotInProgress || seq != pendingSnapshotSeq || pendingSnapshotEntryInProgress || pendingSnapshotAppliedEntries != entryCount) {
                     throw std::runtime_error("AkkEngine: invalid replication snapshot completion");
                 }
                 pendingSnapshotEntryCount = entryCount;
@@ -3769,27 +3875,23 @@ namespace akkaradb::engine {
                     pendingSnapshotOut.close();
                 }
                 const auto path = replicaSnapshotStagingPath();
-#ifdef _WIN32
+                #ifdef _WIN32
                 const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
                     if (file != INVALID_HANDLE_VALUE) { ::CloseHandle(file); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging");
                 }
                 ::CloseHandle(file);
-#else
-                const int file = ::open(path.c_str(), O_RDONLY);
-                if (file < 0 || ::fsync(file) != 0) {
+                #else
+                const int file = ::open(path.c_str(), O_RDONLY); if (file < 0 || ::fsync(file) != 0) {
                     if (file >= 0) { ::close(file); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging");
-                }
-                ::close(file);
-                const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
-                if (directory < 0 || ::fsync(directory) != 0) {
+                } ::close(file); const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY); if (directory < 0 || ::fsync(directory) !=
+                    0) {
                     if (directory >= 0) { ::close(directory); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging directory");
-                }
-                ::close(directory);
-#endif
+                } ::close(directory);
+                #endif
             }
 
             void finishReplicaSnapshotLocked(uint64_t seq, uint64_t entryCount, uint64_t partitionOwner = 0) {
@@ -3809,19 +3911,20 @@ namespace akkaradb::engine {
                     // Validate scratch storage before reserving a local commit slot.
                     // A corrupt receive can then reconnect without leaving a sequence gap.
                     const auto entriesOffset = staged.tellg();
-                    for (uint64_t i = 0; i < stagedEntryCount; ++i) {
-                        (void)readStagedSnapshotRecord(staged, 0, i + 1, false);
-                    }
+                    for (uint64_t i = 0; i < stagedEntryCount; ++i) { (void)readStagedSnapshotRecord(staged, 0, i + 1, false); }
                     char extra = 0;
                     if (staged.get(extra)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
-                    staged.clear(); staged.seekg(entriesOffset);
+                    staged.clear();
+                    staged.seekg(entriesOffset);
                     if (!staged) { throw std::runtime_error("AkkEngine: cannot rewind partition snapshot staging file"); }
                 }
                 const auto inScope = [&](std::span<const uint8_t> key) {
                     if (partitionOwner == 0) { return true; }
                     const auto targets = cluster::detail::partitionTargets(clusterConfig, key);
-                    return !targets.empty() && targets.front().nodeId == partitionOwner &&
-                        std::ranges::any_of(targets, [&](const auto& target) { return target.nodeId == nodeId; });
+                    return !targets.empty() && targets.front().nodeId == partitionOwner && std::ranges::any_of(
+                        targets,
+                        [&](const auto& target) { return target.nodeId == nodeId; }
+                    );
                 };
                 if (partitionOwner != 0 && stagedEntryCount == 0) {
                     core::BufferArena emptyArena;
@@ -3832,26 +3935,35 @@ namespace akkaradb::engine {
                     if (sstManager) { emptySst = sstManager->scanIter({}, {}, visible); }
                     bool hasOwnedKey = false;
                     for (const auto& record : scanGenerator(emptyArena, std::move(emptyMt), std::move(emptySst), blobManager.get())) {
-                        if (inScope(record.key)) { hasOwnedKey = true; break; }
+                        if (inScope(record.key)) {
+                            hasOwnedKey = true;
+                            break;
+                        }
                     }
                     // No storage change: only the sender's peer watermark advances.
-                    if (!hasOwnedKey) { staged.close(); resetReplicaSnapshotStagingLocked(); return; }
+                    if (!hasOwnedKey) {
+                        staged.close();
+                        resetReplicaSnapshotStagingLocked();
+                        return;
+                    }
                 }
                 const uint64_t storageSeq = partitionOwner != 0 ? reserveWriteSeq(1) : seq;
+                bool transactionState = false;
                 uint64_t snapshotWalRecordCount = 0;
                 core::BufferArena arena;
                 memtable::MemTable::KeyRange range;
                 const uint64_t visibleSeq = snapshotSeq();
                 uint64_t storedHistoryThrough = 0;
                 if (versionLog && clusterConfig.usesDataConsensus()) {
-                    versionLog->forceSync(); storedHistoryThrough = versionLog->highestStoredSequence();
+                    versionLog->forceSync();
+                    storedHistoryThrough = versionLog->highestStoredSequence();
                 }
                 auto mt = memtable->iterator(range, visibleSeq);
                 sst::SSTManager::Iterator sst;
                 if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
-                    if (inScope(record.key) && pendingSnapshotKeys.find(key) == pendingSnapshotKeys.end()) {
+                    if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
                         appendSnapshotWalRecord(storageSeq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0);
                         ++snapshotWalRecordCount;
                     }
@@ -3859,6 +3971,15 @@ namespace akkaradb::engine {
 
                 for (uint64_t i = 0; i < stagedEntryCount; ++i) {
                     const auto entry = readStagedSnapshotRecord(staged, storageSeq, i + 1, true, storedHistoryThrough);
+                    if (entry.transaction) {
+                        if (entry.transactionKind == cluster::detail::SnapshotRecordKind::TRANSACTION) {
+                            if (transactionState || decodeDistributedState(entry.storedValue).sequence != seq) {
+                                throw std::runtime_error("AkkEngine: invalid transaction snapshot cut");
+                            }
+                            transactionState = true;
+                        }
+                        continue;
+                    }
                     if (entry.history) {
                         // Applied Raft prefixes are common to all holders. History
                         // reaches disk before the KV snapshot commit advances that prefix.
@@ -3874,6 +3995,7 @@ namespace akkaradb::engine {
                 char trailing = 0;
                 if (staged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
                 staged.close();
+                if (distributedTransactionsEnabled() && !transactionState) { throw std::runtime_error("AkkEngine: missing transaction snapshot state"); }
 
                 if (versionLog && clusterConfig.usesDataConsensus()) { versionLog->forceSync(); }
 
@@ -3891,7 +4013,7 @@ namespace akkaradb::engine {
                 if (sstManager) { applySst = sstManager->scanIter({}, {}, visibleSeq); }
                 for (const auto& record : scanGenerator(applyArena, std::move(applyMt), std::move(applySst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
-                    if (inScope(record.key) && pendingSnapshotKeys.find(key) == pendingSnapshotKeys.end()) {
+                    if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
                         applySnapshotRecordMemory(storageSeq, record.key, {}, MemHdr16::FLAG_TOMBSTONE);
                     }
                 }
@@ -3906,15 +4028,34 @@ namespace akkaradb::engine {
                 }
                 for (uint64_t i = 0; i < stagedEntryCount; ++i) {
                     const auto entry = readStagedSnapshotRecord(applyStaged, storageSeq, i + 1, false);
-                    if (entry.history) { continue; }
+                    if (entry.history || entry.transaction) { continue; }
                     applySnapshotRecordMemory(storageSeq, entry.key, entry.storedValue, entry.flags, entry.fp64, entry.miniKey);
                 }
-                if (applyStaged.get(trailing)) {
-                    throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file");
+                if (applyStaged.get(trailing)) { throw std::runtime_error("AkkEngine: trailing bytes in replication snapshot staging file"); }
+
+                if (transactionState) {
+                    cluster::ClusterSnapshot transactionsSnapshot;
+                    transactionsSnapshot.seq = seq;
+                    transactionsSnapshot.forEachEntry = [&](const cluster::SnapshotEntryVisitor& visitor) {
+                        std::ifstream source{path, std::ios::binary};
+                        const auto [cut, count] = readReplicaSnapshotStagingHeader(source);
+                        if (cut != seq || count != stagedEntryCount) { throw std::runtime_error("AkkEngine: changed transaction snapshot staging"); }
+                        for (uint64_t i = 0; i < count; ++i) {
+                            const auto entry = readStagedSnapshotRecord(source, seq, i + 1, false);
+                            if (!entry.transaction) { continue; }
+                            const auto key = cluster::detail::encodeSnapshotKey({entry.transactionKind, 0, entry.sequence, entry.source, 0, entry.key});
+                            if (!streamSnapshotValue(visitor, key, entry.storedValue, 0, nullptr)) { return false; }
+                        }
+                        return true;
+                    };
+                    installDistributedSnapshot(transactionsSnapshot);
                 }
 
                 memtable->advanceSeq(storageSeq);
-                if (partitionOwner != 0) { markWriteCommitted(storageSeq); }
+                if (partitionOwner != 0) {
+                    replicationStorageSeq.store(std::max(replicationStorageSeq.load(std::memory_order_relaxed), storageSeq), std::memory_order_release);
+                    markWriteCommitted(storageSeq);
+                }
                 else {
                     // A whole-database snapshot replaces the entire prefix.
                     resetCommittedSeq(std::max(committedSeq.load(std::memory_order_acquire), seq));
@@ -3933,22 +4074,30 @@ namespace akkaradb::engine {
                 // engine's transaction staging file, without holding writeMu over network I/O.
                 std::lock_guard installLock{partitionSnapshotMu};
                 beginReplicaSnapshot(snapshot.seq, 0);
-                uint64_t count = 0;
                 try {
+                    uint64_t count = 0;
                     const cluster::SnapshotEntryVisitor visitor{
                         .beginEntry = [&](auto key, uint64_t size, uint32_t crc) {
                             if (key.size() > UINT16_MAX || (!blobManager && size > UINT16_MAX)) {
                                 throw std::runtime_error("AkkEngine: partition snapshot record is too large");
                             }
                             const auto targets = cluster::detail::partitionTargets(clusterConfig, key);
-                            if (targets.empty() || targets.front().nodeId != owner ||
-                                std::ranges::none_of(targets, [&](const auto& target) { return target.nodeId == nodeId; })) {
-                                throw std::runtime_error("AkkEngine: partition snapshot violates placement");
-                            }
-                            beginReplicaSnapshotEntry(key, size, crc); return true;
+                            if (targets.empty() || targets.front().nodeId != owner || std::ranges::none_of(
+                                targets,
+                                [&](const auto& target) { return target.nodeId == nodeId; }
+                            )) { throw std::runtime_error("AkkEngine: partition snapshot violates placement"); }
+                            beginReplicaSnapshotEntry(key, size, crc);
+                            return true;
                         },
-                        .appendValueChunk = [&](uint64_t offset, auto chunk) { appendReplicaSnapshotEntryChunk(offset, chunk); return true; },
-                        .finishEntry = [&] { finishReplicaSnapshotEntry(); ++count; return true; },
+                        .appendValueChunk = [&](uint64_t offset, auto chunk) {
+                            appendReplicaSnapshotEntryChunk(offset, chunk);
+                            return true;
+                        },
+                        .finishEntry = [&] {
+                            finishReplicaSnapshotEntry();
+                            ++count;
+                            return true;
+                        },
                         .fileEntry = {},
                     };
                     if (!snapshot.forEachEntry(visitor)) { throw std::runtime_error("AkkEngine: incomplete partition snapshot"); }
@@ -3969,7 +4118,12 @@ namespace akkaradb::engine {
 
             void recoverReplicaSnapshot(uint64_t seq) {
                 std::lock_guard lock(writeMu);
-                if (snapshotSeq() >= seq) {
+                bool transactionStateDurable = true;
+                if (distributedTransactionsEnabled()) {
+                    std::lock_guard stateLock{distributedStateMu};
+                    transactionStateDurable = distributedState.sequence >= seq;
+                }
+                if (snapshotSeq() >= seq && transactionStateDurable) {
                     durableReplicaSnapshotSeq = std::max(durableReplicaSnapshotSeq, seq);
                     resetReplicaSnapshotStagingLocked();
                     return;
@@ -3980,6 +4134,10 @@ namespace akkaradb::engine {
 
             [[nodiscard]] bool isReplicaSnapshotDurable(uint64_t seq) {
                 std::lock_guard lock(writeMu);
+                if (distributedTransactionsEnabled()) {
+                    std::lock_guard stateLock{distributedStateMu};
+                    if (distributedState.sequence < seq) { return false; }
+                }
                 return snapshotSeq() >= seq || durableReplicaSnapshotSeq >= seq;
             }
 
@@ -3991,26 +4149,42 @@ namespace akkaradb::engine {
                     WriteCoordinator& operator=(const WriteCoordinator&) = delete;
 
                     virtual void put(std::span<const uint8_t> key, std::span<const uint8_t> value) = 0;
-                    virtual void putHinted(
-                        std::span<const uint8_t> key,
-                        std::span<const uint8_t> value,
-                        uint64_t fp64,
-                        uint64_t miniKey
-                    ) = 0;
+                    virtual void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) = 0;
                     virtual void putBatch(std::span<const BatchPutEntry> entries) = 0;
                     virtual void remove(std::span<const uint8_t> key) = 0;
-                    virtual void rollback(
+                    virtual void rollback(std::span<const uint8_t> key, std::span<const uint8_t> value, bool tombstone) = 0;
+
+                    virtual cluster::ClusterRequestResult writeWithRequest(
+                        const cluster::ClusterRequestId& id,
+                        cluster::ReplOpType op,
                         std::span<const uint8_t> key,
-                        std::span<const uint8_t> value,
-                        bool tombstone
-                    ) = 0;
-                    virtual cluster::ClusterRequestResult writeWithRequest(const cluster::ClusterRequestId&, cluster::ReplOpType,
-                        std::span<const uint8_t>, std::span<const uint8_t>) {
-                        throw std::logic_error("AkkEngine: retry-safe writes require Raft");
+                        std::span<const uint8_t> value
+                    ) {
+                        if (!engine_.clusterRuntime || !engine_.opts.cluster.runtime.requests.enabled) {
+                            throw std::logic_error("AkkEngine: retry-safe requests are disabled");
+                        }
+                        engine_.requireOwnsWriteKey(key);
+                        return engine_.clusterRuntime->executeRequest(
+                            id,
+                            requestFingerprint(op, key, value),
+                            [&] {
+                                if (op == cluster::ReplOpType::PUT) { put(key, value); }
+                                else { remove(key); }
+                                engine_.forceClusterLocalDurable();
+                                return engine_.snapshotSeq();
+                            }
+                        );
                     }
+
                     virtual void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) = 0;
 
                 protected:
+                    static std::array<uint8_t, 32> requestFingerprint(cluster::ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value) {
+                        const uint8_t operation = static_cast<uint8_t>(op);
+                        const std::array<std::span<const uint8_t>, 3> parts{std::span<const uint8_t>{&operation, 1}, key, value};
+                        return crypto::hash256(parts);
+                    }
+
                     Impl& engine_;
             };
 
@@ -4018,9 +4192,7 @@ namespace akkaradb::engine {
                 public:
                     using WriteCoordinator::WriteCoordinator;
 
-                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
-                        engine_.applyLocalPutUnreplicated(key, value);
-                    }
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override { engine_.applyLocalPutUnreplicated(key, value); }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
                         engine_.applyLocalPutUnreplicated(key, value, fp64, miniKey);
@@ -4044,75 +4216,117 @@ namespace akkaradb::engine {
                 public:
                     using WriteCoordinator::WriteCoordinator;
 
-                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteKey(key);
-                            if (engine_.strictPrimaryAckFailWrite()) {
-                                strictPut(key, value);
-                                return;
+                    cluster::ClusterRequestResult writeWithRequest(
+                        const cluster::ClusterRequestId& id,
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value
+                    ) override {
+                        if (!engine_.opts.cluster.runtime.requests.persistLocalApplication) { return WriteCoordinator::writeWithRequest(id, op, key, value); }
+                        engine_.requireOwnsWriteKey(key);
+                        const LocalRequestApplication request{.id = id, .fingerprint = requestFingerprint(op, key, value)};
+                        return engine_.clusterRuntime->executeRequest(
+                            id,
+                            request.fingerprint,
+                            [&] {
+                                AppliedWrite write;
+                                engine_.clusterRuntime->executePrimaryWrite(
+                                    [&] {
+                                        engine_.requireOwnsWriteKey(key);
+                                        write = op == cluster::ReplOpType::PUT
+                                                    ? engine_.applyLocalPut(key, value, 0, 0, 0, &request)
+                                                    : engine_.applyLocalRemove(key, 0, 0, 0, &request);
+                                        engine_.forceClusterLocalDurable();
+                                        crashAtTestPoint("request.local.after_apply");
+                                        engine_.replicateCommitted(write);
+                                    }
+                                );
+                                return write.seq;
                             }
-                            const auto write = engine_.applyLocalPut(key, value);
-                            engine_.replicateCommitted(write);
-                        });
+                        );
+                    }
+
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteKey(key);
+                                if (engine_.strictPrimaryAckFailWrite()) {
+                                    strictPut(key, value);
+                                    return;
+                                }
+                                const auto write = engine_.applyLocalPut(key, value);
+                                engine_.replicateCommitted(write);
+                            }
+                        );
                     }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteKey(key);
-                            if (engine_.strictPrimaryAckFailWrite()) {
-                                strictPut(key, value, fp64, miniKey);
-                                return;
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteKey(key);
+                                if (engine_.strictPrimaryAckFailWrite()) {
+                                    strictPut(key, value, fp64, miniKey);
+                                    return;
+                                }
+                                const auto write = engine_.applyLocalPut(key, value, fp64, miniKey);
+                                engine_.replicateCommitted(write);
                             }
-                            const auto write = engine_.applyLocalPut(key, value, fp64, miniKey);
-                            engine_.replicateCommitted(write);
-                        });
+                        );
                     }
 
                     void putBatch(std::span<const BatchPutEntry> entries) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteBatch(entries);
-                            if (engine_.strictPrimaryAckFailWrite()) {
-                                strictPutBatch(entries);
-                                return;
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteBatch(entries);
+                                if (engine_.strictPrimaryAckFailWrite()) {
+                                    strictPutBatch(entries);
+                                    return;
+                                }
+                                const auto writes = engine_.applyLocalPutBatch(entries);
+                                for (const auto& write : writes) { engine_.replicateCommitted(write); }
                             }
-                            const auto writes = engine_.applyLocalPutBatch(entries);
-                            for (const auto& write : writes) { engine_.replicateCommitted(write); }
-                        });
+                        );
                     }
 
                     void remove(std::span<const uint8_t> key) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteKey(key);
-                            if (engine_.strictPrimaryAckFailWrite()) {
-                                strictRemove(key);
-                                return;
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteKey(key);
+                                if (engine_.strictPrimaryAckFailWrite()) {
+                                    strictRemove(key);
+                                    return;
+                                }
+                                const auto write = engine_.applyLocalRemove(key);
+                                engine_.replicateCommitted(write);
                             }
-                            const auto write = engine_.applyLocalRemove(key);
-                            engine_.replicateCommitted(write);
-                        });
+                        );
                     }
 
                     void rollback(std::span<const uint8_t> key, std::span<const uint8_t> value, bool tombstone) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteKey(key);
-                            const auto write = tombstone
-                                                   ? engine_.applyLocalRemove(key, 0, 0, vlog::ROLLBACK_NODE)
-                                                   : engine_.applyLocalPut(key, value, 0, 0, vlog::ROLLBACK_NODE);
-                            if (engine_.strictPrimaryAckFailWrite()) { engine_.forceClusterLocalDurable(); }
-                            engine_.replicateCommitted(write);
-                        });
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteKey(key);
+                                const auto write = tombstone
+                                                       ? engine_.applyLocalRemove(key, 0, 0, vlog::ROLLBACK_NODE)
+                                                       : engine_.applyLocalPut(key, value, 0, 0, vlog::ROLLBACK_NODE);
+                                if (engine_.strictPrimaryAckFailWrite()) { engine_.forceClusterLocalDurable(); }
+                                engine_.replicateCommitted(write);
+                            }
+                        );
                     }
 
                     void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
-                        engine_.clusterRuntime->executePrimaryWrite([&] {
-                            engine_.requireOwnsWriteKey(key);
-                            if (engine_.strictPrimaryAckFailWrite()) {
-                                strictRemove(key, fp64, miniKey);
-                                return;
+                        engine_.clusterRuntime->executePrimaryWrite(
+                            [&] {
+                                engine_.requireOwnsWriteKey(key);
+                                if (engine_.strictPrimaryAckFailWrite()) {
+                                    strictRemove(key, fp64, miniKey);
+                                    return;
+                                }
+                                const auto write = engine_.applyLocalRemove(key, fp64, miniKey);
+                                engine_.replicateCommitted(write);
                             }
-                            const auto write = engine_.applyLocalRemove(key, fp64, miniKey);
-                            engine_.replicateCommitted(write);
-                        });
+                        );
                     }
 
                 private:
@@ -4140,9 +4354,7 @@ namespace akkaradb::engine {
                 public:
                     using WriteCoordinator::WriteCoordinator;
 
-                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override {
-                        engine_.writeStripeValue(key, value);
-                    }
+                    void put(std::span<const uint8_t> key, std::span<const uint8_t> value) override { engine_.writeStripeValue(key, value); }
 
                     void putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t, uint64_t) override {
                         engine_.writeStripeValue(key, value);
@@ -4165,22 +4377,43 @@ namespace akkaradb::engine {
             class RaftQuorumWriteCoordinator final : public WriteCoordinator {
                 public:
                     using WriteCoordinator::WriteCoordinator;
-                    cluster::ClusterRequestResult writeWithRequest(const cluster::ClusterRequestId& id, cluster::ReplOpType op,
-                        std::span<const uint8_t> key, std::span<const uint8_t> value) override {
+
+                    cluster::ClusterRequestResult writeWithRequest(
+                        const cluster::ClusterRequestId& id,
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value
+                    ) override {
                         engine_.requireOwnsWriteKey(key);
+                        auto admission = engine_.distributedWriteAdmission(key);
                         engine_.applyWriteBackpressure();
-                        const uint8_t operation = static_cast<uint8_t>(op);
-                        const std::array<std::span<const uint8_t>, 3> parts{std::span<const uint8_t>{&operation, 1}, key, value};
-                        const auto fingerprint = crypto::hash256(parts);
+                        const auto fingerprint = requestFingerprint(op, key, value);
                         std::optional<uint8_t> preparedFlags;
-                        auto completion = engine_.clusterRuntime->submitRequest(id, fingerprint, [&](uint64_t sequence) {
-                            auto mutation = prepareMutation(
-                                sequence, op, key, value,
-                                op == cluster::ReplOpType::PUT ? MemHdr16::FLAG_NORMAL : MemHdr16::FLAG_TOMBSTONE
+                        const auto submit = [&] {
+                            return engine_.clusterRuntime->submitRequest(
+                                id,
+                                fingerprint,
+                                [&](uint64_t sequence) {
+                                    auto mutation = prepareMutation(
+                                        sequence,
+                                        op,
+                                        key,
+                                        value,
+                                        op == cluster::ReplOpType::PUT ? MemHdr16::FLAG_NORMAL : MemHdr16::FLAG_TOMBSTONE
+                                    );
+                                    preparedFlags = mutation.recordFlags;
+                                    return mutation;
+                                },
+                                admission.term
                             );
-                            preparedFlags = mutation.recordFlags;
-                            return mutation;
-                        });
+                        };
+                        std::shared_future<cluster::ClusterRequestResult> completion;
+                        try { completion = submit(); }
+                        catch (const cluster::ClusterRoutingError&) { throw; }
+                        catch (const std::invalid_argument&) { throw; }
+                        catch (const std::exception& error) {
+                            throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::WRITE_REJECTED, {}, error.what(), id);
+                        }
                         const auto result = completion.get();
                         if (preparedFlags && result.status == cluster::ClusterRequestStatus::APPLIED) {
                             engine_.recordCommittedRaftMutationStats(op, *preparedFlags);
@@ -4201,7 +4434,7 @@ namespace akkaradb::engine {
                     void putBatch(std::span<const BatchPutEntry> entries) override {
                         for (size_t offset = 0; offset < entries.size();) {
                             std::vector<Pending> pending;
-                            const size_t end = std::min(entries.size(), offset + 256);
+                            const size_t end = std::min(entries.size(), offset + (engine_.distributedTransactionsEnabled() ? 1 : 256));
                             std::exception_ptr failure;
                             try {
                                 for (; offset < end; ++offset) {
@@ -4218,18 +4451,18 @@ namespace akkaradb::engine {
                         }
                     }
 
-                    void remove(std::span<const uint8_t> key) override {
-                        finish(submit(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE));
-                    }
+                    void remove(std::span<const uint8_t> key) override { finish(submit(cluster::ReplOpType::REMOVE, key, {}, MemHdr16::FLAG_TOMBSTONE)); }
 
                     void rollback(std::span<const uint8_t> key, std::span<const uint8_t> value, bool tombstone) override {
-                        finish(submit(
-                            tombstone ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT,
-                            key,
-                            value,
-                            tombstone ? MemHdr16::FLAG_TOMBSTONE : MemHdr16::FLAG_NORMAL,
-                            vlog::ROLLBACK_NODE
-                        ));
+                        finish(
+                            submit(
+                                tombstone ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT,
+                                key,
+                                value,
+                                tombstone ? MemHdr16::FLAG_TOMBSTONE : MemHdr16::FLAG_NORMAL,
+                                vlog::ROLLBACK_NODE
+                            )
+                        );
                     }
 
                     void removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) override {
@@ -4243,19 +4476,34 @@ namespace akkaradb::engine {
                         cluster::ReplOpType op = cluster::ReplOpType::PUT;
                         uint8_t recordFlags = MemHdr16::FLAG_NORMAL;
                         std::future<void> completion;
+                        DistributedWriteAdmission admission;
                     };
 
-                    Pending submit(cluster::ReplOpType op, std::span<const uint8_t> key,
-                        std::span<const uint8_t> value, uint8_t flags, uint64_t sourceNodeId = 0) {
+                    Pending submit(
+                        cluster::ReplOpType op,
+                        std::span<const uint8_t> key,
+                        std::span<const uint8_t> value,
+                        uint8_t flags,
+                        uint64_t sourceNodeId = 0
+                    ) {
                         engine_.requireOwnsWriteKey(key);
+                        auto admission = engine_.distributedWriteAdmission(key);
                         engine_.applyWriteBackpressure();
                         uint8_t preparedFlags = flags;
-                        auto submission = engine_.clusterRuntime->submitMutation([&](uint64_t sequence) {
-                            auto mutation = prepareMutation(sequence, op, key, value, flags, sourceNodeId);
-                            preparedFlags = mutation.recordFlags;
-                            return mutation;
-                        });
-                        return Pending{.op = op, .recordFlags = preparedFlags, .completion = std::move(submission.completion)};
+                        auto submission = engine_.clusterRuntime->submitMutation(
+                            [&](uint64_t sequence) {
+                                auto mutation = prepareMutation(sequence, op, key, value, flags, sourceNodeId);
+                                preparedFlags = mutation.recordFlags;
+                                return mutation;
+                            },
+                            admission.term
+                        );
+                        return Pending{
+                            .op = op,
+                            .recordFlags = preparedFlags,
+                            .completion = std::move(submission.completion),
+                            .admission = std::move(admission)
+                        };
                     }
 
                     void finish(Pending pending) {
@@ -4271,6 +4519,10 @@ namespace akkaradb::engine {
                         uint8_t flags,
                         uint64_t sourceNodeId = 0
                     ) {
+                        if (key.size() > UINT16_MAX) { throw std::invalid_argument("AkkEngine: Raft key exceeds storage limit of 65535 bytes"); }
+                        const size_t storedSize = op == cluster::ReplOpType::PUT && engine_.blobManager && value.size() >= engine_.blobManager->threshold()
+                            ? blob::BLOB_REF_SIZE : value.size();
+                        if (storedSize > UINT16_MAX - key.size()) { throw std::invalid_argument("AkkEngine: Raft key and stored value exceed combined storage limit of 65535 bytes"); }
                         cluster::ClusterMutation mutation{
                             .sourceNodeId = sourceNodeId == 0 ? engine_.nodeId : sourceNodeId,
                             .op = op,
@@ -4335,30 +4587,24 @@ namespace akkaradb::engine {
                 size_t cursor = 5;
                 uint32_t count = 0;
                 if (!pullU32(bytes, cursor, count)) { throw std::runtime_error("AkkEngine: truncated rollback control response"); }
-                if (count > (bytes.size() - cursor) / 9) {
-                    throw std::runtime_error("AkkEngine: invalid rollback control result count");
-                }
+                if (count > (bytes.size() - cursor) / 9) { throw std::runtime_error("AkkEngine: invalid rollback control result count"); }
                 std::vector<RollbackItemResult> out;
                 out.reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
                     if (cursor >= bytes.size()) { throw std::runtime_error("AkkEngine: truncated rollback result status"); }
                     const auto status = static_cast<RollbackItemStatus>(bytes[cursor++]);
-                    if (status > RollbackItemStatus::PERMANENT_FAILURE) {
-                        throw std::runtime_error("AkkEngine: invalid rollback result status");
-                    }
+                    if (status > RollbackItemStatus::PERMANENT_FAILURE) { throw std::runtime_error("AkkEngine: invalid rollback result status"); }
                     uint32_t keySize = 0;
                     uint32_t messageSize = 0;
                     std::vector<uint8_t> key;
                     std::vector<uint8_t> message;
-                    if (!pullU32(bytes, cursor, keySize) || !pullBytes(bytes, cursor, keySize, key) ||
-                        !pullU32(bytes, cursor, messageSize) || !pullBytes(bytes, cursor, messageSize, message)) {
-                        throw std::runtime_error("AkkEngine: truncated rollback result item");
-                    }
-                    out.push_back(RollbackItemResult{
-                        .key = std::move(key),
-                        .status = status,
-                        .message = std::string{message.begin(), message.end()},
-                    });
+                    if (!pullU32(bytes, cursor, keySize) || !pullBytes(bytes, cursor, keySize, key) || !pullU32(bytes, cursor, messageSize) || !pullBytes(
+                        bytes,
+                        cursor,
+                        messageSize,
+                        message
+                    )) { throw std::runtime_error("AkkEngine: truncated rollback result item"); }
+                    out.push_back(RollbackItemResult{.key = std::move(key), .status = status, .message = std::string{message.begin(), message.end()},});
                 }
                 if (cursor != bytes.size()) { throw std::runtime_error("AkkEngine: trailing rollback control response"); }
                 return out;
@@ -4396,17 +4642,13 @@ namespace akkaradb::engine {
                     throw std::runtime_error("AkkEngine: truncated rollback stream cursor");
                 }
                 out.items = decodeRollbackItems(bytes.subspan(cursor));
-                if (out.done != out.nextCursor.empty()) {
-                    throw std::runtime_error("AkkEngine: invalid rollback stream continuation");
-                }
+                if (out.done != out.nextCursor.empty()) { throw std::runtime_error("AkkEngine: invalid rollback stream continuation"); }
                 return out;
             }
 
             void persistRollbackJournalLocked() const {
                 if (opts.paths.rollbackJournalPath.empty()) {
-                    if (!deferredRollbacks.empty()) {
-                        throw std::runtime_error("AkkEngine: rollback journal path is required for deferred rollback");
-                    }
+                    if (!deferredRollbacks.empty()) { throw std::runtime_error("AkkEngine: rollback journal path is required for deferred rollback"); }
                     return;
                 }
                 std::vector<uint8_t> bytes{'A', 'K', 'R', 'J', '1'};
@@ -4436,24 +4678,17 @@ namespace akkaradb::engine {
                 if (opts.paths.rollbackJournalPath.empty() || !fs::exists(opts.paths.rollbackJournalPath)) { return; }
                 std::ifstream in{opts.paths.rollbackJournalPath, std::ios::binary};
                 if (!in) { throw std::runtime_error("AkkEngine: failed to open rollback journal"); }
-                std::vector<uint8_t> bytes{
-                    std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}
-                };
-                if (bytes.size() < 13 || std::memcmp(bytes.data(), "AKRJ1", 5) != 0) {
-                    throw std::runtime_error("AkkEngine: corrupt rollback journal header");
-                }
+                std::vector<uint8_t> bytes{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+                if (bytes.size() < 13 || std::memcmp(bytes.data(), "AKRJ1", 5) != 0) { throw std::runtime_error("AkkEngine: corrupt rollback journal header"); }
                 size_t crcCursor = bytes.size() - 4;
                 uint32_t storedCrc = 0;
-                if (!pullU32(bytes, crcCursor, storedCrc) ||
-                    storedCrc != cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size() - 4)) {
+                if (!pullU32(bytes, crcCursor, storedCrc) || storedCrc != cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size() - 4)) {
                     throw std::runtime_error("AkkEngine: rollback journal checksum mismatch");
                 }
                 size_t cursor = 5;
                 uint32_t count = 0;
                 if (!pullU32(bytes, cursor, count)) { throw std::runtime_error("AkkEngine: truncated rollback journal"); }
-                if (count > (bytes.size() - 13) / 103) {
-                    throw std::runtime_error("AkkEngine: invalid rollback journal task count");
-                }
+                if (count > (bytes.size() - 13) / 103) { throw std::runtime_error("AkkEngine: invalid rollback journal task count"); }
                 deferredRollbacks.clear();
                 deferredRollbacks.reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
@@ -4467,25 +4702,16 @@ namespace akkaradb::engine {
                     cursor += 16;
                     std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), 16, task.clusterId.begin());
                     cursor += 16;
-                    if (!pullU64(bytes, cursor, task.configEpoch)) {
-                        throw std::runtime_error("AkkEngine: truncated rollback journal cluster epoch");
-                    }
+                    if (!pullU64(bytes, cursor, task.configEpoch)) { throw std::runtime_error("AkkEngine: truncated rollback journal cluster epoch"); }
                     task.action = static_cast<cluster::StripeControlAction>(bytes[cursor++]);
                     task.clusterTask = bytes[cursor++] != 0;
                     task.conflict = static_cast<RollbackConflictPolicy>(bytes[cursor++]);
                     uint32_t keySize = 0;
-                    if ((task.action != cluster::StripeControlAction::ROLLBACK_KEY &&
-                         task.action != cluster::StripeControlAction::ROLLBACK_STREAM) ||
-                        task.conflict > RollbackConflictPolicy::OVERWRITE_LATEST ||
-                        !pullU64(bytes, cursor, task.targetNodeId) || !pullU64(bytes, cursor, task.targetSeq) ||
-                        !pullU64(bytes, cursor, task.plannedWatermark) || !pullU32(bytes, cursor, keySize) ||
-                        keySize > bytes.size() - 4 - cursor) {
-                        throw std::runtime_error("AkkEngine: invalid rollback journal task");
-                    }
-                    task.key.assign(
-                        bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-                        bytes.begin() + static_cast<std::ptrdiff_t>(cursor + keySize)
-                    );
+                    if ((task.action != cluster::StripeControlAction::ROLLBACK_KEY && task.action != cluster::StripeControlAction::ROLLBACK_STREAM) || task.
+                        conflict > RollbackConflictPolicy::OVERWRITE_LATEST || !pullU64(bytes, cursor, task.targetNodeId) || !
+                        pullU64(bytes, cursor, task.targetSeq) || !pullU64(bytes, cursor, task.plannedWatermark) || !pullU32(bytes, cursor, keySize) || keySize
+                        > bytes.size() - 4 - cursor) { throw std::runtime_error("AkkEngine: invalid rollback journal task"); }
+                    task.key.assign(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), bytes.begin() + static_cast<std::ptrdiff_t>(cursor + keySize));
                     cursor += keySize;
                     deferredRollbacks.push_back(std::move(task));
                 }
@@ -4544,7 +4770,7 @@ namespace akkaradb::engine {
                 }
             }
 
-            [[nodiscard]] bool executeDeferredRollback(const DeferredRollbackTask& task, std::stop_token stop) {
+            [[nodiscard]] bool executeDeferredRollback(const DeferredRollbackTask& task, const std::stop_token& stop) {
                 if (task.clusterTask) {
                     if (!clusterRuntime) { return false; }
                     uint64_t controlNode = task.targetNodeId;
@@ -4570,10 +4796,7 @@ namespace akkaradb::engine {
                         request.ownerNodeId = controlNode;
                         request.fenceToken = task.targetSeq;
                         request.key = cursor;
-                        request.metadata = {
-                            static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE),
-                            static_cast<uint8_t>(task.conflict),
-                        };
+                        request.metadata = {static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE), static_cast<uint8_t>(task.conflict),};
                         pushU64(request.metadata, task.plannedWatermark);
                         const auto response = clusterRuntime->rollbackControl(controlNode, std::move(request));
                         if (response.status != cluster::StripeControlStatus::COMMITTED) { return false; }
@@ -4600,39 +4823,34 @@ namespace akkaradb::engine {
 
             void startRollbackRecovery() {
                 if (deferredRollbacks.empty()) { return; }
-                rollbackRecoveryThread = std::jthread([this](std::stop_token stop) {
-                    while (!stop.stop_requested()) {
-                        std::vector<DeferredRollbackTask> tasks;
-                        {
-                            std::lock_guard lock{rollbackJournalMu};
-                            for (const auto& task : deferredRollbacks) {
-                                if (task.createdStartupId != rollbackStartupId) { tasks.push_back(task); }
+                rollbackRecoveryThread = std::jthread(
+                    [this](const std::stop_token& stop) {
+                        while (!stop.stop_requested()) {
+                            std::vector<DeferredRollbackTask> tasks;
+                            {
+                                std::lock_guard lock{rollbackJournalMu};
+                                for (const auto& task : deferredRollbacks) { if (task.createdStartupId != rollbackStartupId) { tasks.push_back(task); } }
                             }
+                            for (const auto& task : tasks) {
+                                if (stop.stop_requested()) { return; }
+                                bool complete = false;
+                                try { complete = executeDeferredRollback(task, stop); }
+                                catch (...) {}
+                                if (!complete) { continue; }
+                                std::lock_guard lock{rollbackJournalMu};
+                                auto previous = deferredRollbacks;
+                                std::erase_if(deferredRollbacks, [&](const DeferredRollbackTask& candidate) { return candidate.taskId == task.taskId; });
+                                try { persistRollbackJournalLocked(); }
+                                catch (...) { deferredRollbacks = std::move(previous); }
+                            }
+                            std::unique_lock lock{lifecycleMu};
+                            lifecycleCv.wait_for(lock, std::chrono::seconds{1});
                         }
-                        for (const auto& task : tasks) {
-                            if (stop.stop_requested()) { return; }
-                            bool complete = false;
-                            try { complete = executeDeferredRollback(task, stop); }
-                            catch (...) {}
-                            if (!complete) { continue; }
-                            std::lock_guard lock{rollbackJournalMu};
-                            auto previous = deferredRollbacks;
-                            std::erase_if(deferredRollbacks, [&](const DeferredRollbackTask& candidate) {
-                                return candidate.taskId == task.taskId;
-                            });
-                            try { persistRollbackJournalLocked(); }
-                            catch (...) { deferredRollbacks = std::move(previous); }
-                        }
-                        std::unique_lock lock{lifecycleMu};
-                        lifecycleCv.wait_for(lock, std::chrono::seconds{1});
                     }
-                });
+                );
             }
 
-            [[nodiscard]] std::optional<StripeMetadata> stripeMetadataAt(
-                std::span<const uint8_t> publicKey,
-                uint64_t logicalSeq
-            ) {
+            [[nodiscard]] std::optional<StripeMetadata> stripeMetadataAt(std::span<const uint8_t> publicKey, uint64_t logicalSeq) {
                 std::optional<StripeMetadata> selected;
                 if (!versionLog) { return selected; }
                 for (const auto& entry : versionLog->history(stripeMetaKey(publicKey))) {
@@ -4644,17 +4862,11 @@ namespace akkaradb::engine {
                 return selected;
             }
 
-            [[nodiscard]] bool stripeHistoryUnavailableBefore(
-                std::span<const uint8_t> publicKey,
-                uint64_t logicalSeq
-            ) const {
+            [[nodiscard]] bool stripeHistoryUnavailableBefore(std::span<const uint8_t> publicKey, uint64_t logicalSeq) const {
                 if (!versionLog) { return true; }
                 for (const auto& entry : versionLog->history(stripeMetaKey(publicKey))) {
                     const auto metadata = decodeStripeMetadata(entry.value);
-                    if (metadata && metadata->logicalSeq > logicalSeq &&
-                        (entry.flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0) {
-                        return true;
-                    }
+                    if (metadata && metadata->logicalSeq > logicalSeq && (entry.flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0) { return true; }
                 }
                 return false;
             }
@@ -4671,9 +4883,7 @@ namespace akkaradb::engine {
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
                     if (auto current = readStripeMetadata(key)) { currentHead = current->logicalSeq; }
                 }
-                else if (versionLog) {
-                    if (const auto head = versionLog->getAt(key, UINT64_MAX)) { currentHead = head->seq; }
-                }
+                else if (versionLog) { if (const auto head = versionLog->getAt(key, UINT64_MAX)) { currentHead = head->seq; } }
                 if (conflict == RollbackConflictPolicy::FAIL_IF_CHANGED && expectedHead != 0 && currentHead != expectedHead) {
                     result.status = RollbackItemStatus::CONFLICT;
                     result.message = "key changed after rollback planning";
@@ -4710,9 +4920,7 @@ namespace akkaradb::engine {
                     }
                     if (expectedHead == 0) { expectedHead = currentHead; }
                     if (currentHead <= targetSeq) {
-                        return RollbackItemResult{
-                            .key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}
-                        };
+                        return RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}};
                     }
                     const auto target = stripeMetadataAt(key, targetSeq);
                     if (!target && stripeHistoryUnavailableBefore(key, targetSeq)) {
@@ -4722,20 +4930,14 @@ namespace akkaradb::engine {
                             .message = "target revision predates retained STRIPE metadata history",
                         };
                     }
-                    if (!target || target->tombstone) {
-                        return applyMaterializedRollback(key, {}, true, expectedHead, conflict);
-                    }
+                    if (!target || target->tombstone) { return applyMaterializedRollback(key, {}, true, expectedHead, conflict); }
                     try {
                         const auto value = readStripeValueFromMetadata(key, *target, false);
                         if (!value) { throw std::runtime_error("AkkEngine: historical STRIPE value is absent"); }
                         return applyMaterializedRollback(key, *value, false, expectedHead, conflict);
                     }
                     catch (const std::exception& error) {
-                        return RollbackItemResult{
-                            .key = {key.begin(), key.end()},
-                            .status = RollbackItemStatus::PERMANENT_FAILURE,
-                            .message = error.what(),
-                        };
+                        return RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::PERMANENT_FAILURE, .message = error.what(),};
                     }
                 }
 
@@ -4750,16 +4952,13 @@ namespace akkaradb::engine {
                 }
                 if (expectedHead == 0) { expectedHead = currentHead; }
                 if (currentHead <= targetSeq) {
-                    return RollbackItemResult{
-                        .key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}
-                    };
+                    return RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}};
                 }
                 const auto target = versionLog->getAt(key, targetSeq);
                 if (!target || (target->flags & MemHdr16::FLAG_TOMBSTONE) != 0) {
                     auto history = versionLog->history(key);
                     const auto first = history.begin();
-                    if (first != std::default_sentinel && first->seq > targetSeq &&
-                        (first->flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0) {
+                    if (first != std::default_sentinel && first->seq > targetSeq && (first->flags & vlog::VLOG_FLAG_RETENTION_BASE) != 0) {
                         return RollbackItemResult{
                             .key = {key.begin(), key.end()},
                             .status = RollbackItemStatus::PERMANENT_FAILURE,
@@ -4795,9 +4994,7 @@ namespace akkaradb::engine {
                     };
                 }
                 if (expectedHead <= targetSeq) {
-                    return RollbackItemResult{
-                        .key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}
-                    };
+                    return RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::APPLIED, .message = {}};
                 }
                 bool tombstone = true;
                 std::vector<uint8_t> value;
@@ -4816,18 +5013,14 @@ namespace akkaradb::engine {
                         value = std::move(*historical);
                     }
                     catch (const std::exception& error) {
-                        return RollbackItemResult{
-                            .key = {key.begin(), key.end()},
-                            .status = RollbackItemStatus::PERMANENT_FAILURE,
-                            .message = error.what(),
-                        };
+                        return RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::PERMANENT_FAILURE, .message = error.what(),};
                     }
                     tombstone = false;
                 }
 
                 uint64_t authorityNodeId = clusterRuntime->ownerNodeId(key);
                 if (!clusterRuntime->stripeNodeReachable(authorityNodeId)) {
-                    const uint64_t failover = clusterRuntime->stripeFailoverNodeId();
+                    const uint64_t failover = clusterRuntime->stripeFailoverNodeId(key);
                     if (failover != 0) { authorityNodeId = failover; }
                 }
                 cluster::StripeControlRequest request;
@@ -4838,9 +5031,7 @@ namespace akkaradb::engine {
                 pushU64(request.metadata, expectedHead);
                 request.metadata.push_back(tombstone ? 1U : 0U);
                 request.metadata.insert(request.metadata.end(), value.begin(), value.end());
-                if (authorityNodeId == nodeId) {
-                    return applyMaterializedRollback(key, value, tombstone, expectedHead, conflict);
-                }
+                if (authorityNodeId == nodeId) { return applyMaterializedRollback(key, value, tombstone, expectedHead, conflict); }
                 const auto response = clusterRuntime->rollbackControl(authorityNodeId, std::move(request));
                 if (response.status != cluster::StripeControlStatus::COMMITTED) {
                     throw std::runtime_error("AkkEngine: rollback authority rejected the mutation");
@@ -4871,8 +5062,9 @@ namespace akkaradb::engine {
                 }
                 for (auto& [key, _] : versionLog->collectRollbackTargets(targetSeq)) {
                     if (isStripeInternalKey(key)) { continue; }
-                    if (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED && clusterRuntime &&
-                        clusterRuntime->ownerNodeId(key) != nodeId) { continue; }
+                    if (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED && clusterRuntime && clusterRuntime->ownerNodeId(key) != nodeId) {
+                        continue;
+                    }
                     keys.push_back(std::move(key));
                 }
                 std::ranges::sort(keys);
@@ -4883,24 +5075,18 @@ namespace akkaradb::engine {
     AkkEngine::AkkEngine() = default;
 
     bool RollbackResult::complete() const noexcept {
-        return std::ranges::all_of(items, [](const RollbackItemResult& item) {
-            return item.status == RollbackItemStatus::APPLIED;
-        });
+        return std::ranges::all_of(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::APPLIED; });
     }
 
     size_t RollbackResult::appliedCount() const noexcept {
-        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) {
-            return item.status == RollbackItemStatus::APPLIED;
-        }));
+        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::APPLIED; }));
     }
 
     size_t RollbackResult::deferredCount() const noexcept {
-        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) {
-            return item.status == RollbackItemStatus::DEFERRED;
-        }));
+        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::DEFERRED; }));
     }
 
-    #include "detail/TransactionApi.inc"
+    #include "detail/AkkTransaction.inc"
 
     AkkEngine::~AkkEngine() {
         try { close(); }
@@ -4909,13 +5095,14 @@ namespace akkaradb::engine {
 
     std::unique_ptr<AkkEngine> AkkEngine::open(AkkEngineOptions options) {
         const auto& tx = options.transactions;
-        if (tx.maxOpen == 0 || tx.maxOpen > 1024 || tx.maxLifetimeMs == 0 || tx.maxLifetimeMs > 3'600'000 ||
-            tx.maxWrites == 0 || tx.maxWrites > 1'048'576 || tx.maxWriteBytes < 1024 || tx.maxWriteBytes > 512ull * 1024 * 1024 ||
-            tx.maxReadSetBytes < 1024 || tx.maxReadSetBytes > 512ull * 1024 * 1024 ||
-            tx.maxPinnedBytes < 1024 * 1024 || tx.maxPinnedBytes > 1024ull * 1024 * 1024 * 1024 ||
-            tx.maxTrackedBytes < 1024 * 1024 || tx.maxTrackedBytes > 512ull * 1024 * 1024 ||
-            tx.maxJournalBytes < 1024 || tx.maxJournalBytes > 1024ull * 1024 * 1024 * 1024) {
+        if (tx.maxOpen == 0 || tx.maxOpen > 1024 || tx.maxLifetimeMs == 0 || tx.maxLifetimeMs > 3'600'000 || tx.maxWrites == 0 || tx.maxWrites > 1'048'576 || tx
+           .maxWriteBytes < 1024 || tx.maxWriteBytes > 512ull * 1024 * 1024 || tx.maxReadSetBytes < 1024 || tx.maxReadSetBytes > 512ull * 1024 * 1024 || tx.
+            maxPinnedBytes < 1024 * 1024 || tx.maxPinnedBytes > 1024ull * 1024 * 1024 * 1024 || tx.maxTrackedBytes < 1024 * 1024 || tx.maxTrackedBytes > 512ull
+            * 1024 * 1024 || tx.maxJournalBytes < 1024 || tx.maxJournalBytes > 1024ull * 1024 * 1024 * 1024) {
             throw std::invalid_argument("AkkEngine: invalid transaction runtime limits");
+        }
+        if (options.components.sstEnabled && options.components.blobEnabled && !options.sst.trackBlobReferences) {
+            throw std::invalid_argument("AkkEngine: Blob storage requires SST Blob reference tracking");
         }
         resolveWritePolicy(options);
         normalizeVisibilityOptions(options);
@@ -4937,13 +5124,9 @@ namespace akkaradb::engine {
         fillPath(options.paths.transactionDir, "transactions");
 
         if (options.runtime.writerThreads > 0) {
-            if (options.memtable.expectedConcurrentWriters == 0) {
-                options.memtable.expectedConcurrentWriters = options.runtime.writerThreads;
-            }
+            if (options.memtable.expectedConcurrentWriters == 0) { options.memtable.expectedConcurrentWriters = options.runtime.writerThreads; }
             if (options.memtable.shardCount == 0) { options.memtable.shardCount = shardsForThreads(options.runtime.writerThreads, 256); }
-            if (options.wal.shardCount == 0) {
-                options.wal.shardCount = static_cast<uint16_t>(shardsForThreads(options.runtime.writerThreads, 64));
-            }
+            if (options.wal.shardCount == 0) { options.wal.shardCount = static_cast<uint16_t>(shardsForThreads(options.runtime.writerThreads, 64)); }
         }
         normalizeWalOptions(options.wal);
         normalizeMemTableOptions(options.memtable);
@@ -4965,10 +5148,7 @@ namespace akkaradb::engine {
         if (options.runtime.writeAdmission == AkkEngineOptions::WriteAdmissionMode::PARALLEL && !supportsParallelWriteAdmission(options)) {
             throw std::invalid_argument("AkkEngine: runtime.writeAdmission=PARALLEL requires blob and cluster to be disabled");
         }
-        auto engine = std::unique_ptr < AkkEngine >
-        {
-            new AkkEngine()
-        };
+        auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
         engine->impl_ = std::make_unique<Impl>(std::move(options));
         Impl& impl = *engine->impl_;
         impl.loadRollbackJournal();
@@ -4977,23 +5157,29 @@ namespace akkaradb::engine {
         }
         impl.nodeId = loadOrCreateNodeId(impl.opts.paths.nodeIdPath);
         if (impl.opts.components.clusterEnabled) {
-            if (!impl.opts.cluster.config) {
-                impl.opts.cluster.config = cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
-            }
+            if (!impl.opts.cluster.config) { impl.opts.cluster.config = cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath); }
             impl.opts.cluster.config->validateRuntime(impl.nodeId, impl.opts.cluster.runtime);
-            if (impl.opts.cluster.runtime.mirrorFencing.mode == cluster::MirrorFencingMode::QUORUM_FENCED &&
-                (!impl.opts.components.walEnabled || !impl.opts.runtime.recoverWal)) {
-                throw std::invalid_argument("AkkEngine: MIRROR quorum fencing requires WAL durability and WAL recovery");
+            if ((impl.opts.cluster.config->usesDataConsensus() || impl.opts.cluster.config->mode() == cluster::ReplicationMode::PARTITIONED ||
+                 impl.opts.cluster.config->mode() == cluster::ReplicationMode::STRIPE) &&
+                (!impl.opts.components.walEnabled || !impl.opts.runtime.recoverWal ||
+                 (impl.opts.components.sstEnabled && !impl.opts.runtime.recoverSst) ||
+                 impl.opts.runtime.truncateCorruptWalOnRecovery)) {
+                throw std::invalid_argument("AkkEngine: data Raft, PARTITIONED and STRIPE require WAL/SST recovery and reject corrupt-WAL truncation");
             }
+            if (impl.opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT && (impl.opts.runtime.writeVisibility !=
+                AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER || impl.opts.runtime.sequence.allocation !=
+                AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC)) {
+                throw std::invalid_argument("AkkEngine: GLOBAL_SNAPSHOT requires COMMIT_ORDER and GLOBAL_ATOMIC");
+            }
+            if (impl.opts.cluster.runtime.mirrorFencing.mode == cluster::MirrorFencingMode::QUORUM_FENCED && (!impl.opts.components.walEnabled || !impl.opts.
+                runtime.recoverWal)) { throw std::invalid_argument("AkkEngine: MIRROR quorum fencing requires WAL durability and WAL recovery"); }
         }
         for (const auto& task : impl.deferredRollbacks) {
             if (task.clusterTask != impl.opts.components.clusterEnabled) {
                 throw std::runtime_error("AkkEngine: deferred rollback journal does not match the current cluster mode");
             }
             if (task.clusterTask) {
-                const uint64_t epoch = impl.opts.cluster.runtime.clusterGroupEpoch == 0
-                                           ? 1
-                                           : impl.opts.cluster.runtime.clusterGroupEpoch;
+                const uint64_t epoch = impl.opts.cluster.runtime.clusterGroupEpoch == 0 ? 1 : impl.opts.cluster.runtime.clusterGroupEpoch;
                 if (task.clusterId != impl.opts.cluster.config->clusterId() || task.configEpoch != epoch) {
                     throw std::runtime_error("AkkEngine: deferred rollback journal belongs to a different cluster configuration");
                 }
@@ -5002,6 +5188,7 @@ namespace akkaradb::engine {
         if (!impl.opts.components.clusterEnabled || !impl.opts.cluster.config || !impl.opts.cluster.config->usesDataConsensus()) {
             removeFileIfExists(impl.replicaSnapshotStagingPath());
         }
+        impl.loadLocalRequests();
         {
             std::error_code ec;
             fs::remove_all(impl.clusterSnapshotExportDirectory(), ec);
@@ -5027,12 +5214,9 @@ namespace akkaradb::engine {
                 if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
             };
             if (impl.opts.memtable.flushInputMode == memtable::MemTableFlushInputMode::STREAMING) {
-                impl.opts.memtable.onFlushStream = [&, afterFlush](
-                    size_t estimatedRecordCount,
-                    core::ArenaGenerator<core::RecordView> records
-                ) {
-                        afterFlush(impl.sstManager->flush(estimatedRecordCount, std::move(records)));
-                    };
+                impl.opts.memtable.onFlushStream = [&, afterFlush](size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
+                    afterFlush(impl.sstManager->flush(estimatedRecordCount, std::move(records)));
+                };
                 impl.opts.memtable.onFlush = {};
             }
             else {
@@ -5058,9 +5242,8 @@ namespace akkaradb::engine {
             const uint64_t sstMaxSeq = impl.sstManager->maxSequence();
             if (manifestCheckpointSeq > sstMaxSeq) {
                 throw std::runtime_error(
-                    "AkkEngine: manifest checkpoint sequence exceeds recovered SST sequence (checkpoint=" + std::to_string(
-                        manifestCheckpointSeq
-                    ) + ", sstMaxSeq=" + std::to_string(sstMaxSeq) + ")"
+                    "AkkEngine: manifest checkpoint sequence exceeds recovered SST sequence (checkpoint=" + std::to_string(manifestCheckpointSeq) +
+                    ", sstMaxSeq=" + std::to_string(sstMaxSeq) + ")"
                 );
             }
             walRecoveryCheckpointSeq = manifestCheckpointSeq;
@@ -5079,11 +5262,24 @@ namespace akkaradb::engine {
                 wal::WalRecoveryOptions{
                     .walDir = impl.opts.paths.walDir,
                     .checkpointSeq = walRecoveryCheckpointSeq,
-                    .truncateCorruptTail = impl.opts.runtime.truncateCorruptWalOnRecovery
+                    .truncateCorruptTail = impl.opts.runtime.truncateCorruptWalOnRecovery,
+                    .requestApplication = impl.opts.cluster.runtime.requests.persistLocalApplication
+                                              ? std::function<void(std::span<const uint8_t>, uint64_t)>{
+                                                  [&impl](auto metadata, uint64_t seq) { impl.recordLocalRequest(metadata, seq); }
+                                              }
+                                              : std::function<void(std::span<const uint8_t>, uint64_t)>{}
                 },
                 *impl.memtable
             );
             walRecoveryHadCorruption = recovery.corruptSegments > 0;
+            if (walRecoveryHadCorruption && impl.opts.components.clusterEnabled &&
+                (impl.opts.cluster.config->usesDataConsensus() || impl.opts.cluster.config->mode() == cluster::ReplicationMode::PARTITIONED ||
+                 impl.opts.cluster.config->mode() == cluster::ReplicationMode::STRIPE)) {
+                throw std::runtime_error("AkkEngine: corrupt WAL prevents reliable Cluster state-machine recovery");
+            }
+            if (walRecoveryHadCorruption && impl.opts.cluster.runtime.requests.persistLocalApplication) {
+                throw std::runtime_error("Local request: corrupt WAL prevents reliable application recovery");
+            }
             if (walRecoveryHadCorruption && impl.versionLog) {
                 try {
                     const uint64_t versionLogSupplementAfterSeq = std::max(walRecoveryCheckpointSeq, recovery.maxSeq);
@@ -5113,9 +5309,7 @@ namespace akkaradb::engine {
             }
         }
         if (versionLogStartupError) {
-            if (!walRecoveryHadCorruption || !impl.opts.runtime.ignoreVersionLogSupplementErrors) {
-                std::rethrow_exception(versionLogStartupError);
-            }
+            if (!walRecoveryHadCorruption || !impl.opts.runtime.ignoreVersionLogSupplementErrors) { std::rethrow_exception(versionLogStartupError); }
         }
         uint64_t recoveredSeq = 0;
         if (impl.memtable) {
@@ -5125,23 +5319,16 @@ namespace akkaradb::engine {
         if (impl.sstManager) { recoveredSeq = std::max(recoveredSeq, impl.sstManager->maxSequence()); }
         if (impl.memtable && recoveredSeq > 0) { impl.memtable->advanceSeq(recoveredSeq); }
         impl.resetCommittedSeq(recoveredSeq);
+        impl.replicationStorageSeq = recoveredSeq;
         if (impl.versionLog) { impl.versionLog->seedCommittedSeq(recoveredSeq); }
 
         if (impl.opts.components.walEnabled) { impl.walWriter = wal::WalWriter::create(impl.opts.paths.walDir, impl.opts.wal); }
-        if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) {
-            impl.walWriter->pruneUntil(walRecoveryCheckpointSeq);
-        }
+        if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush && walRecoveryCheckpointSeq > 0) { impl.walWriter->pruneUntil(walRecoveryCheckpointSeq); }
 
         if (impl.opts.components.blobEnabled) {
-            impl.opts.blob.onBlobPut = [&impl](
-                uint64_t blobId,
-                uint64_t totalSize,
-                uint64_t storedSize,
-                uint32_t contentCrc32c,
-                uint32_t codec
-            ) {
-                    if (impl.manifest) { impl.manifest->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec); }
-                };
+            impl.opts.blob.onBlobPut = [&impl](uint64_t blobId, uint64_t totalSize, uint64_t storedSize, uint32_t contentCrc32c, uint32_t codec) {
+                if (impl.manifest) { impl.manifest->blobPut(blobId, totalSize, storedSize, contentCrc32c, codec); }
+            };
             impl.opts.blob.onBlobDelete = [&impl](uint64_t blobId) {
                 if (!impl.manifest) { return; }
                 try { impl.manifest->blobDelete(blobId); }
@@ -5160,9 +5347,16 @@ namespace akkaradb::engine {
             impl.clusterConfig = cfg;
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
             impl.clusterReplicationMode = cfg.mode();
-            if (cfg.raidPreset() == cluster::RaidPreset::RAID1 && !impl.walWriter) {
-                throw std::invalid_argument("AkkEngine: RAID.1 requires WAL durability");
+            if (impl.distributedTransactionsEnabled()) {
+                cfg.validateRuntime(impl.nodeId, impl.opts.cluster.runtime);
+                if (!impl.walWriter || !impl.opts.runtime.recoverWal || (impl.sstManager && !impl.opts.runtime.recoverSst) || impl.opts.paths.transactionDir.
+                    empty()) { throw std::invalid_argument("AkkEngine: Cluster transactions require WAL, storage recovery and transactionDir"); }
+                if (impl.blobManager && impl.opts.cluster.runtime.raftBlobPolicy != cluster::RaftBlobPolicy::RAFT_LOG) {
+                    throw std::invalid_argument("AkkEngine: Cluster transactions require replicated Blob payloads");
+                }
             }
+            impl.recoverDistributedState();
+            if (cfg.raidPreset() == cluster::RaidPreset::RAID1 && !impl.walWriter) { throw std::invalid_argument("AkkEngine: RAID.1 requires WAL durability"); }
             if ((cfg.mode() == cluster::ReplicationMode::PARTITIONED || cfg.mode() == cluster::ReplicationMode::STRIPE) && !impl.walWriter) {
                 throw std::invalid_argument("AkkEngine: PARTITIONED and STRIPE require WAL durability");
             }
@@ -5172,89 +5366,88 @@ namespace akkaradb::engine {
             }
             if (cfg.usesDataConsensus()) {
                 const auto raftBlobPolicy = impl.opts.cluster.runtime.raftBlobPolicy;
-                if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT && raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY &&
-                    raftBlobPolicy != cluster::RaftBlobPolicy::RAFT_LOG) {
-                    throw std::invalid_argument("AkkEngine: invalid Raft Blob policy");
-                }
+                if (raftBlobPolicy != cluster::RaftBlobPolicy::REJECT && raftBlobPolicy != cluster::RaftBlobPolicy::PRIMARY_SIDE_ONLY && raftBlobPolicy !=
+                    cluster::RaftBlobPolicy::RAFT_LOG) { throw std::invalid_argument("AkkEngine: invalid Raft Blob policy"); }
                 if (impl.opts.components.blobEnabled && raftBlobPolicy == cluster::RaftBlobPolicy::REJECT) {
                     throw std::invalid_argument("AkkEngine: RAFT_QUORUM does not support Blob payload replication");
                 }
             }
             cluster::ClusterEngineCallbacks callbacks;
+            if (impl.distributedTransactionsEnabled()) {
+                callbacks.transactionMaxJournalBytes = impl.opts.transactions.maxJournalBytes;
+                callbacks.transactionBlobThresholdBytes = impl.blobManager ? impl.blobManager->threshold() : 0;
+                callbacks.applyTransactionControl = [&impl](uint64_t seq, auto bytes) { impl.applyDistributedCommand(seq, bytes); };
+                callbacks.exportTransactionSnapshot = [&impl](uint64_t sequence) { return impl.exportDistributedSnapshot(sequence); };
+                callbacks.installTransactionSnapshot = [&impl](const auto& snapshot) { impl.installDistributedSnapshot(snapshot); };
+            }
             impl.openPartitionEngines();
             if (impl.usesPartitionRaft()) {
-                callbacks.partitionLeader = [&impl](std::span<const uint8_t> key) {
-                    return impl.currentPartitionLeader(key);
-                };
+                callbacks.partitionLeader = [&impl](std::span<const uint8_t> key) { return impl.currentPartitionLeader(key); };
                 callbacks.partitionCandidates = [&impl](std::span<const uint8_t> key) {
                     return cluster::detail::partitionTargets(*impl.livePlacement.load(), key);
                 };
             }
             if (impl.usesPartitionRaft() || cfg.mode() == cluster::ReplicationMode::STRIPE) {
-                callbacks.placementChanged = [&impl](const cluster::ClusterConfig& config, uint64_t generation) {
-                    impl.acceptPlacement(config, generation);
-                };
+                callbacks.placementChanged = [&impl](const cluster::ClusterConfig& config, uint64_t generation) { impl.acceptPlacement(config, generation); };
             }
             callbacks.forward = [&impl](const cluster::ForwardRequest& request) { return impl.receiveForward(request); };
-            callbacks.getCurrentSeq = [&impl] { return impl.snapshotSeq(); };
-            callbacks.getLastSeq = [&impl] { return impl.snapshotSeq(); };
-            callbacks.getEntries = [&impl](
-                uint64_t afterSeq,
-                uint64_t throughSeq
-            ) -> std::optional<std::vector<cluster::ClusterHistoryEntry>> {
-                    if (!impl.walWriter || throughSeq < afterSeq) { return std::nullopt; }
-                    std::vector<cluster::ClusterHistoryEntry> entries;
-                    bool hasExternalBlob = false;
-                    const auto recovery = wal::WalRecovery::recover(
-                        wal::WalRecoveryOptions{.walDir = impl.opts.paths.walDir},
-                        [&](const wal::WalRecoveredEntry& item) {
-                            if ((item.flags & wal::WAL_FLAG_SNAPSHOT_MASK) != 0) { return; }
-                            if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
-                            const uint8_t flags = static_cast<uint8_t>(item.flags);
-                            if ((flags & MemHdr16::FLAG_BLOB) != 0) {
-                                hasExternalBlob = true;
-                                return;
-                            }
-                            entries.push_back(
-                                cluster::ClusterHistoryEntry{
-                                    .seq = item.seq,
-                                    .sourceNodeId = impl.nodeId,
-                                    .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0
-                                                                   ? cluster::ReplOpType::REMOVE
-                                                                   : cluster::ReplOpType::PUT),
-                                    .recordFlags = flags,
-                                    .key = item.key,
-                                    .value = item.value,
-                                }
-                            );
+            callbacks.getCurrentSeq = callbacks.getLastSeq = [&impl] { return impl.clusterReplicationSeq(); };
+            callbacks.checkpointReplication = [&impl] {
+                Impl::OperationGuard operation{impl};
+                std::lock_guard writeLock{impl.writeMu};
+                if (impl.walWriter) { impl.walWriter->forceSync(); }
+                if (impl.versionLog) { impl.versionLog->forceSync(); }
+                return impl.replicationStorageSeq.load(std::memory_order_relaxed);
+            };
+            callbacks.getEntries = [&impl](uint64_t afterSeq, uint64_t throughSeq) -> std::optional<std::vector<cluster::ClusterHistoryEntry>> {
+                if (!impl.walWriter || throughSeq < afterSeq) { return std::nullopt; }
+                std::vector<cluster::ClusterHistoryEntry> entries;
+                bool hasExternalBlob = false;
+                const auto recovery = wal::WalRecovery::recover(
+                    wal::WalRecoveryOptions{.walDir = impl.opts.paths.walDir},
+                    [&](const wal::WalRecoveredEntry& item) {
+                        if ((item.flags & wal::WAL_FLAG_SNAPSHOT_MASK) != 0) { return; }
+                        if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
+                        const auto flags = static_cast<uint8_t>(item.flags);
+                        if ((flags & MemHdr16::FLAG_BLOB) != 0) {
+                            hasExternalBlob = true;
+                            return;
                         }
-                    );
-                    (void)recovery;
-                    if (hasExternalBlob) { return std::nullopt; }
-                    std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) { return left.seq < right.seq; });
-                    uint64_t expected = afterSeq;
-                    for (const auto& entry : entries) {
-                        if (expected == UINT64_MAX || entry.seq != expected + 1) { return std::nullopt; }
-                        expected = entry.seq;
+                        entries.push_back(
+                            cluster::ClusterHistoryEntry{
+                                .seq = item.seq,
+                                .sourceNodeId = (item.flags & wal::WAL_FLAG_ROLLBACK) != 0 ? vlog::ROLLBACK_NODE : impl.nodeId,
+                                .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0 ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT),
+                                .recordFlags = flags,
+                                .key = item.key,
+                                .value = item.value,
+                            }
+                        );
                     }
-                    if (expected != throughSeq) { return std::nullopt; }
-                    return entries;
-                };
+                );
+                (void)recovery;
+                if (hasExternalBlob) { return std::nullopt; }
+                std::ranges::sort(entries, [](const auto& left, const auto& right) { return left.seq < right.seq; });
+                uint64_t expected = afterSeq;
+                for (const auto& entry : entries) {
+                    if (expected == UINT64_MAX || entry.seq != expected + 1) { return std::nullopt; }
+                    expected = entry.seq;
+                }
+                if (expected != throughSeq) { return std::nullopt; }
+                return entries;
+            };
             callbacks.exportSnapshot = [&impl]() -> std::optional<cluster::ClusterSnapshot> {
-                std::unique_lock writeLock{impl.writeMu};
+                std::unique_lock writeLock{impl.writeMu, std::try_to_lock};
+                if (!writeLock.owns_lock()) { return std::nullopt; }
                 if (!impl.memtable) { return std::nullopt; }
-                const uint64_t seq = impl.snapshotSeq();
+                const uint64_t seq = impl.clusterReplicationSeq();
                 const auto makeSnapshot = [](const std::shared_ptr<ClusterSnapshotExportFile>& exported) {
                     cluster::ClusterSnapshot snapshot;
                     snapshot.seq = exported->seq();
-                    snapshot.forEachEntry = [exported](const cluster::ClusterSnapshot::EntryVisitor& visitor) {
-                        return exported->forEachEntry(visitor);
-                    };
+                    snapshot.forEachEntry = [exported](const cluster::ClusterSnapshot::EntryVisitor& visitor) { return exported->forEachEntry(visitor); };
                     return snapshot;
                 };
-                if (auto cached = impl.clusterSnapshotExportCache.lock(); cached && cached->seq() == seq && cached->reusable()) {
-                    return makeSnapshot(cached);
-                }
+                if (auto cached = impl.clusterSnapshotExportCache.lock(); cached && cached->seq() == seq && cached->reusable()) { return makeSnapshot(cached); }
                 // Blob deletion is pinned from fixed-view capture through the
                 // final Blob read, but does not participate in write admission.
                 auto blobReadPin = impl.blobManager ? impl.blobManager->pinReads() : blob::BlobManager::ReadPin{};
@@ -5268,7 +5461,9 @@ namespace akkaradb::engine {
                         seq,
                         policy.mode == cluster::MemoryOnlySnapshotMode::COMPLETION_FIRST,
                         policy.maxPinnedBytes,
-                        policy.maxPinnedGenerations
+                        policy.maxPinnedGenerations,
+                        false,
+                        false
                     );
                     if (!mt) { return std::nullopt; }
                 }
@@ -5286,35 +5481,68 @@ namespace akkaradb::engine {
                     blob::BlobManager* blobManager = nullptr;
                     vlog::VersionLog::RecordSnapshot history;
                     bool typed = false;
+                    std::optional<cluster::ClusterSnapshot> transactions;
                 };
                 auto history = impl.clusterConfig.usesDataConsensus() && impl.versionLog
-                    ? impl.versionLog->captureRecords() : vlog::VersionLog::RecordSnapshot{};
-                auto source = std::make_shared<SnapshotSource>(SnapshotSource{
-                    .memtable = std::move(*mt), .sst = std::move(sst),
-                    .blobReadPin = std::move(blobReadPin), .blobManager = impl.blobManager.get(),
-                    .history = std::move(history), .typed = impl.clusterConfig.usesDataConsensus(),
-                });
+                                   ? impl.versionLog->captureRecords()
+                                   : vlog::VersionLog::RecordSnapshot{};
+                auto source = std::make_shared<SnapshotSource>(
+                    SnapshotSource{
+                        .memtable = std::move(*mt),
+                        .sst = std::move(sst),
+                        .blobReadPin = std::move(blobReadPin),
+                        .blobManager = impl.blobManager.get(),
+                        .history = std::move(history),
+                        .typed = impl.clusterConfig.usesDataConsensus(),
+                        .transactions = {},
+                    }
+                );
+                if (impl.distributedTransactionsEnabled()) { source->transactions = impl.exportDistributedSnapshot(seq); }
                 writeLock.unlock();
                 auto producer = [source](const cluster::ClusterSnapshot::EntryVisitor& visitor) mutable {
-                    if (source->history && !source->history([&](auto key, const vlog::VersionEntry& entry) {
-                        const auto encoded = cluster::detail::encodeSnapshotKey({
-                            cluster::detail::SnapshotRecordKind::HISTORY, entry.flags, entry.seq, entry.sourceNodeId, entry.timestampNs, key,
-                            Impl::snapshotBlobIdentity(entry.flags, entry.value)});
-                        return Impl::streamSnapshotValue(visitor, encoded, entry.value, entry.flags, source->blobManager);
-                    })) { return false; }
+                    if (source->transactions && !source->transactions->forEachEntry(visitor)) { return false; }
+                    if (source->history && !source->history(
+                        [&](auto key, const vlog::VersionEntry& entry) {
+                            const auto encoded = cluster::detail::encodeSnapshotKey(
+                                {
+                                    cluster::detail::SnapshotRecordKind::HISTORY,
+                                    entry.flags,
+                                    entry.seq,
+                                    entry.sourceNodeId,
+                                    entry.timestampNs,
+                                    key,
+                                    Impl::snapshotBlobIdentity(entry.flags, entry.value)
+                                }
+                            );
+                            return Impl::streamSnapshotValue(visitor, encoded, entry.value, entry.flags, source->blobManager);
+                        }
+                    )) { return false; }
                     source->history = {};
                     for (const auto& record : storedScanGenerator(std::move(source->memtable), std::move(source->sst))) {
-                        const auto encoded = source->typed ? cluster::detail::encodeSnapshotKey({
-                            cluster::detail::SnapshotRecordKind::HEAD, record.flags, 0, 0, 0, record.key,
-                            Impl::snapshotBlobIdentity(record.flags, record.value)}) : std::vector<uint8_t>{};
-                        if (!Impl::streamSnapshotValue(visitor, source->typed ? std::span<const uint8_t>{encoded} : record.key,
-                            record.value, record.flags, source->blobManager)) { return false; }
+                        const auto encoded = source->typed
+                                                 ? cluster::detail::encodeSnapshotKey(
+                                                     {
+                                                         cluster::detail::SnapshotRecordKind::HEAD,
+                                                         record.flags,
+                                                         0,
+                                                         0,
+                                                         0,
+                                                         record.key,
+                                                         Impl::snapshotBlobIdentity(record.flags, record.value)
+                                                     }
+                                                 )
+                                                 : std::vector<uint8_t>{};
+                        if (!Impl::streamSnapshotValue(
+                            visitor,
+                            source->typed ? std::span<const uint8_t>{encoded} : record.key,
+                            record.value,
+                            record.flags,
+                            source->blobManager
+                        )) { return false; }
                     }
                     return true;
                 };
-                auto exported = std::make_shared<ClusterSnapshotExportFile>(
-                    impl.newClusterSnapshotExportPath(), seq, std::move(producer)
-                );
+                auto exported = std::make_shared<ClusterSnapshotExportFile>(impl.newClusterSnapshotExportPath(), seq, std::move(producer));
                 impl.clusterSnapshotExportCache = exported;
                 return makeSnapshot(exported);
             };
@@ -5330,19 +5558,14 @@ namespace akkaradb::engine {
             };
             callbacks.finishSnapshotEntry = [&impl] { impl.finishReplicaSnapshotEntry(); };
             callbacks.prepareSnapshot = [&impl](uint64_t seq, uint64_t count) {
-                std::lock_guard lock{impl.writeMu}; impl.prepareReplicaSnapshotLocked(seq, count);
+                std::lock_guard lock{impl.writeMu};
+                impl.prepareReplicaSnapshotLocked(seq, count);
             };
             callbacks.finishSnapshot = [&impl](uint64_t seq, uint64_t entryCount) { impl.finishReplicaSnapshot(seq, entryCount); };
             callbacks.recoverSnapshot = [&impl](uint64_t seq) { impl.recoverReplicaSnapshot(seq); };
             callbacks.isSnapshotDurable = [&impl](uint64_t seq) { return impl.isReplicaSnapshotDurable(seq); };
             callbacks.forceDurable = [&impl] {
-                Impl::OperationGuard operation{impl, false};
-                if (!operation) {
-                    if (impl.opts.cluster.runtime.mirrorFencing.mode != cluster::MirrorFencingMode::STATIC) {
-                        throw std::runtime_error("AkkEngine: closing before fenced write/snapshot durability was confirmed");
-                    }
-                    return;
-                }
+                Impl::OperationGuard operation{impl};
                 if (impl.walWriter) { impl.walWriter->forceSync(); }
                 if (impl.versionLog) { impl.versionLog->forceSync(); }
             };
@@ -5355,26 +5578,30 @@ namespace akkaradb::engine {
                 uint64_t sourceNodeId,
                 uint64_t timestampNs
             ) {
-                    Impl::OperationGuard operation{impl, false};
-                    if (!operation) { return; }
+                    Impl::OperationGuard operation{impl};
+                    if (op == cluster::ReplOpType::TRANSACTION) {
+                        impl.applyDistributedCommand(seq, value);
+                        return;
+                    }
                     impl.applyReplicaRecord(seq, op, key, value, recordFlags, sourceNodeId, timestampNs);
                 };
-            callbacks.read = [&impl](std::span<const uint8_t> key, uint64_t snapshotSeq) {
-                return impl.readLocalForCluster(key, snapshotSeq);
+            callbacks.fatalFailure = [&impl](const std::exception_ptr& failure) {
+                std::lock_guard lock{impl.transactionFailureMu};
+                if (!impl.transactionFailure) { impl.transactionFailure = failure; }
             };
-            callbacks.commitStripeMetadata = [&impl](
-                uint64_t logicalSeq,
-                std::span<const uint8_t> publicKey,
-                std::span<const uint8_t> metadataBytes
-            ) {
+            callbacks.read = [&impl](std::span<const uint8_t> key, uint64_t snapshotSeq) { return impl.readLocalForCluster(key, snapshotSeq); };
+            callbacks.readLocalStorage = [&impl](std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                return impl.readLocalStorageForCluster(key, snapshotSeq);
+            };
+            callbacks.commitStripeMetadata = [&impl](uint64_t logicalSeq, std::span<const uint8_t> publicKey, std::span<const uint8_t> metadataBytes) {
                 if (logicalSeq == UINT64_MAX - 1) {
                     if (metadataBytes.size() < 8) { throw std::runtime_error("AkkEngine: truncated stripe placement alias"); }
                     auto alias = Impl::decodeStripeMetadata(metadataBytes.subspan(8));
                     if (!alias) { throw std::runtime_error("AkkEngine: invalid stripe placement alias"); }
-                    size_t cursor = 0; uint64_t placementGeneration = 0;
+                    size_t cursor = 0;
+                    uint64_t placementGeneration = 0;
                     if (!Impl::pullU64(metadataBytes, cursor, placementGeneration)) { throw std::runtime_error("AkkEngine: malformed placement generation"); }
-                    impl.writeStripeLocal(Impl::stripeHistoryPlacementKey(publicKey, alias->logicalSeq, placementGeneration), metadataBytes);
-                    return;
+                    return impl.writeStripeLocal(Impl::stripeHistoryPlacementKey(publicKey, alias->logicalSeq, placementGeneration), metadataBytes);
                 }
                 auto metadata = Impl::decodeStripeMetadata(metadataBytes);
                 if (!metadata) { throw std::runtime_error("AkkEngine: invalid committed STRIPE metadata"); }
@@ -5382,13 +5609,14 @@ namespace akkaradb::engine {
                 if (logicalSeq != 0 && !snapshotBase) { metadata->logicalSeq = logicalSeq; }
                 const auto encoded = Impl::encodeStripeMetadata(*metadata);
                 uint8_t vlogFlags = 0xFF;
-                if (snapshotBase) {
-                    vlogFlags = static_cast<uint8_t>(vlog::VLOG_FLAG_RETENTION_BASE |
-                        (metadata->rollback ? vlog::VLOG_FLAG_ROLLBACK : 0));
-                }
-                impl.writeStripeLocal(
-                    Impl::stripeMetaKey(publicKey), encoded, cluster::ReplOpType::PUT, 0,
-                    metadata->rollback ? vlog::ROLLBACK_NODE : impl.nodeId, vlogFlags
+                if (snapshotBase) { vlogFlags = static_cast<uint8_t>(vlog::VLOG_FLAG_RETENTION_BASE | (metadata->rollback ? vlog::VLOG_FLAG_ROLLBACK : 0)); }
+                return impl.writeStripeLocal(
+                    Impl::stripeMetaKey(publicKey),
+                    encoded,
+                    cluster::ReplOpType::PUT,
+                    0,
+                    metadata->rollback ? vlog::ROLLBACK_NODE : impl.nodeId,
+                    vlogFlags
                 );
             };
             callbacks.readStripeMetadata = [&impl](std::span<const uint8_t> publicKey) {
@@ -5396,12 +5624,23 @@ namespace akkaradb::engine {
                 if (!value) { return value; }
                 const auto metadata = Impl::decodeStripeMetadata(*value);
                 if (!metadata) { throw std::runtime_error("AkkEngine: invalid local stripe metadata"); }
-                return std::optional<std::vector<uint8_t>>{Impl::encodeStripeMetadata(impl.effectiveStripeMetadata(publicKey, *metadata))};
+                return std::optional{Impl::encodeStripeMetadata(impl.effectiveStripeMetadata(publicKey, *metadata))};
             };
-            callbacks.rollbackControl = [&impl](
-                uint64_t,
-                const cluster::StripeControlRequest& request
-            ) {
+            callbacks.stripeGenerationRetained = [&impl](std::span<const uint8_t> key, uint64_t generation) -> std::optional<bool> {
+                Impl::OperationGuard operation{impl};
+                impl.throwIfBackgroundFailed();
+                impl.waitForVersionLogRecovery();
+                std::shared_lock lock{impl.stripeGcEpochMu};
+                if (impl.stripeQueryPins->load(std::memory_order_acquire) != 0) { return {}; }
+                return impl.stripeGenerationRetainedLocal(key, generation);
+            };
+            callbacks.reclaimStripeGeneration = [&impl](auto key, auto metadata, const std::function<bool()>& retainedByPeers) {
+                Impl::OperationGuard operation{impl};
+                impl.throwIfBackgroundFailed();
+                impl.waitForVersionLogRecovery();
+                return impl.reclaimStripeGeneration(key, metadata, retainedByPeers);
+            };
+            callbacks.rollbackControl = [&impl](uint64_t, const cluster::StripeControlRequest& request) {
                 cluster::StripeControlResponse response;
                 response.requestId = request.requestId;
                 try {
@@ -5409,12 +5648,12 @@ namespace akkaradb::engine {
                         response.status = cluster::StripeControlStatus::REJECTED;
                         return response;
                     }
-                    if (!impl.versionLog) {
+                    if (!impl.versionLog && !(impl.clusterReplicationMode == cluster::ReplicationMode::STRIPE &&
+                        request.action == cluster::StripeControlAction::ROLLBACK_APPLY)) {
                         response.status = cluster::StripeControlStatus::ERROR_STATUS;
                         return response;
                     }
-                    if (request.action == cluster::StripeControlAction::ROLLBACK_KEY &&
-                        impl.clusterReplicationMode == cluster::ReplicationMode::PARTITIONED &&
+                    if (request.action == cluster::StripeControlAction::ROLLBACK_KEY && impl.clusterReplicationMode == cluster::ReplicationMode::PARTITIONED &&
                         impl.clusterRuntime->ownerNodeId(request.key) != impl.nodeId) {
                         response.status = cluster::StripeControlStatus::REJECTED;
                         return response;
@@ -5423,7 +5662,7 @@ namespace akkaradb::engine {
                     impl.throwIfBackgroundFailed();
                     impl.waitForVersionLogRecovery();
                     std::unique_lock epochLock{impl.mutationEpochMu};
-                    impl.versionLog->forceSync();
+                    if (impl.versionLog) { impl.versionLog->forceSync(); }
                     if (request.action == cluster::StripeControlAction::ROLLBACK_WATERMARK) {
                         response.status = cluster::StripeControlStatus::COMMITTED;
                         response.authorityNodeId = impl.nodeId;
@@ -5438,8 +5677,7 @@ namespace akkaradb::engine {
                         size_t cursor = 0;
                         const auto conflict = static_cast<RollbackConflictPolicy>(request.metadata[cursor++]);
                         uint64_t expectedHead = 0;
-                        if (conflict > RollbackConflictPolicy::OVERWRITE_LATEST ||
-                            !Impl::pullU64(request.metadata, cursor, expectedHead)) {
+                        if (conflict > RollbackConflictPolicy::OVERWRITE_LATEST || !Impl::pullU64(request.metadata, cursor, expectedHead)) {
                             response.status = cluster::StripeControlStatus::REJECTED;
                             return response;
                         }
@@ -5449,9 +5687,7 @@ namespace akkaradb::engine {
                             response.status = cluster::StripeControlStatus::REJECTED;
                             return response;
                         }
-                        const auto result = impl.applyMaterializedRollback(
-                            request.key, value, tombstone, expectedHead, conflict
-                        );
+                        const auto result = impl.applyMaterializedRollback(request.key, value, tombstone, expectedHead, conflict);
                         const std::array items{result};
                         response.metadata = Impl::encodeRollbackItems(items);
                         response.status = cluster::StripeControlStatus::COMMITTED;
@@ -5486,9 +5722,7 @@ namespace akkaradb::engine {
                     else if (request.action == cluster::StripeControlAction::ROLLBACK_STREAM) {
                         static constexpr size_t ROLLBACK_STREAM_BATCH_KEYS = 256;
                         const auto keys = impl.rollbackKeysChangedAfter(request.fenceToken);
-                        const auto begin = request.key.empty()
-                                               ? keys.begin()
-                                               : std::ranges::upper_bound(keys, request.key);
+                        const auto begin = request.key.empty() ? keys.begin() : std::ranges::upper_bound(keys, request.key);
                         const auto remaining = static_cast<size_t>(std::distance(begin, keys.end()));
                         const auto batchSize = std::min(remaining, ROLLBACK_STREAM_BATCH_KEYS);
                         const auto end = std::next(begin, static_cast<std::ptrdiff_t>(batchSize));
@@ -5502,8 +5736,8 @@ namespace akkaradb::engine {
                         }
                         const bool done = end == keys.end();
                         const std::span<const uint8_t> nextCursor = done || begin == end
-                                                                          ? std::span<const uint8_t>{}
-                                                                          : std::span<const uint8_t>{*std::prev(end)};
+                                                                        ? std::span<const uint8_t>{}
+                                                                        : std::span<const uint8_t>{*std::prev(end)};
                         response.metadata = Impl::encodeRollbackStreamBatch(results, nextCursor, done);
                         response.status = cluster::StripeControlStatus::COMMITTED;
                         return response;
@@ -5518,9 +5752,9 @@ namespace akkaradb::engine {
                 catch (...) { response.status = cluster::StripeControlStatus::ERROR_STATUS; }
                 return response;
             };
-            callbacks.exportStripeMetadataSnapshot = [&impl](uint64_t metadataSequence)
-                -> std::optional<cluster::ClusterSnapshot> {
-                std::unique_lock lock{impl.writeMu};
+            callbacks.exportStripeMetadataSnapshot = [&impl](uint64_t metadataSequence) -> std::optional<cluster::ClusterSnapshot> {
+                std::unique_lock lock{impl.writeMu, std::try_to_lock};
+                if (!lock.owns_lock()) { return std::nullopt; }
                 if (metadataSequence == 0 || !impl.memtable) { return std::nullopt; }
                 const auto visible = impl.snapshotSeq();
                 memtable::MemTable::KeyRange range;
@@ -5528,8 +5762,15 @@ namespace akkaradb::engine {
                 if (impl.sstManager) { mt.emplace(impl.memtable->sealAndPinIterator(range, visible)); }
                 else {
                     const auto& policy = impl.opts.cluster.runtime.memoryOnlySnapshot;
-                    mt = impl.memtable->sealAndPinMemoryIterator(range, visible,
-                        policy.mode == cluster::MemoryOnlySnapshotMode::COMPLETION_FIRST, policy.maxPinnedBytes, policy.maxPinnedGenerations);
+                    mt = impl.memtable->sealAndPinMemoryIterator(
+                        range,
+                        visible,
+                        policy.mode == cluster::MemoryOnlySnapshotMode::COMPLETION_FIRST,
+                        policy.maxPinnedBytes,
+                        policy.maxPinnedGenerations,
+                        false,
+                        false
+                    );
                     if (!mt) { return std::nullopt; }
                 }
                 sst::SSTManager::Iterator sst;
@@ -5541,33 +5782,58 @@ namespace akkaradb::engine {
                     blob::BlobManager::ReadPin blobPin;
                     std::shared_ptr<Impl::StorageState> storage;
                 };
-                auto source = std::make_shared<MetadataSource>(MetadataSource{
-                    .memtable = std::move(*mt), .sst = std::move(sst),
-                    .history = impl.versionLog ? impl.versionLog->captureRecords() : vlog::VersionLog::RecordSnapshot{},
-                    .blobPin = impl.blobManager ? impl.blobManager->pinReads() : blob::BlobManager::ReadPin{}, .storage = impl.storage,
-                });
+                auto source = std::make_shared<MetadataSource>(
+                    MetadataSource{
+                        .memtable = std::move(*mt),
+                        .sst = std::move(sst),
+                        .history = impl.versionLog ? impl.versionLog->captureRecords() : vlog::VersionLog::RecordSnapshot{},
+                        .blobPin = impl.blobManager ? impl.blobManager->pinReads() : blob::BlobManager::ReadPin{},
+                        .storage = impl.storage,
+                    }
+                );
                 ensureDir(impl.clusterSnapshotExportDirectory());
-                auto exported = std::make_shared<ClusterSnapshotExportFile>(impl.newClusterSnapshotExportPath(), metadataSequence,
+                auto exported = std::make_shared<ClusterSnapshotExportFile>(
+                    impl.newClusterSnapshotExportPath(),
+                    metadataSequence,
                     [source](const cluster::SnapshotEntryVisitor& visitor) mutable {
                         auto* blobs = source->storage->blobManager.get();
-                        if (source->history && !source->history([&](auto key, const vlog::VersionEntry& entry) {
-                            if (!Impl::publicKeyFromStripeMetaKey(key)) { return true; }
-                            const auto encoded = cluster::detail::encodeSnapshotKey({cluster::detail::SnapshotRecordKind::HISTORY,
-                                entry.flags, entry.seq, entry.sourceNodeId, entry.timestampNs, key,
-                                Impl::snapshotBlobIdentity(entry.flags, entry.value)});
-                            return Impl::streamSnapshotValue(visitor, encoded, entry.value, entry.flags, blobs);
-                        })) { return false; }
+                        if (source->history && !source->history(
+                            [&](auto key, const vlog::VersionEntry& entry) {
+                                if (!Impl::publicKeyFromStripeMetaKey(key)) { return true; }
+                                const auto encoded = cluster::detail::encodeSnapshotKey(
+                                    {
+                                        cluster::detail::SnapshotRecordKind::HISTORY,
+                                        entry.flags,
+                                        entry.seq,
+                                        entry.sourceNodeId,
+                                        entry.timestampNs,
+                                        key,
+                                        Impl::snapshotBlobIdentity(entry.flags, entry.value)
+                                    }
+                                );
+                                return Impl::streamSnapshotValue(visitor, encoded, entry.value, entry.flags, blobs);
+                            }
+                        )) { return false; }
                         source->history = {};
                         for (const auto& record : storedScanGenerator(std::move(source->memtable), std::move(source->sst))) {
                             const bool alias = record.key.size() >= 22 && Impl::isStripeInternalKey(record.key) && record.key[4] == 'H';
                             if (!alias && !Impl::publicKeyFromStripeMetaKey(record.key)) { continue; }
-                            const auto encoded = cluster::detail::encodeSnapshotKey({cluster::detail::SnapshotRecordKind::HEAD,
-                                record.flags, 0, 0, 0, record.key,
-                                Impl::snapshotBlobIdentity(record.flags, record.value)});
+                            const auto encoded = cluster::detail::encodeSnapshotKey(
+                                {
+                                    cluster::detail::SnapshotRecordKind::HEAD,
+                                    record.flags,
+                                    0,
+                                    0,
+                                    0,
+                                    record.key,
+                                    Impl::snapshotBlobIdentity(record.flags, record.value)
+                                }
+                            );
                             if (!Impl::streamSnapshotValue(visitor, encoded, record.value, record.flags, blobs)) { return false; }
                         }
                         return true;
-                    });
+                    }
+                );
                 cluster::ClusterSnapshot snapshot;
                 snapshot.seq = metadataSequence;
                 snapshot.forEachEntry = [exported](const auto& visitor) { return exported->forEachEntry(visitor); };
@@ -5581,20 +5847,22 @@ namespace akkaradb::engine {
                 visitor.beginEntry = [&](auto encoded, uint64_t size, uint32_t) {
                     if (size > 4ull * 1024 * 1024) { throw std::runtime_error("AkkEngine: oversized metadata snapshot record"); }
                     const auto record = cluster::detail::decodeSnapshotKey(encoded);
-                    kind = record.kind; flags = record.flags & static_cast<uint8_t>(~MemHdr16::FLAG_BLOB);
-                    key.assign(record.key.begin(), record.key.end()); value.clear(); return true;
+                    kind = record.kind;
+                    flags = record.flags & static_cast<uint8_t>(~MemHdr16::FLAG_BLOB);
+                    key.assign(record.key.begin(), record.key.end());
+                    value.clear();
+                    return true;
                 };
                 visitor.appendValueChunk = [&](uint64_t offset, auto bytes) {
                     if (offset != value.size()) { throw std::runtime_error("AkkEngine: invalid metadata snapshot offset"); }
-                    value.insert(value.end(), bytes.begin(), bytes.end()); return true;
+                    value.insert(value.end(), bytes.begin(), bytes.end());
+                    return true;
                 };
                 visitor.finishEntry = [&] {
                     const bool alias = key.size() >= 22 && Impl::isStripeInternalKey(key) && key[4] == 'H';
                     const bool metadataKey = Impl::publicKeyFromStripeMetaKey(key).has_value();
-                    if ((!alias && !metadataKey) || kind == cluster::detail::SnapshotRecordKind::STATE ||
-                        (alias && kind != cluster::detail::SnapshotRecordKind::HEAD)) {
-                        throw std::runtime_error("AkkEngine: invalid metadata snapshot key");
-                    }
+                    if ((!alias && !metadataKey) || kind == cluster::detail::SnapshotRecordKind::STATE || (alias && kind !=
+                        cluster::detail::SnapshotRecordKind::HEAD)) { throw std::runtime_error("AkkEngine: invalid metadata snapshot key"); }
                     if (alias && value.size() < 8) { throw std::runtime_error("AkkEngine: truncated metadata placement alias"); }
                     auto metadata = Impl::decodeStripeMetadata(alias ? std::span<const uint8_t>{value}.subspan(8) : std::span<const uint8_t>{value});
                     if (!metadata || metadata->logicalSeq == 0 || metadata->logicalSeq > snapshot.seq) {
@@ -5606,27 +5874,25 @@ namespace akkaradb::engine {
                         if (current && *current == value) { return true; }
                         flags = alias ? 0 : metadata->rollback ? vlog::VLOG_FLAG_ROLLBACK : 0;
                     }
-                    impl.writeStripeLocal(key, value, cluster::ReplOpType::PUT, 0,
-                        metadata->rollback ? vlog::ROLLBACK_NODE : metadata->originNodeId, flags);
+                    impl.writeStripeLocal(key, value, cluster::ReplOpType::PUT, 0, metadata->rollback ? vlog::ROLLBACK_NODE : metadata->originNodeId, flags);
                     return true;
                 };
                 if (!snapshot.forEachEntry(visitor)) { throw std::runtime_error("AkkEngine: incomplete metadata snapshot install"); }
+                std::lock_guard lock{impl.writeMu};
+                impl.forceClusterLocalDurable();
+                return impl.clusterReplicationSeq();
             };
-            callbacks.beginBlob = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
-                if (impl.blobManager) {
+            if (impl.blobManager) {
+                callbacks.beginBlob = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t totalSize, uint32_t contentCrc32c) {
                     impl.blobManager->abortWrite(blobId);
                     impl.blobManager->beginWrite(blobId, totalSize, contentCrc32c);
-                }
-            };
-            callbacks.appendBlobChunk = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk) {
-                if (impl.blobManager) { impl.blobManager->appendWriteChunk(blobId, offset, chunk); }
-            };
-            callbacks.finishBlob = [&impl](uint64_t /*seq*/, uint64_t blobId) {
-                if (impl.blobManager) { impl.blobManager->finishWrite(blobId); }
-            };
-            callbacks.abortBlob = [&impl](uint64_t /*seq*/, uint64_t blobId) {
-                if (impl.blobManager) { impl.blobManager->abortWrite(blobId); }
-            };
+                };
+                callbacks.appendBlobChunk = [&impl](uint64_t /*seq*/, uint64_t blobId, uint64_t offset, std::span<const uint8_t> chunk) {
+                    impl.blobManager->appendWriteChunk(blobId, offset, chunk);
+                };
+                callbacks.finishBlob = [&impl](uint64_t /*seq*/, uint64_t blobId) { impl.blobManager->finishWrite(blobId); };
+                callbacks.abortBlob = [&impl](uint64_t /*seq*/, uint64_t blobId) { impl.blobManager->abortWrite(blobId); };
+            }
 
             if (!cluster::clusterRuntimeFactoryAvailable() && !cluster::loadClusterRuntimeBackend(impl.opts.cluster.runtimeBackendPath)) {
                 const auto detail = cluster::lastClusterRuntimeBackendLoadError();
@@ -5660,6 +5926,7 @@ namespace akkaradb::engine {
 
         if (!impl.writeCoordinator) { impl.writeCoordinator = impl.createWriteCoordinator(); }
         impl.forwardReady.store(true, std::memory_order_release);
+        impl.startDistributedRecovery();
         impl.startPlacementRecovery();
         impl.startRollbackRecovery();
 
@@ -5684,24 +5951,29 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         const auto& options = impl_->opts.cluster.runtime.requests;
         if (!impl_->clusterRuntime || !options.enabled) { throw std::logic_error("AkkEngine: retry-safe requests are disabled"); }
-        if (retentionMs == 0) { retentionMs = options.maxRetentionMs; }
+        if (retentionMs == 0) { retentionMs = options.defaultRetentionMs; }
         if (retentionMs > options.maxRetentionMs) { throw std::invalid_argument("AkkEngine: request retention exceeds configured maximum"); }
         cluster::ClusterRequestId id;
         crypto::secureRandom(id.nonce);
-        id.expiresAtUnixMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count()) + retentionMs;
+        id.expiresAtUnixMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).
+            count()) + retentionMs;
         return id;
     }
 
-    cluster::ClusterRequestResult AkkEngine::putWithRequest(const cluster::ClusterRequestId& id,
-       std::span<const uint8_t> key, std::span<const uint8_t> value) {
+    cluster::ClusterRequestResult AkkEngine::putWithRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key, std::span<const uint8_t> value) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        if (auto forwarded = impl_->tryForwardPoint(cluster::ForwardOperation::PUT_REQUEST, key, value, id)) { return forwarded->requestResult; }
-        std::shared_lock epochLock{impl_->mutationEpochMu};
-        return impl_->writeCoordinator->writeWithRequest(id, cluster::ReplOpType::PUT, key, value);
+        try {
+            if (auto forwarded = impl_->tryForwardPoint(cluster::ForwardOperation::PUT_REQUEST, key, value, id)) { return forwarded->requestResult; }
+            std::shared_lock epochLock{impl_->mutationEpochMu};
+            return impl_->writeCoordinator->writeWithRequest(id, cluster::ReplOpType::PUT, key, value);
+        }
+        catch (cluster::ClusterRoutingError& error) {
+            error.requestId = id;
+            throw;
+        }
     }
 
     cluster::ClusterRequestResult AkkEngine::removeWithRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key) {
@@ -5709,18 +5981,36 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        if (auto forwarded = impl_->tryForwardPoint(cluster::ForwardOperation::REMOVE_REQUEST, key, {}, id)) { return forwarded->requestResult; }
-        std::shared_lock epochLock{impl_->mutationEpochMu};
-        return impl_->writeCoordinator->writeWithRequest(id, cluster::ReplOpType::REMOVE, key, {});
+        try {
+            if (auto forwarded = impl_->tryForwardPoint(cluster::ForwardOperation::REMOVE_REQUEST, key, {}, id)) { return forwarded->requestResult; }
+            std::shared_lock epochLock{impl_->mutationEpochMu};
+            return impl_->writeCoordinator->writeWithRequest(id, cluster::ReplOpType::REMOVE, key, {});
+        }
+        catch (cluster::ClusterRoutingError& error) {
+            error.requestId = id;
+            throw;
+        }
+    }
+
+    cluster::ClusterRequestResult AkkEngine::queryLocalRequest(const cluster::ClusterRequestId& id) const {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        impl_->throwIfBackgroundFailed();
+        std::lock_guard lock{impl_->writeMu};
+        return impl_->queryLocalRequest(id);
     }
 
     cluster::ClusterRequestResult AkkEngine::queryRequest(const cluster::ClusterRequestId& id) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
-        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: retry-safe requests require Raft"); }
-        if (impl_->usesPartitionRaft()) { throw std::invalid_argument("AkkEngine: PARTITIONED queryRequest requires the original key"); }
+        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: retry-safe requests require an enabled cluster runtime"); }
+        if (impl_->clusterReplicationMode == cluster::ReplicationMode::PARTITIONED) {
+            throw std::invalid_argument("AkkEngine: PARTITIONED queryRequest requires the original key");
+        }
+        if (!impl_->clusterConfig.usesDataConsensus()) { return impl_->clusterRuntime->queryRequest(id); }
         cluster::ForwardRequest request;
-        request.operation = cluster::ForwardOperation::QUERY_REQUEST; request.deduplicationId = id;
+        request.operation = cluster::ForwardOperation::QUERY_REQUEST;
+        request.deduplicationId = id;
         request.entries.emplace_back();
         if (auto forwarded = impl_->tryForward(std::move(request))) { return forwarded->requestResult; }
         return impl_->clusterRuntime->queryRequest(id);
@@ -5729,7 +6019,8 @@ namespace akkaradb::engine {
     cluster::ClusterRequestResult AkkEngine::queryRequest(const cluster::ClusterRequestId& id, std::span<const uint8_t> key) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
-        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: retry-safe requests require Raft"); }
+        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: retry-safe requests require an enabled cluster runtime"); }
+        if (!impl_->clusterConfig.usesDataConsensus()) { return impl_->clusterRuntime->queryRequest(id); }
         if (auto forwarded = impl_->tryForwardPoint(cluster::ForwardOperation::QUERY_REQUEST, key, {}, id)) { return forwarded->requestResult; }
         return impl_->usesPartitionRaft() ? impl_->requireLocalPartition(key).impl_->clusterRuntime->queryRequest(id) : impl_->clusterRuntime->queryRequest(id);
     }
@@ -5737,6 +6028,19 @@ namespace akkaradb::engine {
     void AkkEngine::put(std::span<const uint8_t> key, std::span<const uint8_t> value) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime && impl_->opts.cluster.runtime.requests.enabled) {
+            const auto id = newRequestId();
+            const auto result = putWithRequest(id, key, value);
+            if (result.status != cluster::ClusterRequestStatus::APPLIED) {
+                throw cluster::ClusterRoutingError(
+                    cluster::ClusterRoutingCode::OUTCOME_UNKNOWN,
+                    {},
+                    "AkkEngine: request is pending or expired; query the original ID before considering another write",
+                    id
+                );
+            }
+            return;
+        }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->waitForVersionLogRecovery();
         if (impl_->tryForwardPoint(cluster::ForwardOperation::PUT, key, value)) { return; }
@@ -5747,6 +6051,19 @@ namespace akkaradb::engine {
     void AkkEngine::putHinted(std::span<const uint8_t> key, std::span<const uint8_t> value, uint64_t fp64, uint64_t miniKey) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime && impl_->opts.cluster.runtime.requests.enabled) {
+            const auto id = newRequestId();
+            const auto result = putWithRequest(id, key, value);
+            if (result.status != cluster::ClusterRequestStatus::APPLIED) {
+                throw cluster::ClusterRoutingError(
+                    cluster::ClusterRoutingCode::OUTCOME_UNKNOWN,
+                    {},
+                    "AkkEngine: request is pending or expired; query the original ID before considering another write",
+                    id
+                );
+            }
+            return;
+        }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->waitForVersionLogRecovery();
         if (impl_->tryForwardPoint(cluster::ForwardOperation::PUT, key, value)) { return; }
@@ -5765,9 +6082,10 @@ namespace akkaradb::engine {
         }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->waitForVersionLogRecovery();
-        if (impl_->clusterRuntime && std::ranges::any_of(entries, [&](const detail::BulkPutEntry& entry) {
-                return !impl_->clusterRuntime->ownsWriteKey(entry.key);
-            })) {
+        if (impl_->clusterRuntime && std::ranges::any_of(
+            entries,
+            [&](const detail::BulkPutEntry& entry) { return !impl_->clusterRuntime->ownsWriteKey(entry.key); }
+        )) {
             if (const auto target = impl_->resolveForwardEntries(entries, true)) {
                 size_t payloadSize = cluster::FORWARD_REQUEST_BASE_SIZE;
                 if (entries.size() > 65536) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, *target); }
@@ -5776,12 +6094,16 @@ namespace akkaradb::engine {
                         throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, *target);
                     }
                     payloadSize += 8 + entry.key.size() + entry.value.size();
-                    if (payloadSize > cluster::MAX_FORWARD_PAYLOAD) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, *target); }
+                    if (payloadSize > cluster::MAX_FORWARD_PAYLOAD) {
+                        throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::PAYLOAD_TOO_LARGE, *target);
+                    }
                 }
                 cluster::ForwardRequest request;
                 request.operation = cluster::ForwardOperation::PUT_BATCH;
                 request.entries.reserve(entries.size());
-                for (const auto& entry : entries) { request.entries.push_back({{entry.key.begin(), entry.key.end()}, {entry.value.begin(), entry.value.end()}}); }
+                for (const auto& entry : entries) {
+                    request.entries.push_back({{entry.key.begin(), entry.key.end()}, {entry.value.begin(), entry.value.end()}});
+                }
                 if (impl_->tryForward(std::move(request))) { return; }
             }
         }
@@ -5792,6 +6114,19 @@ namespace akkaradb::engine {
     void AkkEngine::remove(std::span<const uint8_t> key) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime && impl_->opts.cluster.runtime.requests.enabled) {
+            const auto id = newRequestId();
+            const auto result = removeWithRequest(id, key);
+            if (result.status != cluster::ClusterRequestStatus::APPLIED) {
+                throw cluster::ClusterRoutingError(
+                    cluster::ClusterRoutingCode::OUTCOME_UNKNOWN,
+                    {},
+                    "AkkEngine: request is pending or expired; query the original ID before considering another write",
+                    id
+                );
+            }
+            return;
+        }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->waitForVersionLogRecovery();
         if (impl_->tryForwardPoint(cluster::ForwardOperation::REMOVE, key)) { return; }
@@ -5802,6 +6137,19 @@ namespace akkaradb::engine {
     void AkkEngine::removeHinted(std::span<const uint8_t> key, uint64_t fp64, uint64_t miniKey) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
+        if (impl_->clusterRuntime && impl_->opts.cluster.runtime.requests.enabled) {
+            const auto id = newRequestId();
+            const auto result = removeWithRequest(id, key);
+            if (result.status != cluster::ClusterRequestStatus::APPLIED) {
+                throw cluster::ClusterRoutingError(
+                    cluster::ClusterRoutingCode::OUTCOME_UNKNOWN,
+                    {},
+                    "AkkEngine: request is pending or expired; query the original ID before considering another write",
+                    id
+                );
+            }
+            return;
+        }
         if (impl_->clusterRuntime) { impl_->throwIfBackgroundFailed(); }
         impl_->waitForVersionLogRecovery();
         if (impl_->tryForwardPoint(cluster::ForwardOperation::REMOVE, key)) { return; }
@@ -5814,7 +6162,10 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        // Routed reads may wait for Raft application, which needs exclusive
+        // visibility. The destination admits its local read after ReadIndex.
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterReadMustRoute()) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         return impl_->getValueClusterAware(key);
     }
@@ -5824,7 +6175,8 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterReadMustRoute()) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         if (!impl_->clusterReadMustRoute()) { impl_->waitForKeySequenceReadVisibility(); }
         if (impl_->usesPartitionRaft() && !impl_->clusterReadMustRoute()) {
@@ -5862,7 +6214,8 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterReadMustRoute()) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         if (impl_->clusterReadMustRoute()) {
             impl_->existsTotal.fetch_add(1, std::memory_order_relaxed);
@@ -5885,7 +6238,8 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterReadMustRoute()) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         return impl_->getIntoClusterAware(key, out);
     }
@@ -5895,7 +6249,8 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterReadMustRoute()) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         if (impl_->clusterReadMustRoute()) {
             auto value = impl_->getValueClusterAware(key);
@@ -5916,9 +6271,24 @@ namespace akkaradb::engine {
         impl_->waitForVersionLogRecovery();
         if (impl_->clusterRuntime) {
             size_t total = 0;
+            if (impl_->opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT) {
+                cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.forwardingTimeoutMs, [this] { return impl_->placementClosing(); }};
+                auto readers = impl_->prepareGlobalQuery(startKey, endKey, true);
+                for (auto& reader : readers) {
+                    const auto count = reader->activate(true);
+                    if (count > SIZE_MAX - total) { throw std::overflow_error("AkkEngine: overflowing cluster count"); }
+                    total += static_cast<size_t>(count);
+                }
+                cluster::detail::ReconfigurationDeadline::check();
+                return total;
+            }
             for (const auto& target : impl_->rangeQueryPlan(startKey)) {
-                const auto response = impl_->sendReadQuery(target.node, impl_->openQueryRequest(Impl::QueryAction::COUNT, startKey, endKey, 0, target.partitions));
-                size_t cursor = 0; uint64_t count = 0;
+                const auto response = impl_->sendReadQuery(
+                    target.node,
+                    impl_->openQueryRequest(Impl::QueryAction::COUNT, startKey, endKey, 0, target.partitions)
+                );
+                size_t cursor = 0;
+                uint64_t count = 0;
                 if (!Impl::pullU64(response.value, cursor, count) || cursor != response.value.size() || count > SIZE_MAX - total) {
                     throw std::overflow_error("AkkEngine: invalid or overflowing cluster count");
                 }
@@ -5985,15 +6355,29 @@ namespace akkaradb::engine {
         if (impl_->clusterRuntime) {
             impl_->waitForVersionLogRecovery();
             std::vector<std::unique_ptr<Impl::QueryReader>> readers;
-            for (const auto& target : impl_->rangeQueryPlan(startKey)) {
-                readers.push_back(std::make_unique<Impl::QueryReader>(*impl_, target.node,
-                    impl_->openQueryRequest(Impl::QueryAction::SCAN, startKey, endKey, 0, target.partitions)));
-                readers.back()->operationLifetime = operation;
+            if (impl_->opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT) {
+                cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.forwardingTimeoutMs, [this] { return impl_->placementClosing(); }};
+                readers = impl_->prepareGlobalQuery(startKey, endKey, false);
+                for (auto& reader : readers) { (void)reader->activate(false); }
+                cluster::detail::ReconfigurationDeadline::check();
             }
+            else {
+                for (const auto& target : impl_->rangeQueryPlan(startKey)) {
+                    readers.push_back(
+                        std::make_unique<Impl::QueryReader>(
+                            *impl_,
+                            target.node,
+                            impl_->openQueryRequest(Impl::QueryAction::SCAN, startKey, endKey, 0, target.partitions)
+                        )
+                    );
+                }
+            }
+            for (auto& reader : readers) { reader->operationLifetime = operation; }
             impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
-            return core::ArenaGenerator<ScanRecordView>::withArena(arena, [&] {
-                return impl_->clusterScanGenerator(arena, std::move(readers), std::move(operation));
-            });
+            return core::ArenaGenerator<ScanRecordView>::withArena(
+                arena,
+                [&] { return impl_->clusterScanGenerator(arena, std::move(readers), std::move(operation)); }
+            );
         }
         return scanLocalStorage(arena, startKey, endKey);
     }
@@ -6012,9 +6396,10 @@ namespace akkaradb::engine {
         impl_->waitForKeySequenceReadVisibility();
         impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
         if (impl_->usesPartitionRaft()) {
-            return core::ArenaGenerator<ScanRecordView>::withArena(arena, [&] {
-                return impl_->partitionPublicLocalScan({startKey.begin(), startKey.end()}, {endKey.begin(), endKey.end()}, std::move(operation));
-            });
+            return core::ArenaGenerator<ScanRecordView>::withArena(
+                arena,
+                [&] { return impl_->partitionPublicLocalScan({startKey.begin(), startKey.end()}, {endKey.begin(), endKey.end()}, std::move(operation)); }
+            );
         }
 
         memtable::MemTable::KeyRange range;
@@ -6034,8 +6419,7 @@ namespace akkaradb::engine {
         if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq); }
         return core::ArenaGenerator<ScanRecordView>::withArena(
             arena,
-            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation)
-            ]() mutable {
+            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation) ]() mutable {
                 return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(operation));
             }
         );
@@ -6044,7 +6428,8 @@ namespace akkaradb::engine {
     std::optional<std::vector<uint8_t>> AkkEngine::getAt(std::span<const uint8_t> key, uint64_t atSeq) const {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterRuntime) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         return impl_->getAtValue(key, atSeq);
     }
@@ -6063,7 +6448,8 @@ namespace akkaradb::engine {
         auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
         impl_->throwIfBackgroundFailed();
         impl_->waitForVersionLogRecovery();
-        std::shared_lock transactionRead{impl_->transactionVisibilityMu};
+        std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
+        if (!impl_->clusterRuntime) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
         core::ArenaGenerator<VersionEntry> local;
         std::unique_ptr<Impl::QueryReader> reader;
@@ -6072,9 +6458,11 @@ namespace akkaradb::engine {
             const auto target = impl_->queryTargets(key, false).front();
             reader = std::make_unique<Impl::QueryReader>(*impl_, target, impl_->openQueryRequest(Impl::QueryAction::HISTORY, key, {}, 0));
         }
-        return core::ArenaGenerator<VersionEntry>::withOwnedArena(4096, 65536, [&] {
-            return Impl::publicHistoryGenerator(std::move(local), std::move(reader), std::move(operation));
-        });
+        return core::ArenaGenerator<VersionEntry>::withOwnedArena(
+            4096,
+            65536,
+            [&] { return Impl::publicHistoryGenerator(std::move(local), std::move(reader), std::move(operation)); }
+        );
     }
 
     RollbackResult AkkEngine::rollbackTo(uint64_t targetSeq, RollbackOptions options) {
@@ -6087,18 +6475,19 @@ namespace akkaradb::engine {
         RollbackResult result;
         crypto::secureRandom(result.operationId);
         std::optional<std::array<uint8_t, 16>> deferredTask;
-        const uint64_t plannedWatermark = options.execution == RollbackExecutionMode::IMMEDIATE
-                                              ? UINT64_MAX
-                                              : impl_->captureRollbackWatermark();
+        const uint64_t plannedWatermark = options.execution == RollbackExecutionMode::IMMEDIATE ? UINT64_MAX : impl_->captureRollbackWatermark();
         if (options.execution != RollbackExecutionMode::IMMEDIATE) {
             deferredTask = impl_->scheduleDeferredRollback(
-                result.operationId, cluster::StripeControlAction::ROLLBACK_STREAM, false, 0, targetSeq,
-                plannedWatermark, options.conflict
+                result.operationId,
+                cluster::StripeControlAction::ROLLBACK_STREAM,
+                false,
+                0,
+                targetSeq,
+                plannedWatermark,
+                options.conflict
             );
             if (options.execution == RollbackExecutionMode::NEXT_STARTUP) {
-                result.items.push_back(RollbackItemResult{
-                    .key = {}, .status = RollbackItemStatus::DEFERRED, .message = "scheduled for the next startup"
-                });
+                result.items.push_back(RollbackItemResult{.key = {}, .status = RollbackItemStatus::DEFERRED, .message = "scheduled for the next startup"});
                 return result;
             }
         }
@@ -6106,18 +6495,13 @@ namespace akkaradb::engine {
             std::unique_lock epochLock{impl_->mutationEpochMu};
             impl_->versionLog->forceSync();
             for (const auto& key : impl_->rollbackKeysChangedAfter(targetSeq)) {
-                result.items.push_back(impl_->rollbackKeyLocal(
-                    key, targetSeq, options.conflict, 0,
-                    deferredTask ? plannedWatermark : UINT64_MAX
-                ));
+                result.items.push_back(impl_->rollbackKeyLocal(key, targetSeq, options.conflict, 0, deferredTask ? plannedWatermark : UINT64_MAX));
             }
             if (deferredTask) { impl_->completeDeferredRollback(*deferredTask); }
         }
         catch (const std::exception& error) {
             if (!deferredTask) { throw; }
-            result.items.push_back(RollbackItemResult{
-                .key = {}, .status = RollbackItemStatus::DEFERRED, .message = error.what()
-            });
+            result.items.push_back(RollbackItemResult{.key = {}, .status = RollbackItemStatus::DEFERRED, .message = error.what()});
         }
         return result;
     }
@@ -6132,37 +6516,34 @@ namespace akkaradb::engine {
         RollbackResult result;
         crypto::secureRandom(result.operationId);
         std::optional<std::array<uint8_t, 16>> deferredTask;
-        const uint64_t plannedWatermark = options.execution == RollbackExecutionMode::IMMEDIATE
-                                              ? UINT64_MAX
-                                              : impl_->captureRollbackWatermark();
+        const uint64_t plannedWatermark = options.execution == RollbackExecutionMode::IMMEDIATE ? UINT64_MAX : impl_->captureRollbackWatermark();
         if (options.execution != RollbackExecutionMode::IMMEDIATE) {
             deferredTask = impl_->scheduleDeferredRollback(
-                result.operationId, cluster::StripeControlAction::ROLLBACK_KEY, false, 0, targetSeq,
-                plannedWatermark, options.conflict, key
+                result.operationId,
+                cluster::StripeControlAction::ROLLBACK_KEY,
+                false,
+                0,
+                targetSeq,
+                plannedWatermark,
+                options.conflict,
+                key
             );
             if (options.execution == RollbackExecutionMode::NEXT_STARTUP) {
-                result.items.push_back(RollbackItemResult{
-                    .key = {key.begin(), key.end()},
-                    .status = RollbackItemStatus::DEFERRED,
-                    .message = "scheduled for the next startup",
-                });
+                result.items.push_back(
+                    RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = "scheduled for the next startup",}
+                );
                 return result;
             }
         }
         try {
             std::unique_lock epochLock{impl_->mutationEpochMu};
             impl_->versionLog->forceSync();
-            result.items.push_back(impl_->rollbackKeyLocal(
-                key, targetSeq, options.conflict, 0,
-                deferredTask ? plannedWatermark : UINT64_MAX
-            ));
+            result.items.push_back(impl_->rollbackKeyLocal(key, targetSeq, options.conflict, 0, deferredTask ? plannedWatermark : UINT64_MAX));
             if (deferredTask) { impl_->completeDeferredRollback(*deferredTask); }
         }
         catch (const std::exception& error) {
             if (!deferredTask) { throw; }
-            result.items.push_back(RollbackItemResult{
-                .key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = error.what()
-            });
+            result.items.push_back(RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = error.what()});
         }
         return result;
     }
@@ -6189,7 +6570,12 @@ namespace akkaradb::engine {
             const auto placement = impl_->livePlacement.load();
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{impl_->opts.cluster.runtime.forwardingTimeoutMs};
             for (uint16_t index = 0; index < placement->partition().partitionCount; ++index) {
-                const auto response = impl_->partitionRpcLeader(index, Impl::partitionAdminHeader(Impl::PartitionAdmin::WATERMARK, index, 0), *placement, deadline);
+                const auto response = impl_->partitionRpcLeader(
+                    index,
+                    Impl::partitionAdminHeader(Impl::PartitionAdmin::WATERMARK, index, 0),
+                    *placement,
+                    deadline
+                );
                 checkpoint.watermarks.push_back(Revision{.streamId = uint64_t{index} + 1, .seq = Impl::partitionAdminNumber(response.value)});
             }
             return checkpoint;
@@ -6201,8 +6587,7 @@ namespace akkaradb::engine {
             const auto response = impl_->clusterRuntime->rollbackControl(targetNodeId, std::move(request));
             if (response.status != cluster::StripeControlStatus::COMMITTED) {
                 throw std::runtime_error(
-                    "AkkEngine: checkpoint watermark request failed with status " +
-                    std::to_string(static_cast<unsigned>(response.status))
+                    "AkkEngine: checkpoint watermark request failed with status " + std::to_string(static_cast<unsigned>(response.status))
                 );
             }
             return response.fenceToken;
@@ -6259,29 +6644,29 @@ namespace akkaradb::engine {
         const auto watermarkResponse = impl_->clusterRuntime->rollbackControl(controlNode, std::move(watermarkRequest));
         if (watermarkResponse.status != cluster::StripeControlStatus::COMMITTED) {
             throw std::runtime_error(
-                "AkkEngine: rollback planning watermark request failed with status " +
-                std::to_string(static_cast<unsigned>(watermarkResponse.status))
+                "AkkEngine: rollback planning watermark request failed with status " + std::to_string(static_cast<unsigned>(watermarkResponse.status))
             );
         }
         const uint64_t plannedWatermark = watermarkResponse.fenceToken;
-        if (target.seq > plannedWatermark) {
-            throw std::invalid_argument("AkkEngine: revision is ahead of the current stream watermark");
-        }
+        if (target.seq > plannedWatermark) { throw std::invalid_argument("AkkEngine: revision is ahead of the current stream watermark"); }
         RollbackResult result;
         crypto::secureRandom(result.operationId);
         std::optional<std::array<uint8_t, 16>> deferredTask;
         if (options.execution != RollbackExecutionMode::IMMEDIATE) {
             deferredTask = impl_->scheduleDeferredRollback(
-                result.operationId, cluster::StripeControlAction::ROLLBACK_KEY, true,
+                result.operationId,
+                cluster::StripeControlAction::ROLLBACK_KEY,
+                true,
                 impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE ? 0 : controlNode,
-                target.seq, plannedWatermark, options.conflict, key
+                target.seq,
+                plannedWatermark,
+                options.conflict,
+                key
             );
             if (options.execution == RollbackExecutionMode::NEXT_STARTUP) {
-                result.items.push_back(RollbackItemResult{
-                    .key = {key.begin(), key.end()},
-                    .status = RollbackItemStatus::DEFERRED,
-                    .message = "scheduled for the next startup",
-                });
+                result.items.push_back(
+                    RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = "scheduled for the next startup",}
+                );
                 return result;
             }
         }
@@ -6294,17 +6679,13 @@ namespace akkaradb::engine {
         if (deferredTask) { Impl::pushU64(request.metadata, plannedWatermark); }
         try {
             const auto response = impl_->clusterRuntime->rollbackControl(controlNode, std::move(request));
-            if (response.status != cluster::StripeControlStatus::COMMITTED) {
-                throw std::runtime_error("AkkEngine: cluster rollback request was rejected");
-            }
+            if (response.status != cluster::StripeControlStatus::COMMITTED) { throw std::runtime_error("AkkEngine: cluster rollback request was rejected"); }
             result.items = Impl::decodeRollbackItems(response.metadata);
             if (deferredTask) { impl_->completeDeferredRollback(*deferredTask); }
         }
         catch (const std::exception& error) {
             if (!deferredTask) { throw; }
-            result.items.push_back(RollbackItemResult{
-                .key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = error.what()
-            });
+            result.items.push_back(RollbackItemResult{.key = {key.begin(), key.end()}, .status = RollbackItemStatus::DEFERRED, .message = error.what()});
         }
         return result;
     }
@@ -6318,16 +6699,14 @@ namespace akkaradb::engine {
         if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: ClusterCheckpoint rollback requires cluster mode"); }
         if (!impl_->versionLog) { throw std::runtime_error("AkkEngine: version log is disabled"); }
         if (impl_->usesPartitionRaft()) {
-            if (target.clusterId != impl_->clusterConfig.clusterId() || target.timelineId != 1 ||
-                target.watermarks.size() != impl_->clusterConfig.partition().partitionCount) {
-                throw std::invalid_argument("AkkEngine: checkpoint belongs to another partition layout or timeline");
-            }
+            if (target.clusterId != impl_->clusterConfig.clusterId() || target.timelineId != 1 || target.watermarks.size() != impl_->clusterConfig.partition().
+                partitionCount) { throw std::invalid_argument("AkkEngine: checkpoint belongs to another partition layout or timeline"); }
             std::map<uint64_t, uint64_t> streams;
             for (const auto& revision : target.watermarks) {
-                if (revision.streamId == 0 || revision.streamId > impl_->clusterConfig.partition().partitionCount ||
-                    !streams.emplace(revision.streamId, revision.seq).second) {
-                    throw std::invalid_argument("AkkEngine: checkpoint contains unknown or duplicate partition streams");
-                }
+                if (revision.streamId == 0 || revision.streamId > impl_->clusterConfig.partition().partitionCount || !streams.emplace(
+                    revision.streamId,
+                    revision.seq
+                ).second) { throw std::invalid_argument("AkkEngine: checkpoint contains unknown or duplicate partition streams"); }
             }
             const auto current = createClusterCheckpoint();
             for (const auto& revision : current.watermarks) {
@@ -6341,8 +6720,8 @@ namespace akkaradb::engine {
             }
             return result;
         }
-        if (target.clusterId != impl_->clusterConfig.clusterId() || (impl_->clusterReplicationMode != cluster::ReplicationMode::STRIPE && target.configEpoch != impl_->clusterRuntime->configurationEpoch()) ||
-            target.timelineId != 1) {
+        if (target.clusterId != impl_->clusterConfig.clusterId() || (impl_->clusterReplicationMode != cluster::ReplicationMode::STRIPE && target.configEpoch !=
+            impl_->clusterRuntime->configurationEpoch()) || target.timelineId != 1) {
             throw std::invalid_argument("AkkEngine: checkpoint belongs to a different cluster configuration or timeline");
         }
         std::unordered_map<uint64_t, uint64_t> watermarks;
@@ -6391,33 +6770,34 @@ namespace akkaradb::engine {
             const auto watermarkResponse = impl_->clusterRuntime->rollbackControl(controlNode, std::move(watermarkRequest));
             if (watermarkResponse.status != cluster::StripeControlStatus::COMMITTED) {
                 throw std::runtime_error(
-                    "AkkEngine: rollback planning watermark request failed with status " +
-                    std::to_string(static_cast<unsigned>(watermarkResponse.status))
+                    "AkkEngine: rollback planning watermark request failed with status " + std::to_string(static_cast<unsigned>(watermarkResponse.status))
                 );
             }
-            if (targetWatermark > watermarkResponse.fenceToken) {
-                throw std::invalid_argument("AkkEngine: checkpoint is ahead of a current stream watermark");
-            }
-            plannedRequests.push_back(PlannedStreamRollback{
-                .controlNode = controlNode,
-                .targetWatermark = targetWatermark,
-                .plannedWatermark = watermarkResponse.fenceToken,
-            });
+            if (targetWatermark > watermarkResponse.fenceToken) { throw std::invalid_argument("AkkEngine: checkpoint is ahead of a current stream watermark"); }
+            plannedRequests.push_back(
+                PlannedStreamRollback{.controlNode = controlNode, .targetWatermark = targetWatermark, .plannedWatermark = watermarkResponse.fenceToken,}
+            );
         }
         for (const auto& planned : plannedRequests) {
             std::optional<std::array<uint8_t, 16>> deferredTask;
             if (options.execution != RollbackExecutionMode::IMMEDIATE) {
                 deferredTask = impl_->scheduleDeferredRollback(
-                    result.operationId, cluster::StripeControlAction::ROLLBACK_STREAM, true,
+                    result.operationId,
+                    cluster::StripeControlAction::ROLLBACK_STREAM,
+                    true,
                     impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE ? 0 : planned.controlNode,
-                    planned.targetWatermark, planned.plannedWatermark, options.conflict
+                    planned.targetWatermark,
+                    planned.plannedWatermark,
+                    options.conflict
                 );
                 if (options.execution == RollbackExecutionMode::NEXT_STARTUP) {
-                    result.items.push_back(RollbackItemResult{
-                        .key = {},
-                        .status = RollbackItemStatus::DEFERRED,
-                        .message = "stream " + std::to_string(planned.controlNode) + " is scheduled for the next startup",
-                    });
+                    result.items.push_back(
+                        RollbackItemResult{
+                            .key = {},
+                            .status = RollbackItemStatus::DEFERRED,
+                            .message = "stream " + std::to_string(planned.controlNode) + " is scheduled for the next startup",
+                        }
+                    );
                     continue;
                 }
             }
@@ -6429,20 +6809,14 @@ namespace akkaradb::engine {
                     request.ownerNodeId = planned.controlNode;
                     request.fenceToken = planned.targetWatermark;
                     request.key = cursor;
-                    request.metadata = {
-                        static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE),
-                        static_cast<uint8_t>(options.conflict),
-                    };
+                    request.metadata = {static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE), static_cast<uint8_t>(options.conflict),};
                     if (deferredTask) { Impl::pushU64(request.metadata, planned.plannedWatermark); }
                     const auto response = impl_->clusterRuntime->rollbackControl(planned.controlNode, std::move(request));
                     if (response.status != cluster::StripeControlStatus::COMMITTED) {
                         throw std::runtime_error("AkkEngine: cluster rollback stream request was rejected");
                     }
                     auto batch = Impl::decodeRollbackStreamBatch(response.metadata);
-                    result.items.insert(
-                        result.items.end(), std::make_move_iterator(batch.items.begin()),
-                        std::make_move_iterator(batch.items.end())
-                    );
+                    result.items.insert(result.items.end(), std::make_move_iterator(batch.items.begin()), std::make_move_iterator(batch.items.end()));
                     if (batch.done) { break; }
                     cursor = std::move(batch.nextCursor);
                 }
@@ -6450,302 +6824,19 @@ namespace akkaradb::engine {
             }
             catch (const std::exception& error) {
                 if (!deferredTask) { throw; }
-                result.items.push_back(RollbackItemResult{
-                    .key = {}, .status = RollbackItemStatus::DEFERRED, .message = error.what()
-                });
+                result.items.push_back(RollbackItemResult{.key = {}, .status = RollbackItemStatus::DEFERRED, .message = error.what()});
             }
         }
         return result;
     }
 
-    EngineStats AkkEngine::stats() const noexcept {
-        EngineStats out;
-        if (!impl_) { return out; }
-        Impl::OperationGuard operation{*impl_, false};
-        if (!operation) { return out; }
-
-        out.currentSeq = impl_->snapshotSeq();
-        out.nodeId = impl_->nodeId;
-        {
-            std::lock_guard lock{impl_->stripeRepairStatsMu};
-            out.stripeReadRepair = impl_->stripeRepairStats;
-        }
-        {
-            std::lock_guard lock{impl_->stripeRebuildStatsMu};
-            out.stripeRebuild = impl_->stripeRebuildStats;
-        }
-
-        out.putsTotal = impl_->putsTotal.load(std::memory_order_relaxed);
-        out.removesTotal = impl_->removesTotal.load(std::memory_order_relaxed);
-        out.getsTotal = impl_->getsTotal.load(std::memory_order_relaxed);
-        out.getsMemtableHit = impl_->getsMemtableHit.load(std::memory_order_relaxed);
-        out.getsSstHit = impl_->getsSstHit.load(std::memory_order_relaxed);
-        out.getsMiss = impl_->getsMiss.load(std::memory_order_relaxed);
-        out.existsTotal = impl_->existsTotal.load(std::memory_order_relaxed);
-        out.scansTotal = impl_->scansTotal.load(std::memory_order_relaxed);
-        out.blobPutsTotal = impl_->blobPutsTotal.load(std::memory_order_relaxed);
-        out.config.writeAdmission = static_cast<uint32_t>(impl_->opts.runtime.writeAdmission);
-        out.config.writeDurability = static_cast<uint32_t>(impl_->opts.runtime.writeDurability);
-        out.config.writeVisibility = static_cast<uint32_t>(impl_->opts.runtime.writeVisibility);
-        out.config.readVisibility = static_cast<uint32_t>(impl_->opts.runtime.visibility.readVisibility);
-        out.config.sequenceAllocation = static_cast<uint32_t>(impl_->opts.runtime.sequence.allocation);
-        out.config.sequenceThreadLocalRangeSize = impl_->opts.runtime.sequence.threadLocalRangeSize;
-        out.config.commitWindowSize = impl_->commitWindowSize;
-        out.config.memtableBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.memtableFlushBacklog);
-        out.config.maxMemtableImmutableTables = impl_->opts.runtime.backpressure.maxMemtableImmutableTables;
-        out.config.sstBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.sstCompactionBacklog);
-        out.config.maxSstL0Files = impl_->opts.runtime.backpressure.maxSstL0Files;
-        out.config.backpressureWaitMicros = impl_->opts.runtime.backpressure.waitMicros;
-        out.config.backpressureTimeoutMs = impl_->opts.runtime.backpressure.timeoutMs;
-        out.config.memtableFlushMode = static_cast<uint32_t>(impl_->opts.memtable.flushMode);
-        out.config.walExecution = static_cast<uint32_t>(impl_->opts.wal.execution);
-        out.config.walSyncPolicy = static_cast<uint32_t>(impl_->opts.wal.syncPolicy);
-        out.config.walBackpressure = static_cast<uint32_t>(impl_->opts.wal.backpressure);
-        out.config.sstCompactionMode = static_cast<uint32_t>(impl_->opts.sst.compactionMode);
-        out.backpressure.blockedWrites = impl_->backpressureBlockedWrites.load(std::memory_order_relaxed);
-        out.backpressure.rejectedWrites = impl_->backpressureRejectedWrites.load(std::memory_order_relaxed);
-        out.backpressure.timedOutWrites = impl_->backpressureTimedOutWrites.load(std::memory_order_relaxed);
-        out.backpressure.memtableStalls = impl_->backpressureMemtableStalls.load(std::memory_order_relaxed);
-        out.backpressure.sstStalls = impl_->backpressureSstStalls.load(std::memory_order_relaxed);
-        out.backpressure.waitMicrosTotal = impl_->backpressureWaitMicrosTotal.load(std::memory_order_relaxed);
-        out.backpressure.waitMicrosMax = impl_->backpressureWaitMicrosMax.load(std::memory_order_relaxed);
-        out.api.enabled = impl_->opts.components.apiEnabled;
-        if (impl_->apiServer) { out.api = impl_->apiServer->stats(); }
-
-        if (impl_->memtable) {
-            const auto snap = impl_->memtable->snapshot();
-            out.memtable.shardCount = snap.shardCount;
-            out.memtable.thresholdBytesPerShard = snap.thresholdBytesPerShard;
-            out.memtable.approxBytes = snap.approxBytes;
-            out.memtable.putsApplied = snap.putsApplied;
-            out.memtable.removesApplied = snap.removesApplied;
-            out.memtable.flushesCompleted = snap.flushesCompleted;
-            out.memtable.immutableTables = snap.immutableTables;
-            out.memtable.memorySnapshotCompactionsCompleted = snap.memorySnapshotCompactionsCompleted;
-            out.memtable.memorySnapshotCompactionFailures = snap.memorySnapshotCompactionFailures;
-            out.memtable.memorySnapshotCompactionLastFailureAtUs = snap.memorySnapshotCompactionLastFailureAtUs;
-            out.memtable.memorySnapshotCompactionPending = snap.memorySnapshotCompactionPending;
-        }
-
-        out.wal.enabled = impl_->opts.components.walEnabled;
-        if (impl_->walWriter) {
-            const auto snap = impl_->walWriter->snapshot();
-            out.wal.shardCount = snap.shardCount;
-            out.wal.entriesWritten = snap.entriesWritten;
-            out.wal.bytesWritten = snap.bytesWritten;
-            out.wal.batchesFlushed = snap.batchesFlushed;
-            out.wal.syncsExecuted = snap.syncsExecuted;
-            out.wal.segmentRotations = snap.segmentRotations;
-            out.wal.asyncFailures = snap.asyncFailures;
-            out.wal.pendingEntries = snap.pendingEntries;
-            out.wal.pendingBytes = snap.pendingBytes;
-            out.wal.inFlightBytes = snap.inFlightBytes;
-            out.wal.healthy = snap.healthy;
-        }
-
-        out.blob.enabled = impl_->opts.components.blobEnabled && impl_->blobManager != nullptr;
-        out.blob.thresholdBytes = impl_->opts.blob.thresholdBytes;
-        if (impl_->blobManager) {
-            const auto snap = impl_->blobManager->snapshot();
-            out.blob.blobsWritten = snap.blobsWritten;
-            out.blob.bytesUncompressed = snap.bytesUncompressed;
-            out.blob.bytesOnDisk = snap.bytesOnDisk;
-            out.blob.blobsDeleted = snap.blobsDeleted;
-            out.blob.gcCycles = snap.gcCycles;
-        }
-
-        out.sst.enabled = impl_->sstManager != nullptr;
-        if (impl_->sstManager) {
-            const auto levels = impl_->sstManager->levelStats();
-            out.sst.levels.reserve(levels.size());
-            for (const auto& level : levels) {
-                out.sst.levels.push_back(LevelStats{level.level, level.fileCount, level.bytes, level.budgetBytes});
-                out.sst.fileCount += level.fileCount;
-                out.sst.bytes += level.bytes;
-                if (level.level == 0) { out.sst.l0FileCount = level.fileCount; }
-            }
-            out.sst.compactionPending = impl_->sstManager->compactionPending();
-            const auto snap = impl_->sstManager->compactionSnapshot();
-            out.sst.compactionsCompleted = snap.compactionsCompleted;
-            out.sst.filesCompacted = snap.filesCompacted;
-            out.sst.bytesCompactedIn = snap.bytesCompactedIn;
-            out.sst.bytesCompactedOut = snap.bytesCompactedOut;
-            out.sst.compactionFailures = snap.compactionFailures;
-        }
-
-        out.manifest.enabled = impl_->manifest != nullptr;
-        if (impl_->manifest) {
-            const auto checkpoint = impl_->manifest->lastCheckpoint();
-            out.manifest.hasCheckpoint = checkpoint.has_value();
-            if (checkpoint.has_value()) {
-                out.manifest.lastCheckpointSeq = checkpoint->lastSeq.value_or(0);
-                out.manifest.lastCheckpointStripe = checkpoint->stripe.value_or(0);
-            }
-            out.manifest.liveSstCount = impl_->manifest->liveSst().size();
-            out.manifest.deletedSstCount = impl_->manifest->deletedSst().size();
-            out.manifest.sstSealCount = impl_->manifest->sstSeals().size();
-            out.manifest.sstReferencedBlobCount = impl_->manifest->sstReferencedBlobs().size();
-            out.manifest.sstBlobRefsComplete = impl_->manifest->sstBlobRefsComplete();
-            out.manifest.liveBlobCount = impl_->manifest->liveBlobs().size();
-            out.manifest.deletedBlobCount = impl_->manifest->deletedBlobs().size();
-            out.manifest.blobPutCount = impl_->manifest->blobPuts().size();
-            out.manifest.blobDeleteCount = impl_->manifest->blobDeletes().size();
-            if (const auto lease = impl_->manifest->lastPrimaryLease(); lease.has_value()) {
-                out.manifest.lastPrimaryLeaseNodeId = lease->nodeId;
-                out.manifest.lastPrimaryLeaseUntilUs = lease->leaseUntilUs;
-            }
-        }
-
-        out.cluster.enabled = impl_->opts.components.clusterEnabled && impl_->clusterRuntime != nullptr;
-        out.cluster.configuredNodeCount = impl_->clusterConfiguredNodeCount;
-        if (out.cluster.enabled) {
-            out.cluster.clusterId = impl_->clusterConfig.clusterId();
-            out.cluster.replicationMode = static_cast<uint32_t>(impl_->clusterConfig.mode());
-            out.cluster.consistencyMode = static_cast<uint32_t>(impl_->clusterConfig.consistency().mode);
-            out.cluster.transportMode = static_cast<uint32_t>(impl_->opts.cluster.runtime.transportMode);
-            out.cluster.clusterGroupId = impl_->opts.cluster.runtime.clusterGroupId;
-            out.cluster.clusterGroupEpoch = impl_->opts.cluster.runtime.clusterGroupEpoch;
-            const auto configured = impl_->usesPartitionRaft() || impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE
-                ? impl_->currentPlacement().nodes() : impl_->clusterConfig.usesDataConsensus()
-                ? impl_->clusterRuntime->activeNodes() : impl_->clusterConfig.nodes();
-            out.cluster.configuredNodeCount = static_cast<uint32_t>(configured.size());
-            out.cluster.configuredNodes.reserve(configured.size());
-            for (const auto& node : configured) {
-                out.cluster.configuredNodes.push_back({
-                    .nodeId = node.nodeId,
-                    .host = node.host,
-                    .dataPort = node.dataPort,
-                    .replPort = node.replPort,
-                    .stripeMetadataPort = node.stripeMetadataPort,
-                    .capabilities = node.capabilities,
-                });
-            }
-        }
-        if (impl_->clusterRuntime) {
-            out.cluster.role = static_cast<uint32_t>(impl_->clusterRuntime->role());
-            out.cluster.activeNodeCount = impl_->clusterRuntime->activeNodes().size();
-            const auto runtime = impl_->clusterRuntime->raftStats();
-            const auto metadataRuntime = impl_->clusterRuntime->stripeMetadataRaftStats();
-            out.cluster.sampledAtUs = runtime.sampledAtUs;
-            out.cluster.runtimeStartedAtUs = runtime.runtimeStartedAtUs;
-            out.cluster.clusterGroupId = runtime.clusterGroupId;
-            out.cluster.clusterGroupEpoch = runtime.clusterGroupEpoch;
-            out.cluster.health = runtime.health;
-            if (out.cluster.health != ClusterHealthState::FAILED && out.stripeRebuild.active) {
-                out.cluster.health = ClusterHealthState::REBUILDING;
-            }
-            out.cluster.lastFailure = runtime.lastFailure;
-            out.cluster.lastFailureAtUs = runtime.lastFailureAtUs;
-            out.cluster.raftEnabled = runtime.enabled;
-            if (runtime.enabled) {
-                out.cluster.activeNodeCount = 1;
-                for (const auto& peer : runtime.peers) { if (peer.connected) { ++out.cluster.activeNodeCount; } }
-            }
-            out.cluster.raftTerm = runtime.currentTerm;
-            out.cluster.leaderNodeId = runtime.leaderNodeId;
-            out.cluster.commitIndex = runtime.commitIndex;
-            out.cluster.appliedIndex = runtime.appliedIndex;
-            out.cluster.lastLogIndex = runtime.lastLogIndex;
-            out.cluster.snapshotIndex = runtime.snapshotIndex;
-            out.cluster.voterCount = runtime.voterCount;
-            out.cluster.learnerCount = runtime.learnerCount;
-            out.cluster.localLearner = runtime.localLearner;
-            out.cluster.mirrorAuthorityLeaderNodeId = runtime.mirrorAuthorityLeaderNodeId;
-            out.cluster.mirrorAuthorityPrimaryNodeId = runtime.mirrorAuthorityPrimaryNodeId;
-            out.cluster.mirrorAuthorityEpoch = runtime.mirrorAuthorityEpoch;
-            out.cluster.mirrorAuthorityCommitIndex = runtime.mirrorAuthorityCommitIndex;
-            out.cluster.mirrorWritePending = runtime.mirrorWritePending;
-            out.cluster.stripeMetadataRaftEnabled = metadataRuntime.enabled;
-            out.cluster.stripeMetadataRaftTerm = metadataRuntime.currentTerm;
-            out.cluster.stripeMetadataLeaderNodeId = metadataRuntime.leaderNodeId;
-            out.cluster.stripeMetadataCommitIndex = metadataRuntime.commitIndex;
-            out.cluster.stripeMetadataAppliedIndex = metadataRuntime.appliedIndex;
-            out.cluster.stripeMetadataSnapshotIndex = metadataRuntime.snapshotIndex;
-            out.cluster.outboundConnectionsTotal = runtime.outboundConnections;
-            out.cluster.peerWorkers = runtime.peerWorkers;
-            out.cluster.proposalBatches = runtime.proposalBatches;
-            out.cluster.proposalQueueDepth = runtime.proposalQueueDepth;
-            out.cluster.pendingProposals = runtime.pendingProposals;
-            out.cluster.retainedRequestResults = runtime.retainedRequestResults;
-            out.cluster.pendingRequests = runtime.pendingRequests;
-            out.cluster.requestCapacity = runtime.requestCapacity;
-            out.cluster.expiredRequestsTotal = runtime.expiredRequests;
-            out.cluster.rejectedRequestsTotal = runtime.rejectedRequests;
-            out.cluster.requestJournalBytes = runtime.requestJournalBytes;
-            out.cluster.requestJournalRecords = runtime.requestJournalRecords;
-            out.cluster.requestJournalBytesWrittenTotal = runtime.requestJournalBytesWritten;
-            out.cluster.requestJournalCompactionsTotal = runtime.requestJournalCompactions;
-            out.cluster.peerPolicyMismatchRejectsTotal = runtime.peerPolicyMismatchRejects;
-            out.cluster.foreignClusterRejectsTotal = runtime.foreignClusterRejects;
-            out.cluster.leaseRenewFailuresTotal = runtime.leaseRenewFailures;
-            out.cluster.endpointStartFailuresTotal = runtime.endpointStartFailures;
-            out.cluster.peerReadTimeoutsTotal = runtime.peerReadTimeouts;
-            out.cluster.replicationQueueFrames = runtime.replicationQueueFrames;
-            out.cluster.replicationQueueBytes = runtime.replicationQueueBytes;
-            out.cluster.transferMemoryBytes = runtime.transferMemoryBytes;
-            out.cluster.transferSpoolBytes = runtime.transferSpoolBytes;
-            out.cluster.activeTransfers = runtime.activeTransfers;
-            out.cluster.transferResumeAttemptsTotal = runtime.transferResumeAttempts;
-            out.cluster.transferResumedTotal = runtime.transferResumed;
-            out.cluster.transferResumedBytesTotal = runtime.transferResumedBytes;
-            out.cluster.transferDiscardedPartialsTotal = runtime.transferDiscardedPartials;
-            out.cluster.transferRetainedPartials = runtime.transferRetainedPartials;
-            out.cluster.peers.reserve(runtime.peers.size());
-            for (const auto& peer : runtime.peers) {
-                out.cluster.peers.push_back({
-                    .nodeId = peer.nodeId,
-                    .learner = peer.learner,
-                    .matchIndex = peer.matchIndex,
-                    .nextIndex = peer.nextIndex,
-                    .replicationLag = peer.replicationLag,
-                    .connected = peer.connected,
-                    .lastSuccessfulContactAtUs = peer.lastSuccessfulContactAtUs,
-                    .roundTripsSucceededTotal = peer.roundTripsSucceeded,
-                    .roundTripsFailedTotal = peer.roundTripsFailed,
-                    .consecutiveRoundTripFailures = peer.consecutiveRoundTripFailures,
-                    .lastRoundTripAtUs = peer.lastRoundTripAtUs,
-                    .lastRoundTripFailureAtUs = peer.lastRoundTripFailureAtUs,
-                    .roundTripLatencyUs = peer.roundTripLatencyUs,
-                });
-            }
-        }
-
-        out.vlog.enabled = impl_->versionLog != nullptr;
-        if (impl_->versionLog) {
-            const auto snap = impl_->versionLog->snapshot();
-            out.vlog.syncMode = snap.syncMode;
-            out.vlog.groupN = snap.groupN;
-            out.vlog.groupMicros = snap.groupMicros;
-            out.vlog.groupBytes = snap.groupBytes;
-            out.vlog.asyncMaxPendingBytes = snap.asyncMaxPendingBytes;
-            out.vlog.indexedKeys = snap.indexedKeys;
-            out.vlog.indexedEntries = snap.indexedEntries;
-            out.vlog.rollbackEntries = snap.rollbackEntries;
-            out.vlog.pendingWrites = snap.pendingWrites;
-            out.vlog.pendingBytes = snap.pendingBytes;
-            out.vlog.durableBytes = snap.durableBytes;
-            out.vlog.segmentCount = snap.segmentCount;
-            out.vlog.activeSegmentBytes = snap.activeSegmentBytes;
-            out.vlog.recoveryDurationMicros = snap.recoveryDurationMicros;
-            out.vlog.recoveredSegmentCount = snap.recoveredSegmentCount;
-            out.vlog.recoveredEntryCount = snap.recoveredEntryCount;
-            out.vlog.sidecarFallbackCount = snap.sidecarFallbackCount;
-            out.vlog.sidecarRebuildFailures = snap.sidecarRebuildFailures;
-            out.vlog.retentionPrunedSegments = snap.retentionPrunedSegments;
-            out.vlog.retentionBaseEntriesWritten = snap.retentionBaseEntriesWritten;
-            out.vlog.parallelQueueRejects = snap.parallelQueueRejects;
-            out.vlog.parallelLaneCount = snap.parallelLaneCount;
-            out.vlog.parallelPendingWrites = snap.parallelPendingWrites;
-            out.vlog.parallelPendingBytes = snap.parallelPendingBytes;
-            out.vlog.flushThreadRunning = snap.flushThreadRunning;
-        }
-        return out;
-    }
+    #include "detail/AkkStats.inc"
 
     void AkkEngine::addClusterVotingNode(const cluster::NodeInfo& node) {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        auto transactionsAdmission = impl_->distributedConfigurationAdmission();
         impl_->clusterRuntime->addRaftVotingNode(node);
     }
 
@@ -6753,6 +6844,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        auto transactionsAdmission = impl_->distributedConfigurationAdmission();
         impl_->clusterRuntime->addRaftLearner(node);
     }
 
@@ -6761,6 +6853,13 @@ namespace akkaradb::engine {
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
         impl_->clusterRuntime->transferMirrorAuthorityLeadership(targetNodeId);
+    }
+
+    void AkkEngine::reconfigureRequestAuthority(const std::vector<cluster::NodeInfo>& nodes) {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: cluster runtime is not enabled"); }
+        impl_->clusterRuntime->reconfigureRequestAuthority(nodes);
     }
 
     bool AkkEngine::recoverMirrorWrite() {
@@ -6774,6 +6873,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        auto transactionsAdmission = impl_->distributedConfigurationAdmission();
         impl_->clusterRuntime->promoteRaftLearner(nodeId);
     }
 
@@ -6781,6 +6881,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        auto transactionsAdmission = impl_->distributedConfigurationAdmission();
         impl_->clusterRuntime->removeRaftLearner(nodeId);
     }
 
@@ -6788,6 +6889,7 @@ namespace akkaradb::engine {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         if (!impl_->clusterRuntime) { throw std::runtime_error("AkkEngine: cluster runtime is not enabled"); }
+        auto transactionsAdmission = impl_->distributedConfigurationAdmission();
         impl_->clusterRuntime->removeRaftVotingNode(nodeId);
     }
 
@@ -6830,7 +6932,9 @@ namespace akkaradb::engine {
     ClusterReconfigurationStatus AkkEngine::clusterReconfigurationStatus() const {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
-        if (!impl_->usesPartitionRaft() && impl_->clusterReplicationMode != cluster::ReplicationMode::STRIPE) { throw std::logic_error("AkkEngine: placement status requires PARTITIONED consensus or STRIPE"); }
+        if (!impl_->usesPartitionRaft() && impl_->clusterReplicationMode != cluster::ReplicationMode::STRIPE) {
+            throw std::logic_error("AkkEngine: placement status requires PARTITIONED consensus or STRIPE");
+        }
         const auto state = impl_->clusterRuntime->placementState(true);
         ClusterReconfigurationStatus result;
         result.authorityNodeId = state.leaderNodeId;
@@ -6839,15 +6943,16 @@ namespace akkaradb::engine {
         result.stripeWritesBlocked = state.stripeWritesBlocked;
         result.activationStarted = state.activationStarted;
         result.partitionCount = impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE ? 1 : impl_->clusterConfig.partition().partitionCount;
-        { std::lock_guard progress{impl_->placementProgressMu}; result.lastError = impl_->placementLastError; }
+        {
+            std::lock_guard progress{impl_->placementProgressMu};
+            result.lastError = impl_->placementLastError;
+        }
         if (state.pendingGeneration == 0) { result.completedPartitions = result.partitionCount; }
         if (impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
             const auto response = impl_->partitionRpc(state.leaderNodeId, Impl::partitionAdminHeader(Impl::PartitionAdmin::STATUS, 0, 0));
             size_t cursor = 0;
-            if (!Impl::pullU64(response.value, cursor, result.transferredBytes) ||
-                !Impl::pullU64(response.value, cursor, result.completedRecords) || cursor != response.value.size()) {
-                throw std::runtime_error("Cluster placement: malformed stripe progress response");
-            }
+            if (!Impl::pullU64(response.value, cursor, result.transferredBytes) || !Impl::pullU64(response.value, cursor, result.completedRecords) || cursor !=
+                response.value.size()) { throw std::runtime_error("Cluster placement: malformed stripe progress response"); }
             return result;
         }
         if (state.pendingGeneration == 0) { return result; }
@@ -6857,8 +6962,8 @@ namespace akkaradb::engine {
         for (uint16_t index = 0; index < result.partitionCount; ++index) {
             try {
                 const auto response = impl_->partitionRpcLeader(index, Impl::partitionAdminHeader(Impl::PartitionAdmin::STATUS, index, 0), active, deadline);
-                if (response.value.size() < 16 || response.value[11] != 0 ||
-                    Impl::partitionAdminNumber(std::span{response.value}.first(11)) < state.pendingGeneration) { continue; }
+                if (response.value.size() < 16 || response.value[11] != 0 || Impl::partitionAdminNumber(std::span{response.value}.first(11)) < state.
+                    pendingGeneration) { continue; }
                 size_t position = 12;
                 uint32_t count = 0;
                 if (!Impl::pullU32(response.value, position, count)) { continue; }
@@ -6870,7 +6975,8 @@ namespace akkaradb::engine {
                 }
                 std::vector<uint64_t> desired;
                 for (const auto& member : impl_->partitionConfig(target, index).dataNodes()) { desired.push_back(member.nodeId); }
-                std::ranges::sort(members); std::ranges::sort(desired);
+                std::ranges::sort(members);
+                std::ranges::sort(desired);
                 if (position == response.value.size() && members == desired) { ++result.completedPartitions; }
             }
             catch (const std::exception& error) { result.lastError = error.what(); }
@@ -6905,6 +7011,13 @@ namespace akkaradb::engine {
         return result;
     }
 
+    cluster::ClusterAvailability AkkEngine::clusterAvailability() const {
+        if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
+        Impl::OperationGuard operation{*impl_};
+        if (!impl_->clusterRuntime) { throw std::logic_error("AkkEngine: cluster availability requires Cluster"); }
+        return impl_->currentPlacement().availability();
+    }
+
     void AkkEngine::forceSync() {
         if (!impl_) { return; }
         Impl::OperationGuard operation{*impl_, false};
@@ -6919,8 +7032,7 @@ namespace akkaradb::engine {
 
     void AkkEngine::forceFlush() {
         if (!impl_) { return; }
-        Impl::OperationGuard operation{*impl_, false};
-        if (operation) {
+        if (Impl::OperationGuard operation{*impl_, false}) {
             std::shared_lock admission{impl_->mutationEpochMu};
             if (impl_->usesPartitionRaft()) {
                 for (const auto& child : impl_->partitionSnapshot()) { if (child) { child->forceFlush(); } }
@@ -6951,6 +7063,7 @@ namespace akkaradb::engine {
         impl_->stripeGcThread.request_stop();
         impl_->queryReaper.request_stop();
         impl_->placementRecoveryThread.request_stop();
+        impl_->distributedRecoveryThread.request_stop();
         impl_->lifecycleCv.notify_all();
         if (!impl_->beginClose()) { return; }
 
@@ -6959,7 +7072,9 @@ namespace akkaradb::engine {
         if (impl_->stripeGcThread.joinable()) { impl_->stripeGcThread.join(); }
         if (impl_->queryReaper.joinable()) { impl_->queryReaper.join(); }
         if (impl_->placementRecoveryThread.joinable()) { impl_->placementRecoveryThread.join(); }
+        if (impl_->distributedRecoveryThread.joinable()) { impl_->distributedRecoveryThread.join(); }
         impl_->partitionQueryExecutor.reset();
+        impl_->snapshotQueryExecutor.reset();
         impl_->clearQuerySessions();
         const auto closeStep = [&closeFailure](const auto& operation) {
             try { operation(); }
@@ -6986,9 +7101,18 @@ namespace akkaradb::engine {
         closeStep(
             [&] {
                 std::lock_guard lock{impl_->writeMu};
-                impl_->resetReplicaSnapshotStagingLocked();
+                bool failed = false;
+                {
+                    std::lock_guard failureLock{impl_->transactionFailureMu};
+                    failed = static_cast<bool>(impl_->transactionFailure);
+                }
+                // Durable Raft install intent may still name this staging file.
+                impl_->resetReplicaSnapshotStagingLocked(failed && impl_->clusterConfig.usesDataConsensus());
             }
         );
+        closeStep([&] { if (impl_->localRequestApplications) { impl_->localRequestApplications->close(); } });
+        closeStep([&] { if (impl_->distributedDecisions) { impl_->distributedDecisions->close(); } });
+        closeStep([&] { if (impl_->distributedCompletions) { impl_->distributedCompletions->close(); } });
         closeStep([&] { impl_->checkpointTransactions(); });
         closeStep([&] { if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); } });
         closeStep(
