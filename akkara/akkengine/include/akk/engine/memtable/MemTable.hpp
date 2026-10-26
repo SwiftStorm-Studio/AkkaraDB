@@ -60,6 +60,8 @@ namespace akkaradb::engine::memtable {
                 ConfiguredMemTableFactory backendFactoryWithOptions = nullptr;
                 FlushCallback onFlush = nullptr;
                 StreamingFlushCallback onFlushStream = nullptr;
+                // Runs after unpublishing a persisted generation or draining forceFlush.
+                std::function<void()> onFlushComplete = nullptr;
             };
 
             struct KeyRange {
@@ -161,6 +163,10 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] uint64_t nextSeq() noexcept;
             [[nodiscard]] uint64_t reserveSeq(uint64_t count);
             [[nodiscard]] uint64_t lastSeq() const noexcept;
+
+            // Conservative lower bound across all generations not yet persisted.
+            // UINT64_MAX means no unflushed records remain.
+            [[nodiscard]] uint64_t minimumUnflushedSequence() const;
 
             void flushHint();
             void forceFlush();

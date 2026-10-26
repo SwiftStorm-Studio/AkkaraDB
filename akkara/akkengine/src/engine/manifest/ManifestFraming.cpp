@@ -10,664 +10,433 @@
 // akkengine/src/engine/manifest/ManifestFraming.cpp
 #include "akk/engine/manifest/ManifestFraming.hpp"
 #include <chrono>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace akkaradb::engine::manifest {
-    // ============================================================================
-    // Internal helpers
-    // ============================================================================
-
     namespace {
-        uint64_t nowUs() noexcept {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()
-            ).count());
+        void put(uint8_t* out, uint64_t value, size_t width) noexcept {
+            for (size_t i = 0; i < width; ++i) {
+                out[i] = static_cast<uint8_t>(value >> (i * 8));
+            }
         }
-
-        // Write a little-endian u16 into a byte buffer at offset.
-        inline void writeU16(uint8_t* buf, size_t off, uint16_t v) noexcept {
-            buf[off] = static_cast<uint8_t>(v);
-            buf[off + 1] = static_cast<uint8_t>(v >> 8);
+        uint64_t get(const uint8_t* in, size_t width) noexcept {
+            uint64_t value = 0;
+            for (size_t i = 0; i < width; ++i) {
+                value |= static_cast<uint64_t>(in[i]) << (i * 8);
+            }
+            return value;
         }
-
-        // Write a little-endian u32 into a byte buffer at offset.
-        inline void writeU32(uint8_t* buf, size_t off, uint32_t v) noexcept {
-            buf[off] = static_cast<uint8_t>(v);
-            buf[off + 1] = static_cast<uint8_t>(v >> 8);
-            buf[off + 2] = static_cast<uint8_t>(v >> 16);
-            buf[off + 3] = static_cast<uint8_t>(v >> 24);
+        uint32_t checkedSize(size_t size) {
+            if (size > UINT32_MAX) {
+                throw std::length_error("Manifest: payload exceeds the v1 u32 limit");
+            }
+            return static_cast<uint32_t>(size);
         }
-
-        // Write a little-endian u64 into a byte buffer at offset.
-        inline void writeU64(uint8_t* buf, size_t off, uint64_t v) noexcept {
-            buf[off] = static_cast<uint8_t>(v);
-            buf[off + 1] = static_cast<uint8_t>(v >> 8);
-            buf[off + 2] = static_cast<uint8_t>(v >> 16);
-            buf[off + 3] = static_cast<uint8_t>(v >> 24);
-            buf[off + 4] = static_cast<uint8_t>(v >> 32);
-            buf[off + 5] = static_cast<uint8_t>(v >> 40);
-            buf[off + 6] = static_cast<uint8_t>(v >> 48);
-            buf[off + 7] = static_cast<uint8_t>(v >> 56);
+        struct Writer {
+            std::vector<uint8_t> bytes;
+            void integer(uint64_t value, size_t width) {
+                if (width > UINT32_MAX - bytes.size()) {
+                    throw std::length_error("Manifest: payload too large");
+                }
+                const auto offset = bytes.size();
+                bytes.resize(offset + width);
+                put(bytes.data() + offset, value, width);
+            }
+            void u8(uint8_t v) { integer(v, 1); }
+            void u16(uint16_t v) { integer(v, 2); }
+            void u32(uint32_t v) { integer(v, 4); }
+            void u64(uint64_t v) { integer(v, 8); }
+            void string(const std::string& value) {
+                const auto n = checkedSize(value.size());
+                u32(n);
+                if (n > UINT32_MAX - bytes.size()) {
+                    throw std::length_error("Manifest: payload too large");
+                }
+                bytes.insert(bytes.end(), value.begin(), value.end());
+            }
+            void optionalString(const std::optional<std::string>& value) {
+                u8(value.has_value());
+                if (value) {
+                    string(*value);
+                }
+            }
+            void strings(const std::vector<std::string>& values) {
+                u32(checkedSize(values.size()));
+                for (const auto& value : values) {
+                    string(value);
+                }
+            }
+            void level(int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("Manifest: negative SST level");
+                }
+                u32(static_cast<uint32_t>(value));
+            }
+        };
+        struct Reader {
+            const uint8_t* data;
+            size_t size;
+            size_t offset = 0;
+            bool valid = true;
+            uint64_t integer(size_t width) {
+                if (!valid || width > size - offset) {
+                    valid = false;
+                    return 0;
+                }
+                auto v = get(data + offset, width);
+                offset += width;
+                return v;
+            }
+            uint8_t u8() { return static_cast<uint8_t>(integer(1)); }
+            uint16_t u16() { return static_cast<uint16_t>(integer(2)); }
+            uint32_t u32() { return static_cast<uint32_t>(integer(4)); }
+            uint64_t u64() { return integer(8); }
+            std::string string() {
+                const auto n = u32();
+                if (!valid || n > size - offset) {
+                    valid = false;
+                    return {};
+                }
+                std::string v(reinterpret_cast<const char*>(data + offset), n);
+                offset += n;
+                return v;
+            }
+            std::optional<std::string> optionalString() {
+                const auto present = u8();
+                if (present > 1) {
+                    valid = false;
+                }
+                if (present == 1) {
+                    return string();
+                }
+                return std::nullopt;
+            }
+            std::vector<std::string> strings() {
+                const auto count = u32();
+                std::vector<std::string> values;
+                if (!valid || count > (size - offset) / 4) {
+                    valid = false;
+                    return values;
+                }
+                values.reserve(count);
+                for (uint32_t i = 0; i < count && valid; ++i) {
+                    values.push_back(string());
+                }
+                return values;
+            }
+            int level() {
+                const auto v = u32();
+                if (v > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                    valid = false;
+                    return 0;
+                }
+                return static_cast<int>(v);
+            }
+            bool done() const { return valid && offset == size; }
+        };
+        std::optional<uint64_t> optionalU64(uint64_t v) {
+            return v == MANIFEST_ABSENT_U64 ? std::nullopt : std::optional<uint64_t>{v};
         }
-
-        // Read a little-endian u16 from a byte buffer at offset.
-        inline uint16_t readU16(const uint8_t* buf, size_t off) noexcept {
-            return static_cast<uint16_t>(buf[off]) | (static_cast<uint16_t>(buf[off + 1]) << 8);
-        }
-
-        // Read a little-endian u32 from a byte buffer at offset.
-        inline uint32_t readU32(const uint8_t* buf, size_t off) noexcept {
-            return static_cast<uint32_t>(buf[off]) | (static_cast<uint32_t>(buf[off + 1]) << 8) | (static_cast<uint32_t>(buf[off + 2]) <<
-                16) | (static_cast<uint32_t>(buf[off + 3]) << 24);
-        }
-
-        // Read a little-endian u64 from a byte buffer at offset.
-        inline uint64_t readU64(const uint8_t* buf, size_t off) noexcept {
-            return static_cast<uint64_t>(buf[off]) | (static_cast<uint64_t>(buf[off + 1]) << 8) | (static_cast<uint64_t>(buf[off + 2]) <<
-                16) | (static_cast<uint64_t>(buf[off + 3]) << 24) | (static_cast<uint64_t>(buf[off + 4]) << 32) | (static_cast<uint64_t>(buf
-                [off + 5]) << 40) | (static_cast<uint64_t>(buf[off + 6]) << 48) | (static_cast<uint64_t>(buf[off + 7]) << 56);
-        }
-
-        // Read a length-prefixed string from payload at cursor; advances cursor.
-        bool readLengthPrefixed(const uint8_t* payload, uint16_t payloadLen, size_t& cursor, std::string& out) {
-            if (cursor + 2 > payloadLen) { return false; }
-            const uint16_t len = readU16(payload, cursor);
-            cursor += 2;
-            if (cursor + len > payloadLen) { return false; }
-            out.assign(reinterpret_cast<const char*>(payload + cursor), len);
-            cursor += len;
-            return true;
-        }
-    } // anonymous namespace
-
-    // ============================================================================
-    // ManifestFileHeader
-    // ============================================================================
+    } // namespace
 
     ManifestFileHeader ManifestFileHeader::build(uint32_t fileSeq) noexcept {
         ManifestFileHeader hdr{};
         hdr.magic = MAGIC;
         hdr.version = VERSION;
-        hdr.flags = 0;
         hdr.fileSeq = fileSeq;
-        hdr.createdAtUs = nowUs();
-        hdr.crc32c = 0;
-        std::memset(hdr.reserved, 0, sizeof(hdr.reserved));
-
-        // Compute CRC over serialized header with crc32c field zeroed
-        uint8_t tmp[SIZE];
-        hdr.serialize(tmp);
-        hdr.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(tmp), SIZE);
-
+        hdr.createdAtUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        uint8_t bytes[SIZE];
+        hdr.serialize(bytes);
+        hdr.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), SIZE);
         return hdr;
     }
-
     void ManifestFileHeader::serialize(uint8_t out[SIZE]) const noexcept {
-        writeU32(out, 0, magic);
-        writeU16(out, 4, version);
-        writeU16(out, 6, flags);
-        writeU32(out, 8, fileSeq);
-        writeU64(out, 12, createdAtUs);
-        writeU32(out, 20, crc32c);
+        put(out, magic, 4);
+        put(out + 4, version, 2);
+        put(out + 6, flags, 2);
+        put(out + 8, fileSeq, 4);
+        put(out + 12, createdAtUs, 8);
+        put(out + 20, crc32c, 4);
         std::memcpy(out + 24, reserved, 8);
     }
-
     bool ManifestFileHeader::verifyChecksum() const noexcept {
-        uint8_t tmp[SIZE];
-        // Serialize with crc32c = 0
-        writeU32(tmp, 0, magic);
-        writeU16(tmp, 4, version);
-        writeU16(tmp, 6, flags);
-        writeU32(tmp, 8, fileSeq);
-        writeU64(tmp, 12, createdAtUs);
-        writeU32(tmp, 20, 0); // zeroed crc32c
-        std::memcpy(tmp + 24, reserved, 8);
-
-        return crc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(tmp), SIZE);
+        auto copy = *this;
+        copy.crc32c = 0;
+        uint8_t bytes[SIZE];
+        copy.serialize(bytes);
+        return crc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), SIZE);
     }
-
-    // ============================================================================
-    // ManifestRecordHeader
-    // ============================================================================
-
-    ManifestRecordHeader ManifestRecordHeader::build(ManifestRecordType rtype, const uint8_t* payload, uint16_t payloadLen) noexcept {
+    ManifestRecordHeader ManifestRecordHeader::build(ManifestRecordType type, const uint8_t* payload, uint32_t payloadLen) noexcept {
         ManifestRecordHeader hdr{};
-        hdr.type = static_cast<uint8_t>(rtype);
-        hdr.flags = 0;
+        hdr.type = static_cast<uint8_t>(type);
         hdr.payloadLen = payloadLen;
         hdr.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(payload), payloadLen);
+        uint8_t bytes[SIZE];
+        hdr.serialize(bytes);
+        hdr.headerCrc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), SIZE);
         return hdr;
     }
-
     void ManifestRecordHeader::serialize(uint8_t out[SIZE]) const noexcept {
         out[0] = type;
         out[1] = flags;
-        writeU16(out, 2, payloadLen);
-        writeU32(out, 4, crc32c);
+        put(out + 2, reserved, 2);
+        put(out + 4, payloadLen, 4);
+        put(out + 8, crc32c, 4);
+        put(out + 12, headerCrc32c, 4);
     }
-
     ManifestRecordHeader ManifestRecordHeader::deserialize(const uint8_t in[SIZE]) noexcept {
-        ManifestRecordHeader hdr{};
-        hdr.type = in[0];
-        hdr.flags = in[1];
-        hdr.payloadLen = readU16(in, 2);
-        hdr.crc32c = readU32(in, 4);
-        return hdr;
+        return {in[0],
+                in[1],
+                static_cast<uint16_t>(get(in + 2, 2)),
+                static_cast<uint32_t>(get(in + 4, 4)),
+                static_cast<uint32_t>(get(in + 8, 4)),
+                static_cast<uint32_t>(get(in + 12, 4))};
+    }
+    bool ManifestRecordHeader::verifyChecksum() const noexcept {
+        auto copy = *this;
+        copy.headerCrc32c = 0;
+        uint8_t bytes[SIZE];
+        copy.serialize(bytes);
+        return flags == 0 && reserved == 0 && headerCrc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), SIZE);
     }
 
-    // ============================================================================
-    // Encode functions
-    // ============================================================================
-
-    std::vector<uint8_t> encodeStripeCommit(uint64_t tsUs, uint64_t stripeCount) {
-        std::vector<uint8_t> p(16);
-        writeU64(p.data(), 0, tsUs);
-        writeU64(p.data(), 8, stripeCount);
-        return p;
+    std::vector<uint8_t> encodeStripeCommit(uint64_t ts, uint64_t count) {
+        Writer w;
+        w.u64(ts);
+        w.u64(count);
+        return std::move(w.bytes);
     }
-
-    std::vector<uint8_t> encodeSstSeal(
-        uint64_t tsUs,
-        int level,
-        const std::string& name,
-        uint64_t entries,
-        const std::optional<std::string>& firstKeyHex,
-        const std::optional<std::string>& lastKeyHex
-    ) {
-        const uint16_t fkLen = firstKeyHex ? static_cast<uint16_t>(firstKeyHex->size()) : 0;
-        const uint16_t lkLen = lastKeyHex ? static_cast<uint16_t>(lastKeyHex->size()) : 0;
-        const uint16_t nameLen = static_cast<uint16_t>(name.size());
-        const uint8_t keyFlags = (firstKeyHex ? 0x01 : 0x00) | (lastKeyHex ? 0x02 : 0x00);
-
-        // Fixed header: 24 bytes
-        const size_t total = 24 + nameLen + fkLen + lkLen;
-        std::vector<uint8_t> p(total);
-        uint8_t* b = p.data();
-
-        writeU64(b, 0, tsUs);
-        writeU64(b, 8, entries);
-        b[16] = static_cast<uint8_t>(level);
-        b[17] = keyFlags;
-        writeU16(b, 18, nameLen);
-        writeU16(b, 20, fkLen);
-        writeU16(b, 22, lkLen);
-
-        size_t off = 24;
-        std::memcpy(b + off, name.data(), nameLen);
-        off += nameLen;
-        if (firstKeyHex) {
-            std::memcpy(b + off, firstKeyHex->data(), fkLen);
-            off += fkLen;
+    std::vector<uint8_t> encodeSstSeal(uint64_t ts, int level, const std::string& name, uint64_t entries,
+                                       const std::optional<std::string>& first, const std::optional<std::string>& last) {
+        Writer w;
+        w.u64(ts);
+        w.u64(entries);
+        w.level(level);
+        w.string(name);
+        w.optionalString(first);
+        w.optionalString(last);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeSstDelete(uint64_t ts, const std::string& name) {
+        Writer w;
+        w.u64(ts);
+        w.string(name);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeCompactionStart(uint64_t ts, int level, const std::vector<std::string>& inputs) {
+        Writer w;
+        w.u64(ts);
+        w.level(level);
+        w.strings(inputs);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeCompactionEnd(uint64_t ts, int level, const std::string& output, const std::vector<std::string>& inputs,
+                                             uint64_t entries, const std::optional<std::string>& first,
+                                             const std::optional<std::string>& last) {
+        Writer w;
+        w.u64(ts);
+        w.u64(entries);
+        w.level(level);
+        w.string(output);
+        w.optionalString(first);
+        w.optionalString(last);
+        w.strings(inputs);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeCheckpoint(uint64_t ts, const std::optional<std::string>& name, const std::optional<uint64_t>& stripe,
+                                          const std::optional<uint64_t>& seq) {
+        Writer w;
+        w.u64(ts);
+        w.u64(stripe.value_or(MANIFEST_ABSENT_U64));
+        w.u64(seq.value_or(MANIFEST_ABSENT_U64));
+        w.optionalString(name);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeTruncate(uint64_t ts, const std::optional<std::string>& reason) {
+        Writer w;
+        w.u64(ts);
+        w.optionalString(reason);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeCompactionCommit(uint64_t ts, const std::vector<std::string>& outputs,
+                                                const std::vector<std::string>& inputs) {
+        Writer w;
+        w.u64(ts);
+        w.strings(outputs);
+        w.strings(inputs);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeSstBlobRefs(uint64_t ts, const std::string& name, const std::vector<SSTBlobRefEntry>& entries) {
+        Writer w;
+        w.u64(ts);
+        w.string(name);
+        w.u32(checkedSize(entries.size()));
+        for (const auto& e : entries) {
+            w.u64(e.seq);
+            w.u64(e.blobId.value_or(MANIFEST_ABSENT_U64));
+            w.u8(e.flags);
+            w.string(std::string(e.key.begin(), e.key.end()));
         }
-        if (lastKeyHex) { std::memcpy(b + off, lastKeyHex->data(), lkLen); }
-
-        return p;
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeBlobPut(uint64_t ts, uint64_t id, uint64_t total, uint64_t stored, uint32_t crc, uint32_t codec) {
+        Writer w;
+        w.u64(ts);
+        w.u64(id);
+        w.u64(total);
+        w.u64(stored);
+        w.u32(crc);
+        w.u32(codec);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeBlobDelete(uint64_t ts, uint64_t id) {
+        Writer w;
+        w.u64(ts);
+        w.u64(id);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeNodeJoin(uint64_t ts, uint64_t id, uint16_t port, const std::string& host) {
+        Writer w;
+        w.u64(ts);
+        w.u64(id);
+        w.u16(port);
+        w.string(host);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodeNodeLeave(uint64_t ts, uint64_t id) {
+        Writer w;
+        w.u64(ts);
+        w.u64(id);
+        return std::move(w.bytes);
+    }
+    std::vector<uint8_t> encodePrimaryLease(uint64_t ts, uint64_t id, uint64_t until) {
+        Writer w;
+        w.u64(ts);
+        w.u64(id);
+        w.u64(until);
+        return std::move(w.bytes);
     }
 
-    std::vector<uint8_t> encodeSstDelete(uint64_t tsUs, const std::string& name) {
-        const uint16_t nameLen = static_cast<uint16_t>(name.size());
-        std::vector<uint8_t> p(10 + nameLen);
-        writeU64(p.data(), 0, tsUs);
-        writeU16(p.data(), 8, nameLen);
-        std::memcpy(p.data() + 10, name.data(), nameLen);
-        return p;
+    bool decodeStripeCommit(const uint8_t* p, uint32_t len, DecodedStripeCommit& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.stripeCount = r.u64();
+        return r.done();
     }
-
-    std::vector<uint8_t> encodeCompactionStart(uint64_t tsUs, int level, const std::vector<std::string>& inputs) {
-        const auto inputCount = static_cast<uint8_t>(inputs.size());
-
-        // Fixed: 12 bytes + [u16 len + bytes] per input
-        size_t varSize = 0;
-        for (const auto& s : inputs) { varSize += 2 + s.size(); }
-
-        std::vector<uint8_t> p(12 + varSize);
-        uint8_t* b = p.data();
-        writeU64(b, 0, tsUs);
-        b[8] = static_cast<uint8_t>(level);
-        b[9] = inputCount;
-        writeU16(b, 10, 0); // reserved
-
-        size_t off = 12;
-        for (const auto& s : inputs) {
-            writeU16(b, off, static_cast<uint16_t>(s.size()));
-            off += 2;
-            std::memcpy(b + off, s.data(), s.size());
-            off += s.size();
-        }
-        return p;
+    bool decodeSstSeal(const uint8_t* p, uint32_t len, DecodedSSTSeal& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.entries = r.u64();
+        out.level = r.level();
+        out.name = r.string();
+        out.firstKeyHex = r.optionalString();
+        out.lastKeyHex = r.optionalString();
+        return r.done();
     }
-
-    std::vector<uint8_t> encodeCompactionEnd(
-        uint64_t tsUs,
-        int level,
-        const std::string& output,
-        const std::vector<std::string>& inputs,
-        uint64_t entries,
-        const std::optional<std::string>& firstKeyHex,
-        const std::optional<std::string>& lastKeyHex
-    ) {
-        const uint16_t outLen = static_cast<uint16_t>(output.size());
-        const uint16_t fkLen = firstKeyHex ? static_cast<uint16_t>(firstKeyHex->size()) : 0;
-        const uint16_t lkLen = lastKeyHex ? static_cast<uint16_t>(lastKeyHex->size()) : 0;
-        const uint8_t inputCount = static_cast<uint8_t>(inputs.size());
-        const uint8_t keyFlags = (firstKeyHex ? 0x01 : 0x00) | (lastKeyHex ? 0x02 : 0x00);
-
-        // Fixed: 28 bytes
-        size_t varSize = outLen + fkLen + lkLen;
-        for (const auto& s : inputs) { varSize += 2 + s.size(); }
-
-        std::vector<uint8_t> p(28 + varSize);
-        uint8_t* b = p.data();
-
-        writeU64(b, 0, tsUs);
-        writeU64(b, 8, entries);
-        b[16] = static_cast<uint8_t>(level);
-        b[17] = keyFlags;
-        b[18] = inputCount;
-        b[19] = 0; // reserved
-        writeU16(b, 20, outLen);
-        writeU16(b, 22, fkLen);
-        writeU16(b, 24, lkLen);
-        writeU16(b, 26, 0); // reserved
-
-        size_t off = 28;
-        std::memcpy(b + off, output.data(), outLen);
-        off += outLen;
-        if (firstKeyHex) {
-            std::memcpy(b + off, firstKeyHex->data(), fkLen);
-            off += fkLen;
-        }
-        if (lastKeyHex) {
-            std::memcpy(b + off, lastKeyHex->data(), lkLen);
-            off += lkLen;
-        }
-        for (const auto& s : inputs) {
-            writeU16(b, off, static_cast<uint16_t>(s.size()));
-            off += 2;
-            std::memcpy(b + off, s.data(), s.size());
-            off += s.size();
-        }
-        return p;
+    bool decodeSstDelete(const uint8_t* p, uint32_t len, DecodedSSTDelete& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.name = r.string();
+        return r.done();
     }
-
-    std::vector<uint8_t> encodeCheckpoint(
-        uint64_t tsUs,
-        const std::optional<std::string>& name,
-        const std::optional<uint64_t>& stripe,
-        const std::optional<uint64_t>& lastSeq
-    ) {
-        const uint16_t nameLen = name ? static_cast<uint16_t>(name->size()) : 0;
-
-        // Fixed: 26 bytes
-        std::vector<uint8_t> p(26 + nameLen);
-        uint8_t* b = p.data();
-
-        writeU64(b, 0, tsUs);
-        writeU64(b, 8, stripe.value_or(MANIFEST_ABSENT_U64));
-        writeU64(b, 16, lastSeq.value_or(MANIFEST_ABSENT_U64));
-        writeU16(b, 24, nameLen);
-
-        if (name) { std::memcpy(b + 26, name->data(), nameLen); }
-        return p;
+    bool decodeCompactionStart(const uint8_t* p, uint32_t len, DecodedCompactionStart& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.level = r.level();
+        out.inputs = r.strings();
+        return r.done();
     }
-
-    std::vector<uint8_t> encodeTruncate(uint64_t tsUs, const std::optional<std::string>& reason) {
-        const uint16_t reasonLen = reason ? static_cast<uint16_t>(reason->size()) : 0;
-        std::vector<uint8_t> p(10 + reasonLen);
-        writeU64(p.data(), 0, tsUs);
-        writeU16(p.data(), 8, reasonLen);
-        if (reason) { std::memcpy(p.data() + 10, reason->data(), reasonLen); }
-        return p;
+    bool decodeCompactionEnd(const uint8_t* p, uint32_t len, DecodedCompactionEnd& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.entries = r.u64();
+        out.level = r.level();
+        out.output = r.string();
+        out.firstKeyHex = r.optionalString();
+        out.lastKeyHex = r.optionalString();
+        out.inputs = r.strings();
+        return r.done();
     }
-
-    // ============================================================================
-    // Decode functions
-    // ============================================================================
-
-    bool decodeStripeCommit(const uint8_t* payload, uint16_t len, DecodedStripeCommit& out) {
-        if (len < 16) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.stripeCount = readU64(payload, 8);
-        return true;
+    bool decodeCheckpoint(const uint8_t* p, uint32_t len, DecodedCheckpoint& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.stripe = optionalU64(r.u64());
+        out.lastSeq = optionalU64(r.u64());
+        out.name = r.optionalString();
+        return r.done();
     }
-
-    bool decodeSstSeal(const uint8_t* payload, uint16_t len, DecodedSSTSeal& out) {
-        if (len < 24) { return false; }
-
-        out.tsUs = readU64(payload, 0);
-        out.entries = readU64(payload, 8);
-        out.level = static_cast<int>(payload[16]);
-        const uint8_t keyFlags = payload[17];
-        const uint16_t nameLen = readU16(payload, 18);
-        const uint16_t fkLen = readU16(payload, 20);
-        const uint16_t lkLen = readU16(payload, 22);
-
-        size_t required = 24u + nameLen + fkLen + lkLen;
-        if (len < required) { return false; }
-
-        size_t off = 24;
-        out.name.assign(reinterpret_cast<const char*>(payload + off), nameLen);
-        off += nameLen;
-
-        if (keyFlags & 0x01) { out.firstKeyHex.emplace(reinterpret_cast<const char*>(payload + off), fkLen); }
-        off += fkLen; // advance unconditionally - fk bytes always occupy fkLen space
-        if (keyFlags & 0x02) { out.lastKeyHex.emplace(reinterpret_cast<const char*>(payload + off), lkLen); }
-        return true;
+    bool decodeTruncate(const uint8_t* p, uint32_t len, DecodedTruncate& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.reason = r.optionalString();
+        return r.done();
     }
-
-    bool decodeSstDelete(const uint8_t* payload, uint16_t len, DecodedSSTDelete& out) {
-        if (len < 10) { return false; }
-        out.tsUs = readU64(payload, 0);
-        const uint16_t nameLen = readU16(payload, 8);
-        if (len < 10u + nameLen) { return false; }
-        out.name.assign(reinterpret_cast<const char*>(payload + 10), nameLen);
-        return true;
+    bool decodeCompactionCommit(const uint8_t* p, uint32_t len, DecodedCompactionCommit& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.outputFiles = r.strings();
+        out.inputFiles = r.strings();
+        return r.done();
     }
-
-    bool decodeCompactionStart(const uint8_t* payload, uint16_t len, DecodedCompactionStart& out) {
-        if (len < 12) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.level = static_cast<int>(payload[8]);
-        const uint8_t inputCount = payload[9];
-
-        size_t cursor = 12;
-        out.inputs.clear();
-        out.inputs.reserve(inputCount);
-        for (uint8_t i = 0; i < inputCount; ++i) {
-            std::string s;
-            if (!readLengthPrefixed(payload, len, cursor, s)) { return false; }
-            out.inputs.push_back(std::move(s));
-        }
-        return true;
-    }
-
-    bool decodeCompactionEnd(const uint8_t* payload, uint16_t len, DecodedCompactionEnd& out) {
-        if (len < 28) { return false; }
-
-        out.tsUs = readU64(payload, 0);
-        out.entries = readU64(payload, 8);
-        out.level = static_cast<int>(payload[16]);
-        const uint8_t keyFlags = payload[17];
-        const uint8_t inputCount = payload[18];
-        const uint16_t outLen = readU16(payload, 20);
-        const uint16_t fkLen = readU16(payload, 22);
-        const uint16_t lkLen = readU16(payload, 24);
-
-        size_t required = 28u + outLen + fkLen + lkLen;
-        if (len < required) { return false; }
-
-        size_t off = 28;
-        out.output.assign(reinterpret_cast<const char*>(payload + off), outLen);
-        off += outLen;
-
-        if (keyFlags & 0x01) { out.firstKeyHex.emplace(reinterpret_cast<const char*>(payload + off), fkLen); }
-        off += fkLen; // advance unconditionally - fk bytes always occupy fkLen space
-        if (keyFlags & 0x02) { out.lastKeyHex.emplace(reinterpret_cast<const char*>(payload + off), lkLen); }
-        off += lkLen; // advance unconditionally - inputs follow immediately
-
-        out.inputs.clear();
-        out.inputs.reserve(inputCount);
-        for (uint8_t i = 0; i < inputCount; ++i) {
-            std::string s;
-            if (!readLengthPrefixed(payload, len, off, s)) { return false; }
-            out.inputs.push_back(std::move(s));
-        }
-        return true;
-    }
-
-    bool decodeCheckpoint(const uint8_t* payload, uint16_t len, DecodedCheckpoint& out) {
-        if (len < 26) { return false; }
-
-        out.tsUs = readU64(payload, 0);
-
-        const uint64_t stripe = readU64(payload, 8);
-        const uint64_t lastSeq = readU64(payload, 16);
-        const uint16_t nameLen = readU16(payload, 24);
-
-        out.stripe = (stripe != MANIFEST_ABSENT_U64) ? std::optional(stripe) : std::nullopt;
-        out.lastSeq = (lastSeq != MANIFEST_ABSENT_U64) ? std::optional(lastSeq) : std::nullopt;
-
-        if (nameLen > 0) {
-            if (len < 26u + nameLen) { return false; }
-            out.name.emplace(reinterpret_cast<const char*>(payload + 26), nameLen);
-        }
-        return true;
-    }
-
-    bool decodeTruncate(const uint8_t* payload, uint16_t len, DecodedTruncate& out) {
-        if (len < 10) { return false; }
-        out.tsUs = readU64(payload, 0);
-        const uint16_t reasonLen = readU16(payload, 8);
-        if (reasonLen > 0) {
-            if (len < 10u + reasonLen) { return false; }
-            out.reason.emplace(reinterpret_cast<const char*>(payload + 10), reasonLen);
-        }
-        return true;
-    }
-
-    std::vector<uint8_t> encodeCompactionCommit(
-        uint64_t tsUs,
-        const std::vector<std::string>& outputFiles,
-        const std::vector<std::string>& inputFiles
-    ) {
-        const auto outputCount = static_cast<uint8_t>(outputFiles.size());
-        const auto inputCount = static_cast<uint8_t>(inputFiles.size());
-
-        // Fixed: 12 bytes + [u16 len + bytes] per output + [u16 len + bytes] per input
-        size_t varSize = 0;
-        for (const auto& s : outputFiles) { varSize += 2 + s.size(); }
-        for (const auto& s : inputFiles) { varSize += 2 + s.size(); }
-
-        std::vector<uint8_t> p(12 + varSize);
-        uint8_t* b = p.data();
-        writeU64(b, 0, tsUs);
-        b[8] = outputCount;
-        b[9] = inputCount;
-        writeU16(b, 10, 0); // reserved
-
-        size_t off = 12;
-        for (const auto& s : outputFiles) {
-            writeU16(b, off, static_cast<uint16_t>(s.size()));
-            off += 2;
-            std::memcpy(b + off, s.data(), s.size());
-            off += s.size();
-        }
-        for (const auto& s : inputFiles) {
-            writeU16(b, off, static_cast<uint16_t>(s.size()));
-            off += 2;
-            std::memcpy(b + off, s.data(), s.size());
-            off += s.size();
-        }
-        return p;
-    }
-
-    std::vector<uint8_t> encodeSstBlobRefs(uint64_t tsUs, const std::string& name, const std::vector<SSTBlobRefEntry>& entries) {
-        if (name.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref filename is too long"); }
-        if (entries.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref list is too large"); }
-        const auto nameLen = static_cast<uint16_t>(name.size());
-        const auto entryCount = static_cast<uint16_t>(entries.size());
-        size_t total = 12 + name.size();
-        for (const auto& entry : entries) {
-            if (entry.key.size() > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref key is too large"); }
-            total += 20 + entry.key.size();
-        }
-        if (total > UINT16_MAX) { throw std::invalid_argument("Manifest: SST blob ref payload is too large"); }
-        std::vector<uint8_t> p(total);
-        writeU64(p.data(), 0, tsUs);
-        writeU16(p.data(), 8, nameLen);
-        writeU16(p.data(), 10, entryCount);
-        std::memcpy(p.data() + 12, name.data(), name.size());
-        size_t off = 12 + name.size();
-        for (const auto& entry : entries) {
-            writeU64(p.data(), off, entry.seq);
-            off += sizeof(uint64_t);
-            writeU64(p.data(), off, entry.blobId.value_or(MANIFEST_ABSENT_U64));
-            off += sizeof(uint64_t);
-            writeU16(p.data(), off, static_cast<uint16_t>(entry.key.size()));
-            off += sizeof(uint16_t);
-            p[off++] = entry.flags;
-            p[off++] = 0;
-            std::memcpy(p.data() + off, entry.key.data(), entry.key.size());
-            off += entry.key.size();
-        }
-        return p;
-    }
-
-    bool decodeCompactionCommit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out) {
-        if (len < 12) { return false; }
-        out.tsUs = readU64(payload, 0);
-        const uint8_t outputCount = payload[8];
-        const uint8_t inputCount = payload[9];
-
-        size_t cursor = 12;
-        out.outputFiles.clear();
-        out.outputFiles.reserve(outputCount);
-        for (uint8_t i = 0; i < outputCount; ++i) {
-            std::string s;
-            if (!readLengthPrefixed(payload, len, cursor, s)) { return false; }
-            out.outputFiles.push_back(std::move(s));
-        }
-        out.inputFiles.clear();
-        out.inputFiles.reserve(inputCount);
-        for (uint8_t i = 0; i < inputCount; ++i) {
-            std::string s;
-            if (!readLengthPrefixed(payload, len, cursor, s)) { return false; }
-            out.inputFiles.push_back(std::move(s));
-        }
-        return true;
-    }
-
-    bool decodeSstBlobRefs(const uint8_t* payload, uint16_t len, DecodedSSTBlobRefs& out) {
-        if (len < 12) { return false; }
-        out.tsUs = readU64(payload, 0);
-        const uint16_t nameLen = readU16(payload, 8);
-        const uint16_t entryCount = readU16(payload, 10);
-        if (len < 12u + nameLen) { return false; }
-        out.name.assign(reinterpret_cast<const char*>(payload + 12), nameLen);
+    bool decodeSstBlobRefs(const uint8_t* p, uint32_t len, DecodedSSTBlobRefs& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.name = r.string();
+        const auto count = r.u32();
         out.entries.clear();
-        out.entries.reserve(entryCount);
-        size_t off = 12u + nameLen;
-        for (uint16_t i = 0; i < entryCount; ++i) {
-            if (off + 20 > len) { return false; }
-            SSTBlobRefEntry entry;
-            entry.seq = readU64(payload, off);
-            off += sizeof(uint64_t);
-            const uint64_t blobId = readU64(payload, off);
-            off += sizeof(uint64_t);
-            if (blobId != MANIFEST_ABSENT_U64) { entry.blobId = blobId; }
-            const uint16_t keyLen = readU16(payload, off);
-            off += sizeof(uint16_t);
-            entry.flags = payload[off++];
-            ++off;
-            if (off + keyLen > len) { return false; }
-            entry.key.assign(payload + off, payload + off + keyLen);
-            off += keyLen;
-            out.entries.push_back(std::move(entry));
+        if (!r.valid || count > (r.size - r.offset) / 21) {
+            return false;
         }
-        return true;
+        out.entries.reserve(count);
+        for (uint32_t i = 0; i < count && r.valid; ++i) {
+            SSTBlobRefEntry e{};
+            e.seq = r.u64();
+            e.blobId = optionalU64(r.u64());
+            e.flags = r.u8();
+            const auto key = r.string();
+            e.key.assign(key.begin(), key.end());
+            out.entries.push_back(std::move(e));
+        }
+        return r.done();
     }
-
-    // ============================================================================
-    // Blob lifecycle encode / decode (v1)
-    // ============================================================================
-
-    std::vector<uint8_t> encodeBlobPut(
-        uint64_t tsUs,
-        uint64_t blobId,
-        uint64_t totalSize,
-        uint64_t storedSize,
-        uint32_t contentCrc32c,
-        uint32_t codec
-    ) {
-        std::vector<uint8_t> p(40);
-        writeU64(p.data(), 0, tsUs);
-        writeU64(p.data(), 8, blobId);
-        writeU64(p.data(), 16, totalSize);
-        writeU64(p.data(), 24, storedSize);
-        writeU32(p.data(), 32, contentCrc32c);
-        writeU32(p.data(), 36, codec);
-        return p;
+    bool decodeBlobPut(const uint8_t* p, uint32_t len, DecodedBlobPut& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.blobId = r.u64();
+        out.totalSize = r.u64();
+        out.storedSize = r.u64();
+        out.contentCrc32c = r.u32();
+        out.codec = r.u32();
+        return r.done();
     }
-
-    std::vector<uint8_t> encodeBlobDelete(uint64_t tsUs, uint64_t blobId) {
-        std::vector<uint8_t> p(16);
-        writeU64(p.data(), 0, tsUs);
-        writeU64(p.data(), 8, blobId);
-        return p;
+    bool decodeBlobDelete(const uint8_t* p, uint32_t len, DecodedBlobDelete& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.blobId = r.u64();
+        return r.done();
     }
-
-    bool decodeBlobPut(const uint8_t* payload, uint16_t len, DecodedBlobPut& out) {
-        if (len < 40) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.blobId = readU64(payload, 8);
-        out.totalSize = readU64(payload, 16);
-        out.storedSize = readU64(payload, 24);
-        out.contentCrc32c = readU32(payload, 32);
-        out.codec = readU32(payload, 36);
-        return true;
+    bool decodeNodeJoin(const uint8_t* p, uint32_t len, DecodedNodeJoin& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.nodeId = r.u64();
+        out.replPort = r.u16();
+        out.host = r.string();
+        return r.done();
     }
-
-    bool decodeBlobDelete(const uint8_t* payload, uint16_t len, DecodedBlobDelete& out) {
-        if (len < 16) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.blobId = readU64(payload, 8);
-        return true;
+    bool decodeNodeLeave(const uint8_t* p, uint32_t len, DecodedNodeLeave& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.nodeId = r.u64();
+        return r.done();
     }
-
-    // ============================================================================
-    // Cluster event encode / decode (v1)
-    // ============================================================================
-
-    std::vector<uint8_t> encodeNodeJoin(uint64_t tsUs, uint64_t nodeId, uint16_t replPort, const std::string& host) {
-        const uint16_t hostLen = static_cast<uint16_t>(host.size());
-        std::vector<uint8_t> p(20 + hostLen);
-        uint8_t* b = p.data();
-        writeU64(b, 0, tsUs);
-        writeU64(b, 8, nodeId);
-        writeU16(b, 16, replPort);
-        writeU16(b, 18, hostLen);
-        std::memcpy(b + 20, host.data(), hostLen);
-        return p;
-    }
-
-    std::vector<uint8_t> encodeNodeLeave(uint64_t tsUs, uint64_t nodeId) {
-        std::vector<uint8_t> p(16);
-        writeU64(p.data(), 0, tsUs);
-        writeU64(p.data(), 8, nodeId);
-        return p;
-    }
-
-    std::vector<uint8_t> encodePrimaryLease(uint64_t tsUs, uint64_t nodeId, uint64_t leaseUntilUs) {
-        std::vector<uint8_t> p(24);
-        writeU64(p.data(), 0, tsUs);
-        writeU64(p.data(), 8, nodeId);
-        writeU64(p.data(), 16, leaseUntilUs);
-        return p;
-    }
-
-    bool decodeNodeJoin(const uint8_t* payload, uint16_t len, DecodedNodeJoin& out) {
-        if (len < 20) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.nodeId = readU64(payload, 8);
-        out.replPort = readU16(payload, 16);
-        const uint16_t hostLen = readU16(payload, 18);
-        if (len < 20u + hostLen) { return false; }
-        out.host.assign(reinterpret_cast<const char*>(payload + 20), hostLen);
-        return true;
-    }
-
-    bool decodeNodeLeave(const uint8_t* payload, uint16_t len, DecodedNodeLeave& out) {
-        if (len < 16) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.nodeId = readU64(payload, 8);
-        return true;
-    }
-
-    bool decodePrimaryLease(const uint8_t* payload, uint16_t len, DecodedPrimaryLease& out) {
-        if (len < 24) { return false; }
-        out.tsUs = readU64(payload, 0);
-        out.nodeId = readU64(payload, 8);
-        out.leaseUntilUs = readU64(payload, 16);
-        return true;
+    bool decodePrimaryLease(const uint8_t* p, uint32_t len, DecodedPrimaryLease& out) {
+        Reader r{p, len};
+        out.tsUs = r.u64();
+        out.nodeId = r.u64();
+        out.leaseUntilUs = r.u64();
+        return r.done();
     }
 } // namespace akkaradb::engine::manifest

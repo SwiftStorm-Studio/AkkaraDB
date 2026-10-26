@@ -1208,21 +1208,51 @@ The SST manager stores immutable sorted files under `sstDir`.
 In `AUTO`, zero `compactThreads` disables background compaction; otherwise it
 selects background compaction.
 
-Reads search L0 newest first because L0 files may overlap. Higher levels are
-kept as ordered ranges by compaction policy. SST lookup and scan apply the
+L0 files may overlap and can finish flushing out of sequence order. Point reads,
+`contains`, `getInto`, and scans choose the largest visible retained sequence
+across all relevant files and levels, including tombstones. File ids and flush
+completion order are not version precedence. Higher levels are kept as ordered
+ranges by compaction policy. SST lookup and scan apply the
 caller-provided snapshot sequence as a visibility upper bound over records that
 remain in the current SST set.
 
+Within a single SST, repeated keys may have retained sequences in any order and
+may span data blocks. Point reads select the largest sequence at or below the
+snapshot across all such records. The low-level `SSTReader::scan` yields every
+visible physical version; SSTManager scans merge these into one version per key.
+
 ### 12.2 Flush and Compaction
 
-MemTable flush writes sorted records to an L0 SST. Compaction replaces one or
+MemTable flush writes sorted records to an L0 SST. A recovery checkpoint advances
+only through the contiguous publication frontier and below every unflushed
+MemTable generation's minimum sequence, across all shards. The frontier is
+tracked even for `APPLIED` visibility; unused thread-local sequence reservations
+can conservatively delay WAL retirement. Flushed generations are unpublished
+before recalculating this boundary. The checkpoint and preceding SST seals must
+be durable before any covered WAL segments are retired. SST seal, compaction
+commit, and checkpoint calls enforce this handoff even in Manifest fast mode.
+Compaction replaces one or
 more input files with output files and may collapse multiple records for the
 same key to the newest retained record. SST compaction is not required to
 preserve compacted-away historical versions for arbitrary older snapshot
 sequences; `getAt`, `history`, and rollback use VersionLog for persistent
 history. The Manifest's atomic `COMPACTION_COMMIT` record names all outputs and
 all inputs, so recovery either installs the whole replacement or preserves the
-old inputs and discards orphan outputs.
+old inputs and discards orphan outputs. Tombstones remain at the bottom level:
+a delayed lower-sequence flush must not resurrect a deleted key.
+
+Without an external Manifest, SSTManager owns the synchronous `sst-state.akmf`
+catalog inside `sstDir`, using the same atomic SST seal and compaction-commit
+protocol. This catalog is required even when the engine's general Manifest
+component is disabled. Preserve it together with the SST files. Existing SST
+directories without the catalog, and switching an existing private-catalog
+directory to an external Manifest, are rejected before SST cleanup; no import
+or migration of untracked files is provided.
+
+Recovery rejects a catalog-live SST whose level is outside the configured
+`maxLevels`, before deleting abandoned files or publishing recovered state.
+If `maxLevels` was reduced below existing levels, restore a value greater than
+the highest live level before reopening; no live SST is silently omitted.
 
 Blocking L0 backpressure with compaction disabled is rejected at open.
 
@@ -1243,7 +1273,9 @@ It records:
 
 `fastMode == false` writes and syncs each manifest record. `fastMode == true`
 uses a background flusher and provides lower-latency but weaker immediate
-manifest durability.
+manifest durability for other events. SST seal, compaction commit, and checkpoint
+calls synchronously drain preceding records and wait for durable storage, even
+when the batching worker has not been started.
 
 Manifest replay rebuilds the live/deleted SST sets and last checkpoint state.
 
@@ -4307,7 +4339,7 @@ dispatch where available.
 | SST file | `AKS1` | 1 | Header, metadata, footer, and block CRCs |
 | SST footer | `A1SF` | 1 | Footer CRC |
 | Blob file | `AKB1` | 1 | Header CRC and original-content CRC |
-| Manifest | `AMV1` | 1 | Header CRC and per-record payload CRC |
+| Manifest | `AMV1` | 1 | File-header CRC, record-header CRC and per-record payload CRC |
 | VersionLog segment | `AKV1` | 1 | File-header and entry CRCs |
 | VersionLog sidecar index | `AKVI` | 1 | Header CRC and payload CRC |
 | VersionLog durable tail | `AKVT` | 1 | Tail-header CRC |
@@ -4421,14 +4453,27 @@ Record flags mirror tombstone and Blob status.
 ### 24.6 Manifest
 
 Manifest files start with a 32-byte file header and then a sequence of records.
-Each record has an 8-byte prefix:
+Each v1 record has a 16-byte prefix:
 
 ```text
-[type:u8][flags:u8][payloadLen:u16le][crc32c:u32le][payload]
+[type:u8][flags:u8][reserved:u16le][payloadLen:u32le]
+[payloadCrc32c:u32le][headerCrc32c:u32le][payload]
 ```
 
 Record payloads encode SST lifecycle, checkpoint, compaction, truncation, and
-cluster lifecycle events.
+cluster lifecycle events. Strings and collection counts use checked `u32` lengths;
+SST levels use `u32`, and optional strings use a `u8` presence flag followed by
+the length-prefixed string when present. This supports the full Native key size
+and compaction input/output sets above 255 files without narrowing. Payloads
+above `UINT32_MAX` are rejected before publication. Replay checks the record
+header before allocating payload storage and bounds every payload by the
+remaining file length. An incomplete final record is retired before new appends;
+a malformed complete payload or a damaged earlier rotated file is rejected.
+
+The current layout defines Manifest v1 (`AMV1`). Earlier development layouts,
+including those that reused this identifier, are unsupported; no compatibility
+reader or migration is provided. Recreate databases written with those layouts
+using an external export/backup. SST and WAL layouts are unchanged.
 
 ### 24.7 VersionLog
 

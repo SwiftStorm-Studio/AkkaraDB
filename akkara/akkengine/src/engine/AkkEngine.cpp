@@ -1049,6 +1049,8 @@ namespace akkaradb::engine {
 
             mutable std::mutex blobGcPlanMu;
             mutable std::mutex writeMu;
+            std::mutex sstCheckpointMu;
+            uint64_t sstCheckpointSeq = 0;
             std::mutex partitionSnapshotMu;
             mutable std::shared_mutex mutationEpochMu;
             std::unique_ptr<std::array<std::mutex, KEY_SEQUENCE_ORDER_STRIPES>> keySequenceOrderMu;
@@ -1126,7 +1128,8 @@ namespace akkaradb::engine {
             }
 
             void markWriteCommitted(uint64_t seq, bool knownContiguous = false) {
-                if (opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::APPLIED) { return; }
+                // APPLIED reads can see out of order writes, but WAL retirement still
+                // requires the contiguous publication frontier maintained here.
                 if (knownContiguous && seq == committedSeq.load(std::memory_order_acquire) + 1u) {
                     committedSeq.store(seq, std::memory_order_release);
                     if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) { commitCv.notify_all(); }
@@ -5204,25 +5207,38 @@ namespace akkaradb::engine {
         }
 
         if (impl.sstManager) {
-            auto afterFlush = [&impl](uint64_t checkpointSeq) {
-                if (checkpointSeq == 0) { return; }
-                crashAtTestPoint("engine.flush.after_sst_flush");
-                if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
-                crashAtTestPoint("engine.flush.after_wal_prune");
-                if (impl.manifest) { impl.manifest->checkpoint(std::optional<std::string>{"flush"}, std::nullopt, checkpointSeq); }
-                crashAtTestPoint("engine.flush.after_manifest_checkpoint");
+            impl.opts.memtable.onFlushComplete = [&impl] {
+                std::lock_guard checkpointLock{impl.sstCheckpointMu};
+                // Sample publication first: every seq at or below this cut is already
+                // in a MemTable (or durably flushed). Later publications cannot extend it.
+                if (!impl.memtable || !impl.sstManager) { return; }
+                uint64_t checkpointSeq = impl.committedSeq.load(std::memory_order_acquire);
+                const uint64_t pending = impl.memtable->minimumUnflushedSequence();
+                if (pending != UINT64_MAX) { checkpointSeq = std::min(checkpointSeq, pending == 0 ? 0 : pending - 1); }
+                checkpointSeq = std::min(checkpointSeq, impl.sstManager->maxSequence());
+                if (checkpointSeq > impl.sstCheckpointSeq) {
+                    // Persist the recovery boundary before retiring any WAL files.
+                    // checkpoint() also drains preceding SST seals in fast mode.
+                    if (impl.manifest) { impl.manifest->checkpoint(std::optional<std::string>{"flush"}, std::nullopt, checkpointSeq); }
+                    crashAtTestPoint("engine.flush.after_manifest_checkpoint");
+                    if (impl.walWriter && impl.opts.runtime.pruneWalOnFlush) { impl.walWriter->pruneUntil(checkpointSeq); }
+                    crashAtTestPoint("engine.flush.after_wal_prune");
+                    impl.sstCheckpointSeq = checkpointSeq;
+                }
                 if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
             };
             if (impl.opts.memtable.flushInputMode == memtable::MemTableFlushInputMode::STREAMING) {
-                impl.opts.memtable.onFlushStream = [&, afterFlush](size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
-                    afterFlush(impl.sstManager->flush(estimatedRecordCount, std::move(records)));
+                impl.opts.memtable.onFlushStream = [&impl](size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
+                    (void)impl.sstManager->flush(estimatedRecordCount, std::move(records));
+                    crashAtTestPoint("engine.flush.after_sst_flush");
                 };
                 impl.opts.memtable.onFlush = {};
             }
             else {
-                impl.opts.memtable.onFlush = [&, afterFlush](std::span<const core::RecordView> records) {
+                impl.opts.memtable.onFlush = [&impl](std::span<const core::RecordView> records) {
                     if (records.empty()) { return; }
-                    afterFlush(impl.sstManager->flush(records));
+                    (void)impl.sstManager->flush(records);
+                    crashAtTestPoint("engine.flush.after_sst_flush");
                 };
                 impl.opts.memtable.onFlushStream = {};
             }
@@ -5230,6 +5246,7 @@ namespace akkaradb::engine {
         else {
             impl.opts.memtable.onFlush = {};
             impl.opts.memtable.onFlushStream = {};
+            impl.opts.memtable.onFlushComplete = {};
         }
         impl.memtable = memtable::MemTable::create(impl.opts.memtable);
         uint64_t manifestCheckpointSeq = 0;
@@ -5247,6 +5264,7 @@ namespace akkaradb::engine {
                 );
             }
             walRecoveryCheckpointSeq = manifestCheckpointSeq;
+            impl.sstCheckpointSeq = manifestCheckpointSeq;
         }
         uint64_t preWalRecoveredSeq = 0;
         if (impl.sstManager) { preWalRecoveredSeq = std::max(preWalRecoveredSeq, impl.sstManager->maxSequence()); }

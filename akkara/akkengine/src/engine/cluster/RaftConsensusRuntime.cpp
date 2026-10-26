@@ -72,9 +72,9 @@
 
 namespace akkaradb::engine::cluster {
     namespace {
-        #include "detail/RaftSupport.inc"
-        #include "detail/RaftTransport.inc"
-        #include "detail/RaftProtocol.inc"
+        #include "detail/raft/RaftSupport.inc"
+        #include "detail/raft/RaftTransport.inc"
+        #include "detail/raft/RaftProtocol.inc"
     }
 
     class RaftConsensusRuntime::Impl {
@@ -394,16 +394,18 @@ namespace akkaradb::engine::cluster {
                     ((entry.flags & core::MemHdr16::FLAG_BLOB) == 0 || runtimeOptions_.raftBlobPolicy != RaftBlobPolicy::RAFT_LOG || hasRaftBlobStorage(callbacks_));
             }
 
-            #include "detail/RaftPeerTransport.inc"
-            #include "detail/RaftProposals.inc"
-            #include "detail/RaftMembership.inc"
-            #include "detail/RaftLog.inc"
-            #include "detail/RaftPersistence.inc"
-            #include "detail/RaftElection.inc"
-            #include "detail/RaftSnapshots.inc"
-            #include "detail/RaftReplication.inc"
-            #include "detail/RaftServer.inc"
-            #include "detail/RaftApplication.inc"
+            #include "detail/raft/RaftPeerTransport.inc"
+            #include "detail/raft/RaftProposals.inc"
+            #include "detail/raft/RaftMembership.inc"
+            #include "detail/raft/RaftLog.inc"
+
+            #include "detail/raft/RaftPersistence.inc"
+            #include "detail/raft/RaftElection.inc"
+            #include "detail/raft/RaftSnapshots.inc"
+            #include "detail/raft/RaftReplication.inc"
+            #include "detail/raft/RaftServer.inc"
+            #include "detail/raft/RaftApplication.inc"
+
 
         public:
             Impl(std::filesystem::path dbDir, ClusterConfig config, uint64_t selfNodeId, ClusterEngineCallbacks callbacks, ClusterRuntimeOptions runtimeOptions,

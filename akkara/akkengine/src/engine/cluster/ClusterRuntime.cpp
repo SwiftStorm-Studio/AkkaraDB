@@ -974,8 +974,8 @@ namespace akkaradb::engine::cluster {
                 if (!accepts(self_, previousEpoch + 1)) { throw std::runtime_error("MIRROR authority: promotion rejected"); }
             }
         };
-        #include "PlacementAuthority.inc"
-        #include "RequestAuthority.inc"
+        #include "detail/PlacementAuthority.inc"
+        #include "detail/RequestAuthority.inc"
     } // namespace
 
     class ClusterRuntime::Impl {

@@ -24,32 +24,22 @@ namespace akkaradb::engine::manifest {
     // ManifestRecordType
     // ============================================================================
 
-    /**
-     * ManifestRecordType - Discriminator for manifest record payload.
-     */
     enum class ManifestRecordType : uint8_t {
         STRIPE_COMMIT = 0x01,
         ///< Stripe counter advance
         SST_SEAL = 0x02,
         ///< New SST file sealed (L0 flush only)
         SST_DELETE = 0x03,
-        ///< SST file deleted (legacy; superseded by CompactionCommit)
+        ///< SST file deleted (individual SST deletion)
         COMPACTION_START = 0x04,
         ///< Compaction began (informational hint)
         COMPACTION_END = 0x05,
-        ///< Compaction completed (legacy single-output format)
+        ///< Compaction completed (single-output completion event)
         CHECKPOINT = 0x06,
         ///< Checkpoint marker
         TRUNCATE = 0x07,
         ///< Manifest truncate marker
-        /**
-         * Atomic compaction commit - replaces CompactionEnd + SSTDelete.
-         *
-         * A single CRC-protected record that simultaneously adds all output files
-         * and removes all input files from the live set.  If this record is absent
-         * (e.g. process killed mid-write, detected by CRC mismatch), replay treats
-         * the old input files as still live and discards the orphan output files.
-         */
+
         COMPACTION_COMMIT = 0x08,
         SST_BLOB_REFS = 0x09,
         ///< Blob ids referenced by one SST file
@@ -104,21 +94,10 @@ namespace akkaradb::engine::manifest {
         [[nodiscard]] bool verifyMagic() const noexcept { return magic == MAGIC; }
         [[nodiscard]] bool verifyVersion() const noexcept { return version == VERSION; }
 
-        /**
-         * Verifies the header checksum.
-         * Recomputes CRC with crc32c field zeroed and compares.
-         */
         [[nodiscard]] bool verifyChecksum() const noexcept;
 
-        /**
-         * Builds and returns a valid header as a byte array.
-         * Computes and fills crc32c automatically.
-         */
         [[nodiscard]] static ManifestFileHeader build(uint32_t fileSeq) noexcept;
 
-        /**
-         * Serializes this header to a 32-byte output buffer.
-         */
         void serialize(uint8_t out[SIZE]) const noexcept;
     };
     #pragma pack(pop)
@@ -129,52 +108,34 @@ namespace akkaradb::engine::manifest {
     // ManifestRecordHeader - Prefix for every manifest record
     // ============================================================================
 
-    /**
-     * ManifestRecordHeader - 8-byte header preceding each manifest record payload.
-     *
-     * On-disk layout (8 bytes, all fields LE):
-     * [type:u8][flags:u8][payloadLen:u16][crc32c:u32]
-     *
-     * Design:
-     * - type: ManifestRecordType discriminator
-     * - flags: Reserved (0 for now)
-     * - payloadLen: Byte length of the payload that follows
-     * - crc32c: CRC32C of payload bytes only
-     */
     #pragma pack(push, 1)
+    // V1 record: type:u8, flags:u8, reserved:u16, payloadLen:u32, payload CRC:u32, header CRC:u32.
+    // Strings and collection counts in v1 payloads use checked u32 fields.
     struct AKDB_API ManifestRecordHeader {
         uint8_t type;
         uint8_t flags;
-        uint16_t payloadLen;
+        uint16_t reserved;
+        uint32_t payloadLen;
         uint32_t crc32c;
+        uint32_t headerCrc32c;
 
-        static constexpr size_t SIZE = 8;
+        static constexpr size_t SIZE = 16;
 
-        /**
-         * Builds a header for a given payload.
-         */
-        [[nodiscard]] static ManifestRecordHeader build(ManifestRecordType type, const uint8_t* payload, uint16_t payloadLen) noexcept;
+        [[nodiscard]] static ManifestRecordHeader build(ManifestRecordType type, const uint8_t* payload, uint32_t payloadLen) noexcept;
 
-        /**
-         * Serializes this header to an 8-byte output buffer.
-         */
         void serialize(uint8_t out[SIZE]) const noexcept;
 
-        /**
-         * Deserializes a header from 8 bytes.
-         */
         [[nodiscard]] static ManifestRecordHeader deserialize(const uint8_t in[SIZE]) noexcept;
 
-        /**
-         * Verifies the payload CRC.
-         */
-        [[nodiscard]] bool verifyPayload(const uint8_t* payload, uint16_t len) const noexcept {
+        [[nodiscard]] bool verifyChecksum() const noexcept;
+
+        [[nodiscard]] bool verifyPayload(const uint8_t* payload, uint32_t len) const noexcept {
             return crc32c == cpu::CRC32C(reinterpret_cast<const std::byte*>(payload), len);
         }
     };
     #pragma pack(pop)
 
-    static_assert(sizeof(ManifestRecordHeader) == 8, "ManifestRecordHeader must be 8 bytes");
+    static_assert(sizeof(ManifestRecordHeader) == 16, "ManifestRecordHeader must be 16 bytes");
 
     // ============================================================================
     // Sentinel values
@@ -186,19 +147,8 @@ namespace akkaradb::engine::manifest {
     // Encode functions - produce raw payload bytes for each record type
     // ============================================================================
 
-    /**
-     * Encodes a StripeCommit payload.
-     * Payload (16 bytes): [tsUs:u64][stripeCount:u64]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeStripeCommit(uint64_t tsUs, uint64_t stripeCount);
 
-    /**
-     * Encodes an SSTSeal payload.
-     *
-     * Payload fixed (24 bytes):
-     *   [tsUs:u64][entries:u64][level:u8][keyFlags:u8][nameLen:u16][fkLen:u16][lkLen:u16]
-     * Variable: name bytes, firstKey bytes (if keyFlags bit0), lastKey bytes (if keyFlags bit1)
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeSstSeal(
         uint64_t tsUs,
         int level,
@@ -208,28 +158,10 @@ namespace akkaradb::engine::manifest {
         const std::optional<std::string>& lastKeyHex
     );
 
-    /**
-     * Encodes an SSTDelete payload.
-     * Payload fixed (10 bytes): [tsUs:u64][nameLen:u16]
-     * Variable: name bytes
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeSstDelete(uint64_t tsUs, const std::string& name);
 
-    /**
-     * Encodes a CompactionStart payload.
-     * Payload fixed (12 bytes): [tsUs:u64][level:u8][inputCount:u8][reserved:u16]
-     * Variable: [len:u16][bytes] x input_count
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCompactionStart(uint64_t tsUs, int level, const std::vector<std::string>& inputs);
 
-    /**
-     * Encodes a CompactionEnd payload.
-     *
-     * Payload fixed (28 bytes):
-     *   [tsUs:u64][entries:u64][level:u8][keyFlags:u8][inputCount:u8][reserved:u8]
-     *   [outLen:u16][fkLen:u16][lkLen:u16][reserved:u16]
-     * Variable: output bytes, firstKey bytes, lastKey bytes, [len:u16 + bytes] x input_count
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCompactionEnd(
         uint64_t tsUs,
         int level,
@@ -240,15 +172,6 @@ namespace akkaradb::engine::manifest {
         const std::optional<std::string>& lastKeyHex
     );
 
-    /**
-     * Encodes a Checkpoint payload.
-     *
-     * Payload fixed (26 bytes): [tsUs:u64][stripe:u64][lastSeq:u64][nameLen:u16]
-     * Variable: name bytes
-     *
-     * stripe / lastSeq use MANIFEST_ABSENT_U64 when not present.
-     * nameLen = 0 when no name.
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCheckpoint(
         uint64_t tsUs,
         const std::optional<std::string>& name,
@@ -256,43 +179,14 @@ namespace akkaradb::engine::manifest {
         const std::optional<uint64_t>& lastSeq
     );
 
-    /**
-     * Encodes a Truncate payload.
-     * Payload fixed (10 bytes): [tsUs:u64][reasonLen:u16]
-     * Variable: reason bytes
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeTruncate(uint64_t tsUs, const std::optional<std::string>& reason);
 
-    /**
-     * Encodes a CompactionCommit payload (atomic multi-file compaction result).
-     *
-     * Payload fixed (12 bytes):
-     *   [tsUs:u64][outputCount:u8][inputCount:u8][reserved:u16]
-     * Variable:
-     *   outputCount x [nameLen:u16][name bytes]
-     *   inputCount  x [nameLen:u16][name bytes]
-     *
-     * During replay, this record atomically:
-     *   - Adds all outputFiles to the live set
-     *   - Removes all inputFiles from the live set
-     * If this record is absent (CRC mismatch = interrupted write), the live set
-     * is left unchanged (old input files remain live; orphan outputs are ignored).
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeCompactionCommit(
         uint64_t tsUs,
         const std::vector<std::string>& outputFiles,
         const std::vector<std::string>& inputFiles
     );
 
-    /**
-     * Encodes an SSTBlobRefs payload.
-     * Payload fixed (12 bytes): [tsUs:u64][nameLen:u16][entryCount:u16]
-     * Variable:
-     *   name bytes
-     *   entryCount x [seq:u64][blobId:u64][keyLen:u16][flags:u8][reserved:u8][key bytes]
-     *
-     * blobId uses MANIFEST_ABSENT_U64 for records whose current value is not an external blob ref.
-     */
     struct AKDB_API SSTBlobRefEntry {
         std::vector<uint8_t> key;
         uint64_t seq;
@@ -369,27 +263,20 @@ namespace akkaradb::engine::manifest {
         std::vector<SSTBlobRefEntry> entries;
     };
 
-    /**
-     * Decode functions.  Return false if payload is malformed / too short.
-     */
-    [[nodiscard]] AKDB_API bool decodeStripeCommit(const uint8_t* payload, uint16_t len, DecodedStripeCommit& out);
-    [[nodiscard]] AKDB_API bool decodeSstSeal(const uint8_t* payload, uint16_t len, DecodedSSTSeal& out);
-    [[nodiscard]] AKDB_API bool decodeSstDelete(const uint8_t* payload, uint16_t len, DecodedSSTDelete& out);
-    [[nodiscard]] AKDB_API bool decodeCompactionStart(const uint8_t* payload, uint16_t len, DecodedCompactionStart& out);
-    [[nodiscard]] AKDB_API bool decodeCompactionEnd(const uint8_t* payload, uint16_t len, DecodedCompactionEnd& out);
-    [[nodiscard]] AKDB_API bool decodeCheckpoint(const uint8_t* payload, uint16_t len, DecodedCheckpoint& out);
-    [[nodiscard]] AKDB_API bool decodeTruncate(const uint8_t* payload, uint16_t len, DecodedTruncate& out);
-    [[nodiscard]] AKDB_API bool decodeCompactionCommit(const uint8_t* payload, uint16_t len, DecodedCompactionCommit& out);
-    [[nodiscard]] AKDB_API bool decodeSstBlobRefs(const uint8_t* payload, uint16_t len, DecodedSSTBlobRefs& out);
+    [[nodiscard]] AKDB_API bool decodeStripeCommit(const uint8_t* payload, uint32_t len, DecodedStripeCommit& out);
+    [[nodiscard]] AKDB_API bool decodeSstSeal(const uint8_t* payload, uint32_t len, DecodedSSTSeal& out);
+    [[nodiscard]] AKDB_API bool decodeSstDelete(const uint8_t* payload, uint32_t len, DecodedSSTDelete& out);
+    [[nodiscard]] AKDB_API bool decodeCompactionStart(const uint8_t* payload, uint32_t len, DecodedCompactionStart& out);
+    [[nodiscard]] AKDB_API bool decodeCompactionEnd(const uint8_t* payload, uint32_t len, DecodedCompactionEnd& out);
+    [[nodiscard]] AKDB_API bool decodeCheckpoint(const uint8_t* payload, uint32_t len, DecodedCheckpoint& out);
+    [[nodiscard]] AKDB_API bool decodeTruncate(const uint8_t* payload, uint32_t len, DecodedTruncate& out);
+    [[nodiscard]] AKDB_API bool decodeCompactionCommit(const uint8_t* payload, uint32_t len, DecodedCompactionCommit& out);
+    [[nodiscard]] AKDB_API bool decodeSstBlobRefs(const uint8_t* payload, uint32_t len, DecodedSSTBlobRefs& out);
 
     // ========================================================================
     // Blob lifecycle encode / decode (v1)
     // ========================================================================
 
-    /**
-     * Encodes a BlobPut payload.
-     * Payload (40 bytes): [tsUs:u64][blobId:u64][totalSize:u64][storedSize:u64][contentCrc32c:u32][codec:u32]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeBlobPut(
         uint64_t tsUs,
         uint64_t blobId,
@@ -399,10 +286,6 @@ namespace akkaradb::engine::manifest {
         uint32_t codec
     );
 
-    /**
-     * Encodes a BlobDelete payload.
-     * Payload (16 bytes): [tsUs:u64][blobId:u64]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeBlobDelete(uint64_t tsUs, uint64_t blobId);
 
     struct AKDB_API DecodedBlobPut {
@@ -419,29 +302,17 @@ namespace akkaradb::engine::manifest {
         uint64_t blobId;
     };
 
-    [[nodiscard]] AKDB_API bool decodeBlobPut(const uint8_t* payload, uint16_t len, DecodedBlobPut& out);
-    [[nodiscard]] AKDB_API bool decodeBlobDelete(const uint8_t* payload, uint16_t len, DecodedBlobDelete& out);
+    [[nodiscard]] AKDB_API bool decodeBlobPut(const uint8_t* payload, uint32_t len, DecodedBlobPut& out);
+    [[nodiscard]] AKDB_API bool decodeBlobDelete(const uint8_t* payload, uint32_t len, DecodedBlobDelete& out);
 
     // ========================================================================
     // Cluster event encode / decode (v1)
     // ========================================================================
 
-    /**
-     * Encodes a NodeJoin payload.
-     * Payload: [tsUs:u64][nodeId:u64][replPort:u16][hostLen:u16][host bytes]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeNodeJoin(uint64_t tsUs, uint64_t nodeId, uint16_t replPort, const std::string& host);
 
-    /**
-     * Encodes a NodeLeave payload.
-     * Payload (16 bytes): [tsUs:u64][nodeId:u64]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodeNodeLeave(uint64_t tsUs, uint64_t nodeId);
 
-    /**
-     * Encodes a PrimaryLease payload.
-     * Payload (24 bytes): [tsUs:u64][nodeId:u64][leaseUntilUs:u64]
-     */
     [[nodiscard]] AKDB_API std::vector<uint8_t> encodePrimaryLease(uint64_t tsUs, uint64_t nodeId, uint64_t leaseUntilUs);
 
     struct AKDB_API DecodedNodeJoin {
@@ -462,7 +333,7 @@ namespace akkaradb::engine::manifest {
         uint64_t leaseUntilUs;
     };
 
-    [[nodiscard]] AKDB_API bool decodeNodeJoin(const uint8_t* payload, uint16_t len, DecodedNodeJoin& out);
-    [[nodiscard]] AKDB_API bool decodeNodeLeave(const uint8_t* payload, uint16_t len, DecodedNodeLeave& out);
-    [[nodiscard]] AKDB_API bool decodePrimaryLease(const uint8_t* payload, uint16_t len, DecodedPrimaryLease& out);
+    [[nodiscard]] AKDB_API bool decodeNodeJoin(const uint8_t* payload, uint32_t len, DecodedNodeJoin& out);
+    [[nodiscard]] AKDB_API bool decodeNodeLeave(const uint8_t* payload, uint32_t len, DecodedNodeLeave& out);
+    [[nodiscard]] AKDB_API bool decodePrimaryLease(const uint8_t* payload, uint32_t len, DecodedPrimaryLease& out);
 } // namespace akkaradb::engine::manifest

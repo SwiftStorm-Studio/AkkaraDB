@@ -10,6 +10,7 @@
 // benchmarks/smoke/engine_recovery_smoke_test.cpp
 #include "akk/engine/detail/ProtocolBulkWriter.hpp"
 #include "akk/engine/AkkEngine.hpp"
+#include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
 
@@ -277,6 +278,73 @@ namespace {
             require(walCount == 1 && walName.ends_with("0001.akwal"), "WAL prune boundary did not remove the sealed segment");
         }
         engine->close();
+    }
+
+    std::string partialFlushKey(bool shardOne, size_t ordinal) {
+        for (size_t n = ordinal * 1000; ; ++n) {
+            auto key = "partial-flush-" + std::to_string(n);
+            uint64_t hash = akkaradb::core::computeKeyFp64(bytes(key)) ^ (static_cast<uint64_t>(key.size()) * 0xbf58476d1ce4e5b9ULL);
+            hash ^= hash >> 33; hash *= 0xff51afd7ed558ccdULL;
+            hash ^= hash >> 33; hash *= 0xc4ceb9fe1a85ec53ULL; hash ^= hash >> 33;
+            if (static_cast<bool>(hash & 1u) == shardOne) { return key; }
+        }
+    }
+
+    auto partialFlushOptions(const fs::path& dir, const std::string& mode) {
+        auto options = persistentOptions(dir);
+        options.memtable.shardCount = 2;
+        options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::BYTES_PER_SHARD;
+        options.memtable.thresholdBytesPerShard = 4096;
+        options.wal.shardCount = 1;
+        options.manifest.fastMode = mode.find("fast") != std::string::npos;
+        options.runtime.writeVisibility = mode.find("applied") != std::string::npos
+            ? akkaradb::engine::AkkEngineOptions::WriteVisibilityMode::APPLIED
+            : akkaradb::engine::AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER;
+        options.runtime.pruneWalOnFlush = mode.find("no-prune") == std::string::npos;
+        return options;
+    }
+
+    int runPartialShardCrashWriter(const std::string& mode, const fs::path& dir) {
+        setTestWalSegmentBytes(16384);
+        auto engine = akkaradb::engine::AkkEngine::open(partialFlushOptions(dir, mode));
+        const auto cold = partialFlushKey(false, 0);
+        engine->put(bytes(cold), bytes("old")); engine->forceFlush();
+        require(engine->stats().manifest.lastCheckpointSeq == 1, "complete flush must advance the initial checkpoint");
+        if (mode.starts_with("tombstone")) { engine->remove(bytes(cold)); }
+        else { engine->put(bytes(cold), bytes("new")); }
+        const auto initialFlushes = engine->stats().memtable.flushesCompleted;
+        const std::vector<uint8_t> value(8192, 'h');
+        for (size_t i = 1; i <= 3; ++i) { engine->put(bytes(partialFlushKey(true, i)), value); }
+        require(waitUntil([&] { return engine->stats().memtable.flushesCompleted >= initialFlushes + 3; }),
+            "hot shard did not complete its automatic SST flushes");
+        engine->forceSync();
+        require(engine->stats().manifest.lastCheckpointSeq <= 1, "partial shard flush advanced past an unpersisted earlier mutation");
+        std::quick_exit(86);
+    }
+
+    void runPartialShardCrashRecoveryTests(const fs::path& executable) {
+        for (const std::string mode : {"value-commit-sync", "tombstone-commit-fast", "value-applied-fast-no-prune", "tombstone-applied-sync"}) {
+            const auto dir = fs::temp_directory_path() / ("akkaradb_partial_shard_" + mode);
+            std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+            const auto status = std::system(crashChildCommand(executable, "--partial-shard-crash-writer", mode, dir).c_str());
+            require(status == expectedCrashStatus(), "partial-shard writer did not reach its verified crash boundary");
+            auto options = partialFlushOptions(dir, mode);
+            options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::MANUAL_ONLY;
+            for (int pass = 0; pass < 2; ++pass) {
+                auto engine = akkaradb::engine::AkkEngine::open(options);
+                const auto actual = engine->get(bytes(partialFlushKey(false, 0)));
+                if (mode.starts_with("tombstone")) { require(!actual, "partial shard checkpoint resurrected a deleted key"); }
+                else { require(actual == std::optional<std::vector<uint8_t>>{{'n', 'e', 'w'}}, "partial shard checkpoint lost an earlier durable WAL mutation"); }
+                const std::vector<uint8_t> expected(8192, 'h');
+                for (size_t i = 1; i <= 3; ++i) {
+                    require(engine->get(bytes(partialFlushKey(true, i))) == std::optional<std::vector<uint8_t>>{expected}, "hot shard SST was lost");
+                }
+                engine->forceFlush();
+                require(engine->stats().manifest.lastCheckpointSeq == 5, "checkpoint did not advance after every shard became durable");
+                engine->close();
+            }
+            fs::remove_all(dir, ec);
+        }
     }
 
     int runFlushCrashWriter(const std::string& point, const fs::path& dir) {
@@ -1126,6 +1194,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 3 && std::string{argv[1]} == "--crash-writer") { return runCrashWriter(fs::path{argv[2]}); }
         if (argc == 3 && std::string{argv[1]} == "--parallel-wal-crash-writer") { return runParallelWalCrashWriter(fs::path{argv[2]}); }
+        if (argc == 4 && std::string{argv[1]} == "--partial-shard-crash-writer") { return runPartialShardCrashWriter(argv[2], fs::path{argv[3]}); }
         if (argc == 4 && std::string{argv[1]} == "--flush-crash-writer") { return runFlushCrashWriter(argv[2], fs::path{argv[3]}); }
         if (argc == 4 && std::string{argv[1]} == "--compaction-crash-writer") { return runCompactionCrashWriter(argv[2], fs::path{argv[3]}); }
         if (argc != 1) { throw std::invalid_argument("unexpected command line"); }
@@ -1139,6 +1208,7 @@ int main(int argc, char** argv) {
         runManifestStatsExposeBlobLifecycleTest();
         runParallelWalMatrixRecoveryTest(fs::absolute(fs::path{argv[0]}));
         runParallelWalSstCorrectnessTest();
+        runPartialShardCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));
         runFlushBoundaryCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));
         runCompactionCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));
         runRollbackExecutionModeRecoveryTest();

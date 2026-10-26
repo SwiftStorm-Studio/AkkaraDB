@@ -14,9 +14,16 @@
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/core/record/RecordView.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
+#include "akk/engine/manifest/ManifestFraming.hpp"
 #include "akk/engine/sstable/SSTManager.hpp"
 #include "akk/engine/sstable/SSTWriter.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <exception>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -67,6 +74,144 @@ namespace {
         akkaradb::engine::sst::SSTWriter::Options options;
         options.level = level;
         (void)akkaradb::engine::sst::SSTWriter::write(path, records, options);
+    }
+
+    void testVersionsWithinOneSst() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+        const auto dir = fs::current_path() / ".bench-tmp" / "sst_repeated_key_versions";
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        const std::vector<uint8_t> key(24, 'k'), missing{'m'}, sentinel{'!'};
+        const std::vector<std::vector<uint64_t>> orders{
+            {10, 20, 30, 40, 50}, {50, 40, 30, 20, 10}, {20, 10, 40, 50, 30}
+        };
+        for (const auto codec : {sst::SSTWriter::Codec::NONE, sst::SSTWriter::Codec::ZSTD}) {
+            for (const size_t valueSize : {size_t{32}, size_t{3000}}) {
+                for (const auto& order : orders) {
+                    std::vector<std::vector<uint8_t>> values;
+                    for (const auto seq : order) {
+                        values.emplace_back(seq == 40 ? 0 : valueSize, static_cast<uint8_t>(seq));
+                    }
+                    std::vector<akkaradb::core::RecordView> records;
+                    for (size_t i = 0; i < order.size(); ++i) {
+                        records.push_back(record(key, values[i], order[i], order[i] == 40 ? sst::SST_RECORD_FLAG_TOMBSTONE : 0));
+                    }
+                    sst::SSTWriter::Options options;
+                    options.codec = codec;
+                    options.blockSize = 4096;
+                    const auto path = dir / "versions.aksst";
+                    (void)sst::SSTWriter::write(path, records, options);
+                    auto reader = sst::SSTReader::open(path, {.blockCacheBytes = 0});
+                    require(reader != nullptr, "repeated-key SST must open");
+                    require((reader->header().blockCount > 1) == (valueSize == 3000), "version fixture must cover block boundaries");
+                    sst::SSTManager::Options managerOptions;
+                    managerOptions.compactThreads = 0;
+                    managerOptions.compactionMode = sst::SSTCompactionMode::DISABLED;
+                    managerOptions.codec = codec;
+                    managerOptions.blockSize = options.blockSize;
+                    auto manager = sst::SSTManager::create(dir / "managed", managerOptions);
+                    manager->flush(records);
+                    for (const uint64_t snapshot : {uint64_t{0}, uint64_t{9}, uint64_t{10}, uint64_t{19}, uint64_t{20}, uint64_t{29},
+                                                  uint64_t{30}, uint64_t{39}, uint64_t{40}, uint64_t{49}, uint64_t{50}, UINT64_MAX}) {
+                        const uint64_t expected = std::min<uint64_t>(snapshot / 10 * 10, 50);
+                        const auto got = reader->get(key, snapshot);
+                        const auto contains = reader->contains(key, snapshot);
+                        auto out = sentinel;
+                        const auto hit = reader->getInto(key, out, snapshot);
+                        if (expected == 0) {
+                            require(!got && !contains && !hit && out == sentinel, "future versions must not hide a snapshot miss");
+                        }
+                        else {
+                            const bool live = expected != 40;
+                            const std::vector<uint8_t> expectedValue(live ? valueSize : 0, static_cast<uint8_t>(expected));
+                            require(got && got->seq == expected && got->value == expectedValue && got->isTombstone() == !live,
+                                    "point lookup must choose newest visible version within an SST");
+                            require(contains && *contains == live && hit && *hit == live, "point APIs must agree on selected version");
+                            require(out == (live ? expectedValue : sentinel), "getInto must preserve output on tombstone or miss");
+                        }
+                        size_t count = 0;
+                        for (const auto& row : reader->scan({}, {}, snapshot)) {
+                            require(row.key == key && row.seq <= snapshot, "raw scan returned an invisible version");
+                            ++count;
+                        }
+                        require(count == static_cast<size_t>(std::count_if(order.begin(), order.end(), [snapshot](uint64_t seq) {
+                            return seq <= snapshot;
+                        })), "raw SST scan must retain all visible physical versions");
+                        auto scan = manager->scanIter({}, {}, snapshot, true);
+                        const auto point = manager->get(key, snapshot);
+                        const auto iteratorPoint = scan.get(key);
+                        const auto row = scan.next();
+                        require(point.has_value() == got.has_value() && iteratorPoint.has_value() == got.has_value() &&
+                                row.has_value() == got.has_value() && !scan.hasNext(), "manager point and scan visibility must agree");
+                        if (got) {
+                            require(point->seq == got->seq && iteratorPoint->seq == got->seq && row->seq == got->seq &&
+                                    row->flags == got->flags && row->value == got->value, "manager must merge all same-SST versions");
+                        }
+                    }
+                    require(!reader->get(missing) && !reader->contains(missing), "absent key must remain absent");
+                    manager->shutdown();
+                    manager.reset();
+                    fs::remove_all(dir / "managed");
+                    reader.reset();
+                }
+            }
+        }
+        fs::remove_all(dir);
+    }
+
+    void testRecoveryRejectsInsufficientLevels() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+        namespace manifest = akkaradb::engine::manifest;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst_recovery_level_limit";
+        fs::remove_all(root);
+        const std::vector<uint8_t> lowKey{'a'}, highKey{'z'}, value{'v'};
+        for (const bool external : {false, true}) {
+            const auto dir = root / (external ? "external" : "private");
+            fs::create_directories(dir);
+            const auto catalog = dir / (external ? "manifest.akmf" : "sst-state.akmf");
+            auto mf = manifest::Manifest::create(catalog);
+            writeSstFile(dir / "L0_1.aksst", 0, std::vector{record(lowKey, value, 1)});
+            writeSstFile(dir / "L3_2.aksst", 3, std::vector{record(highKey, value, 2)});
+            mf->sstSeal(0, "L0_1.aksst", 1, std::nullopt, std::nullopt);
+            mf->sstSeal(3, "L3_2.aksst", 1, std::nullopt, std::nullopt);
+            if (!external) { mf->close(); mf.reset(); }
+            const auto orphan = dir / "L0_100.aksst";
+            writeSstFile(orphan, 0, std::vector{record(lowKey, value, 3)});
+            const auto temporary = dir / "unfinished.tmp";
+            { std::ofstream file{temporary}; file << "unfinished"; }
+            sst::SSTManager::Options options;
+            options.compactThreads = 0;
+            options.compactionMode = sst::SSTCompactionMode::DISABLED;
+            options.maxLevels = 3;
+            {
+                auto manager = sst::SSTManager::create(dir, options, mf.get());
+                bool rejected = false;
+                try { manager->recover(); }
+                catch (const std::runtime_error& ex) {
+                    rejected = std::string{ex.what()}.find("maxLevels") != std::string::npos;
+                }
+                require(rejected, "recovery must reject a live SST outside maxLevels");
+                require(!manager->get(lowKey) && !manager->get(highKey), "failed recovery must not publish a partial SST set");
+                require(fs::exists(orphan) && fs::exists(temporary), "failed recovery must precede orphan and temporary cleanup");
+                require(fs::exists(dir / "L0_1.aksst") && fs::exists(dir / "L3_2.aksst"), "failed recovery must preserve live SSTs");
+                manager->shutdown();
+            }
+            options.maxLevels = 4;
+            {
+                auto manager = sst::SSTManager::create(dir, options, mf.get());
+                manager->recover();
+                const auto low = manager->get(lowKey);
+                const auto high = manager->get(highKey);
+                require(low && low->seq == 1 && high && high->seq == 2,
+                        "restoring maxLevels must recover all existing data");
+                require(!fs::exists(orphan) && !fs::exists(temporary), "successful recovery must still clean abandoned files");
+                manager->shutdown();
+            }
+            if (mf) { mf->close(); }
+        }
+        fs::remove_all(root);
     }
 
     void testBlobFreeReferenceTracking() {
@@ -387,6 +532,394 @@ namespace {
         require(static_cast<bool>(file), "failed to write SST legacy-format test fixture");
     }
 
+    template <typename Predicate>
+    void waitForSst(Predicate ready) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+        while (!ready()) {
+            require(std::chrono::steady_clock::now() < deadline, "SST operation did not reach the expected boundary");
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+    }
+
+    void verifySelectedVersion(akkaradb::engine::sst::SSTManager& manager, const std::vector<uint8_t>& key,
+        uint64_t snapshot, uint64_t seq, bool tombstone, const std::vector<uint8_t>& value) {
+        const auto actual = manager.get(key, snapshot);
+        require(actual && actual->seq == seq && actual->isTombstone() == tombstone, "point read selected the wrong retained sequence");
+        std::vector<uint8_t> into{'s', 'e', 'n', 't', 'i', 'n', 'e', 'l'};
+        const auto hit = manager.getInto(key, into, snapshot);
+        require(hit && *hit == !tombstone, "getInto visibility differs from point read");
+        if (!tombstone) { require(actual->value == value && into == value, "getInto selected the wrong value"); }
+        else { require(into == std::vector<uint8_t>({'s', 'e', 'n', 't', 'i', 'n', 'e', 'l'}), "tombstone getInto modified output"); }
+        const auto contains = manager.contains(key, snapshot);
+        require(contains && *contains == !tombstone, "contains visibility differs from point read");
+        auto scan = manager.scanIter({}, {}, snapshot);
+        const auto pinned = scan.get(key);
+        require(pinned && pinned->seq == seq, "pinned point read differs from manager point read");
+        bool found = false;
+        while (scan.hasNext()) {
+            auto row = scan.next();
+            if (row->key == key) { require(!tombstone && row->seq == seq && row->value == value, "scan differs from point read"); found = true; }
+        }
+        require(found == !tombstone, "scan tombstone visibility differs from point read");
+    }
+
+    akkaradb::core::ArenaGenerator<akkaradb::core::RecordView> delayedFlush(
+        akkaradb::core::RecordView row, std::atomic<bool>& entered, std::atomic<bool>& released) {
+        entered.store(true, std::memory_order_release);
+        while (!released.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+        co_yield row;
+    }
+
+    void testOutOfOrderSstVersions() {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst; namespace mf = akkaradb::engine::manifest;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst_out_of_order_versions";
+        std::error_code ec; fs::remove_all(root, ec); fs::create_directories(root);
+        const std::vector<uint8_t> key{'k'}, old{'o'}, latest{'n'}, empty;
+        for (const bool external : {false, true}) {
+            const auto dir = root / (external ? "external" : "standalone"); fs::create_directories(dir);
+            std::unique_ptr<mf::Manifest> manifest;
+            if (external) { manifest = mf::Manifest::create(dir / "external.akmf", true); manifest->start(); }
+            sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+            auto manager = sst::SSTManager::create(dir, options, manifest.get());
+            std::atomic<bool> entered{false}, released{false}, finished{false}; std::exception_ptr failure;
+            std::thread older([&] {
+                try { manager->flush(1, delayedFlush(record(key, old, 10), entered, released)); }
+                catch (...) { failure = std::current_exception(); }
+                finished.store(true, std::memory_order_release);
+            });
+            try {
+                waitForSst([&] { return entered.load(std::memory_order_acquire) || finished.load(std::memory_order_acquire); });
+                if (!entered.load()) { older.join(); if (failure) { std::rethrow_exception(failure); } }
+                const std::vector rows{record(key, latest, 20)}; manager->flush(rows);
+            }
+            catch (...) { released.store(true); if (older.joinable()) { older.join(); } throw; }
+            released.store(true, std::memory_order_release); if (older.joinable()) { older.join(); }
+            if (failure) { std::rethrow_exception(failure); }
+            verifySelectedVersion(*manager, key, UINT64_MAX, 20, false, latest);
+            verifySelectedVersion(*manager, key, 10, 10, false, old);
+            const std::vector tombstones{record(key, empty, 30, akkaradb::core::RecordView::FLAG_TOMBSTONE)}; manager->flush(tombstones);
+            const std::vector delayed{record(key, old, 25)}; manager->flush(delayed);
+            for (int pass = 0; pass < 2; ++pass) {
+                verifySelectedVersion(*manager, key, UINT64_MAX, 30, true, empty);
+                verifySelectedVersion(*manager, key, 25, 25, false, old);
+                verifySelectedVersion(*manager, key, 20, 20, false, latest);
+                manager->shutdown(); manager.reset();
+                if (pass == 0) { manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover(); }
+            }
+            if (manifest) { manifest->close(); }
+        }
+        fs::remove_all(root, ec);
+    }
+
+    void testLateFlushAgainstCompactedVersions() {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst;
+        const auto dir = fs::current_path() / ".bench-tmp" / "sst_late_flush_compacted_versions";
+        std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+        const std::vector<uint8_t> key{'k'}, filler{'z'}, old{'o'}, latest{'n'}, empty;
+        sst::SSTManager::Options options;
+        options.compactionMode = sst::SSTCompactionMode::BACKGROUND; options.compactThreads = 1;
+        options.maxLevels = 3; options.maxL0Files = 2; options.l1MaxBytes = 1;
+        auto manager = sst::SSTManager::create(dir, options);
+        const std::vector first{record(key, latest, 20)}, second{record(filler, old, 1)};
+        manager->flush(first); manager->flush(second);
+        const auto waitBottom = [&] {
+            waitForSst([&] {
+                manager->throwIfBackgroundFailed(); const auto levels = manager->levelStats();
+                return levels[0].fileCount == 0 && levels[1].fileCount == 0 && levels[2].fileCount != 0;
+            });
+        };
+        waitBottom();
+        const std::vector delayed{record(key, old, 10)}; manager->flush(delayed);
+        verifySelectedVersion(*manager, key, UINT64_MAX, 20, false, latest);
+        const std::vector tombstone{record(key, empty, 30, akkaradb::core::RecordView::FLAG_TOMBSTONE)}; manager->flush(tombstone);
+        waitBottom();
+        const std::vector evenLater{record(key, old, 25)}; manager->flush(evenLater);
+        verifySelectedVersion(*manager, key, UINT64_MAX, 30, true, empty);
+        manager->shutdown(); manager.reset();
+        options.compactionMode = sst::SSTCompactionMode::DISABLED;
+        manager = sst::SSTManager::create(dir, options); manager->recover();
+        verifySelectedVersion(*manager, key, UINT64_MAX, 30, true, empty);
+        manager->shutdown(); manager.reset(); fs::remove_all(dir, ec);
+    }
+
+    void testMissingSstCatalogFailsClosed() {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst; namespace mf = akkaradb::engine::manifest;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst_catalog_required";
+        std::error_code ec; fs::remove_all(root, ec); fs::create_directories(root);
+        const std::vector<uint8_t> key{'k'}, value{'v'}; const std::vector rows{record(key, value, 1)};
+        writeSstFile(root / "L0_1.aksst", 0, rows);
+        sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+        bool rejected = false;
+        try { (void)sst::SSTManager::create(root, options); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && fs::exists(root / "L0_1.aksst") && !fs::exists(root / "sst-state.akmf"), "missing catalog must not import or delete unknown SSTs");
+        const auto standalone = root / "standalone";
+        { auto manager = sst::SSTManager::create(standalone, options); manager->flush(rows); }
+        auto external = mf::Manifest::create(root / "external.akmf"); rejected = false;
+        try { (void)sst::SSTManager::create(standalone, options, external.get()); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && fs::exists(standalone / "L0_1.aksst"), "changing catalog ownership must not discard live SSTs");
+        external->close(); external.reset(); fs::remove_all(root, ec);
+    }
+
+    void setSstCrashPoint(const std::string& point) {
+#ifdef _WIN32
+        require(_putenv_s("AKKARADB_TEST_CRASH_POINT", point.c_str()) == 0, "failed to set SST crash point");
+#else
+        require(::setenv("AKKARADB_TEST_CRASH_POINT", point.c_str(), 1) == 0, "failed to set SST crash point");
+#endif
+    }
+
+    int runSstLifecycleCrashChild(const std::string& mode, const std::string& point, const std::filesystem::path& dir) {
+        namespace sst = akkaradb::engine::sst; namespace mf = akkaradb::engine::manifest;
+        std::unique_ptr<mf::Manifest> manifest;
+        if (mode == "fast") {
+            // Deliberately leave batching stopped. A lifecycle handoff must persist
+            // its preceding records without depending on the flusher's scheduling.
+            manifest = mf::Manifest::create(dir / "external.akmf", true);
+        }
+        const std::vector<uint8_t> a{'a'}, b{'b'}, c{'c'}, d{'d'}, old{'o'}, newer{'n'}, kept{'c'}, added{'d'}, empty;
+        sst::SSTManager::Options options;
+        options.compactionMode = sst::SSTCompactionMode::BACKGROUND; options.compactThreads = 1;
+        options.maxLevels = 2; options.maxL0Files = 1;
+        if (point.starts_with("sst.flush.")) {
+            options.compactionMode = sst::SSTCompactionMode::DISABLED;
+            auto manager = sst::SSTManager::create(dir, options, manifest.get());
+            setSstCrashPoint(point);
+            const std::vector rows{record(a, old, 10), record(b, old, 11), record(c, kept, 12)};
+            manager->flush(rows);
+        }
+        else {
+            auto manager = sst::SSTManager::create(dir, options, manifest.get());
+            const std::vector seed{record(a, old, 10), record(b, old, 11), record(c, kept, 12)};
+            manager->flush(seed);
+            waitForSst([&] { manager->throwIfBackgroundFailed(); return manager->compactionSnapshot().compactionsCompleted == 1; });
+            manager->shutdown(); manager.reset();
+            options.maxL0Files = 2; options.targetFileSize = 1;
+            manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
+            setSstCrashPoint(point);
+            const std::vector update{record(a, empty, 20, akkaradb::core::RecordView::FLAG_TOMBSTONE), record(b, newer, 21)};
+            const std::vector insertion{record(d, added, 22)};
+            manager->flush(update); manager->flush(insertion);
+            waitForSst([&] { manager->throwIfBackgroundFailed(); return manager->compactionSnapshot().compactionsCompleted != 0; });
+        }
+        throw std::runtime_error("SST child missed its requested crash boundary");
+    }
+
+    void testSstLifecycleCrashRecovery(const std::filesystem::path& executable) {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst; namespace mf = akkaradb::engine::manifest;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst_lifecycle_crashes";
+        std::error_code ec; fs::remove_all(root, ec); fs::create_directories(root);
+        const std::vector<uint8_t> a{'a'}, b{'b'}, c{'c'}, d{'d'}, old{'o'}, newer{'n'}, kept{'c'}, added{'d'}, empty;
+        for (const std::string mode : {"standalone", "fast"}) {
+            for (const std::string point : {"sst.flush.after_rename", "sst.flush.after_manifest_seal",
+                "sst.compaction.after_output_tmp_write", "sst.compaction.after_output_rename", "sst.compaction.after_manifest_commit",
+                "sst.compaction.after_first_input_delete", "sst.compaction.after_input_delete"}) {
+                const auto dir = root / (mode + "-" + point); fs::create_directories(dir);
+                const std::string args = "\"" + executable.string() + "\" --sst-lifecycle-crash-child " + mode + " " + point + " \"" + dir.string() + "\"";
+#ifdef _WIN32
+                const int status = std::system(("\"" + args + "\"").c_str());
+                require(status == 86, "SST child did not stop at the requested lifecycle boundary");
+#else
+                const int status = std::system(args.c_str());
+                require(status == (86 << 8), "SST child did not stop at the requested lifecycle boundary");
+#endif
+                if (point == "sst.compaction.after_first_input_delete") {
+                    size_t l0 = 0;
+                    for (const auto& entry : fs::directory_iterator(dir)) { if (entry.path().filename().string().starts_with("L0_")) { ++l0; } }
+                    require(l0 == 1, "partial-deletion fixture must really delete one input and leave the other");
+                }
+                const bool flushOnly = point.starts_with("sst.flush.");
+                const bool sealed = point != "sst.flush.after_rename";
+                const bool committed = point == "sst.compaction.after_manifest_commit" || point.ends_with("input_delete");
+                sst::SSTManager::Options options; options.maxLevels = 2; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::unique_ptr<mf::Manifest> manifest;
+                    if (mode == "fast") { manifest = mf::Manifest::create(dir / "external.akmf"); }
+                    auto manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
+                    if (flushOnly && !sealed) {
+                        require(!manager->get(a) && !manager->get(b) && !manager->get(c), "unsealed SST must not become live after a crash");
+                        require(!manager->scanIter().hasNext(), "unsealed SST leaked into a scan");
+                    }
+                    else if (flushOnly) {
+                        verifySelectedVersion(*manager, a, UINT64_MAX, 10, false, old);
+                        verifySelectedVersion(*manager, b, UINT64_MAX, 11, false, old);
+                        verifySelectedVersion(*manager, c, UINT64_MAX, 12, false, kept);
+                    }
+                    else {
+                        verifySelectedVersion(*manager, a, UINT64_MAX, 20, true, empty);
+                        verifySelectedVersion(*manager, b, UINT64_MAX, 21, false, newer);
+                        verifySelectedVersion(*manager, c, UINT64_MAX, 12, false, kept);
+                        verifySelectedVersion(*manager, d, UINT64_MAX, 22, false, added);
+                        const auto levels = manager->levelStats();
+                        require(levels[0].fileCount == (committed ? 0u : 2u) && levels[1].fileCount == (committed ? 4u : 1u),
+                            "recovery selected a partially replaced compaction set");
+                    }
+                    for (const auto& entry : fs::directory_iterator(dir)) {
+                        require(entry.path().extension() != ".tmp", "SST recovery left an interrupted output temporary file");
+                    }
+                    manager->shutdown(); manager.reset(); if (manifest) { manifest->close(); }
+                }
+            }
+        }
+        fs::remove_all(root, ec);
+    }
+
+    void testManifestV1LargeRecords() {
+        namespace mf = akkaradb::engine::manifest;
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::current_path() / ".bench-tmp" / "manifest_v1_large_records";
+        std::error_code ec;
+        fs::remove_all(dir, ec); fs::create_directories(dir);
+        std::vector<std::string> inputs, outputs;
+        for (size_t i = 0; i < 300; ++i) {
+            inputs.push_back("old-" + std::to_string(i) + std::string(240, 'i'));
+            outputs.push_back("new-" + std::to_string(i) + std::string(240, 'o'));
+        }
+        const auto path = dir / "manifest.akmf";
+        uint64_t beforeCommit = 0;
+        {
+            auto manifest = mf::Manifest::create(path);
+            manifest->sstSeal(0, inputs.front(), 1, std::nullopt, std::nullopt);
+            manifest->compactionCommit(inputs, {});
+            beforeCommit = fs::file_size(path);
+            manifest->compactionCommit(outputs, inputs);
+            manifest->close();
+        }
+        const auto partial = dir / "partial.akmf";
+        fs::copy_file(path, partial);
+        fs::resize_file(partial, fs::file_size(partial) - 1);
+        {
+            auto manifest = mf::Manifest::create(partial);
+            auto actual = manifest->liveSst(); auto expected = inputs;
+            std::sort(actual.begin(), actual.end()); std::sort(expected.begin(), expected.end());
+            require(actual == expected, "torn large compaction commit must retain all original inputs");
+            manifest->compactionCommit(outputs, inputs);
+            manifest->close();
+        }
+        {
+            auto manifest = mf::Manifest::create(partial);
+            auto actual = manifest->liveSst(); auto expected = outputs;
+            std::sort(actual.begin(), actual.end()); std::sort(expected.begin(), expected.end());
+            require(actual == expected, "records appended after tail repair must survive another reopen");
+            manifest->close();
+        }
+        require(fs::file_size(path) - beforeCommit > UINT16_MAX, "large commit fixture must exceed the old narrow record limit");
+        for (int pass = 0; pass < 2; ++pass) {
+            auto manifest = mf::Manifest::create(path);
+            auto actual = manifest->liveSst(); auto expected = outputs;
+            std::sort(actual.begin(), actual.end()); std::sort(expected.begin(), expected.end());
+            require(actual == expected, "v1 must retain every compaction output and retire every input");
+            if (pass == 0) { manifest->compact(); }
+            manifest->close();
+        }
+        std::vector<mf::SSTBlobRefEntry> refs(65536);
+        for (size_t i = 0; i < refs.size(); ++i) { refs[i] = {{'k'}, i + 1, 0, std::nullopt}; }
+        auto encoded = mf::encodeSstBlobRefs(7, "large.aksst", refs);
+        mf::DecodedSSTBlobRefs decoded;
+        require(mf::decodeSstBlobRefs(encoded.data(), static_cast<uint32_t>(encoded.size()), decoded) && decoded.entries.size() == refs.size() &&
+            decoded.entries.back().seq == refs.back().seq, "v1 must support more than 65535 blob-reference entries");
+        auto commit = mf::encodeCompactionCommit(1, outputs, inputs);
+        mf::DecodedCompactionCommit decodedCommit;
+        require(!mf::decodeCompactionCommit(commit.data(), static_cast<uint32_t>(commit.size() - 1), decodedCommit), "truncated file list must be rejected");
+        commit.push_back(0);
+        require(!mf::decodeCompactionCommit(commit.data(), static_cast<uint32_t>(commit.size()), decodedCommit), "trailing commit data must be rejected");
+        commit[8] = commit[9] = commit[10] = commit[11] = 0xff;
+        require(!mf::decodeCompactionCommit(commit.data(), static_cast<uint32_t>(commit.size()), decodedCommit), "impossible collection counts must be rejected");
+        auto header = mf::ManifestRecordHeader::build(mf::ManifestRecordType::COMPACTION_COMMIT, encoded.data(), static_cast<uint32_t>(encoded.size()));
+        require(header.verifyChecksum(), "v1 record header checksum must round trip");
+        ++header.payloadLen;
+        require(!header.verifyChecksum(), "record length corruption must be detected before allocation");
+        fs::remove_all(dir, ec);
+    }
+
+    void testLargeSstCompactionRoundTrip() {
+        namespace mf = akkaradb::engine::manifest;
+        namespace sst = akkaradb::engine::sst;
+        namespace fs = std::filesystem;
+        const auto dir = fs::current_path() / ".bench-tmp" / "sst_large_compaction";
+        std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+        std::vector<std::vector<uint8_t>> keys;
+        const std::vector<uint8_t> value{'v'};
+        for (size_t i = 0; i < 300; ++i) {
+            const auto key = "large-compaction-" + std::to_string(1000 + i);
+            keys.emplace_back(key.begin(), key.end());
+        }
+        sst::SSTManager::Options options;
+        options.compactionMode = sst::SSTCompactionMode::BACKGROUND;
+        options.compactThreads = 1; options.maxL0Files = 2; options.targetFileSize = 1;
+        {
+            auto manifest = mf::Manifest::create(dir / "manifest.akmf", true); manifest->start();
+            auto manager = sst::SSTManager::create(dir, options, manifest.get());
+            for (size_t batch = 0; batch < 2; ++batch) {
+                std::vector<akkaradb::core::RecordView> rows;
+                for (size_t i = batch * 150; i < (batch + 1) * 150; ++i) { rows.push_back(record(keys[i], value, i + 1)); }
+                manager->flush(rows);
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+            while (manager->compactionSnapshot().compactionsCompleted == 0 && std::chrono::steady_clock::now() < deadline) {
+                manager->throwIfBackgroundFailed(); std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+            manager->shutdown(); manager->throwIfBackgroundFailed();
+            require(manager->levelStats()[1].fileCount == 300, "fixture must produce more than 255 real compaction outputs");
+            manifest->compact(); manager.reset(); manifest->close();
+        }
+        options.compactionMode = sst::SSTCompactionMode::DISABLED;
+        {
+            auto manifest = mf::Manifest::create(dir / "manifest.akmf");
+            auto manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
+            require(manager->levelStats()[0].fileCount == 0 && manager->levelStats()[1].fileCount == 300,
+                "recovery must install every output without resurrecting compacted inputs");
+            for (const auto& key : keys) {
+                const auto actual = manager->get(key);
+                require(actual && actual->value == value, "large compaction lost a key after restart");
+            }
+            size_t count = 0; auto scan = manager->scanIter();
+            while (scan.hasNext()) { (void)scan.next(); ++count; }
+            require(count == keys.size(), "large compaction scan must match point reads");
+            manager->shutdown(); manager.reset(); manifest->close();
+        }
+        fs::remove_all(dir, ec);
+    }
+
+    void testManifestV1LongKeysAndVersionRejection() {
+        namespace mf = akkaradb::engine::manifest;
+        namespace sst = akkaradb::engine::sst;
+        namespace fs = std::filesystem;
+        const fs::path root = fs::current_path() / ".bench-tmp" / "manifest_v1_long_keys";
+        std::error_code ec; fs::remove_all(root, ec); fs::create_directories(root);
+        for (const bool fast : {false, true}) {
+            const auto dir = root / (fast ? "fast" : "sync"); fs::create_directories(dir);
+            const auto path = dir / "manifest.akmf";
+            sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+            const std::vector<uint8_t> value{'v'};
+            for (int pass = 0; pass < 2; ++pass) {
+                auto manifest = mf::Manifest::create(path, fast); manifest->start();
+                auto manager = sst::SSTManager::create(dir, options, manifest.get());
+                manager->recover();
+                for (const size_t length : {20000u, 32768u, 65534u}) {
+                    const std::vector<uint8_t> key(length, 'k');
+                    if (pass == 0) {
+                        const std::vector<akkaradb::core::RecordView> rows{record(key, value, length)};
+                        manager->flush(rows);
+                    }
+                    const auto actual = manager->get(key);
+                    require(actual && actual->value == value, "long legal keys must survive SST/Manifest reopen");
+                }
+                if (pass == 0) { manifest->compact(); }
+                manager->shutdown(); manager.reset(); manifest->close();
+            }
+        }
+        auto unsupported = mf::ManifestFileHeader::build(0); unsupported.version = 2; unsupported.crc32c = 0;
+        uint8_t bytes[mf::ManifestFileHeader::SIZE]; unsupported.serialize(bytes);
+        unsupported.crc32c = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), sizeof(bytes)); unsupported.serialize(bytes);
+        const auto unsupportedPath = root / "unsupported.akmf";
+        { std::ofstream out(unsupportedPath, std::ios::binary); out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes)); }
+        bool rejected = false;
+        try { (void)mf::Manifest::create(unsupportedPath); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "unsupported Manifest version must be explicitly rejected");
+        require(fs::file_size(unsupportedPath) == sizeof(bytes), "rejecting an unsupported version must not modify existing data");
+        fs::remove_all(root, ec);
+    }
+
     void testSstCorruptionDetection() {
         namespace fs = std::filesystem;
         namespace sst = akkaradb::engine::sst;
@@ -441,10 +974,16 @@ namespace {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     try {
+        if (argc == 5 && std::string{argv[1]} == "--sst-lifecycle-crash-child") {
+            return runSstLifecycleCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
+        }
+        require(argc == 1, "unexpected SST test command line");
+        testVersionsWithinOneSst();
+        testRecoveryRejectsInsufficientLevels();
         namespace fs = std::filesystem;
         namespace sst = akkaradb::engine::sst;
 
@@ -514,6 +1053,13 @@ int main() {
         testZstdCompressionLevel();
         testL0RecoveryUsesNumericFileOrder();
         testSstCorruptionDetection();
+        testOutOfOrderSstVersions();
+        testLateFlushAgainstCompactedVersions();
+        testMissingSstCatalogFailsClosed();
+        testSstLifecycleCrashRecovery(fs::absolute(fs::path{argv[0]}));
+        testManifestV1LargeRecords();
+        testLargeSstCompactionRoundTrip();
+        testManifestV1LongKeysAndVersionRejection();
         return 0;
     }
     catch (const std::exception& ex) {

@@ -307,6 +307,25 @@ namespace akkaradb::engine::sst {
                 if (sstDir_.empty()) { throw std::invalid_argument("SSTManager: sstDir is required"); }
                 validateZstdCompressionLevel(options_);
                 std::filesystem::create_directories(sstDir_);
+                const auto statePath = sstDir_ / "sst-state.akmf";
+                if (manifest_ && std::filesystem::exists(statePath)) {
+                    throw std::runtime_error("SSTManager: SST state catalog is present; retain standalone catalog mode or recreate the database");
+                }
+                if (!manifest_) {
+                    if (!std::filesystem::exists(statePath)) {
+                        for (const auto& entry : std::filesystem::directory_iterator(sstDir_)) {
+                            if (entry.path().extension() == ".aksst") {
+                                throw std::runtime_error("SSTManager: existing SST files require their SST state catalog; recreate the pre-release database");
+                            }
+                        }
+                    }
+                    // Standalone SST storage needs the same atomic replacement protocol
+                    // as an engine with an external Manifest. Never infer live files from
+                    // directory contents after a partially completed compaction.
+                    ownedManifest_ = manifest::Manifest::create(statePath);
+                    manifest_ = ownedManifest_.get();
+                    syncDirectoryBestEffort(sstDir_);
+                }
                 levels_.resize(static_cast<size_t>(options_.maxLevels));
                 publishLocked();
                 if (compactionEnabled(options_)) {
@@ -320,47 +339,44 @@ namespace akkaradb::engine::sst {
 
             void recover() {
                 std::unique_lock lock{levelsMu_};
-                for (auto& level : levels_) { level.clear(); }
-                nextFileId_ = 1;
+                Levels recovered(levels_.size());
 
-                std::vector<std::filesystem::path> orphanSsts;
+                std::vector<std::filesystem::path> abandonedFiles;
                 std::unordered_set<std::string> liveManifestFiles;
                 std::vector<std::string> allSstFiles;
                 for (const auto& entry : std::filesystem::directory_iterator(sstDir_)) {
                     const auto p = entry.path();
-                    if (p.extension() == ".tmp") { removeFileDurable(p); }
+                    if (p.extension() == ".tmp") { abandonedFiles.push_back(p); }
                     else if (p.extension() == ".aksst") {
                         const std::string filename = p.filename().string();
                         allSstFiles.push_back(filename);
-                        observeFileId(filename);
                     }
                 }
 
-                std::vector<std::string> files;
-                if (manifest_) {
-                    files = manifest_->liveSst();
-                    liveManifestFiles.insert(files.begin(), files.end());
-                    for (const auto& filename : allSstFiles) {
-                        if (liveManifestFiles.find(filename) == liveManifestFiles.end()) { orphanSsts.push_back(sstDir_ / filename); }
-                    }
+                const auto files = manifest_->liveSst();
+                liveManifestFiles.insert(files.begin(), files.end());
+                for (const auto& filename : allSstFiles) {
+                    if (liveManifestFiles.find(filename) == liveManifestFiles.end()) { abandonedFiles.push_back(sstDir_ / filename); }
                 }
-                else {
-                    for (const auto& entry : std::filesystem::directory_iterator(sstDir_)) {
-                        if (entry.path().extension() == ".aksst") { files.push_back(entry.path().filename().string()); }
-                    }
-                }
-
-                for (const auto& orphan : orphanSsts) { removeFileDurable(orphan); }
 
                 for (const auto& file : files) {
                     const auto path = sstDir_ / file;
                     auto reader = SSTReader::open(path, readerOptions());
                     if (!reader) { throw std::runtime_error("SSTManager: manifest references missing or corrupt SST: " + file); }
+                    const uint32_t level = reader->header().level;
+                    if (level >= static_cast<uint32_t>(options_.maxLevels)) {
+                        throw std::runtime_error("SSTManager: live SST " + file + " uses level " + std::to_string(level) +
+                            " outside configured maxLevels=" + std::to_string(options_.maxLevels));
+                    }
                     Meta meta = makeMeta(path, file, std::move(reader));
-                    if (meta.level < 0 || meta.level >= options_.maxLevels) { continue; }
-                    levels_[static_cast<size_t>(meta.level)].push_back(std::move(meta));
-                    observeFileId(file);
+                    recovered[level].push_back(std::move(meta));
                 }
+                // Validate the complete live set before cleanup or publishing any recovered state.
+                for (const auto& abandoned : abandonedFiles) { removeFileDurable(abandoned); }
+                levels_ = std::move(recovered);
+                nextFileId_ = 1;
+                for (const auto& file : allSstFiles) { observeFileId(file); }
+                for (const auto& file : files) { observeFileId(file); }
                 sortAllLevelsLocked();
                 publishLocked();
                 requestCompaction();
@@ -396,10 +412,8 @@ namespace akkaradb::engine::sst {
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
                 Meta meta = makeMeta(path, path.filename().string(), std::move(reader));
 
-                if (manifest_) {
-                    manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
-                    manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
-                }
+                manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
+                manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
                 crashAtTestPoint("sst.flush.after_manifest_seal");
 
                 {
@@ -433,10 +447,8 @@ namespace akkaradb::engine::sst {
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
                 Meta meta = makeMeta(path, path.filename().string(), std::move(reader));
 
-                if (manifest_) {
-                    manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
-                    manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
-                }
+                manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
+                manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
                 crashAtTestPoint("sst.flush.after_manifest_seal");
 
                 {
@@ -449,19 +461,17 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
-                auto snap = snapshot_.load(std::memory_order_acquire);
+                const auto snap = snapshot_.load(std::memory_order_acquire);
                 if (!snap) { return std::nullopt; }
-
-                if (!snap->empty()) {
-                    for (const auto& m : (*snap)[0]) {
-                        if (m.reader) {
-                            if (m.minSeq > snapshotSeq) { continue; }
-                            auto rec = m.reader->get(key, snapshotSeq);
-                            if (rec) { return rec; }
-                        }
-                    }
-                }
-
+                std::optional<SSTRecord> best;
+                const auto consider = [&](const Meta& meta) {
+                    if (!meta.reader || meta.minSeq > snapshotSeq || (best && meta.maxSeq <= best->seq)) { return; }
+                    auto candidate = meta.reader->get(key, snapshotSeq);
+                    if (candidate && (!best || candidate->seq > best->seq)) { best = std::move(candidate); }
+                };
+                // Flush completion/file id ordering does not imply sequence ordering,
+                // including between L0 and older compaction destinations.
+                if (!snap->empty()) { for (const auto& meta : (*snap)[0]) { consider(meta); } }
                 for (size_t level = 1; level < snap->size(); ++level) {
                     const auto& files = (*snap)[level];
                     size_t lo = 0;
@@ -471,14 +481,11 @@ namespace akkaradb::engine::sst {
                         if (compareBytes(files[mid].lastKey, key) < 0) { lo = mid + 1; }
                         else { hi = mid; }
                     }
-                    if (lo < files.size() && compareBytes(files[lo].firstKey, key) <= 0 && compareBytes(key, files[lo].lastKey) <= 0 &&
-                        files[lo].reader) {
-                        if (files[lo].minSeq > snapshotSeq) { continue; }
-                        auto rec = files[lo].reader->get(key, snapshotSeq);
-                        if (rec) { return rec; }
+                    if (lo < files.size() && compareBytes(files[lo].firstKey, key) <= 0 && compareBytes(key, files[lo].lastKey) <= 0) {
+                        consider(files[lo]);
                     }
                 }
-                return std::nullopt;
+                return best;
             }
 
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
@@ -488,36 +495,11 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
-                auto snap = snapshot_.load(std::memory_order_acquire);
-                if (!snap) { return std::nullopt; }
-
-                if (!snap->empty()) {
-                    for (const auto& m : (*snap)[0]) {
-                        if (!m.reader) { continue; }
-                        if (m.minSeq > snapshotSeq) { continue; }
-                        auto hit = m.reader->getInto(key, out, snapshotSeq);
-                        if (hit.has_value()) { return hit; }
-                    }
-                }
-
-                for (size_t level = 1; level < snap->size(); ++level) {
-                    const auto& files = (*snap)[level];
-                    size_t lo = 0;
-                    size_t hi = files.size();
-                    while (lo < hi) {
-                        const size_t mid = lo + (hi - lo) / 2;
-                        if (compareBytes(files[mid].lastKey, key) < 0) { lo = mid + 1; }
-                        else { hi = mid; }
-                    }
-                    if (lo >= files.size()) { continue; }
-                    if (compareBytes(files[lo].firstKey, key) > 0 || compareBytes(key, files[lo].lastKey) > 0 || !files[lo].reader) {
-                        continue;
-                    }
-                    if (files[lo].minSeq > snapshotSeq) { continue; }
-                    auto hit = files[lo].reader->getInto(key, out, snapshotSeq);
-                    if (hit.has_value()) { return hit; }
-                }
-                return std::nullopt;
+                auto record = get(key, snapshotSeq);
+                if (!record) { return std::nullopt; }
+                if (record->isTombstone()) { return false; }
+                out = std::move(record->value);
+                return true;
             }
 
             [[nodiscard]] Iterator scanIter(
@@ -749,7 +731,7 @@ namespace akkaradb::engine::sst {
                 auto reader = SSTReader::open(path, readerOptions());
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen compacted SST"); }
 
-                if (manifest_) { manifest_->sstBlobRefs(path.filename().string(), toManifestBlobRefs(result.blobRefs)); }
+                manifest_->sstBlobRefs(path.filename().string(), toManifestBlobRefs(result.blobRefs));
 
                 std::vector<Meta> outputs;
                 outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));
@@ -801,7 +783,9 @@ namespace akkaradb::engine::sst {
                 std::vector<Meta> outputs;
                 std::vector<SSTRecord> chunk;
                 uint64_t chunkBytes = 0;
-                const bool dropTombstones = work.dst == options_.maxLevels - 1;
+                // A lower-sequence flush can arrive even after bottom-level compaction.
+                // Retain tombstones until a future reclamation policy can prove that
+                // no older generation or promotion can be published.
 
                 while (!heap.empty()) {
                     HeapEntry best = heap.top();
@@ -814,8 +798,6 @@ namespace akkaradb::engine::sst {
                         pushCurrent(heap, sources, next.sourceIdx);
                         if (next.rec.seq > best.rec.seq) { best.rec = std::move(next.rec); }
                     }
-
-                    if (dropTombstones && best.rec.isTombstone()) { continue; }
 
                     const uint64_t bytes = recordBytes(best.rec);
                     if (!chunk.empty() && chunkBytes + bytes > options_.targetFileSize) {
@@ -841,7 +823,7 @@ namespace akkaradb::engine::sst {
                 std::vector<std::string> inputFiles;
                 inputFiles.reserve(work.inputs.size());
                 for (const auto& m : work.inputs) { inputFiles.push_back(m.filename); }
-                if (manifest_) { manifest_->compactionStart(work.src, inputFiles); }
+                manifest_->compactionStart(work.src, inputFiles);
 
                 std::vector<Meta> outputs = compactOutputs(work);
 
@@ -853,7 +835,7 @@ namespace akkaradb::engine::sst {
                     bytesOut += m.file_size;
                 }
 
-                if (manifest_) { manifest_->compactionCommit(outputFiles, inputFiles); }
+                manifest_->compactionCommit(outputFiles, inputFiles);
                 crashAtTestPoint("sst.compaction.after_manifest_commit");
 
                 {
@@ -866,7 +848,15 @@ namespace akkaradb::engine::sst {
                     publishLocked();
                 }
 
-                for (const auto& m : work.inputs) { removeFileDurable(m.path); }
+                for (size_t i = 0; i < work.inputs.size(); ++i) {
+                    auto& input = work.inputs[i];
+                    // Release our obsolete reader before unlinking (Windows denies
+                    // deletion while an ifstream is open). Pinned readers remain valid;
+                    // their leftover files are safely retired by catalog recovery.
+                    input.reader.reset();
+                    removeFileDurable(input.path);
+                    if (i == 0) { crashAtTestPoint("sst.compaction.after_first_input_delete"); }
+                }
                 crashAtTestPoint("sst.compaction.after_input_delete");
 
                 compactionsCompleted_.fetch_add(1, std::memory_order_relaxed);
@@ -899,6 +889,7 @@ namespace akkaradb::engine::sst {
 
             std::filesystem::path sstDir_;
             Options options_;
+            std::unique_ptr<manifest::Manifest> ownedManifest_;
             manifest::Manifest* manifest_;
 
             mutable std::shared_mutex levelsMu_;

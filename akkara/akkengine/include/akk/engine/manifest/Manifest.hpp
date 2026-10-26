@@ -27,7 +27,7 @@ namespace akkaradb::engine::manifest {
      * markers to enable crash recovery and state reconstruction.
      *
      * Binary on-disk format (.akmf):
-     *   [ManifestFileHeader:32B] [ManifestRecordHeader:8B][payload]...
+     *   [ManifestFileHeader:32B] [ManifestRecordHeader:16B][payload]...
      *
      * Thread-safety: All public methods are thread-safe.
      *
@@ -36,7 +36,8 @@ namespace akkaradb::engine::manifest {
      *     Suitable for correctness-critical paths.
      *   - Fast mode (fastMode=true): Writes are batched by a background
      *     flusher thread and fsynced periodically.  Lower latency but
-     *     relaxed durability guarantee.
+     *     relaxed durability for other events. SST seal, compaction commit
+     *     and checkpoint calls always wait for durable storage.
      */
     class AKDB_API Manifest {
         public:
@@ -126,7 +127,8 @@ namespace akkaradb::engine::manifest {
 
             /**
              * Starts the background flusher thread (fastMode only).
-             * No-op in sync mode.  Must be called before first write.
+             * No-op in sync mode. Start before relying on background persistence;
+             * SST lifecycle handoffs drain and sync their records even without it.
              */
             void start();
 

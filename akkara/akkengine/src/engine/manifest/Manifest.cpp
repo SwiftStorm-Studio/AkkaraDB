@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
@@ -94,7 +95,8 @@ namespace akkaradb::engine::manifest {
                         FILE_ATTRIBUTE_NORMAL,
                         nullptr
                     ); if (fh.handle_ == INVALID) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
-                    ::SetFilePointer(fh.handle_, 0, nullptr, FILE_END);
+                    LARGE_INTEGER end{};
+                    if (!::SetFilePointerEx(fh.handle_, end, nullptr, FILE_END)) { throw std::runtime_error("Manifest seek failed"); }
                     #else
                     fh.handle_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
                     if (fh.handle_ < 0) { throw std::runtime_error("Failed to open manifest: " + path.string()); }
@@ -103,14 +105,23 @@ namespace akkaradb::engine::manifest {
                 }
 
                 void write(const uint8_t* data, size_t size) {
-                    #ifdef _WIN32
-                    DWORD written = 0; if (!::WriteFile(handle_, data, static_cast<DWORD>(size), &written, nullptr)) {
-                        throw std::runtime_error("Manifest write failed");
+                    while (size != 0) {
+                        #ifdef _WIN32
+                        DWORD written = 0;
+                        const auto chunk = static_cast<DWORD>(std::min<size_t>(size, UINT32_MAX));
+                        if (!::WriteFile(handle_, data, chunk, &written, nullptr) || written == 0) {
+                            throw std::runtime_error("Manifest write failed");
+                        }
+                        const size_t count = written;
+                        #else
+                        const auto written = ::write(handle_, data, std::min<size_t>(size, 1024u * 1024u));
+                        if (written < 0 && errno == EINTR) { continue; }
+                        if (written <= 0) { throw std::runtime_error("Manifest write failed"); }
+                        const size_t count = static_cast<size_t>(written);
+                        #endif
+                        data += count;
+                        size -= count;
                     }
-                    #else
-                    ssize_t result = ::write(handle_, data, size);
-                    if (result < 0 || static_cast<size_t>(result) != size) { throw std::runtime_error("Manifest write failed"); }
-                    #endif
                 }
 
                 void fsyncData() {
@@ -174,7 +185,7 @@ namespace akkaradb::engine::manifest {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
                 const bool manifestExistsNow = pathExists(path_);
-                if (manifestExistsNow) { replayInternal(); }
+                if (manifestExistsNow) { replayInternal(true); }
 
                 rotationCounter_ = findLastRotationNumber();
 
@@ -236,6 +247,7 @@ namespace akkaradb::engine::manifest {
                 std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::SST_SEAL, encodeSstSeal(ts, level, file, entries, firstKeyHex, lastKeyHex));
+                flushPendingForCompact();
 
                 std::lock_guard lock{mutex_};
                 sstSeals_.push_back(SSTSealEvent{level, file, entries, firstKeyHex, lastKeyHex, ts});
@@ -262,6 +274,7 @@ namespace akkaradb::engine::manifest {
                 std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
                 append(ManifestRecordType::CHECKPOINT, encodeCheckpoint(ts, name, stripe, lastSeq));
+                flushPendingForCompact();
 
                 std::lock_guard lock{mutex_};
                 lastCheckpoint_ = CheckpointEvent{name, stripe, lastSeq, ts};
@@ -313,6 +326,7 @@ namespace akkaradb::engine::manifest {
                 // Single append call -> single CRC-protected record.
                 // Either fully applied on replay or entirely absent (CRC mismatch).
                 append(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), outputFiles, inputFiles));
+                flushPendingForCompact();
 
                 std::lock_guard lock{mutex_};
                 for (const auto& f : outputFiles) {
@@ -384,7 +398,12 @@ namespace akkaradb::engine::manifest {
             // Replay
             // ----------------------------------------------------------------
 
-            void replay() { replayInternal(); }
+            void replay() {
+                std::lock_guard apiLock{apiMutex_};
+                flushPendingForCompact();
+                std::lock_guard rotationLock{rotationMutex_};
+                replayInternal(false);
+            }
 
             void compact() {
                 std::lock_guard apiLock{apiMutex_};
@@ -447,6 +466,7 @@ namespace akkaradb::engine::manifest {
 
                 if (stripes > 0) { writeRecord(ManifestRecordType::STRIPE_COMMIT, encodeStripeCommit(nowUs(), stripes)); }
                 for (const auto& seal : seals) {
+                    if (!std::binary_search(live.begin(), live.end(), seal.file)) { continue; }
                     writeRecord(
                         ManifestRecordType::SST_SEAL,
                         encodeSstSeal(seal.tsUs, seal.level, seal.file, seal.entries, seal.firstKeyHex, seal.lastKeyHex)
@@ -725,7 +745,8 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             [[nodiscard]] static std::vector<uint8_t> buildRecord(ManifestRecordType type, std::vector<uint8_t> payload) {
-                const auto plen = static_cast<uint16_t>(payload.size());
+                if (payload.size() > UINT32_MAX) { throw std::length_error("Manifest: payload exceeds the v1 u32 limit"); }
+                const auto plen = static_cast<uint32_t>(payload.size());
                 const ManifestRecordHeader rhdr = ManifestRecordHeader::build(type, payload.data(), plen);
                 payload.resize(ManifestRecordHeader::SIZE + plen);
                 std::memmove(payload.data() + ManifestRecordHeader::SIZE, payload.data(), plen);
@@ -753,70 +774,66 @@ namespace akkaradb::engine::manifest {
                 }
             }
 
-            void flushPendingForCompact() {
-                if (!fastMode_) { return; }
+            // All dequeue/write operations use rotationMutex_ before queueMutex_.
+            // This keeps an older background batch ahead of a synchronous barrier.
+            void writeQueuedRecords(bool forceSync = true) {
+                if (termWriteError_) { std::rethrow_exception(termWriteError_); }
                 std::vector<std::vector<uint8_t>> batch;
                 {
                     std::lock_guard lock{queueMutex_};
                     std::swap(batch, queue_);
                 }
-                if (batch.empty()) { return; }
-                std::lock_guard rotationLock{rotationMutex_};
-                for (const auto& record : batch) {
-                    checkRotation();
-                    fileHandle_.write(record.data(), record.size());
-                    currentFileSize_ += record.size();
+                if (batch.empty() && !forceSync) { return; }
+                try {
+                    for (const auto& record : batch) {
+                        checkRotation();
+                        fileHandle_.write(record.data(), record.size());
+                        currentFileSize_ += record.size();
+                    }
+                    fileHandle_.fsyncData();
                 }
-                fileHandle_.fsyncData();
+                catch (...) {
+                    termWriteError_ = std::current_exception();
+                    throw;
+                }
             }
 
-            // ----------------------------------------------------------------
-            // Background flusher (fastMode only)
-            // ----------------------------------------------------------------
+            void flushPendingForCompact() {
+                if (!fastMode_) { return; }
+                std::lock_guard rotationLock{rotationMutex_};
+                writeQueuedRecords();
+            }
 
+            // Background batching is used for events without an SST/WAL durability handoff.
             void runFlusher() {
                 constexpr auto MAX_WAIT = std::chrono::microseconds(500);
-
-                std::vector<std::vector<uint8_t>> batch;
-                batch.reserve(64);
-
                 try {
                     while (true) {
                         {
                             std::unique_lock lock{queueMutex_};
                             queueCv_.wait_for(lock, MAX_WAIT, [this] { return !queue_.empty() || !running_; });
-
                             if (!running_ && queue_.empty()) { break; }
-                            std::swap(batch, queue_);
                         }
-
-                        if (!batch.empty()) {
-                            std::lock_guard rotationLock{rotationMutex_};
-                            for (const auto& record : batch) {
-                                checkRotation();
-                                fileHandle_.write(record.data(), record.size());
-                                currentFileSize_ += record.size();
-                            }
-                            fileHandle_.fsyncData();
-                            batch.clear();
-                        }
-
-                        auto now = std::chrono::steady_clock::now();
+                        std::lock_guard rotationLock{rotationMutex_};
+                        writeQueuedRecords(false);
+                        const auto now = std::chrono::steady_clock::now();
                         if (now - lastStrongSync_ > std::chrono::seconds(5)) {
-                            std::lock_guard rotationLock{rotationMutex_};
                             fileHandle_.fsyncFull();
                             lastStrongSync_ = now;
                         }
                     }
                 }
-                catch (...) { termWriteError_ = std::current_exception(); }
+                catch (...) {
+                    std::lock_guard rotationLock{rotationMutex_};
+                    if (!termWriteError_) { termWriteError_ = std::current_exception(); }
+                }
             }
 
             // ----------------------------------------------------------------
             // Replay
             // ----------------------------------------------------------------
 
-            void replayInternal() {
+            void replayInternal(bool repairTail) {
                 {
                     std::lock_guard lock{mutex_};
                     sstSeals_.clear();
@@ -847,10 +864,10 @@ namespace akkaradb::engine::manifest {
                     else { break; }
                 }
 
-                for (const auto& f : files) { replaySingleFile(f); }
+                for (size_t i = 0; i < files.size(); ++i) { replaySingleFile(files[i], repairTail && i + 1 == files.size()); }
             }
 
-            void replaySingleFile(const std::filesystem::path& filePath) {
+            void replaySingleFile(const std::filesystem::path& filePath, bool repairTail) {
                 if (!pathExists(filePath)) { return; }
                 const auto file_size = pathFileSize(filePath);
                 if (file_size == 0) { return; }
@@ -863,7 +880,7 @@ namespace akkaradb::engine::manifest {
                     uint8_t hdrBuf[ManifestFileHeader::SIZE];
                     file.read(reinterpret_cast<char*>(hdrBuf), ManifestFileHeader::SIZE);
                     if (!file || file.gcount() < static_cast<std::streamsize>(ManifestFileHeader::SIZE)) {
-                        return; // Too short to have a valid header
+                        throw std::runtime_error("Manifest: truncated file header");
                     }
 
                     ManifestFileHeader fhdr{};
@@ -889,10 +906,13 @@ namespace akkaradb::engine::manifest {
                     fhdr.crc32c = readU32(20);
                     std::memcpy(fhdr.reserved, hdrBuf + 24, 8);
 
-                    if (!fhdr.verifyMagic() || !fhdr.verifyVersion()) { return; }
-                    if (!fhdr.verifyChecksum()) { return; }
+                    if (!fhdr.verifyMagic() || !fhdr.verifyVersion()) {
+                        throw std::runtime_error("Manifest: unsupported format; v1 is required (recreate the pre-release database)");
+                    }
+                    if (!fhdr.verifyChecksum()) { throw std::runtime_error("Manifest: corrupt file header"); }
                 }
 
+                uint64_t validEnd = ManifestFileHeader::SIZE;
                 // --- Read records ---
                 std::vector<uint8_t> payload; // reused across records - avoids per-record heap alloc
                 while (file) {
@@ -901,6 +921,9 @@ namespace akkaradb::engine::manifest {
                     if (!file || file.gcount() < static_cast<std::streamsize>(ManifestRecordHeader::SIZE)) { break; }
 
                     const ManifestRecordHeader rhdr = ManifestRecordHeader::deserialize(rhdrBuf);
+                    if (!rhdr.verifyChecksum()) { break; }
+                    const auto position = static_cast<uint64_t>(file.tellg());
+                    if (position > file_size || rhdr.payloadLen > file_size - position) { break; }
 
                     if (rhdr.payloadLen > 0) {
                         payload.resize(rhdr.payloadLen);
@@ -913,20 +936,31 @@ namespace akkaradb::engine::manifest {
 
                         applyEvent(static_cast<ManifestRecordType>(rhdr.type), payload.data(), rhdr.payloadLen);
                     }
+                    else { throw std::runtime_error("Manifest: empty v1 event payload"); }
+                    validEnd = position + rhdr.payloadLen;
+                }
+                if (validEnd != file_size) {
+                    if (!repairTail) { throw std::runtime_error("Manifest: damaged record before the append boundary"); }
+                    // A crash can leave an incomplete final record. Retire it before
+                    // appending, otherwise every later valid record would be hidden.
+                    file.close();
+                    std::filesystem::resize_file(filePath, validEnd);
+                    auto repaired = FileHandle::open(filePath);
+                    repaired.fsyncFull();
                 }
             }
 
-            void applyEvent(ManifestRecordType type, const uint8_t* payload, uint16_t len) {
+            void applyEvent(ManifestRecordType type, const uint8_t* payload, uint32_t len) {
                 switch (type) {
                     case ManifestRecordType::STRIPE_COMMIT: {
                         DecodedStripeCommit d;
-                        if (!decodeStripeCommit(payload, len, d)) { return; }
+                        if (!decodeStripeCommit(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         if (d.stripeCount >= stripesWritten_) { stripesWritten_ = d.stripeCount; }
                         break;
                     }
                     case ManifestRecordType::SST_SEAL: {
                         DecodedSSTSeal d;
-                        if (!decodeSstSeal(payload, len, d)) { return; }
+                        if (!decodeSstSeal(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         sstSeals_.push_back(SSTSealEvent{d.level, d.name, d.entries, d.firstKeyHex, d.lastKeyHex, d.tsUs});
                         liveSst_.insert(d.name);
@@ -935,7 +969,7 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::SST_DELETE: {
                         DecodedSSTDelete d;
-                        if (!decodeSstDelete(payload, len, d)) { return; }
+                        if (!decodeSstDelete(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         liveSst_.erase(d.name);
                         deletedSst_.insert(d.name);
@@ -944,7 +978,7 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::COMPACTION_END: {
                         DecodedCompactionEnd d;
-                        if (!decodeCompactionEnd(payload, len, d)) { return; }
+                        if (!decodeCompactionEnd(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         liveSst_.insert(d.output);
                         for (const auto& inp : d.inputs) {
@@ -956,7 +990,7 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::CHECKPOINT: {
                         DecodedCheckpoint d;
-                        if (!decodeCheckpoint(payload, len, d)) { return; }
+                        if (!decodeCheckpoint(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         lastCheckpoint_ = CheckpointEvent{d.name, d.stripe, d.lastSeq, d.tsUs};
                         deletedSst_.clear();
@@ -967,7 +1001,7 @@ namespace akkaradb::engine::manifest {
                         // Atomic multi-file compaction commit.
                         // Adds all outputs and removes all inputs in one operation.
                         DecodedCompactionCommit d;
-                        if (!decodeCompactionCommit(payload, len, d)) { return; }
+                        if (!decodeCompactionCommit(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         for (const auto& f : d.outputFiles) {
                             liveSst_.insert(f);
@@ -982,7 +1016,7 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::SST_BLOB_REFS: {
                         DecodedSSTBlobRefs d;
-                        if (!decodeSstBlobRefs(payload, len, d)) { return; }
+                        if (!decodeSstBlobRefs(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         auto entries = sortedUniqueEntries(toManifestEntries(std::move(d.entries)));
                         sstBlobRefs_.push_back(SSTBlobRefsEvent{d.name, entries, d.tsUs});
@@ -991,28 +1025,28 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::NODE_JOIN: {
                         DecodedNodeJoin d;
-                        if (!decodeNodeJoin(payload, len, d)) { return; }
+                        if (!decodeNodeJoin(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         nodeJoins_.push_back(NodeJoinEvent{d.nodeId, d.replPort, d.host, d.tsUs});
                         break;
                     }
                     case ManifestRecordType::NODE_LEAVE: {
                         DecodedNodeLeave d;
-                        if (!decodeNodeLeave(payload, len, d)) { return; }
+                        if (!decodeNodeLeave(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         nodeLeaves_.push_back(NodeLeaveEvent{d.nodeId, d.tsUs});
                         break;
                     }
                     case ManifestRecordType::PRIMARY_LEASE: {
                         DecodedPrimaryLease d;
-                        if (!decodePrimaryLease(payload, len, d)) { return; }
+                        if (!decodePrimaryLease(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         lastPrimaryLease_ = PrimaryLeaseEvent{d.nodeId, d.leaseUntilUs, d.tsUs};
                         break;
                     }
                     case ManifestRecordType::BLOB_PUT: {
                         DecodedBlobPut d;
-                        if (!decodeBlobPut(payload, len, d)) { return; }
+                        if (!decodeBlobPut(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         blobPuts_.push_back(BlobPutEvent{d.blobId, d.totalSize, d.storedSize, d.contentCrc32c, d.codec, d.tsUs});
                         liveBlobs_.insert(d.blobId);
@@ -1021,17 +1055,24 @@ namespace akkaradb::engine::manifest {
                     }
                     case ManifestRecordType::BLOB_DELETE: {
                         DecodedBlobDelete d;
-                        if (!decodeBlobDelete(payload, len, d)) { return; }
+                        if (!decodeBlobDelete(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         blobDeletes_.push_back(BlobDeleteEvent{d.blobId, d.tsUs});
                         liveBlobs_.erase(d.blobId);
                         deletedBlobs_.insert(d.blobId);
                         break;
                     }
-                    case ManifestRecordType::COMPACTION_START:
-                    case ManifestRecordType::TRUNCATE:
-                        // Informational only - no state change
+                    case ManifestRecordType::COMPACTION_START: {
+                        DecodedCompactionStart d;
+                        if (!decodeCompactionStart(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         break;
+                    }
+                    case ManifestRecordType::TRUNCATE: {
+                        DecodedTruncate d;
+                        if (!decodeTruncate(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
+                        break;
+                    }
+                    default: throw std::runtime_error("Manifest: unknown v1 event type");
                 }
             }
 

@@ -134,6 +134,18 @@ namespace akkaradb::engine::sst {
                 size_t bytes = 0;
             };
 
+            struct RecordLocation {
+                std::shared_ptr<Block> block;
+                uint32_t offset;
+
+                [[nodiscard]] const core::SSTHdr32& header() const noexcept {
+                    return *reinterpret_cast<const core::SSTHdr32*>(block->data.data() + offset);
+                }
+                [[nodiscard]] const uint8_t* keyData() const noexcept {
+                    return block->data.data() + offset + sizeof(core::SSTHdr32);
+                }
+            };
+
             struct CacheEntry {
                 size_t blockIndex;
                 std::shared_ptr<Block> block;
@@ -210,41 +222,35 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
-                if (!keyInRange(key)) { return std::nullopt; }
-                const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
-                const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
-                if (!bloomMightContain(fp)) { return std::nullopt; }
-                const auto blockIndex = candidateBlock(key);
-                if (!blockIndex.has_value()) { return std::nullopt; }
-                const auto block = loadBlock(*blockIndex);
-                auto rec = findInBlock(*block, key, fp, mini, true);
-                if (!rec || rec->seq > snapshotSeq) { return std::nullopt; }
-                return rec;
+                const auto location = findRecord(key, snapshotSeq);
+                if (!location) { return std::nullopt; }
+                const auto& hdr = location->header();
+                const uint8_t* keyPtr = location->keyData();
+                const uint8_t* valPtr = keyPtr + hdr.kLen;
+                return SSTRecord{
+                    .key = std::vector<uint8_t>(keyPtr, keyPtr + hdr.kLen),
+                    .value = std::vector<uint8_t>(valPtr, valPtr + hdr.vLen),
+                    .seq = hdr.seq,
+                    .flags = hdr.flags,
+                    .keyFp64 = hdr.keyFp64,
+                    .miniKey = hdr.miniKey
+                };
             }
 
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
-                if (!keyInRange(key)) { return std::nullopt; }
-                const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
-                const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
-                if (!bloomMightContain(fp)) { return std::nullopt; }
-                const auto blockIndex = candidateBlock(key);
-                if (!blockIndex.has_value()) { return std::nullopt; }
-                const auto block = loadBlock(*blockIndex);
-                const auto rec = findInBlock(*block, key, fp, mini, false);
-                if (!rec) { return std::nullopt; }
-                if (rec->seq > snapshotSeq) { return std::nullopt; }
-                return !rec->isTombstone();
+                const auto location = findRecord(key, snapshotSeq);
+                if (!location) { return std::nullopt; }
+                return (location->header().flags & core::SSTHdr32::FLAG_TOMBSTONE) == 0;
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
-                if (!keyInRange(key)) { return std::nullopt; }
-                const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
-                const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
-                if (!bloomMightContain(fp)) { return std::nullopt; }
-                const auto blockIndex = candidateBlock(key);
-                if (!blockIndex.has_value()) { return std::nullopt; }
-                const auto block = loadBlock(*blockIndex);
-                return findValueInBlock(*block, key, fp, mini, out, snapshotSeq);
+                const auto location = findRecord(key, snapshotSeq);
+                if (!location) { return std::nullopt; }
+                const auto& hdr = location->header();
+                if ((hdr.flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0) { return false; }
+                const uint8_t* valPtr = location->keyData() + hdr.kLen;
+                out.assign(valPtr, valPtr + hdr.vLen);
+                return true;
             }
 
             [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(
@@ -458,77 +464,38 @@ namespace akkaradb::engine::sst {
                 }
             }
 
-            [[nodiscard]] std::optional<SSTRecord> findInBlock(
-                const Block& block,
-                std::span<const uint8_t> key,
-                uint64_t fp,
-                uint64_t mini,
-                bool copyValue
-            ) const {
-                size_t lo = 0;
-                size_t hi = block.offsets.size();
-                while (lo < hi) {
-                    const size_t mid = lo + (hi - lo) / 2;
-                    const uint32_t off = block.offsets[mid];
-                    if (off + sizeof(core::SSTHdr32) > block.data.size()) { throw std::runtime_error("SSTReader: corrupt record offset"); }
-                    const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
-                    const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
-                    const int cmp = compareRecordKey(*hdr, keyPtr, key);
-                    if (cmp < 0) { lo = mid + 1; }
-                    else { hi = mid; }
+            [[nodiscard]] std::optional<RecordLocation> findRecord(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+                if (!keyInRange(key)) { return std::nullopt; }
+                const uint64_t fp = key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size());
+                const uint64_t mini = key.empty() ? 0 : core::buildMiniKey(key.data(), key.size());
+                if (!bloomMightContain(fp)) { return std::nullopt; }
+                const auto firstBlock = candidateBlock(key);
+                if (!firstBlock) { return std::nullopt; }
+                std::optional<RecordLocation> best;
+                // Equal keys may span blocks, and their sequences need not be ordered.
+                for (size_t i = *firstBlock; i < index_.size(); ++i) {
+                    const auto first = arenaKey(keyArena_, index_[i].firstKeyOffset, index_[i].firstKeyLen);
+                    if (compareBytes(first, key) > 0) { break; }
+                    const auto block = loadBlock(i);
+                    size_t lo = 0;
+                    size_t hi = block->offsets.size();
+                    while (lo < hi) {
+                        const size_t mid = lo + (hi - lo) / 2;
+                        const RecordLocation candidate{block, block->offsets[mid]};
+                        if (compareRecordKey(candidate.header(), candidate.keyData(), key) < 0) { lo = mid + 1; }
+                        else { hi = mid; }
+                    }
+                    for (; lo < block->offsets.size(); ++lo) {
+                        const RecordLocation candidate{block, block->offsets[lo]};
+                        const auto& hdr = candidate.header();
+                        if (compareRecordKey(hdr, candidate.keyData(), key) != 0) { break; }
+                        if (keyEquals(hdr, candidate.keyData(), key, fp, mini) && hdr.seq <= snapshotSeq &&
+                            (!best || hdr.seq > best->header().seq)) {
+                            best = candidate;
+                        }
+                    }
                 }
-                if (lo >= block.offsets.size()) { return std::nullopt; }
-                const uint32_t off = block.offsets[lo];
-                const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
-                const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
-                const uint8_t* valPtr = keyPtr + hdr->kLen;
-                if (valPtr + hdr->vLen > block.data.data() + block.data.size()) {
-                    throw std::runtime_error("SSTReader: corrupt record payload");
-                }
-                if (!keyEquals(*hdr, keyPtr, key, fp, mini)) { return std::nullopt; }
-                SSTRecord rec;
-                rec.key.assign(keyPtr, keyPtr + hdr->kLen);
-                if (copyValue) { rec.value.assign(valPtr, valPtr + hdr->vLen); }
-                rec.seq = hdr->seq;
-                rec.flags = hdr->flags;
-                rec.keyFp64 = hdr->keyFp64;
-                rec.miniKey = hdr->miniKey;
-                return rec;
-            }
-
-            [[nodiscard]] std::optional<bool> findValueInBlock(
-                const Block& block,
-                std::span<const uint8_t> key,
-                uint64_t fp,
-                uint64_t mini,
-                std::vector<uint8_t>& out,
-                uint64_t snapshotSeq
-            ) const {
-                size_t lo = 0;
-                size_t hi = block.offsets.size();
-                while (lo < hi) {
-                    const size_t mid = lo + (hi - lo) / 2;
-                    const uint32_t off = block.offsets[mid];
-                    if (off + sizeof(core::SSTHdr32) > block.data.size()) { throw std::runtime_error("SSTReader: corrupt record offset"); }
-                    const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
-                    const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
-                    const int cmp = compareRecordKey(*hdr, keyPtr, key);
-                    if (cmp < 0) { lo = mid + 1; }
-                    else { hi = mid; }
-                }
-                if (lo >= block.offsets.size()) { return std::nullopt; }
-                const uint32_t off = block.offsets[lo];
-                const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.data.data() + off);
-                const uint8_t* keyPtr = block.data.data() + off + sizeof(core::SSTHdr32);
-                const uint8_t* valPtr = keyPtr + hdr->kLen;
-                if (valPtr + hdr->vLen > block.data.data() + block.data.size()) {
-                    throw std::runtime_error("SSTReader: corrupt record payload");
-                }
-                if (!keyEquals(*hdr, keyPtr, key, fp, mini)) { return std::nullopt; }
-                if (hdr->seq > snapshotSeq) { return std::nullopt; }
-                if ((hdr->flags & core::SSTHdr32::FLAG_TOMBSTONE) != 0) { return false; }
-                out.assign(valPtr, valPtr + hdr->vLen);
-                return true;
+                return best;
             }
 
             std::filesystem::path path_;

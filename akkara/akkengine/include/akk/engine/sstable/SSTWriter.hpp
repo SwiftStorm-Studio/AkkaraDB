@@ -68,6 +68,7 @@ namespace akkaradb::engine::sst {
                 std::vector<BlobRefEntry> blobRefs;
             };
 
+            // Input is sorted by key; repeated keys may contain sequences in any order.
             [[nodiscard]] static Result write(const std::filesystem::path& path, std::span<const core::RecordView> records);
             [[nodiscard]] static Result write(
                 const std::filesystem::path& path,

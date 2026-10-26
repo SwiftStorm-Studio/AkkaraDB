@@ -60,6 +60,7 @@ namespace akkaradb::engine::sst {
             SSTReader(SSTReader&&) noexcept;
             SSTReader& operator=(SSTReader&&) noexcept;
 
+            // Point reads select the largest retained sequence <= snapshotSeq, including tombstones.
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
             [[nodiscard]] std::optional<bool> getInto(
@@ -67,6 +68,7 @@ namespace akkaradb::engine::sst {
                 std::vector<uint8_t>& out,
                 uint64_t snapshotSeq = UINT64_MAX
             ) const;
+            // Raw scan yields every visible physical version; SSTManager merges versions by key.
             [[nodiscard]] core::ArenaGenerator<SSTRecord> scan(
                 std::span<const uint8_t> startKey = {},
                 std::span<const uint8_t> endKey = {},

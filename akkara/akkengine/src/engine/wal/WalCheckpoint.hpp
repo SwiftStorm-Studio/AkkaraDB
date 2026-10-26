@@ -6,14 +6,15 @@
 #include <array>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <optional>
 #include <stdexcept>
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -25,11 +26,33 @@ namespace akkaradb::engine::wal::detail {
 
     inline std::optional<WalSegmentHeader> readCheckpoint(const std::filesystem::path& segment) {
         const auto path = checkpointPath(segment);
-        if (!std::filesystem::exists(path)) { return {}; }
         std::array<uint8_t, WalSegmentHeader::SIZE> bytes{};
-        std::ifstream input{path, std::ios::binary};
-        if (std::filesystem::file_size(path) != bytes.size() ||
-            !input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
+#ifdef _WIN32
+        // Readers keep the old immutable image alive without preventing an
+        // atomic publication or proof retirement on another thread.
+        const auto input = ::CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (input == INVALID_HANDLE_VALUE) {
+            const auto error = ::GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) { return {}; }
+            throw std::runtime_error("WAL: failed to open segment checkpoint at " + path.string());
+        }
+        LARGE_INTEGER size{}; DWORD read = 0;
+        const bool valid = ::GetFileSizeEx(input, &size) && size.QuadPart == bytes.size() &&
+            ::ReadFile(input, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size();
+        ::CloseHandle(input);
+#else
+        FILE* input = std::fopen(path.c_str(), "rb");
+        if (!input) {
+            if (errno == ENOENT) { return {}; }
+            throw std::runtime_error("WAL: failed to open segment checkpoint at " + path.string());
+        }
+        struct stat size{};
+        const bool valid = ::fstat(::fileno(input), &size) == 0 && size.st_size == bytes.size() &&
+            std::fread(bytes.data(), 1, bytes.size(), input) == bytes.size();
+        std::fclose(input);
+#endif
+        if (!valid) {
             throw std::runtime_error("WAL: corrupt segment checkpoint at " + path.string());
         }
         const auto header = WalSegmentHeader::deserialize(bytes.data());

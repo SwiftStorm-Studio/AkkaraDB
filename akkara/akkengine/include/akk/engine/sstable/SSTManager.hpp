@@ -102,6 +102,8 @@ namespace akkaradb::engine::sst {
                     std::unique_ptr<Impl> impl_;
             };
 
+            // Without an external Manifest, sstDir/sst-state.akmf owns the durable
+            // live-file catalog. Its state must be retained with the SST directory.
             [[nodiscard]] static std::unique_ptr<SSTManager> create(
                 std::filesystem::path sstDir,
                 Options options,
@@ -112,6 +114,7 @@ namespace akkaradb::engine::sst {
             SSTManager(const SSTManager&) = delete;
             SSTManager& operator=(const SSTManager&) = delete;
 
+            // Rejects live SST levels outside maxLevels before cleanup or state publication.
             void recover();
             void shutdown();
             uint64_t flush(std::span<const core::RecordView> records);

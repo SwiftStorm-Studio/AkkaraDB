@@ -10,21 +10,12 @@ Current documentation is published at [docs.swiftstorm.dev/akkaradb-native](http
 
 Choose the entry point that matches your application:
 
-| Use case | Entry point |
-|---|---|
-| Raw embedded KV engine | `AkkEngine` |
+| Use case                                        | Entry point                          |
+|-------------------------------------------------|--------------------------------------|
+| Raw embedded KV engine                          | `AkkEngine`                          |
 | Typed C++ tables with indexes and query helpers | `AkkaraDB` and `PackedTable<&T::id>` |
-| Kotlin/JVM integration | JNI wrapper with `ByteBufferL` |
-| Remote access over HTTP/TCP/gRPC | `akkara/akkserver/` backends |
-
-## Cluster Deployment Intent
-
-Native Cluster primarily targets separate physical machines within a LAN or
-across a WAN. Same-machine loopback tests do not establish real LAN/WAN
-performance. A smaller AkkaraDB specifically for deployment as a Cluster node
-is under consideration; its feature set and packaging are not yet defined.
-See [AGENTS.md](AGENTS.md) for this design context and [SPEC.md](SPEC.md#15-cluster-and-replication)
-for the current Cluster contracts.
+| Kotlin/JVM integration                          | JNI wrapper with `ByteBufferL`       |
+| Remote access over HTTP/TCP/gRPC                | `akkara/akkserver/` backends         |
 
 ## Why AkkaraDB
 

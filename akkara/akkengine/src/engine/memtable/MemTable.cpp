@@ -260,6 +260,7 @@ namespace akkaradb::engine::memtable {
                     uint64_t id;
                     std::shared_ptr<IMemTable> table;
                     size_t bytes;
+                    uint64_t minSeq = UINT64_MAX;
                 };
 
                 struct PublishedTables {
@@ -273,6 +274,7 @@ namespace akkaradb::engine::memtable {
                 std::atomic<uint64_t> putsApplied{0};
                 std::atomic<uint64_t> removesApplied{0};
                 size_t activeBytes{0};
+                uint64_t activeMinSeq = UINT64_MAX;
                 uint64_t nextImmutableId{1};
             };
 
@@ -377,8 +379,9 @@ namespace akkaradb::engine::memtable {
                                 if (onDone_) { onDone_(item.shardIndex, item.id); }
                             }
                             catch (...) {
-                                // Keep the immutable table published: callers can still read it and
-                                // recovery can replay its WAL record instead of silently losing data.
+                                // Failed persistence keeps the immutable published. A completion
+                                // notification can fail after persistence; latch either failure
+                                // so subsequent callers cannot silently continue.
                                 recordFailure(std::current_exception());
                             }
 
@@ -467,6 +470,7 @@ namespace akkaradb::engine::memtable {
                     const size_t newActiveBytes = shard.active->sizeBytes();
                     const size_t previousActiveBytes = shard.activeBytes;
                     shard.activeBytes = newActiveBytes;
+                    shard.activeMinSeq = std::min(shard.activeMinSeq, seq);
 
                     size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
                     totalBytes = totalBytes - previousActiveBytes + newActiveBytes;
@@ -620,11 +624,12 @@ namespace akkaradb::engine::memtable {
                         auto sealed = shard.active;
                         const size_t sealedBytes = shard.activeBytes;
                         const uint64_t immutableId = shard.nextImmutableId++;
-                        shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes});
+                        shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes, shard.activeMinSeq});
 
                         shard.active = std::move(replacements[i]);
                         shard.activeRaw.store(shard.active.get(), std::memory_order_release);
                         shard.activeBytes = shard.active->sizeBytes();
+                        shard.activeMinSeq = UINT64_MAX;
                         const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
                         shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
                         publishTablesLocked(shard);
@@ -736,10 +741,11 @@ namespace akkaradb::engine::memtable {
                             shard.active->freeze();
                             const auto sealed = shard.active;
                             const size_t sealedBytes = shard.activeBytes;
-                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes});
+                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes, shard.activeMinSeq});
                             shard.active = std::move(replacements[i]);
                             shard.activeRaw.store(shard.active.get(), std::memory_order_release);
                             shard.activeBytes = shard.active->sizeBytes();
+                            shard.activeMinSeq = UINT64_MAX;
                             const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
                             shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
                             publishTablesLocked(shard);
@@ -782,6 +788,16 @@ namespace akkaradb::engine::memtable {
                 }
             }
 
+            [[nodiscard]] uint64_t minimumUnflushedSequence() const {
+                uint64_t result = UINT64_MAX;
+                for (const auto& shard : shards_) {
+                    std::shared_lock lock{shard->mutex};
+                    result = std::min(result, shard->activeMinSeq);
+                    for (const auto& table : shard->immutables) { result = std::min(result, table.minSeq); }
+                }
+                return result;
+            }
+
             void flushHint() {
                 throwIfFlushFailed();
                 if (flushMode_ != MemTableFlushMode::BYTES_PER_SHARD) { return; }
@@ -799,6 +815,7 @@ namespace akkaradb::engine::memtable {
                 throwIfFlushFailed();
                 for (uint32_t i = 0; i < shardCount_; ++i) { triggerFlush(i); }
                 if (flushPool_) { flushPool_->drain(); }
+                if (options_.onFlushComplete) { options_.onFlushComplete(); }
             }
 
             void throwIfFlushFailed() const { if (flushPool_) { flushPool_->throwIfFailed(); } }
@@ -951,10 +968,11 @@ namespace akkaradb::engine::memtable {
                             shard.active->freeze();
                             const auto sealed = shard.active;
                             const size_t sealedBytes = shard.activeBytes;
-                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes});
+                            shard.immutables.emplace_back(Shard::Immutable{shard.nextImmutableId++, sealed, sealedBytes, shard.activeMinSeq});
                             shard.active = std::shared_ptr<IMemTable>{std::move(replacement)};
                             shard.activeRaw.store(shard.active.get(), std::memory_order_release);
                             shard.activeBytes = shard.active->sizeBytes();
+                            shard.activeMinSeq = UINT64_MAX;
                             const size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
                             shard.approxBytes.store(totalBytes + shard.activeBytes, std::memory_order_relaxed);
                             publishTablesLocked(shard);
@@ -974,9 +992,11 @@ namespace akkaradb::engine::memtable {
                     RangeIterator::Impl merged{
                         {}, std::move(capturedSources), {}, {}, std::numeric_limits<uint64_t>::max()
                     };
+                    uint64_t compactedMinSeq = UINT64_MAX;
                     while (merged.hasNext()) {
                         const auto record = merged.next();
                         if (!record) { break; }
+                        compactedMinSeq = std::min(compactedMinSeq, record->seq());
                         const auto status = compacted->put(
                             toByteView(record->key()), toByteView(record->value()), record->seq(), record->flags(),
                             record->keyFp64(), record->miniKey()
@@ -1006,7 +1026,7 @@ namespace akkaradb::engine::memtable {
                             [&](const Shard::Immutable& item) { return item.id > lastCapturedId; }
                         );
                         shard.immutables.insert(insertAt, Shard::Immutable{
-                            shard.nextImmutableId++, std::move(compactedShared), compactedBytes
+                            shard.nextImmutableId++, std::move(compactedShared), compactedBytes, compactedMinSeq
                         });
                     }
                     size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
@@ -1048,12 +1068,13 @@ namespace akkaradb::engine::memtable {
                     auto newActive = makeBackend();
                     if (!newActive) { throw std::invalid_argument("MemTable backend factory returned null"); }
                     immutableId = shard.nextImmutableId++;
-                    shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes});
+                    shard.immutables.emplace_back(Shard::Immutable{immutableId, sealed, sealedBytes, shard.activeMinSeq});
                     shard.immutableCount.store(static_cast<uint32_t>(shard.immutables.size()), std::memory_order_release);
 
                     shard.active = std::shared_ptr<IMemTable>{std::move(newActive)};
                     shard.activeRaw.store(shard.active.get(), std::memory_order_release);
                     shard.activeBytes = shard.active->sizeBytes();
+                    shard.activeMinSeq = UINT64_MAX;
 
                     size_t totalBytes = shard.approxBytes.load(std::memory_order_relaxed);
                     totalBytes = totalBytes - sealedBytes + shard.activeBytes + sealedBytes;
@@ -1079,6 +1100,8 @@ namespace akkaradb::engine::memtable {
                 );
                 publishTablesLocked(shard);
                 flushesCompleted_.fetch_add(1, std::memory_order_relaxed);
+                lock.unlock();
+                if (options_.onFlushComplete) { options_.onFlushComplete(); }
             }
 
             Options options_;
@@ -1203,6 +1226,8 @@ namespace akkaradb::engine::memtable {
     uint64_t MemTable::reserveSeq(uint64_t count) { return impl_->reserveSeq(count); }
 
     uint64_t MemTable::lastSeq() const noexcept { return impl_->lastSeq(); }
+
+    uint64_t MemTable::minimumUnflushedSequence() const { return impl_->minimumUnflushedSequence(); }
 
     void MemTable::flushHint() { impl_->flushHint(); }
 
