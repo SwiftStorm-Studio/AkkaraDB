@@ -129,35 +129,35 @@ namespace akkaradb::engine::sst {
             #endif
         }
 
-        void syncDirectoryBestEffort(const std::filesystem::path& dir) {
-            if (dir.empty()) { return; }
-            #ifdef _WIN32
-            HANDLE h = ::CreateFileW(
-                dir.wstring().c_str(),
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS,
-                nullptr
-            ); if (h == INVALID_HANDLE_VALUE) { return; } (void)::FlushFileBuffers(h); ::CloseHandle(h);
-            #else
-            const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-            if (fd < 0) { return; }
-            (void)::fsync(fd);
+        void syncDirectory(const std::filesystem::path& dir) {
+            #ifndef _WIN32
+            const auto path = dir.empty() ? std::filesystem::path{"."} : dir;
+            const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+            if (fd < 0) { throw std::runtime_error("SSTManager: cannot open directory for sync: " + path.string()); }
+            const int rc = ::fsync(fd);
+            const int saved = errno;
             ::close(fd);
+            if (rc != 0) { throw std::runtime_error("SSTManager: directory sync failed: " + path.string() + " errno=" + std::to_string(saved)); }
+            #else
+            (void)dir; // Windows publication uses a write-through rename below.
             #endif
         }
 
         void durableRename(const std::filesystem::path& tmp, const std::filesystem::path& path) {
             syncFile(tmp);
+            #ifdef _WIN32
+            if (!::MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error("SSTManager: durable rename failed: " + std::to_string(::GetLastError()));
+            }
+            #else
             std::filesystem::rename(tmp, path);
-            syncDirectoryBestEffort(path.parent_path());
+            syncDirectory(path.parent_path());
+            #endif
         }
 
         void removeFileDurable(const std::filesystem::path& path) {
             std::error_code ec;
-            if (std::filesystem::remove(path, ec)) { syncDirectoryBestEffort(path.parent_path()); }
+            if (std::filesystem::remove(path, ec)) { syncDirectory(path.parent_path()); }
         }
 
         // Test-only fault injection. Each point is reached only after the preceding
@@ -324,7 +324,7 @@ namespace akkaradb::engine::sst {
                     // directory contents after a partially completed compaction.
                     ownedManifest_ = manifest::Manifest::create(statePath);
                     manifest_ = ownedManifest_.get();
-                    syncDirectoryBestEffort(sstDir_);
+                    syncDirectory(sstDir_);
                 }
                 levels_.resize(static_cast<size_t>(options_.maxLevels));
                 publishLocked();

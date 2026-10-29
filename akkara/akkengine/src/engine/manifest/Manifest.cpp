@@ -12,13 +12,18 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cerrno>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,6 +60,59 @@ namespace akkaradb::engine::manifest {
             #else
             return std::filesystem::file_size(path);
             #endif
+        }
+
+        [[nodiscard]] ManifestFileHeader readFileHeader(const std::filesystem::path& path) {
+            std::ifstream file(path, std::ios::binary);
+            uint8_t bytes[ManifestFileHeader::SIZE];
+            file.read(reinterpret_cast<char*>(bytes), sizeof(bytes));
+            if (!file) { throw std::runtime_error("Manifest: missing or truncated file header: " + path.string()); }
+            const auto readLe = [&](size_t offset, size_t size) {
+                uint64_t value = 0;
+                for (size_t i = 0; i < size; ++i) { value |= static_cast<uint64_t>(bytes[offset + i]) << (i * 8); }
+                return value;
+            };
+            ManifestFileHeader header{};
+            header.magic = static_cast<uint32_t>(readLe(0, 4));
+            header.version = static_cast<uint16_t>(readLe(4, 2));
+            header.flags = static_cast<uint16_t>(readLe(6, 2));
+            header.fileSeq = static_cast<uint32_t>(readLe(8, 4));
+            header.createdAtUs = readLe(12, 8);
+            header.crc32c = static_cast<uint32_t>(readLe(20, 4));
+            std::memcpy(header.reserved, bytes + 24, sizeof(header.reserved));
+            if (!header.verifyMagic() || !header.verifyVersion()) {
+                throw std::runtime_error("Manifest: unsupported format; v1 is required (recreate the pre-release database)");
+            }
+            if (!header.verifyChecksum()) { throw std::runtime_error("Manifest: corrupt file header: " + path.string()); }
+            return header;
+        }
+
+        void syncDirectory(const std::filesystem::path& path) {
+            #ifndef _WIN32
+            const auto directory = path.empty() ? std::filesystem::path{"."} : path;
+            const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+            if (fd < 0) { throw std::runtime_error("Manifest: cannot open directory for sync"); }
+            const int result = ::fsync(fd);
+            ::close(fd);
+            if (result != 0) { throw std::runtime_error("Manifest: directory sync failed"); }
+            #else
+            (void)path; // Replacement uses MOVEFILE_WRITE_THROUGH on Windows.
+            #endif
+        }
+
+        void replaceFile(const std::filesystem::path& source, const std::filesystem::path& destination) {
+            #ifdef _WIN32
+            if (!::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                throw std::runtime_error("Manifest: atomic replacement failed: " + std::to_string(::GetLastError()));
+            }
+            #else
+            std::filesystem::rename(source, destination);
+            #endif
+        }
+
+        void crashAtTestPoint(const char* point) noexcept {
+            const char* requested = std::getenv("AKKARADB_TEST_CRASH_POINT");
+            if (requested && std::strcmp(requested, point) == 0) { std::quick_exit(86); }
         }
 
         class FileHandle {
@@ -185,11 +243,14 @@ namespace akkaradb::engine::manifest {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
 
                 const bool manifestExistsNow = pathExists(path_);
+                if (!manifestExistsNow && mayHaveManifestHistory()) {
+                    throw std::runtime_error("Manifest: base file is missing while manifest history remains");
+                }
                 if (manifestExistsNow) { replayInternal(true); }
 
-                rotationCounter_ = findLastRotationNumber();
-
-                currentPath_ = makeManifestPath(rotationCounter_);
+                const auto files = manifestFiles();
+                rotationCounter_ = static_cast<size_t>(baseFileSeq_) + files.size() - 1;
+                currentPath_ = files.back();
                 fileHandle_ = FileHandle::open(currentPath_);
 
                 currentFileSize_ = pathFileSize(currentPath_);
@@ -324,7 +385,8 @@ namespace akkaradb::engine::manifest {
             void compactionCommit(const std::vector<std::string>& outputFiles, const std::vector<std::string>& inputFiles) {
                 std::lock_guard apiLock{apiMutex_};
                 // Single append call -> single CRC-protected record.
-                // Either fully applied on replay or entirely absent (CRC mismatch).
+                // Replay applies a complete valid record, repairs an incomplete tail,
+                // or rejects corruption without changing the catalog.
                 append(ManifestRecordType::COMPACTION_COMMIT, encodeCompactionCommit(nowUs(), outputFiles, inputFiles));
                 flushPendingForCompact();
 
@@ -451,7 +513,9 @@ namespace akkaradb::engine::manifest {
                 FileHandle compactFile = FileHandle::open(tmpPath);
                 uint64_t compactSize = 0;
                 {
-                    const ManifestFileHeader fhdr = ManifestFileHeader::build(0);
+                    // The base snapshot covers every rotation through this number.
+                    // A crash before obsolete-file cleanup must not replay them again.
+                    const ManifestFileHeader fhdr = ManifestFileHeader::build(static_cast<uint32_t>(rotationCounter_));
                     uint8_t buf[ManifestFileHeader::SIZE];
                     fhdr.serialize(buf);
                     compactFile.write(buf, ManifestFileHeader::SIZE);
@@ -502,20 +566,28 @@ namespace akkaradb::engine::manifest {
 
                 compactFile.fsyncFull();
                 compactFile.close();
+                crashAtTestPoint("manifest.compact.after_tmp_sync");
 
                 std::lock_guard rotationLock{rotationMutex_};
                 fileHandle_.close();
-                std::filesystem::remove(path_);
-                std::filesystem::rename(tmpPath, path_);
-                for (size_t i = 1; i < 10000; ++i) {
-                    const auto p = existingManifestPath(i);
-                    if (p.empty()) { break; }
-                    std::filesystem::remove(p);
+                try { replaceFile(tmpPath, path_); }
+                catch (...) {
+                    fileHandle_ = FileHandle::open(currentPath_);
+                    throw;
                 }
-                rotationCounter_ = 0;
+                crashAtTestPoint("manifest.compact.after_replace");
+                baseFileSeq_ = static_cast<uint32_t>(rotationCounter_);
                 currentPath_ = path_;
                 currentFileSize_ = compactSize;
                 fileHandle_ = FileHandle::open(currentPath_);
+                try { syncDirectory(path_.parent_path()); }
+                catch (...) { termWriteError_ = std::current_exception(); throw; }
+                crashAtTestPoint("manifest.compact.after_directory_sync");
+                for (size_t i = 1; i <= baseFileSeq_; ++i) {
+                    std::filesystem::remove(makeManifestPath(i));
+                    std::filesystem::remove(makeLegacyManifestPath(i));
+                    if (i == 1) { crashAtTestPoint("manifest.compact.after_first_rotation_delete"); }
+                }
             }
 
             // ----------------------------------------------------------------
@@ -582,6 +654,17 @@ namespace akkaradb::engine::manifest {
             std::vector<SSTBlobRefsEvent> sstBlobRefs() const {
                 std::lock_guard lock{mutex_};
                 return sstBlobRefs_;
+            }
+
+            std::optional<std::vector<SSTBlobRefsEvent::Entry>> liveSstBlobRefs() const {
+                std::lock_guard lock{mutex_};
+                std::vector<SSTBlobRefsEvent::Entry> refs;
+                for (const auto& file : liveSst_) {
+                    const auto found = sstBlobRefsByFile_.find(file);
+                    if (found == sstBlobRefsByFile_.end()) { return std::nullopt; }
+                    refs.insert(refs.end(), found->second.begin(), found->second.end());
+                }
+                return refs;
             }
 
             std::vector<uint64_t> sstReferencedBlobs() const {
@@ -673,18 +756,9 @@ namespace akkaradb::engine::manifest {
                 return path_.parent_path() / (path_.stem().string() + "-" + std::to_string(rotationNumber) + path_.extension().string());
             }
 
-            [[nodiscard]] std::filesystem::path existingManifestPath(size_t rotationNumber) const {
-                const auto path = makeManifestPath(rotationNumber);
-                if (pathExists(path)) { return path; }
-
-                const auto legacyPath = makeLegacyManifestPath(rotationNumber);
-                if (legacyPath != path && pathExists(legacyPath)) { return legacyPath; }
-                return {};
-            }
-
             [[nodiscard]] bool mayHaveManifestHistory() const {
-                const auto parent = path_.parent_path();
-                if (parent.empty() || !std::filesystem::exists(parent)) { return false; }
+                const auto parent = path_.has_parent_path() ? path_.parent_path() : std::filesystem::path{"."};
+                if (!std::filesystem::exists(parent)) { return false; }
 
                 const std::string baseName = path_.filename().string();
                 const std::string stem = path_.stem().string();
@@ -698,16 +772,35 @@ namespace akkaradb::engine::manifest {
                 return false;
             }
 
-            [[nodiscard]] size_t findLastRotationNumber() const {
-                const bool baseExists = pathExists(path_);
-                if (!baseExists) { return 0; }
-                size_t maxRotation = 0;
-                if (baseExists) { maxRotation = 0; }
-                for (size_t i = 1; i < 10000; ++i) {
-                    if (!existingManifestPath(i).empty()) { maxRotation = i; }
-                    else { break; }
+            [[nodiscard]] std::vector<std::filesystem::path> manifestFiles() const {
+                std::map<uint32_t, std::filesystem::path> rotations;
+                const auto parent = path_.has_parent_path() ? path_.parent_path() : std::filesystem::path{"."};
+                const auto modernPrefix = path_.stem().string() + "-";
+                const auto extension = path_.extension().string();
+                const auto legacyPrefix = path_.filename().string() + ".";
+                for (const auto& entry : std::filesystem::directory_iterator(parent)) {
+                    const auto name = entry.path().filename().string();
+                    std::string_view number;
+                    bool modern = false;
+                    if (name.starts_with(modernPrefix) && name.ends_with(extension) && name.size() > modernPrefix.size() + extension.size()) {
+                        number = std::string_view{name}.substr(modernPrefix.size(), name.size() - modernPrefix.size() - extension.size());
+                        modern = true;
+                    }
+                    else if (name.starts_with(legacyPrefix)) { number = std::string_view{name}.substr(legacyPrefix.size()); }
+                    else { continue; }
+                    uint32_t sequence = 0;
+                    const auto parsed = std::from_chars(number.data(), number.data() + number.size(), sequence);
+                    if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || sequence <= baseFileSeq_) { continue; }
+                    if (modern || !rotations.contains(sequence)) { rotations[sequence] = entry.path(); }
                 }
-                return maxRotation;
+                std::vector<std::filesystem::path> files{path_};
+                uint64_t expected = static_cast<uint64_t>(baseFileSeq_) + 1;
+                for (const auto& [sequence, file] : rotations) {
+                    if (sequence != expected) { throw std::runtime_error("Manifest: missing rotation " + std::to_string(expected)); }
+                    files.push_back(file);
+                    ++expected;
+                }
+                return files;
             }
 
             // ----------------------------------------------------------------
@@ -721,6 +814,7 @@ namespace akkaradb::engine::manifest {
                 fhdr.serialize(buf);
                 fileHandle_.write(buf, ManifestFileHeader::SIZE);
                 fileHandle_.fsyncData();
+                syncDirectory(path_.parent_path());
                 currentFileSize_ += ManifestFileHeader::SIZE;
             }
 
@@ -730,7 +824,12 @@ namespace akkaradb::engine::manifest {
 
             void checkRotation() {
                 if (currentFileSize_ < ROTATION_THRESHOLD) { return; }
+                if (rotationCounter_ == UINT32_MAX) { throw std::runtime_error("Manifest: rotation counter exhausted"); }
 
+                // A durability barrier may span several files in one queued batch.
+                // Sync the old file before losing its handle, not just the final file.
+                fileHandle_.fsyncData();
+                crashAtTestPoint("manifest.rotation.after_sync");
                 fileHandle_.close();
                 ++rotationCounter_;
                 currentPath_ = makeManifestPath(rotationCounter_);
@@ -767,6 +866,7 @@ namespace akkaradb::engine::manifest {
                 }
                 else {
                     std::lock_guard lock{rotationMutex_};
+                    if (termWriteError_) { std::rethrow_exception(termWriteError_); }
                     checkRotation();
                     fileHandle_.write(payload.data(), payload.size());
                     fileHandle_.fsyncData();
@@ -854,84 +954,45 @@ namespace akkaradb::engine::manifest {
 
                 const bool baseExists = pathExists(path_);
                 if (!baseExists) { return; }
+                baseFileSeq_ = readFileHeader(path_).fileSeq;
 
-                std::vector<std::filesystem::path> files;
+                const auto files = manifestFiles();
 
-                if (baseExists) { files.push_back(path_); }
-                for (size_t i = 1; i < 10000; ++i) {
-                    auto p = existingManifestPath(i);
-                    if (!p.empty()) { files.push_back(std::move(p)); }
-                    else { break; }
+                for (size_t i = 0; i < files.size(); ++i) {
+                    replaySingleFile(files[i], static_cast<uint32_t>(baseFileSeq_ + i), repairTail && i + 1 == files.size());
                 }
-
-                for (size_t i = 0; i < files.size(); ++i) { replaySingleFile(files[i], repairTail && i + 1 == files.size()); }
             }
 
-            void replaySingleFile(const std::filesystem::path& filePath, bool repairTail) {
-                if (!pathExists(filePath)) { return; }
+            void replaySingleFile(const std::filesystem::path& filePath, uint32_t expectedFileSeq, bool repairTail) {
                 const auto file_size = pathFileSize(filePath);
-                if (file_size == 0) { return; }
+                const auto header = readFileHeader(filePath);
+                if (header.fileSeq != expectedFileSeq) { throw std::runtime_error("Manifest: inconsistent rotation sequence"); }
 
                 std::ifstream file(filePath, std::ios::binary);
                 if (!file) { throw std::runtime_error("Failed to open manifest for replay: " + filePath.string()); }
-
-                // --- Read and validate file header ---
-                {
-                    uint8_t hdrBuf[ManifestFileHeader::SIZE];
-                    file.read(reinterpret_cast<char*>(hdrBuf), ManifestFileHeader::SIZE);
-                    if (!file || file.gcount() < static_cast<std::streamsize>(ManifestFileHeader::SIZE)) {
-                        throw std::runtime_error("Manifest: truncated file header");
-                    }
-
-                    ManifestFileHeader fhdr{};
-                    // Deserialize manually (same field order as serialize)
-                    auto readU32 = [&](size_t off) -> uint32_t {
-                        return static_cast<uint32_t>(hdrBuf[off]) | (static_cast<uint32_t>(hdrBuf[off + 1]) << 8) | (static_cast<uint32_t>(
-                            hdrBuf[off + 2]) << 16) | (static_cast<uint32_t>(hdrBuf[off + 3]) << 24);
-                    };
-                    auto readU16 = [&](size_t off) -> uint16_t {
-                        return static_cast<uint16_t>(hdrBuf[off]) | (static_cast<uint16_t>(hdrBuf[off + 1]) << 8);
-                    };
-                    auto readU64 = [&](size_t off) -> uint64_t {
-                        uint64_t v = 0;
-                        for (int i = 7; i >= 0; --i) { v = (v << 8) | hdrBuf[off + i]; }
-                        return v;
-                    };
-
-                    fhdr.magic = readU32(0);
-                    fhdr.version = readU16(4);
-                    fhdr.flags = readU16(6);
-                    fhdr.fileSeq = readU32(8);
-                    fhdr.createdAtUs = readU64(12);
-                    fhdr.crc32c = readU32(20);
-                    std::memcpy(fhdr.reserved, hdrBuf + 24, 8);
-
-                    if (!fhdr.verifyMagic() || !fhdr.verifyVersion()) {
-                        throw std::runtime_error("Manifest: unsupported format; v1 is required (recreate the pre-release database)");
-                    }
-                    if (!fhdr.verifyChecksum()) { throw std::runtime_error("Manifest: corrupt file header"); }
-                }
+                file.seekg(ManifestFileHeader::SIZE);
 
                 uint64_t validEnd = ManifestFileHeader::SIZE;
                 // --- Read records ---
                 std::vector<uint8_t> payload; // reused across records - avoids per-record heap alloc
-                while (file) {
+                while (validEnd < file_size) {
+                    if (file_size - validEnd < ManifestRecordHeader::SIZE) { break; }
                     uint8_t rhdrBuf[ManifestRecordHeader::SIZE];
                     file.read(reinterpret_cast<char*>(rhdrBuf), ManifestRecordHeader::SIZE);
-                    if (!file || file.gcount() < static_cast<std::streamsize>(ManifestRecordHeader::SIZE)) { break; }
+                    if (!file) { throw std::runtime_error("Manifest: record header read failed"); }
 
                     const ManifestRecordHeader rhdr = ManifestRecordHeader::deserialize(rhdrBuf);
-                    if (!rhdr.verifyChecksum()) { break; }
-                    const auto position = static_cast<uint64_t>(file.tellg());
-                    if (position > file_size || rhdr.payloadLen > file_size - position) { break; }
+                    if (!rhdr.verifyChecksum()) { throw std::runtime_error("Manifest: corrupt record header"); }
+                    const auto position = validEnd + ManifestRecordHeader::SIZE;
+                    if (rhdr.payloadLen > file_size - position) { break; }
 
                     if (rhdr.payloadLen > 0) {
                         payload.resize(rhdr.payloadLen);
                         file.read(reinterpret_cast<char*>(payload.data()), rhdr.payloadLen);
-                        if (!file || file.gcount() < rhdr.payloadLen) { break; }
+                        if (!file) { throw std::runtime_error("Manifest: record payload read failed"); }
 
                         if (!rhdr.verifyPayload(payload.data(), rhdr.payloadLen)) {
-                            break; // CRC mismatch - stop replay
+                            throw std::runtime_error("Manifest: corrupt record payload");
                         }
 
                         applyEvent(static_cast<ManifestRecordType>(rhdr.type), payload.data(), rhdr.payloadLen);
@@ -941,8 +1002,8 @@ namespace akkaradb::engine::manifest {
                 }
                 if (validEnd != file_size) {
                     if (!repairTail) { throw std::runtime_error("Manifest: damaged record before the append boundary"); }
-                    // A crash can leave an incomplete final record. Retire it before
-                    // appending, otherwise every later valid record would be hidden.
+                    // Only a physically incomplete final record is repairable. A full
+                    // record with a bad CRC is corruption, even at the end of the log.
                     file.close();
                     std::filesystem::resize_file(filePath, validEnd);
                     auto repaired = FileHandle::open(filePath);
@@ -1117,6 +1178,7 @@ namespace akkaradb::engine::manifest {
             std::filesystem::path currentPath_;
             size_t currentFileSize_;
             size_t rotationCounter_;
+            uint32_t baseFileSeq_ = 0;
     };
 
     // ============================================================================
@@ -1202,6 +1264,8 @@ namespace akkaradb::engine::manifest {
     std::vector<Manifest::BlobPutEvent> Manifest::blobPuts() const { return impl_->blobPuts(); }
     std::vector<Manifest::BlobDeleteEvent> Manifest::blobDeletes() const { return impl_->blobDeletes(); }
     std::vector<Manifest::SSTBlobRefsEvent> Manifest::sstBlobRefs() const { return impl_->sstBlobRefs(); }
+
+    std::optional<std::vector<Manifest::SSTBlobRefsEvent::Entry>> Manifest::liveSstBlobRefs() const { return impl_->liveSstBlobRefs(); }
     std::vector<uint64_t> Manifest::sstReferencedBlobs() const { return impl_->sstReferencedBlobs(); }
     bool Manifest::sstBlobRefsComplete() const { return impl_->sstBlobRefsComplete(); }
 

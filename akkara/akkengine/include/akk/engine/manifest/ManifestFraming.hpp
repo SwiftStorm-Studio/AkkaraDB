@@ -72,7 +72,8 @@ namespace akkaradb::engine::manifest {
      * Design:
      * - magic: Format / corruption detection
      * - version: Forward-compatibility
-     * - fileSeq: Rotation counter (0 = base file, N = Nth rotated file)
+     * - fileSeq: Rotation counter. In the base file, the highest rotation
+     *   included in its compacted snapshot (initially 0); replay starts after it.
      * - createdAtUs: Microseconds since epoch
      * - crc32c: CRC32C of this header with crc32c field zeroed
      */

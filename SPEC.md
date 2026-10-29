@@ -93,7 +93,7 @@ Application
 | Data model | Binary key/value records with bytewise lexicographic key order |
 | Mutation identity | Every mutation receives a 64-bit sequence number |
 | Delete model | Deletes are tombstones that suppress older visible records |
-| Reads | MemTable first, then SST, with Blob dereference when needed |
+| Reads | Newest visible sequence across MemTable and SST, with Blob dereference when needed |
 | Persistence | WAL, SST, Manifest, Blob files, and VersionLog are configurable |
 | Integrity | Persisted structures use CRC32C and explicit magic/version fields |
 | Concurrency | Public `AkkEngine` operations are thread-safe |
@@ -801,17 +801,16 @@ consumers together. No compatibility reader or migration is provided.
 
 ### 8.1 Point Lookup
 
-Point reads search newest visible MemTable state first, then SST state:
+Point reads choose the newest visible retained version across MemTable and SST:
 
 1. Capture visibility snapshot.
 2. Search MemTable by key and snapshot.
-3. If MemTable returns a visible tombstone, report missing.
-4. If MemTable returns a normal or Blob record, materialize the public value.
-5. If MemTable misses, search retained SST records with the same snapshot upper
-   bound.
-6. If SST returns a tombstone, report missing.
-7. If SST returns a normal or Blob record, materialize the public value.
-8. If `runtime.sstPromoteReads` is enabled, copy the SST hit back into the
+3. Search retained SST records with the same snapshot upper bound when an SST
+   can contain a newer sequence, or when MemTable misses.
+4. Select the larger sequence, preferring MemTable only on a sequence tie.
+5. If the selected record is a tombstone, report missing; otherwise materialize
+   its normal or Blob value.
+6. If `runtime.sstPromoteReads` is enabled, copy the selected SST hit back into the
    MemTable with its original sequence and flags.
 
 `sstPromoteReads` is a cache/promotion optimization. It is not a new mutation
@@ -831,8 +830,8 @@ and must not alter snapshot semantics.
 
 `count(startKey, endKey)` and `scan(arena, startKey, endKey)` use one captured
 visibility snapshot. Empty start or end spans are unbounded. Scan merges
-MemTable and SST ordered iterators, gives a MemTable version precedence over an
-SST version of the same key, and suppresses tombstones.
+MemTable and SST ordered iterators, chooses the largest visible sequence for
+each key, and suppresses tombstones only after resolving both sources.
 
 With Cluster enabled these APIs return public keys across the configured data
 placement. PARTITIONED queries each data owner, filters physical replicas by
@@ -1182,6 +1181,14 @@ codec, stored size, and expected content CRC before returning a public value.
 `runBlobGc()` is a no-op when Blob is disabled. It throws when VersionLog is
 enabled because historical records may still reference older Blob ids.
 
+Orphan collection pins MemTable generations before capturing SST references.
+Manifest live-file membership and reference metadata are captured atomically;
+incomplete metadata falls back to an SST scan. The collector takes nonblocking
+mutation admission and writer locks so a newly created Blob cannot appear
+between reference capture and orphan scanning. A busy writer or flush drain
+causes that collection attempt to be skipped. Point reads pin Blob files until
+their selected value has been materialized.
+
 Blob externalization disables parallel write admission.
 
 ## 12. SST and Manifest
@@ -1241,6 +1248,10 @@ all inputs, so recovery either installs the whole replacement or preserves the
 old inputs and discards orphan outputs. Tombstones remain at the bottom level:
 a delayed lower-sequence flush must not resurrect a deleted key.
 
+SST publication synchronizes the temporary file before renaming it. Windows uses
+a write-through rename; POSIX synchronizes the parent directory and propagates
+synchronization failures before sealing or committing the output.
+
 Without an external Manifest, SSTManager owns the synchronous `sst-state.akmf`
 catalog inside `sstDir`, using the same atomic SST seal and compaction-commit
 protocol. This catalog is required even when the engine's general Manifest
@@ -1276,8 +1287,26 @@ uses a background flusher and provides lower-latency but weaker immediate
 manifest durability for other events. SST seal, compaction commit, and checkpoint
 calls synchronously drain preceding records and wait for durable storage, even
 when the batching worker has not been started.
+Rotation synchronizes the previous Manifest file before closing it, so one
+durability barrier also covers batches spanning multiple files.
 
 Manifest replay rebuilds the live/deleted SST sets and last checkpoint state.
+
+Manifest compaction synchronizes its replacement file before atomically replacing
+the base file, without deleting the previous base first. POSIX also synchronizes
+the parent directory; Windows uses a write-through replacement. The compacted
+base header retains the highest included rotation number. Replay ignores older
+rotations even if cleanup was interrupted, and subsequent rotations continue
+with larger numbers. These are the current Manifest v1 replay semantics.
+
+Only a physically incomplete final record (a partial record header, or a valid
+header whose payload extends past EOF) is truncated during recovery. A complete
+record with an invalid header or payload checksum is rejected without changing
+the log or cleaning up SST files. A missing base with remaining Manifest history
+is also rejected instead of being initialized as an empty catalog.
+Recovery enumerates the complete rotation chain and rejects a missing intermediate
+rotation before replay or SST cleanup. Rotations already covered by a compacted
+base remain obsolete and are ignored.
 
 ## 13. Version Log
 
@@ -4470,10 +4499,12 @@ header before allocating payload storage and bounds every payload by the
 remaining file length. An incomplete final record is retired before new appends;
 a malformed complete payload or a damaged earlier rotated file is rejected.
 
-The current layout defines Manifest v1 (`AMV1`). Earlier development layouts,
-including those that reused this identifier, are unsupported; no compatibility
-reader or migration is provided. Recreate databases written with those layouts
-using an external export/backup. SST and WAL layouts are unchanged.
+The current layout defines Manifest v1 (`AMV1`), with the base file's `fileSeq`
+identifying the highest rotation included in its compacted snapshot. Earlier
+development layouts, including prototypes that reused this identifier, are
+unsupported; no compatibility reader or migration is provided. Recreate
+databases written with those layouts using an external export/backup. SST and
+WAL layouts are unchanged.
 
 ### 24.7 VersionLog
 

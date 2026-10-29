@@ -1746,6 +1746,37 @@ namespace akkaradb::engine {
                 return shard;
             }
 
+            struct StoredPointRead {
+                std::optional<memtable::MemTable::PinnedRecord> memory;
+                std::optional<sst::SSTRecord> disk;
+
+                [[nodiscard]] explicit operator bool() const noexcept { return memory.has_value() || disk.has_value(); }
+                [[nodiscard]] core::RecordView view() const noexcept {
+                    if (memory) { return memory->view; }
+                    return {disk->key.data(), static_cast<uint16_t>(disk->key.size()), disk->value.data(),
+                        static_cast<uint16_t>(disk->value.size()), disk->seq, disk->flags, disk->keyFp64, disk->miniKey};
+                }
+            };
+
+            [[nodiscard]] StoredPointRead readStoredPoint(std::span<const uint8_t> key, uint64_t seq) const {
+                StoredPointRead result;
+                // Pin memory first: a flush publishes its SST before unpublishing memory.
+                result.memory = memtable->getPinned(key, seq);
+                if (sstManager && (!result.memory || sstManager->maxSequence() > result.memory->view.seq())) {
+                    result.disk = sstManager->get(key, seq);
+                }
+                if (result.memory && result.disk && result.memory->view.seq() >= result.disk->seq) { result.disk.reset(); }
+                if (result.disk) { result.memory.reset(); }
+                return result;
+            }
+
+            void promoteStoredPoint(const StoredPointRead& record) {
+                if (opts.runtime.sstPromoteReads && record.disk) {
+                    const auto view = record.view();
+                    memtable->put(view.key(), view.value(), view.seq(), view.flags(), view.keyFp64(), view.miniKey());
+                }
+            }
+
             [[nodiscard]] std::optional<std::vector<uint8_t>> getValueInternal(
                 std::span<const uint8_t> key,
                 bool countStats,
@@ -1758,36 +1789,17 @@ namespace akkaradb::engine {
                 throwIfBackgroundFailed();
                 if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
                 auto transactionRead = distributedReadAdmission(key, {}, true);
+                auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
-
-                if (auto pinned = memtable->getPinned(key, seq)) {
-                    const auto& view = pinned->view;
-                    if (view.isTombstone()) {
-                        getsMiss.fetch_add(1, std::memory_order_relaxed);
-                        return std::nullopt;
-                    }
+                const auto record = readStoredPoint(key, seq);
+                if (record && !record.view().isTombstone()) {
+                    promoteStoredPoint(record);
+                    const auto view = record.view();
                     auto value = resolveValue(view.flags(), view.value());
-                    if (value) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
+                    if (value) { (record.disk ? getsSstHit : getsMemtableHit).fetch_add(1, std::memory_order_relaxed); }
                     else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
                     return value;
-                }
-
-                if (sstManager) {
-                    auto record = sstManager->get(key, seq);
-                    if (record) {
-                        if (record->isTombstone()) {
-                            getsMiss.fetch_add(1, std::memory_order_relaxed);
-                            return std::nullopt;
-                        }
-                        if (opts.runtime.sstPromoteReads && memtable) {
-                            memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                        }
-                        auto value = resolveValue(record->flags, record->value);
-                        if (value) { getsSstHit.fetch_add(1, std::memory_order_relaxed); }
-                        else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
-                        return value;
-                    }
                 }
                 getsMiss.fetch_add(1, std::memory_order_relaxed);
                 return std::nullopt;
@@ -2405,7 +2417,7 @@ namespace akkaradb::engine {
                     const auto seq = snapshotSeq();
                     auto mt = memtable->iterator(range, seq);
                     sst::SSTManager::Iterator sst;
-                    if (sstManager) { sst = sstManager->scanIter({}, {}, seq); }
+                    if (sstManager) { sst = sstManager->scanIter({}, {}, seq, true); }
                     for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                         if (isStripeInternalKey(record.key) && record.key[4] == 'T') {
                             std::lock_guard stateLock{stripeStateMu};
@@ -2485,7 +2497,7 @@ namespace akkaradb::engine {
                     const uint64_t visibleSeq = snapshotSeq();
                     auto mt = memtable->iterator(range, visibleSeq);
                     sst::SSTManager::Iterator sst;
-                    if (sstManager) { sst = sstManager->scanIter(range.start, {}, visibleSeq); }
+                    if (sstManager) { sst = sstManager->scanIter(range.start, {}, visibleSeq, true); }
                     std::vector<uint8_t> lastMetadataKey;
                     uint32_t metadataKeysVisited = 0;
                     for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
@@ -2984,24 +2996,13 @@ namespace akkaradb::engine {
                 auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
-                if (const auto mt = memtable->getInto(key, seq, out); mt.has_value()) {
-                    if (*mt) { getsMemtableHit.fetch_add(1, std::memory_order_relaxed); }
-                    else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
-                    return *mt;
-                }
-                if (sstManager) {
-                    if (const auto sst = sstManager->getInto(key, out, seq); sst.has_value()) {
-                        if (*sst) {
-                            if (opts.runtime.sstPromoteReads) {
-                                if (auto record = sstManager->get(key, seq); record && !record->isTombstone()) {
-                                    memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                                }
-                            }
-                            getsSstHit.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        else { getsMiss.fetch_add(1, std::memory_order_relaxed); }
-                        return *sst;
-                    }
+                const auto record = readStoredPoint(key, seq);
+                if (record && !record.view().isTombstone()) {
+                    promoteStoredPoint(record);
+                    const auto value = record.view().value();
+                    out.assign(value.begin(), value.end());
+                    (record.disk ? getsSstHit : getsMemtableHit).fetch_add(1, std::memory_order_relaxed);
+                    return true;
                 }
                 getsMiss.fetch_add(1, std::memory_order_relaxed);
                 return false;
@@ -3026,31 +3027,12 @@ namespace akkaradb::engine {
                 auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
                 const uint64_t seq = snapshotSeq();
-                if (auto pinned = memtable->getPinned(key, seq)) {
-                    const auto& view = pinned->view;
-                    if (view.isTombstone()) {
-                        getsMiss.fetch_add(1, std::memory_order_relaxed);
-                        return false;
-                    }
-                    out = copySpanToArena(view.value(), arena);
-                    getsMemtableHit.fetch_add(1, std::memory_order_relaxed);
+                const auto record = readStoredPoint(key, seq);
+                if (record && !record.view().isTombstone()) {
+                    promoteStoredPoint(record);
+                    out = copySpanToArena(record.view().value(), arena);
+                    (record.disk ? getsSstHit : getsMemtableHit).fetch_add(1, std::memory_order_relaxed);
                     return true;
-                }
-
-                if (sstManager) {
-                    auto record = sstManager->get(key, seq);
-                    if (record) {
-                        if (record->isTombstone()) {
-                            getsMiss.fetch_add(1, std::memory_order_relaxed);
-                            return false;
-                        }
-                        if (opts.runtime.sstPromoteReads && memtable) {
-                            memtable->put(record->key, record->value, record->seq, record->flags, record->keyFp64, record->miniKey);
-                        }
-                        out = copySpanToArena(record->value, arena);
-                        getsSstHit.fetch_add(1, std::memory_order_relaxed);
-                        return true;
-                    }
                 }
                 getsMiss.fetch_add(1, std::memory_order_relaxed);
                 return false;
@@ -3214,57 +3196,24 @@ namespace akkaradb::engine {
                 if (seq >= latest.seq) { latest = LatestBlobReference{seq, blobId}; }
             }
 
-            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIdsByScan() const {
-                std::unordered_set<uint64_t> live;
-                if (!blobManager || !memtable) { return live; }
-
-                const uint64_t snapshotSeq = this->snapshotSeq();
+            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
+                // Pin memory before capturing SST state. A completed flush cannot
+                // disappear from both sources, and live-file refs are sampled atomically.
                 memtable::MemTable::KeyRange range;
-                auto mt = memtable->iterator(range, snapshotSeq);
-                sst::SSTManager::Iterator sstIt;
-                if (sstManager) { sstIt = sstManager->scanIter({}, {}, snapshotSeq); }
-
-                auto mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
-                auto sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
-
-                while (mtCur || sstCur) {
-                    const bool hasMt = mtCur.has_value();
-                    const bool hasSst = sstCur.has_value();
-                    const int cmp = (hasMt && hasSst) ? compareKey(mtCur->key(), sstCur->key) : (hasMt ? -1 : 1);
-
-                    if (cmp <= 0) {
-                        const auto record = *mtCur;
-                        if (!record.isTombstone()) {
-                            if (const auto blobId = decodeBlobIdIfReference(record.flags(), record.value())) { live.insert(*blobId); }
-                        }
-                        mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
-                        if (cmp == 0) { sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{}; }
-                    }
-                    else {
-                        const auto record = std::move(*sstCur);
-                        if (!record.isTombstone()) { if (const auto blobId = decodeBlobIdIfReference(record.flags, record.value)) { live.insert(*blobId); } }
-                        sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
-                    }
-                }
-
-                return live;
-            }
-
-            [[nodiscard]] std::optional<std::unordered_set<uint64_t>> collectReferencedBlobIdsFromManifest() const {
-                if (!blobManager || !memtable || !manifest || !manifest->sstBlobRefsComplete()) { return std::nullopt; }
-
-                std::unordered_set<std::string> liveSstFiles;
-                for (const auto& file : manifest->liveSst()) { liveSstFiles.insert(file); }
-
+                auto mt = memtable->pinnedIterator(range, [] { return UINT64_MAX; });
                 std::unordered_map<std::string, LatestBlobReference> latestByKey;
-                for (const auto& refs : manifest->sstBlobRefs()) {
-                    if (!liveSstFiles.contains(refs.file)) { continue; }
-                    for (const auto& entry : refs.entries) { recordLatestBlobReference(latestByKey, entry.key, entry.seq, entry.blobId); }
+                const auto refs = manifest ? manifest->liveSstBlobRefs() : std::nullopt;
+                if (refs) {
+                    for (const auto& entry : *refs) { recordLatestBlobReference(latestByKey, entry.key, entry.seq, entry.blobId); }
                 }
-
-                const uint64_t snapshotSeq = this->snapshotSeq();
-                memtable::MemTable::KeyRange range;
-                auto mt = memtable->iterator(range, snapshotSeq);
+                else if (sstManager) {
+                    auto sst = sstManager->scanIter({}, {}, UINT64_MAX, true);
+                    while (sst.hasNext()) {
+                        const auto record = sst.next();
+                        const auto blobId = record->isTombstone() ? std::nullopt : decodeBlobIdIfReference(record->flags, record->value);
+                        recordLatestBlobReference(latestByKey, record->key, record->seq, blobId);
+                    }
+                }
                 while (mt.hasNext()) {
                     const auto record = mt.next();
                     if (!record.has_value()) { continue; }
@@ -3278,15 +3227,17 @@ namespace akkaradb::engine {
                 return live;
             }
 
-            [[nodiscard]] std::unordered_set<uint64_t> collectReferencedBlobIds() const {
-                if (const auto manifestLive = collectReferencedBlobIdsFromManifest(); manifestLive.has_value()) { return *manifestLive; }
-                return collectReferencedBlobIdsByScan();
-            }
-
             void runBlobGcIfSafe() {
                 if (!canRunBlobGc()) { return; }
                 std::unique_lock planning{blobGcPlanMu, std::try_to_lock};
                 if (!planning.owns_lock() || !canRunBlobGc()) { return; }
+                std::unique_lock admission{mutationEpochMu, std::try_to_lock};
+                if (!admission.owns_lock()) { return; }
+                // Blob writers publish the file before its reference. Do not admit
+                // a new file between reference capture and the orphan directory scan.
+                // A flush callback must not wait for a writer that is draining it.
+                std::unique_lock writer{writeMu, std::try_to_lock};
+                if (!writer.owns_lock() || !canRunBlobGc()) { return; }
                 const auto live = collectReferencedBlobIds();
                 blobManager->scanOrphans([&live](uint64_t blobId) { return live.contains(blobId); });
             }
@@ -3935,7 +3886,7 @@ namespace akkaradb::engine {
                     const auto visible = snapshotSeq();
                     auto emptyMt = memtable->iterator(emptyRange, visible);
                     sst::SSTManager::Iterator emptySst;
-                    if (sstManager) { emptySst = sstManager->scanIter({}, {}, visible); }
+                    if (sstManager) { emptySst = sstManager->scanIter({}, {}, visible, true); }
                     bool hasOwnedKey = false;
                     for (const auto& record : scanGenerator(emptyArena, std::move(emptyMt), std::move(emptySst), blobManager.get())) {
                         if (inScope(record.key)) {
@@ -3963,7 +3914,7 @@ namespace akkaradb::engine {
                 }
                 auto mt = memtable->iterator(range, visibleSeq);
                 sst::SSTManager::Iterator sst;
-                if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
+                if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq, true); }
                 for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
                     if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
@@ -4013,7 +3964,7 @@ namespace akkaradb::engine {
                 memtable::MemTable::KeyRange applyRange;
                 auto applyMt = memtable->iterator(applyRange, visibleSeq);
                 sst::SSTManager::Iterator applySst;
-                if (sstManager) { applySst = sstManager->scanIter({}, {}, visibleSeq); }
+                if (sstManager) { applySst = sstManager->scanIter({}, {}, visibleSeq, true); }
                 for (const auto& record : scanGenerator(applyArena, std::move(applyMt), std::move(applySst), blobManager.get())) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
                     if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
@@ -5052,7 +5003,7 @@ namespace akkaradb::engine {
                     const uint64_t visibleSeq = snapshotSeq();
                     auto mt = memtable->iterator(range, visibleSeq);
                     sst::SSTManager::Iterator sst;
-                    if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq); }
+                    if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq, true); }
                     for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
                         auto publicKey = publicKeyFromStripeMetaKey(record.key);
                         if (!publicKey) { continue; }
@@ -5486,7 +5437,7 @@ namespace akkaradb::engine {
                     if (!mt) { return std::nullopt; }
                 }
                 sst::SSTManager::Iterator sst;
-                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, seq); }
+                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, seq, true); }
 
                 // Both paths own immutable sources. Memory-only snapshots retain
                 // in-memory generations and compact them after the final pin.
@@ -5792,7 +5743,7 @@ namespace akkaradb::engine {
                     if (!mt) { return std::nullopt; }
                 }
                 sst::SSTManager::Iterator sst;
-                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, visible); }
+                if (impl.sstManager) { sst = impl.sstManager->scanIter({}, {}, visible, true); }
                 struct MetadataSource {
                     memtable::MemTable::RangeIterator memtable;
                     sst::SSTManager::Iterator sst;
@@ -6246,9 +6197,8 @@ namespace akkaradb::engine {
             return child && child->exists(key);
         }
         const uint64_t seq = impl_->snapshotSeq();
-        if (const auto mt = impl_->memtable->contains(key, seq); mt.has_value()) { return *mt; }
-        if (impl_->sstManager) { if (const auto sst = impl_->sstManager->contains(key, seq); sst.has_value()) { return *sst; } }
-        return false;
+        const auto record = impl_->readStoredPoint(key, seq);
+        return record && !record.view().isTombstone();
     }
 
     bool AkkEngine::getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out) const {
@@ -6332,31 +6282,12 @@ namespace akkaradb::engine {
             return impl_->memtable->iterator(range, seq);
         }();
         sst::SSTManager::Iterator sstIt;
-        if (impl_->sstManager) { sstIt = impl_->sstManager->scanIter(startKey, endKey, seq); }
+        if (impl_->sstManager) { sstIt = impl_->sstManager->scanIter(startKey, endKey, seq, true); }
 
-        auto mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
-        auto sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
         size_t n = 0;
-
-        while (mtCur || sstCur) {
-            const bool hasMt = mtCur.has_value();
-            const bool hasSst = sstCur.has_value();
-            int cmp = 0;
-            if (hasMt && hasSst) { cmp = compareKey(mtCur->key(), sstCur->key); }
-            else { cmp = hasMt ? -1 : 1; }
-
-            bool tombstone = false;
-            if (cmp <= 0) {
-                tombstone = mtCur->isTombstone();
-                mtCur = mt.hasNext() ? mt.next() : std::optional<core::RecordView>{};
-                if (cmp == 0) { sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{}; }
-            }
-            else {
-                tombstone = sstCur->isTombstone();
-                sstCur = sstIt.hasNext() ? sstIt.next() : std::optional<sst::SSTRecord>{};
-            }
-
-            if (!tombstone) { ++n; }
+        for (const auto& record : storedScanGenerator(std::move(mt), std::move(sstIt))) {
+            (void)record;
+            ++n;
         }
 
         return n;
@@ -6434,7 +6365,7 @@ namespace akkaradb::engine {
             return impl_->memtable->iterator(range, seq);
         }();
         sst::SSTManager::Iterator st;
-        if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq); }
+        if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq, true); }
         return core::ArenaGenerator<ScanRecordView>::withArena(
             arena,
             [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation) ]() mutable {

@@ -190,9 +190,9 @@ namespace akkaradb::engine::manifest {
              * compaction in a single CRC-protected manifest record.
              *
              * This replaces the non-atomic (CompactionEnd + SSTDelete x N) pattern.
-             * During replay, either the full record is applied (all outputs added,
-             * all inputs removed) or it is absent (CRC mismatch from partial write),
-             * in which case the pre-compaction state is preserved exactly.
+             * Replay applies the full valid record (all outputs added, all inputs
+             * removed), or ignores a physically incomplete final record. Complete
+             * records with bad checksums reject recovery without changing the files.
              *
              * @param outputFiles  Filenames of new SST files written by the compaction.
              * @param inputFiles   Filenames of SST files consumed by the compaction.
@@ -234,8 +234,10 @@ namespace akkaradb::engine::manifest {
             void replay();
 
             /**
-             * Rewrites the current replay state into a fresh base manifest file
-             * and removes rotated manifest history.
+             * Atomically replaces the base with a synchronized snapshot of the
+             * current replay state, then removes covered rotated manifest history.
+             * The base header retains the highest included rotation number so
+             * interrupted cleanup cannot cause old records to be replayed again.
              *
              * The compacted file is encoded as ordinary manifest records, so no
              * separate snapshot record format is required. Public write methods
@@ -283,6 +285,8 @@ namespace akkaradb::engine::manifest {
 
             /** Returns all SST blob-reference events in replay order. */
             [[nodiscard]] std::vector<SSTBlobRefsEvent> sstBlobRefs() const;
+            // One consistent live-file/reference snapshot; nullopt means a live SST lacks metadata.
+            [[nodiscard]] std::optional<std::vector<SSTBlobRefsEvent::Entry>> liveSstBlobRefs() const;
 
             /** Returns unique blob ids referenced by latest versions in currently live SST files. */
             [[nodiscard]] std::vector<uint64_t> sstReferencedBlobs() const;

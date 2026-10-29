@@ -99,7 +99,7 @@ FixedQuerySource captureQuerySource(std::span<const uint8_t> start, std::span<co
                 opts.cluster.runtime.queryMaxPinnedBytes, opts.cluster.runtime.queryMaxPinnedSnapshots); }
             if (mt) {
                 sst::SSTManager::Iterator st;
-                if (sstManager) { st = sstManager->scanIter(start, end, seq); }
+                if (sstManager) { st = sstManager->scanIter(start, end, seq, true); }
                 auto blobPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 if (stamps) {
                     stamps->push_back({std::move(child), storage, seq, memtable->lastSeq(),

@@ -12,6 +12,7 @@
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/engine/manifest/Manifest.hpp"
+#include "akk/engine/memtable/SkipListMemTable.hpp"
 #include "akk/engine/wal/WalWriter.hpp"
 
 #include "TestErrorHandlers.hpp"
@@ -20,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -1187,11 +1189,16 @@ namespace {
         database->close();
         fs::remove_all(dir, ec);
     }
+    #include "detail/sst_integrity_regressions.inc"
 }
 
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
     try {
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-integrity") {
+            runSstIntegrityRegressions();
+            return 0;
+        }
         if (argc == 3 && std::string{argv[1]} == "--crash-writer") { return runCrashWriter(fs::path{argv[2]}); }
         if (argc == 3 && std::string{argv[1]} == "--parallel-wal-crash-writer") { return runParallelWalCrashWriter(fs::path{argv[2]}); }
         if (argc == 4 && std::string{argv[1]} == "--partial-shard-crash-writer") { return runPartialShardCrashWriter(argv[2], fs::path{argv[3]}); }
@@ -1206,6 +1213,7 @@ int main(int argc, char** argv) {
         runManifestCheckpointIntegrityRejectsMissingSstTest();
         runManifestStatsExposeRecoveryMetadataTest();
         runManifestStatsExposeBlobLifecycleTest();
+        runSstIntegrityRegressions();
         runParallelWalMatrixRecoveryTest(fs::absolute(fs::path{argv[0]}));
         runParallelWalSstCorrectnessTest();
         runPartialShardCrashRecoveryTests(fs::absolute(fs::path{argv[0]}));

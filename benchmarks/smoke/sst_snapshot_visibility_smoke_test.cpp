@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -36,6 +37,10 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace {
     void require(bool condition, const char* message) {
@@ -908,16 +913,212 @@ namespace {
                 manager->shutdown(); manager.reset(); manifest->close();
             }
         }
-        auto unsupported = mf::ManifestFileHeader::build(0); unsupported.version = 2; unsupported.crc32c = 0;
-        uint8_t bytes[mf::ManifestFileHeader::SIZE]; unsupported.serialize(bytes);
-        unsupported.crc32c = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), sizeof(bytes)); unsupported.serialize(bytes);
-        const auto unsupportedPath = root / "unsupported.akmf";
-        { std::ofstream out(unsupportedPath, std::ios::binary); out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes)); }
-        bool rejected = false;
-        try { (void)mf::Manifest::create(unsupportedPath); } catch (const std::runtime_error&) { rejected = true; }
-        require(rejected, "unsupported Manifest version must be explicitly rejected");
-        require(fs::file_size(unsupportedPath) == sizeof(bytes), "rejecting an unsupported version must not modify existing data");
+        for (const uint16_t version : {0, 2}) {
+            auto unsupported = mf::ManifestFileHeader::build(0); unsupported.version = version; unsupported.crc32c = 0;
+            if (version == 2) { unsupported.magic = 0x32564D41; }
+            uint8_t bytes[mf::ManifestFileHeader::SIZE]; unsupported.serialize(bytes);
+            unsupported.crc32c = akkaradb::cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), sizeof(bytes)); unsupported.serialize(bytes);
+            const auto unsupportedPath = root / ("unsupported-" + std::to_string(version) + ".akmf");
+            { std::ofstream out(unsupportedPath, std::ios::binary); out.write(reinterpret_cast<const char*>(bytes), sizeof(bytes)); }
+            bool rejected = false;
+            try { (void)mf::Manifest::create(unsupportedPath); } catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "unsupported Manifest version must be explicitly rejected");
+            std::ifstream unchanged(unsupportedPath, std::ios::binary);
+            const std::vector<uint8_t> actual{std::istreambuf_iterator<char>{unchanged}, std::istreambuf_iterator<char>{}};
+            require(actual == std::vector<uint8_t>(bytes, bytes + sizeof(bytes)), "rejecting an unsupported version must not modify existing data");
+        }
         fs::remove_all(root, ec);
+    }
+
+    std::vector<uint8_t> readFileBytes(const std::filesystem::path& path) {
+        std::ifstream file(path, std::ios::binary);
+        require(static_cast<bool>(file), "cannot read regression fixture");
+        return {std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    }
+
+    void writeManifestRotation(const std::filesystem::path& base, uint32_t sequence, uint64_t stripes) {
+        namespace mf = akkaradb::engine::manifest;
+        const auto path = base.parent_path() / (base.stem().string() + "-" + std::to_string(sequence) + base.extension().string());
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        uint8_t fileHeader[mf::ManifestFileHeader::SIZE];
+        mf::ManifestFileHeader::build(sequence).serialize(fileHeader);
+        out.write(reinterpret_cast<const char*>(fileHeader), sizeof(fileHeader));
+        const auto append = [&](mf::ManifestRecordType type, const std::vector<uint8_t>& payload) {
+            uint8_t header[mf::ManifestRecordHeader::SIZE];
+            mf::ManifestRecordHeader::build(type, payload.data(), static_cast<uint32_t>(payload.size())).serialize(header);
+            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+        };
+        append(mf::ManifestRecordType::CHECKPOINT, mf::encodeCheckpoint(1, "rotated", std::nullopt, 20));
+        append(mf::ManifestRecordType::STRIPE_COMMIT, mf::encodeStripeCommit(1, stripes));
+        out.close();
+        require(static_cast<bool>(out), "cannot write rotated Manifest fixture");
+    }
+
+    int runManifestCompactCrashChild(const std::string& mode, const std::string& point, const std::filesystem::path& dir) {
+        namespace mf = akkaradb::engine::manifest; namespace sst = akkaradb::engine::sst;
+        const auto path = dir / (mode == "standalone" ? "sst-state.akmf" : "external.akmf");
+        std::unique_ptr<mf::Manifest> manifest;
+        if (mode != "standalone") { manifest = mf::Manifest::create(path, mode == "fast"); }
+        sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+        const std::vector<uint8_t> a{'a'}, b{'b'}, value{'v'};
+        auto manager = sst::SSTManager::create(dir, options, manifest.get());
+        const std::vector rows{record(a, value, 10), record(b, value, 20)};
+        manager->flush(rows); manager->shutdown(); manager.reset();
+        if (manifest) { manifest->close(); manifest.reset(); }
+        writeManifestRotation(path, 1, 1);
+        writeManifestRotation(path, 2, 2);
+        manifest = mf::Manifest::create(path, mode == "fast"); manifest->start();
+        setSstCrashPoint(point);
+        manifest->compact();
+        throw std::runtime_error("Manifest child missed the requested crash boundary");
+    }
+
+    void testManifestCompactCrashRecovery(const std::filesystem::path& executable) {
+        namespace fs = std::filesystem; namespace mf = akkaradb::engine::manifest; namespace sst = akkaradb::engine::sst;
+        const auto root = fs::current_path() / ".bench-tmp" / "manifest_compact_crashes";
+        std::error_code ec; fs::remove_all(root, ec);
+        const std::vector<uint8_t> a{'a'}, b{'b'}, value{'v'};
+        for (const std::string mode : {"standalone", "sync", "fast"}) {
+            for (const std::string point : {"manifest.compact.after_tmp_sync", "manifest.compact.after_replace",
+                "manifest.compact.after_directory_sync", "manifest.compact.after_first_rotation_delete"}) {
+                const auto dir = root / (mode + "-" + point); fs::create_directories(dir);
+                const auto path = dir / (mode == "standalone" ? "sst-state.akmf" : "external.akmf");
+                const std::string args = "\"" + executable.string() + "\" --manifest-compact-crash-child " + mode + " " + point + " \"" + dir.string() + "\"";
+#ifdef _WIN32
+                const int status = std::system(("\"" + args + "\"").c_str());
+                require(status == 86, "Manifest child did not stop at its crash boundary");
+#else
+                const int status = std::system(args.c_str());
+                require(status == (86 << 8), "Manifest child did not stop at its crash boundary");
+#endif
+                require(fs::exists(path), "Manifest replacement left the base absent");
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::unique_ptr<mf::Manifest> manifest;
+                    if (mode != "standalone") { manifest = mf::Manifest::create(path, mode == "fast"); manifest->start(); }
+                    sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+                    auto manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
+                    verifySelectedVersion(*manager, a, UINT64_MAX, 10, false, value);
+                    verifySelectedVersion(*manager, b, UINT64_MAX, 20, false, value);
+                    manager->shutdown(); manager.reset();
+                    if (manifest) { manifest->close(); manifest.reset(); }
+                    manifest = mf::Manifest::create(path);
+                    require(manifest->lastCheckpoint() && manifest->lastCheckpoint()->lastSeq == 20, "Manifest compaction lost the recovery checkpoint");
+                    require(manifest->stripesWritten() == (pass == 0 ? 2u : 8u), "Manifest replay selected obsolete rotation state");
+                    manifest->compact();
+                    manifest->advance(pass == 0 ? 7u : 9u);
+                    manifest->close(); manifest.reset();
+                    if (pass == 0) { writeManifestRotation(path, 3, 8); }
+                }
+                auto final = mf::Manifest::create(path);
+                require(final->stripesWritten() == 9, "appends after Manifest replacement did not survive reopen");
+                final->close();
+            }
+        }
+        fs::remove_all(root, ec);
+    }
+
+    void testManifestCorruptionPreservesSsts() {
+        namespace fs = std::filesystem; namespace mf = akkaradb::engine::manifest; namespace sst = akkaradb::engine::sst;
+        const auto root = fs::current_path() / ".bench-tmp" / "manifest_corruption_preserves_ssts";
+        std::error_code ec; fs::remove_all(root, ec);
+        const std::vector<uint8_t> value{'v'};
+        const std::vector<std::vector<uint8_t>> keys{{'a'}, {'b'}, {'c'}};
+        for (const std::string mode : {"standalone", "sync", "fast"}) {
+            for (const bool headerCorruption : {false, true}) {
+                for (const size_t recordIndex : {0u, 2u, 5u}) {
+                    const auto dir = root / (mode + (headerCorruption ? "-header-" : "-payload-") + std::to_string(recordIndex));
+                    fs::create_directories(dir);
+                    const auto path = dir / (mode == "standalone" ? "sst-state.akmf" : "external.akmf");
+                    std::unique_ptr<mf::Manifest> manifest;
+                    if (mode != "standalone") { manifest = mf::Manifest::create(path, mode == "fast"); }
+                    sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+                    auto manager = sst::SSTManager::create(dir, options, manifest.get());
+                    for (size_t i = 0; i < keys.size(); ++i) {
+                        const std::vector rows{record(keys[i], value, i + 1)}; manager->flush(rows);
+                    }
+                    manager->shutdown(); manager.reset();
+                    if (manifest) { manifest->close(); manifest.reset(); }
+                    std::vector<std::vector<uint8_t>> ssts;
+                    for (size_t i = 1; i <= keys.size(); ++i) { ssts.push_back(readFileBytes(dir / ("L0_" + std::to_string(i) + ".aksst"))); }
+                    const auto bytes = readFileBytes(path);
+                    size_t offset = mf::ManifestFileHeader::SIZE;
+                    for (size_t i = 0; i < recordIndex; ++i) {
+                        const auto header = mf::ManifestRecordHeader::deserialize(bytes.data() + offset);
+                        offset += mf::ManifestRecordHeader::SIZE + header.payloadLen;
+                    }
+                    flipFileByte(path, offset + (headerCorruption ? 12 : mf::ManifestRecordHeader::SIZE));
+                    const auto corruptBytes = readFileBytes(path);
+                    for (int pass = 0; pass < 2; ++pass) {
+                        bool rejected = false;
+                        try {
+                            if (mode != "standalone") { manifest = mf::Manifest::create(path, mode == "fast"); }
+                            manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
+                        }
+                        catch (const std::runtime_error&) { rejected = true; }
+                        require(rejected, "complete corrupt Manifest record must reject recovery");
+                        require(readFileBytes(path) == corruptBytes, "corruption rejection modified the Manifest");
+                        for (size_t i = 1; i <= keys.size(); ++i) {
+                            require(readFileBytes(dir / ("L0_" + std::to_string(i) + ".aksst")) == ssts[i - 1], "corruption rejection removed or changed a valid SST");
+                        }
+                    }
+                }
+            }
+        }
+        fs::remove_all(root, ec);
+    }
+
+    void testManifestIncompleteTailRepair() {
+        namespace fs = std::filesystem; namespace mf = akkaradb::engine::manifest;
+        const auto dir = fs::current_path() / ".bench-tmp" / "manifest_incomplete_tail";
+        std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+        const auto source = dir / "source.akmf";
+        auto manifest = mf::Manifest::create(source);
+        manifest->sstSeal(0, "retained.aksst", 1, std::nullopt, std::nullopt);
+        const auto boundary = fs::file_size(source);
+        manifest->checkpoint("incomplete", std::nullopt, 42);
+        manifest->close(); manifest.reset();
+        const auto size = fs::file_size(source);
+        for (uint64_t cut = boundary + 1; cut < size; ++cut) {
+            const auto path = dir / ("cut-" + std::to_string(cut) + ".akmf");
+            fs::copy_file(source, path); fs::resize_file(path, cut);
+            manifest = mf::Manifest::create(path);
+            require(manifest->liveSst() == std::vector<std::string>{"retained.aksst"} && !manifest->lastCheckpoint(), "tail repair lost the complete prefix");
+            require(fs::file_size(path) == boundary, "incomplete tail was not removed at a record boundary");
+            manifest->checkpoint("repaired", std::nullopt, 43); manifest->close(); manifest.reset();
+            manifest = mf::Manifest::create(path);
+            require(manifest->lastCheckpoint() && manifest->lastCheckpoint()->lastSeq == 43, "appends after tail repair did not survive reopen");
+            manifest->close(); manifest.reset();
+        }
+        const auto missing = dir / "missing.akmf";
+        fs::copy_file(source, dir / "missing.akmf.compact.tmp");
+        bool rejected = false;
+        try { (void)mf::Manifest::create(missing); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && !fs::exists(missing), "missing base with interrupted compaction must not create an empty catalog");
+        fs::remove_all(dir, ec);
+    }
+
+    void testManifestReplacementFailure() {
+#ifdef _WIN32
+        namespace fs = std::filesystem; namespace mf = akkaradb::engine::manifest;
+        const auto dir = fs::current_path() / ".bench-tmp" / "manifest_replacement_failure";
+        std::error_code ec; fs::remove_all(dir, ec); fs::create_directories(dir);
+        const auto path = dir / "manifest.akmf";
+        auto manifest = mf::Manifest::create(path);
+        manifest->sstSeal(0, "retained.aksst", 1, std::nullopt, std::nullopt);
+        const auto before = readFileBytes(path);
+        HANDLE blocker = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(blocker != INVALID_HANDLE_VALUE, "cannot hold the Manifest replacement fixture open");
+        bool rejected = false;
+        try { manifest->compact(); } catch (const std::runtime_error&) { rejected = true; }
+        ::CloseHandle(blocker);
+        require(rejected && readFileBytes(path) == before, "failed replacement changed the original Manifest");
+        manifest->checkpoint("after-failure", std::nullopt, 44); manifest->close(); manifest.reset();
+        manifest = mf::Manifest::create(path);
+        require(manifest->liveSst() == std::vector<std::string>{"retained.aksst"} && manifest->lastCheckpoint()->lastSeq == 44,
+            "Manifest could not continue after a failed replacement");
+        manifest->close(); manifest.reset(); fs::remove_all(dir, ec);
+#endif
     }
 
     void testSstCorruptionDetection() {
@@ -972,14 +1173,22 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    #include "detail/sst_durability_regressions.inc"
 }
 
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     try {
+        if (argc == 3 && std::string_view{argv[1]} == "--manifest-rotation-sync-child") {
+            runManifestRotationSyncChild(std::filesystem::path{argv[2]}, true);
+            throw std::runtime_error("rotation child did not reach the sync boundary");
+        }
         if (argc == 5 && std::string{argv[1]} == "--sst-lifecycle-crash-child") {
             return runSstLifecycleCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
+        }
+        if (argc == 5 && std::string{argv[1]} == "--manifest-compact-crash-child") {
+            return runManifestCompactCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
         }
         require(argc == 1, "unexpected SST test command line");
         testVersionsWithinOneSst();
@@ -1060,6 +1269,14 @@ int main(int argc, char** argv) {
         testManifestV1LargeRecords();
         testLargeSstCompactionRoundTrip();
         testManifestV1LongKeysAndVersionRejection();
+        testManifestCorruptionPreservesSsts();
+        testManifestIncompleteTailRepair();
+        testManifestReplacementFailure();
+        testManifestCompactCrashRecovery(fs::absolute(fs::path{argv[0]}));
+        testManifestRotationGaps();
+        testManifestRotationSync(fs::absolute(fs::path{argv[0]}));
+        testSstRenameFailure();
+        testLiveSstBlobSnapshot();
         return 0;
     }
     catch (const std::exception& ex) {
