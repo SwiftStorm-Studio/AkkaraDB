@@ -29,6 +29,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "akk/core/record/RecordView.hpp"
@@ -44,6 +45,7 @@ namespace akkaradb::engine::sst {
     class AKDB_API SSTManager {
         private:
             class Impl;
+            struct ReadState;
 
         public:
             struct Options {
@@ -81,6 +83,18 @@ namespace akkaradb::engine::sst {
                 uint64_t compactionFailures = 0;
             };
 
+            class AKDB_API ReadSnapshot {
+                public:
+                    ReadSnapshot() = default;
+                    [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
+                    [[nodiscard]] uint64_t maxSequence() const noexcept;
+
+                private:
+                    friend class Impl;
+                    explicit ReadSnapshot(std::shared_ptr<const ReadState> state) : state_{std::move(state)} {}
+                    std::shared_ptr<const ReadState> state_;
+            };
+
             class AKDB_API Iterator {
                 public:
                     Iterator();
@@ -104,9 +118,12 @@ namespace akkaradb::engine::sst {
 
             // Without an external Manifest, sstDir/sst-state.akmf owns the durable
             // live-file catalog. Its state must be retained with the SST directory.
+            // Retain sst-catalog.akid with either kind of catalog; mismatched
+            // catalog identities are rejected before SST cleanup.
+            // Exclusively owns sstDir until destruction; duplicate owners fail
+            // before catalog recovery, temporary writes or orphan cleanup.
             [[nodiscard]] static std::unique_ptr<SSTManager> create(
-                std::filesystem::path sstDir,
-                Options options,
+                std::filesystem::path sstDir, const Options& options,
                 manifest::Manifest* manifest = nullptr
             );
 
@@ -118,8 +135,12 @@ namespace akkaradb::engine::sst {
             void recover();
             void shutdown();
             uint64_t flush(std::span<const core::RecordView> records);
+            // The estimate is only a sizing hint, including zero. An empty stream returns zero without writing an SST.
             uint64_t flush(size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records);
             void throwIfBackgroundFailed() const;
+
+            // Keeps the current file set readable across flushes and compaction.
+            [[nodiscard]] ReadSnapshot readSnapshot() const;
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq = UINT64_MAX) const;

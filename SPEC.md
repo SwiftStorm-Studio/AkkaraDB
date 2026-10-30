@@ -1080,6 +1080,17 @@ materialization vector. SST writing still retains format metadata such as block
 index, key arena, Bloom filter bits, and Manifest blob-reference entries until
 the file is sealed.
 
+The streaming record count is a sizing hint, including zero; it never determines
+whether records are written. SSTManager consumes every yielded record once and
+returns its actual maximum sequence. An empty stream returns zero without
+creating an SST or temporary file, regardless of the estimate. Generator errors
+propagate without publishing a partial SST.
+
+Streaming key/value buffers need only remain valid until the generator is
+resumed. SSTWriter compares each key against its owned last-key metadata, so
+the producer may reuse or release earlier buffers without affecting sort
+validation or stored records.
+
 `forceFlush()` schedules all shards and waits for flush workers to drain.
 Asynchronous flush failure poisons later engine work and is rethrown by
 `forceFlush()` / public operation boundaries.
@@ -1189,6 +1200,10 @@ between reference capture and orphan scanning. A busy writer or flush drain
 causes that collection attempt to be skipped. Point reads pin Blob files until
 their selected value has been materialized.
 
+Local scans acquire a Blob read lease before capturing MemTable/SST sources.
+The lease protects an unstarted or suspended cursor and is released when the
+scan completes, throws, or is destroyed, so already queued GC can then resume.
+
 Blob externalization disables parallel write admission.
 
 ## 12. SST and Manifest
@@ -1228,6 +1243,13 @@ may span data blocks. Point reads select the largest sequence at or below the
 snapshot across all such records. The low-level `SSTReader::scan` yields every
 visible physical version; SSTManager scans merge these into one version per key.
 
+Engine point reads pin their MemTable source generations before capturing an
+`SSTManager::ReadSnapshot` and sampling visibility, then perform the lookup against
+those retained sources. Flush and compaction can complete during the lookup
+without removing its readable SST versions. Local `getBatch` retains the same
+source set and visibility sequence for the whole batch. These source pins do not
+exclude ordinary writers or extend the MemTable backend's version-retention policy.
+
 ### 12.2 Flush and Compaction
 
 MemTable flush writes sorted records to an L0 SST. A recovery checkpoint advances
@@ -1252,6 +1274,14 @@ SST publication synchronizes the temporary file before renaming it. Windows uses
 a write-through rename; POSIX synchronizes the parent directory and propagates
 synchronization failures before sealing or committing the output.
 
+Each SST directory has one owner, enforced by an OS-held `.sst.lock` companion
+file before catalog recovery or file publication. A Manifest also holds its
+`.lock-<filename>` companion before replay, retaining ownership across rotation
+and atomic replacement until `close()`. Duplicate opens fail, including from the
+same process or through a directory alias. Process exit releases the OS locks;
+the companion files stay in place and must not be removed while an owner is
+running. These files add no persisted data format or migration requirement.
+
 Without an external Manifest, SSTManager owns the synchronous `sst-state.akmf`
 catalog inside `sstDir`, using the same atomic SST seal and compaction-commit
 protocol. This catalog is required even when the engine's general Manifest
@@ -1259,6 +1289,24 @@ component is disabled. Preserve it together with the SST files. Existing SST
 directories without the catalog, and switching an existing private-catalog
 directory to an external Manifest, are rejected before SST cleanup; no import
 or migration of untracked files is provided.
+
+`sstDir/sst-catalog.akid` binds the directory to its catalog before the first
+SST is published. Its 28-byte `AKSC` v1 record contains the catalog identity and
+a CRC32C. Retain this file with the SST directory and Manifest. A different or
+recreated catalog, even at the same path, is rejected before cleanup. Existing
+databases without a binding acquire one after their complete catalog-live SST
+set is validated; an empty unbound catalog cannot claim existing SST files.
+The identity uses the base Manifest header's creation timestamp and eight
+identity bytes in its reserved area (randomized for new catalogs), preserved
+through rotations and Manifest compaction. SST and Manifest v1 layouts and
+existing record encodings remain unchanged.
+
+A Manifest write or synchronization failure fences subsequent writes, replay
+and Manifest compaction until reopen. SST compaction records its failure and
+stops retrying that work; subsequent flushes report the background failure.
+Reopen resolves whether the original commit was complete before new work can
+replace its inputs. Explicit Manifest close reports the stored error after
+closing its file; destruction does not throw.
 
 Recovery rejects a catalog-live SST whose level is outside the configured
 `maxLevels`, before deleting abandoned files or publishing recovered state.

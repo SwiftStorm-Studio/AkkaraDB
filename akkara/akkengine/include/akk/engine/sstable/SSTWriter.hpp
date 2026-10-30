@@ -75,6 +75,7 @@ namespace akkaradb::engine::sst {
                 std::span<const core::RecordView> records,
                 const Options& options
             );
+            // Yielded key/value buffers need only remain valid until the generator resumes.
             [[nodiscard]] static Result write(
                 const std::filesystem::path& path,
                 size_t estimatedRecordCount,

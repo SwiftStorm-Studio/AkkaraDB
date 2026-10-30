@@ -81,6 +81,166 @@ namespace {
         (void)akkaradb::engine::sst::SSTWriter::write(path, records, options);
     }
 
+    akkaradb::core::ArenaGenerator<akkaradb::core::RecordView> streamingFixture(
+        std::vector<akkaradb::engine::sst::SSTRecord> rows,
+        size_t& produced,
+        size_t failAfter = SIZE_MAX
+    ) {
+        if (failAfter == 0) { throw std::runtime_error("stream fixture failure"); }
+        for (const auto& row : rows) {
+            if (produced == failAfter) { throw std::runtime_error("stream fixture failure"); }
+            ++produced;
+            co_yield record(row.key, row.value, row.seq, row.flags);
+        }
+    }
+
+    void testStreamingFlushEstimates() {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst-streaming-estimates";
+        std::error_code ec; fs::remove_all(root, ec);
+        const std::vector<sst::SSTRecord> rows{
+            {.key = {'a'}, .value = std::vector<uint8_t>(3000, 'v'), .seq = 7},
+            {.key = {'b'}, .value = {}, .seq = 2},
+            {.key = {'c'}, .value = {}, .seq = 5, .flags = sst::SST_RECORD_FLAG_TOMBSTONE}
+        };
+        for (const auto codec : {sst::SSTWriter::Codec::NONE, sst::SSTWriter::Codec::ZSTD}) {
+            for (const size_t estimate : {size_t{0}, size_t{1}, size_t{32}}) {
+                const auto dir = root / (std::to_string(static_cast<int>(codec)) + "-" + std::to_string(estimate));
+                sst::SSTManager::Options opts; opts.compactionMode = sst::SSTCompactionMode::DISABLED; opts.codec = codec;
+                auto manager = sst::SSTManager::create(dir, opts);
+                size_t produced = 0;
+                require(manager->flush(estimate, streamingFixture(rows, produced)) == 7, "streaming flush must return the actual maximum sequence regardless of estimate");
+                require(produced == rows.size(), "streaming flush skipped input or consumed it more than once");
+                const auto verify = [&] {
+                    require(manager->maxSequence() == 7 && manager->levelStats()[0].fileCount == 1, "streaming flush did not publish exactly one SST");
+                    for (const auto& expected : rows) {
+                        const auto actual = manager->get(expected.key);
+                        require(actual && actual->key == expected.key && actual->value == expected.value && actual->seq == expected.seq && actual->flags == expected.flags,
+                            "streaming flush changed or lost a record");
+                    }
+                    auto scan = manager->scanIter({}, {}, UINT64_MAX, true);
+                    for (const auto& expected : rows) {
+                        const auto actual = scan.next();
+                        require(actual && actual->key == expected.key && actual->seq == expected.seq, "streaming flush scan skipped its first or subsequent record");
+                    }
+                    require(!scan.hasNext(), "streaming flush duplicated records");
+                };
+                verify(); manager.reset();
+                manager = sst::SSTManager::create(dir, opts); manager->recover(); verify(); manager.reset();
+            }
+        }
+        {
+            const auto dir = root / "empty";
+            sst::SSTManager::Options opts; opts.compactionMode = sst::SSTCompactionMode::DISABLED;
+            auto manager = sst::SSTManager::create(dir, opts);
+            for (const size_t estimate : {size_t{0}, size_t{8}}) {
+                size_t produced = 0;
+                require(manager->flush(estimate, streamingFixture({}, produced)) == 0 && produced == 0, "empty stream must be a no-op regardless of estimate");
+                require(manager->flush(estimate, {}) == 0, "default-constructed generator must be an empty stream");
+            }
+            require(manager->maxSequence() == 0 && manager->levelStats()[0].fileCount == 0, "empty stream published SST state");
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                require(entry.path().extension() != ".aksst" && entry.path().extension() != ".tmp", "empty stream created an SST or temporary file");
+            }
+            for (const size_t failAfter : {size_t{0}, size_t{1}}) {
+                size_t produced = 0; bool rejected = false;
+                try { manager->flush(0, streamingFixture(rows, produced, failAfter)); }
+                catch (const std::runtime_error&) { rejected = true; }
+                require(rejected && produced == failAfter && manager->levelStats()[0].fileCount == 0, "streaming failure was swallowed or published partial data");
+            }
+            manager.reset(); manager = sst::SSTManager::create(dir, opts); manager->recover();
+            require(!manager->scanIter().hasNext(), "failed streaming flush became live after recovery");
+        }
+        fs::remove_all(root, ec);
+    }
+
+    akkaradb::core::ArenaGenerator<akkaradb::core::RecordView> transientStreamingFixture(
+        std::span<const akkaradb::engine::sst::SSTRecord> rows,
+        bool reuseBuffers
+    ) {
+        std::vector<uint8_t> key, value;
+        for (const auto& row : rows) {
+            if (reuseBuffers) {
+                key.assign(row.key.begin(), row.key.end());
+                value.assign(row.value.begin(), row.value.end());
+                co_yield record(key, value, row.seq, row.flags);
+            }
+            else {
+                // These buffers cease to exist as soon as the consumer advances.
+                const auto transientKey = row.key;
+                const auto transientValue = row.value;
+                co_yield record(transientKey, transientValue, row.seq, row.flags);
+            }
+        }
+    }
+
+    void testStreamingRecordLifetime() {
+        namespace fs = std::filesystem; namespace sst = akkaradb::engine::sst;
+        const auto root = fs::current_path() / ".bench-tmp" / "sst-streaming-record-lifetime";
+        std::error_code ec; fs::remove_all(root, ec);
+        const std::vector<uint8_t> first{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'a', 'a'};
+        const std::vector<uint8_t> second{'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'b'};
+        auto binary = second; binary.push_back(0);
+        std::vector<uint8_t> longFirst(6000, 'z'); longFirst.push_back('a');
+        std::vector<uint8_t> longLast(6000, 'z'); longLast.back() = '{';
+        const std::vector<sst::SSTRecord> rows{
+            {.key = {}, .value = {}, .seq = 1},
+            {.key = {'a'}, .value = {'s'}, .seq = 2},
+            {.key = first, .value = std::vector<uint8_t>(3000, 'a'), .seq = 4},
+            {.key = second, .value = std::vector<uint8_t>(3000, 'b'), .seq = 7},
+            {.key = second, .value = {'d'}, .seq = 3},
+            {.key = binary, .value = {}, .seq = 5, .flags = sst::SST_RECORD_FLAG_TOMBSTONE},
+            {.key = longFirst, .value = {'l'}, .seq = 6},
+            {.key = longLast, .value = {'m'}, .seq = 8}
+        };
+        for (const auto codec : {sst::SSTWriter::Codec::NONE, sst::SSTWriter::Codec::ZSTD}) {
+            for (const bool reuse : {true, false}) {
+                const auto dir = root / (std::to_string(static_cast<int>(codec)) + "-" + std::to_string(reuse));
+                sst::SSTWriter::Options options; options.codec = codec; options.blockSize = 4096;
+                const auto result = sst::SSTWriter::write(dir / "writer.aksst", rows.size(), transientStreamingFixture(rows, reuse), options);
+                require(result.entryCount == rows.size() && result.firstKey == rows.front().key && result.lastKey == rows.back().key,
+                        "transient streaming input changed SST record count or bounds");
+                auto reader = sst::SSTReader::open(result.path);
+                require(reader && reader->header().blockCount > 1, "transient input must survive multiple SST blocks");
+                size_t count = 0;
+                for (const auto& row : reader->scan()) {
+                    require(count < rows.size(), "transient streaming input duplicated a record");
+                    const auto& expected = rows[count++];
+                    require(row.key == expected.key && row.value == expected.value && row.seq == expected.seq && row.flags == expected.flags,
+                            "transient streaming input changed a key, value or version");
+                }
+                require(count == rows.size(), "transient streaming input lost a record");
+                sst::SSTManager::Options managed; managed.compactionMode = sst::SSTCompactionMode::DISABLED;
+                managed.codec = codec; managed.blockSize = options.blockSize;
+                auto manager = sst::SSTManager::create(dir / "managed", managed);
+                require(manager->flush(rows.size(), transientStreamingFixture(rows, reuse)) == 8, "transient flush returned the wrong sequence");
+                for (int pass = 0; pass < 2; ++pass) {
+                    for (const auto& row : rows) {
+                        const auto* expected = &row;
+                        for (const auto& candidate : rows) {
+                            if (candidate.key == row.key && candidate.seq > expected->seq) { expected = &candidate; }
+                        }
+                        const auto actual = manager->get(row.key);
+                        require(actual && actual->seq == expected->seq && actual->value == expected->value && actual->flags == expected->flags,
+                                "transient stream flush or recovery changed point-read visibility");
+                    }
+                    if (pass == 0) { manager.reset(); manager = sst::SSTManager::create(dir / "managed", managed); manager->recover(); }
+                }
+                // Same-prefix descending keys must still be rejected when buffers change.
+                const std::vector<sst::SSTRecord> descending{{.key = second, .seq = 1}, {.key = first, .seq = 2}};
+                bool rejected = false;
+                try { (void)sst::SSTWriter::write(dir / "unsorted.aksst", descending.size(), transientStreamingFixture(descending, reuse), options); }
+                catch (const std::invalid_argument&) { rejected = true; }
+                require(rejected, "transient streaming input bypassed sorted-key validation");
+                auto invalid = sst::SSTManager::create(dir / "invalid", managed); rejected = false;
+                try { invalid->flush(descending.size(), transientStreamingFixture(descending, reuse)); }
+                catch (const std::invalid_argument&) { rejected = true; }
+                require(rejected && !invalid->scanIter().hasNext(), "unsorted transient stream published an SST");
+            }
+        }
+        fs::remove_all(root, ec);
+    }
+
     void testVersionsWithinOneSst() {
         namespace fs = std::filesystem;
         namespace sst = akkaradb::engine::sst;
@@ -1174,12 +1334,41 @@ namespace {
     }
 
     #include "detail/sst_durability_regressions.inc"
+    #include "detail/sst_catalog_failure_regressions.inc"
+    #include "detail/sst_ownership_regressions.inc"
 }
 
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     try {
+        if (argc == 4 && std::string_view{argv[1]} == "--sst-ownership-child") {
+            const std::string_view mode{argv[2]};
+            return runSstOwnershipChild(argv[3], mode == "locked", mode == "crash");
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-ownership") {
+            testSstExclusiveOwnership(std::filesystem::absolute(argv[0]));
+            testSstReadSnapshotAcrossCompaction();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-p2") {
+            testStreamingRecordLifetime();
+            testStreamingFlushEstimates();
+            testVersionsWithinOneSst();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-p1") {
+            testSstCatalogBinding();
+#ifdef _WIN32
+            testManifestTerminalIoFailure();
+            testSstCompactionTerminalIoFailure();
+#endif
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--streaming-estimates") {
+            testStreamingFlushEstimates();
+            return 0;
+        }
         if (argc == 3 && std::string_view{argv[1]} == "--manifest-rotation-sync-child") {
             runManifestRotationSyncChild(std::filesystem::path{argv[2]}, true);
             throw std::runtime_error("rotation child did not reach the sync boundary");
@@ -1191,8 +1380,12 @@ int main(int argc, char** argv) {
             return runManifestCompactCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
         }
         require(argc == 1, "unexpected SST test command line");
+        testSstExclusiveOwnership(std::filesystem::absolute(argv[0]));
+        testSstReadSnapshotAcrossCompaction();
         testVersionsWithinOneSst();
         testRecoveryRejectsInsufficientLevels();
+        testStreamingFlushEstimates();
+        testStreamingRecordLifetime();
         namespace fs = std::filesystem;
         namespace sst = akkaradb::engine::sst;
 
@@ -1277,6 +1470,11 @@ int main(int argc, char** argv) {
         testManifestRotationSync(fs::absolute(fs::path{argv[0]}));
         testSstRenameFailure();
         testLiveSstBlobSnapshot();
+        testSstCatalogBinding();
+#ifdef _WIN32
+        testManifestTerminalIoFailure();
+        testSstCompactionTerminalIoFailure();
+#endif
         return 0;
     }
     catch (const std::exception& ex) {

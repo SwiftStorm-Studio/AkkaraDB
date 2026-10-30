@@ -34,6 +34,10 @@ namespace akkaradb::engine::memtable {
     };
 
     class AKDB_API MemTable {
+        private:
+            class Impl;
+            struct ReadState;
+
         public:
             using RecordView = core::RecordView;
             using FlushCallback = std::function<void(std::span<const RecordView>)>;
@@ -132,6 +136,25 @@ namespace akkaradb::engine::memtable {
             // Retain the published generations until the borrowed view has been copied.
             struct PinnedRecord { RecordView view; std::shared_ptr<const void> lifetime; };
             [[nodiscard]] std::optional<PinnedRecord> getPinned(std::span<const uint8_t> key, uint64_t snapshotSeq) const;
+            // Pins the key's published sources before invoking the provider,
+            // so it can capture SST state before any record lookup starts.
+            [[nodiscard]] std::optional<PinnedRecord> getPinnedWithSnapshot(
+                std::span<const uint8_t> key, const std::function<uint64_t()>& snapshotSeqProvider) const;
+
+            class AKDB_API ReadSnapshot {
+                public:
+                    [[nodiscard]] std::optional<PinnedRecord> getPinned(std::span<const uint8_t> key) const;
+                    [[nodiscard]] uint64_t snapshotSeq() const noexcept { return snapshotSeq_; }
+
+                private:
+                    friend class Impl;
+                    uint64_t snapshotSeq_ = 0;
+                    std::vector<std::shared_ptr<const ReadState>> shards_;
+            };
+
+            // Pins all published sources before sampling the sequence. Like
+            // point reads, this does not exclude concurrent ordinary writers.
+            [[nodiscard]] ReadSnapshot readSnapshot(const std::function<uint64_t()>& snapshotSeqProvider) const;
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const;
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const;
 
@@ -179,7 +202,6 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] MemTableSnapshot snapshot() const noexcept;
 
         private:
-            class Impl;
             explicit MemTable(const Options& options);
             std::shared_ptr<Impl> impl_;
     };

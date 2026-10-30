@@ -14,7 +14,7 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
-#include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 
@@ -27,13 +27,14 @@
 namespace akkaradb::engine::sst {
     namespace {
         [[nodiscard]] uint32_t crc32c(std::span<const uint8_t> bytes) noexcept {
-            return cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+            const auto data = std::as_bytes(bytes);
+            return cpu::CRC32C(data.data(), data.size());
         }
 
         [[nodiscard]] SSTWriter::Result::BlobRefEntry blobRefEntryFromRecord(const core::RecordView& rec) {
             SSTWriter::Result::BlobRefEntry entry;
             const auto key = rec.key();
-            entry.key.assign(key.begin(), key.end());
+            entry.key.assign_range(key);
             entry.seq = rec.seq();
             entry.flags = rec.flags();
             if ((rec.flags() & SST_RECORD_FLAG_BLOB) != 0 && rec.valueSize() >= blob::BLOB_REF_SIZE) {
@@ -44,24 +45,24 @@ namespace akkaradb::engine::sst {
 
         template <typename T>
         [[nodiscard]] uint32_t crc32cPodVector(const std::vector<T>& values) noexcept {
-            return cpu::CRC32C(reinterpret_cast<const std::byte*>(values.data()), values.size() * sizeof(T));
+            const auto bytes = std::as_bytes(std::span{values});
+            return cpu::CRC32C(bytes.data(), bytes.size());
         }
 
         template <typename T>
         void appendPod(std::vector<uint8_t>& out, const T& value) {
             const auto* p = reinterpret_cast<const uint8_t*>(&value);
-            out.insert(out.end(), p, p + sizeof(T));
+            out.append_range(std::span{p, sizeof(T)});
         }
 
         [[nodiscard]] size_t sharedPrefixLen(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept {
-            const size_t n = std::min(a.size(), b.size());
-            size_t i = 0;
-            while (i < n && a[i] == b[i]) { ++i; }
-            return i;
+            if (a.empty()) { return 0; }
+            const auto mismatch = std::ranges::mismatch(a, b);
+            return static_cast<size_t>(mismatch.in1 - a.begin());
         }
 
         void writeExact(std::ofstream& out, const void* data, size_t size) {
-            out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+            out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
             if (!out) { throw std::runtime_error("SSTWriter: write failed"); }
         }
 
@@ -76,19 +77,19 @@ namespace akkaradb::engine::sst {
             std::vector<uint8_t> bits;
 
             explicit BloomBuild(size_t entries, uint32_t bitsPerKey) {
-                const uint64_t requestedBits = std::max<uint64_t>(512, static_cast<uint64_t>(entries) * std::max<uint32_t>(1, bitsPerKey));
+                const auto requestedBits = std::ranges::max(uint64_t{512}, static_cast<uint64_t>(entries) * std::ranges::max(1u, bitsPerKey));
                 header.numBits = nextPow2U32(requestedBits);
-                header.numHashes = std::max<uint32_t>(1, static_cast<uint32_t>(static_cast<double>(bitsPerKey) * 0.69));
+                header.numHashes = std::ranges::max(1u, static_cast<uint32_t>(bitsPerKey * 0.69));
                 header.bitsSize = header.numBits / 8;
                 bits.assign(header.bitsSize, 0);
             }
 
             void add(uint64_t fp64) {
-                const uint32_t mask = header.numBits - 1;
-                const uint32_t h1 = static_cast<uint32_t>(fp64);
-                const uint32_t h2 = (static_cast<uint32_t>(fp64 >> 32) | 1u);
+                const auto mask = header.numBits - 1u;
+                const auto h1 = static_cast<uint32_t>(fp64);
+                const auto h2 = static_cast<uint32_t>(fp64 >> 32) | 1u;
                 for (uint32_t i = 0; i < header.numHashes; ++i) {
-                    const uint32_t bit = (h1 + i * h2) & mask;
+                    const auto bit = (h1 + i * h2) & mask;
                     bits[bit >> 3] = static_cast<uint8_t>(bits[bit >> 3] | (1u << (bit & 7u)));
                 }
             }
@@ -111,8 +112,8 @@ namespace akkaradb::engine::sst {
 
         [[nodiscard]] uint32_t addKey(std::vector<uint8_t>& arena, std::span<const uint8_t> key) {
             if (arena.size() > UINT32_MAX) { throw std::runtime_error("SSTWriter: key arena too large"); }
-            const uint32_t off = static_cast<uint32_t>(arena.size());
-            arena.insert(arena.end(), key.begin(), key.end());
+            const auto off = static_cast<uint32_t>(arena.size());
+            arena.append_range(key);
             return off;
         }
 
@@ -122,10 +123,10 @@ namespace akkaradb::engine::sst {
 
             const auto key = rec.key();
             const auto value = rec.value();
-            core::SSTHdr32 hdr{
+            const auto hdr = core::SSTHdr32{
                 .seq = rec.seq(),
-                .kLen = static_cast<uint16_t>(key.size()),
-                .vLen = static_cast<uint16_t>(value.size()),
+                .kLen = rec.keySize(),
+                .vLen = rec.valueSize(),
                 .flags = rec.flags(),
                 .reserved0 = 0,
                 .reserved1 = 0,
@@ -138,18 +139,18 @@ namespace akkaradb::engine::sst {
             }
 
             appendPod(block.raw, hdr);
-            block.raw.insert(block.raw.end(), key.begin(), key.end());
-            block.raw.insert(block.raw.end(), value.begin(), value.end());
-            const uint64_t padded = alignUpU64(static_cast<uint64_t>(block.raw.size()), 8);
+            block.raw.append_range(key);
+            block.raw.append_range(value);
+            const auto padded = alignUpU64(block.raw.size(), 8);
             block.raw.resize(static_cast<size_t>(padded), 0);
 
             if (block.offsets.size() == 1) {
-                block.firstKey.assign(key.begin(), key.end());
+                block.firstKey.assign_range(key);
                 block.firstSeq = hdr.seq;
                 block.firstFp = hdr.keyFp64;
                 block.firstMini = hdr.miniKey;
             }
-            block.lastKey.assign(key.begin(), key.end());
+            block.lastKey.assign_range(key);
             block.lastSeq = hdr.seq;
             block.lastFp = hdr.keyFp64;
             block.lastMini = hdr.miniKey;
@@ -161,13 +162,13 @@ namespace akkaradb::engine::sst {
             int zstdCompressionLevel,
             uint32_t& flags
         ) {
-            const uint32_t extraFlags = flags & ~SST_BLOCK_FLAG_RAW;
+            const auto extraFlags = flags & ~SST_BLOCK_FLAG_RAW;
             flags = extraFlags | SST_BLOCK_FLAG_RAW;
             if (codec != SSTWriter::Codec::ZSTD || raw.empty()) { return raw; }
 
-            const size_t bound = ZSTD_compressBound(raw.size());
+            const auto bound = ZSTD_compressBound(raw.size());
             std::vector<uint8_t> compressed(bound);
-            const size_t n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), zstdCompressionLevel);
+            const auto n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), zstdCompressionLevel);
             if (ZSTD_isError(n) || n >= raw.size()) { return raw; }
             compressed.resize(n);
             flags = extraFlags | SST_BLOCK_FLAG_COMPRESSED;
@@ -187,33 +188,30 @@ namespace akkaradb::engine::sst {
             out.offsets.reserve(block.offsets.size());
 
             std::vector<uint8_t> prevKey;
-            for (size_t i = 0; i < block.offsets.size(); ++i) {
-                const uint32_t off = block.offsets[i];
+            for (const auto off : block.offsets) {
                 if (off + sizeof(core::SSTHdr32) > block.raw.size()) { throw std::runtime_error("SSTWriter: corrupt source block header"); }
                 const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.raw.data() + off);
-                const uint8_t* keyPtr = block.raw.data() + off + sizeof(core::SSTHdr32);
-                const uint8_t* valPtr = keyPtr + hdr->kLen;
+                const auto* keyPtr = block.raw.data() + off + sizeof(core::SSTHdr32);
+                const auto* valPtr = keyPtr + hdr->kLen;
                 if (valPtr + hdr->vLen > block.raw.data() + block.raw.size()) {
                     throw std::runtime_error("SSTWriter: corrupt source block payload");
                 }
 
-                std::span<const uint8_t> key{keyPtr, hdr->kLen};
-                const uint16_t shared = static_cast<uint16_t>(std::min<size_t>(sharedPrefixLen(prevKey, key), UINT16_MAX));
-                const size_t suffixLen = key.size() - shared;
+                const auto key = std::span{keyPtr, hdr->kLen};
+                const auto shared = static_cast<uint16_t>(std::ranges::min(sharedPrefixLen(prevKey, key), size_t{UINT16_MAX}));
 
                 out.offsets.push_back(static_cast<uint32_t>(out.data.size()));
 
-                core::SSTHdr32 encHdr = *hdr;
+                auto encHdr = *hdr;
                 encHdr.reserved0 = 0;
                 encHdr.reserved1 = shared;
                 appendPod(out.data, encHdr);
-                out.data.insert(out.data.end(), key.begin() + shared, key.end());
-                out.data.insert(out.data.end(), valPtr, valPtr + hdr->vLen);
-                const uint64_t padded = alignUpU64(static_cast<uint64_t>(out.data.size()), 8);
+                out.data.append_range(key.subspan(shared));
+                out.data.append_range(std::span{valPtr, hdr->vLen});
+                const auto padded = alignUpU64(out.data.size(), 8);
                 out.data.resize(static_cast<size_t>(padded), 0);
 
-                (void)suffixLen;
-                prevKey.assign(key.begin(), key.end());
+                prevKey.assign_range(key);
             }
 
             return out;
@@ -250,23 +248,22 @@ namespace akkaradb::engine::sst {
         std::vector<SSTBlockIndexEntryV1> index;
         std::vector<uint8_t> keyArena;
         PendingBlock block;
-        std::optional<core::RecordView> previousRecord;
 
         auto flushBlock = [&]() {
             if (block.empty()) { return; }
 
-            const BlockPayload encoded = encodePrefixCompressedBlock(block);
-            const bool usePrefixCompressed = !encoded.data.empty() && encoded.data.size() < block.raw.size();
-            const std::vector<uint8_t>& rawPayload = usePrefixCompressed ? encoded.data : block.raw;
-            const std::vector<uint32_t>& rawOffsets = usePrefixCompressed ? encoded.offsets : block.offsets;
+            const auto encoded = encodePrefixCompressedBlock(block);
+            const auto usePrefixCompressed = !encoded.data.empty() && encoded.data.size() < block.raw.size();
+            const auto& rawPayload = usePrefixCompressed ? encoded.data : block.raw;
+            const auto& rawOffsets = usePrefixCompressed ? encoded.offsets : block.offsets;
 
             uint32_t blockFlags = usePrefixCompressed ? SST_BLOCK_FLAG_PREFIX_COMPRESSED : 0;
-            std::vector<uint8_t> payload = compressOrRaw(rawPayload, options.codec, options.zstdCompressionLevel, blockFlags);
+            const auto payload = compressOrRaw(rawPayload, options.codec, options.zstdCompressionLevel, blockFlags);
             std::vector<uint8_t> offsetsBytes;
             offsetsBytes.reserve(rawOffsets.size() * sizeof(uint32_t));
-            for (const uint32_t off : rawOffsets) { appendPod(offsetsBytes, off); }
+            for (const auto off : rawOffsets) { appendPod(offsetsBytes, off); }
 
-            const uint64_t blockOffset = static_cast<uint64_t>(out.tellp());
+            const auto blockOffset = static_cast<uint64_t>(out.tellp());
             SSTBlockHeaderV1 bh{};
             bh.headerSize = sizeof(SSTBlockHeaderV1);
             bh.flags = blockFlags;
@@ -281,23 +278,23 @@ namespace akkaradb::engine::sst {
 
             std::vector<uint8_t> crcInput;
             crcInput.reserve(payload.size() + offsetsBytes.size());
-            crcInput.insert(crcInput.end(), payload.begin(), payload.end());
-            crcInput.insert(crcInput.end(), offsetsBytes.begin(), offsetsBytes.end());
+            crcInput.append_range(payload);
+            crcInput.append_range(offsetsBytes);
             bh.crc32c = crc32c(crcInput);
 
             writeExact(out, &bh, sizeof(bh));
             writeExact(out, payload.data(), payload.size());
             writeExact(out, offsetsBytes.data(), offsetsBytes.size());
 
-            const uint64_t next = alignUpU64(static_cast<uint64_t>(out.tellp()), 8);
-            const size_t pad = static_cast<size_t>(next - static_cast<uint64_t>(out.tellp()));
+            const auto next = alignUpU64(static_cast<uint64_t>(out.tellp()), 8);
+            const auto pad = static_cast<size_t>(next - static_cast<uint64_t>(out.tellp()));
             if (pad > 0) {
                 const uint8_t zeros[8]{};
                 writeExact(out, zeros, pad);
             }
 
-            const uint32_t firstKeyOff = addKey(keyArena, block.firstKey);
-            const uint32_t lastKeyOff = addKey(keyArena, block.lastKey);
+            const auto firstKeyOff = addKey(keyArena, block.firstKey);
+            const auto lastKeyOff = addKey(keyArena, block.lastKey);
             index.push_back(
                 SSTBlockIndexEntryV1{
                     .blockOffset = blockOffset,
@@ -320,40 +317,41 @@ namespace akkaradb::engine::sst {
         };
 
         for (const auto& rec : records) {
-            if (previousRecord.has_value() && previousRecord->compareKey(rec) > 0) {
+            // lastKey owns the preceding key even after a streaming producer
+            // reuses or destroys its previous record's buffers.
+            if (result.entryCount != 0 && rec.compareKey(result.lastKey) < 0) {
                 throw std::invalid_argument("SSTWriter::write: records must be sorted by key");
             }
-            if (result.entryCount == 0) { result.firstKey.assign(rec.key().begin(), rec.key().end()); }
+            if (result.entryCount == 0) { result.firstKey.assign_range(rec.key()); }
 
             bloom.add(rec.keyFp64());
-            result.minSeq = std::min(result.minSeq, rec.seq());
-            result.maxSeq = std::max(result.maxSeq, rec.seq());
-            result.lastKey.assign(rec.key().begin(), rec.key().end());
+            result.minSeq = std::ranges::min(result.minSeq, rec.seq());
+            result.maxSeq = std::ranges::max(result.maxSeq, rec.seq());
+            result.lastKey.assign_range(rec.key());
             if (options.trackBlobReferences) { result.blobRefs.push_back(blobRefEntryFromRecord(rec)); }
             else if ((rec.flags() & SST_RECORD_FLAG_BLOB) != 0) {
                 throw std::invalid_argument("SSTWriter: disabled Blob tracking requires Blob-free records");
             }
             ++result.entryCount;
 
-            const uint64_t estimated = alignUpU64(32 + rec.keySize() + rec.valueSize(), 8);
+            const auto estimated = alignUpU64(32 + rec.keySize() + rec.valueSize(), 8);
             if (!block.empty() && block.raw.size() + estimated > options.blockSize) { flushBlock(); }
             appendRecord(block, rec);
-            previousRecord = rec;
         }
         if (result.entryCount == 0) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         flushBlock();
 
-        const uint64_t indexOffset = static_cast<uint64_t>(out.tellp());
+        const auto indexOffset = static_cast<uint64_t>(out.tellp());
         for (const auto& entry : index) { writeExact(out, &entry, sizeof(entry)); }
 
-        const uint64_t keyArenaOffset = static_cast<uint64_t>(out.tellp());
+        const auto keyArenaOffset = static_cast<uint64_t>(out.tellp());
         if (!keyArena.empty()) { writeExact(out, keyArena.data(), keyArena.size()); }
 
-        const uint64_t bloomOffset = static_cast<uint64_t>(out.tellp());
+        const auto bloomOffset = static_cast<uint64_t>(out.tellp());
         writeExact(out, &bloom.header, sizeof(bloom.header));
         writeExact(out, bloom.bits.data(), bloom.bits.size());
 
-        const uint64_t footerOffset = static_cast<uint64_t>(out.tellp());
+        const auto footerOffset = static_cast<uint64_t>(out.tellp());
         SSTFooterV1 footer{};
         footer.file_size = footerOffset + sizeof(SSTFooterV1);
         footer.indexOffset = indexOffset;
@@ -385,7 +383,7 @@ namespace akkaradb::engine::sst {
         std::vector<uint8_t> bloomData;
         bloomData.reserve(sizeof(bloom.header) + bloom.bits.size());
         appendPod(bloomData, bloom.header);
-        bloomData.insert(bloomData.end(), bloom.bits.begin(), bloom.bits.end());
+        bloomData.append_range(bloom.bits);
         const SSTMetadataCrcV1 metadataCrc{
             .indexCrc32c = crc32cPodVector(index),
             .keyArenaCrc32c = crc32c(keyArena),
@@ -393,11 +391,13 @@ namespace akkaradb::engine::sst {
         };
         std::memcpy(header.reserved, &metadataCrc, sizeof(metadataCrc));
         header.crc32c = 0;
-        header.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(&header), sizeof(header));
+        const auto headerBytes = std::as_bytes(std::span{&header, 1});
+        header.crc32c = cpu::CRC32C(headerBytes.data(), headerBytes.size());
 
         footer.headerCrc32c = header.crc32c;
         footer.footerCrc32c = 0;
-        footer.footerCrc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(&footer), sizeof(footer));
+        const auto footerBytes = std::as_bytes(std::span{&footer, 1});
+        footer.footerCrc32c = cpu::CRC32C(footerBytes.data(), footerBytes.size());
         writeExact(out, &footer, sizeof(footer));
 
         out.seekp(0);

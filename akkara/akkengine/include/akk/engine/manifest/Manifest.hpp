@@ -12,6 +12,7 @@
 
 #include "akkaradb/Export.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -38,6 +39,8 @@ namespace akkaradb::engine::manifest {
      *     flusher thread and fsynced periodically.  Lower latency but
      *     relaxed durability for other events. SST seal, compaction commit
      *     and checkpoint calls always wait for durable storage.
+     * A write/sync failure makes subsequent mutations, replay and compaction
+     * fail until the Manifest is reopened to resolve its durable state.
      */
     class AKDB_API Manifest {
         public:
@@ -116,6 +119,8 @@ namespace akkaradb::engine::manifest {
              * @param path      Base path for the manifest file (e.g. "db/MANIFEST.akmf").
              *                  Rotated files are stored as "<stem>-1<ext>", "<stem>-2<ext>", etc.
              * @param fastMode Enable background-flusher (batched fsync) mode.
+             * The catalog is exclusively owned until close(), including across
+             * rotation and compaction. A second opener fails before replay.
              * @throws std::runtime_error on I/O failure.
              */
             [[nodiscard]] static std::unique_ptr<Manifest> create(const std::filesystem::path& path, bool fastMode = false);
@@ -251,6 +256,9 @@ namespace akkaradb::engine::manifest {
 
             [[nodiscard]] uint64_t stripesWritten() const noexcept;
 
+            /** Stable catalog identity, retained across rotation and compaction. */
+            [[nodiscard]] std::array<uint8_t, 16> catalogIdentity() const;
+
             [[nodiscard]] std::optional<CheckpointEvent> lastCheckpoint() const noexcept;
 
             /** Returns all currently live SST file names. */
@@ -300,7 +308,7 @@ namespace akkaradb::engine::manifest {
 
             /**
              * Flushes any pending writes and closes the manifest file.
-             * Idempotent.
+             * Idempotent. Reports any stored write/sync failure after closing.
              */
             void close();
 

@@ -1195,6 +1195,10 @@ namespace {
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
     try {
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-scan-gc") {
+            runSstScanBlobGcRegression();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--sst-integrity") {
             runSstIntegrityRegressions();
             return 0;

@@ -248,6 +248,22 @@ namespace akkaradb::engine::memtable {
             std::optional<RecordView> pending_;
     };
 
+    struct MemTable::ReadState {
+        std::shared_ptr<const IMemTable> active;
+        std::vector<std::shared_ptr<const IMemTable>> immutables;
+
+        [[nodiscard]] std::optional<RecordView> get(core::ByteView key, uint64_t snapshotSeq) const {
+            std::optional<RecordView> result;
+            const auto consider = [&](const std::shared_ptr<const IMemTable>& table) {
+                RecordView candidate;
+                if (table && table->get(key, snapshotSeq, &candidate) && (!result || candidate.seq() > result->seq())) { result = candidate; }
+            };
+            consider(active);
+            for (const auto& immutable : immutables) { consider(immutable); }
+            return result;
+        }
+    };
+
     class MemTable::Impl : public std::enable_shared_from_this<MemTable::Impl> {
         public:
             struct Shard {
@@ -263,10 +279,7 @@ namespace akkaradb::engine::memtable {
                     uint64_t minSeq = UINT64_MAX;
                 };
 
-                struct PublishedTables {
-                    std::shared_ptr<const IMemTable> active;
-                    std::vector<std::shared_ptr<const IMemTable>> immutables;
-                };
+                using PublishedTables = ReadState;
 
                 std::deque<Immutable> immutables;
                 std::atomic<std::shared_ptr<const PublishedTables>> published;
@@ -510,20 +523,33 @@ namespace akkaradb::engine::memtable {
                 if (!published) { return false; }
                 if (lifetime) { *lifetime = published; }
 
-                bool found = false;
-                RecordView newest;
-                const auto consider = [&](const std::shared_ptr<const IMemTable>& table) {
-                    RecordView candidate;
-                    if (table && table->get(keyView, snapshotSeq, &candidate) && (!found || candidate.seq() > newest.seq())) {
-                        newest = candidate;
-                        found = true;
-                    }
-                };
+                const auto record = published->get(keyView, snapshotSeq);
+                if (record) { *out = *record; }
+                return record.has_value();
+            }
 
-                consider(published->active);
-                for (const auto& immutable : published->immutables) { consider(immutable); }
-                if (found) { *out = newest; }
-                return found;
+            [[nodiscard]] static std::optional<PinnedRecord> readPinned(
+                const std::shared_ptr<const ReadState>& source, std::span<const uint8_t> key, uint64_t snapshotSeq) {
+                if (!source) { return std::nullopt; }
+                const auto record = source->get(toByteView(key), snapshotSeq);
+                return record ? std::optional<PinnedRecord>{{*record, source}} : std::nullopt;
+            }
+
+            [[nodiscard]] std::optional<PinnedRecord> getPinnedWithSnapshot(
+                std::span<const uint8_t> key, const std::function<uint64_t()>& snapshotSeqProvider) const {
+                const auto index = shardForHash(shardRouteHash(computeFp64(key, 0), key.size()), shardCount_);
+                const auto& shard = *shards_[index];
+                const auto source = shard.published.load(std::memory_order_acquire);
+                const uint64_t seq = snapshotSeqProvider();
+                return readPinned(source, key, seq);
+            }
+
+            [[nodiscard]] ReadSnapshot readSnapshot(const std::function<uint64_t()>& snapshotSeqProvider) const {
+                ReadSnapshot result;
+                result.shards_.reserve(shards_.size());
+                for (const auto& shard : shards_) { result.shards_.push_back(shard->published.load(std::memory_order_acquire)); }
+                result.snapshotSeq_ = snapshotSeqProvider();
+                return result;
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, uint64_t snapshotSeq, std::vector<uint8_t>& out) const {
@@ -1177,6 +1203,21 @@ namespace akkaradb::engine::memtable {
         PinnedRecord record;
         if (!impl_->get(key, snapshotSeq, &record.view, 0, &record.lifetime)) { return std::nullopt; }
         return record;
+    }
+
+    std::optional<MemTable::PinnedRecord> MemTable::getPinnedWithSnapshot(
+        std::span<const uint8_t> key, const std::function<uint64_t()>& snapshotSeqProvider) const {
+        return impl_->getPinnedWithSnapshot(key, snapshotSeqProvider);
+    }
+
+    MemTable::ReadSnapshot MemTable::readSnapshot(const std::function<uint64_t()>& snapshotSeqProvider) const {
+        return impl_->readSnapshot(snapshotSeqProvider);
+    }
+
+    std::optional<MemTable::PinnedRecord> MemTable::ReadSnapshot::getPinned(std::span<const uint8_t> key) const {
+        if (shards_.empty()) { return std::nullopt; }
+        const auto index = shardForHash(shardRouteHash(computeFp64(key, 0), key.size()), static_cast<uint32_t>(shards_.size()));
+        return Impl::readPinned(shards_[index], key, snapshotSeq_);
     }
 
     bool MemTable::get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const {

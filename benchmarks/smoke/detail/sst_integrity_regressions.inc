@@ -147,7 +147,138 @@ void runSstBlobGcRegression() {
     }
 }
 
+void runSstPointCompactionRegression() {
+    for (int api = 0; api < 5; ++api) {
+        const auto dir = fs::current_path() / ".bench-tmp" / ("sst-point-compaction-" + std::to_string(api));
+        std::error_code ec; fs::remove_all(dir, ec);
+        auto gate = std::make_shared<SstIntegrityGate>();
+        auto options = persistentOptions(dir);
+        options.sst.compactionMode = akkaradb::engine::sst::SSTCompactionMode::BACKGROUND;
+        options.sst.compactThreads = 1; options.sst.maxL0Files = 2;
+        options.memtable.backendFactory = [gate] { return std::make_unique<SstIntegrityBackend>(gate); };
+        auto database = akkaradb::engine::AkkEngine::open(options);
+        const auto key = bytes("a"), secondKey = bytes("z");
+        const std::vector<uint8_t> oldValue{'o'}, newValue{'n'};
+        database->put(key, oldValue); database->put(secondKey, oldValue); database->forceFlush();
+        gate->arm(SstIntegrityGate::Boundary::MISS);
+        std::exception_ptr readFailure;
+        std::thread reader{[&] {
+            try {
+                std::vector<uint8_t> out;
+                if (api == 0) { require(database->get(key) == std::optional{oldValue}, "get lost its SST version during compaction"); }
+                else if (api == 1) { require(database->getInto(key, out) && out == oldValue, "getInto lost its SST version during compaction"); }
+                else if (api == 2) {
+                    akkaradb::core::BufferArena arena; std::span<const uint8_t> value;
+                    require(database->getIntoArena(key, arena, value) && std::ranges::equal(value, oldValue), "arena read lost its SST version during compaction");
+                }
+                else if (api == 3) { require(database->exists(key), "exists returned false during compaction of a live key"); }
+                else {
+                    const std::array keys{key, secondKey};
+                    const auto batch = database->getBatch(keys);
+                    require(batch.size() == 2 && batch[0].found && batch[1].found && batch[0].value == oldValue && batch[1].value == oldValue,
+                        "batch did not retain one SST generation across compaction");
+                }
+            } catch (...) { readFailure = std::current_exception(); }
+        }};
+        const bool entered = gate->wait();
+        try {
+            require(entered, "reader did not reach the compaction boundary");
+            database->put(key, newValue); database->put(secondKey, newValue); database->forceFlush();
+            require(waitUntil([&] { return database->stats().sst.compactionsCompleted != 0; }), "compaction did not complete while the read was paused");
+        } catch (...) { gate->release(); reader.join(); throw; }
+        gate->release(); reader.join();
+        if (readFailure) { std::rethrow_exception(readFailure); }
+        require(database->get(key) == std::optional{newValue}, "current get did not select the compacted head");
+        database->close(); database.reset();
+        database = akkaradb::engine::AkkEngine::open(options);
+        require(database->get(key) == std::optional{newValue}, "read pin changed the recovered compacted head");
+        database->close(); database.reset(); fs::remove_all(dir, ec);
+    }
+}
+
+void runSstScanBlobGcRegression() {
+    using Engine = akkaradb::engine::AkkEngine;
+    using Generator = akkaradb::core::ArenaGenerator<Engine::ScanRecordView>;
+    for (const bool manifestEnabled : {false, true}) {
+        // Capture in progress, unstarted, suspended, two cancellation states,
+        // and an exception after capture must all retain/release the Blob lease.
+        for (int phase = 0; phase < 6; ++phase) {
+            const auto dir = fs::current_path() / ".bench-tmp" / ("sst-scan-blob-gc-" + std::to_string(manifestEnabled) + "-" + std::to_string(phase));
+            std::error_code ec; fs::remove_all(dir, ec);
+            auto gate = std::make_shared<SstIntegrityGate>();
+            auto options = persistentOptions(dir);
+            options.components.manifestEnabled = manifestEnabled;
+            options.components.blobEnabled = true; options.blob.thresholdBytes = 8;
+            options.memtable.backendFactory = [gate] { return std::make_unique<SstIntegrityBackend>(gate); };
+            auto database = Engine::open(options);
+            const auto a = bytes("a"), z = bytes("z");
+            const std::vector<uint8_t> oldValue(64, 'o'), newValue(64, 'n');
+            database->put(a, oldValue); database->put(z, oldValue); database->forceFlush();
+            fs::path firstBlob;
+            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (entry.path().filename() == "0000000000000001.akblob") { firstBlob = entry.path(); }
+            }
+            require(!firstBlob.empty(), "scan GC fixture lacks its first Blob");
+            akkaradb::core::BufferArena arena;
+            std::optional<Generator> scan;
+            const auto createScan = [&] {
+                return (phase & 1) == 0 ? database->scan(arena) : database->scanLocalStorage(arena);
+            };
+            const auto replaceAndQueueGc = [&] {
+                database->put(a, newValue); database->put(z, newValue); database->forceFlush();
+                database->runBlobGc();
+                require(waitUntil([&] { return database->stats().blob.gcCycles != 0; }), "scan GC fixture did not queue deletion");
+                require(!waitUntil([&] { return database->stats().blob.blobsDeleted != 0; }, std::chrono::milliseconds{200}),
+                    "GC deleted a Blob retained by a scan");
+            };
+            if (phase == 0) {
+                gate->arm(SstIntegrityGate::Boundary::ITERATOR);
+                std::exception_ptr failure;
+                std::thread creator{[&] { try { scan.emplace(createScan()); } catch (...) { failure = std::current_exception(); } }};
+                const bool entered = gate->wait();
+                try {
+                    require(entered, "scan did not reach the source-capture boundary");
+                    replaceAndQueueGc();
+                } catch (...) { gate->release(); creator.join(); throw; }
+                gate->release(); creator.join();
+                if (failure) { std::rethrow_exception(failure); }
+            }
+            else { scan.emplace(createScan()); }
+
+            Generator::iterator position;
+            size_t rows = 0;
+            if (phase == 2 || phase == 4) {
+                position = scan->begin();
+                require(position != scan->end() && std::ranges::equal(position->value, oldValue), "scan did not start with its old Blob value");
+                ++rows;
+            }
+            if (phase != 0) { replaceAndQueueGc(); }
+
+            if (phase == 3 || phase == 4) { scan.reset(); }
+            else if (phase == 5) {
+                flipByte(firstBlob, 0);
+                requireRuntimeError([&] { (void)scan->begin(); }, "corrupt scan Blob must report a read error");
+            }
+            else {
+                if (phase == 2) { ++position; } else { position = scan->begin(); }
+                for (; position != scan->end(); ++position) {
+                    require(std::ranges::equal(position->value, oldValue), "scan lost or changed a captured Blob value");
+                    ++rows;
+                }
+                require(rows == 2, "scan omitted a captured Blob row");
+            }
+            // Even an exhausted/failed generator still in scope must release
+            // its lease so an already queued collection can finish.
+            require(waitUntil([&] { return database->stats().blob.blobsDeleted == 2; }), "scan retained its Blob lease after completion or cancellation");
+            require(database->get(a) == std::optional{newValue} && database->get(z) == std::optional{newValue}, "scan GC damaged the current Blob values");
+            scan.reset(); database->close(); database.reset(); fs::remove_all(dir, ec);
+        }
+    }
+}
+
 void runSstIntegrityRegressions() {
+    runSstScanBlobGcRegression();
+    runSstPointCompactionRegression();
     runSstPromotionRegression();
     runSstBlobGcRegression();
 }

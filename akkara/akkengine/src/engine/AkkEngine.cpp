@@ -905,8 +905,14 @@ namespace akkaradb::engine {
         memtable::MemTable::RangeIterator memtableIter,
         sst::SSTManager::Iterator sstIter,
         blob::BlobManager* blobManager,
+        blob::BlobManager::ReadPin blobReadPin,
         std::shared_ptr<void> operationLifetime = {}
     ) {
+        // The parameter protects even an unstarted generator. Moving it into
+        // a local releases the lease at completion or exception, before the
+        // caller destroys an already exhausted generator.
+        auto readPin = std::move(blobReadPin);
+        (void)readPin;
         for (const auto& [key, value, flags] : storedScanGenerator(std::move(memtableIter), std::move(sstIter), std::move(operationLifetime))) {
             auto v = resolveScanValue(flags, value, blobManager, arena);
             if (v) { co_yield AkkEngine::ScanRecordView{.key = key, .value = *v}; }
@@ -1758,12 +1764,45 @@ namespace akkaradb::engine {
                 }
             };
 
-            [[nodiscard]] StoredPointRead readStoredPoint(std::span<const uint8_t> key, uint64_t seq) const {
+            struct StoredReadSnapshot {
+                memtable::MemTable::ReadSnapshot memory;
+                sst::SSTManager::ReadSnapshot disk;
+            };
+
+            [[nodiscard]] StoredReadSnapshot captureStoredReadSnapshot() const {
+                StoredReadSnapshot result;
+                result.memory = memtable->readSnapshot([&] {
+                    if (sstManager) { result.disk = sstManager->readSnapshot(); }
+                    return snapshotSeq();
+                });
+                return result;
+            }
+
+            [[nodiscard]] StoredPointRead readStoredPoint(
+                std::span<const uint8_t> key,
+                std::optional<uint64_t> requestedSnapshot = std::nullopt,
+                const StoredReadSnapshot* snapshot = nullptr
+            ) const {
                 StoredPointRead result;
-                // Pin memory first: a flush publishes its SST before unpublishing memory.
-                result.memory = memtable->getPinned(key, seq);
-                if (sstManager && (!result.memory || sstManager->maxSequence() > result.memory->view.seq())) {
-                    result.disk = sstManager->get(key, seq);
+                sst::SSTManager::ReadSnapshot disk;
+                uint64_t seq;
+                if (snapshot) {
+                    disk = snapshot->disk;
+                    seq = snapshot->memory.snapshotSeq();
+                    result.memory = snapshot->memory.getPinned(key);
+                }
+                else {
+                    // Capture both sources and the sequence before a lookup can
+                    // pause. Owning memory sources closes the flush/unpublish
+                    // gap; the SST snapshot retains pre-compaction versions.
+                    result.memory = memtable->getPinnedWithSnapshot(key, [&] {
+                        if (sstManager) { disk = sstManager->readSnapshot(); }
+                        seq = requestedSnapshot.value_or(snapshotSeq());
+                        return seq;
+                    });
+                }
+                if (!result.memory || disk.maxSequence() > result.memory->view.seq()) {
+                    result.disk = disk.get(key, seq);
                 }
                 if (result.memory && result.disk && result.memory->view.seq() >= result.disk->seq) { result.disk.reset(); }
                 if (result.disk) { result.memory.reset(); }
@@ -1780,19 +1819,19 @@ namespace akkaradb::engine {
             [[nodiscard]] std::optional<std::vector<uint8_t>> getValueInternal(
                 std::span<const uint8_t> key,
                 bool countStats,
-                std::optional<uint64_t> requestedSnapshot = std::nullopt
+                std::optional<uint64_t> requestedSnapshot = std::nullopt,
+                const StoredReadSnapshot* snapshot = nullptr
             ) {
                 if (usesPartitionRaft()) {
                     auto* child = localPartition(key);
-                    return child ? child->impl_->getValueInternal(key, countStats, requestedSnapshot) : std::nullopt;
+                    return child ? child->impl_->getValueInternal(key, countStats, requestedSnapshot, snapshot) : std::nullopt;
                 }
                 throwIfBackgroundFailed();
                 if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
                 auto transactionRead = distributedReadAdmission(key, {}, true);
                 auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
-                const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
-                const auto record = readStoredPoint(key, seq);
+                const auto record = readStoredPoint(key, requestedSnapshot, snapshot);
                 if (record && !record.view().isTombstone()) {
                     promoteStoredPoint(record);
                     const auto view = record.view();
@@ -2412,13 +2451,14 @@ namespace akkaradb::engine {
                 checkStripeHealthy();
                 if (!stripeGcLoaded) {
                     std::lock_guard lock{writeMu};
+                    auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                     core::BufferArena arena;
                     memtable::MemTable::KeyRange range;
                     const auto seq = snapshotSeq();
                     auto mt = memtable->iterator(range, seq);
                     sst::SSTManager::Iterator sst;
                     if (sstManager) { sst = sstManager->scanIter({}, {}, seq, true); }
-                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
                         if (isStripeInternalKey(record.key) && record.key[4] == 'T') {
                             std::lock_guard stateLock{stripeStateMu};
                             stripePending[std::vector<uint8_t>{record.key.begin(), record.key.end()}] = std::vector<uint8_t>{
@@ -2491,6 +2531,7 @@ namespace akkaradb::engine {
                         ++stripeRebuildStats.cycles;
                         if (stripeRebuildCursor.empty()) { stripeRebuildStats.active = false; }
                     }
+                    auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                     core::BufferArena arena;
                     memtable::MemTable::KeyRange range;
                     range.start = stripeRebuildCursor;
@@ -2500,7 +2541,7 @@ namespace akkaradb::engine {
                     if (sstManager) { sst = sstManager->scanIter(range.start, {}, visibleSeq, true); }
                     std::vector<uint8_t> lastMetadataKey;
                     uint32_t metadataKeysVisited = 0;
-                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
                         std::vector<uint8_t> internalKey{record.key.begin(), record.key.end()};
                         if (!stripeRebuildCursor.empty() && internalKey <= stripeRebuildCursor) { continue; }
                         auto publicKey = publicKeyFromStripeMetaKey(record.key);
@@ -2978,16 +3019,17 @@ namespace akkaradb::engine {
                 std::span<const uint8_t> key,
                 std::vector<uint8_t>& out,
                 bool countStats,
-                std::optional<uint64_t> requestedSnapshot = std::nullopt
+                std::optional<uint64_t> requestedSnapshot = std::nullopt,
+                const StoredReadSnapshot* snapshot = nullptr
             ) {
                 if (usesPartitionRaft()) {
                     auto* child = localPartition(key);
-                    return child && child->impl_->getIntoInternal(key, out, countStats, requestedSnapshot);
+                    return child && child->impl_->getIntoInternal(key, out, countStats, requestedSnapshot, snapshot);
                 }
                 throwIfBackgroundFailed();
                 if (!requestedSnapshot.has_value()) { waitForKeySequenceReadVisibility(); }
                 if (blobManager) {
-                    auto value = getValueInternal(key, countStats, requestedSnapshot);
+                    auto value = getValueInternal(key, countStats, requestedSnapshot, snapshot);
                     if (!value) { return false; }
                     out = std::move(*value);
                     return true;
@@ -2995,8 +3037,7 @@ namespace akkaradb::engine {
 
                 auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
-                const uint64_t seq = requestedSnapshot.value_or(snapshotSeq());
-                const auto record = readStoredPoint(key, seq);
+                const auto record = readStoredPoint(key, requestedSnapshot, snapshot);
                 if (record && !record.view().isTombstone()) {
                     promoteStoredPoint(record);
                     const auto value = record.view().value();
@@ -3026,8 +3067,7 @@ namespace akkaradb::engine {
 
                 auto transactionRead = distributedReadAdmission(key, {}, true);
                 if (countStats) { getsTotal.fetch_add(1, std::memory_order_relaxed); }
-                const uint64_t seq = snapshotSeq();
-                const auto record = readStoredPoint(key, seq);
+                const auto record = readStoredPoint(key);
                 if (record && !record.view().isTombstone()) {
                     promoteStoredPoint(record);
                     out = copySpanToArena(record.view().value(), arena);
@@ -3881,6 +3921,7 @@ namespace akkaradb::engine {
                     );
                 };
                 if (partitionOwner != 0 && stagedEntryCount == 0) {
+                    auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                     core::BufferArena emptyArena;
                     memtable::MemTable::KeyRange emptyRange;
                     const auto visible = snapshotSeq();
@@ -3888,7 +3929,7 @@ namespace akkaradb::engine {
                     sst::SSTManager::Iterator emptySst;
                     if (sstManager) { emptySst = sstManager->scanIter({}, {}, visible, true); }
                     bool hasOwnedKey = false;
-                    for (const auto& record : scanGenerator(emptyArena, std::move(emptyMt), std::move(emptySst), blobManager.get())) {
+                    for (const auto& record : scanGenerator(emptyArena, std::move(emptyMt), std::move(emptySst), blobManager.get(), std::move(blobReadPin))) {
                         if (inScope(record.key)) {
                             hasOwnedKey = true;
                             break;
@@ -3904,6 +3945,7 @@ namespace akkaradb::engine {
                 const uint64_t storageSeq = partitionOwner != 0 ? reserveWriteSeq(1) : seq;
                 bool transactionState = false;
                 uint64_t snapshotWalRecordCount = 0;
+                auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 core::BufferArena arena;
                 memtable::MemTable::KeyRange range;
                 const uint64_t visibleSeq = snapshotSeq();
@@ -3915,7 +3957,7 @@ namespace akkaradb::engine {
                 auto mt = memtable->iterator(range, visibleSeq);
                 sst::SSTManager::Iterator sst;
                 if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq, true); }
-                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
                     if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
                         appendSnapshotWalRecord(storageSeq, record.key, {}, MemHdr16::FLAG_TOMBSTONE, 0);
@@ -3961,11 +4003,12 @@ namespace akkaradb::engine {
                 }
 
                 core::BufferArena applyArena;
+                auto applyBlobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 memtable::MemTable::KeyRange applyRange;
                 auto applyMt = memtable->iterator(applyRange, visibleSeq);
                 sst::SSTManager::Iterator applySst;
                 if (sstManager) { applySst = sstManager->scanIter({}, {}, visibleSeq, true); }
-                for (const auto& record : scanGenerator(applyArena, std::move(applyMt), std::move(applySst), blobManager.get())) {
+                for (const auto& record : scanGenerator(applyArena, std::move(applyMt), std::move(applySst), blobManager.get(), std::move(applyBlobReadPin))) {
                     const std::string key{reinterpret_cast<const char*>(record.key.data()), record.key.size()};
                     if (inScope(record.key) && !pendingSnapshotKeys.contains(key)) {
                         applySnapshotRecordMemory(storageSeq, record.key, {}, MemHdr16::FLAG_TOMBSTONE);
@@ -4998,13 +5041,14 @@ namespace akkaradb::engine {
             [[nodiscard]] std::vector<std::vector<uint8_t>> rollbackKeysChangedAfter(uint64_t targetSeq) {
                 std::vector<std::vector<uint8_t>> keys;
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
+                    auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                     core::BufferArena arena;
                     memtable::MemTable::KeyRange range;
                     const uint64_t visibleSeq = snapshotSeq();
                     auto mt = memtable->iterator(range, visibleSeq);
                     sst::SSTManager::Iterator sst;
                     if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq, true); }
-                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get())) {
+                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
                         auto publicKey = publicKeyFromStripeMetaKey(record.key);
                         if (!publicKey) { continue; }
                         const auto metadata = decodeStripeMetadata(record.value);
@@ -6162,7 +6206,9 @@ namespace akkaradb::engine {
             }
             return results;
         }
-        const uint64_t snapshot = impl_->snapshotSeq();
+        auto blobReadPin = impl_->blobManager ? impl_->blobManager->pinReads() : blob::BlobManager::ReadPin{};
+        std::optional<Impl::StoredReadSnapshot> snapshot;
+        if (!impl_->clusterReadMustRoute()) { snapshot = impl_->captureStoredReadSnapshot(); }
 
         std::vector<BatchGetResult> out;
         out.reserve(keys.size());
@@ -6171,7 +6217,7 @@ namespace akkaradb::engine {
             BatchGetResult result;
             result.found = impl_->clusterReadMustRoute()
                                ? impl_->getIntoClusterAware(key, result.value)
-                               : impl_->getIntoInternal(key, result.value, true, snapshot);
+                               : impl_->getIntoInternal(key, result.value, true, snapshot->memory.snapshotSeq(), &*snapshot);
             out.push_back(std::move(result));
         }
 
@@ -6196,8 +6242,7 @@ namespace akkaradb::engine {
             auto* child = impl_->localPartition(key);
             return child && child->exists(key);
         }
-        const uint64_t seq = impl_->snapshotSeq();
-        const auto record = impl_->readStoredPoint(key, seq);
+        const auto record = impl_->readStoredPoint(key);
         return record && !record.view().isTombstone();
     }
 
@@ -6351,6 +6396,7 @@ namespace akkaradb::engine {
             );
         }
 
+        auto blobReadPin = impl_->blobManager ? impl_->blobManager->pinReads() : blob::BlobManager::ReadPin{};
         memtable::MemTable::KeyRange range;
         range.start.assign(startKey.begin(), startKey.end());
         range.end.assign(endKey.begin(), endKey.end());
@@ -6368,8 +6414,9 @@ namespace akkaradb::engine {
         if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq, true); }
         return core::ArenaGenerator<ScanRecordView>::withArena(
             arena,
-            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(), operation = std::move(operation) ]() mutable {
-                return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(operation));
+            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(),
+                blobReadPin = std::move(blobReadPin), operation = std::move(operation)]() mutable {
+                return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(blobReadPin), std::move(operation));
             }
         );
     }

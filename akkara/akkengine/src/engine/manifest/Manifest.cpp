@@ -9,6 +9,7 @@
 
 // akkengine/src/engine/manifest/Manifest.cpp
 #include "akk/engine/manifest/Manifest.hpp"
+#include "akk/engine/detail/StorageFileLock.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -241,6 +243,7 @@ namespace akkaradb::engine::manifest {
                   currentFileSize_{0},
                   rotationCounter_{0} {
                 if (path_.has_parent_path()) { std::filesystem::create_directories(path_.parent_path()); }
+                ownershipLock_ = std::make_unique<detail::StorageFileLock>(path_.parent_path() / (".lock-" + path_.filename().string()));
 
                 const bool manifestExistsNow = pathExists(path_);
                 if (!manifestExistsNow && mayHaveManifestHistory()) {
@@ -256,16 +259,24 @@ namespace akkaradb::engine::manifest {
                 currentFileSize_ = pathFileSize(currentPath_);
                 const bool isNewFile = (currentFileSize_ == 0);
 
-                if (isNewFile) { writeFileHeader(rotationCounter_); }
+                if (isNewFile) {
+                    catalogHeader_ = ManifestFileHeader::build(0);
+                    std::random_device random;
+                    for (auto& byte : catalogHeader_.reserved) { byte = static_cast<uint8_t>(random()); }
+                    writeFileHeader(rotationCounter_);
+                }
             }
 
-            ~Impl() { close(); }
+            // Explicit close reports persistence failures; destruction cannot throw.
+            ~Impl() { try { close(); } catch (...) {} }
 
             // ----------------------------------------------------------------
             // start / close
             // ----------------------------------------------------------------
 
             void start() {
+                std::lock_guard apiLock{apiMutex_};
+                if (!ownershipLock_) { throw std::runtime_error("Manifest: already closed"); }
                 if (!fastMode_ || running_) { return; }
                 running_ = true;
                 lastStrongSync_ = std::chrono::steady_clock::now();
@@ -273,13 +284,16 @@ namespace akkaradb::engine::manifest {
             }
 
             void close() {
+                std::lock_guard apiLock{apiMutex_};
                 if (fastMode_ && running_) {
                     running_ = false;
                     queueCv_.notify_one();
                     if (flusherThread_.joinable()) { flusherThread_.join(); }
-                    if (termWriteError_) { std::rethrow_exception(termWriteError_); }
                 }
+                std::lock_guard rotationLock{rotationMutex_};
                 fileHandle_.close();
+                ownershipLock_.reset();
+                if (termWriteError_) { std::rethrow_exception(termWriteError_); }
             }
 
             // ----------------------------------------------------------------
@@ -293,9 +307,9 @@ namespace akkaradb::engine::manifest {
                     if (newCount < stripesWritten_.load(std::memory_order_relaxed)) {
                         throw std::invalid_argument("Manifest: stripe counter must be monotonic");
                     }
-                    stripesWritten_.store(newCount, std::memory_order_relaxed);
                 }
                 append(ManifestRecordType::STRIPE_COMMIT, encodeStripeCommit(nowUs(), newCount));
+                stripesWritten_.store(newCount, std::memory_order_relaxed);
             }
 
             void sstSeal(
@@ -515,7 +529,7 @@ namespace akkaradb::engine::manifest {
                 {
                     // The base snapshot covers every rotation through this number.
                     // A crash before obsolete-file cleanup must not replay them again.
-                    const ManifestFileHeader fhdr = ManifestFileHeader::build(static_cast<uint32_t>(rotationCounter_));
+                    const ManifestFileHeader fhdr = catalogFileHeader(rotationCounter_);
                     uint8_t buf[ManifestFileHeader::SIZE];
                     fhdr.serialize(buf);
                     compactFile.write(buf, ManifestFileHeader::SIZE);
@@ -595,6 +609,16 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             uint64_t stripesWritten() const noexcept { return stripesWritten_; }
+
+            std::array<uint8_t, 16> catalogIdentity() const {
+                std::lock_guard lock{mutex_};
+                uint8_t header[ManifestFileHeader::SIZE];
+                catalogHeader_.serialize(header);
+                std::array<uint8_t, 16> identity;
+                std::memcpy(identity.data(), header + 12, 8);
+                std::memcpy(identity.data() + 8, header + 24, 8);
+                return identity;
+            }
 
             std::optional<CheckpointEvent> lastCheckpoint() const noexcept {
                 std::lock_guard lock{mutex_};
@@ -807,8 +831,19 @@ namespace akkaradb::engine::manifest {
             // File header
             // ----------------------------------------------------------------
 
+            [[nodiscard]] ManifestFileHeader catalogFileHeader(size_t rotationCounter) const {
+                std::lock_guard lock{mutex_};
+                auto header = catalogHeader_;
+                header.fileSeq = static_cast<uint32_t>(rotationCounter);
+                header.crc32c = 0;
+                uint8_t bytes[ManifestFileHeader::SIZE];
+                header.serialize(bytes);
+                header.crc32c = cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes), sizeof(bytes));
+                return header;
+            }
+
             void writeFileHeader(size_t rotationCounter) {
-                const ManifestFileHeader fhdr = ManifestFileHeader::build(static_cast<uint32_t>(rotationCounter));
+                const ManifestFileHeader fhdr = catalogFileHeader(rotationCounter);
 
                 uint8_t buf[ManifestFileHeader::SIZE];
                 fhdr.serialize(buf);
@@ -855,6 +890,9 @@ namespace akkaradb::engine::manifest {
 
             void append(ManifestRecordType type, std::vector<uint8_t> payload) {
                 payload = buildRecord(type, std::move(payload));
+                std::lock_guard lock{rotationMutex_};
+                if (!ownershipLock_) { throw std::runtime_error("Manifest: already closed"); }
+                if (termWriteError_) { std::rethrow_exception(termWriteError_); }
                 if (fastMode_) {
                     bool wasEmpty;
                     {
@@ -865,12 +903,18 @@ namespace akkaradb::engine::manifest {
                     if (wasEmpty) queueCv_.notify_one();
                 }
                 else {
-                    std::lock_guard lock{rotationMutex_};
-                    if (termWriteError_) { std::rethrow_exception(termWriteError_); }
-                    checkRotation();
-                    fileHandle_.write(payload.data(), payload.size());
-                    fileHandle_.fsyncData();
-                    currentFileSize_ += payload.size();
+                    try {
+                        checkRotation();
+                        fileHandle_.write(payload.data(), payload.size());
+                        fileHandle_.fsyncData();
+                        currentFileSize_ += payload.size();
+                    }
+                    catch (...) {
+                        // A failed write/sync can still have persisted the event.
+                        // Only reopening and replaying can resolve that outcome.
+                        termWriteError_ = std::current_exception();
+                        throw;
+                    }
                 }
             }
 
@@ -899,9 +943,10 @@ namespace akkaradb::engine::manifest {
             }
 
             void flushPendingForCompact() {
-                if (!fastMode_) { return; }
                 std::lock_guard rotationLock{rotationMutex_};
-                writeQueuedRecords();
+                if (!ownershipLock_) { throw std::runtime_error("Manifest: already closed"); }
+                if (termWriteError_) { std::rethrow_exception(termWriteError_); }
+                if (fastMode_) { writeQueuedRecords(); }
             }
 
             // Background batching is used for events without an SST/WAL durability handoff.
@@ -954,7 +999,9 @@ namespace akkaradb::engine::manifest {
 
                 const bool baseExists = pathExists(path_);
                 if (!baseExists) { return; }
-                baseFileSeq_ = readFileHeader(path_).fileSeq;
+                const auto header = readFileHeader(path_);
+                baseFileSeq_ = header.fileSeq;
+                { std::lock_guard lock{mutex_}; catalogHeader_ = header; }
 
                 const auto files = manifestFiles();
 
@@ -1142,6 +1189,8 @@ namespace akkaradb::engine::manifest {
             // ----------------------------------------------------------------
 
             std::filesystem::path path_;
+            std::unique_ptr<detail::StorageFileLock> ownershipLock_;
+            ManifestFileHeader catalogHeader_{};
             bool fastMode_;
             std::atomic<bool> running_;
             FileHandle fileHandle_;
@@ -1194,6 +1243,8 @@ namespace akkaradb::engine::manifest {
     Manifest::~Manifest() = default;
 
     void Manifest::start() { impl_->start(); }
+
+    std::array<uint8_t, 16> Manifest::catalogIdentity() const { return impl_->catalogIdentity(); }
 
     void Manifest::advance(uint64_t newCount) { impl_->advance(newCount); }
 
