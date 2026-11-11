@@ -54,6 +54,7 @@ namespace akkaradb::crypto {
      *
      * The file stores only the secret seed.  The X25519 key pair and public
      * fingerprint are derived from it at load time.
+     * New seed files are private to the creating account from creation onward.
      */
     class AKDB_API IdentityStore {
         public:

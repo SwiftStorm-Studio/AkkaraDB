@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "akk/core/Status.hpp"
 #include "akk/core/record/RecordView.hpp"
@@ -92,6 +93,25 @@ namespace akkaradb::engine::memtable {
     class AKDB_API IMemTable {
         public:
             virtual ~IMemTable() = default;
+
+            // Configure before writing. SST-backed engines require the largest
+            // retained sequence <= the read cut, regardless of application order.
+            virtual void useSequenceOrder() {
+                throw std::invalid_argument("MemTable backend does not support sequence-ordered versions");
+            }
+
+            // Called before the first write when a publication frontier requires
+            // versions beyond the backend's ordinary bounded history. Wrappers
+            // must forward this and flushIterator() to their underlying backend.
+            virtual void retainAllVersions() {
+                throw std::invalid_argument("MemTable backend does not support publication-safe version retention");
+            }
+
+            // Frozen input only. Unlike a user scan, persistence must enumerate
+            // every retained version, in key order (sequence order is arbitrary).
+            [[nodiscard]] virtual ArenaGenerator<RecordView> flushIterator() const {
+                return iterator({}, {}, UINT64_MAX);
+            }
 
             /**
              * @brief Insert or append a new record version.

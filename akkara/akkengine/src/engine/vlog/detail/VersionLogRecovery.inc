@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogRecovery.hpp
+// akkengine/src/engine/vlog/detail/VersionLogRecovery.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 [[nodiscard]] uint64_t trailingReadSegmentId() const {
     if (usesTrueParallelWrites() || opts_.syncMode != VLogSyncMode::ASYNC) { return std::numeric_limits<uint64_t>::max(); }
     std::lock_guard lock{writeMu_};

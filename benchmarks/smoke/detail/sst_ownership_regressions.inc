@@ -88,6 +88,48 @@ void testSstExclusiveOwnership(const std::filesystem::path& executable) {
     reopened.reset(); manifest.reset(); fs::remove_all(root, ec);
 }
 
+void testSstSnapshotMaxSequence() {
+    namespace fs = std::filesystem;
+    namespace sst = akkaradb::engine::sst;
+    const auto dir = fs::current_path() / ".bench-tmp" / "sst-snapshot-max-sequence";
+    std::error_code ec; fs::remove_all(dir, ec);
+    require(sst::SSTManager::ReadSnapshot{}.maxSequence() == 0, "default read snapshot must have maximum sequence zero");
+    sst::SSTManager::Options options; options.compactionMode = sst::SSTCompactionMode::DISABLED;
+    {
+        auto manager = sst::SSTManager::create(dir, options);
+        const auto empty = manager->readSnapshot();
+        require(manager->maxSequence() == 0 && empty.maxSequence() == 0, "empty SST state must have maximum sequence zero");
+        const std::vector<uint8_t> key{'a'}, value{'v'};
+        manager->flush(std::vector{record(key, value, 90)});
+        const auto first = manager->readSnapshot();
+        require(manager->maxSequence() == 90 && first.maxSequence() == 90, "flush did not publish its maximum sequence");
+
+        size_t produced = 0;
+        manager->flush(3, streamingFixture({
+            {.key = {'b'}, .value = {'v'}, .seq = 7},
+            {.key = {'c'}, .value = {}, .seq = 120, .flags = sst::SST_RECORD_FLAG_TOMBSTONE},
+            {.key = {'d'}, .value = {'v'}, .seq = 2}
+        }, produced));
+        const auto latest = manager->readSnapshot();
+        require(manager->maxSequence() == 120 && latest.maxSequence() == 120, "streaming flush must include tombstone maximum sequences");
+
+        manager->flush(std::vector{record(key, value, 11)});
+        require(manager->maxSequence() == 120 && manager->readSnapshot().maxSequence() == 120, "late lower-sequence flush reduced the maximum sequence");
+        require(empty.maxSequence() == 0 && first.maxSequence() == 90 && latest.maxSequence() == 120,
+            "publication changed the maximum sequence of a retained snapshot");
+
+        manager.reset();
+        manager = sst::SSTManager::create(dir, options); manager->recover();
+        const auto recovered = manager->readSnapshot();
+        require(manager->maxSequence() == 120 && recovered.maxSequence() == 120, "recovery did not rebuild the snapshot maximum sequence");
+        manager->flush(std::vector{record(key, value, UINT64_MAX)});
+        require(manager->maxSequence() == UINT64_MAX && manager->readSnapshot().maxSequence() == UINT64_MAX,
+            "snapshot maximum sequence truncated UINT64_MAX");
+        require(recovered.maxSequence() == 120, "flush changed the maximum sequence of a recovered snapshot");
+    }
+    fs::remove_all(dir, ec);
+}
+
 void testSstReadSnapshotAcrossCompaction() {
     namespace fs = std::filesystem;
     namespace sst = akkaradb::engine::sst;
@@ -102,6 +144,7 @@ void testSstReadSnapshotAcrossCompaction() {
         manager->flush(std::vector{record(key, newValue, 2)});
         waitForSst([&] { manager->throwIfBackgroundFailed(); return manager->compactionSnapshot().compactionsCompleted != 0; });
         require(snapshot.maxSequence() == 1 && snapshot.get(key, 1)->value == oldValue, "read snapshot lost a compacted version");
+        require(manager->maxSequence() == 2 && manager->readSnapshot().maxSequence() == 2, "compaction did not publish the current maximum sequence");
         require(manager->get(key)->value == newValue, "read snapshot changed the current SST head");
     }
     fs::remove_all(dir, ec);

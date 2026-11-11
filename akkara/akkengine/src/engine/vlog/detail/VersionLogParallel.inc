@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogParallel.hpp
+// akkengine/src/engine/vlog/detail/VersionLogParallel.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 void rotateParallelLaneIfNeeded(ParallelLane& lane) {
     if (opts_.segmentBytes == 0 || lane.bytes < opts_.segmentBytes) { return; }
     const uint64_t oldId = lane.segmentId;

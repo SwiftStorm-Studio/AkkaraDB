@@ -41,6 +41,7 @@ std::future<void> submitProposal(std::vector<RaftLogEntry> entries, std::shared_
     proposals_.push_back(proposal);
     proposalQueue_.push_back(proposal);
     cv_.notify_all();
+    proposalTask_->notify(Clock::now() + std::chrono::milliseconds{1});
     return future;
 }
 
@@ -94,90 +95,87 @@ void finishProposalsLocked() {
 void advanceLeaderCommit() {
     bool advanced = false;
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         if (!running_ || role_.load() != RaftRole::LEADER) { return; }
+        if (persistenceInFlight_) { proposalTask_->notify(); return; }
         for (auto it = log_.rbegin(); it != log_.rend() && it->index > commitIndex_; ++it) {
             if (!canCommitEntryLocked(*it)) { continue; }
             commitIndex_ = it->index;
-            persistLog();
+            persistLog(&lock);
             advanced = true;
             break;
         }
     }
-    applyCommitted();
+    scheduleApplication();
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
+        if (persistenceInFlight_) { proposalTask_->notify(); return; }
         finishProposalsLocked();
         peerReplicationCv_.notify_all();
     }
     if (advanced) { sendHeartbeats(); }
 }
 
-void proposalLoop() {
-    for (;;) {
-        try {
-            bool appended = false;
-            {
-                std::unique_lock lock{mutex_};
-                cv_.wait_for(lock, std::chrono::milliseconds{10}, [&] { return !running_ || !proposalQueue_.empty(); });
-                if (!running_) {
-                    finishProposalsLocked();
-                    proposalQueue_.clear();
-                    return;
-                }
-                if (!proposalQueue_.empty()) {
-                    // Coalesce concurrent admissions without waiting for prior quorum I/O.
-                    cv_.wait_for(lock, std::chrono::milliseconds{1}, [&] { return !running_ || proposalQueue_.size() >= 256; });
-                }
-                size_t batchBytes = 0;
-                for (size_t count = 0; running_ && !proposalQueue_.empty() && count < 256; ++count) {
-                    auto proposal = proposalQueue_.front();
-                    proposalQueue_.pop_front();
-                    if (proposal->error) { continue; }
-                    if (role_.load() != RaftRole::LEADER || currentTerm_ != proposal->term || Clock::now() >= proposal->deadline) {
-                        proposal->error = std::make_exception_ptr(std::runtime_error("Raft proposal expired before append"));
-                        continue;
-                    }
-                    const auto previousSize = log_.size();
-                    try {
-                        for (auto& entry : proposal->entries) {
-                            entry.term = currentTerm_;
-                            entry.index = lastLogIndex() + 1;
-                            if (!isValidStateMachineEntry(entry) || !entryPreservesStateMachineSequenceLocked(entry)) {
-                                throw std::invalid_argument("RaftConsensusRuntime: invalid proposal or state-machine sequence");
-                            }
-                            log_.push_back(std::move(entry));
-                        }
-                        proposal->index = lastLogIndex();
-                        proposal->entries.clear();
-                        appended = true;
-                        batchBytes += proposal->bytes;
-                    }
-                    catch (...) {
-                        invalidateLogSuffixLocked(lastIncludedIndex_ + previousSize + 1);
-                        log_.resize(previousSize);
-                        proposal->error = std::current_exception();
-                    }
-                    if (batchBytes >= 4 * 1024 * 1024) { break; }
-                }
-                if (appended) {
-                    persistLog();
-                    ++proposalBatches_;
-                    for (const auto& proposal : proposals_) { if (proposal->index != 0 && !proposal->error) { proposal->localDurable = true; } }
-                    cv_.notify_all();
-                }
+void proposalStep() {
+    try {
+        bool appended = false;
+        {
+            auto lock = stateLock();
+            if (!running_) {
                 finishProposalsLocked();
+                proposalQueue_.clear();
+                return;
             }
-            if (appended) { sendHeartbeats(); }
-            advanceLeaderCommit();
-        }
-        catch (...) {
-            std::lock_guard lock{mutex_};
-            stopRuntimeLocked();
+            size_t batchBytes = 0;
+            for (size_t count = 0; running_ && !proposalQueue_.empty() && count < 256; ++count) {
+                auto proposal = proposalQueue_.front();
+                proposalQueue_.pop_front();
+                if (proposal->error) { continue; }
+                if (role_.load() != RaftRole::LEADER || currentTerm_ != proposal->term || Clock::now() >= proposal->deadline) {
+                    proposal->error = std::make_exception_ptr(std::runtime_error("Raft proposal expired before append"));
+                    continue;
+                }
+                const auto previousSize = log_.size();
+                try {
+                    for (auto& entry : proposal->entries) {
+                        entry.term = currentTerm_;
+                        entry.index = lastLogIndex() + 1;
+                        if (!isValidStateMachineEntry(entry) || !entryPreservesStateMachineSequenceLocked(entry)) {
+                            throw std::invalid_argument("RaftConsensusRuntime: invalid proposal or state-machine sequence");
+                        }
+                        log_.push_back(std::move(entry));
+                    }
+                    proposal->index = lastLogIndex();
+                    proposal->entries.clear();
+                    appended = true;
+                    batchBytes += proposal->bytes;
+                }
+                catch (...) {
+                    invalidateLogSuffixLocked(lastIncludedIndex_ + previousSize + 1);
+                    log_.resize(previousSize);
+                    proposal->error = std::current_exception();
+                }
+                if (batchBytes >= 4 * 1024 * 1024) { break; }
+            }
+            if (appended) {
+                persistLog(&lock);
+                ++proposalBatches_;
+                for (const auto& proposal : proposals_) { if (proposal->index != 0 && !proposal->error) { proposal->localDurable = true; } }
+                cv_.notify_all();
+            }
             finishProposalsLocked();
-            proposalQueue_.clear();
-            return;
+            if (!proposalQueue_.empty()) { proposalTask_->notify(); }
+            for (const auto& proposal : proposals_) { proposalTask_->notify(proposal->deadline); }
         }
+        if (appended) { sendHeartbeats(); }
+        advanceLeaderCommit();
+    }
+    catch (...) {
+        auto lock = stateLock();
+        stopRuntimeLocked();
+        finishProposalsLocked();
+        proposalQueue_.clear();
+        return;
     }
 }
 
@@ -190,7 +188,7 @@ struct AdministrativeGuard {
         : runtime{owner}, serialization{detail::ReconfigurationDeadline::lock(owner.administrationMutex_)} { if (pause) { pauseWrites(); } }
 
     void pauseWrites() {
-        std::unique_lock lock{runtime.mutex_};
+        auto lock = runtime.stateLock();
         runtime.administrativeChange_ = true;
         if (!runtime.cv_.wait_until(
             lock,
@@ -206,7 +204,7 @@ struct AdministrativeGuard {
 
     ~AdministrativeGuard() {
         if (!paused) { return; }
-        std::lock_guard lock{runtime.mutex_};
+        auto lock = runtime.stateLock();
         runtime.administrativeChange_ = false;
         runtime.cv_.notify_all();
     }

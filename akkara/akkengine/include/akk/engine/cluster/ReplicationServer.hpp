@@ -104,7 +104,7 @@ namespace akkaradb::engine::cluster {
              *        configured for this primary.  ALL_CONFIGURED counts offline
              *        replicas too; legacy ALL_TARGETS only counts live links.
              * @param configuredReplicaNodeIds Valid data-bearing replica node ids;
-             *        empty preserves direct test/server use without membership filtering.
+             *        empty rejects every replica until allowReplica() admits a node.
              * @param runtimeOptions Transport and per-replica outbound queue limits.
              */
             [[nodiscard]] static std::unique_ptr<ReplicationServer> create(

@@ -42,7 +42,6 @@ namespace akkaradb::engine::sst {
             struct Options {
                 int level = 0;
                 uint32_t blockSize = SST_DEFAULT_BLOCK_SIZE;
-                uint64_t targetFileSize = SST_DEFAULT_TARGET_FILE_SIZE;
                 uint32_t bloomBitsPerKey = SST_DEFAULT_BLOOM_BITS_PER_KEY;
                 Codec codec = Codec::ZSTD;
                 int zstdCompressionLevel = 1;
@@ -75,7 +74,9 @@ namespace akkaradb::engine::sst {
                 std::span<const core::RecordView> records,
                 const Options& options
             );
-            // Yielded key/value buffers need only remain valid until the generator resumes.
+            // Writes one file. The estimate is a bounded reserve hint only; Bloom
+            // sizing uses the actual distinct-key count. Yielded key/value buffers
+            // need only remain valid until the generator resumes.
             [[nodiscard]] static Result write(
                 const std::filesystem::path& path,
                 size_t estimatedRecordCount,

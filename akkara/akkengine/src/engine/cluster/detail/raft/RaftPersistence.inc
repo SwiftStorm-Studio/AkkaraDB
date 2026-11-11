@@ -148,7 +148,7 @@ static std::vector<uint8_t> requestJournalRecord(uint8_t type, const RequestStat
     std::vector<uint8_t> framed; writeU32(framed, static_cast<uint32_t>(payload.size())); writeU32(framed, crcBytes(payload));
     framed.insert(framed.end(), payload.begin(), payload.end()); return framed;
 }
-void writeRequestJournalCheckpointLocked() {
+void writeRequestJournalCheckpointLocked(std::unique_lock<std::mutex>* lock = nullptr) {
     if (requestJournalGeneration_ == UINT64_MAX) { throw std::runtime_error("Raft request journal: generations exhausted"); }
     uint64_t generation = requestJournalGeneration_ + 1;
     while (std::filesystem::exists(requestJournalPath(generation))) {
@@ -157,29 +157,31 @@ void writeRequestJournalCheckpointLocked() {
     }
     std::vector<uint8_t> bytes{'A', 'K', 'R', 'Q', '2'};
     const auto record = requestJournalRecord(0, requestState_); bytes.insert(bytes.end(), record.begin(), record.end());
-    writeFileAtomically(requestJournalPath(generation), bytes, "Raft result-store checkpoint");
+    persistenceIO(lock, [&] { writeFileAtomically(requestJournalPath(generation), bytes, "Raft result-store checkpoint"); });
     crashAtLogTestPoint("raft.request.after_journal_sync");
     requestJournalBytesWritten_.fetch_add(bytes.size()); ++requestJournalCompactions_;
     requestJournalGeneration_ = generation; requestJournalBytes_ = bytes.size(); requestJournalRecords_ = 1; journalState_ = requestState_;
 }
-void prepareRequestJournalLocked() {
+void prepareRequestJournalLocked(std::unique_lock<std::mutex>* lock = nullptr) {
     if (journalState_ == requestState_) { return; }
-    if (resultStore_) { resultStore_->sync(); }
+    if (resultStore_) { persistenceIO(lock, [&] { resultStore_->sync(); }); }
     const auto forced = requestJournalCompactRecords();
     if (!requestJournalGeneration_ || requestJournalBytes_ >= REQUEST_JOURNAL_COMPACT_BYTES ||
         (forced && requestJournalRecords_ >= forced) || requestState_.generation != journalState_.generation) {
-        writeRequestJournalCheckpointLocked(); return;
+        writeRequestJournalCheckpointLocked(lock); return;
     }
     const auto path = requestJournalPath(requestJournalGeneration_);
     if (!std::filesystem::exists(path) || std::filesystem::file_size(path) < requestJournalBytes_) { throw std::runtime_error("Raft result checkpoint is missing"); }
     if (std::filesystem::file_size(path) != requestJournalBytes_) { std::filesystem::resize_file(path, requestJournalBytes_); }
     const auto record = requestJournalRecord(1, requestState_);
-    {
+    persistenceIO(lock, [&] {
         std::ofstream out{path, std::ios::binary | std::ios::app};
         out.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size())); out.flush();
         if (!out) { throw std::runtime_error("Raft result checkpoint write failed"); }
-    }
-    syncLogSegment(path); crashAtLogTestPoint("raft.request.after_journal_sync");
+        out.close();
+        syncLogSegment(path);
+    });
+    crashAtLogTestPoint("raft.request.after_journal_sync");
     requestJournalBytesWritten_.fetch_add(record.size()); requestJournalBytes_ += record.size(); ++requestJournalRecords_; journalState_ = requestState_;
 }
 void recoverRequestJournalLocked() {
@@ -270,31 +272,43 @@ void collectUnusedLogSegments() const noexcept {
     catch (...) { /* Cleanup is retryable; it cannot invalidate durable log state. */ }
 }
 
-void persistLog() {
+void persistLog(std::unique_lock<std::mutex>* lock = nullptr) {
     enforceLogInvariantsLocked("RaftConsensusRuntime log");
     const auto removed = persistedLogLocations_.reconcile(lastIncludedIndex_ + 1, lastLogIndex() + 1, changedLogFrom_);
     const auto common = persistedLogLocations_.size();
     auto& locations = persistedLogLocations_;
     try {
         if (common < log_.size()) {
-            std::filesystem::create_directories(logSegmentDir());
+            const bool createdDirectory = std::filesystem::create_directories(logSegmentDir());
             uint64_t segment = 0;
             uint64_t offset = 0;
+            bool createdSegment = false;
             if (!locations.empty() && std::filesystem::file_size(logSegmentPath(locations.back().segment)) == locations.back().end) {
                 segment = locations.back().segment;
                 offset = locations.back().end;
             }
-            std::ofstream out;
+            std::vector<uint8_t> segmentBytes;
             const auto finishSegment = [&] {
-                if (!out.is_open()) { return; }
-                out.flush();
-                if (!out) { throw std::runtime_error("Raft log: segment write failed"); }
-                out.close();
-                if (out.fail()) { throw std::runtime_error("Raft log: segment close failed"); }
-                syncLogSegment(logSegmentPath(segment));
-                #ifndef _WIN32
-                syncParentDirectory(logSegmentPath(segment), "Raft log segment");
-                #endif
+                if (segmentBytes.empty()) { return; }
+                persistenceIO(lock, [&] {
+                    std::ofstream out(logSegmentPath(segment), std::ios::binary | std::ios::app);
+                    if (!out) { throw std::runtime_error("Raft log: cannot append segment"); }
+                    out.write(reinterpret_cast<const char*>(segmentBytes.data()), static_cast<std::streamsize>(segmentBytes.size()));
+                    out.flush();
+                    if (!out) { throw std::runtime_error("Raft log: segment write failed"); }
+                    out.close();
+                    if (out.fail()) { throw std::runtime_error("Raft log: segment close failed"); }
+                    syncLogSegment(logSegmentPath(segment));
+                    // Appending to a previously published segment changes its
+                    // contents, not its directory entry. New names still need sync.
+                    if (createdSegment) {
+                        #ifndef _WIN32
+                        syncParentDirectory(logSegmentPath(segment), "Raft log segment");
+                        #endif
+                        createdSegment = false;
+                    }
+                });
+                segmentBytes.clear();
             };
             for (size_t i = common; i < log_.size(); ++i) {
                 const auto payload = encodeEntryPayload(log_[i]);
@@ -310,24 +324,23 @@ void persistLog() {
                     }
                     while (std::filesystem::exists(logSegmentPath(segment)));
                     offset = 0;
+                    createdSegment = true;
                 }
-                if (!out.is_open()) {
-                    out.open(logSegmentPath(segment), std::ios::binary | std::ios::app);
-                    if (!out) { throw std::runtime_error("Raft log: cannot append segment"); }
-                }
-                out.write(reinterpret_cast<const char*>(record.data()), static_cast<std::streamsize>(record.size()));
+                segmentBytes.insert(segmentBytes.end(), record.begin(), record.end());
                 locations.append(LogLocation{log_[i].index, log_[i].term, segment, offset, offset + record.size()});
                 offset += record.size();
             }
             finishSegment();
-            #ifndef _WIN32
-            syncParentDirectory(logSegmentDir(), "Raft log segment directory");
-            #endif
+            if (createdDirectory) {
+                #ifndef _WIN32
+                syncParentDirectory(logSegmentDir(), "Raft log segment directory");
+                #endif
+            }
             crashAtLogTestPoint("raft.after_segment_sync");
         }
 
         const auto& extents = locations.extents();
-        prepareRequestJournalLocked();
+        prepareRequestJournalLocked(lock);
         std::vector<uint8_t> bytes{'A', 'K', 'R', 'L', '2'};
         writeU64(bytes, commitIndex_);
         writeU64(bytes, lastApplied_);
@@ -354,9 +367,15 @@ void persistLog() {
         }
         writeU32(bytes, crcBytes(bytes));
         // Publish only after every referenced segment has reached disk.
-        writeFileAtomically(logPath_, bytes, "RaftConsensusRuntime log metadata");
+        if (bytes != persistedLogMetadata_) {
+            persistenceIO(lock, [&] { writeFileAtomically(logPath_, bytes, "RaftConsensusRuntime log metadata"); });
+            persistedLogMetadata_ = std::move(bytes);
+        }
         crashAtLogTestPoint("raft.after_log_metadata");
         changedLogFrom_ = UINT64_MAX;
+        durableLogIndex_ = lastLogIndex();
+        durableCommitIndex_ = commitIndex_;
+        durableAppliedIndex_ = lastApplied_;
     }
     catch (...) {
         // An atomic replacement can have succeeded before a sync error.
@@ -367,7 +386,10 @@ void persistLog() {
         throw;
     }
     if (removed) { collectUnusedLogSegments(); }
-    collectUnusedRequestJournals();
+    if (collectedRequestJournalGeneration_ != requestJournalGeneration_) {
+        collectUnusedRequestJournals();
+        collectedRequestJournalGeneration_ = requestJournalGeneration_;
+    }
 }
 
 void recoverLog() {
@@ -479,7 +501,7 @@ void recoverLog() {
 void validateRecoveredStateMachine() {
     if (!callbacks_.getLastSeq) { return; }
     const auto durableClientSeq = callbacks_.getLastSeq();
-    std::lock_guard lock{mutex_};
+    auto lock = stateLock();
     // A durable apply marker cannot replace the state machine it describes.
     // Snapshot intent owns recovery of its replacement image before replay.
     if (!durableSnapshotInstall_) {
@@ -500,7 +522,7 @@ void validateRecoveredStateMachine() {
 void recoverDurableSnapshotInstall() {
     std::optional<SnapshotInstallTransaction> transaction;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         transaction = durableSnapshotInstall_;
     }
     if (!transaction) { return; }
@@ -511,7 +533,7 @@ void recoverDurableSnapshotInstall() {
         else if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(transaction->snapshotSeq, transaction->entryCount); }
         if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
 
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (durableSnapshotInstall_ && durableSnapshotInstall_->snapshotSeq == transaction->snapshotSeq && durableSnapshotInstall_->lastIncludedIndex ==
             transaction->lastIncludedIndex && durableSnapshotInstall_->lastIncludedTerm == transaction->lastIncludedTerm) {
             const auto backup = captureDurableLogStateLocked();

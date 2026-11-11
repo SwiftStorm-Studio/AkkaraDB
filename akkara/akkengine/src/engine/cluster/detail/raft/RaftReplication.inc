@@ -33,7 +33,7 @@ bool claimPeerReplication(uint64_t peerId) {
 
 void releasePeerReplication(uint64_t peerId) noexcept {
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         if (auto* state = peerState(peerId); state != nullptr) { state->inFlight = false; }
     }
     peerReplicationCv_.notify_all();
@@ -48,7 +48,7 @@ bool replicateEntryToMajority(const RaftLogEntry& entry, std::chrono::millisecon
         detail::ReconfigurationDeadline::check();
         std::vector<NodeInfo> targets;
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (!running_ || role_.load() != RaftRole::LEADER || currentTerm_ != entry.term) { return false; }
             if (peerReplication_.empty()) { resetLeaderReplicationState(); }
             ensurePeerReplicationTargetsLocked(entryTargets ? &*entryTargets : nullptr);
@@ -56,7 +56,7 @@ bool replicateEntryToMajority(const RaftLogEntry& entry, std::chrono::millisecon
             targets = peers_;
         }
         for (const auto& peer : targets) { scheduleReplication(peer, entry.index, false); }
-        std::unique_lock lock{mutex_};
+        auto lock = stateLock();
         peerReplicationCv_.wait_until(
             lock,
             std::min(deadline, Clock::now() + std::chrono::milliseconds{50}),
@@ -75,14 +75,14 @@ bool commitOutstandingEntry(std::chrono::milliseconds retryWindow) {
     RaftLogEntry entry;
     uint64_t term = 0;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || role_.load() != RaftRole::LEADER || commitIndex_ == lastLogIndex() || log_.empty()) { return true; }
         entry = log_.back();
         term = currentTerm_;
     }
     if (!replicateEntryToMajority(entry, retryWindow)) { return false; }
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() != RaftRole::LEADER || currentTerm_ != term) { return false; }
         if (entry.index > commitIndex_ && canCommitEntryLocked(entry)) {
             const auto backup = captureDurableLogStateLocked(lastLogIndex() + 1);
@@ -121,8 +121,10 @@ bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat 
         uint64_t requestTerm = 0;
         auto needsSnapshot = false;
         AppendEntries appendRequest;
+        std::vector<std::vector<uint8_t>> pipeline;
+        std::vector<std::shared_ptr<void>> pipelineMemory;
         {
-            std::lock_guard lock{mutex_};
+            std::unique_lock lock{mutex_};
             if (!running_ || role_.load() != RaftRole::LEADER) { return false; }
             if (!containsNode(committedMembers_, peerId)) { migration = true; }
             auto* state = peerState(peerId);
@@ -137,10 +139,27 @@ bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat 
                 appendRequest.leaderId = selfNodeId_;
                 appendRequest.prevLogIndex = state->nextIndex - 1;
                 appendRequest.prevLogTerm = termAt(appendRequest.prevLogIndex);
-                appendRequest.leaderCommit = commitIndex_;
+                appendRequest.leaderCommit = durableCommitIndex_;
                 if (state->matchIndex < targetIndex) {
                     appendRequest.entries = entriesFrom(state->nextIndex);
                     if (appendRequest.entries.empty()) { return false; }
+                    auto nextIndex = appendRequest.entries.back().index + 1;
+                    // Optimistic ordered frames use the existing wire protocol. Bound
+                    // additional copies/encoding across every group hosted by this node.
+                    while (!migration && nextIndex <= targetIndex && nextIndex <= durableLogIndex_ && pipeline.size() + 1 < state->appendWindow) {
+                        constexpr auto copies = 3ull + (2ull * sizeof(RaftLogEntry) + RAFT_ENTRY_PAYLOAD_BASE_SIZE - 1) / RAFT_ENTRY_PAYLOAD_BASE_SIZE;
+                        auto memory = runtimeOptions_.nodeResourceBudget->raftPipeline->tryReserve(
+                            copies * (ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE));
+                        if (!memory) { break; }
+                        AppendEntries next;
+                        next.term = currentTerm_; next.leaderId = selfNodeId_;
+                        next.prevLogIndex = nextIndex - 1; next.prevLogTerm = termAt(next.prevLogIndex);
+                        next.leaderCommit = durableCommitIndex_; next.entries = entriesFrom(nextIndex);
+                        if (next.entries.empty()) { break; }
+                        nextIndex = next.entries.back().index + 1;
+                        pipeline.push_back(encodeAppendEntries(next));
+                        pipelineMemory.push_back(std::move(memory));
+                    }
                 }
             }
         }
@@ -150,7 +169,7 @@ bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat 
                 if (response.term > requestTerm) { becomeFollower(response.term); }
                 return false;
             }
-            std::lock_guard lock{mutex_};
+            std::unique_lock lock{mutex_};
             if (!running_ || role_.load() != RaftRole::LEADER || currentTerm_ != requestTerm || response.term != requestTerm) { return false; }
             if (auto* state = peerState(peerId); state != nullptr) {
                 state->matchIndex = std::max(state->matchIndex, response.lastIncludedIndex);
@@ -175,20 +194,28 @@ bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat 
             }
         }
         const auto appendStarted = Clock::now();
-        if (!appendEntries(peer, appendRequest, response)) {
-            std::lock_guard lock{mutex_};
-            if (currentTerm_ == requestTerm) { if (auto* state = peerState(peerId)) { state->successfulAppend.reset(); } }
+        if (!appendEntriesWindow(peer, appendRequest, pipeline, response)) {
+            std::unique_lock lock{mutex_};
+            if (currentTerm_ == requestTerm) {
+                if (auto* state = peerState(peerId)) { state->successfulAppend.reset(); state->appendWindow = 1; }
+            }
             return false;
         }
         if (response.term > appendRequest.term) {
             becomeFollower(response.term);
             return false;
         }
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         if (!running_ || role_.load() != RaftRole::LEADER || currentTerm_ != requestTerm || response.term != requestTerm) { return false; }
         auto* state = peerState(peerId);
         if (state == nullptr) { return false; }
         if (response.success) {
+            if (!appendRequest.entries.empty() && !migration) {
+                const auto elapsed = Clock::now() - appendStarted;
+                const auto budget = std::chrono::milliseconds{rpcTimeoutMs(1000)};
+                if (elapsed < budget / 2) { state->appendWindow = std::min<size_t>(4, state->appendWindow + 1); }
+                else if (elapsed > budget * 3 / 4) { state->appendWindow = std::max<size_t>(1, state->appendWindow / 2); }
+            }
             state->observedTerm = requestTerm;
             state->successfulAppend = appendStarted;
             auto degraded = ClusterHealthState::DEGRADED;
@@ -203,6 +230,7 @@ bool replicatePeerTo(uint64_t peerId, uint64_t targetIndex, bool forceHeartbeat 
         }
         else {
             state->successfulAppend.reset();
+            state->appendWindow = 1;
             const auto before = state->nextIndex;
             updateNextIndexAfterConflictLocked(*state, response);
             // A peer which repeatedly refuses the same prefix must
@@ -216,11 +244,11 @@ void sendHeartbeats() {
     std::vector<NodeInfo> targets;
     uint64_t targetCommit = 0;
     {
-        std::lock_guard lock{mutex_};
+        std::unique_lock lock{mutex_};
         if (!running_ || role_.load() != RaftRole::LEADER) { return; }
         if (peerReplication_.empty()) { resetLeaderReplicationState(); }
         ensurePeerReplicationTargetsLocked();
-        targetCommit = lastLogIndex();
+        targetCommit = durableLogIndex_;
         targets = peers_;
     }
     for (const auto& peer : targets) { scheduleReplication(peer, targetCommit, true); }
@@ -231,7 +259,7 @@ AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
     std::optional<NodeRole> roleChange;
     std::optional<AppendEntriesResponse> earlyResponse;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || applyFailed_.load() || !isReplicationMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
             return AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
         }
@@ -250,9 +278,23 @@ AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
         roleChange = setRole(RaftRole::FOLLOWER);
         recordLeaderContactLocked();
 
-        if (request.prevLogIndex < lastIncludedIndex_) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
-        else if (request.prevLogIndex > lastLogIndex()) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
-        else if (termAt(request.prevLogIndex) != request.prevLogTerm) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
+        // Allow one append frame to overlap application, then backpressure new
+        // payloads. A blocked apply/snapshot must not accumulate an unbounded log.
+        // Heartbeats and retransmitted prefixes can still advance durable commit.
+        cv_.wait(lock, [&] {
+            return !running_ || request.term != currentTerm_ || !activeApplications_ ||
+                request.entries.empty() || request.entries.back().index <= lastLogIndex() || lastLogIndex() <= applicationBoundary_;
+        });
+        waitForPersistenceLocked(lock);
+        if (!running_ || applyFailed_.load() || request.term != currentTerm_ ||
+            !isReplicationMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
+            earlyResponse = AppendEntriesResponse{.term = currentTerm_, .success = false, .matchIndex = lastLogIndex()};
+        }
+        if (!earlyResponse) {
+            if (request.prevLogIndex < lastIncludedIndex_) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
+            else if (request.prevLogIndex > lastLogIndex()) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
+            else if (termAt(request.prevLogIndex) != request.prevLogTerm) { earlyResponse = conflictResponseLocked(request.prevLogIndex); }
+        }
         if (earlyResponse) { response = *earlyResponse; }
         else {
             const auto backup = captureDurableLogStateLocked(request.prevLogIndex + 1);
@@ -298,7 +340,7 @@ AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
                         commitIndex_ = std::min(request.leaderCommit, acceptedMatchIndex);
                         mutatedLogState = true;
                     }
-                    if (mutatedLogState) { persistLog(); }
+                    if (mutatedLogState) { persistLog(&lock); }
                     observeLeaderLocked(request.term, request.leaderId);
                     response = AppendEntriesResponse{.term = currentTerm_, .success = true, .matchIndex = acceptedMatchIndex};
                     auto degraded = ClusterHealthState::DEGRADED;
@@ -313,7 +355,9 @@ AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
     }
     notifyRoleChange(roleChange);
     if (earlyResponse) { return response; }
-    applyCommitted();
+    // The log and commit boundary are durable. State-machine latency must not
+    // delay the follower's consensus acknowledgement or subsequent frames.
+    scheduleApplication();
     return response;
 }
 

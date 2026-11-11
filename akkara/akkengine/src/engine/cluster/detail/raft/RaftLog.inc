@@ -19,12 +19,12 @@ uint64_t lastLogIndex() const noexcept { return log_.empty() ? lastIncludedIndex
 
 uint64_t lastLogTerm() const noexcept { return log_.empty() ? lastIncludedTerm_ : log_.back().term; }
 
-std::optional<RaftLogEntry> entryAt(uint64_t index) const {
-    if (index <= lastIncludedIndex_) { return std::nullopt; }
+const RaftLogEntry* entryAt(uint64_t index) const {
+    if (index <= lastIncludedIndex_) { return nullptr; }
     const auto offset = index - lastIncludedIndex_ - 1;
-    if (offset >= log_.size()) { return std::nullopt; }
+    if (offset >= log_.size()) { return nullptr; }
     const auto& entry = log_[static_cast<size_t>(offset)];
-    return entry.index == index ? std::optional<RaftLogEntry>{entry} : std::nullopt;
+    return entry.index == index ? &entry : nullptr;
 }
 
 uint64_t termAt(uint64_t index) const {
@@ -41,8 +41,8 @@ std::vector<RaftLogEntry> entriesFrom(uint64_t nextIndex) const {
     const auto offset = nextIndex <= lastIncludedIndex_ ? 0 : nextIndex - lastIncludedIndex_ - 1;
     for (size_t i = static_cast<size_t>(std::min<uint64_t>(offset, log_.size())); i < log_.size(); ++i) {
         const auto& entry = log_[i];
-        const auto entryPayload = encodeEntryPayload(entry);
-        const size_t entrySize = RAFT_ENTRY_LENGTH_PREFIX_SIZE + entryPayload.size();
+        if (entry.index > durableLogIndex_) { break; }
+        const size_t entrySize = RAFT_ENTRY_LENGTH_PREFIX_SIZE + entryPayloadSize(entry);
         if (payloadSize + entrySize > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) {
             if (entries.empty()) { return {}; }
             break;
@@ -206,7 +206,7 @@ bool shouldCompactLogLocked(Clock::time_point now) const {
 void maybeCompactLog(bool force = false) {
     if (!runtimeOptions_.raftSnapshot.enabled || !callbacks_.exportSnapshot) { return; }
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
         const auto now = Clock::now();
         if (!force && now < nextCompactionCheck_) { return; }
@@ -216,7 +216,7 @@ void maybeCompactLog(bool force = false) {
     std::unique_lock applyLock{applyMutex_, std::try_to_lock};
     if (!applyLock.owns_lock()) { return; }
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
         if (!force && !shouldCompactLogLocked(Clock::now())) { return; }
     }
@@ -224,7 +224,7 @@ void maybeCompactLog(bool force = false) {
     try { snapshot = callbacks_.exportSnapshot(); }
     catch (const TransactionSnapshotUnavailable&) { return; }
     if (!snapshot) { return; }
-    std::lock_guard lock{mutex_};
+    auto lock = stateLock();
     if (!running_ || durableSnapshotInstall_ || pendingSnapshotInstall_.active) { return; }
     const auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
     if (!logIndex || *logIndex <= lastIncludedIndex_ || *logIndex > commitIndex_) { return; }

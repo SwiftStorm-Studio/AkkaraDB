@@ -200,7 +200,8 @@ void testRaftReceiverStorageLimits() {
         AKK_CLUSTER_CHECK(state.lastLogIndex == 0 && state.commitIndex == 0 && state.appliedIndex == 0 && harness->appliedCount.load() == 0);
     }
     const auto response = append(1, 1);
-    AKK_CLUSTER_CHECK(response.payload.at(8) == 1 && harness->hasState(1, "k", "v"));
+    AKK_CLUSTER_CHECK(response.payload.at(8) == 1);
+    AKK_CLUSTER_CHECK(waitUntil([&] { return harness->hasState(1, "k", "v"); }));
     peer.close(); harness->runtime->close();
 }
 

@@ -81,6 +81,8 @@ namespace akkaradb::engine::memtable {
         const size_t bytes = sizeof(VersionChain) + slotBytes;
         std::byte* mem = dataArena_.allocate(bytes, alignof(VersionChain));
         VersionChain* chain = new(mem) VersionChain{};
+        chain->history.sequenceOrdered = sequenceOrderedVersions_;
+        if (retainAllVersions_) { chain->history.append(initial, dataArena_, bytes_); }
         chain->capacity = maxVersionsPerKey_;
         auto* ring = chain->ring();
         for (uint16_t i = 0; i < maxVersionsPerKey_; ++i) { new(&ring[i]) std::atomic<const core::OwnedRecord*>{nullptr}; }
@@ -153,9 +155,26 @@ namespace akkaradb::engine::memtable {
         return lo;
     }
 
-    void BPTreeMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept {
+    void BPTreeMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) {
         if (chain == nullptr) { return; }
-
+        if (retainAllVersions_) {
+            chain->history.append(record, dataArena_, bytes_);
+            entries.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (sequenceOrderedVersions_) {
+            chain->version.fetch_add(1, std::memory_order_acq_rel);
+            auto head = chain->head.load(std::memory_order_relaxed);
+            auto count = chain->count.load(std::memory_order_relaxed);
+            const bool grew = detail::insertSequenceOrdered(chain->capacity, head, count, record,
+                [&](uint16_t index) { return chain->ring()[index].load(std::memory_order_relaxed); },
+                [&](uint16_t index, const core::OwnedRecord* value) { chain->ring()[index].store(value, std::memory_order_relaxed); });
+            chain->head.store(head, std::memory_order_relaxed);
+            chain->count.store(count, std::memory_order_relaxed);
+            if (grew) { entries.fetch_add(1, std::memory_order_relaxed); }
+            chain->version.fetch_add(1, std::memory_order_release);
+            return;
+        }
         chain->version.fetch_add(1, std::memory_order_acq_rel);
 
         const uint16_t capacity = chain->capacity;
@@ -177,6 +196,7 @@ namespace akkaradb::engine::memtable {
 
     bool BPTreeMemTable::visibleRecord(VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
+        if (chain->history.latest.load(std::memory_order_acquire)) { return chain->history.get(snapshotSeq, out); }
 
         for (;;) {
             const uint64_t begin = chain->version.load(std::memory_order_acquire);
@@ -490,7 +510,7 @@ namespace akkaradb::engine::memtable {
         return false;
     }
 
-    ArenaGenerator<RecordView> BPTreeMemTable::iterateFrozenSnapshot(uint64_t snapshotSeq) const {
+    ArenaGenerator<RecordView> BPTreeMemTable::iterateFrozenSnapshot(uint64_t snapshotSeq, bool allVersions) const {
         Node* node = root_.load(std::memory_order_acquire);
         while (node != nullptr && !node->isLeaf) { node = node->children[0].load(std::memory_order_acquire); }
 
@@ -499,7 +519,20 @@ namespace akkaradb::engine::memtable {
             for (uint16_t i = 0; i < keyCount; ++i) {
                 VersionChain* chain = node->chains[i].load(std::memory_order_acquire);
                 RecordView visible;
-                if (visibleRecord(chain, snapshotSeq, &visible)) { co_yield visible; }
+                if (allVersions) {
+                    if (retainAllVersions_) {
+                        for (const auto& record : chain->history.records()) { co_yield record; }
+                    }
+                    else {
+                        const auto head = chain->head.load(std::memory_order_relaxed);
+                        const auto count = chain->count.load(std::memory_order_relaxed);
+                        for (uint16_t j = 0; j < count; ++j) {
+                            const auto index = static_cast<uint16_t>((head + chain->capacity - j) % chain->capacity);
+                            co_yield toView(*chain->ring()[index].load(std::memory_order_relaxed));
+                        }
+                    }
+                }
+                else if (visibleRecord(chain, snapshotSeq, &visible)) { co_yield visible; }
             }
             node = node->nextLeaf.load(std::memory_order_acquire);
         }
@@ -934,6 +967,23 @@ namespace akkaradb::engine::memtable {
                                   : iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned)));
             }
         );
+    }
+
+    void BPTreeMemTable::retainAllVersions() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: retention must be configured before writing"); }
+        retainAllVersions_ = true;
+    }
+
+    void BPTreeMemTable::useSequenceOrder() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: version order must be configured before writing"); }
+        sequenceOrderedVersions_ = true;
+    }
+
+    ArenaGenerator<RecordView> BPTreeMemTable::flushIterator() const {
+        if (!frozen_.load(std::memory_order_acquire)) { throw std::logic_error("MemTable: flush requires a frozen backend"); }
+        return ArenaGenerator<RecordView>::withOwnedArena(
+            generatorArenaInitialBlockSize_, generatorArenaMaxBlockSize_,
+            [this] { return iterateFrozenSnapshot(UINT64_MAX, true); });
     }
 
     void BPTreeMemTable::freeze() {

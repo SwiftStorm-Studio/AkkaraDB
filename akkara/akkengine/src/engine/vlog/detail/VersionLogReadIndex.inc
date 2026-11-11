@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogReadIndex.hpp
+// akkengine/src/engine/vlog/detail/VersionLogReadIndex.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 class IndexUnavailable final : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;

@@ -190,6 +190,7 @@ struct PeerReplicationState {
     uint64_t nextIndex = 1;
     uint64_t matchIndex = 0;
     bool inFlight = false;
+    size_t appendWindow = 1;
     uint64_t observedTerm = 0;
     std::optional<Clock::time_point> successfulAppend{};
 };
@@ -298,8 +299,14 @@ bool readOptionalNodeSetField(std::span<const uint8_t> in, size_t& cursor, std::
     return true;
 }
 
+static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 53;
+size_t entryPayloadSize(const RaftLogEntry& entry) {
+    return RAFT_ENTRY_PAYLOAD_BASE_SIZE + (entry.requestId ? 64u : 0u) + entry.key.size() + entry.value.size();
+}
+
 std::vector<uint8_t> encodeEntryPayload(const RaftLogEntry& entry) {
     std::vector<uint8_t> out;
+    out.reserve(entryPayloadSize(entry));
     writeU64(out, entry.term);
     writeU64(out, entry.index);
     writeU64(out, entry.clientSeq);
@@ -766,7 +773,6 @@ struct RaftBlobChunk {
 
 static constexpr size_t RAFT_APPEND_ENTRIES_BASE_SIZE = 44;
 static constexpr size_t RAFT_ENTRY_LENGTH_PREFIX_SIZE = 4;
-static constexpr size_t RAFT_ENTRY_PAYLOAD_BASE_SIZE = 53;
 static constexpr size_t RAFT_BLOB_CHUNK_KEY_SIZE = 28;
 
 uint32_t maxRaftBlobChunkSizeBytes() {

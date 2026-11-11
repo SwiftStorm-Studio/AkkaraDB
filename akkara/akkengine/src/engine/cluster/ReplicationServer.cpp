@@ -388,7 +388,6 @@ namespace akkaradb::engine::cluster {
                 ReadRequest request;
                 std::shared_ptr<void> reservation;
             };
-            std::optional<PendingRead> pendingRead;
             struct PendingStripeControl {
                 StripeControlRequest request;
                 std::shared_ptr<void> reservation;
@@ -451,6 +450,7 @@ namespace akkaradb::engine::cluster {
             std::condition_variable ackCv;
             std::unordered_set<uint64_t> lagBlockedReplicas;
             std::unique_ptr<detail::BoundedExecutor> stripeControlExecutor;
+            std::unique_ptr<detail::BoundedExecutor> readExecutor, storageReadExecutor;
             mutable std::mutex failureMutex;
             std::exception_ptr replicationFailure;
             std::function<void(std::exception_ptr)> fatalFailureCallback;
@@ -549,6 +549,8 @@ namespace akkaradb::engine::cluster {
                 reaperStopping.store(false);
                 try {
                     stripeControlExecutor = std::make_unique<detail::BoundedExecutor>(4, 64);
+                    readExecutor = std::make_unique<detail::BoundedExecutor>(4, 64);
+                    storageReadExecutor = std::make_unique<detail::BoundedExecutor>(4, 64);
                     reaperThread = std::thread([this] { reapLoop(); });
                     for (size_t i = 0; i < HANDSHAKE_WORKERS; ++i) {
                         handshakeWorkers.emplace_back([this] { handshakeLoop(); });
@@ -593,6 +595,8 @@ namespace akkaradb::engine::cluster {
                 reaperCv.notify_all();
                 if (reaperThread.joinable()) { reaperThread.join(); }
                 stripeControlExecutor.reset();
+                readExecutor.reset();
+                storageReadExecutor.reset();
             }
 
             void reapLoop() {
@@ -737,7 +741,7 @@ namespace akkaradb::engine::cluster {
                 }
                 {
                     std::lock_guard lock{replicasMutex};
-                    if (!configuredReplicaNodeIds.empty() && !std::ranges::contains(configuredReplicaNodeIds, hello.nodeId)) { return false; }
+                    if (!std::ranges::contains(configuredReplicaNodeIds, hello.nodeId)) { return false; }
                 }
                 if (secure) {
                     const auto expected = pinnedPeerKey(runtimeOptions, hello.nodeId);
@@ -1124,22 +1128,43 @@ namespace akkaradb::engine::cluster {
                 return sendTo(replica, *wire);
             }
 
+            bool handleForwardRequest(const std::shared_ptr<ReplicaState>& replica, ReplicaState::PendingForward pending) {
+                ForwardResponse response;
+                response.errorCode = ClusterRoutingCode::FORWARD_UNAVAILABLE;
+                const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    pending.deadline - std::chrono::steady_clock::now()).count();
+                if (forwardCallback && remaining > 0) {
+                    pending.request.timeoutMs = static_cast<uint32_t>(remaining);
+                    try { response = forwardCallback(pending.request); }
+                    catch (const ClusterRoutingError& error) {
+                        response.errorCode = error.code; response.target = error.target; response.message = error.what();
+                    }
+                    catch (const std::exception& error) { response.errorCode = forwardMayMutate(pending.request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; response.message = error.what(); }
+                    catch (...) { response.errorCode = forwardMayMutate(pending.request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; }
+                }
+                response.requestId = pending.request.requestId;
+                response.message.resize(std::min<size_t>(4096, response.message.size()));
+                auto wire = encodeForwardResponse(response);
+                if (wire.empty()) {
+                    response = {}; response.requestId = pending.request.requestId;
+                    response.errorCode = forwardMayMutate(pending.request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::PAYLOAD_TOO_LARGE;
+                    wire = encodeForwardResponse(response);
+                }
+                const auto message = detail::messageFromWire(std::move(wire), transferBudget);
+                return sendTo(replica, *message);
+            }
+
             void readLoop(const std::shared_ptr<ReplicaState>& replica) {
                 while (!replica->dead.load()) {
-                    std::optional<ReplicaState::PendingRead> pendingRead;
                     std::optional<ReplicaState::PendingStripeControl> pendingControl;
                     std::optional<ReplicaState::PendingForward> pendingForward;
                     {
                         std::unique_lock lock{replica->readMutex};
                         replica->readCv.wait(lock, [&] {
-                            return replica->dead.load() || replica->pendingRead.has_value() || replica->pendingStripeControl.has_value() || !replica->pendingForwards.empty();
+                            return replica->dead.load() || replica->pendingStripeControl.has_value() || !replica->pendingForwards.empty();
                         });
                         if (replica->dead.load()) { return; }
-                        if (replica->pendingRead) {
-                            pendingRead = std::move(replica->pendingRead);
-                            replica->pendingRead.reset();
-                        }
-                        else if (replica->pendingStripeControl) {
+                        if (replica->pendingStripeControl) {
                             pendingControl = std::move(replica->pendingStripeControl);
                             replica->pendingStripeControl.reset();
                         }
@@ -1150,31 +1175,8 @@ namespace akkaradb::engine::cluster {
                     }
                     try {
                         if (pendingForward) {
-                            ForwardResponse response;
-                            response.errorCode = ClusterRoutingCode::FORWARD_UNAVAILABLE;
-                            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                pendingForward->deadline - std::chrono::steady_clock::now()).count();
-                            if (forwardCallback && remaining > 0) {
-                                pendingForward->request.timeoutMs = static_cast<uint32_t>(remaining);
-                                try { response = forwardCallback(pendingForward->request); }
-                                catch (const ClusterRoutingError& error) {
-                                    response.errorCode = error.code; response.target = error.target; response.message = error.what();
-                                }
-                                catch (const std::exception& error) { response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; response.message = error.what(); }
-                                catch (...) { response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::FORWARD_UNAVAILABLE; }
-                            }
-                            response.requestId = pendingForward->request.requestId;
-                            response.message.resize(std::min<size_t>(4096, response.message.size()));
-                            auto wire = encodeForwardResponse(response);
-                            if (wire.empty()) {
-                                response = {}; response.requestId = pendingForward->request.requestId;
-                                response.errorCode = forwardMayMutate(pendingForward->request.operation) ? ClusterRoutingCode::OUTCOME_UNKNOWN : ClusterRoutingCode::PAYLOAD_TOO_LARGE;
-                                wire = encodeForwardResponse(response);
-                            }
-                            const auto message = detail::messageFromWire(std::move(wire), transferBudget);
-                            if (sendTo(replica, *message)) { continue; }
+                            if (handleForwardRequest(replica, std::move(*pendingForward))) { continue; }
                         }
-                        if (pendingRead && handleReadRequest(replica, pendingRead->request)) { continue; }
                         if (pendingControl) {
                             StripeControlResponse response;
                             if (stripeControlCallback) {
@@ -1251,12 +1253,26 @@ namespace akkaradb::engine::cluster {
                             if (!decodeReadRequest(frame.payload, pending.request)) { break; }
                         }
                         catch (...) { break; }
-                        {
-                            std::lock_guard lock{replica->readMutex};
-                            if (replica->pendingRead) { break; } // Bound pipelined work per connection.
-                            replica->pendingRead = std::move(pending);
+                        // Public STRIPE reads can request local-storage shards recursively.
+                        // Keep leaf reads independent of saturated coordinator workers.
+                        const bool storage = pending.request.keySpace == ReadKeySpace::LOCAL_STORAGE;
+                        auto* executor = storage ? storageReadExecutor.get() : readExecutor.get();
+                        const auto id = pending.request.requestId;
+                        bool admitted;
+                        try {
+                            admitted = executor->trySubmit([this, replica, pending = std::move(pending)] {
+                                if (replica->dead.load()) { return; }
+                                try { if (handleReadRequest(replica, pending.request)) { return; } } catch (...) {}
+                                requestReplicaStop(replica);
+                            });
+                        } catch (...) { break; }
+                        if (!admitted) {
+                            ReadResponse rejected; rejected.requestId = id; rejected.status = ReadStatus::ERROR_STATUS;
+                            try {
+                                const auto response = detail::readResponseMessage(rejected, transferBudget);
+                                if (!sendTo(replica, *response)) { break; }
+                            } catch (...) { break; }
                         }
-                        replica->readCv.notify_one();
                         continue;
                     }
                     if (frame.type == ReplMsgType::FORWARD_REQUEST) {
@@ -1267,6 +1283,25 @@ namespace akkaradb::engine::cluster {
                         }
                         catch (...) { break; }
                         pending.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(pending.request.timeoutMs);
+                        if (pending.request.operation == ForwardOperation::GET) {
+                            const auto id = pending.request.requestId;
+                            bool admitted;
+                            try {
+                                admitted = readExecutor->trySubmit([this, replica, pending = std::move(pending)] {
+                                    if (replica->dead.load()) { return; }
+                                    try { if (handleForwardRequest(replica, std::move(pending))) { return; } } catch (...) {}
+                                    requestReplicaStop(replica);
+                                });
+                            } catch (...) { break; }
+                            if (!admitted) {
+                                ForwardResponse rejected; rejected.requestId = id; rejected.errorCode = ClusterRoutingCode::FORWARD_UNAVAILABLE;
+                                try {
+                                    const auto response = detail::messageFromWire(encodeForwardResponse(rejected), transferBudget);
+                                    if (!sendTo(replica, *response)) { break; }
+                                } catch (...) { break; }
+                            }
+                            continue;
+                        }
                         {
                             std::lock_guard lock{replica->readMutex};
                             if (replica->pendingForwards.size() >= 64) { break; }

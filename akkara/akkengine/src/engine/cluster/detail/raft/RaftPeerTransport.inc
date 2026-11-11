@@ -9,6 +9,15 @@
 
 
 // Included inside RaftConsensusRuntime::Impl.
+void forwardPoolStep() {
+    std::unique_lock lock{workersMutex_};
+    if (workersStopping_) { return; }
+    std::erase_if(idleForwardChannels_, [](const auto& idle) { return Clock::now() >= idle.expires; });
+    if (!idleForwardChannels_.empty()) {
+        forwardPoolTask_->notify(std::ranges::min(idleForwardChannels_, {}, &IdleForwardChannel::expires).expires);
+    }
+}
+
 std::shared_ptr<PeerWorker> peerWorker(uint64_t peerId) {
     std::lock_guard lock{workersMutex_};
     if (workersStopping_) { throw std::runtime_error("Raft transport is closing"); }
@@ -45,7 +54,7 @@ std::shared_ptr<PeerWorker> peerWorker(uint64_t peerId) {
                         }
                     }
                     catch (...) {
-                        std::lock_guard lock{mutex_};
+                        auto lock = stateLock();
                         stopRuntimeLocked();
                     }
                 }
@@ -79,7 +88,7 @@ std::future<void> schedulePeerTask(uint64_t peerId, std::function<void()> fn) {
 void retirePeerWorkers() {
     std::vector<NodeInfo> peers;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         peers = peers_;
     }
     std::vector<std::shared_ptr<PeerWorker>> retired;
@@ -117,7 +126,10 @@ bool exchangeRpc(
     DecodedFrame& frame,
     int timeoutMs,
     bool* submitted = nullptr,
-    ForwardRequest* forwardRequest = nullptr
+    ForwardRequest* forwardRequest = nullptr,
+    ForwardResponse* forwardResponse = nullptr,
+    const std::vector<std::vector<uint8_t>>* pipeline = nullptr,
+    std::vector<AppendEntriesResponse>* appendResponses = nullptr
 ) {
     const auto deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds(timeoutMs));
     auto worker = forwardRequest ? std::make_shared<PeerWorker>() : peerWorker(peer.nodeId);
@@ -126,12 +138,41 @@ bool exchangeRpc(
         std::shared_ptr<PeerWorker> channel;
         bool placementRead = false;
         std::shared_ptr<void> nodeLease;
+        bool reusable = false;
 
         ~ForwardChannelGuard() {
             if (!owner) { return; }
             std::lock_guard lock{owner->workersMutex_};
             auto& channels = placementRead ? owner->placementReadChannels_ : owner->forwardChannels_;
             std::erase_if(channels, [&](const auto& weak) { return weak.expired() || weak.lock() == channel; });
+            // Idle leases are reclaimable across every group on this node.
+            if (reusable && !owner->workersStopping_ && owner->runtimeOptions_.raftMaxForwardRequests > 1 &&
+                owner->runtimeOptions_.nodeResources.outgoingForwardRequests > 1 &&
+                owner->runtimeOptions_.nodeResources.incomingForwardRequests > 1) {
+                try {
+                    // Forward-only request-authority clients also use this lazy cache task.
+                    if (!owner->forwardPoolTask_) {
+                        owner->forwardPoolTask_ = owner->runtimeOptions_.nodeResourceBudget->scheduler()->task(
+                            [runtime = owner] { runtime->forwardPoolStep(); });
+                    }
+                    const auto quota = placementRead ? owner->runtimeOptions_.nodeResourceBudget->outgoingControl
+                        : owner->runtimeOptions_.nodeResourceBudget->outgoingForward;
+                    quota->park(nodeLease, [weak = std::weak_ptr<PeerWorker>{channel}] {
+                        if (auto worker = weak.lock()) {
+                            std::lock_guard lock{worker->socketMutex}; shutdownSocket(worker->socket);
+                        }
+                    });
+                    const size_t limit = placementRead ? 1 : std::min<size_t>(8, owner->runtimeOptions_.raftMaxForwardRequests);
+                    if (std::ranges::count(owner->idleForwardChannels_, placementRead, &IdleForwardChannel::control) >=
+                        static_cast<std::ptrdiff_t>(limit)) {
+                        const auto oldest = std::ranges::find(owner->idleForwardChannels_, placementRead, &IdleForwardChannel::control);
+                        owner->idleForwardChannels_.erase(oldest);
+                    }
+                    owner->idleForwardChannels_.push_back({channel, std::move(nodeLease), placementRead,
+                        Clock::now() + std::chrono::seconds{2}});
+                    owner->forwardPoolTask_->notify(owner->idleForwardChannels_.back().expires);
+                } catch (...) { /* Pooling is optional; destruction closes the channel. */ }
+            }
             owner->forwardChannelsCv_.notify_all();
         }
     } forwardGuard;
@@ -152,18 +193,30 @@ bool exchangeRpc(
         channels.push_back(worker);
         forwardGuard.owner = this;
         forwardGuard.channel = worker;
+        const auto quota = forwardGuard.placementRead ? runtimeOptions_.nodeResourceBudget->outgoingControl
+            : runtimeOptions_.nodeResourceBudget->outgoingForward;
+        std::erase_if(idleForwardChannels_, [&](const auto& cached) {
+            if (cached.expires <= Clock::now()) { return true; }
+            return false;
+        });
+        const auto idle = std::ranges::find_if(idleForwardChannels_, [&](const auto& cached) {
+            return cached.control == forwardGuard.placementRead && cached.worker->endpoint.nodeId == peer.nodeId &&
+                cached.worker->endpoint.host == peer.host && cached.worker->endpoint.replPort == peer.replPort &&
+                quota->activate(cached.nodeLease);
+        });
+        if (idle != idleForwardChannels_.end()) {
+            worker = idle->worker;
+            forwardGuard.nodeLease = std::move(idle->nodeLease);
+            channels.back() = worker;
+            forwardGuard.channel = worker;
+            idleForwardChannels_.erase(idle);
+        }
         lock.unlock();
-        {
-            const auto quota = forwardGuard.placementRead
-                                   ? runtimeOptions_.nodeResourceBudget->outgoingControl
-                                   : runtimeOptions_.nodeResourceBudget->outgoingForward;
+        if (!forwardGuard.nodeLease) {
             forwardGuard.nodeLease = quota->waitReserve(
                 1,
                 deadline,
-                [this] {
-                    std::lock_guard stoppingLock{workersMutex_};
-                    return workersStopping_;
-                }
+                [this] { return workersStopping_.load(); }
             );
             if (!forwardGuard.nodeLease) { return false; }
         }
@@ -171,7 +224,7 @@ bool exchangeRpc(
     std::unique_lock ioLock{worker->ioMutex, std::defer_lock};
     if (!ioLock.try_lock_until(deadline)) { return false; }
     std::unique_ptr<detail::ForwardDeadline> forwardDeadline;
-    if (submitted || detail::ReconfigurationDeadline::current().deadline != Clock::time_point::max()) {
+    if (submitted || pipeline || detail::ReconfigurationDeadline::current().deadline != Clock::time_point::max()) {
         forwardDeadline = std::make_unique<detail::ForwardDeadline>(
             deadline,
             [worker] {
@@ -267,17 +320,33 @@ bool exchangeRpc(
     }
     setTimeouts(worker->socket, static_cast<int>(remaining));
     if (submitted) { *submitted = true; }
-    if (!sendFrame(worker->socket, worker->secure.get(), forwardRequest ? forwardWire : wire) || !recvFrame(
-        worker->socket,
-        worker->secure.get(),
-        frame,
-        channelBudget
-    ) || frame.type != expected || Clock::now() >= deadline) {
+    if (!sendFrame(worker->socket, worker->secure.get(), forwardRequest ? forwardWire : wire)) {
         reset();
         return false;
     }
+    if (pipeline) {
+        for (const auto& next : *pipeline) {
+            if (!sendFrame(worker->socket, worker->secure.get(), next)) { reset(); return false; }
+        }
+    }
+    const size_t count = 1 + (pipeline ? pipeline->size() : 0);
+    for (size_t i = 0; i < count; ++i) {
+        if (!recvFrame(worker->socket, worker->secure.get(), frame, channelBudget) || frame.type != expected || Clock::now() >= deadline) {
+            reset(); return false;
+        }
+        if (appendResponses) {
+            AppendEntriesResponse response;
+            if (!decodeAppendEntriesResponse(frame.payload, response)) { reset(); return false; }
+            appendResponses->push_back(response);
+        }
+    }
+    if (forwardResponse && (!decodeForwardResponse(frame.payload, *forwardResponse) ||
+        forwardResponse->requestId != forwardRequest->requestId)) { reset(); return false; }
+    forwardDeadline.reset();
+    if (Clock::now() >= deadline) { reset(); return false; }
     worker->lastSuccessfulContactAtUs.store(observationNowUs(), std::memory_order_relaxed);
     observation.succeeded = true;
+    forwardGuard.reusable = true;
     return true;
 }
 
@@ -302,6 +371,21 @@ bool appendEntries(const NodeInfo& peer, const AppendEntries& request, AppendEnt
     DecodedFrame frame;
     return exchangeRpc(peer, encodeAppendEntries(request), ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE, frame, rpcTimeoutMs(1000)) &&
         decodeAppendEntriesResponse(frame.payload, response);
+}
+
+bool appendEntriesWindow(const NodeInfo& peer, const AppendEntries& request,
+    const std::vector<std::vector<uint8_t>>& pipeline, AppendEntriesResponse& response) {
+    if (pipeline.empty()) { return appendEntries(peer, request, response); }
+    DecodedFrame frame;
+    std::vector<AppendEntriesResponse> responses;
+    if (!exchangeRpc(peer, encodeAppendEntries(request), ReplMsgType::RAFT_APPEND_ENTRIES_RESPONSE,
+        frame, rpcTimeoutMs(1000), nullptr, nullptr, nullptr, &pipeline, &responses)) { return false; }
+    response = responses.front();
+    for (size_t i = 1; i < responses.size(); ++i) {
+        const auto& next = responses[i];
+        if (next.term > response.term || (next.term == response.term && response.success)) { response = next; }
+    }
+    return true;
 }
 
 bool installSnapshot(const NodeInfo& peer, const InstallSnapshot& request, InstallSnapshotResponse& response) {

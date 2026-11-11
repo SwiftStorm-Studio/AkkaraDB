@@ -187,9 +187,9 @@ namespace akkaradb::engine {
         };
 
         enum class ParallelWriteOrderMode : uint8_t {
-            // Preserve the current fast path: a read observes the last write
-            // applied to a key, even when parallel writers reserved sequences
-            // in a different order.
+            // Reserve sequences without a per-key ordering lock. SST-backed
+            // reads choose the largest visible retained sequence; memory-only
+            // reads observe the last applied write.
             APPLY_ORDER = 0,
             // Serialize writes that route to the same ordering stripe before
             // sequence allocation. Different stripes still insert concurrently.

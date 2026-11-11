@@ -23,6 +23,7 @@
 #include "akk/core/buffer/BufferArena.hpp"
 #include "akk/core/record/OwnedRecord.hpp"
 #include "akk/engine/memtable/IMemTable.hpp"
+#include "akk/engine/memtable/detail/VersionHistory.hpp"
 
 namespace akkaradb::engine::memtable {
     class AKDB_API ARTMemTable final : public IMemTable {
@@ -47,13 +48,20 @@ namespace akkaradb::engine::memtable {
             ) override;
             [[nodiscard]] bool get(ByteView key, uint64_t snapshotSeq, RecordView* out) const override;
             [[nodiscard]] ArenaGenerator<RecordView> iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const override;
+            void retainAllVersions() override;
+            void useSequenceOrder() override;
+            [[nodiscard]] ArenaGenerator<RecordView> flushIterator() const override;
             void freeze() override;
 
             [[nodiscard]] size_t sizeBytes() const override;
             [[nodiscard]] size_t entryCount() const override;
 
         private:
+            bool retainAllVersions_ = false;
+            bool sequenceOrderedVersions_ = false;
+
             struct VersionChain {
+                detail::VersionHistory history;
                 uint8_t head{0};
                 uint8_t count{0};
                 std::array<const core::OwnedRecord*, MAX_VERSIONS_PER_KEY> ring{};
@@ -179,7 +187,8 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] ArenaGenerator<RecordView> iterateSnapshotRange(
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,
-                std::vector<uint8_t> endKey
+                std::vector<uint8_t> endKey,
+                bool allVersions = false
             ) const;
     };
 } // namespace akkaradb::engine::memtable

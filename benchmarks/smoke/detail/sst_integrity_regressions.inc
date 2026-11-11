@@ -44,6 +44,12 @@ public:
         return materialized(std::move(rows));
     }
     void freeze() override { inner_.freeze(); }
+    void retainAllVersions() override { inner_.retainAllVersions(); }
+    void useSequenceOrder() override { inner_.useSequenceOrder(); }
+    akkaradb::core::ArenaGenerator<akkaradb::core::RecordView> flushIterator() const override {
+        gate_->pause(Boundary::ITERATOR);
+        return inner_.flushIterator();
+    }
     size_t sizeBytes() const override { return inner_.sizeBytes(); }
     size_t entryCount() const override { return inner_.entryCount(); }
 };
@@ -51,8 +57,10 @@ public:
 void runSstPromotionRegression() {
     using akkaradb::engine::AkkEngine;
     for (int api = 0; api < 3; ++api) {
-        for (const bool deleted : {false, true}) {
-            const auto dir = fs::current_path() / ".bench-tmp" / ("sst-promotion-" + std::to_string(api) + (deleted ? "-delete" : "-put"));
+        for (int state = 0; state < 4; ++state) {
+            const bool deleted = (state & 1) != 0;
+            const bool flushUpdate = (state & 2) != 0;
+            const auto dir = fs::current_path() / ".bench-tmp" / ("sst-promotion-" + std::to_string(api) + "-" + std::to_string(state));
             std::error_code ec; fs::remove_all(dir, ec);
             auto gate = std::make_shared<SstIntegrityGate>();
             auto options = persistentOptions(dir);
@@ -79,7 +87,7 @@ void runSstPromotionRegression() {
             try {
                 require(entered, "reader did not reach the promotion race");
                 if (deleted) { database->remove(key); } else { database->put(key, newValue); }
-                database->forceFlush();
+                if (flushUpdate) { database->forceFlush(); }
             } catch (...) { gate->release(); reader.join(); throw; }
             gate->release(); reader.join();
             if (readFailure) { std::rethrow_exception(readFailure); }
@@ -98,6 +106,97 @@ void runSstPromotionRegression() {
             require(database->get(key) == (deleted ? std::nullopt : std::optional{newValue}), "stale promotion survived reopen as the visible head");
             database->close(); database.reset(); fs::remove_all(dir, ec);
         }
+    }
+}
+
+void runSstCloseFlushRegression() {
+    using akkaradb::engine::AkkEngine;
+    for (const bool failRotation : {false, true}) {
+        const auto dir = fs::current_path() / ".bench-tmp" / ("sst-close-active-flush-" + std::to_string(failRotation));
+        std::error_code ec; fs::remove_all(dir, ec);
+        auto gate = std::make_shared<SstIntegrityGate>();
+        auto options = persistentOptions(dir);
+        options.runtime.forceFlushOnClose = failRotation;
+        options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::BYTES_PER_SHARD;
+        options.memtable.thresholdBytesPerShard = 4096;
+        auto failNextFactory = std::make_shared<std::atomic<bool>>(false);
+        options.memtable.backendFactory = [gate, failNextFactory] {
+            if (failNextFactory->exchange(false)) { throw std::bad_alloc{}; }
+            return std::make_unique<SstIntegrityBackend>(gate);
+        };
+        auto database = AkkEngine::open(options);
+        gate->arm(SstIntegrityGate::Boundary::ITERATOR);
+        const std::vector<uint8_t> value(5000, 'v');
+        database->put(bytes("key"), value);
+        require(gate->wait(), "background flush did not reach the close race");
+        if (failRotation) {
+            database->put(bytes("pending"), bytes("small"));
+            failNextFactory->store(true);
+        }
+        std::exception_ptr failure;
+        std::thread closer{[&] { try { database->close(); } catch (...) { failure = std::current_exception(); } }};
+        const bool closed = waitUntil([&] {
+            try { (void)database->get(bytes("key")); return false; }
+            catch (const std::runtime_error&) { return true; }
+        });
+        // Leave the frozen input blocked while close reaches its flush drain.
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        gate->release(); closer.join();
+        require(closed, "close did not reject new operations");
+        if (failRotation) {
+            require(failure != nullptr, "close did not report its force-flush failure");
+            try { std::rethrow_exception(failure); }
+            catch (const std::bad_alloc&) {}
+        }
+        else if (failure) { std::rethrow_exception(failure); }
+        database.reset();
+        database = AkkEngine::open(options);
+        require(database->get(bytes("key")) == std::optional{value}, "close lost a queued SST flush");
+        database->close(); database.reset(); fs::remove_all(dir, ec);
+    }
+}
+
+void runSstMemtableFrontierRegression() {
+    using Engine = akkaradb::engine::AkkEngine;
+    using Options = akkaradb::engine::AkkEngineOptions;
+    for (const bool automaticFlush : {false, true}) {
+        const auto dir = fs::current_path() / ".bench-tmp" / ("sst-memtable-frontier-" + std::to_string(automaticFlush));
+        std::error_code ec; fs::remove_all(dir, ec);
+        auto gate = std::make_shared<SstIntegrityGate>();
+        auto options = parallelWalOptions(dir);
+        options.components.walEnabled = false;
+        options.runtime.writeDurability = Options::WriteDurabilityMode::MEMORY;
+        options.memtable.shardCount = 2;
+        if (automaticFlush) {
+            options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::BYTES_PER_SHARD;
+            options.memtable.thresholdBytesPerShard = 4096;
+        }
+        options.memtable.backendFactory = [gate] { return std::make_unique<SstIntegrityBackend>(gate); };
+        auto database = Engine::open(options);
+        const auto target = partialFlushKey(false, 0), slow = partialFlushKey(true, 0);
+        const std::vector<uint8_t> oldValue{'o'}, newValue(512, 'n');
+        database->put(bytes(target), oldValue);
+        gate->arm(SstIntegrityGate::Boundary::PUT);
+        std::exception_ptr failure;
+        std::thread writer{[&] {
+            try { database->put(bytes(slow), newValue); } catch (...) { failure = std::current_exception(); }
+        }};
+        try {
+            require(gate->wait(), "writer did not establish a committed sequence gap");
+            for (int i = 0; i < 8; ++i) { database->put(bytes(target), newValue); }
+            if (automaticFlush) {
+                require(waitUntil([&] { return database->stats().memtable.flushesCompleted != 0; }), "target shard did not flush across the commit gap");
+            }
+            require(database->stats().currentSeq == 1, "fixture lost its publication frontier");
+            require(database->get(bytes(target)) == std::optional{oldValue}, "MemTable retention or flush lost the currently committed value");
+            std::vector<uint8_t> out;
+            require(database->getInto(bytes(target), out) && out == oldValue, "getInto lost the committed MemTable baseline");
+            require(database->exists(bytes(target)), "exists lost the committed MemTable baseline");
+        } catch (...) { gate->release(); writer.join(); throw; }
+        gate->release(); writer.join();
+        if (failure) { std::rethrow_exception(failure); }
+        require(database->get(bytes(target)) == std::optional{newValue}, "closing the commit gap did not publish its latest value");
+        database->close(); database.reset(); fs::remove_all(dir, ec);
     }
 }
 
@@ -276,7 +375,111 @@ void runSstScanBlobGcRegression() {
     }
 }
 
+void runSstCommitFrontierCompactionRegression() {
+    using Engine = akkaradb::engine::AkkEngine;
+    using Options = akkaradb::engine::AkkEngineOptions;
+    for (const bool walEnabled : {false, true}) {
+        for (const bool deleted : {false, true}) {
+            const auto dir = fs::current_path() / ".bench-tmp" /
+                ("sst-commit-frontier-" + std::to_string(walEnabled) + "-" + std::to_string(deleted));
+            std::error_code ec; fs::remove_all(dir, ec);
+            auto gate = std::make_shared<SstIntegrityGate>();
+            auto options = parallelWalOptions(dir);
+            options.components.walEnabled = walEnabled;
+            options.runtime.writeDurability = walEnabled ? Options::WriteDurabilityMode::SYNCED : Options::WriteDurabilityMode::MEMORY;
+            options.memtable.shardCount = 2;
+            options.memtable.flushMode = akkaradb::engine::memtable::MemTableFlushMode::BYTES_PER_SHARD;
+            options.memtable.thresholdBytesPerShard = 1;
+            options.sst.compactionMode = akkaradb::engine::sst::SSTCompactionMode::BACKGROUND;
+            options.sst.compactThreads = 1; options.sst.maxL0Files = 2;
+            options.memtable.backendFactory = [gate] { return std::make_unique<SstIntegrityBackend>(gate); };
+            auto database = Engine::open(options);
+            const auto target = partialFlushKey(false, 0), slow = partialFlushKey(true, 0);
+            const std::vector<uint8_t> oldValue{'o'}, newValue{'n'};
+            database->put(bytes(target), oldValue); database->forceFlush();
+
+            gate->arm(SstIntegrityGate::Boundary::PUT);
+            std::exception_ptr failure;
+            std::thread writer{[&] {
+                try { database->put(bytes(slow), newValue); } catch (...) { failure = std::current_exception(); }
+            }};
+            try {
+                require(gate->wait(), "writer did not pause before the second sequence was applied");
+                if (deleted) { database->remove(bytes(target)); } else { database->put(bytes(target), newValue); }
+                require(waitUntil([&] { return database->stats().sst.compactionsCompleted != 0; }), "compaction did not run across a commit gap");
+                require(database->stats().currentSeq == 1, "fixture lost its committed sequence gap");
+                require(database->get(bytes(target)) == std::optional{oldValue}, "compaction removed the currently committed SST version");
+                std::vector<uint8_t> out;
+                require(database->getInto(bytes(target), out) && out == oldValue, "getInto lost the committed version during compaction");
+                require(database->exists(bytes(target)), "exists lost the committed version during compaction");
+                const std::array keys{bytes(target)};
+                const auto batch = database->getBatch(keys);
+                require(batch.size() == 1 && batch[0].found && batch[0].value == oldValue, "batch lost the committed version during compaction");
+            } catch (...) { gate->release(); writer.join(); throw; }
+            gate->release(); writer.join();
+            if (failure) { std::rethrow_exception(failure); }
+            const auto expected = deleted ? std::optional<std::vector<uint8_t>>{} : std::optional{newValue};
+            require(database->get(bytes(target)) == expected, "closing the commit gap did not expose the future version");
+            database->forceFlush(); database->close(); database.reset();
+            database = Engine::open(options);
+            require(database->get(bytes(target)) == expected && database->get(bytes(slow)) == std::optional{newValue},
+                "compaction visibility versions did not survive recovery");
+            database->close(); database.reset(); fs::remove_all(dir, ec);
+        }
+    }
+}
+
+void runSstRangeCompactionRegression() {
+    for (int api = 0; api < 3; ++api) {
+        const auto dir = fs::current_path() / ".bench-tmp" / ("sst-range-compaction-" + std::to_string(api));
+        std::error_code ec; fs::remove_all(dir, ec);
+        auto gate = std::make_shared<SstIntegrityGate>();
+        auto options = persistentOptions(dir);
+        options.sst.compactionMode = akkaradb::engine::sst::SSTCompactionMode::BACKGROUND;
+        options.sst.compactThreads = 1; options.sst.maxL0Files = 2;
+        options.memtable.backendFactory = [gate] { return std::make_unique<SstIntegrityBackend>(gate); };
+        auto database = akkaradb::engine::AkkEngine::open(options);
+        const auto key = bytes("m");
+        const std::vector<uint8_t> oldValue{'o'}, newValue{'n'};
+        for (const auto k : {bytes("a"), key, bytes("z")}) { database->put(k, oldValue); }
+        database->forceFlush();
+        gate->arm(SstIntegrityGate::Boundary::ITERATOR);
+        size_t rows = 0;
+        std::exception_ptr failure;
+        std::thread reader{[&] {
+            try {
+                if (api == 2) { rows = database->count(bytes("b"), bytes("y")); }
+                else {
+                    akkaradb::core::BufferArena arena;
+                    auto scan = api == 0 ? database->scan(arena, bytes("b"), bytes("y"))
+                                         : database->scanLocalStorage(arena, bytes("b"), bytes("y"));
+                    for (const auto& row : scan) {
+                        require(std::ranges::equal(row.key, key) && std::ranges::equal(row.value, oldValue),
+                            "range read changed its captured version or bounds during compaction");
+                        ++rows;
+                    }
+                }
+            } catch (...) { failure = std::current_exception(); }
+        }};
+        try {
+            require(gate->wait(), "range reader did not pause during MemTable iterator creation");
+            database->put(key, newValue); database->forceFlush();
+            require(waitUntil([&] { return database->stats().sst.compactionsCompleted != 0; }), "range fixture did not compact");
+        } catch (...) { gate->release(); reader.join(); throw; }
+        gate->release(); reader.join();
+        if (failure) { std::rethrow_exception(failure); }
+        require(rows == 1, "range read omitted a key across its SST source-capture boundary");
+        require(database->get(key) == std::optional{newValue} && database->count(bytes("b"), bytes("y")) == 1,
+            "retaining range sources changed the current head");
+        database->close(); database.reset(); fs::remove_all(dir, ec);
+    }
+}
+
 void runSstIntegrityRegressions() {
+    runSstMemtableFrontierRegression();
+    runSstCloseFlushRegression();
+    runSstCommitFrontierCompactionRegression();
+    runSstRangeCompactionRegression();
     runSstScanBlobGcRegression();
     runSstPointCompactionRegression();
     runSstPromotionRegression();

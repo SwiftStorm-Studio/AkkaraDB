@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogFiles.hpp
+// akkengine/src/engine/vlog/detail/VersionLogFiles.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 static void writeFileHeaderRaw(FILE* wf, VLogSyncMode syncModeHint) {
     AkvlogV1FileHeader hdr{};
     hdr.magic = AKVLOG_V1_MAGIC;

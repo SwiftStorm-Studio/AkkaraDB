@@ -54,10 +54,14 @@ namespace akkaradb::engine::memtable {
                 // AUTO maps to BYTES_PER_SHARD when thresholdBytesPerShard > 0, otherwise MANUAL_ONLY.
                 MemTableFlushMode flushMode = MemTableFlushMode::AUTO;
                 size_t thresholdBytesPerShard = 64ULL * 1024 * 1024;
+                // Preferred callback when both are installed. A sole callback is
+                // always used, regardless of this preference.
                 MemTableFlushInputMode flushInputMode = MemTableFlushInputMode::MATERIALIZE_VECTOR;
                 // Backend construction policy. BPTree uses mutableScanMode;
                 // SkipList and ART accept it as a no-op.
                 MemTableBackendOptions backendOptions{};
+                // Match SST version precedence. Enabled by SST-backed engines.
+                bool sequenceOrderedVersions = false;
                 // Physical in-memory index implementation and optional immutable flush sink.
                 // backendFactoryWithOptions takes precedence when supplied.
                 MemTableFactory backendFactory = nullptr;
@@ -112,6 +116,12 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] static std::unique_ptr<MemTable> create();
             [[nodiscard]] static std::unique_ptr<MemTable> create(const Options& options);
+            // Enables unbounded retention within each generation. Memory-only
+            // compaction retains the newest version <= this monotonic frontier
+            // and every newer version. The provider must be thread-safe and
+            // remain valid until this MemTable is destroyed.
+            [[nodiscard]] static std::unique_ptr<MemTable> create(
+                const Options& options, std::function<uint64_t()> retentionVisibilitySeq);
 
             ~MemTable();
 
@@ -130,6 +140,9 @@ namespace akkaradb::engine::memtable {
             );
 
             void remove(std::span<const uint8_t> key, uint64_t seq, uint64_t precomputedFp64 = 0, uint64_t precomputedMk = 0);
+
+            // Cache insertion: atomically skip keys already present in memory.
+            void promote(const RecordView& record);
 
             void advanceSeq(uint64_t seq) noexcept;
 
@@ -155,6 +168,8 @@ namespace akkaradb::engine::memtable {
             // Pins all published sources before sampling the sequence. Like
             // point reads, this does not exclude concurrent ordinary writers.
             [[nodiscard]] ReadSnapshot readSnapshot(const std::function<uint64_t()>& snapshotSeqProvider) const;
+            // Borrowed result: use getPinned when the view must survive concurrent
+            // flush/unpublication or memory-generation compaction after this call.
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const;
             [[nodiscard]] bool get(std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out, uint64_t precomputedFp64) const;
 
@@ -163,6 +178,10 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const;
 
             [[nodiscard]] RangeIterator iterator(const KeyRange& range, uint64_t snapshotSeq) const;
+            // Retains all published sources before invoking the provider, then
+            // constructs backend iterators after the SST state/cut can be pinned.
+            [[nodiscard]] RangeIterator iteratorWithSnapshot(
+                const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const;
             // Acquires all shard read locks before invoking snapshotSeqProvider.
             // The returned iterator retains those locks until it is destroyed.
             [[nodiscard]] RangeIterator pinnedIterator(const KeyRange& range, const std::function<uint64_t()>& snapshotSeqProvider) const;
@@ -193,6 +212,9 @@ namespace akkaradb::engine::memtable {
 
             void flushHint();
             void forceFlush();
+            // Waits for already queued flushes without rotating active tables.
+            // Drains all workers before reporting a latched persistence failure.
+            void drainFlushes();
             // Rethrows the first asynchronous immutable-flush failure, if any.
             void throwIfFlushFailed() const;
             void setFlushCallback(const FlushCallback& cb);
@@ -202,7 +224,7 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] MemTableSnapshot snapshot() const noexcept;
 
         private:
-            explicit MemTable(const Options& options);
+            MemTable(const Options& options, std::function<uint64_t()> retentionVisibilitySeq);
             std::shared_ptr<Impl> impl_;
     };
 } // namespace akkaradb::engine::memtable

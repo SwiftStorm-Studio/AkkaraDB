@@ -16,15 +16,24 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 namespace akkaradb::crypto {
@@ -52,6 +61,47 @@ namespace akkaradb::crypto {
             for (const auto byte : bytes) { out << std::setw(2) << static_cast<unsigned>(byte); }
             return out.str();
         }
+
+#ifdef _WIN32
+        struct WindowsHandle {
+            HANDLE value = INVALID_HANDLE_VALUE;
+            ~WindowsHandle() { if (value != INVALID_HANDLE_VALUE && value != nullptr) { ::CloseHandle(value); } }
+            WindowsHandle() = default;
+            WindowsHandle(const WindowsHandle&) = delete;
+            WindowsHandle& operator=(const WindowsHandle&) = delete;
+        };
+
+        HANDLE createPrivateSeedFile(const std::filesystem::path& path) {
+            WindowsHandle token;
+            if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token.value)) {
+                throw std::runtime_error("IdentityStore: cannot query file owner");
+            }
+            DWORD size = 0;
+            if (::GetTokenInformation(token.value, TokenUser, nullptr, 0, &size) ||
+                ::GetLastError() != ERROR_INSUFFICIENT_BUFFER || size == 0) {
+                throw std::runtime_error("IdentityStore: cannot query file owner");
+            }
+            std::vector<uint8_t> tokenInfo(size);
+            if (!::GetTokenInformation(token.value, TokenUser, tokenInfo.data(), size, &size)) {
+                throw std::runtime_error("IdentityStore: cannot query file owner");
+            }
+            const auto user = reinterpret_cast<const TOKEN_USER*>(tokenInfo.data());
+            alignas(ACL) std::array<uint8_t, sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + SECURITY_MAX_SID_SIZE> aclBytes{};
+            const auto acl = reinterpret_cast<ACL*>(aclBytes.data());
+            SECURITY_DESCRIPTOR descriptor{};
+            // Protect the DACL so a shared parent cannot grant access to the seed.
+            if (!::InitializeAcl(acl, static_cast<DWORD>(aclBytes.size()), ACL_REVISION) ||
+                !::AddAccessAllowedAce(acl, ACL_REVISION, FILE_ALL_ACCESS, user->User.Sid) ||
+                !::InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+                !::SetSecurityDescriptorOwner(&descriptor, user->User.Sid, FALSE) ||
+                !::SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE) ||
+                !::SetSecurityDescriptorControl(&descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+                throw std::runtime_error("IdentityStore: cannot restrict seed file access");
+            }
+            SECURITY_ATTRIBUTES attributes{sizeof(SECURITY_ATTRIBUTES), &descriptor, FALSE};
+            return ::CreateFileW(path.c_str(), GENERIC_WRITE, 0, &attributes, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+#endif
     } // namespace
 
     NodeIdentity generateNodeIdentity() {
@@ -122,20 +172,64 @@ namespace akkaradb::crypto {
         const auto parent = path_.parent_path();
         if (!parent.empty()) { std::filesystem::create_directories(parent); }
 
-        const auto tmp = path_.string() + ".tmp";
-        {
-            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            if (!out) { throw std::runtime_error("IdentityStore: failed to open seed file for write"); }
-            out.write(reinterpret_cast<const char*>(IDENTITY_FILE_MAGIC.data()), static_cast<std::streamsize>(IDENTITY_FILE_MAGIC.size()));
-            out.write(reinterpret_cast<const char*>(seed.data()), static_cast<std::streamsize>(seed.size()));
-            if (!out) { throw std::runtime_error("IdentityStore: failed to write seed file"); }
+        std::array<uint8_t, 16> nonce{};
+        secureRandom(nonce);
+        auto tmp = path_;
+        tmp += ".tmp." + bytesToHex(nonce);
+#ifdef _WIN32
+        WindowsHandle file;
+        file.value = createPrivateSeedFile(tmp);
+        if (file.value == INVALID_HANDLE_VALUE) { throw std::runtime_error("IdentityStore: failed to create private seed file"); }
+#else
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        int file = ::open(tmp.c_str(), flags, S_IRUSR | S_IWUSR);
+        if (file < 0) { throw std::runtime_error("IdentityStore: failed to create private seed file"); }
+#endif
+        try {
+            const auto writeAll = [&](std::span<const uint8_t> bytes) {
+                while (!bytes.empty()) {
+#ifdef _WIN32
+                    DWORD written = 0;
+                    if (!::WriteFile(file.value, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) || written == 0) {
+                        throw std::runtime_error("IdentityStore: failed to write seed file");
+                    }
+#else
+                    const auto written = ::write(file, bytes.data(), bytes.size());
+                    if (written < 0 && errno == EINTR) { continue; }
+                    if (written <= 0) { throw std::runtime_error("IdentityStore: failed to write seed file"); }
+#endif
+                    bytes = bytes.subspan(static_cast<size_t>(written));
+                }
+            };
+            writeAll(IDENTITY_FILE_MAGIC);
+            writeAll(seed);
+#ifdef _WIN32
+            if (!::FlushFileBuffers(file.value)) { throw std::runtime_error("IdentityStore: failed to sync seed file"); }
+            if (!::CloseHandle(std::exchange(file.value, INVALID_HANDLE_VALUE))) {
+                throw std::runtime_error("IdentityStore: failed to close seed file");
+            }
+#else
+            if (::fsync(file) != 0) { throw std::runtime_error("IdentityStore: failed to sync seed file"); }
+            if (::close(std::exchange(file, -1)) != 0) { throw std::runtime_error("IdentityStore: failed to close seed file"); }
+#endif
+            std::filesystem::rename(tmp, path_);
         }
-
-        #ifndef _WIN32
-        (void)::chmod(tmp.c_str(), S_IRUSR | S_IWUSR);
-        #endif
-
-        std::filesystem::rename(tmp, path_);
+        catch (...) {
+#ifdef _WIN32
+            if (file.value != INVALID_HANDLE_VALUE) { ::CloseHandle(std::exchange(file.value, INVALID_HANDLE_VALUE)); }
+#else
+            if (file >= 0) { ::close(std::exchange(file, -1)); }
+#endif
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            throw;
+        }
     }
 
     SecretKey IdentityStore::loadSeed() const {

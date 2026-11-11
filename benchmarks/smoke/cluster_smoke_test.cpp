@@ -22,6 +22,7 @@
 #include <unistd.h>
 #endif
 #include "TestErrorHandlers.hpp"
+#include "../../akkara/akkengine/src/engine/detail/ClusterQuerySpool.hpp"
 
 #include "akk/core/record/MemHdr16.hpp"
 #include "akk/engine/AkkEngine.hpp"
@@ -4515,7 +4516,7 @@ namespace {
         fingerprintInput.insert(fingerprintInput.begin() + 5, domainPolicy.begin(), domainPolicy.end());
         appendRaftTestInteger(fingerprintInput, options.requests.maxRetainedResultBytes);
         if (options.raftGroupKind == RaftGroupKind::DATA || options.raftGroupKind == RaftGroupKind::PARTITION_DATA) {
-            const std::string_view contract = "DATA-RECORD1";
+            const std::string_view contract = "DATA-RECORD1WAL-BOUNDARY2";
             fingerprintInput.insert(fingerprintInput.end(), contract.begin(), contract.end());
         }
         const std::array parts{std::span<const uint8_t>{fingerprintInput}};
@@ -5411,14 +5412,19 @@ namespace {
         auto released = release.get_future().share();
         std::promise<void> entered;
         auto started = entered.get_future();
-        std::atomic<unsigned> calls{0};
-        server->setReadCallback([&](const ReadRequest&) {
+        std::atomic<unsigned> calls{0}, blockedReads{0};
+        server->setReadCallback([&](const ReadRequest& request) {
             if (calls.fetch_add(1) == 0) {
                 entered.set_value();
+            }
+            if (textOf(request.key) == "blocked") {
+                blockedReads.fetch_add(1);
                 (void)released.wait_for(std::chrono::seconds{5});
+                blockedReads.fetch_sub(1);
             }
             ReadResponse response;
             response.status = ReadStatus::FOUND;
+            response.value = request.key;
             return response;
         });
         auto client = ReplicationClient::create("127.0.0.1", 23203, 2, [] { return uint64_t{0}; }, ack, options);
@@ -5434,11 +5440,15 @@ namespace {
             AKK_CLUSTER_CHECK(timedOut);
         }
         AKK_CLUSTER_CHECK(started.wait_for(std::chrono::seconds{1}) == std::future_status::ready);
+        const bool allReadsEntered = waitUntil([&] { return blockedReads.load() == 4; }, std::chrono::seconds{1});
+        // Pending read callbacks must not hold up durable replication ACKs.
         server->shipEntry(1, ReplOpType::PUT, bytesOf("write"), bytesOf("ok"), 0, 1);
-        AKK_CLUSTER_CHECK(applied.load() == 1 && calls.load() == 1);
+        const bool writeApplied = applied.load() == 1 && client->connected() && blockedReads.load() == 4;
         release.set_value();
-        AKK_CLUSTER_CHECK(client->readKey(bytesOf("next"), 0, 1000).status == ReadStatus::FOUND);
-        AKK_CLUSTER_CHECK(calls.load() == 2);
+        AKK_CLUSTER_CHECK(allReadsEntered && writeApplied);
+        const auto next = client->readKey(bytesOf("next"), 0, 1000);
+        AKK_CLUSTER_CHECK(next.status == ReadStatus::FOUND && textOf(next.value) == "next");
+        AKK_CLUSTER_CHECK(calls.load() == 5);
         client->close(); server->close();
     }
 
@@ -7080,7 +7090,7 @@ namespace {
         options.transportMode = TransportMode::PLAIN;
 
         const AckPolicy all{.mode = AckPolicyMode::ALL_TARGETS, .stage = AckStage::APPLIED};
-        auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, {}, 0, {}, options);
+        auto server = ReplicationServer::create(port, 1, [] { return uint64_t{1}; }, all, {}, 0, {2}, options);
         std::atomic<uint64_t> lastSeq{0};
         std::atomic<int> applied{0};
 
@@ -8710,6 +8720,7 @@ namespace {
 #include "detail/cluster_log_retention_test.inc"
 #include "detail/cluster_mirror_recovery_test.inc"
 #include "detail/cluster_parallelism_test.inc"
+#include "detail/cluster_performance_test.inc"
 #include "detail/cluster_availability_options_test.inc"
 #include "detail/cluster_transactions_test.inc"
 #include "detail/cluster_transaction_concurrency_test.inc"
@@ -9639,6 +9650,8 @@ int main(int argc, char** argv) {
             testRaftEngineLargeBlobLeaderChurnKeepsBlobIdsUnique();
             return 0;
         }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-performance") { runClusterPerformanceTests(); return 0; }
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-small-snapshot") { testClusterManySmallSnapshotChunks(); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--raft-pipeline") {
             testRaftPipelinedProposalsAndReadIndex();
             testRaftPipelinedProposalsAndReadIndex(true);

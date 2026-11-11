@@ -29,7 +29,7 @@ namespace akkaradb::core {
         dst.hdr.seq = seq;
         dst.hdr.flags = flags;
 
-        dst.keyFp64 = fp64;
+        dst.keyFp64 = (fp64 != 0) ? fp64 : computeKeyFp64(key);
         dst.miniKey = (mk != 0) ? mk : buildMiniKey(key);
 
         dst.data = SmallBuffer(key.data(), key.size(), value.data(), value.size(), arena);

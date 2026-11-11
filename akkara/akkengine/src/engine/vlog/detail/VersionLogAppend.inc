@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogAppend.hpp
+// akkengine/src/engine/vlog/detail/VersionLogAppend.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 static void completeAppend(const std::shared_ptr<AppendCompletion>& completion, std::exception_ptr error = {}) {
     if (!completion) { return; }
     {

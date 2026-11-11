@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogImplState.hpp
+// akkengine/src/engine/vlog/detail/VersionLogImplState.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 struct AppendCompletion;
 fs::path logPath_;
 VersionLogOptions opts_;

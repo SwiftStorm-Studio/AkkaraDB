@@ -14,6 +14,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
@@ -21,6 +22,8 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iterator>
+#include <list>
 #include <mutex>
 #include <queue>
 #include <ranges>
@@ -104,6 +107,30 @@ namespace akkaradb::engine::sst {
             }
         }
 
+        void validateOptions(const SSTManager::Options& options) {
+            if (options.maxL0Files <= 0) { throw std::invalid_argument("SSTManager: maxL0Files must be positive"); }
+            if (options.compactThreads < 0) { throw std::invalid_argument("SSTManager: compactThreads must be nonnegative"); }
+            if (options.l1MaxBytes == 0 || options.targetFileSize == 0) {
+                throw std::invalid_argument("SSTManager: level and target file sizes must be positive");
+            }
+            if (!std::isfinite(options.levelSizeMultiplier) || options.levelSizeMultiplier < 1.0) {
+                throw std::invalid_argument("SSTManager: levelSizeMultiplier must be finite and >= 1");
+            }
+            if (options.blockSize < 4096 || (options.blockSize & 7u) != 0) {
+                throw std::invalid_argument("SSTManager: blockSize must be >=4096 and 8-byte aligned");
+            }
+            switch (options.compactionMode) {
+                case SSTCompactionMode::AUTO:
+                case SSTCompactionMode::BACKGROUND:
+                case SSTCompactionMode::DISABLED: break;
+                default: throw std::invalid_argument("SSTManager: invalid compaction mode");
+            }
+            if (options.codec != SSTWriter::Codec::NONE && options.codec != SSTWriter::Codec::ZSTD) {
+                throw std::invalid_argument("SSTManager: invalid codec");
+            }
+            validateZstdCompressionLevel(options);
+        }
+
         std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> toManifestBlobRefs(
             const std::vector<SSTWriter::Result::BlobRefEntry>& refs
         ) {
@@ -168,13 +195,28 @@ namespace akkaradb::engine::sst {
             if (std::filesystem::remove(path, ec)) { syncDirectory(path.parent_path()); }
         }
 
-        [[nodiscard]] core::ArenaGenerator<core::RecordView> continueRecords(
-            core::ArenaGenerator<core::RecordView> records,
-            core::ArenaGenerator<core::RecordView>::iterator position
+        [[nodiscard]] core::ArenaGenerator<core::RecordView> spanRecords(std::span<const core::RecordView> records) {
+            for (const auto& record : records) { co_yield record; }
+        }
+
+        [[nodiscard]] core::ArenaGenerator<core::RecordView> flushChunk(
+            core::ArenaGenerator<core::RecordView>::iterator& position, uint64_t targetBytes
         ) {
-            // begin() resumes this single-pass generator; retain its primed cursor
-            // and ownership instead of calling begin() again and skipping a record.
-            for (; position != records.end(); ++position) { co_yield *position; }
+            uint64_t bytes = 0;
+            std::vector<uint8_t> lastKey;
+            bool nonempty = false;
+            while (position != std::default_sentinel) {
+                const auto& record = *position;
+                const auto size = alignUpU64(sizeof(core::SSTHdr32) + record.keySize() + record.valueSize(), 8);
+                if (nonempty && record.compareKey(lastKey) != 0 && (bytes >= targetBytes || size > targetBytes - bytes)) {
+                    co_return;
+                }
+                lastKey.assign_range(record.key());
+                nonempty = true;
+                bytes += size;
+                co_yield record;
+                ++position;
+            }
         }
 
         // Test-only fault injection. Each point is reached only after the preceding
@@ -185,16 +227,108 @@ namespace akkaradb::engine::sst {
         }
     } // namespace
 
+    struct SSTManager::ReadState {
+        public:
+            struct Meta {
+                std::filesystem::path path;
+                std::string filename;
+                int level = 0;
+                uint64_t entryCount = 0;
+                uint64_t file_size = 0;
+                uint64_t minSeq = 0;
+                uint64_t maxSeq = 0;
+                std::vector<uint8_t> firstKey;
+                std::vector<uint8_t> lastKey;
+                std::shared_ptr<SSTReader> reader;
+            };
+
+            using Levels = std::vector<std::vector<Meta>>;
+            Levels levels;
+            uint64_t maxSeq = 0;
+            // Balanced interval tree over overlapping L0 ranges. Each midpoint
+            // stores the index of the greatest lastKey in its subtree.
+            std::vector<size_t> l0Order;
+            std::vector<size_t> l0MaxLast;
+
+            size_t buildRangeIndex(size_t begin, size_t end) {
+                const auto mid = begin + (end - begin) / 2;
+                auto maximum = l0Order[mid];
+                const auto merge = [&](size_t other) {
+                    if (keyLess(levels[0][maximum].lastKey, levels[0][other].lastKey)) { maximum = other; }
+                };
+                if (begin < mid) { merge(buildRangeIndex(begin, mid)); }
+                if (mid + 1 < end) { merge(buildRangeIndex(mid + 1, end)); }
+                l0MaxLast[mid] = maximum;
+                return maximum;
+            }
+
+            void indexRanges() {
+                if (levels.empty() || levels[0].empty()) { return; }
+                for (size_t i = 0; i < levels[0].size(); ++i) { l0Order.push_back(i); }
+                std::ranges::sort(l0Order, [this](size_t a, size_t b) { return keyLess(levels[0][a].firstKey, levels[0][b].firstKey); });
+                l0MaxLast.resize(l0Order.size());
+                (void)buildRangeIndex(0, l0Order.size());
+            }
+
+            [[nodiscard]] std::vector<std::shared_ptr<SSTReader>> rangeReaders(
+                std::span<const uint8_t> start, std::span<const uint8_t> end, uint64_t seq) const {
+                std::vector<std::shared_ptr<SSTReader>> readers;
+                if (!end.empty() && !start.empty() && compareBytes(start, end) >= 0) { return readers; }
+                const auto consider = [&](const Meta& meta) {
+                    if (meta.reader && meta.minSeq <= seq && (start.empty() || compareBytes(meta.lastKey, start) >= 0) &&
+                        (end.empty() || compareBytes(meta.firstKey, end) < 0)) { readers.push_back(meta.reader); }
+                };
+                const auto visit = [&](auto&& self, size_t begin, size_t finish) -> void {
+                    if (begin == finish) { return; }
+                    const auto mid = begin + (finish - begin) / 2;
+                    if (!start.empty() && keyLess(levels[0][l0MaxLast[mid]].lastKey, start)) { return; }
+                    self(self, begin, mid);
+                    const auto& meta = levels[0][l0Order[mid]];
+                    if (!end.empty() && compareBytes(meta.firstKey, end) >= 0) { return; }
+                    consider(meta);
+                    self(self, mid + 1, finish);
+                };
+                visit(visit, 0, l0Order.size());
+                for (const auto& files : levels | std::views::drop(1)) {
+                    const auto first = start.empty() ? files.begin() : std::ranges::lower_bound(files, start, keyLess, &Meta::lastKey);
+                    for (auto it = first; it != files.end(); ++it) {
+                        if (!end.empty() && compareBytes(it->firstKey, end) >= 0) { break; }
+                        consider(*it);
+                    }
+                }
+                return readers;
+            }
+
+            [[nodiscard]] std::optional<SSTReader::PinnedRecord> getPinned(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+                std::optional<SSTReader::PinnedRecord> best;
+                const auto consider = [&](const Meta& meta) {
+                    if (!meta.reader || meta.minSeq > snapshotSeq || (best && meta.maxSeq <= best->view.seq())) { return; }
+                    auto candidate = meta.reader->getPinned(key, snapshotSeq);
+                    if (candidate && (!best || candidate->view.seq() > best->view.seq())) { best = std::move(candidate); }
+                };
+                // Flush completion and file ids do not imply sequence precedence.
+                if (!levels.empty()) { for (const auto& meta : levels[0]) { consider(meta); } }
+                for (const auto& files : levels | std::views::drop(1)) {
+                    const auto candidate = std::ranges::lower_bound(files, key, keyLess, &Meta::lastKey);
+                    if (candidate != files.end() && compareBytes(candidate->firstKey, key) <= 0 && compareBytes(key, candidate->lastKey) <= 0) {
+                        consider(*candidate);
+                    }
+                }
+                return best;
+            }
+    };
+
     class SSTManager::Iterator::Impl {
         public:
             Impl(
-                std::vector<std::shared_ptr<SSTReader>> readers,
+                std::shared_ptr<const ReadState> state,
                 std::span<const uint8_t> startKey,
                 std::span<const uint8_t> endKey,
                 uint64_t snapshotSeq,
                 bool includeTombstones
             )
-                : snapshotSeq_{snapshotSeq}, includeTombstones_{includeTombstones}, startKey_{std::from_range, startKey}, endKey_{std::from_range, endKey} {
+                : state_{std::move(state)}, snapshotSeq_{snapshotSeq}, includeTombstones_{includeTombstones}, startKey_{std::from_range, startKey}, endKey_{std::from_range, endKey} {
+                auto readers = state_->rangeReaders(startKey_, endKey_, snapshotSeq_);
                 sources_.reserve(readers.size());
                 for (auto& reader : readers) {
                     if (!reader) { continue; }
@@ -220,16 +354,11 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key) const {
-                std::optional<SSTRecord> result;
-                for (const auto& source : sources_) {
-                    auto record = source.reader->get(key, snapshotSeq_);
-                    if (record && (!result || record->seq > result->seq)) { result = std::move(record); }
-                }
-                return result;
+                const auto result = state_->getPinned(key, snapshotSeq_);
+                return result ? std::optional{result->toOwned()} : std::nullopt;
             }
             [[nodiscard]] std::unique_ptr<Impl> fork(std::span<const uint8_t> start, std::span<const uint8_t> end) const {
-                auto readers = sources_ | std::views::transform(&Source::reader) | std::ranges::to<std::vector>();
-                return std::make_unique<Impl>(std::move(readers), start, end, snapshotSeq_, includeTombstones_);
+                return std::make_unique<Impl>(state_, start, end, snapshotSeq_, includeTombstones_);
             }
 
         private:
@@ -255,7 +384,7 @@ namespace akkaradb::engine::sst {
             void pushCurrent(size_t sourceIdx) {
                 auto& source = sources_[sourceIdx];
                 if (source.it == std::default_sentinel) { return; }
-                heap_.push(HeapEntry{*source.it, sourceIdx});
+                heap_.push(HeapEntry{.rec = *source.it, .sourceIdx = sourceIdx});
                 ++source.it;
             }
 
@@ -280,6 +409,7 @@ namespace akkaradb::engine::sst {
                 }
             }
 
+            std::shared_ptr<const ReadState> state_;
             uint64_t snapshotSeq_;
             bool includeTombstones_;
             std::vector<uint8_t> startKey_;
@@ -289,49 +419,38 @@ namespace akkaradb::engine::sst {
             std::optional<SSTRecord> pending_;
     };
 
-    struct SSTManager::ReadState {
-        public:
-            struct Meta {
-                std::filesystem::path path;
-                std::string filename;
-                int level = 0;
-                uint64_t entryCount = 0;
-                uint64_t file_size = 0;
-                uint64_t minSeq = 0;
-                uint64_t maxSeq = 0;
-                std::vector<uint8_t> firstKey;
-                std::vector<uint8_t> lastKey;
-                std::shared_ptr<SSTReader> reader;
-            };
-
-            using Levels = std::vector<std::vector<Meta>>;
-            Levels levels;
-    };
-
     std::optional<SSTRecord> SSTManager::ReadSnapshot::get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
         if (!state_) { return std::nullopt; }
-        const auto& levels = state_->levels;
-        std::optional<SSTRecord> best;
-        const auto consider = [&](const ReadState::Meta& meta) {
-            if (!meta.reader || meta.minSeq > snapshotSeq || (best && meta.maxSeq <= best->seq)) { return; }
-            auto candidate = meta.reader->get(key, snapshotSeq);
-            if (candidate && (!best || candidate->seq > best->seq)) { best = std::move(candidate); }
-        };
-        // Flush completion and file ids do not imply sequence precedence.
-        if (!levels.empty()) { for (const auto& meta : levels[0]) { consider(meta); } }
-        for (const auto& files : levels | std::views::drop(1)) {
-            const auto candidate = std::ranges::lower_bound(files, key, keyLess, &ReadState::Meta::lastKey);
-            if (candidate != files.end() && compareBytes(candidate->firstKey, key) <= 0 && compareBytes(key, candidate->lastKey) <= 0) {
-                consider(*candidate);
-            }
-        }
-        return best;
+        const auto record = state_->getPinned(key, snapshotSeq);
+        return record ? std::optional{record->toOwned()} : std::nullopt;
+    }
+
+    std::optional<bool> SSTManager::ReadSnapshot::contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
+        if (!state_) { return std::nullopt; }
+        const auto record = state_->getPinned(key, snapshotSeq);
+        return record ? std::optional{!record->view.isTombstone()} : std::nullopt;
+    }
+
+    std::optional<bool> SSTManager::ReadSnapshot::getInto(
+        std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
+        if (!state_) { return std::nullopt; }
+        const auto record = state_->getPinned(key, snapshotSeq);
+        if (!record) { return std::nullopt; }
+        if (record->view.isTombstone()) { return false; }
+        out.assign_range(record->view.value());
+        return true;
     }
 
     uint64_t SSTManager::ReadSnapshot::maxSequence() const noexcept {
-        if (!state_) { return 0; }
-        const auto sequences = state_->levels | std::views::join | std::views::transform(&ReadState::Meta::maxSeq);
-        return std::ranges::fold_left(sequences, uint64_t{0}, std::ranges::max);
+        return state_ ? state_->maxSeq : 0;
+    }
+
+    SSTManager::Iterator SSTManager::ReadSnapshot::scanIter(
+        std::span<const uint8_t> startKey, std::span<const uint8_t> endKey,
+        uint64_t snapshotSeq, bool includeTombstones
+    ) const {
+        if (!state_) { return Iterator{}; }
+        return Iterator{std::make_unique<Iterator::Impl>(state_, startKey, endKey, snapshotSeq, includeTombstones)};
     }
 
     class SSTManager::Impl {
@@ -343,6 +462,7 @@ namespace akkaradb::engine::sst {
                 int src = 0;
                 int dst = 1;
                 std::vector<Meta> inputs;
+                std::vector<std::vector<uint8_t>> splitBefore{};
             };
 
             struct BusyWork {
@@ -350,11 +470,15 @@ namespace akkaradb::engine::sst {
                 int dst = 0;
             };
 
-            Impl(std::filesystem::path sstDir, const Options& options, manifest::Manifest* manifest)
-                : sstDir_{std::move(sstDir)}, options_{options}, manifest_{manifest} {
+            Impl(std::filesystem::path sstDir, const Options& options, manifest::Manifest* manifest,
+                std::function<uint64_t()> compactionVisibilitySeq)
+                : sstDir_{std::move(sstDir)}, options_{options}, manifest_{manifest},
+                  compactionVisibilitySeq_{std::move(compactionVisibilitySeq)} {
                 if (options_.maxLevels < 2) { options_.maxLevels = 2; }
                 if (sstDir_.empty()) { throw std::invalid_argument("SSTManager: sstDir is required"); }
-                validateZstdCompressionLevel(options_);
+                validateOptions(options_);
+                blockCache_ = std::make_shared<SSTReader::BlockCache>(options_.blockCacheBytes);
+                sstDir_ = std::filesystem::absolute(sstDir_);
                 std::filesystem::create_directories(sstDir_);
                 directoryLock_ = std::make_unique<detail::StorageFileLock>(sstDir_ / ".sst.lock");
                 const auto statePath = sstDir_ / "sst-state.akmf";
@@ -382,7 +506,7 @@ namespace akkaradb::engine::sst {
                 if (compactionEnabled(options_)) {
                     const auto n = std::ranges::max(1, options_.compactThreads);
                     compactThreads_.reserve(static_cast<size_t>(n));
-                    for (int i = 0; i < n; ++i) { compactThreads_.emplace_back([this] { compactionLoop(); }); }
+                    for (auto i = 0; i < n; ++i) { compactThreads_.emplace_back([this] { compactionLoop(); }); }
                 }
             }
 
@@ -390,6 +514,7 @@ namespace akkaradb::engine::sst {
 
             void recover() {
                 std::unique_lock lock{levelsMu_};
+                { std::lock_guard retireLock{retiredMu_}; retiredFiles_.clear(); }
                 validateCatalogBinding();
                 Levels recovered(levels_.size());
 
@@ -425,13 +550,35 @@ namespace akkaradb::engine::sst {
                 }
                 // Validate the complete live set before cleanup or publishing any recovered state.
                 if (!catalogBound_) { writeCatalogBinding(); }
-                for (const auto& abandoned : abandonedFiles) { removeFileDurable(abandoned); }
+                manifest_->discardUnsealedSstBlobRefs();
+                for (const auto& abandoned : abandonedFiles) {
+                    if (!SSTReader::isPinned(abandoned)) { removeFileDurable(abandoned); }
+                    if (abandoned.extension() == ".aksst") {
+                        std::lock_guard retireLock{retiredMu_};
+                        retiredFiles_.push_back(abandoned);
+                    }
+                }
                 levels_ = std::move(recovered);
                 nextFileId_ = 1;
                 for (const auto& file : allSstFiles) { observeFileId(file); }
                 for (const auto& file : files) { observeFileId(file); }
                 sortAllLevelsLocked();
                 publishLocked();
+                // A reopened manager can inherit retired readers even with
+                // compaction disabled. Start cleanup only if leftovers remain.
+                if (!shuttingDown_.load(std::memory_order_relaxed) && compactThreads_.empty() && !cleanupThread_.joinable()) {
+                    reclaimRetiredFiles();
+                    if (!retiredFiles_.empty()) {
+                        cleanupThread_ = std::thread([this] {
+                            while (!shuttingDown_.load(std::memory_order_relaxed)) {
+                                reclaimRetiredFiles();
+                                std::unique_lock cleanupLock{compactMu_};
+                                compactCv_.wait_for(cleanupLock, std::chrono::milliseconds{50},
+                                    [this] { return shuttingDown_.load(std::memory_order_relaxed); });
+                            }
+                        });
+                    }
+                }
                 requestCompaction();
             }
 
@@ -441,81 +588,88 @@ namespace akkaradb::engine::sst {
                 compactCv_.notify_all();
                 for (auto& t : compactThreads_) { if (t.joinable()) { t.join(); } }
                 compactThreads_.clear();
+                if (cleanupThread_.joinable()) { cleanupThread_.join(); }
             }
 
             uint64_t flush(std::span<const core::RecordView> records) {
-                throwIfBackgroundFailed();
-                requireCatalogBinding();
-                if (records.empty()) { return 0; }
-                const auto path = makeFilePath(0);
-                const auto tmp = path.string() + ".tmp";
-
-                SSTWriter::Options wopts;
-                wopts.level = 0;
-                wopts.blockSize = options_.blockSize;
-                wopts.targetFileSize = options_.targetFileSize;
-                wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
-                wopts.codec = options_.codec;
-                wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
-                wopts.trackBlobReferences = options_.trackBlobReferences;
-
-                const auto result = SSTWriter::write(tmp, records, wopts);
-                crashAtTestPoint("sst.flush.after_tmp_write");
-                durableRename(tmp, path);
-                crashAtTestPoint("sst.flush.after_rename");
-                auto reader = SSTReader::open(path, readerOptions());
-                if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
-                auto meta = makeMeta(path, path.filename().string(), std::move(reader));
-
-                manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
-                manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
-                crashAtTestPoint("sst.flush.after_manifest_seal");
-
-                {
-                    std::unique_lock lock{levelsMu_};
-                    levels_[0].insert(levels_[0].begin(), std::move(meta));
-                    publishLocked();
-                }
-                requestCompaction();
-                return result.maxSeq;
+                return flush(records.size(), spanRecords(records));
             }
 
             uint64_t flush(size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
                 throwIfBackgroundFailed();
                 requireCatalogBinding();
-                const auto first = records.begin();
-                if (first == records.end()) { return 0; }
-                const auto path = makeFilePath(0);
-                const auto tmp = path.string() + ".tmp";
+                auto position = records.begin();
+                if (position == records.end()) { return 0; }
 
                 SSTWriter::Options wopts;
                 wopts.level = 0;
                 wopts.blockSize = options_.blockSize;
-                wopts.targetFileSize = options_.targetFileSize;
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
                 wopts.trackBlobReferences = options_.trackBlobReferences;
 
-                const auto result = SSTWriter::write(tmp, estimatedRecordCount, continueRecords(std::move(records), first), wopts);
-                crashAtTestPoint("sst.flush.after_tmp_write");
-                durableRename(tmp, path);
-                crashAtTestPoint("sst.flush.after_rename");
-                auto reader = SSTReader::open(path, readerOptions());
-                if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
-                auto meta = makeMeta(path, path.filename().string(), std::move(reader));
-
-                manifest_->sstBlobRefs(meta.filename, toManifestBlobRefs(result.blobRefs));
-                manifest_->sstSeal(0, meta.filename, meta.entryCount, hexKey(meta.firstKey), hexKey(meta.lastKey));
-                crashAtTestPoint("sst.flush.after_manifest_seal");
-
-                {
+                std::vector<Meta> outputs;
+                std::vector<SSTWriter::Result> results;
+                std::vector<std::pair<std::filesystem::path, bool>> paths;
+                uint64_t maxSeq = 0;
+                bool publicationAttempted = false;
+                try {
+                    while (position != records.end()) {
+                        if (!outputs.empty() && position->compareKey(outputs.back().lastKey) < 0) {
+                            throw std::invalid_argument("SSTManager::flush: records must be sorted by key");
+                        }
+                        const auto path = makeFilePath(0);
+                        paths.emplace_back(path, false);
+                        const auto tmp = path.string() + ".tmp";
+                        const auto estimate = static_cast<size_t>(std::min<uint64_t>(estimatedRecordCount,
+                            std::max<uint64_t>(1, options_.targetFileSize / sizeof(core::SSTHdr32))));
+                        auto result = SSTWriter::write(tmp, estimate, flushChunk(position, options_.targetFileSize), wopts);
+                        crashAtTestPoint("sst.flush.after_tmp_write");
+                        durableRename(tmp, path);
+                        paths.back().second = true;
+                        crashAtTestPoint("sst.flush.after_rename");
+                        auto reader = SSTReader::open(path, readerOptions());
+                        if (!reader) { throw std::runtime_error("SSTManager: cannot reopen flushed SST"); }
+                        outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));
+                        maxSeq = std::max(maxSeq, result.maxSeq);
+                        results.push_back(std::move(result));
+                    }
+                    crashAtTestPoint("sst.flush.after_outputs");
+                    for (size_t i = 0; i < outputs.size(); ++i) {
+                        manifest_->sstBlobRefs(outputs[i].filename, toManifestBlobRefs(results[i].blobRefs));
+                    }
+                    crashAtTestPoint("sst.flush.after_manifest_refs");
+                    // An uncertain commit must be resolved by replay. Never delete
+                    // output files after attempting the durable publication record.
+                    if (outputs.size() == 1) {
+                        const auto& output = outputs.front();
+                        publicationAttempted = true;
+                        manifest_->sstSeal(0, output.filename, output.entryCount, hexKey(output.firstKey), hexKey(output.lastKey));
+                    }
+                    else {
+                        const auto files = outputs | std::views::transform(&Meta::filename) | std::ranges::to<std::vector>();
+                        publicationAttempted = true;
+                        manifest_->compactionCommit(files, {});
+                    }
+                    crashAtTestPoint("sst.flush.after_manifest_seal");
                     std::unique_lock lock{levelsMu_};
-                    levels_[0].insert(levels_[0].begin(), std::move(meta));
+                    levels_[0].insert(levels_[0].begin(), std::make_move_iterator(outputs.begin()), std::make_move_iterator(outputs.end()));
                     publishLocked();
                 }
+                catch (...) {
+                    if (!publicationAttempted) {
+                        outputs.clear();
+                        for (const auto& [path, renamed] : paths) {
+                            std::error_code error;
+                            if (renamed) { std::filesystem::remove(path, error); }
+                            std::filesystem::remove(path.string() + ".tmp", error);
+                        }
+                    }
+                    throw;
+                }
                 requestCompaction();
-                return result.maxSeq;
+                return maxSeq;
             }
 
             [[nodiscard]] std::optional<SSTRecord> get(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
@@ -525,17 +679,11 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] ReadSnapshot readSnapshot() const { return ReadSnapshot{snapshot_.load(std::memory_order_acquire)}; }
 
             [[nodiscard]] std::optional<bool> contains(std::span<const uint8_t> key, uint64_t snapshotSeq) const {
-                auto rec = get(key, snapshotSeq);
-                if (!rec) { return std::nullopt; }
-                return !rec->isTombstone();
+                return readSnapshot().contains(key, snapshotSeq);
             }
 
             [[nodiscard]] std::optional<bool> getInto(std::span<const uint8_t> key, std::vector<uint8_t>& out, uint64_t snapshotSeq) const {
-                auto record = get(key, snapshotSeq);
-                if (!record) { return std::nullopt; }
-                if (record->isTombstone()) { return false; }
-                out = std::move(record->value);
-                return true;
+                return readSnapshot().getInto(key, out, snapshotSeq);
             }
 
             [[nodiscard]] Iterator scanIter(
@@ -544,13 +692,7 @@ namespace akkaradb::engine::sst {
                 uint64_t snapshotSeq,
                 bool includeTombstones
             ) const {
-                auto snap = snapshot_.load(std::memory_order_acquire);
-                if (!snap) { return Iterator{}; }
-
-                auto readers = snap->levels | std::views::join
-                    | std::views::filter([snapshotSeq](const Meta& meta) { return meta.reader && meta.minSeq <= snapshotSeq; })
-                    | std::views::transform(&Meta::reader) | std::ranges::to<std::vector>();
-                return Iterator{std::make_unique<Iterator::Impl>(std::move(readers), startKey, endKey, snapshotSeq, includeTombstones)};
+                return readSnapshot().scanIter(startKey, endKey, snapshotSeq, includeTombstones);
             }
 
             [[nodiscard]] std::vector<LevelStats> levelStats() const {
@@ -560,7 +702,7 @@ namespace akkaradb::engine::sst {
                 out.reserve(snap->levels.size());
                 for (const auto& [i, level] : std::views::enumerate(snap->levels)) {
                     const auto bytes = std::ranges::fold_left(level | std::views::transform(&Meta::file_size), uint64_t{0}, std::plus{});
-                    out.push_back(LevelStats{static_cast<int>(i), level.size(), bytes, i == 0 ? 0 : levelBudget(static_cast<int>(i))});
+                    out.push_back(LevelStats{.level = static_cast<int>(i), .fileCount = level.size(), .bytes = bytes, .budgetBytes = i == 0 ? 0 : levelBudget(static_cast<int>(i))});
                 }
                 return out;
             }
@@ -571,13 +713,15 @@ namespace akkaradb::engine::sst {
 
             [[nodiscard]] bool compactionPending() const noexcept { return compactRequested_.load(std::memory_order_relaxed); }
 
+            [[nodiscard]] SSTReader::CacheStats blockCacheStats() const { return blockCache_->stats(); }
+
             [[nodiscard]] CompactionSnapshot compactionSnapshot() const noexcept {
                 return {
-                    compactionsCompleted_.load(std::memory_order_relaxed),
-                    filesCompacted_.load(std::memory_order_relaxed),
-                    bytesCompactedIn_.load(std::memory_order_relaxed),
-                    bytesCompactedOut_.load(std::memory_order_relaxed),
-                    compactionFailures_.load(std::memory_order_relaxed)
+                    .compactionsCompleted = compactionsCompleted_.load(std::memory_order_relaxed),
+                    .filesCompacted = filesCompacted_.load(std::memory_order_relaxed),
+                    .bytesCompactedIn = bytesCompactedIn_.load(std::memory_order_relaxed),
+                    .bytesCompactedOut = bytesCompactedOut_.load(std::memory_order_relaxed),
+                    .compactionFailures = compactionFailures_.load(std::memory_order_relaxed)
                 };
             }
 
@@ -613,7 +757,7 @@ namespace akkaradb::engine::sst {
                 catalogBound_ = false;
                 const auto path = sstDir_ / "sst-catalog.akid";
                 if (std::filesystem::exists(path)) {
-                    std::array<uint8_t, 28> bytes;
+                    std::array<uint8_t, 28> bytes{};
                     std::ifstream in{path, std::ios::binary};
                     in.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
                     if (!in || in.peek() != std::char_traits<char>::eof() || bytes != catalogBinding()) {
@@ -641,12 +785,15 @@ namespace akkaradb::engine::sst {
                 if (!catalogBound_) { throw std::runtime_error("SSTManager: recover existing SST files before flushing"); }
             }
 
-            [[nodiscard]] SSTReader::Options readerOptions() const noexcept { return SSTReader::Options{options_.blockCacheBytes}; }
+            [[nodiscard]] SSTReader::Options readerOptions() const noexcept { return {.sharedBlockCache = blockCache_}; }
 
             [[nodiscard]] uint64_t levelBudget(int level) const {
                 if (level <= 0) { return 0; }
                 auto budget = static_cast<double>(options_.l1MaxBytes);
-                for (int i = 1; i < level; ++i) { budget *= options_.levelSizeMultiplier; }
+                for (auto i = 1; i < level; ++i) { budget *= options_.levelSizeMultiplier; }
+                // Large but valid layouts saturate instead of overflowing the
+                // floating-point-to-integer conversion.
+                if (budget >= static_cast<double>(UINT64_MAX)) { return UINT64_MAX; }
                 return static_cast<uint64_t>(budget);
             }
 
@@ -701,7 +848,11 @@ namespace akkaradb::engine::sst {
             }
 
             void publishLocked() {
-                auto snap = std::make_shared<ReadState>(ReadState{levels_});
+                auto snap = std::make_shared<ReadState>();
+                snap->levels = levels_;
+                const auto sequences = snap->levels | std::views::join | std::views::transform(&Meta::maxSeq);
+                snap->maxSeq = std::ranges::fold_left(sequences, uint64_t{0}, std::ranges::max);
+                snap->indexRanges();
                 snapshot_.store(std::move(snap), std::memory_order_release);
             }
 
@@ -730,6 +881,7 @@ namespace akkaradb::engine::sst {
 
             void compactionLoop() {
                 while (!shuttingDown_.load(std::memory_order_relaxed)) {
+                    reclaimRetiredFiles();
                     {
                         std::unique_lock lock{compactMu_};
                         compactCv_.wait_for(
@@ -741,7 +893,7 @@ namespace akkaradb::engine::sst {
                         );
                     }
                     if (shuttingDown_.load(std::memory_order_relaxed)) { break; }
-                    for (;;) {
+                    while (!shuttingDown_.load(std::memory_order_relaxed)) {
                         auto work = pickWork();
                         if (!work) {
                             compactRequested_.store(false, std::memory_order_relaxed);
@@ -761,26 +913,49 @@ namespace akkaradb::engine::sst {
             [[nodiscard]] std::optional<Work> pickWork() {
                 std::unique_lock levelsLock{levelsMu_};
                 std::lock_guard busyLock{busyMu_};
+                if (shuttingDown_.load(std::memory_order_relaxed)) { return std::nullopt; }
                 if (compactionFailed_.load(std::memory_order_acquire)) { return std::nullopt; }
-                if (levels_[0].size() >= static_cast<size_t>(options_.maxL0Files) && !isBusyLocked(0, 1)) {
-                    Work w{0, 1, levels_[0]};
-                    if (levels_.size() > 1) { w.inputs.append_range(levels_[1]); }
-                    busyWork_.push_back({w.src, w.dst});
+                if (!levels_[0].empty() && levels_[0].size() >= static_cast<size_t>(options_.maxL0Files) && !isBusyLocked(0, 1)) {
+                    Work w{.src = 0, .dst = 1, .inputs = levels_[0]};
+                    // L1 ranges are disjoint. Include only files intersecting an
+                    // L0 input; compactOutputs keeps disconnected ranges apart.
+                    std::unordered_set<std::string> selected;
+                    for (const auto& source : levels_[0]) {
+                        const auto first = std::ranges::lower_bound(levels_[1], source.firstKey, keyLess, &Meta::lastKey);
+                        for (auto it = first; it != levels_[1].end() && !keyLess(source.lastKey, it->firstKey); ++it) {
+                            if (selected.insert(it->filename).second) { w.inputs.push_back(*it); }
+                        }
+                    }
+                    std::vector<const Meta*> ordered;
+                    for (const auto& input : w.inputs) { ordered.push_back(&input); }
+                    std::ranges::sort(ordered, keyLess, [](const Meta* meta) { return std::span{meta->firstKey}; });
+                    std::span<const uint8_t> last = ordered.front()->lastKey;
+                    for (const auto* input : ordered | std::views::drop(1)) {
+                        if (keyLess(last, input->firstKey)) {
+                            const auto gap = std::ranges::upper_bound(levels_[1], last, keyLess, &Meta::firstKey);
+                            if (gap != levels_[1].end() && keyLess(gap->firstKey, input->firstKey)) {
+                                w.splitBefore.push_back(input->firstKey);
+                            }
+                            last = input->lastKey;
+                        }
+                        else if (keyLess(last, input->lastKey)) { last = input->lastKey; }
+                    }
+                    busyWork_.push_back({.src = w.src, .dst = w.dst});
                     return w;
                 }
 
-                for (int level = 1; level + 1 < options_.maxLevels; ++level) {
+                for (auto level = 1; level + 1 < options_.maxLevels; ++level) {
                     if (isBusyLocked(level, level + 1)) { continue; }
                     if (levelBytesLocked(level) <= levelBudget(level) || levels_[static_cast<size_t>(level)].empty()) { continue; }
 
                     const auto srcIt = std::ranges::min_element(levels_[static_cast<size_t>(level)], {}, &Meta::maxSeq);
-                    Work w{level, level + 1, {*srcIt}};
+                    Work w{.src = level, .dst = level + 1, .inputs = {*srcIt}};
                     for (const auto& m : levels_[static_cast<size_t>(level + 1)]) {
                         if (compareBytes(m.lastKey, srcIt->firstKey) >= 0 && compareBytes(m.firstKey, srcIt->lastKey) <= 0) {
                             w.inputs.push_back(m);
                         }
                     }
-                    busyWork_.push_back({w.src, w.dst});
+                    busyWork_.push_back({.src = w.src, .dst = w.dst});
                     return w;
                 }
                 return std::nullopt;
@@ -796,7 +971,6 @@ namespace akkaradb::engine::sst {
                 SSTWriter::Options wopts;
                 wopts.level = dst;
                 wopts.blockSize = options_.blockSize;
-                wopts.targetFileSize = options_.targetFileSize;
                 wopts.bloomBitsPerKey = options_.bloomBitsPerKey;
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
@@ -817,6 +991,7 @@ namespace akkaradb::engine::sst {
             }
 
             [[nodiscard]] std::vector<Meta> compactOutputs(const Work& work) {
+                const auto visibilitySeq = compactionVisibilitySeq_ ? compactionVisibilitySeq_() : UINT64_MAX;
                 struct Source {
                     core::ArenaGenerator<SSTRecord> rows;
                     core::ArenaGenerator<SSTRecord>::iterator it;
@@ -859,31 +1034,47 @@ namespace akkaradb::engine::sst {
 
                 std::vector<Meta> outputs;
                 std::vector<SSTRecord> chunk;
+                std::vector<SSTRecord> retained;
                 uint64_t chunkBytes = 0;
+                size_t boundary = 0;
                 // A lower-sequence flush can arrive even after bottom-level compaction.
                 // Retain tombstones until a future reclamation policy can prove that
                 // no older generation or promotion can be published.
 
                 while (!heap.empty()) {
-                    auto [best, sourceIdx] = heap.top();
-                    heap.pop();
-                    pushCurrent(heap, sources, sourceIdx);
-
-                    while (!heap.empty() && compareBytes(heap.top().rec.key, best.key) == 0) {
+                    const auto key = heap.top().rec.key;
+                    // Preserve untouched destination ranges without producing
+                    // tiny outputs for gaps that contain no destination file.
+                    if (boundary < work.splitBefore.size() && !keyLess(key, work.splitBefore[boundary])) {
+                        auto flushed = flushOutputChunk(chunk, work.dst);
+                        outputs.append_range(flushed | std::views::as_rvalue);
+                        chunkBytes = 0;
+                        do { ++boundary; } while (boundary < work.splitBefore.size() && !keyLess(key, work.splitBefore[boundary]));
+                    }
+                    retained.clear();
+                    std::optional<SSTRecord> visible;
+                    do {
                         auto [next, nextSourceIdx] = heap.top();
                         heap.pop();
                         pushCurrent(heap, sources, nextSourceIdx);
-                        if (next.seq > best.seq) { best = std::move(next); }
-                    }
+                        if (next.seq > visibilitySeq) { retained.push_back(std::move(next)); }
+                        else if (!visible || next.seq > visible->seq) { visible = std::move(next); }
+                    } while (!heap.empty() && compareBytes(heap.top().rec.key, key) == 0);
+                    if (visible) { retained.push_back(std::move(*visible)); }
+                    std::ranges::sort(retained, std::greater{}, &SSTRecord::seq);
+                    const auto duplicates = std::ranges::unique(retained, {}, &SSTRecord::seq);
+                    retained.erase(duplicates.begin(), duplicates.end());
 
-                    const auto bytes = recordBytes(best);
+                    const auto bytes = std::ranges::fold_left(retained | std::views::transform(recordBytes), uint64_t{0}, std::plus{});
+                    // Higher levels require disjoint key ranges: never split a
+                    // retained key's versions across output files, even if oversized.
                     if (!chunk.empty() && chunkBytes + bytes > options_.targetFileSize) {
                         auto flushed = flushOutputChunk(chunk, work.dst);
                         outputs.append_range(flushed | std::views::as_rvalue);
                         chunkBytes = 0;
                     }
                     chunkBytes += bytes;
-                    chunk.push_back(std::move(best));
+                    chunk.append_range(retained | std::views::as_rvalue);
                 }
 
                 if (!chunk.empty()) {
@@ -923,13 +1114,14 @@ namespace akkaradb::engine::sst {
                 }
 
                 for (auto&& [i, input] : std::views::enumerate(work.inputs)) {
-                    // Release our obsolete reader before unlinking (Windows denies
-                    // deletion while an ifstream is open). Pinned readers remain valid;
-                    // their leftover files are safely retired by catalog recovery.
+                    // A cached descriptor can be evicted and reopened. Keep the
+                    // path until the last snapshot/iterator releases its reader.
+                    { std::lock_guard lock{retiredMu_}; retiredFiles_.push_back(input.path); }
+                    input.reader->retire();
                     input.reader.reset();
-                    removeFileDurable(input.path);
                     if (i == 0) { crashAtTestPoint("sst.compaction.after_first_input_delete"); }
                 }
+                syncDirectory(sstDir_);
                 crashAtTestPoint("sst.compaction.after_input_delete");
 
                 compactionsCompleted_.fetch_add(1, std::memory_order_relaxed);
@@ -961,11 +1153,26 @@ namespace akkaradb::engine::sst {
                 return std::ranges::any_of(busyWork_, [=](const BusyWork& item) { return levelsOverlap(src, dst, item.src, item.dst); });
             }
 
+            void reclaimRetiredFiles() {
+                std::lock_guard lock{retiredMu_};
+                const auto attempts = std::min<size_t>(retiredFiles_.size(), 64);
+                for (size_t i = 0; i < attempts; ++i) {
+                    const auto file = retiredFiles_.begin();
+                    std::error_code error;
+                    const auto pinned = SSTReader::isPinned(*file);
+                    if (!pinned) { std::filesystem::remove(*file, error); }
+                    if (pinned || error) { retiredFiles_.splice(retiredFiles_.end(), retiredFiles_, file); }
+                    else { retiredFiles_.erase(file); }
+                }
+            }
+
             std::filesystem::path sstDir_;
             Options options_;
+            std::shared_ptr<SSTReader::BlockCache> blockCache_;
             std::unique_ptr<detail::StorageFileLock> directoryLock_;
             std::unique_ptr<manifest::Manifest> ownedManifest_;
             manifest::Manifest* manifest_;
+            std::function<uint64_t()> compactionVisibilitySeq_;
             bool catalogBound_ = false;
 
             mutable std::shared_mutex levelsMu_;
@@ -974,12 +1181,15 @@ namespace akkaradb::engine::sst {
             std::atomic<uint64_t> nextFileId_{1};
 
             std::vector<std::thread> compactThreads_;
+            std::thread cleanupThread_;
             mutable std::mutex compactMu_;
             std::condition_variable compactCv_;
             std::atomic<bool> compactRequested_{false};
             std::atomic<bool> shuttingDown_{false};
             std::mutex busyMu_;
             std::vector<BusyWork> busyWork_;
+            std::mutex retiredMu_;
+            std::list<std::filesystem::path> retiredFiles_;
 
             std::atomic<uint64_t> compactionsCompleted_{0};
             std::atomic<uint64_t> filesCompacted_{0};
@@ -1011,11 +1221,17 @@ namespace akkaradb::engine::sst {
     }
 
     std::unique_ptr<SSTManager> SSTManager::create(std::filesystem::path sstDir, const Options& options, manifest::Manifest* manifest) {
-        return std::unique_ptr<SSTManager>(new SSTManager(std::move(sstDir), options, manifest));
+        return create(std::move(sstDir), options, manifest, {});
     }
 
-    SSTManager::SSTManager(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest)
-        : impl_{std::make_unique<Impl>(std::move(sstDir), options, manifest)} {}
+    std::unique_ptr<SSTManager> SSTManager::create(std::filesystem::path sstDir, const Options& options,
+        manifest::Manifest* manifest, std::function<uint64_t()> compactionVisibilitySeq) {
+        return std::unique_ptr<SSTManager>(new SSTManager(std::move(sstDir), options, manifest, std::move(compactionVisibilitySeq)));
+    }
+
+    SSTManager::SSTManager(std::filesystem::path sstDir, Options options, manifest::Manifest* manifest,
+        std::function<uint64_t()> compactionVisibilitySeq)
+        : impl_{std::make_unique<Impl>(std::move(sstDir), options, manifest, std::move(compactionVisibilitySeq))} {}
 
     SSTManager::~SSTManager() = default;
     void SSTManager::recover() { impl_->recover(); }
@@ -1053,4 +1269,5 @@ namespace akkaradb::engine::sst {
     uint64_t SSTManager::maxSequence() const noexcept { return impl_->maxSequence(); }
     bool SSTManager::compactionPending() const noexcept { return impl_->compactionPending(); }
     SSTManager::CompactionSnapshot SSTManager::compactionSnapshot() const noexcept { return impl_->compactionSnapshot(); }
+    SSTReader::CacheStats SSTManager::blockCacheStats() const { return impl_->blockCacheStats(); }
 } // namespace akkaradb::engine::sst

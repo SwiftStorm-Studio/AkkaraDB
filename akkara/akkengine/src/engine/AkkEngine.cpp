@@ -8,19 +8,19 @@
  */
 
 // akkengine/src/engine/AkkEngine.cpp
-#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
-#include "akk/engine/cluster/detail/DiskResults.hpp"
-#include "akk/engine/cluster/detail/ClusterHealth.hpp"
-#include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include "akk/engine/AkkEngine.hpp"
-#include "akk/engine/detail/ProtocolBulkWriter.hpp"
-#include "akk/crypto/Random.hpp"
-#include "akk/engine/cluster/detail/ClusterPlacement.hpp"
-#include "akk/engine/cluster/detail/TransactionProtocol.hpp"
-#include "akk/engine/cluster/detail/KeyedMutex.hpp"
-#include "akk/engine/cluster/detail/BoundedExecutor.hpp"
-#include "akk/engine/cluster/detail/EngineSnapshot.hpp"
+#include <akk/engine/cluster/detail/ReconfigurationDeadline.hpp>
 #include "akk/cpu/CRC32C.hpp"
+#include "akk/crypto/Random.hpp"
+#include "akk/engine/cluster/detail/BoundedExecutor.hpp"
+#include "akk/engine/cluster/detail/ClusterHealth.hpp"
+#include "akk/engine/cluster/detail/ClusterPlacement.hpp"
+#include "akk/engine/cluster/detail/DiskResults.hpp"
+#include "akk/engine/cluster/detail/EngineSnapshot.hpp"
+#include "akk/engine/cluster/detail/KeyedMutex.hpp"
+#include "akk/engine/cluster/detail/NodeResourceBudget.hpp"
+#include "akk/engine/cluster/detail/TransactionProtocol.hpp"
+#include "akk/engine/detail/ProtocolBulkWriter.hpp"
 
 #include "akk/core/record/KeyFingerprint.hpp"
 #include "akk/core/record/MemHdr16.hpp"
@@ -38,32 +38,35 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <functional>
 #include <fstream>
+#include <functional>
+#include <iterator>
 #include <limits>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
+#include <ranges>
+#include <set>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <map>
-#include <ranges>
-#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include "detail/ClusterQuerySpool.hpp"
 
 #ifdef _WIN32
-#include <Windows.h>
 #include <io.h>
+#include <Windows.h>
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -77,7 +80,7 @@ namespace akkaradb::engine {
         [[nodiscard]] uint64_t nowNs() noexcept {
             timespec ts{};
             timespec_get(&ts, TIME_UTC);
-            return static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL + static_cast<uint64_t>(ts.tv_nsec);
+            return ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
         }
 
         void validateRollbackOptions(RollbackOptions options) {
@@ -87,18 +90,18 @@ namespace akkaradb::engine {
 
         void writeFileAtomicallyDurable(const fs::path& path, std::span<const uint8_t> bytes) {
             if (!path.parent_path().empty()) { fs::create_directories(path.parent_path()); }
-            fs::path temporary = path;
+            auto temporary = path;
             temporary += ".tmp";
             {
                 std::ofstream out{temporary, std::ios::binary | std::ios::trunc};
-                if (!out || !out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+                if (!out || !out.write(reinterpret_cast<const char*>(bytes.data()), std::ssize(bytes))) {
                     throw std::runtime_error("AkkEngine: failed to write durable journal");
                 }
                 out.flush();
                 if (!out) { throw std::runtime_error("AkkEngine: failed to flush durable journal"); }
             }
             #ifdef _WIN32
-            const HANDLE file = ::CreateFileW(
+            auto* const file = CreateFileW(
                 temporary.c_str(),
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ,
@@ -107,23 +110,23 @@ namespace akkaradb::engine {
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
                 nullptr
             );
-            if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
-                if (file != INVALID_HANDLE_VALUE) { ::CloseHandle(file); }
+            if (file == INVALID_HANDLE_VALUE || !FlushFileBuffers(file)) {
+                if (file != INVALID_HANDLE_VALUE) { CloseHandle(file); }
                 throw std::runtime_error("AkkEngine: failed to sync durable journal");
             }
-            ::CloseHandle(file);
-            if (!::MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            CloseHandle(file);
+            if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
                 throw std::runtime_error("AkkEngine: failed to publish durable journal");
             }
             #else
-            const int fd = ::open(temporary.c_str(), O_RDONLY); if (fd < 0 || ::fsync(fd) != 0) {
-                if (fd >= 0) { ::close(fd); }
+            const int fd = open(temporary.c_str(), O_RDONLY); if (fd < 0 || fsync(fd) != 0) {
+                if (fd >= 0) { close(fd); }
                 throw std::runtime_error("AkkEngine: failed to sync durable journal");
-            } ::close(fd); fs::rename(temporary, path); const fs::path parentPath = path.parent_path().empty() ? fs::path{"."} : path.parent_path(); const int
-                parent = ::open(parentPath.c_str(), O_RDONLY | O_DIRECTORY); if (parent < 0 || ::fsync(parent) != 0) {
-                if (parent >= 0) { ::close(parent); }
+            } close(fd); fs::rename(temporary, path); const fs::path parentPath = path.parent_path().empty() ? fs::path{"."} : path.parent_path(); const int
+                parent = open(parentPath.c_str(), O_RDONLY | O_DIRECTORY); if (parent < 0 || fsync(parent) != 0) {
+                if (parent >= 0) { close(parent); }
                 throw std::runtime_error("AkkEngine: failed to sync durable journal directory");
-            } ::close(parent);
+            } close(parent);
             #endif
         }
 
@@ -133,28 +136,30 @@ namespace akkaradb::engine {
         // terminates without unwinding, matching the storage guarantees required
         // at each persistence boundary.
         void crashAtTestPoint(const char* point) noexcept {
-            const char* requested = std::getenv("AKKARADB_TEST_CRASH_POINT");
-            if (requested != nullptr && std::strcmp(requested, point) == 0) { std::quick_exit(86); }
+            if (const auto* requested = std::getenv("AKKARADB_TEST_CRASH_POINT"); requested != nullptr && std::strcmp(requested, point) == 0) {
+                std::quick_exit(86);
+            }
         }
 
         void corruptSnapshotStagingAtTestPoint(const fs::path& path, const char* point) {
-            const char* requested = std::getenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
-            if (requested == nullptr || std::strcmp(requested, point) != 0) { return; }
+            if (const auto* requested = std::getenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT"); requested == nullptr || std::strcmp(requested, point) != 0) {
+                return;
+            }
             #ifdef _WIN32
             (void)_putenv_s("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT", "");
             #else
-            (void)::unsetenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
+            (void)unsetenv("AKKARADB_TEST_CORRUPT_SNAPSHOT_STAGING_POINT");
             #endif
 
             std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
             if (!file) { throw std::runtime_error("AkkEngine: failed to open replication snapshot staging file for test corruption"); }
 
-            constexpr auto firstRecordHeaderOffset = static_cast<std::streamoff>(5 + sizeof(uint64_t) + sizeof(uint64_t));
+            constexpr std::streamoff firstRecordHeaderOffset = 5 + sizeof(uint64_t) + sizeof(uint64_t);
             file.seekg(firstRecordHeaderOffset);
             std::array<uint8_t, sizeof(uint32_t)> keyLenBytes{};
             std::array<uint8_t, sizeof(uint64_t)> valueLenBytes{};
-            file.read(reinterpret_cast<char*>(keyLenBytes.data()), static_cast<std::streamsize>(keyLenBytes.size()));
-            file.read(reinterpret_cast<char*>(valueLenBytes.data()), static_cast<std::streamsize>(valueLenBytes.size()));
+            file.read(reinterpret_cast<char*>(keyLenBytes.data()), keyLenBytes.size());
+            file.read(reinterpret_cast<char*>(valueLenBytes.data()), valueLenBytes.size());
             if (!file) { throw std::runtime_error("AkkEngine: failed to read replication snapshot staging header for test corruption"); }
             uint32_t keyLen = 0;
             for (size_t i = 0; i < keyLenBytes.size(); ++i) { keyLen |= static_cast<uint32_t>(keyLenBytes[i]) << (i * 8); }
@@ -162,13 +167,13 @@ namespace akkaradb::engine {
             for (size_t i = 0; i < valueLenBytes.size(); ++i) { valueLen |= static_cast<uint64_t>(valueLenBytes[i]) << (i * 8); }
             if (valueLen == 0) { throw std::runtime_error("AkkEngine: replication snapshot staging value is empty at test corruption point"); }
 
-            const std::streamoff firstValueByteOffset = firstRecordHeaderOffset + static_cast<std::streamoff>(sizeof(uint32_t) + sizeof(uint64_t) + sizeof(
-                uint32_t) + keyLen);
+            constexpr std::streamoff firstValueHeaderSize = sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t);
+            const std::streamoff firstValueByteOffset = firstRecordHeaderOffset + firstValueHeaderSize + keyLen;
             file.seekg(firstValueByteOffset);
             char byte = 0;
             file.get(byte);
             if (!file) { throw std::runtime_error("AkkEngine: failed to read replication snapshot staging byte for test corruption"); }
-            byte = static_cast<char>(static_cast<unsigned char>(byte) ^ 0x5Au);
+            byte ^= 0x5A;
             file.clear();
             file.seekp(firstValueByteOffset);
             file.put(byte);
@@ -186,12 +191,12 @@ namespace akkaradb::engine {
             return out;
         }
 
-        static constexpr uint64_t BLOB_ID_NAMESPACE_BITS = 2;
-        static constexpr uint64_t BLOB_ID_PAYLOAD_BITS = 64 - BLOB_ID_NAMESPACE_BITS;
-        static constexpr uint64_t BLOB_ID_NAMESPACE_RAFT_LOG = 1ULL << BLOB_ID_PAYLOAD_BITS;
-        static constexpr uint64_t BLOB_ID_NAMESPACE_SNAPSHOT = 2ULL << BLOB_ID_PAYLOAD_BITS;
-        static constexpr uint64_t LOCAL_BLOB_ID_LIMIT = 1ULL << BLOB_ID_PAYLOAD_BITS;
-        static constexpr size_t SNAPSHOT_STAGING_VALUE_CHUNK_BYTES = 1024ULL * 1024ULL;
+        constexpr uint64_t BLOB_ID_NAMESPACE_BITS = 2;
+        constexpr uint64_t BLOB_ID_PAYLOAD_BITS = 64 - BLOB_ID_NAMESPACE_BITS;
+        constexpr uint64_t BLOB_ID_NAMESPACE_RAFT_LOG = 1ULL << BLOB_ID_PAYLOAD_BITS;
+        constexpr uint64_t BLOB_ID_NAMESPACE_SNAPSHOT = 2ULL << BLOB_ID_PAYLOAD_BITS;
+        constexpr uint64_t LOCAL_BLOB_ID_LIMIT = 1ULL << BLOB_ID_PAYLOAD_BITS;
+        constexpr size_t SNAPSHOT_STAGING_VALUE_CHUNK_BYTES = 1024ULL * 1024ULL;
 
         [[nodiscard]] uint64_t raftLogBlobId(uint64_t nodeId, uint64_t seq) {
             constexpr uint64_t SEQ_BITS = 46;
@@ -221,10 +226,11 @@ namespace akkaradb::engine {
             return !options.components.blobEnabled && !options.components.clusterEnabled;
         }
 
-        static constexpr size_t COMMIT_COMPLETION_RING_SIZE = 1u << 16u;
+        constexpr size_t COMMIT_COMPLETION_RING_SIZE = 1u << 16u;
 
         [[nodiscard]] uint32_t resolveCommitWindowSize(uint32_t requested) noexcept {
-            if (requested == 0) { return static_cast<uint32_t>(COMMIT_COMPLETION_RING_SIZE); }
+            if (requested == 0) { return
+                COMMIT_COMPLETION_RING_SIZE; }
             return nextPow2(std::clamp<uint32_t>(requested, 64u, 1u << 24u));
         }
 
@@ -339,27 +345,28 @@ namespace akkaradb::engine {
 
         void writeU32Le(std::ostream& out, uint32_t value) {
             std::array<uint8_t, 4> bytes{};
-            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
-            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = value >> (i * 8); }
+            out.write(reinterpret_cast<const char*>(bytes.data()), std::ssize(bytes));
             if (!out) { throw std::runtime_error("AkkEngine: failed to write snapshot staging record"); }
         }
 
         void writeU64Le(std::ostream& out, uint64_t value) {
             std::array<uint8_t, 8> bytes{};
-            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
-            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = value >> (i * 8); }
+            out.write(reinterpret_cast<const char*>(bytes.data()), std::ssize(bytes));
             if (!out) { throw std::runtime_error("AkkEngine: failed to write snapshot staging record"); }
         }
 
-        void readExact(std::istream& in, void* out, size_t bytes, const char* what) {
-            if (bytes == 0) { return; }
-            in.read(static_cast<char*>(out), static_cast<std::streamsize>(bytes));
+        template<typename Byte, size_t Extent>
+        void readExact(std::istream& in, std::span<Byte, Extent> out, const char* what) {
+            if (out.empty()) { return; }
+            in.read(reinterpret_cast<char*>(out.data()), std::ssize(out));
             if (!in) { throw std::runtime_error(std::string{"AkkEngine: failed to read snapshot staging "} + what); }
         }
 
         [[nodiscard]] uint32_t readU32Le(std::istream& in, const char* what) {
             std::array<uint8_t, 4> bytes{};
-            readExact(in, bytes.data(), bytes.size(), what);
+            readExact(in, std::span{bytes}, what);
             uint32_t out = 0;
             for (size_t i = 0; i < bytes.size(); ++i) { out |= static_cast<uint32_t>(bytes[i]) << (i * 8); }
             return out;
@@ -367,7 +374,7 @@ namespace akkaradb::engine {
 
         [[nodiscard]] uint64_t readU64Le(std::istream& in, const char* what) {
             std::array<uint8_t, 8> bytes{};
-            readExact(in, bytes.data(), bytes.size(), what);
+            readExact(in, std::span{bytes}, what);
             uint64_t out = 0;
             for (size_t i = 0; i < bytes.size(); ++i) { out |= static_cast<uint64_t>(bytes[i]) << (i * 8); }
             return out;
@@ -398,13 +405,13 @@ namespace akkaradb::engine {
 
         void updateCrcU32Le(Crc32cStream& crc, uint32_t value) noexcept {
             std::array<uint8_t, 4> bytes{};
-            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = value >> (i * 8); }
             crc.update(bytes);
         }
 
         void updateCrcU64Le(Crc32cStream& crc, uint64_t value) noexcept {
             std::array<uint8_t, 8> bytes{};
-            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = static_cast<uint8_t>(value >> (i * 8)); }
+            for (size_t i = 0; i < bytes.size(); ++i) { bytes[i] = value >> (i * 8); }
             crc.update(bytes);
         }
 
@@ -421,7 +428,7 @@ namespace akkaradb::engine {
             const uint32_t valueCrc32c = readU32Le(in, "entry value crc");
             SnapshotStagingEntryHeader header;
             header.key.resize(keyLen);
-            readExact(in, header.key.data(), header.key.size(), "entry key");
+            readExact(in, std::span{header.key}, "entry key");
             header.valueSize = valueLen;
             header.valueCrc32c = valueCrc32c;
             updateCrcU32Le(header.recordCrc, keyLen);
@@ -458,9 +465,9 @@ namespace akkaradb::engine {
                     Producer producer;
                     uint64_t replayCount = 0;
                     std::exception_ptr failure;
-                    bool replayReady = false;
-                    bool failed = false;
-                    bool followActiveProducer = false;
+                    auto replayReady = false;
+                    auto failed = false;
+                    auto followActiveProducer = false;
                     {
                         std::lock_guard lock{mutex_};
                         if (state_ == State::COMPLETE) {
@@ -531,8 +538,8 @@ namespace akkaradb::engine {
                     const bool fileBacked = visitor.fileEntry && wireSizeValid && 8ull + header.key.size() + header.valueSize > visitor.fileEntryThresholdBytes;
                     Crc32cStream payloadCrc;
                     if (fileBacked) {
-                        updateCrcU32Le(payloadCrc, static_cast<uint32_t>(header.key.size()));
-                        updateCrcU32Le(payloadCrc, static_cast<uint32_t>(header.valueSize));
+                        updateCrcU32Le(payloadCrc, header.key.size());
+                        updateCrcU32Le(payloadCrc, header.valueSize);
                         payloadCrc.update(header.key);
                     }
                     else if (!visitor.beginEntry(header.key, header.valueSize, header.valueCrc32c)) { return false; }
@@ -540,8 +547,8 @@ namespace akkaradb::engine {
                     Crc32cStream valueCrc;
                     uint64_t offset = 0;
                     while (offset < header.valueSize) {
-                        const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), header.valueSize - offset));
-                        readExact(in, buffer.data(), count, "export entry value");
+                        const size_t count = std::min<uint64_t>(buffer.size(), header.valueSize - offset);
+                        readExact(in, std::span{buffer}.first(count), "export entry value");
                         const auto chunk = std::span<const uint8_t>{buffer}.first(count);
                         valueCrc.update(chunk);
                         header.recordCrc.update(chunk);
@@ -570,7 +577,7 @@ namespace akkaradb::engine {
 
                 void readHeader(std::istream& in, std::optional<uint64_t> expectedEntryCount) const {
                     std::array<char, MAGIC.size()> magic{};
-                    readExact(in, magic.data(), magic.size(), "export header");
+                    readExact(in, std::span{magic}, "export header");
                     const uint64_t fileSeq = readU64Le(in, "export seq");
                     const uint64_t fileEntryCount = readU64Le(in, "export entry count");
                     if (magic != MAGIC || fileSeq != seq_ || (expectedEntryCount && fileEntryCount != *expectedEntryCount)) {
@@ -661,7 +668,7 @@ namespace akkaradb::engine {
                             if (entryActive) { throw std::runtime_error("AkkEngine: nested cluster snapshot entry"); }
                             if (producedEntries == UINT64_MAX) { throw std::overflow_error("AkkEngine: cluster snapshot has too many entries"); }
                             if (key.size() > UINT32_MAX) { throw std::runtime_error("AkkEngine: cluster snapshot key is too large"); }
-                            const uint32_t keySize = static_cast<uint32_t>(key.size());
+                            const uint32_t keySize = key.size();
                             const bool wireSizeValid = key.size() <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull && valueSize <= UINT32_MAX && valueSize
                                 <= cluster::ReplFrameHeader::MAX_PAYLOAD_SIZE - 8ull - key.size();
                             const uint64_t wireSize = wireSizeValid ? 8ull + key.size() + valueSize : 0;
@@ -684,13 +691,13 @@ namespace akkaradb::engine {
                             writeU32Le(out, valueCrc32c);
                             const auto dataOffset = out.tellp();
                             if (dataOffset < 0) { throw std::runtime_error("AkkEngine: invalid cluster snapshot export offset"); }
-                            entryDataOffset = static_cast<uint64_t>(dataOffset);
-                            if (!key.empty()) { out.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
+                            entryDataOffset = dataOffset;
+                            if (!key.empty()) { out.write(reinterpret_cast<const char*>(key.data()), std::ssize(key)); }
                             if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot export header"); }
                             addUnpublished(sizeof(uint32_t) * 2 + sizeof(uint64_t) + key.size());
                             if (entryFileBacked) {
                                 updateCrcU32Le(entryPayloadCrc, keySize);
-                                updateCrcU32Le(entryPayloadCrc, static_cast<uint32_t>(valueSize));
+                                updateCrcU32Le(entryPayloadCrc, valueSize);
                                 entryPayloadCrc.update(key);
                             }
                             else if (primaryVisitorComplete && !visitor.beginEntry(key, valueSize, valueCrc32c)) { primaryVisitorComplete = false; }
@@ -700,14 +707,14 @@ namespace akkaradb::engine {
                             if (!entryActive || offset != entryValueOffset || chunk.size() > entryValueSize - entryValueOffset || (chunk.empty() && (
                                 entryValueSize != 0 || sawChunk))) { throw std::runtime_error("AkkEngine: invalid cluster snapshot value chunk"); }
                             sawChunk = true;
-                            if (!chunk.empty()) { out.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size())); }
+                            if (!chunk.empty()) { out.write(reinterpret_cast<const char*>(chunk.data()), std::ssize(chunk)); }
                             if (!out) { throw std::runtime_error("AkkEngine: failed to write cluster snapshot value chunk"); }
                             entryValueCrc.update(chunk);
                             entryRecordCrc.update(chunk);
                             if (entryFileBacked) { entryPayloadCrc.update(chunk); }
                             addUnpublished(chunk.size());
                             if (!entryFileBacked && primaryVisitorComplete && !visitor.appendValueChunk(offset, chunk)) { primaryVisitorComplete = false; }
-                            entryValueOffset += static_cast<uint64_t>(chunk.size());
+                            entryValueOffset += chunk.size();
                             return hasConsumer();
                         },
                         .finishEntry = [&] {
@@ -748,7 +755,7 @@ namespace akkaradb::engine {
                     const bool complete = producer(spoolVisitor);
                     if (complete && entryActive) { throw std::runtime_error("AkkEngine: unterminated cluster snapshot entry"); }
                     if (!complete) { return false; }
-                    out.seekp(static_cast<std::streamoff>(MAGIC.size() + sizeof(uint64_t)));
+                    out.seekp(MAGIC.size() + sizeof(uint64_t));
                     writeU64Le(out, producedEntries);
                     out.flush();
                     if (!out) { throw std::runtime_error("AkkEngine: failed to finish cluster snapshot export"); }
@@ -794,7 +801,7 @@ namespace akkaradb::engine {
         [[nodiscard]] std::vector<uint8_t> encodeSnapshotCommitValue(uint64_t recordCount) {
             std::vector<uint8_t> out;
             out.insert(out.end(), {'A', 'K', 'S', 'C', '1'});
-            for (size_t i = 0; i < sizeof(uint64_t); ++i) { out.push_back(static_cast<uint8_t>(recordCount >> (i * 8))); }
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) { out.push_back(recordCount >> (i * 8)); }
             return out;
         }
 
@@ -825,16 +832,16 @@ namespace akkaradb::engine {
             return cmp;
         }
 
-        [[nodiscard]] std::span<const uint8_t> copySpanToArena(std::span<const uint8_t> in, core::BufferArena& arena) {
+        [[nodiscard]] std::span<const uint8_t> copySpanToArena(std::span<const uint8_t> in, BufferArena& arena) {
             if (in.empty()) { return {}; }
-            std::byte* raw = arena.allocate(in.size(), alignof(uint8_t));
+            auto* raw = arena.allocate(in.size(), alignof(uint8_t));
             auto* bytes = reinterpret_cast<uint8_t*>(raw);
             std::memcpy(bytes, in.data(), in.size());
             return {bytes, in.size()};
         }
 
         [[nodiscard]] std::optional<uint64_t> decodeBlobIdIfReference(uint8_t flags, std::span<const uint8_t> value) noexcept {
-            if ((flags & core::MemHdr16::FLAG_BLOB) == 0 || value.size() < blob::BLOB_REF_SIZE) { return std::nullopt; }
+            if ((flags & MemHdr16::FLAG_BLOB) == 0 || value.size() < blob::BLOB_REF_SIZE) { return std::nullopt; }
             return blob::decodeBlobRef(value.data()).blobId;
         }
     } // namespace
@@ -843,11 +850,11 @@ namespace akkaradb::engine {
         uint8_t flags,
         std::span<const uint8_t> value,
         blob::BlobManager* blobManager,
-        core::BufferArena& arena
+        BufferArena& arena
     ) {
-        if ((flags & core::MemHdr16::FLAG_BLOB) == 0) { return value; }
+        if ((flags & MemHdr16::FLAG_BLOB) == 0) { return value; }
         if (!blobManager || value.size() < blob::BLOB_REF_SIZE) { return std::nullopt; }
-        const blob::BlobRef ref = blob::decodeBlobRef(value.data());
+        const auto ref = blob::decodeBlobRef(value.data());
         auto out = blobManager->read(ref.blobId, ref.contentCrc32c);
         if (out.empty() && ref.totalSize != 0) { return std::nullopt; }
         return copySpanToArena(std::span<const uint8_t>{out.data(), out.size()}, arena);
@@ -859,14 +866,14 @@ namespace akkaradb::engine {
         uint8_t flags = 0;
     };
 
-    [[nodiscard]] core::ArenaGenerator<StoredScanRecordView> storedScanGenerator(
+    [[nodiscard]] ArenaGenerator<StoredScanRecordView> storedScanGenerator(
         memtable::MemTable::RangeIterator memtableIter,
         sst::SSTManager::Iterator sstIter,
         std::shared_ptr<void> operationLifetime = {}
     ) {
         // Retains a public operation guard for the lifetime of a returned scan.
         (void)operationLifetime;
-        auto memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
+        auto memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<RecordView>{};
         auto sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{};
 
         while (memtableCur || sstCur) {
@@ -883,13 +890,13 @@ namespace akkaradb::engine {
                     if (!memtableCur->isTombstone()) { co_yield StoredScanRecordView{memtableCur->key(), memtableCur->value(), memtableCur->flags()}; }
                 }
                 else if (!sstCur->isTombstone()) { co_yield StoredScanRecordView{sstCur->key, sstCur->value, sstCur->flags}; }
-                memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
+                memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<RecordView>{};
                 sstCur = sstIter.hasNext() ? sstIter.next() : std::optional<sst::SSTRecord>{};
             }
             else if (cmp < 0) {
                 const auto record = *memtableCur;
                 if (!record.isTombstone()) { co_yield StoredScanRecordView{record.key(), record.value(), record.flags()}; }
-                memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<core::RecordView>{};
+                memtableCur = memtableIter.hasNext() ? memtableIter.next() : std::optional<RecordView>{};
             }
             else {
                 const auto record = std::move(*sstCur);
@@ -914,8 +921,7 @@ namespace akkaradb::engine {
         auto readPin = std::move(blobReadPin);
         (void)readPin;
         for (const auto& [key, value, flags] : storedScanGenerator(std::move(memtableIter), std::move(sstIter), std::move(operationLifetime))) {
-            auto v = resolveScanValue(flags, value, blobManager, arena);
-            if (v) { co_yield AkkEngine::ScanRecordView{.key = key, .value = *v}; }
+            if (auto v = resolveScanValue(flags, value, blobManager, arena)) { co_yield AkkEngine::ScanRecordView{.key = key, .value = *v}; }
         }
     }
 
@@ -1141,7 +1147,7 @@ namespace akkaradb::engine {
                     if (opts.runtime.parallelWriteOrder == AkkEngineOptions::ParallelWriteOrderMode::KEY_SEQUENCE) { commitCv.notify_all(); }
                     return;
                 }
-                bool advanced = false;
+                auto advanced = false;
                 {
                     std::lock_guard lock{commitMu};
                     uint64_t current = committedSeq.load(std::memory_order_relaxed);
@@ -1151,7 +1157,7 @@ namespace akkaradb::engine {
                     const size_t mask = completedSeqRing.size() - 1u;
                     const uint64_t distance = seq - current;
                     if (distance <= completedSeqRing.size()) {
-                        const size_t slot = static_cast<size_t>(seq) & mask;
+                        const size_t slot = seq & mask;
                         if (completedSeqRing[slot] == 0 || completedSeqRing[slot] <= current) { completedSeqRing[slot] = seq; }
                         else if (completedSeqRing[slot] != seq) { completedSeqOverflow.insert(seq); }
                     }
@@ -1159,7 +1165,7 @@ namespace akkaradb::engine {
 
                     while (true) {
                         const uint64_t next = current + 1u;
-                        const size_t slot = static_cast<size_t>(next) & mask;
+                        const size_t slot = next & mask;
                         if (completedSeqRing[slot] == next) {
                             completedSeqRing[slot] = 0;
                             current = next;
@@ -1192,7 +1198,7 @@ namespace akkaradb::engine {
                         return committedSeq.load(std::memory_order_acquire) >= target || keySequenceFailure || closed.load(std::memory_order_acquire);
                     }
                 );
-                const std::exception_ptr failure = keySequenceFailure;
+                const auto failure = keySequenceFailure;
                 lock.unlock();
                 if (failure) { std::rethrow_exception(failure); }
             }
@@ -1262,7 +1268,7 @@ namespace akkaradb::engine {
                     uint64_t next = 0;
                     uint64_t end = 0;
                 };
-                static thread_local SeqRangeCache cache;
+                thread_local SeqRangeCache cache;
 
                 if (cache.owner != this || cache.next >= cache.end) {
                     const uint32_t rangeSize = std::max<uint32_t>(2, opts.runtime.sequence.threadLocalRangeSize);
@@ -1343,7 +1349,7 @@ namespace akkaradb::engine {
 
                 blobManager->write(seq, value);
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
-                blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
+                blob::encodeBlobRef(ref.data(), blob::BlobRef{seq, value.size(), blob::crc32c(value)});
                 flags |= MemHdr16::FLAG_BLOB;
                 if (clusterRuntime) { clusterRuntime->shipBlob(seq, seq, value); }
                 return ref;
@@ -1429,7 +1435,7 @@ namespace akkaradb::engine {
                     record.source = decoded.source;
                     record.timestamp = decoded.timestamp;
                     record.blobId = decoded.blobId;
-                    record.flags = decoded.flags & static_cast<uint8_t>(~MemHdr16::FLAG_BLOB);
+                    record.flags = decoded.flags & ~MemHdr16::FLAG_BLOB;
                     record.key = std::vector<uint8_t>{decoded.key.begin(), decoded.key.end()};
                     if (record.history) {
                         record.historyPresent = record.sequence <= snapshotSeq() || (writeBlob && versionLog && record.sequence <= storedHistoryThrough &&
@@ -1457,24 +1463,24 @@ namespace akkaradb::engine {
                         }
 
                         std::vector<uint8_t> buffer;
-                        buffer.resize(static_cast<size_t>(std::min<uint64_t>(SNAPSHOT_STAGING_VALUE_CHUNK_BYTES, valueSize)));
+                        buffer.resize(std::min<uint64_t>(SNAPSHOT_STAGING_VALUE_CHUNK_BYTES, valueSize));
                         uint64_t offset = 0;
                         while (offset < valueSize) {
-                            const size_t chunkSize = static_cast<size_t>(std::min<uint64_t>(buffer.size(), valueSize - offset));
-                            readExact(in, buffer.data(), chunkSize, "entry value chunk");
+                            const size_t chunkSize = std::min<uint64_t>(buffer.size(), valueSize - offset);
+                            readExact(in, std::span{buffer}.first(chunkSize), "entry value chunk");
                             const std::span<const uint8_t> chunk{buffer.data(), chunkSize};
                             recordCrc.update(chunk);
                             valueCrc.update(chunk);
                             if (writeBlob) { blobManager->appendWriteChunk(blobId, offset, chunk); }
-                            offset += static_cast<uint64_t>(chunkSize);
+                            offset += chunkSize;
                         }
                     }
                     else {
-                        if (valueSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+                        if (valueSize > std::numeric_limits<size_t>::max()) {
                             throw std::runtime_error("AkkEngine: replication snapshot staged value is too large");
                         }
-                        record.storedValue.resize(static_cast<size_t>(valueSize));
-                        readExact(in, record.storedValue.data(), record.storedValue.size(), "entry value");
+                        record.storedValue.resize(valueSize);
+                        readExact(in, std::span{record.storedValue}, "entry value");
                         recordCrc.update(record.storedValue);
                         valueCrc.update(record.storedValue);
                     }
@@ -1518,7 +1524,7 @@ namespace akkaradb::engine {
 
                 const uint64_t blobId = opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG ? raftLogBlobId(nodeId, seq) : seq;
                 std::vector<uint8_t> ref(blob::BLOB_REF_SIZE);
-                blob::encodeBlobRef(ref.data(), blob::BlobRef{blobId, static_cast<uint64_t>(value.size()), blob::crc32c(value)});
+                blob::encodeBlobRef(ref.data(), blob::BlobRef{blobId, value.size(), blob::crc32c(value)});
                 flags |= MemHdr16::FLAG_BLOB;
 
                 if (opts.cluster.runtime.raftBlobPolicy == cluster::RaftBlobPolicy::RAFT_LOG) {
@@ -1559,21 +1565,21 @@ namespace akkaradb::engine {
             };
 
             static void pushU16(std::vector<uint8_t>& out, uint16_t value) {
-                out.push_back(static_cast<uint8_t>(value));
-                out.push_back(static_cast<uint8_t>(value >> 8));
+                out.push_back(value);
+                out.push_back(value >> 8);
             }
 
             static void pushU32(std::vector<uint8_t>& out, uint32_t value) {
-                for (size_t i = 0; i < 4; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+                for (size_t i = 0; i < 4; ++i) { out.push_back(value >> (i * 8)); }
             }
 
             static void pushU64(std::vector<uint8_t>& out, uint64_t value) {
-                for (size_t i = 0; i < 8; ++i) { out.push_back(static_cast<uint8_t>(value >> (i * 8))); }
+                for (size_t i = 0; i < 8; ++i) { out.push_back(value >> (i * 8)); }
             }
 
             static bool pullU16(std::span<const uint8_t> bytes, size_t& cursor, uint16_t& out) {
                 if (cursor + 2 > bytes.size()) { return false; }
-                out = static_cast<uint16_t>(bytes[cursor]) | static_cast<uint16_t>(bytes[cursor + 1] << 8);
+                out = bytes[cursor] | bytes[cursor + 1] << 8;
                 cursor += 2;
                 return true;
             }
@@ -1596,7 +1602,7 @@ namespace akkaradb::engine {
 
             static bool pullBytes(std::span<const uint8_t> bytes, size_t& cursor, size_t size, std::vector<uint8_t>& out) {
                 if (size > bytes.size() - cursor) { return false; }
-                out.assign(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), bytes.begin() + static_cast<std::ptrdiff_t>(cursor + size));
+                out.assign_range(bytes.subspan(cursor, size));
                 cursor += size;
                 return true;
             }
@@ -1605,7 +1611,7 @@ namespace akkaradb::engine {
                 // A fixed namespace followed by the raw key preserves public
                 // byte order and permits bounded metadata range seeks.
                 std::vector<uint8_t> out{0, 'A', 'K', 'S', 'M', '1'};
-                out.insert(out.end(), key.begin(), key.end());
+                out.append_range(key);
                 return out;
             }
 
@@ -1613,7 +1619,7 @@ namespace akkaradb::engine {
                 std::vector<uint8_t> out{0, 'A', 'K', 'S', 'H', '2'};
                 pushU64(out, generation);
                 pushU64(out, sequence);
-                out.insert(out.end(), key.begin(), key.end());
+                out.append_range(key);
                 return out;
             }
 
@@ -1635,8 +1641,8 @@ namespace akkaradb::engine {
                 std::vector<uint8_t> out{0, 'A', 'K', 'S', 'S', '1'};
                 pushU64(out, version);
                 pushU16(out, shardIndex);
-                pushU32(out, static_cast<uint32_t>(key.size()));
-                out.insert(out.end(), key.begin(), key.end());
+                pushU32(out, key.size());
+                out.append_range(key);
                 return out;
             }
 
@@ -1648,13 +1654,13 @@ namespace akkaradb::engine {
             static std::optional<std::vector<uint8_t>> publicKeyFromStripeMetaKey(std::span<const uint8_t> key) {
                 if (key.size() < 6 || key[0] != 0 || key[1] != 'A' || key[2] != 'K' || key[3] != 'S' || key[4] != 'M' || key[5] != '1') { return std::nullopt; }
                 std::vector<uint8_t> out;
-                out.assign(key.begin() + 6, key.end());
+                out.assign_range(key.subspan(6));
                 return out;
             }
 
             static std::vector<uint8_t> encodeStripeMetadata(const StripeMetadata& metadata) {
                 std::vector<uint8_t> out{'A', 'K', 'S', 'M', '1'};
-                out.push_back(static_cast<uint8_t>((metadata.tombstone ? 1U : 0U) | (metadata.rollback ? 2U : 0U)));
+                out.push_back((metadata.tombstone ? 1U : 0U) | (metadata.rollback ? 2U : 0U));
                 pushU64(out, metadata.version);
                 pushU64(out, metadata.ownerNodeId);
                 pushU64(out, metadata.authorityNodeId);
@@ -1662,10 +1668,10 @@ namespace akkaradb::engine {
                 pushU64(out, metadata.originalSize);
                 pushU16(out, metadata.layout.dataShards);
                 pushU16(out, metadata.layout.parityShards);
-                pushU16(out, static_cast<uint16_t>(metadata.nodeIds.size()));
+                pushU16(out, metadata.nodeIds.size());
                 for (const auto nodeId : metadata.nodeIds) { pushU64(out, nodeId); }
-                pushU16(out, static_cast<uint16_t>(metadata.shardPresent.size()));
-                out.insert(out.end(), metadata.shardPresent.begin(), metadata.shardPresent.end());
+                pushU16(out, metadata.shardPresent.size());
+                out.append_range(metadata.shardPresent);
                 pushU64(out, metadata.logicalSeq);
                 pushU64(out, metadata.originNodeId);
                 pushU64(out, metadata.timestampNs);
@@ -1692,7 +1698,7 @@ namespace akkaradb::engine {
                 if (!pullU16(bytes, cursor, nodeCount) || logicalShards == 0 || nodeCount % logicalShards != 0) { return std::nullopt; }
                 const uint16_t copiesPerShard = nodeCount / logicalShards;
                 if (copiesPerShard != 1 && copiesPerShard != 2) { return std::nullopt; }
-                metadata.copiesPerShard = static_cast<uint8_t>(copiesPerShard);
+                metadata.copiesPerShard = copiesPerShard;
                 metadata.nodeIds.reserve(nodeCount);
                 for (uint16_t i = 0; i < nodeCount; ++i) {
                     uint64_t nodeId = 0;
@@ -1701,10 +1707,7 @@ namespace akkaradb::engine {
                 }
                 uint16_t presenceCount = 0;
                 if (!pullU16(bytes, cursor, presenceCount) || presenceCount != nodeCount || presenceCount > bytes.size() - cursor) { return std::nullopt; }
-                metadata.shardPresent.assign(
-                    bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-                    bytes.begin() + static_cast<std::ptrdiff_t>(cursor + presenceCount)
-                );
+                metadata.shardPresent.assign_range(bytes.subspan(cursor, presenceCount));
                 if (std::ranges::any_of(metadata.shardPresent, [](uint8_t present) { return present > 1; })) { return std::nullopt; }
                 cursor += presenceCount;
                 if (!pullU64(bytes, cursor, metadata.logicalSeq) || !pullU64(bytes, cursor, metadata.originNodeId) || !pullU64(
@@ -1723,8 +1726,8 @@ namespace akkaradb::engine {
                 pushU16(out, layout.dataShards);
                 pushU16(out, layout.parityShards);
                 pushU32(out, shard.crc32c);
-                pushU32(out, static_cast<uint32_t>(shard.payload.size()));
-                out.insert(out.end(), shard.payload.begin(), shard.payload.end());
+                pushU32(out, shard.payload.size());
+                out.append_range(shard.payload);
                 return out;
             }
 
@@ -1757,7 +1760,7 @@ namespace akkaradb::engine {
                 std::optional<sst::SSTRecord> disk;
 
                 [[nodiscard]] explicit operator bool() const noexcept { return memory.has_value() || disk.has_value(); }
-                [[nodiscard]] core::RecordView view() const noexcept {
+                [[nodiscard]] RecordView view() const noexcept {
                     if (memory) { return memory->view; }
                     return {disk->key.data(), static_cast<uint16_t>(disk->key.size()), disk->value.data(),
                         static_cast<uint16_t>(disk->value.size()), disk->seq, disk->flags, disk->keyFp64, disk->miniKey};
@@ -1776,6 +1779,26 @@ namespace akkaradb::engine {
                     return snapshotSeq();
                 });
                 return result;
+            }
+
+            struct StoredRangeRead {
+                memtable::MemTable::RangeIterator memory;
+                sst::SSTManager::Iterator disk;
+            };
+
+            [[nodiscard]] StoredRangeRead captureStoredRangeRead(
+                const memtable::MemTable::KeyRange& range, bool pinWriters = false) const {
+                sst::SSTManager::ReadSnapshot disk;
+                const auto captureSequence = [&] {
+                    if (sstManager) { disk = sstManager->readSnapshot(); }
+                    return snapshotSeq();
+                };
+                // Pin memory ownership, SST generation and visibility before a
+                // backend iterator can pause while flush/compaction replaces files.
+                auto memory = pinWriters ? memtable->pinnedIterator(range, captureSequence)
+                                         : memtable->iteratorWithSnapshot(range, captureSequence);
+                auto iterator = disk.scanIter(range.start, range.end, memory.snapshotSeq(), true);
+                return {std::move(memory), std::move(iterator)};
             }
 
             [[nodiscard]] StoredPointRead readStoredPoint(
@@ -1812,7 +1835,7 @@ namespace akkaradb::engine {
             void promoteStoredPoint(const StoredPointRead& record) {
                 if (opts.runtime.sstPromoteReads && record.disk) {
                     const auto view = record.view();
-                    memtable->put(view.key(), view.value(), view.seq(), view.flags(), view.keyFp64(), view.miniKey());
+                    memtable->promote(view);
                 }
             }
 
@@ -1875,8 +1898,8 @@ namespace akkaradb::engine {
                         const uint64_t firstScore = rendezvousScore(key, first);
                         const uint64_t secondScore = rendezvousScore(key, second);
                         if (secondScore > firstScore || (secondScore == firstScore && second < first)) { std::swap(first, second); }
-                        const auto pairIds = std::minmax(first, second);
-                        pairs.push_back(MirrorPair{.score = rendezvousScore(key, pairIds.first, pairIds.second), .first = first, .second = second});
+                        const auto [minId, maxId] = std::minmax(first, second);
+                        pairs.push_back(MirrorPair{.score = rendezvousScore(key, minId, maxId), .first = first, .second = second});
                     }
                     std::ranges::sort(
                         pairs,
@@ -1887,9 +1910,9 @@ namespace akkaradb::engine {
                     );
                     std::vector<uint64_t> ids;
                     ids.reserve(totalPlacements);
-                    for (const auto& pair : pairs) {
-                        ids.push_back(pair.first);
-                        ids.push_back(pair.second);
+                    for (const auto& [score, first, second] : pairs) {
+                        ids.push_back(first);
+                        ids.push_back(second);
                     }
                     if (excludedNodeId != 0) {
                         if (replacementNodeId == 0 && clusterRuntime) { replacementNodeId = clusterRuntime->stripeFailoverNodeId(key); }
@@ -1923,16 +1946,16 @@ namespace akkaradb::engine {
                 if (stripeFailure) { std::rethrow_exception(stripeFailure); }
             }
 
-            void failStripe(std::exception_ptr failure) {
+            void failStripe(const std::exception_ptr& failure) {
                 std::lock_guard lock{stripeStateMu};
-                if (!stripeFailure) { stripeFailure = std::move(failure); }
+                if (!stripeFailure) { stripeFailure = failure; }
             }
 
             static std::vector<uint8_t> stripeTransactionKey(std::span<const uint8_t> key, uint64_t version) {
                 // Intent and shard keys retain their generation-oriented format.
                 std::vector<uint8_t> out{0, 'A', 'K', 'S', 'T', '1'};
-                pushU32(out, static_cast<uint32_t>(key.size()));
-                out.insert(out.end(), key.begin(), key.end());
+                pushU32(out, key.size());
+                out.append_range(key);
                 pushU64(out, version);
                 return out;
             }
@@ -2057,7 +2080,7 @@ namespace akkaradb::engine {
                     metadata.authorityNodeId != nodeId) { return; }
                 // Only the owner repairs, under the key lock, so repair cannot
                 // resurrect a retired generation after the owner's GC.
-                for (uint16_t placement = 0; placement < metadata.nodeIds.size(); ++placement) {
+                for (size_t placement = 0; placement < metadata.nodeIds.size(); ++placement) {
                     if (placement < present.size() && present[placement]) { continue; }
                     const uint16_t shardIndex = placement / metadata.copiesPerShard;
                     {
@@ -2108,7 +2131,7 @@ namespace akkaradb::engine {
                     metadata.nodeIds.size(),
                     [&](size_t placement) {
                         cluster::detail::ReconfigurationDeadline scope{budget};
-                        const uint16_t shardIndex = static_cast<uint16_t>(placement / metadata.copiesPerShard);
+                        const uint16_t shardIndex = placement / metadata.copiesPerShard;
                         std::optional<std::vector<uint8_t>> stored;
                         try { stored = readStripeRecordFromNode(metadata.nodeIds[placement], stripeShardKey(publicKey, metadata.version, shardIndex)); }
                         catch (const std::runtime_error&) { return; }
@@ -2206,10 +2229,10 @@ namespace akkaradb::engine {
                 std::vector<uint8_t> out{'A', 'K', 'S', 'T', '1'};
                 const auto nextBytes = encodeStripeMetadata(next);
                 const auto previousBytes = previous ? encodeStripeMetadata(*previous) : std::vector<uint8_t>{};
-                pushU32(out, static_cast<uint32_t>(nextBytes.size()));
-                out.insert(out.end(), nextBytes.begin(), nextBytes.end());
-                pushU32(out, static_cast<uint32_t>(previousBytes.size()));
-                out.insert(out.end(), previousBytes.begin(), previousBytes.end());
+                pushU32(out, nextBytes.size());
+                out.append_range(nextBytes);
+                pushU32(out, previousBytes.size());
+                out.append_range(previousBytes);
                 return out;
             }
 
@@ -2271,9 +2294,9 @@ namespace akkaradb::engine {
                     next.ownerNodeId = originalOwner;
                     next.authorityNodeId = lease.authorityNodeId;
                     next.originNodeId = lease.authorityNodeId;
-                    next.timestampNs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    next.timestampNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::system_clock::now().time_since_epoch()
-                    ).count());
+                    ).count();
                     next.fenceToken = lease.coordinated ? lease.fenceToken : 1;
                     next.originalSize = value.size();
                     next.layout = stripeLayoutFor(currentPlacement());
@@ -2285,9 +2308,8 @@ namespace akkaradb::engine {
                         const auto normal = stripeNodeIdsFor(placementView, publicKey);
                         // A reachable owner replacement may differ from the
                         // current authority, which can already hold another shard.
-                        const auto ownerPosition = std::ranges::find(normal, excludedOwner);
-                        if (ownerPosition != normal.end()) {
-                            const auto position = static_cast<size_t>(ownerPosition - normal.begin());
+                        if (const auto ownerPosition = std::ranges::find(normal, excludedOwner); ownerPosition != normal.end()) {
+                            const size_t position = ownerPosition - normal.begin();
                             const auto spare = previous->nodeIds[position];
                             if (placementView.isStripeFailoverNode(spare) && clusterRuntime->stripeNodeReachable(spare)) { next.nodeIds[position] = spare; }
                         }
@@ -2332,7 +2354,7 @@ namespace akkaradb::engine {
                         stripeExecutor->forEach(
                             next.nodeIds.size(),
                             [&](size_t placement) {
-                                const auto shardIndex = static_cast<uint16_t>(placement / next.copiesPerShard);
+                                const uint16_t shardIndex = placement / next.copiesPerShard;
                                 const auto targetNodeId = next.nodeIds[placement];
                                 try {
                                     if (targetNodeId != nodeId && clusterRuntime && !clusterRuntime->stripeNodeReachable(targetNodeId)) { return; }
@@ -2355,7 +2377,7 @@ namespace akkaradb::engine {
                             }
                         }
                         bool sufficient = durablePlacements == next.nodeIds.size();
-                        uint16_t requiredPlacements = static_cast<uint16_t>(next.nodeIds.size());
+                        uint16_t requiredPlacements = next.nodeIds.size();
                         if (opts.cluster.runtime.stripeWriteCommitMode == cluster::StripeWriteCommitMode::DATA_SHARDS) {
                             if (next.copiesPerShard == 2) {
                                 sufficient = std::ranges::all_of(durableCopies, [](uint8_t copies) { return copies != 0; });
@@ -2432,7 +2454,7 @@ namespace akkaradb::engine {
                     throw std::runtime_error("AkkEngine: invalid STRIPE reclamation candidate");
                 }
                 if (candidate->tombstone || stripeGenerationRetainedLocal(publicKey, candidate->version) || retainedByPeers()) { return true; }
-                for (uint16_t placement = 0; placement < candidate->nodeIds.size(); ++placement) {
+                for (size_t placement = 0; placement < candidate->nodeIds.size(); ++placement) {
                     const uint16_t shardIndex = placement / candidate->copiesPerShard;
                     writeStripeRecordToNode(
                         candidate->nodeIds[placement],
@@ -2452,7 +2474,7 @@ namespace akkaradb::engine {
                 if (!stripeGcLoaded) {
                     std::lock_guard lock{writeMu};
                     auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
-                    core::BufferArena arena;
+                    BufferArena arena;
                     memtable::MemTable::KeyRange range;
                     const auto seq = snapshotSeq();
                     auto mt = memtable->iterator(range, seq);
@@ -2532,16 +2554,13 @@ namespace akkaradb::engine {
                         if (stripeRebuildCursor.empty()) { stripeRebuildStats.active = false; }
                     }
                     auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
-                    core::BufferArena arena;
+                    BufferArena arena;
                     memtable::MemTable::KeyRange range;
                     range.start = stripeRebuildCursor;
-                    const uint64_t visibleSeq = snapshotSeq();
-                    auto mt = memtable->iterator(range, visibleSeq);
-                    sst::SSTManager::Iterator sst;
-                    if (sstManager) { sst = sstManager->scanIter(range.start, {}, visibleSeq, true); }
+                    auto sources = captureStoredRangeRead(range);
                     std::vector<uint8_t> lastMetadataKey;
                     uint32_t metadataKeysVisited = 0;
-                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
+                    for (const auto& record : scanGenerator(arena, std::move(sources.memory), std::move(sources.disk), blobManager.get(), std::move(blobReadPin))) {
                         std::vector<uint8_t> internalKey{record.key.begin(), record.key.end()};
                         if (!stripeRebuildCursor.empty() && internalKey <= stripeRebuildCursor) { continue; }
                         auto publicKey = publicKeyFromStripeMetaKey(record.key);
@@ -2574,7 +2593,7 @@ namespace akkaradb::engine {
                     auto shards = readStripeShards(candidate.key, candidate.metadata);
                     bool missing = false;
                     std::vector<uint8_t> observed(candidate.metadata.nodeIds.size(), 0);
-                    for (uint16_t i = 0; i < observed.size(); ++i) {
+                    for (size_t i = 0; i < observed.size(); ++i) {
                         if (i < shards.present.size() && shards.present[i]) { observed[i] = 1; }
                         else { missing = true; }
                     }
@@ -2583,7 +2602,7 @@ namespace akkaradb::engine {
                         stripeRebuildStats.active = true;
                     }
                     const auto originalNodes = candidate.metadata.nodeIds;
-                    for (uint16_t placement = 0; placement < observed.size(); ++placement) {
+                    for (size_t placement = 0; placement < observed.size(); ++placement) {
                         if (observed[placement] != 0) { continue; }
                         const uint16_t shardIndex = placement / candidate.metadata.copiesPerShard;
                         uint64_t targetNodeId = candidate.metadata.nodeIds[placement];
@@ -2889,7 +2908,7 @@ namespace akkaradb::engine {
                 }
                 const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
                 if (remaining <= 0) { throw cluster::ClusterRoutingError(cluster::ClusterRoutingCode::FORWARD_UNAVAILABLE, target); }
-                request.timeoutMs = static_cast<uint32_t>(remaining);
+                request.timeoutMs = remaining;
                 const std::optional<uint16_t> partition = usesPartitionRaft() && !request.entries.empty()
                                                               ? std::optional{partitionIndex(request.entries.front().key)}
                                                               : std::nullopt;
@@ -2943,7 +2962,7 @@ namespace akkaradb::engine {
                 request.operation = operation;
                 request.deduplicationId = requestId;
                 request.entries.push_back({{key.begin(), key.end()}, {}});
-                if (forwarding) { request.entries.back().value.assign(value.begin(), value.end()); }
+                if (forwarding) { request.entries.back().value.assign_range(value); }
                 return tryForward(std::move(request), allowForward);
             }
 
@@ -3041,7 +3060,7 @@ namespace akkaradb::engine {
                 if (record && !record.view().isTombstone()) {
                     promoteStoredPoint(record);
                     const auto value = record.view().value();
-                    out.assign(value.begin(), value.end());
+                    out.assign_range(value);
                     (record.disk ? getsSstHit : getsMemtableHit).fetch_add(1, std::memory_order_relaxed);
                     return true;
                 }
@@ -3049,7 +3068,7 @@ namespace akkaradb::engine {
                 return false;
             }
 
-            [[nodiscard]] bool getIntoArenaInternal(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out, bool countStats) {
+            [[nodiscard]] bool getIntoArenaInternal(std::span<const uint8_t> key, BufferArena& arena, std::span<const uint8_t>& out, bool countStats) {
                 if (usesPartitionRaft()) {
                     auto* child = localPartition(key);
                     out = {};
@@ -3100,8 +3119,8 @@ namespace akkaradb::engine {
             }
 
             [[nodiscard]] std::mutex& keySequenceOrderMutex(uint64_t fp64, size_t keySize) noexcept {
-                const uint64_t route = fp64 ^ (static_cast<uint64_t>(keySize) * 0x9E3779B97F4A7C15ULL);
-                return (*keySequenceOrderMu)[static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u)];
+                const uint64_t route = fp64 ^ (keySize * 0x9E3779B97F4A7C15ULL);
+                return (*keySequenceOrderMu)[route & (KEY_SEQUENCE_ORDER_STRIPES - 1u)];
             }
 
             [[nodiscard]] std::vector<std::unique_lock<std::mutex>> lockKeySequenceOrderStripes(std::span<const BatchPutEntry> entries) {
@@ -3110,7 +3129,7 @@ namespace akkaradb::engine {
                 for (const auto& [key, value] : entries) {
                     const uint64_t fp64 = key.empty() ? 0 : computeKeyFp64(key.data(), key.size());
                     const uint64_t route = fp64 ^ (key.size() * 0x9E3779B97F4A7C15ULL);
-                    stripes.push_back(static_cast<size_t>(route) & (KEY_SEQUENCE_ORDER_STRIPES - 1u));
+                    stripes.push_back(route & (KEY_SEQUENCE_ORDER_STRIPES - 1u));
                 }
                 std::ranges::sort(stripes);
                 stripes.erase(std::ranges::unique(stripes).begin(), stripes.end());
@@ -3136,7 +3155,7 @@ namespace akkaradb::engine {
             }
 
             void recordBackpressureWait(std::chrono::steady_clock::duration elapsed) const noexcept {
-                const uint64_t micros = static_cast<uint64_t>(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+                const uint64_t micros = std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
                 backpressureWaitMicrosTotal.fetch_add(micros, std::memory_order_relaxed);
                 uint64_t observed = backpressureWaitMicrosMax.load(std::memory_order_relaxed);
                 while (observed < micros && !backpressureWaitMicrosMax.compare_exchange_weak(
@@ -3242,8 +3261,7 @@ namespace akkaradb::engine {
                 memtable::MemTable::KeyRange range;
                 auto mt = memtable->pinnedIterator(range, [] { return UINT64_MAX; });
                 std::unordered_map<std::string, LatestBlobReference> latestByKey;
-                const auto refs = manifest ? manifest->liveSstBlobRefs() : std::nullopt;
-                if (refs) {
+                if (const auto refs = manifest ? manifest->liveSstBlobRefs() : std::nullopt) {
                     for (const auto& entry : *refs) { recordLatestBlobReference(latestByKey, entry.key, entry.seq, entry.blobId); }
                 }
                 else if (sstManager) {
@@ -3306,10 +3324,10 @@ namespace akkaradb::engine {
                 if (localRequestRecoveryRequired) { throw std::runtime_error("Local request: reopen is required after interrupted publication"); }
                 waitForVersionLogRecovery();
                 memtable->throwIfFlushFailed();
-                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
-                const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
+                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : computeKeyFp64(key);
+                const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : buildMiniKey(key);
                 const bool replayingRaft = clusterConfig.usesDataConsensus() && seq <= snapshotSeq();
-                const auto walFlags = static_cast<uint16_t>(flags | (sourceNodeId == vlog::ROLLBACK_NODE ? wal::WAL_FLAG_ROLLBACK : 0));
+                const uint16_t walFlags = flags | (sourceNodeId == vlog::ROLLBACK_NODE ? wal::WAL_FLAG_ROLLBACK : 0);
                 bool applyHead = true;
                 if (replayingRaft) {
                     // A crash can leave later KV heads durable before Raft records
@@ -3318,28 +3336,28 @@ namespace akkaradb::engine {
                     const auto head = memtable->getPinned(key, UINT64_MAX);
                     if (head && head->view.seq() >= seq) { applyHead = false; }
                     if (applyHead && sstManager) {
-                        const auto head = sstManager->get(key);
-                        if (head && head->seq >= seq) { applyHead = false; }
+                        const auto diskHead = sstManager->get(key);
+                        if (diskHead && diskHead->seq >= seq) { applyHead = false; }
                     }
                 }
                 if (request) {
                     reserveLocalRequest(*request);
                     const auto metadata = localRequestMetadata(*request);
                     std::vector<uint8_t> envelope{'A', 'K', 'L', 'A', '1'};
-                    envelope.insert(envelope.end(), metadata.begin(), metadata.end());
-                    envelope.insert(envelope.end(), storedValue.begin(), storedValue.end());
+                    envelope.append_range(metadata);
+                    envelope.append_range(storedValue);
                     if (envelope.size() + key.size() + wal::WalEntryHeader::SIZE > 64ull * 1024 * 1024) {
                         throw std::invalid_argument("Local request: mutation exceeds WAL recovery record limit");
                     }
                     localRequestRecoveryRequired = true;
-                    walWriter->append(key, envelope, seq, static_cast<uint16_t>(walFlags | wal::WAL_FLAG_REQUEST_APPLICATION), fp64, wal::WalAppendAck::SYNCED);
+                    walWriter->append(key, envelope, seq, walFlags | wal::WAL_FLAG_REQUEST_APPLICATION, fp64, wal::WalAppendAck::SYNCED);
                     crashAtTestPoint("request.local.after_wal");
                     recordLocalRequest(metadata, seq);
                     crashAtTestPoint("request.local.after_checkpoint");
                 }
                 else if (walWriter && applyHead) { walWriter->append(key, storedValue, seq, walFlags, fp64, walAckForWriteDurability()); }
                 if (versionLog) {
-                    const uint8_t defaultVlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK) : flags;
+                    const uint8_t defaultVlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? flags | vlog::VLOG_FLAG_ROLLBACK : flags;
                     const uint8_t vlogFlags = versionLogFlags == 0xFF ? defaultVlogFlags : versionLogFlags;
                     const auto timestamp = timestampNs == 0 ? nowNs() : timestampNs;
                     if (!replayingRaft || !versionLog->containsStoredRecord(key, seq, sourceNodeId, timestamp, vlogFlags)) {
@@ -3375,8 +3393,8 @@ namespace akkaradb::engine {
                 uint64_t precomputedFp64
             ) {
                 if (!walWriter) { return; }
-                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
-                walWriter->append(key, storedValue, seq, static_cast<uint16_t>(flags) | wal::WAL_FLAG_SNAPSHOT_RECORD, fp64, wal::WalAppendAck::WRITTEN);
+                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : computeKeyFp64(key);
+                walWriter->append(key, storedValue, seq, flags | wal::WAL_FLAG_SNAPSHOT_RECORD, fp64, wal::WalAppendAck::WRITTEN);
             }
 
             void appendSnapshotWalCommit(uint64_t seq, uint64_t recordCount) {
@@ -3395,8 +3413,8 @@ namespace akkaradb::engine {
                 uint64_t precomputedMiniKey = 0
             ) {
                 ++querySnapshotGeneration;
-                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : core::computeKeyFp64(key);
-                const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : core::buildMiniKey(key);
+                const uint64_t fp64 = precomputedFp64 != 0 ? precomputedFp64 : computeKeyFp64(key);
+                const uint64_t mini = precomputedMiniKey != 0 ? precomputedMiniKey : buildMiniKey(key);
                 if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { memtable->remove(key, seq, fp64, mini); }
                 else { memtable->put(key, storedValue, seq, flags, fp64, mini); }
                 if (versionLog && !clusterConfig.usesDataConsensus()) {
@@ -3440,8 +3458,8 @@ namespace akkaradb::engine {
                 const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
-                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : computeKeyFp64(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -3466,7 +3484,7 @@ namespace akkaradb::engine {
                 putsTotal.fetch_add(1, std::memory_order_relaxed);
 
                 if (blobManager && value.size() >= blobManager->threshold()) {
-                    std::vector<uint8_t> stored = maybeExternalize(seq, value, flags);
+                    auto stored = maybeExternalize(seq, value, flags);
                     if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                     appendAll(seq, key, stored, flags, writeSourceNodeId, fp64, miniKey, 0xFF, true);
                     return;
@@ -3482,8 +3500,8 @@ namespace akkaradb::engine {
 
                 std::lock_guard lock(writeMu);
                 const uint64_t baseSeq = reserveWriteSeq(entries.size());
-                for (size_t i = 0; i < entries.size(); ++i) {
-                    const auto& [key, value] = entries[i];
+                for (const auto& [i, entry] : std::views::enumerate(entries)) {
+                    const auto& [key, value] = entry;
                     AppliedWrite write;
                     write.seq = baseSeq + i;
                     write.key = key;
@@ -3506,8 +3524,8 @@ namespace akkaradb::engine {
                     if (keySequenceOrder) { keyOrderLocks = lockKeySequenceOrderStripes(entries); }
                     const uint64_t baseSeq = reserveWriteSeq(entries.size());
                     try {
-                        for (size_t i = 0; i < entries.size(); ++i) {
-                            const auto& [key, value] = entries[i];
+                        for (const auto& [i, entry] : std::views::enumerate(entries)) {
+                            const auto& [key, value] = entry;
                             putsTotal.fetch_add(1, std::memory_order_relaxed);
                             appendAll(baseSeq + i, key, value, MemHdr16::FLAG_NORMAL, nodeId);
                         }
@@ -3521,14 +3539,14 @@ namespace akkaradb::engine {
 
                 std::lock_guard lock(writeMu);
                 const uint64_t baseSeq = reserveWriteSeq(entries.size());
-                for (size_t i = 0; i < entries.size(); ++i) {
-                    const auto& [key, value] = entries[i];
+                for (const auto& [i, entry] : std::views::enumerate(entries)) {
+                    const auto& [key, value] = entry;
                     uint8_t flags = MemHdr16::FLAG_NORMAL;
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
                     const uint64_t seq = baseSeq + i;
 
                     if (blobManager && value.size() >= blobManager->threshold()) {
-                        std::vector<uint8_t> stored = maybeExternalize(seq, value, flags);
+                        auto stored = maybeExternalize(seq, value, flags);
                         if ((flags & MemHdr16::FLAG_BLOB) != 0) { blobPutsTotal.fetch_add(1, std::memory_order_relaxed); }
                         appendAll(seq, key, stored, flags, nodeId, 0, 0, 0xFF, true);
                     }
@@ -3562,8 +3580,8 @@ namespace akkaradb::engine {
                 const uint64_t writeSourceNodeId = sourceNodeId == 0 ? nodeId : sourceNodeId;
                 applyWriteBackpressure();
                 if (canUseParallelWriteAdmission()) {
-                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : core::computeKeyFp64(key.data(), key.size()));
-                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : core::buildMiniKey(key.data(), key.size()));
+                    const uint64_t resolvedFp64 = fp64 != 0 ? fp64 : (key.empty() ? 0 : computeKeyFp64(key.data(), key.size()));
+                    const uint64_t resolvedMiniKey = miniKey != 0 ? miniKey : (key.empty() ? 0 : buildMiniKey(key.data(), key.size()));
                     if (usesKeySequenceOrder()) {
                         std::lock_guard lock{keySequenceOrderMutex(resolvedFp64, key.size())};
                         const uint64_t seq = reserveWriteSeq(1);
@@ -3596,7 +3614,7 @@ namespace akkaradb::engine {
             [[nodiscard]] bool strictPrimaryAckFailWrite() const noexcept { return primaryAckTimeoutAction == cluster::AckTimeoutAction::FAIL_WRITE; }
 
             void recordCommittedRaftMutationStats(cluster::ReplOpType op, uint8_t recordFlags) {
-                const uint8_t flags = op == cluster::ReplOpType::REMOVE ? static_cast<uint8_t>(recordFlags | MemHdr16::FLAG_TOMBSTONE) : recordFlags;
+                const uint8_t flags = op == cluster::ReplOpType::REMOVE ? recordFlags | MemHdr16::FLAG_TOMBSTONE : recordFlags;
                 if (op == cluster::ReplOpType::REMOVE) { removesTotal.fetch_add(1, std::memory_order_relaxed); }
                 else {
                     putsTotal.fetch_add(1, std::memory_order_relaxed);
@@ -3622,7 +3640,7 @@ namespace akkaradb::engine {
                 std::lock_guard lock(writeMu);
                 uint8_t flags = recordFlags;
                 if (op == cluster::ReplOpType::REMOVE) { flags |= MemHdr16::FLAG_TOMBSTONE; }
-                const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? static_cast<uint8_t>(flags | vlog::VLOG_FLAG_ROLLBACK) : flags;
+                const uint8_t vlogFlags = sourceNodeId == vlog::ROLLBACK_NODE ? flags | vlog::VLOG_FLAG_ROLLBACK : flags;
                 const bool partitionedRemote = (clusterReplicationMode == cluster::ReplicationMode::PARTITIONED || clusterReplicationMode ==
                     cluster::ReplicationMode::STRIPE) && sourceNodeId != 0 && sourceNodeId != nodeId;
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
@@ -3641,7 +3659,7 @@ namespace akkaradb::engine {
                         const uint8_t copiesPerShard = placement.stripe().copiesPerShard;
                         const auto targetsShard = [&](const std::vector<uint64_t>& placements) {
                             if (index >= placement.stripe().totalShards()) { return false; }
-                            const size_t firstPlacement = static_cast<size_t>(index) * copiesPerShard;
+                            const size_t firstPlacement = index * copiesPerShard;
                             return std::ranges::any_of(
                                 std::span<const uint64_t>{placements}.subspan(firstPlacement, copiesPerShard),
                                 [&](uint64_t targetNodeId) { return targetNodeId == nodeId; }
@@ -3698,8 +3716,8 @@ namespace akkaradb::engine {
             [[nodiscard]] std::pair<uint64_t, uint64_t> readReplicaSnapshotStagingHeader(std::istream& in) const {
                 static constexpr char SNAPSHOT_STAGING_MAGIC[] = {'A', 'K', 'S', 'S', '1'};
                 std::array<char, sizeof(SNAPSHOT_STAGING_MAGIC)> magic{};
-                readExact(in, magic.data(), magic.size(), "header");
-                if (!std::equal(magic.begin(), magic.end(), std::begin(SNAPSHOT_STAGING_MAGIC))) {
+                readExact(in, std::span{magic}, "header");
+                if (!std::ranges::equal(magic, SNAPSHOT_STAGING_MAGIC)) {
                     throw std::runtime_error("AkkEngine: corrupt replication snapshot staging file");
                 }
                 const uint64_t stagedSeq = readU64Le(in, "snapshot seq");
@@ -3731,8 +3749,9 @@ namespace akkaradb::engine {
                     if (record.kind != cluster::detail::SnapshotRecordKind::HEAD) { throw std::runtime_error("AkkEngine: invalid data snapshot record kind"); }
                     key = record.key;
                 }
-                const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(key.data()), key.size());
-                if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate heads"); }
+                if (const auto [position, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(key.data()), key.size()); !inserted) {
+                    throw std::runtime_error("AkkEngine: replication snapshot has duplicate heads");
+                }
             }
 
             void loadReplicaSnapshotStagingForRecoveryLocked(uint64_t seq) {
@@ -3754,8 +3773,9 @@ namespace akkaradb::engine {
                 for (uint64_t i = 0; i < stagedEntryCount; ++i) {
                     const auto entry = readStagedSnapshotRecord(staged, seq, i + 1, false);
                     if (!entry.history && !entry.transaction) {
-                        const auto [_, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size());
-                        if (!inserted) { throw std::runtime_error("AkkEngine: replication snapshot has duplicate heads"); }
+                        if (const auto [position, inserted] = pendingSnapshotKeys.emplace(reinterpret_cast<const char*>(entry.key.data()), entry.key.size()); !inserted) {
+                            throw std::runtime_error("AkkEngine: replication snapshot has duplicate heads");
+                        }
                     }
                 }
                 char trailing = 0;
@@ -3803,11 +3823,11 @@ namespace akkaradb::engine {
 
                 rememberSnapshotHead(key);
 
-                const auto keyLen = static_cast<uint32_t>(key.size());
+                const uint32_t keyLen = key.size();
                 writeU32Le(pendingSnapshotOut, keyLen);
                 writeU64Le(pendingSnapshotOut, valueSize);
                 writeU32Le(pendingSnapshotOut, valueCrc32c);
-                if (!key.empty()) { pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), static_cast<std::streamsize>(key.size())); }
+                if (!key.empty()) { pendingSnapshotOut.write(reinterpret_cast<const char*>(key.data()), std::ssize(key)); }
                 if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot staging entry"); }
 
                 pendingSnapshotEntryInProgress = true;
@@ -3831,12 +3851,12 @@ namespace akkaradb::engine {
                     throw std::runtime_error("AkkEngine: invalid replication snapshot chunk");
                 }
                 if (!chunk.empty()) {
-                    pendingSnapshotOut.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                    pendingSnapshotOut.write(reinterpret_cast<const char*>(chunk.data()), std::ssize(chunk));
                     if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to write replication snapshot chunk"); }
                 }
                 pendingSnapshotEntryRecordCrc.update(chunk);
                 pendingSnapshotEntryValueCrc.update(chunk);
-                pendingSnapshotEntryValueOffset += static_cast<uint64_t>(chunk.size());
+                pendingSnapshotEntryValueOffset += chunk.size();
             }
 
             void finishReplicaSnapshotEntry() {
@@ -3862,7 +3882,7 @@ namespace akkaradb::engine {
                 }
                 pendingSnapshotEntryCount = entryCount;
                 if (pendingSnapshotOut.is_open()) {
-                    pendingSnapshotOut.seekp(static_cast<std::streamoff>(5 + sizeof(uint64_t)));
+                    pendingSnapshotOut.seekp(5 + sizeof(uint64_t));
                     writeU64Le(pendingSnapshotOut, entryCount);
                     pendingSnapshotOut.flush();
                     if (!pendingSnapshotOut) { throw std::runtime_error("AkkEngine: failed to flush replication snapshot staging file"); }
@@ -3870,17 +3890,17 @@ namespace akkaradb::engine {
                 }
                 const auto path = replicaSnapshotStagingPath();
                 #ifdef _WIN32
-                const HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (file == INVALID_HANDLE_VALUE || !::FlushFileBuffers(file)) {
-                    if (file != INVALID_HANDLE_VALUE) { ::CloseHandle(file); }
+                auto* const file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (file == INVALID_HANDLE_VALUE || !FlushFileBuffers(file)) {
+                    if (file != INVALID_HANDLE_VALUE) { CloseHandle(file); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging");
                 }
-                ::CloseHandle(file);
+                CloseHandle(file);
                 #else
-                const int file = ::open(path.c_str(), O_RDONLY); if (file < 0 || ::fsync(file) != 0) {
+                const int file = ::open(path.c_str(), O_RDONLY); if (file < 0 || fsync(file) != 0) {
                     if (file >= 0) { ::close(file); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging");
-                } ::close(file); const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY); if (directory < 0 || ::fsync(directory) !=
+                } ::close(file); const int directory = ::open(path.parent_path().c_str(), O_RDONLY | O_DIRECTORY); if (directory < 0 || fsync(directory) !=
                     0) {
                     if (directory >= 0) { ::close(directory); }
                     throw std::runtime_error("AkkEngine: failed to sync snapshot staging directory");
@@ -3922,7 +3942,7 @@ namespace akkaradb::engine {
                 };
                 if (partitionOwner != 0 && stagedEntryCount == 0) {
                     auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
-                    core::BufferArena emptyArena;
+                    BufferArena emptyArena;
                     memtable::MemTable::KeyRange emptyRange;
                     const auto visible = snapshotSeq();
                     auto emptyMt = memtable->iterator(emptyRange, visible);
@@ -3946,7 +3966,7 @@ namespace akkaradb::engine {
                 bool transactionState = false;
                 uint64_t snapshotWalRecordCount = 0;
                 auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
-                core::BufferArena arena;
+                BufferArena arena;
                 memtable::MemTable::KeyRange range;
                 const uint64_t visibleSeq = snapshotSeq();
                 uint64_t storedHistoryThrough = 0;
@@ -4002,7 +4022,7 @@ namespace akkaradb::engine {
                     crashAtTestPoint("snapshot.finish.after_wal_commit");
                 }
 
-                core::BufferArena applyArena;
+                BufferArena applyArena;
                 auto applyBlobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
                 memtable::MemTable::KeyRange applyRange;
                 auto applyMt = memtable->iterator(applyRange, visibleSeq);
@@ -4177,7 +4197,7 @@ namespace akkaradb::engine {
 
                 protected:
                     static std::array<uint8_t, 32> requestFingerprint(cluster::ReplOpType op, std::span<const uint8_t> key, std::span<const uint8_t> value) {
-                        const uint8_t operation = static_cast<uint8_t>(op);
+                        const auto operation = std::to_underlying(op);
                         const std::array<std::span<const uint8_t>, 3> parts{std::span<const uint8_t>{&operation, 1}, key, value};
                         return crypto::hash256(parts);
                     }
@@ -4550,6 +4570,8 @@ namespace akkaradb::engine {
 
             std::unique_ptr<WriteCoordinator> writeCoordinator;
             std::atomic<bool> forwardReady{false};
+            std::mutex batchReadExecutorMu;
+            std::unique_ptr<cluster::detail::BoundedExecutor> batchReadExecutor;
 
             [[nodiscard]] uint64_t localRollbackWatermark() {
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE && clusterRuntime) {
@@ -4566,13 +4588,13 @@ namespace akkaradb::engine {
 
             [[nodiscard]] static std::vector<uint8_t> encodeRollbackItems(std::span<const RollbackItemResult> items) {
                 std::vector<uint8_t> out{'A', 'K', 'R', 'R', '1'};
-                pushU32(out, static_cast<uint32_t>(items.size()));
+                pushU32(out, items.size());
                 for (const auto& item : items) {
-                    out.push_back(static_cast<uint8_t>(item.status));
-                    pushU32(out, static_cast<uint32_t>(item.key.size()));
-                    out.insert(out.end(), item.key.begin(), item.key.end());
-                    pushU32(out, static_cast<uint32_t>(item.message.size()));
-                    out.insert(out.end(), item.message.begin(), item.message.end());
+                    out.push_back(std::to_underlying(item.status));
+                    pushU32(out, item.key.size());
+                    out.append_range(item.key);
+                    pushU32(out, item.message.size());
+                    out.append_range(item.message);
                 }
                 return out;
             }
@@ -4620,10 +4642,10 @@ namespace akkaradb::engine {
             ) {
                 std::vector<uint8_t> out{'A', 'K', 'R', 'B', '1'};
                 out.push_back(done ? 1U : 0U);
-                pushU32(out, static_cast<uint32_t>(nextCursor.size()));
-                out.insert(out.end(), nextCursor.begin(), nextCursor.end());
+                pushU32(out, nextCursor.size());
+                out.append_range(nextCursor);
                 auto encodedItems = encodeRollbackItems(items);
-                out.insert(out.end(), encodedItems.begin(), encodedItems.end());
+                out.append_range(encodedItems);
                 return out;
             }
 
@@ -4649,21 +4671,21 @@ namespace akkaradb::engine {
                     return;
                 }
                 std::vector<uint8_t> bytes{'A', 'K', 'R', 'J', '1'};
-                pushU32(bytes, static_cast<uint32_t>(deferredRollbacks.size()));
+                pushU32(bytes, deferredRollbacks.size());
                 for (const auto& task : deferredRollbacks) {
-                    bytes.insert(bytes.end(), task.taskId.begin(), task.taskId.end());
-                    bytes.insert(bytes.end(), task.operationId.begin(), task.operationId.end());
-                    bytes.insert(bytes.end(), task.createdStartupId.begin(), task.createdStartupId.end());
-                    bytes.insert(bytes.end(), task.clusterId.begin(), task.clusterId.end());
+                    bytes.append_range(task.taskId);
+                    bytes.append_range(task.operationId);
+                    bytes.append_range(task.createdStartupId);
+                    bytes.append_range(task.clusterId);
                     pushU64(bytes, task.configEpoch);
-                    bytes.push_back(static_cast<uint8_t>(task.action));
+                    bytes.push_back(std::to_underlying(task.action));
                     bytes.push_back(task.clusterTask ? 1U : 0U);
-                    bytes.push_back(static_cast<uint8_t>(task.conflict));
+                    bytes.push_back(std::to_underlying(task.conflict));
                     pushU64(bytes, task.targetNodeId);
                     pushU64(bytes, task.targetSeq);
                     pushU64(bytes, task.plannedWatermark);
-                    pushU32(bytes, static_cast<uint32_t>(task.key.size()));
-                    bytes.insert(bytes.end(), task.key.begin(), task.key.end());
+                    pushU32(bytes, task.key.size());
+                    bytes.append_range(task.key);
                 }
                 const uint32_t crc = cpu::CRC32C(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
                 pushU32(bytes, crc);
@@ -4691,13 +4713,13 @@ namespace akkaradb::engine {
                 for (uint32_t i = 0; i < count; ++i) {
                     DeferredRollbackTask task;
                     if (cursor + 75 > bytes.size() - 4) { throw std::runtime_error("AkkEngine: truncated rollback journal task"); }
-                    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), 16, task.taskId.begin());
+                    std::ranges::copy(std::span{bytes}.subspan(cursor, 16), task.taskId.begin());
                     cursor += 16;
-                    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), 16, task.operationId.begin());
+                    std::ranges::copy(std::span{bytes}.subspan(cursor, 16), task.operationId.begin());
                     cursor += 16;
-                    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), 16, task.createdStartupId.begin());
+                    std::ranges::copy(std::span{bytes}.subspan(cursor, 16), task.createdStartupId.begin());
                     cursor += 16;
-                    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), 16, task.clusterId.begin());
+                    std::ranges::copy(std::span{bytes}.subspan(cursor, 16), task.clusterId.begin());
                     cursor += 16;
                     if (!pullU64(bytes, cursor, task.configEpoch)) { throw std::runtime_error("AkkEngine: truncated rollback journal cluster epoch"); }
                     task.action = static_cast<cluster::StripeControlAction>(bytes[cursor++]);
@@ -4708,7 +4730,7 @@ namespace akkaradb::engine {
                         conflict > RollbackConflictPolicy::OVERWRITE_LATEST || !pullU64(bytes, cursor, task.targetNodeId) || !
                         pullU64(bytes, cursor, task.targetSeq) || !pullU64(bytes, cursor, task.plannedWatermark) || !pullU32(bytes, cursor, keySize) || keySize
                         > bytes.size() - 4 - cursor) { throw std::runtime_error("AkkEngine: invalid rollback journal task"); }
-                    task.key.assign(bytes.begin() + static_cast<std::ptrdiff_t>(cursor), bytes.begin() + static_cast<std::ptrdiff_t>(cursor + keySize));
+                    task.key.assign_range(std::span{bytes}.subspan(cursor, keySize));
                     cursor += keySize;
                     deferredRollbacks.push_back(std::move(task));
                 }
@@ -4750,7 +4772,7 @@ namespace akkaradb::engine {
                 task.targetSeq = targetSeq;
                 task.plannedWatermark = plannedWatermark;
                 task.conflict = conflict;
-                task.key.assign(key.begin(), key.end());
+                task.key.assign_range(key);
                 const auto taskId = task.taskId;
                 enqueueDeferredRollback(std::move(task));
                 return taskId;
@@ -4793,7 +4815,7 @@ namespace akkaradb::engine {
                         request.ownerNodeId = controlNode;
                         request.fenceToken = task.targetSeq;
                         request.key = cursor;
-                        request.metadata = {static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE), static_cast<uint8_t>(task.conflict),};
+                        request.metadata = {std::to_underlying(RollbackExecutionMode::IMMEDIATE), std::to_underlying(task.conflict),};
                         pushU64(request.metadata, task.plannedWatermark);
                         const auto response = clusterRuntime->rollbackControl(controlNode, std::move(request));
                         if (response.status != cluster::StripeControlStatus::COMMITTED) { return false; }
@@ -5023,11 +5045,11 @@ namespace akkaradb::engine {
                 cluster::StripeControlRequest request;
                 request.action = cluster::StripeControlAction::ROLLBACK_APPLY;
                 request.ownerNodeId = authorityNodeId;
-                request.key.assign(key.begin(), key.end());
-                request.metadata.push_back(static_cast<uint8_t>(conflict));
+                request.key.assign_range(key);
+                request.metadata.push_back(std::to_underlying(conflict));
                 pushU64(request.metadata, expectedHead);
                 request.metadata.push_back(tombstone ? 1U : 0U);
-                request.metadata.insert(request.metadata.end(), value.begin(), value.end());
+                request.metadata.append_range(value);
                 if (authorityNodeId == nodeId) { return applyMaterializedRollback(key, value, tombstone, expectedHead, conflict); }
                 const auto response = clusterRuntime->rollbackControl(authorityNodeId, std::move(request));
                 if (response.status != cluster::StripeControlStatus::COMMITTED) {
@@ -5042,13 +5064,10 @@ namespace akkaradb::engine {
                 std::vector<std::vector<uint8_t>> keys;
                 if (clusterReplicationMode == cluster::ReplicationMode::STRIPE) {
                     auto blobReadPin = blobManager ? blobManager->pinReads() : blob::BlobManager::ReadPin{};
-                    core::BufferArena arena;
+                    BufferArena arena;
                     memtable::MemTable::KeyRange range;
-                    const uint64_t visibleSeq = snapshotSeq();
-                    auto mt = memtable->iterator(range, visibleSeq);
-                    sst::SSTManager::Iterator sst;
-                    if (sstManager) { sst = sstManager->scanIter({}, {}, visibleSeq, true); }
-                    for (const auto& record : scanGenerator(arena, std::move(mt), std::move(sst), blobManager.get(), std::move(blobReadPin))) {
+                    auto sources = captureStoredRangeRead(range);
+                    for (const auto& record : scanGenerator(arena, std::move(sources.memory), std::move(sources.disk), blobManager.get(), std::move(blobReadPin))) {
                         auto publicKey = publicKeyFromStripeMetaKey(record.key);
                         if (!publicKey) { continue; }
                         const auto metadata = decodeStripeMetadata(record.value);
@@ -5077,11 +5096,11 @@ namespace akkaradb::engine {
     }
 
     size_t RollbackResult::appliedCount() const noexcept {
-        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::APPLIED; }));
+        return std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::APPLIED; });
     }
 
     size_t RollbackResult::deferredCount() const noexcept {
-        return static_cast<size_t>(std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::DEFERRED; }));
+        return std::ranges::count_if(items, [](const RollbackItemResult& item) { return item.status == RollbackItemStatus::DEFERRED; });
     }
 
     #include "detail/AkkTransaction.inc"
@@ -5124,7 +5143,7 @@ namespace akkaradb::engine {
         if (options.runtime.writerThreads > 0) {
             if (options.memtable.expectedConcurrentWriters == 0) { options.memtable.expectedConcurrentWriters = options.runtime.writerThreads; }
             if (options.memtable.shardCount == 0) { options.memtable.shardCount = shardsForThreads(options.runtime.writerThreads, 256); }
-            if (options.wal.shardCount == 0) { options.wal.shardCount = static_cast<uint16_t>(shardsForThreads(options.runtime.writerThreads, 64)); }
+            if (options.wal.shardCount == 0) { options.wal.shardCount = shardsForThreads(options.runtime.writerThreads, 64); }
         }
         normalizeWalOptions(options.wal);
         normalizeMemTableOptions(options.memtable);
@@ -5148,7 +5167,7 @@ namespace akkaradb::engine {
         }
         auto engine = std::unique_ptr<AkkEngine>{new AkkEngine()};
         engine->impl_ = std::make_unique<Impl>(std::move(options));
-        Impl& impl = *engine->impl_;
+        auto& impl = *engine->impl_;
         impl.loadRollbackJournal();
         if (!impl.deferredRollbacks.empty() && !impl.opts.components.versionLogEnabled) {
             throw std::runtime_error("AkkEngine: deferred rollback journal requires the version log to remain enabled");
@@ -5197,7 +5216,12 @@ namespace akkaradb::engine {
         }
 
         if (impl.opts.components.sstEnabled && !impl.opts.paths.sstDir.empty()) {
-            impl.sstManager = sst::SSTManager::create(impl.opts.paths.sstDir, impl.opts.sst, impl.manifest.get());
+            std::function<uint64_t()> compactionVisibilitySeq;
+            if (impl.opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+                compactionVisibilitySeq = [&impl] { return impl.committedSeq.load(std::memory_order_acquire); };
+            }
+            impl.sstManager = sst::SSTManager::create(
+                impl.opts.paths.sstDir, impl.opts.sst, impl.manifest.get(), std::move(compactionVisibilitySeq));
             if (impl.opts.runtime.recoverSst) { impl.sstManager->recover(); }
         }
 
@@ -5223,14 +5247,14 @@ namespace akkaradb::engine {
                 if (impl.blobManager && impl.opts.blob.gcOnFlush) { impl.runBlobGcIfSafe(); }
             };
             if (impl.opts.memtable.flushInputMode == memtable::MemTableFlushInputMode::STREAMING) {
-                impl.opts.memtable.onFlushStream = [&impl](size_t estimatedRecordCount, core::ArenaGenerator<core::RecordView> records) {
+                impl.opts.memtable.onFlushStream = [&impl](size_t estimatedRecordCount, ArenaGenerator<RecordView> records) {
                     (void)impl.sstManager->flush(estimatedRecordCount, std::move(records));
                     crashAtTestPoint("engine.flush.after_sst_flush");
                 };
                 impl.opts.memtable.onFlush = {};
             }
             else {
-                impl.opts.memtable.onFlush = [&impl](std::span<const core::RecordView> records) {
+                impl.opts.memtable.onFlush = [&impl](std::span<const RecordView> records) {
                     if (records.empty()) { return; }
                     (void)impl.sstManager->flush(records);
                     crashAtTestPoint("engine.flush.after_sst_flush");
@@ -5243,11 +5267,17 @@ namespace akkaradb::engine {
             impl.opts.memtable.onFlushStream = {};
             impl.opts.memtable.onFlushComplete = {};
         }
-        impl.memtable = memtable::MemTable::create(impl.opts.memtable);
+        std::function<uint64_t()> retentionVisibilitySeq;
+        if (impl.opts.runtime.writeVisibility == AkkEngineOptions::WriteVisibilityMode::COMMIT_ORDER) {
+            retentionVisibilitySeq = [&impl] { return impl.committedSeq.load(std::memory_order_acquire); };
+        }
+        if (impl.sstManager) { impl.opts.memtable.sequenceOrderedVersions = true; }
+        impl.memtable = memtable::MemTable::create(impl.opts.memtable, std::move(retentionVisibilitySeq));
         uint64_t manifestCheckpointSeq = 0;
         if (impl.manifest) {
-            const auto checkpoint = impl.manifest->lastCheckpoint();
-            if (checkpoint.has_value() && checkpoint->lastSeq.has_value()) { manifestCheckpointSeq = *checkpoint->lastSeq; }
+            if (const auto checkpoint = impl.manifest->lastCheckpoint(); checkpoint.has_value() && checkpoint->lastSeq.has_value()) {
+                manifestCheckpointSeq = *checkpoint->lastSeq;
+            }
         }
         uint64_t walRecoveryCheckpointSeq = 0;
         if (manifestCheckpointSeq > 0 && impl.sstManager && impl.opts.runtime.recoverSst) {
@@ -5298,10 +5328,10 @@ namespace akkaradb::engine {
                     const uint64_t versionLogSupplementAfterSeq = std::max(walRecoveryCheckpointSeq, recovery.maxSeq);
                     const auto records = impl.versionLog->collectSince(versionLogSupplementAfterSeq);
                     for (const auto& record : records) {
-                        const uint8_t flags = static_cast<uint8_t>(record.entry.flags & (MemHdr16::FLAG_TOMBSTONE | MemHdr16::FLAG_BLOB));
+                        const uint8_t flags = record.entry.flags & (MemHdr16::FLAG_TOMBSTONE | MemHdr16::FLAG_BLOB);
                         const std::span<const uint8_t> key{record.key.data(), record.key.size()};
-                        const uint64_t fp64 = core::computeKeyFp64(key);
-                        const uint64_t mini = core::buildMiniKey(key);
+                        const uint64_t fp64 = computeKeyFp64(key);
+                        const uint64_t mini = buildMiniKey(key);
                         if ((flags & MemHdr16::FLAG_TOMBSTONE) != 0) { impl.memtable->remove(key, record.entry.seq, fp64, mini); }
                         else {
                             impl.memtable->put(
@@ -5354,9 +5384,9 @@ namespace akkaradb::engine {
         impl.recoverTransactions();
 
         if (impl.opts.components.clusterEnabled) {
-            cluster::ClusterConfig cfg = impl.opts.cluster.config.has_value()
-                                             ? *impl.opts.cluster.config
-                                             : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
+            auto cfg = impl.opts.cluster.config.has_value()
+                           ? *impl.opts.cluster.config
+                           : cluster::ClusterConfig::load(impl.opts.paths.clusterConfigPath);
             impl.clusterConfig = cfg;
             impl.clusterConfiguredNodeCount = cfg.nodes().size();
             impl.clusterReplicationMode = cfg.mode();
@@ -5421,7 +5451,7 @@ namespace akkaradb::engine {
                     [&](const wal::WalRecoveredEntry& item) {
                         if ((item.flags & wal::WAL_FLAG_SNAPSHOT_MASK) != 0) { return; }
                         if (item.seq <= afterSeq || item.seq > throughSeq) { return; }
-                        const auto flags = static_cast<uint8_t>(item.flags);
+                        const uint8_t flags = item.flags;
                         if ((flags & MemHdr16::FLAG_BLOB) != 0) {
                             hasExternalBlob = true;
                             return;
@@ -5430,7 +5460,7 @@ namespace akkaradb::engine {
                             cluster::ClusterHistoryEntry{
                                 .seq = item.seq,
                                 .sourceNodeId = (item.flags & wal::WAL_FLAG_ROLLBACK) != 0 ? vlog::ROLLBACK_NODE : impl.nodeId,
-                                .op = static_cast<uint8_t>((flags & MemHdr16::FLAG_TOMBSTONE) != 0 ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT),
+                                .op = std::to_underlying((flags & MemHdr16::FLAG_TOMBSTONE) != 0 ? cluster::ReplOpType::REMOVE : cluster::ReplOpType::PUT),
                                 .recordFlags = flags,
                                 .key = item.key,
                                 .value = item.value,
@@ -5622,7 +5652,7 @@ namespace akkaradb::engine {
                 if (logicalSeq != 0 && !snapshotBase) { metadata->logicalSeq = logicalSeq; }
                 const auto encoded = Impl::encodeStripeMetadata(*metadata);
                 uint8_t vlogFlags = 0xFF;
-                if (snapshotBase) { vlogFlags = static_cast<uint8_t>(vlog::VLOG_FLAG_RETENTION_BASE | (metadata->rollback ? vlog::VLOG_FLAG_ROLLBACK : 0)); }
+                if (snapshotBase) { vlogFlags = vlog::VLOG_FLAG_RETENTION_BASE | (metadata->rollback ? vlog::VLOG_FLAG_ROLLBACK : 0); }
                 return impl.writeStripeLocal(
                     Impl::stripeMetaKey(publicKey),
                     encoded,
@@ -5633,7 +5663,7 @@ namespace akkaradb::engine {
                 );
             };
             callbacks.readStripeMetadata = [&impl](std::span<const uint8_t> publicKey) {
-                const auto value = impl.getValueInternal(Impl::stripeMetaKey(publicKey), false);
+                auto value = impl.getValueInternal(Impl::stripeMetaKey(publicKey), false);
                 if (!value) { return value; }
                 const auto metadata = Impl::decodeStripeMetadata(*value);
                 if (!metadata) { throw std::runtime_error("AkkEngine: invalid local stripe metadata"); }
@@ -5733,12 +5763,12 @@ namespace akkaradb::engine {
                         );
                     }
                     else if (request.action == cluster::StripeControlAction::ROLLBACK_STREAM) {
-                        static constexpr size_t ROLLBACK_STREAM_BATCH_KEYS = 256;
+                        static constexpr std::ptrdiff_t ROLLBACK_STREAM_BATCH_KEYS = 256;
                         const auto keys = impl.rollbackKeysChangedAfter(request.fenceToken);
                         const auto begin = request.key.empty() ? keys.begin() : std::ranges::upper_bound(keys, request.key);
-                        const auto remaining = static_cast<size_t>(std::distance(begin, keys.end()));
+                        const std::ptrdiff_t remaining = std::distance(begin, keys.end());
                         const auto batchSize = std::min(remaining, ROLLBACK_STREAM_BATCH_KEYS);
-                        const auto end = std::next(begin, static_cast<std::ptrdiff_t>(batchSize));
+                        const auto end = std::next(begin, batchSize);
                         for (auto it = begin; it != end; ++it) {
                             const auto& key = *it;
                             results.push_back(
@@ -5861,14 +5891,14 @@ namespace akkaradb::engine {
                     if (size > 4ull * 1024 * 1024) { throw std::runtime_error("AkkEngine: oversized metadata snapshot record"); }
                     const auto record = cluster::detail::decodeSnapshotKey(encoded);
                     kind = record.kind;
-                    flags = record.flags & static_cast<uint8_t>(~MemHdr16::FLAG_BLOB);
-                    key.assign(record.key.begin(), record.key.end());
+                    flags = record.flags & ~MemHdr16::FLAG_BLOB;
+                    key.assign_range(record.key);
                     value.clear();
                     return true;
                 };
                 visitor.appendValueChunk = [&](uint64_t offset, auto bytes) {
                     if (offset != value.size()) { throw std::runtime_error("AkkEngine: invalid metadata snapshot offset"); }
-                    value.insert(value.end(), bytes.begin(), bytes.end());
+                    value.append_range(bytes);
                     return true;
                 };
                 visitor.finishEntry = [&] {
@@ -5968,8 +5998,8 @@ namespace akkaradb::engine {
         if (retentionMs > options.maxRetentionMs) { throw std::invalid_argument("AkkEngine: request retention exceeds configured maximum"); }
         cluster::ClusterRequestId id;
         crypto::secureRandom(id.nonce);
-        id.expiresAtUnixMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).
-            count()) + retentionMs;
+        id.expiresAtUnixMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).
+            count() + retentionMs;
         return id;
     }
 
@@ -6195,20 +6225,38 @@ namespace akkaradb::engine {
         if (impl_->usesPartitionRaft() && !impl_->clusterReadMustRoute()) {
             std::vector<BatchGetResult> results(keys.size());
             std::map<uint16_t, std::vector<size_t>> grouped;
-            for (size_t i = 0; i < keys.size(); ++i) { grouped[impl_->partitionIndex(keys[i])].push_back(i); }
+            for (const auto& [i, key] : std::views::enumerate(keys)) { grouped[impl_->partitionIndex(key)].push_back(i); }
             for (const auto& [partition, indexes] : grouped) {
                 const auto children = impl_->partitionSnapshot();
                 if (!children[partition]) { continue; }
                 std::vector<std::span<const uint8_t>> batch;
                 for (const auto index : indexes) { batch.push_back(keys[index]); }
                 auto values = children[partition]->getBatch(batch);
-                for (size_t i = 0; i < indexes.size(); ++i) { results[indexes[i]] = std::move(values[i]); }
+                for (const auto& [index, value] : std::views::zip(indexes, values)) { results[index] = std::move(value); }
             }
             return results;
         }
         auto blobReadPin = impl_->blobManager ? impl_->blobManager->pinReads() : blob::BlobManager::ReadPin{};
         std::optional<Impl::StoredReadSnapshot> snapshot;
         if (!impl_->clusterReadMustRoute()) { snapshot = impl_->captureStoredReadSnapshot(); }
+
+        if (impl_->clusterReadMustRoute() && keys.size() > 1) {
+            cluster::detail::BoundedExecutor* executor;
+            {
+                std::lock_guard lock{impl_->batchReadExecutorMu};
+                if (!impl_->batchReadExecutor) {
+                    impl_->batchReadExecutor = std::make_unique<cluster::detail::BoundedExecutor>(8, 64);
+                }
+                executor = impl_->batchReadExecutor.get();
+            }
+            std::vector<BatchGetResult> results(keys.size());
+            const auto context = cluster::detail::ReconfigurationDeadline::current();
+            executor->forEach(keys.size(), [&](size_t index) {
+                cluster::detail::ReconfigurationDeadline scope{context};
+                results[index].found = impl_->getIntoClusterAware(keys[index], results[index].value);
+            }, context.deadline);
+            return results;
+        }
 
         std::vector<BatchGetResult> out;
         out.reserve(keys.size());
@@ -6257,7 +6305,7 @@ namespace akkaradb::engine {
         return impl_->getIntoClusterAware(key, out);
     }
 
-    bool AkkEngine::getIntoArena(std::span<const uint8_t> key, core::BufferArena& arena, std::span<const uint8_t>& out) const {
+    bool AkkEngine::getIntoArena(std::span<const uint8_t> key, BufferArena& arena, std::span<const uint8_t>& out) const {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         Impl::OperationGuard operation{*impl_};
         impl_->throwIfBackgroundFailed();
@@ -6287,25 +6335,39 @@ namespace akkaradb::engine {
             if (impl_->opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT) {
                 cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.forwardingTimeoutMs, [this] { return impl_->placementClosing(); }};
                 auto readers = impl_->prepareGlobalQuery(startKey, endKey, true);
-                for (auto& reader : readers) {
-                    const auto count = reader->activate(true);
+                const auto context = cluster::detail::ReconfigurationDeadline::current();
+                std::vector<uint64_t> counts(readers.size());
+                impl_->opts.cluster.runtime.nodeResourceBudget->queryExecutor()->forEach(readers.size(), [&](size_t slot) {
+                    cluster::detail::ReconfigurationDeadline scope{context};
+                    counts[slot] = readers[slot]->activate(true);
+                }, context.deadline);
+                for (const auto count : counts) {
                     if (count > SIZE_MAX - total) { throw std::overflow_error("AkkEngine: overflowing cluster count"); }
-                    total += static_cast<size_t>(count);
+                    total += count;
                 }
                 cluster::detail::ReconfigurationDeadline::check();
                 return total;
             }
-            for (const auto& target : impl_->rangeQueryPlan(startKey)) {
+            const auto targets = impl_->rangeQueryPlan(startKey);
+            const auto context = cluster::detail::ReconfigurationDeadline::current();
+            std::vector<uint64_t> counts(targets.size());
+            impl_->opts.cluster.runtime.nodeResourceBudget->queryExecutor()->forEach(targets.size(), [&](size_t slot) {
+                cluster::detail::ReconfigurationDeadline scope{context};
+                const auto& target = targets[slot];
                 const auto response = impl_->sendReadQuery(
                     target.node,
                     impl_->openQueryRequest(Impl::QueryAction::COUNT, startKey, endKey, 0, target.partitions)
                 );
                 size_t cursor = 0;
                 uint64_t count = 0;
-                if (!Impl::pullU64(response.value, cursor, count) || cursor != response.value.size() || count > SIZE_MAX - total) {
+                if (!Impl::pullU64(response.value, cursor, count) || cursor != response.value.size()) {
                     throw std::overflow_error("AkkEngine: invalid or overflowing cluster count");
                 }
-                total += static_cast<size_t>(count);
+                counts[slot] = count;
+            }, context.deadline);
+            for (const auto count : counts) {
+                if (count > SIZE_MAX - total) { throw std::overflow_error("AkkEngine: overflowing cluster count"); }
+                total += count;
             }
             return total;
         }
@@ -6314,23 +6376,13 @@ namespace akkaradb::engine {
         impl_->waitForKeySequenceReadVisibility();
 
         memtable::MemTable::KeyRange range;
-        range.start.assign(startKey.begin(), startKey.end());
-        range.end.assign(endKey.begin(), endKey.end());
-        uint64_t seq = 0;
-        auto mt = [&]() {
-            if (impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT) {
-                auto pinned = impl_->memtable->pinnedIterator(range, [this] { return impl_->snapshotSeq(); });
-                seq = pinned.snapshotSeq();
-                return pinned;
-            }
-            seq = impl_->snapshotSeq();
-            return impl_->memtable->iterator(range, seq);
-        }();
-        sst::SSTManager::Iterator sstIt;
-        if (impl_->sstManager) { sstIt = impl_->sstManager->scanIter(startKey, endKey, seq, true); }
+        range.start.assign_range(startKey);
+        range.end.assign_range(endKey);
+        auto sources = impl_->captureStoredRangeRead(
+            range, impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT);
 
         size_t n = 0;
-        for (const auto& record : storedScanGenerator(std::move(mt), std::move(sstIt))) {
+        for (const auto& record : storedScanGenerator(std::move(sources.memory), std::move(sources.disk))) {
             (void)record;
             ++n;
         }
@@ -6338,8 +6390,8 @@ namespace akkaradb::engine {
         return n;
     }
 
-    core::ArenaGenerator<AkkEngine::ScanRecordView> AkkEngine::scan(
-        core::BufferArena& arena,
+    ArenaGenerator<AkkEngine::ScanRecordView> AkkEngine::scan(
+        BufferArena& arena,
         std::span<const uint8_t> startKey,
         std::span<const uint8_t> endKey
     ) const {
@@ -6352,23 +6404,30 @@ namespace akkaradb::engine {
             if (impl_->opts.cluster.runtime.queryConsistencyMode == cluster::QueryConsistencyMode::GLOBAL_SNAPSHOT) {
                 cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.forwardingTimeoutMs, [this] { return impl_->placementClosing(); }};
                 readers = impl_->prepareGlobalQuery(startKey, endKey, false);
-                for (auto& reader : readers) { (void)reader->activate(false); }
+                const auto context = cluster::detail::ReconfigurationDeadline::current();
+                impl_->opts.cluster.runtime.nodeResourceBudget->queryExecutor()->forEach(readers.size(), [&](size_t slot) {
+                    cluster::detail::ReconfigurationDeadline scope{context};
+                    (void)readers[slot]->activate(false);
+                }, context.deadline);
                 cluster::detail::ReconfigurationDeadline::check();
             }
             else {
-                for (const auto& target : impl_->rangeQueryPlan(startKey)) {
-                    readers.push_back(
-                        std::make_unique<Impl::QueryReader>(
+                const auto targets = impl_->rangeQueryPlan(startKey);
+                const auto context = cluster::detail::ReconfigurationDeadline::current();
+                readers.resize(targets.size());
+                impl_->opts.cluster.runtime.nodeResourceBudget->queryExecutor()->forEach(targets.size(), [&](size_t slot) {
+                    cluster::detail::ReconfigurationDeadline scope{context};
+                    const auto& target = targets[slot];
+                    readers[slot] = std::make_unique<Impl::QueryReader>(
                             *impl_,
                             target.node,
                             impl_->openQueryRequest(Impl::QueryAction::SCAN, startKey, endKey, 0, target.partitions)
-                        )
-                    );
-                }
+                        );
+                }, context.deadline);
             }
             for (auto& reader : readers) { reader->operationLifetime = operation; }
             impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
-            return core::ArenaGenerator<ScanRecordView>::withArena(
+            return ArenaGenerator<ScanRecordView>::withArena(
                 arena,
                 [&] { return impl_->clusterScanGenerator(arena, std::move(readers), std::move(operation)); }
             );
@@ -6376,8 +6435,8 @@ namespace akkaradb::engine {
         return scanLocalStorage(arena, startKey, endKey);
     }
 
-    core::ArenaGenerator<AkkEngine::ScanRecordView> AkkEngine::scanLocalStorage(
-        core::BufferArena& arena,
+    ArenaGenerator<AkkEngine::ScanRecordView> AkkEngine::scanLocalStorage(
+        BufferArena& arena,
         std::span<const uint8_t> startKey,
         std::span<const uint8_t> endKey
     ) const {
@@ -6390,7 +6449,7 @@ namespace akkaradb::engine {
         impl_->waitForKeySequenceReadVisibility();
         impl_->scansTotal.fetch_add(1, std::memory_order_relaxed);
         if (impl_->usesPartitionRaft()) {
-            return core::ArenaGenerator<ScanRecordView>::withArena(
+            return ArenaGenerator<ScanRecordView>::withArena(
                 arena,
                 [&] { return impl_->partitionPublicLocalScan({startKey.begin(), startKey.end()}, {endKey.begin(), endKey.end()}, std::move(operation)); }
             );
@@ -6398,25 +6457,15 @@ namespace akkaradb::engine {
 
         auto blobReadPin = impl_->blobManager ? impl_->blobManager->pinReads() : blob::BlobManager::ReadPin{};
         memtable::MemTable::KeyRange range;
-        range.start.assign(startKey.begin(), startKey.end());
-        range.end.assign(endKey.begin(), endKey.end());
-        uint64_t seq = 0;
-        auto mt = [&]() {
-            if (impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT) {
-                auto pinned = impl_->memtable->pinnedIterator(range, [this] { return impl_->snapshotSeq(); });
-                seq = pinned.snapshotSeq();
-                return pinned;
-            }
-            seq = impl_->snapshotSeq();
-            return impl_->memtable->iterator(range, seq);
-        }();
-        sst::SSTManager::Iterator st;
-        if (impl_->sstManager) { st = impl_->sstManager->scanIter(startKey, endKey, seq, true); }
-        return core::ArenaGenerator<ScanRecordView>::withArena(
+        range.start.assign_range(startKey);
+        range.end.assign_range(endKey);
+        auto sources = impl_->captureStoredRangeRead(
+            range, impl_->opts.runtime.scanConsistency == AkkEngineOptions::ScanConsistencyMode::PINNED_SNAPSHOT);
+        return ArenaGenerator<ScanRecordView>::withArena(
             arena,
-            [&arena, mt = std::move(mt), st = std::move(st), blobManager = impl_->blobManager.get(),
-                blobReadPin = std::move(blobReadPin), operation = std::move(operation)]() mutable {
-                return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(blobReadPin), std::move(operation));
+            [&arena, mt = std::move(sources.memory), st = std::move(sources.disk), blobManager = impl_->blobManager.get(),
+                readPin = std::move(blobReadPin), operationLifetime = std::move(operation)]() mutable {
+                return scanGenerator(arena, std::move(mt), std::move(st), blobManager, std::move(readPin), std::move(operationLifetime));
             }
         );
     }
@@ -6439,7 +6488,7 @@ namespace akkaradb::engine {
         return impl_->getAtValue(key, revision.seq);
     }
 
-    core::ArenaGenerator<VersionEntry> AkkEngine::history(std::span<const uint8_t> key) const {
+    ArenaGenerator<VersionEntry> AkkEngine::history(std::span<const uint8_t> key) const {
         if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
         auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
         impl_->throwIfBackgroundFailed();
@@ -6447,14 +6496,14 @@ namespace akkaradb::engine {
         std::shared_lock transactionRead{impl_->transactionVisibilityMu, std::defer_lock};
         if (!impl_->clusterRuntime) { transactionRead.lock(); }
         impl_->throwIfBackgroundFailed();
-        core::ArenaGenerator<VersionEntry> local;
+        ArenaGenerator<VersionEntry> local;
         std::unique_ptr<Impl::QueryReader> reader;
         if (!impl_->clusterRuntime) { local = impl_->publicHistoryLocal(key); }
         else {
             const auto target = impl_->queryTargets(key, false).front();
             reader = std::make_unique<Impl::QueryReader>(*impl_, target, impl_->openQueryRequest(Impl::QueryAction::HISTORY, key, {}, 0));
         }
-        return core::ArenaGenerator<VersionEntry>::withOwnedArena(
+        return ArenaGenerator<VersionEntry>::withOwnedArena(
             4096,
             65536,
             [&] { return Impl::publicHistoryGenerator(std::move(local), std::move(reader), std::move(operation)); }
@@ -6670,8 +6719,8 @@ namespace akkaradb::engine {
         request.action = cluster::StripeControlAction::ROLLBACK_KEY;
         request.ownerNodeId = controlNode;
         request.fenceToken = target.seq;
-        request.key.assign(key.begin(), key.end());
-        request.metadata = {static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE), static_cast<uint8_t>(options.conflict)};
+        request.key.assign_range(key);
+        request.metadata = {std::to_underlying(RollbackExecutionMode::IMMEDIATE), std::to_underlying(options.conflict)};
         if (deferredTask) { Impl::pushU64(request.metadata, plannedWatermark); }
         try {
             const auto response = impl_->clusterRuntime->rollbackControl(controlNode, std::move(request));
@@ -6711,8 +6760,8 @@ namespace akkaradb::engine {
             RollbackResult result;
             crypto::secureRandom(result.operationId);
             for (const auto& [stream, sequence] : streams) {
-                auto part = impl_->partitionRollback(static_cast<uint16_t>(stream - 1), sequence, options, true);
-                result.items.insert(result.items.end(), std::make_move_iterator(part.items.begin()), std::make_move_iterator(part.items.end()));
+                auto part = impl_->partitionRollback(stream - 1, sequence, options, true);
+                result.items.append_range(part.items | std::views::as_rvalue);
             }
             return result;
         }
@@ -6805,14 +6854,14 @@ namespace akkaradb::engine {
                     request.ownerNodeId = planned.controlNode;
                     request.fenceToken = planned.targetWatermark;
                     request.key = cursor;
-                    request.metadata = {static_cast<uint8_t>(RollbackExecutionMode::IMMEDIATE), static_cast<uint8_t>(options.conflict),};
+                    request.metadata = {std::to_underlying(RollbackExecutionMode::IMMEDIATE), std::to_underlying(options.conflict),};
                     if (deferredTask) { Impl::pushU64(request.metadata, planned.plannedWatermark); }
                     const auto response = impl_->clusterRuntime->rollbackControl(planned.controlNode, std::move(request));
                     if (response.status != cluster::StripeControlStatus::COMMITTED) {
                         throw std::runtime_error("AkkEngine: cluster rollback stream request was rejected");
                     }
                     auto batch = Impl::decodeRollbackStreamBatch(response.metadata);
-                    result.items.insert(result.items.end(), std::make_move_iterator(batch.items.begin()), std::make_move_iterator(batch.items.end()));
+                    result.items.append_range(batch.items | std::views::as_rvalue);
                     if (batch.done) { break; }
                     cursor = std::move(batch.nextCursor);
                 }
@@ -7070,7 +7119,7 @@ namespace akkaradb::engine {
         if (impl_->placementRecoveryThread.joinable()) { impl_->placementRecoveryThread.join(); }
         if (impl_->distributedRecoveryThread.joinable()) { impl_->distributedRecoveryThread.join(); }
         impl_->partitionQueryExecutor.reset();
-        impl_->snapshotQueryExecutor.reset();
+        impl_->batchReadExecutor.reset();
         impl_->clearQuerySessions();
         const auto closeStep = [&closeFailure](const auto& operation) {
             try { operation(); }
@@ -7111,6 +7160,10 @@ namespace akkaradb::engine {
         closeStep([&] { if (impl_->distributedCompletions) { impl_->distributedCompletions->close(); } });
         closeStep([&] { impl_->checkpointTransactions(); });
         closeStep([&] { if (impl_->memtable && impl_->opts.runtime.forceFlushOnClose) { impl_->memtable->forceFlush(); } });
+        // Flush callbacks borrow SST/Manifest/WAL/Blob state. Even when active
+        // tables are not flushed, or forceFlush failed, drain their queued work
+        // before destroying any of those dependencies.
+        closeStep([&] { if (impl_->memtable) { impl_->memtable->drainFlushes(); } });
         closeStep(
             [&] {
                 if (impl_->blobManager) {

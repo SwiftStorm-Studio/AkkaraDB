@@ -67,6 +67,7 @@ namespace akkaradb::core {
 
         // ==================== Factory (implemented in .cpp) ====================
 
+        // Zero fingerprint/mini-key arguments are computed from the supplied key.
         [[nodiscard]] static OwnedRecord create(
             std::span<const uint8_t> key,
             std::span<const uint8_t> value,

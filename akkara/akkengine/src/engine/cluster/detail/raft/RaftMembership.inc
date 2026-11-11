@@ -217,7 +217,7 @@ RaftLogEntry makeConfigEntry(
     const std::vector<NodeInfo>& newMembers,
     uint64_t generation = 0
 ) {
-    std::lock_guard lock{mutex_};
+    auto lock = stateLock();
     if (commitIndex_ != lastLogIndex()) {
         throw std::runtime_error("RaftConsensusRuntime: cannot change membership while a prior entry is uncommitted");
     }
@@ -237,7 +237,7 @@ void appendReplicateAndCommitConfig(const RaftLogEntry& entry, bool appendEntry 
     detail::ReconfigurationDeadline::check();
     uint64_t term = 0;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
         term = currentTerm_;
         if (!isValidRaftLogEntryShape(entry)) { throw std::runtime_error("RaftConsensusRuntime: invalid membership log entry"); }
@@ -273,7 +273,7 @@ void appendReplicateAndCommitConfig(const RaftLogEntry& entry, bool appendEntry 
     }
     if (entry.kind == RaftEntryKind::CONFIG_JOINT) { crashAtLogTestPoint("raft.learner.after_joint_replication"); }
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
             throw std::runtime_error("RaftConsensusRuntime: leadership changed before membership commit");
         }
@@ -314,6 +314,8 @@ void applyConfigEntryLocked(const RaftLogEntry& entry) {
     }
     refreshPeersFromMembershipLocked();
     ensurePeerReplicationTargetsLocked();
+    if (timerTask_) { timerTask_->notify(); }
+    if (maintenanceTask_) { maintenanceTask_->notify(); }
 }
 
 bool applySnapshotMembershipLocked(const InstallSnapshot& request) {
@@ -333,6 +335,8 @@ bool applySnapshotMembershipLocked(const InstallSnapshot& request) {
     }
     refreshPeersFromMembershipLocked();
     ensurePeerReplicationTargetsLocked();
+    if (timerTask_) { timerTask_->notify(); }
+    if (maintenanceTask_) { maintenanceTask_->notify(); }
     return true;
 }
 
@@ -355,6 +359,8 @@ bool applySnapshotMembershipLocked(const SnapshotInstallTransaction& transaction
     }
     refreshPeersFromMembershipLocked();
     ensurePeerReplicationTargetsLocked();
+    if (timerTask_) { timerTask_->notify(); }
+    if (maintenanceTask_) { maintenanceTask_->notify(); }
     return true;
 }
 
@@ -420,7 +426,7 @@ void changeLearner(NodeInfo node, bool remove) {
     std::vector<NodeInfo> oldMembers;
     std::vector<NodeInfo> newMembers;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
         if (jointOldMembers_ || jointNewMembers_ || commitIndex_ != lastLogIndex()) {
             throw std::runtime_error("RaftConsensusRuntime: membership change already in progress");
@@ -455,7 +461,7 @@ void transferLeadershipAdmitted(uint64_t targetNodeId) {
     uint64_t targetIndex = 0;
     uint64_t term = 0;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() != RaftRole::LEADER) { throw std::runtime_error("RaftConsensusRuntime: local node is not Raft leader"); }
         if (!isVotingMemberLocked(targetNodeId)) { throw std::invalid_argument("RaftConsensusRuntime: transfer target is not a voting member"); }
         auto* state = this->peerState(targetNodeId);
@@ -469,7 +475,7 @@ void transferLeadershipAdmitted(uint64_t targetNodeId) {
         throw std::runtime_error("RaftConsensusRuntime: failed to catch up transfer target");
     }
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         const auto* state = this->peerState(targetNodeId);
         if (role_.load() != RaftRole::LEADER || currentTerm_ != term) {
             throw std::runtime_error("RaftConsensusRuntime: leadership changed before transfer");
@@ -490,9 +496,9 @@ void transferLeadershipAdmitted(uint64_t targetNodeId) {
     if (!response.accepted) { throw std::runtime_error("RaftConsensusRuntime: leader transfer target rejected request"); }
     std::optional<NodeRole> roleChange;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (role_.load() == RaftRole::LEADER && currentTerm_ == term) {
-            electionDeadline_ = this->nextElectionDeadline();
+            resetElectionDeadlineLocked();
             roleChange = setRole(RaftRole::FOLLOWER);
         }
     }

@@ -122,7 +122,7 @@ target_compile_definitions(akkaradb PRIVATE
         AKKARADB_CLUSTER_LIBRARY_FILENAME="${AKKARADB_CLUSTER_DIST_LIBRARY_NAME}"
 )
 if(WIN32)
-    target_link_libraries(akkaradb PRIVATE ws2_32 bcrypt)
+    target_link_libraries(akkaradb PRIVATE ws2_32 bcrypt advapi32)
 endif()
 if(CMAKE_DL_LIBS)
     target_link_libraries(akkaradb PRIVATE ${CMAKE_DL_LIBS})

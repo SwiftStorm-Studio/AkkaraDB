@@ -31,6 +31,7 @@
 #include <iterator>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -858,7 +859,9 @@ namespace {
             manager->flush(seed);
             waitForSst([&] { manager->throwIfBackgroundFailed(); return manager->compactionSnapshot().compactionsCompleted == 1; });
             manager->shutdown(); manager.reset();
-            options.maxL0Files = 2; options.targetFileSize = 1;
+            // The update flush splits into two files; include the insertion's
+            // third file before triggering the replacement under test.
+            options.maxL0Files = 3; options.targetFileSize = 1;
             manager = sst::SSTManager::create(dir, options, manifest.get()); manager->recover();
             setSstCrashPoint(point);
             const std::vector update{record(a, empty, 20, akkaradb::core::RecordView::FLAG_TOMBSTONE), record(b, newer, 21)};
@@ -890,7 +893,7 @@ namespace {
                 if (point == "sst.compaction.after_first_input_delete") {
                     size_t l0 = 0;
                     for (const auto& entry : fs::directory_iterator(dir)) { if (entry.path().filename().string().starts_with("L0_")) { ++l0; } }
-                    require(l0 == 1, "partial-deletion fixture must really delete one input and leave the other");
+                    require(l0 == 2, "partial-deletion fixture must delete one of the three L0 inputs");
                 }
                 const bool flushOnly = point.starts_with("sst.flush.");
                 const bool sealed = point != "sst.flush.after_rename";
@@ -915,7 +918,7 @@ namespace {
                         verifySelectedVersion(*manager, c, UINT64_MAX, 12, false, kept);
                         verifySelectedVersion(*manager, d, UINT64_MAX, 22, false, added);
                         const auto levels = manager->levelStats();
-                        require(levels[0].fileCount == (committed ? 0u : 2u) && levels[1].fileCount == (committed ? 4u : 1u),
+                        require(levels[0].fileCount == (committed ? 0u : 3u) && levels[1].fileCount == (committed ? 4u : 1u),
                             "recovery selected a partially replaced compaction set");
                     }
                     for (const auto& entry : fs::directory_iterator(dir)) {
@@ -1020,7 +1023,8 @@ namespace {
                 manager->flush(rows);
             }
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
-            while (manager->compactionSnapshot().compactionsCompleted == 0 && std::chrono::steady_clock::now() < deadline) {
+            while ((manager->levelStats()[0].fileCount != 0 || manager->levelStats()[1].fileCount != 300) &&
+                std::chrono::steady_clock::now() < deadline) {
                 manager->throwIfBackgroundFailed(); std::this_thread::sleep_for(std::chrono::milliseconds{5});
             }
             manager->shutdown(); manager->throwIfBackgroundFailed();
@@ -1336,12 +1340,36 @@ namespace {
     #include "detail/sst_durability_regressions.inc"
     #include "detail/sst_catalog_failure_regressions.inc"
     #include "detail/sst_ownership_regressions.inc"
+    #include "detail/sst_compaction_visibility_regressions.inc"
+    #include "detail/sst_point_read_regressions.inc"
+    #include "detail/sst_flush_sizing_regressions.inc"
+    #include "detail/sst_cache_range_regressions.inc"
 }
 
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
 
     try {
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-cache-ranges") {
+            testSharedSstBlockCache();
+            testSstRangeSelection();
+            return 0;
+        }
+        if (argc == 5 && std::string_view{argv[1]} == "--sst-split-flush-child") {
+            return runSplitFlushCrashChild(argv[2], argv[3], argv[4]);
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-flush-sizing") {
+            testFlushSizeTargets();
+            testBloomSizingFromActualKeys();
+            testSplitFlushPublication();
+            testSplitFlushCrashRecovery(std::filesystem::absolute(argv[0]));
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-max-sequence") {
+            testSstSnapshotMaxSequence();
+            testSstReadSnapshotAcrossCompaction();
+            return 0;
+        }
         if (argc == 4 && std::string_view{argv[1]} == "--sst-ownership-child") {
             const std::string_view mode{argv[2]};
             return runSstOwnershipChild(argv[3], mode == "locked", mode == "crash");
@@ -1380,8 +1408,17 @@ int main(int argc, char** argv) {
             return runManifestCompactCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
         }
         require(argc == 1, "unexpected SST test command line");
+        testSharedSstBlockCache();
+        testSstRangeSelection();
+        testFlushSizeTargets();
+        testBloomSizingFromActualKeys();
+        testSplitFlushPublication();
+        testSplitFlushCrashRecovery(std::filesystem::absolute(argv[0]));
+        testSstSnapshotMaxSequence();
         testSstExclusiveOwnership(std::filesystem::absolute(argv[0]));
         testSstReadSnapshotAcrossCompaction();
+        testCompactionVisibilityFrontier();
+        testSstDirectPointReads();
         testVersionsWithinOneSst();
         testRecoveryRejectsInsufficientLevels();
         testStreamingFlushEstimates();

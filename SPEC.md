@@ -301,6 +301,8 @@ The associated payload is contiguous `[key][stored value]`.
 | 32 | 32 | `SmallBuffer data` | Inline or arena-backed `[key][value]` |
 
 `OwnedRecord` owns its bytes and is not a thread-safe shared object.
+Its factories compute the key fingerprint and mini-key when the corresponding
+precomputed argument is zero, including the string-key and tombstone helpers.
 Fingerprints and mini keys are optimization hints only. Full key comparison is
 the correctness authority.
 
@@ -471,7 +473,7 @@ Invalid component combinations fail during `open`.
 
 | Mode | Behavior |
 |---|---|
-| `APPLY_ORDER` | Default fast path. Reads follow the order writes reached the MemTable. |
+| `APPLY_ORDER` | Default fast path without per-key sequence-allocation locking. Memory-only engines read the last applied version; SST-backed engines choose the largest visible retained sequence in both MemTable and SST. |
 | `KEY_SEQUENCE` | Requires `sequence.allocation=GLOBAL_ATOMIC` and `COMMIT_ORDER`. Writes on the same internal ordering stripe reserve and apply their sequence while holding that stripe's mutex. Writes on different stripes remain concurrent. Reads wait for the prefix reserved at read start to commit, so they do not expose an earlier cross-key sequence gap. |
 
 ### 6.6 Sequence Allocation
@@ -815,6 +817,9 @@ Point reads choose the newest visible retained version across MemTable and SST:
 
 `sstPromoteReads` is a cache/promotion optimization. It is not a new mutation
 and must not alter snapshot semantics.
+Promotion checks the currently published memory sources under the key's shard
+write lock and skips keys already present there, including tombstones and
+unpublished updates. An old SST read cannot overwrite a concurrent memory write.
 
 ### 8.2 Public Point APIs
 
@@ -918,14 +923,18 @@ reservation contract changes the 2PC envelope/state markers and Raft compatibili
 fingerprints; recreate earlier pre-release 2PC stores. No migration is provided.
 
 Cluster scan/history delivery is selected by `queryResultMode`, and the
-initiating engine includes its choice in OPEN. `PREPARED` (default) writes the
-complete result to a private disk spool before returning; consumption then
+initiating engine includes its choice in OPEN. `PREPARED` (default) materializes the
+complete result before returning. A cursor retains up to 64 KiB in memory and
+spills larger results to a private disk spool using buffered writes; both forms
+count against `queryMaxSpoolBytes`. Consumption then
 needs no storage snapshot pins. `STREAMING` captures fixed sources at OPEN and
 generates up to 1 MiB per NEXT page without spooling the complete result. A
 record may span pages. The reader retains one page and one current record per
 owner, plus caller-owned output. Page replay retains only the latest page;
 non-sequential offsets are rejected. A failed streaming cursor cannot resume
 as if it had completed successfully.
+Local partition and remote source merges use a key-ordered heap, with
+`O(N log P)` comparisons for N output records and P participating sources.
 
 Both modes seal active MemTables into immutable sources and switch writers to
 new active tables. The short capture excludes publication, but copying and
@@ -1015,6 +1024,28 @@ default. `MemTableBackendOptions::maxVersionsPerKey` may raise or lower this
 per mutable backend instance where supported. This is an in-memory optimization,
 not the historical-read API. Persistent history requires VersionLog.
 
+SST-backed engines enable `MemTable::Options::sequenceOrderedVersions` before
+constructing any backend. Point reads and scans select the largest retained
+sequence at or below their visibility cut, consistently before and after flush,
+compaction and restart. Bounded backends retain their highest sequences rather
+than evicting a newer version for a delayed older write. Memory-only engines keep
+application-order behavior unless this option is explicitly enabled. Custom
+backends/wrappers used with SST must implement/forward `useSequenceOrder()`;
+unsupported backends fail during initialization before accepting writes.
+
+`COMMIT_ORDER` engines override that bounded history: each mutable generation
+retains all applied versions until persistence or memory-generation compaction.
+An unpublished higher sequence must not evict the currently committed value.
+The `MemTable::create(options, retentionVisibilitySeq)` overload enables this policy for low-level
+callers. Memory-generation compaction keeps the newest sequence at or below
+that monotonic frontier and every newer sequence. This does not provide an
+arbitrary historical-read guarantee after compaction.
+
+Custom `IMemTable` backends used with this policy must implement
+`retainAllVersions()` and `flushIterator()`; wrappers must forward both methods.
+Unsupported backends fail during construction, before accepting writes.
+Built-in backends and existing SST/Manifest formats require no migration.
+
 Backend construction options are:
 
 | Field | Default | Meaning |
@@ -1048,6 +1079,9 @@ can expose transient unreachable paths to readers.
 `MemTable::get` returns a `RecordView` when the key exists at or before the
 snapshot sequence. Tombstones are returned as records so the engine can stop
 the SST search.
+The call retains its source generations while looking up the record. Its result
+is still borrowed: use `getPinned` to keep the bytes alive after the call when
+flush or memory-generation compaction may run concurrently.
 
 `getInto` and `contains` return:
 
@@ -1064,6 +1098,19 @@ to the immutable-table list. A fresh active backend is installed. Background
 flush workers iterate immutable tables in key order and invoke either `onFlush`
 or `onFlushStream`, depending on `flushInputMode`.
 
+Persistence uses `IMemTable::flushIterator()`, which emits every retained
+version in key order. Ordinary `iterator()` still emits one visible version
+per key. This includes every version still present in a bounded version ring;
+versions already evicted from that ring are not recreated. In publication-safe
+retention mode, a flush therefore preserves the
+committed baseline and intermediate unpublished versions instead of collapsing
+them at `UINT64_MAX`.
+Byte-triggered, forced and snapshot-triggered rotations prepare the replacement
+backend, publication state and any flush queue storage before freezing the active
+generation. Failure during that preparation leaves it writable for a later retry.
+If snapshot construction fails after some shards have already rotated, those
+shards remain readable and their prepared persistence work is still enqueued.
+
 In the engine, `onFlush` writes records through `SSTManager::flush`, checkpoints
 the Manifest, optionally prunes WAL through the returned checkpoint sequence,
 and can run Blob GC when configured.
@@ -1072,13 +1119,20 @@ and can run Blob GC when configured.
 into one sorted `std::vector<RecordView>` before invoking `onFlush`. This keeps
 the legacy callback contract and gives consumers a contiguous span.
 
+The input mode selects the preferred callback when both callbacks are installed.
+A sole installed callback is always used, regardless of the input mode; a flush
+cannot complete without invoking its persistence callback.
+
 `MemTableFlushInputMode::STREAMING` passes an estimated record count and an
 `ArenaGenerator<RecordView>` to `onFlushStream`. `AkkEngine` uses this mode to
-stream immutable records into `SSTManager::flush`, which forwards the generator
-to `SSTWriter::write`. This removes the flush worker's full `RecordView`
+stream immutable records into `SSTManager::flush`, which passes bounded key-group
+chunks to `SSTWriter::write`. This removes the flush worker's full `RecordView`
 materialization vector. SST writing still retains format metadata such as block
-index, key arena, Bloom filter bits, and Manifest blob-reference entries until
-the file is sealed.
+index, key arena, Bloom filter bits, and one 64-bit fingerprint per distinct key.
+The complete flush's Manifest blob-reference entries remain until publication.
+Each file's Bloom filter is sized from its actual distinct-key count after its
+input finishes; the estimate only controls a bounded initial reserve. Input is
+not replayed and its key/value buffers are not retained for Bloom construction.
 
 The streaming record count is a sizing hint, including zero; it never determines
 whether records are written. SSTManager consumes every yielded record once and
@@ -1250,9 +1304,77 @@ without removing its readable SST versions. Local `getBatch` retains the same
 source set and visibility sequence for the whole batch. These source pins do not
 exclude ordinary writers or extend the MemTable backend's version-retention policy.
 
+Local `scan`, `scanLocalStorage`, and `count` also retain their MemTable sources,
+capture an SST `ReadSnapshot`, and sample visibility before constructing any
+backend iterator. SST iteration uses that retained file set even if a flush or
+compaction completes during iterator construction. This ordering applies to both
+`WEAK_ORDERED` and `PINNED_SNAPSHOT`; only the latter holds shard read locks for
+the operation's lifetime. Low-level callers can likewise build `scanIter` from
+an `SSTManager::ReadSnapshot` after retaining the file set.
+
+SST point-read selection retains decoded block bytes through an
+`SSTReader::PinnedRecord` instead of copying each candidate's key and value.
+`SSTManager::getInto` and its `ReadSnapshot` equivalent copy only the selected
+live value directly into the caller's vector, reusing capacity; missing keys and
+tombstones leave that vector unchanged. `contains` does not materialize a value.
+The owning `get` API materializes only the winning record. A reader pin keeps
+its view valid across cache eviction and reader destruction; `toOwned` makes an
+independent copy when needed.
+
+SST readers share a process-wide LRU of at most 64 open SST streams. An active
+I/O operation leases its stream; eviction closes only idle streams and waits
+when all slots are in use. Reader inventories and retained snapshots do not
+reserve one descriptor per file. A compacted input keeps its original path
+until its last reader is released, allowing an evicted stream to reopen safely.
+The last release closes its cached stream and attempts file deletion. A bounded
+round-robin cleanup pass on the manager's compaction workers
+retries obsolete paths after transient unlink failures (including Windows share
+locks), without a new flush or reopen. If compaction is disabled and recovery
+finds leftovers, it starts a cleanup-only worker; it never schedules compaction.
+Pinned readers remain protected. Recovery retries leftover obsolete files after
+shutdown or a crash.
+Recovery preserves paths pinned by readers from a previous manager instance in
+the same process. Stream reopen uses an absolute canonical path, independent of
+later changes to the process current directory.
+
 ### 12.2 Flush and Compaction
 
-MemTable flush writes sorted records to an L0 SST. A recovery checkpoint advances
+`SSTManager::Options::blockCacheBytes` is one shared LRU budget across all of
+the manager's SST readers, including readers retained by old snapshots and
+compaction. Concurrent misses may decode independently, but insertion deduplicates
+the block under the cache lock. Accounting uses the allocated capacities of the
+decoded byte and offset buffers; cache bookkeeping, file metadata and buffers
+held by active reads or `PinnedRecord` pins are outside this budget. Blocks larger
+than the budget are read without admission. Reader destruction removes its cache
+entries without invalidating outstanding pins. Standalone `SSTReader` instances
+use private caches by default and can opt into a shared `SSTReader::BlockCache`.
+`blockCacheStats()` exposes the manager's capacity, resident bytes, entry count
+and hit/miss counters. A zero budget disables block retention.
+
+Range scans use a balanced interval index for overlapping L0 files and binary
+search over disjoint higher-level file ranges. Each selected reader seeks the
+first intersecting block and record by binary search. Bounds remain inclusive
+at the start and exclusive at the end; empty bounds are unbounded. Iterators
+retain the captured file set, so point access and forks with wider bounds still
+use the original snapshot.
+
+MemTable flush writes sorted records to one or more L0 SSTs. `targetFileSize`
+budgets aligned, uncompressed record bytes, consistently with compaction;
+indexes, Bloom filters and other file metadata add overhead, and compression
+can reduce stored size. All retained versions of one key stay in one file even
+if that group exceeds the target. Span and streaming flushes use the same split
+policy. The low-level `SSTWriter` writes one file; its unused
+`Options::targetFileSize` member has been removed. Set the target on `SSTManager`.
+
+Flush finishes all input and output files before publishing any of them. Input
+errors remove unpublished outputs. A single-file flush uses `SST_SEAL`; a split
+flush atomically publishes all files through the existing `COMPACTION_COMMIT`
+record with an empty input set. In-memory publication also installs the complete
+set at once. A crash before this commit publishes none of the batch; a crash
+after it recovers every output. Uncertain publication failures retain the files
+for replay. SST and Manifest v1 layouts are unchanged.
+
+A recovery checkpoint advances
 only through the contiguous publication frontier and below every unflushed
 MemTable generation's minimum sequence, across all shards. The frontier is
 tracked even for `APPLIED` visibility; unused thread-local sequence reservations
@@ -1261,14 +1383,31 @@ before recalculating this boundary. The checkpoint and preceding SST seals must
 be durable before any covered WAL segments are retired. SST seal, compaction
 commit, and checkpoint calls enforce this handoff even in Manifest fast mode.
 Compaction replaces one or
-more input files with output files and may collapse multiple records for the
-same key to the newest retained record. SST compaction is not required to
+more input files with output files. In an engine using `COMMIT_ORDER`, it samples
+the committed sequence frontier once per compaction, retaining the newest record
+at or below that frontier and every newer sequence, including tombstones. This
+preserves the currently visible value while a lower-sequence writer is still
+in flight, and preserves intermediate versions as the frontier advances. All
+retained versions of one key stay in the same output file, even if that key's
+group exceeds `targetFileSize`, so higher-level file ranges remain disjoint.
+Later compaction may discard superseded versions after the frontier advances.
+Standalone SSTManager callers can supply a thread-safe, monotonic visibility
+provider through the four-argument `create` overload; it must remain valid until
+shutdown. Without a provider, compaction retains only the newest sequence per key.
+SST compaction is not required to
 preserve compacted-away historical versions for arbitrary older snapshot
 sequences; `getAt`, `history`, and rollback use VersionLog for persistent
 history. The Manifest's atomic `COMPACTION_COMMIT` record names all outputs and
 all inputs, so recovery either installs the whole replacement or preserves the
 old inputs and discards orphan outputs. Tombstones remain at the bottom level:
 a delayed lower-sequence flush must not resurrect a deleted key.
+
+L0 compaction selects only L1 files intersecting an L0 input range. Input ranges
+separated by untouched L1 files produce separate outputs even below the size
+target, preventing an output from spanning those files. Other gaps do not force
+small outputs. Nonintersecting L1 files retain
+their identities and are not rewritten. The existing level-level exclusion
+between compaction workers and atomic catalog publication still apply.
 
 SST publication synchronizes the temporary file before renaming it. Windows uses
 a write-through rename; POSIX synchronizes the parent directory and propagates
@@ -1314,8 +1453,26 @@ If `maxLevels` was reduced below existing levels, restore a value greater than
 the highest live level before reopening; no live SST is silently omitted.
 
 Blocking L0 backpressure with compaction disabled is rejected at open.
+SST manager creation rejects nonpositive `maxL0Files`, `l1MaxBytes` and
+`targetFileSize`, negative `compactThreads`, nonfinite or less-than-one
+`levelSizeMultiplier`, invalid codec/compaction modes, and data block sizes below
+4096 bytes or not aligned to eight bytes, before opening storage. Oversized
+computed level budgets saturate at `UINT64_MAX`. Shutdown finishes an active
+compaction but selects no further work.
 
 ### 12.3 Manifest
+
+`Manifest::sstBlobRefs()` returns the latest reference metadata for each tracked
+SST, sorted by filename, including unsealed outputs awaiting publication.
+Replacing metadata for a file replaces its previous entry; SST deletion and
+compaction discard input-file metadata in memory and during replay. This API
+does not provide historical reference events. `liveSstBlobRefs()` continues to
+return the consistent live-file reference snapshot used for Blob protection.
+Manifest compaction retains pending output metadata as well as live metadata,
+so it can run between an output's reference record and its seal/commit.
+After validating every catalog-live SST, SST recovery durably discards reference
+metadata for unpublished outputs, including outputs whose files are missing.
+The SST and Manifest v1 persisted layouts are unchanged; no migration is needed.
 
 The Manifest is a durable append-only log of SST and cluster lifecycle state.
 It records:
@@ -2043,9 +2200,16 @@ the advertised owner for larger values. Up to 64 outstanding forward requests
 per non-Raft peer connection are identified independently. Streaming large
 forwarded values and transparent client-side redirect following are future work.
 Raft forwarding uses independent RPC channels, with `raftMaxForwardRequests`
-limiting active channels per runtime (default 64, range 1–256). Waiting for a
+limiting active channels per runtime (default 128, range 1–256). Waiting for a
 channel consumes the caller's original deadline. Consensus traffic uses separate
 connections so forwarded administration cannot block its own replication.
+Each runtime may retain one recently completed ordinary channel and one leaf
+control channel for 20 ms, reusing TCP/SECURE sessions during bursts. Cached
+channels retain node admission leases and expire independently of further RPCs;
+single-slot configurations disable caching. Failed exchanges are never cached
+or implicitly replayed. Routed `getBatch` executes independent point reads with
+up to eight shared workers per engine, preserving input order and duplicates.
+It retains the existing per-key read consistency rather than a common snapshot.
 One additional channel is reserved for leaf placement-state reads needed by
 forwarding callbacks, allowing reconfiguration even when the ordinary limit is 1.
 Inbound forwarding and receive memory have independent limits, while consensus
@@ -2872,6 +3036,18 @@ raw-public-key identity:
 - peers can be pinned by node id and public key,
 - clients can require an expected primary node id.
 
+New identity seed files are written to an exclusively created temporary file
+with owner-only access before any secret bytes are written (mode `0600` on
+POSIX, a protected DACL granting only the current account access on Windows).
+The completed file is synced and renamed without changing the seed format.
+Existing seed files retain their permissions; their parent directories and
+access controls must also be protected by the deployment.
+
+Non-Raft replication always checks the configured replica node-id allowlist.
+An empty allowlist accepts no replicas; low-level callers must provide node ids
+or admit them through `allowReplica()`. A pinned public key alone does not
+authorize cluster membership.
+
 Plain replication is intentionally restricted to validated LAN or loopback
 advertised addresses. PLAIN deliberately provides neither confidentiality nor
 peer authentication: a process able to reach the replication port can impersonate
@@ -2989,12 +3165,14 @@ close. Reaping waits for worker initialization to finish, including failed
 initialization, so it cannot race thread creation. Server close interrupts
 handshaking sockets, joins the accept worker, and drains connection cleanup.
 
-Read callbacks run on a separate per-connection worker so owner coordination
-cannot block receipt of replication ACKs. Each connection allows at most one
-active read and one pending read; another request while the pending slot is
-occupied terminates the connection. Outbound frames and read responses share
-serialized socket writes. Configured outbound frame/byte queue limits remain
-independent of this read-work bound.
+Read callbacks run on bounded executors so owner coordination cannot block
+receipt of replication ACKs. Public reads and forwarded GETs share four workers
+and up to 64 queued requests per server; local-storage shard reads have a separate
+executor with the same bounds to avoid coordinator/leaf deadlock. Excess work
+receives an error response without closing the replication connection. Rollback
+controls retain their separate per-connection serialization. Outbound frames and
+read responses share serialized socket writes. Configured outbound frame/byte
+queue limits remain independent of these read-work bounds.
 
 The non-Raft runtime copies shared endpoint ownership while holding its lifecycle
 mutex, then releases that mutex before peer reads, replication sends, targeted
@@ -3004,12 +3182,25 @@ is transactional from the caller's perspective: a failed bind or endpoint start
 performs best-effort cleanup and leaves the same runtime eligible for a later
 `start()` retry.
 
+Non-Raft point reads correlate up to 64 outstanding requests per connection.
+Late responses to timed-out reads are discarded by request id. Server point-read
+and forwarded-GET work uses four workers and 64 queued jobs per runtime; local
+storage leaf reads have a separate pool with the same limits, preventing
+coordinator saturation from starving the shard reads it needs. Rollback control
+ordering remains serialized. Close drains both pools.
+
 ### 15.8 Raft Replication, Proposal Batching, and ReadIndex
 
 Raft uses a long-lived worker and reusable outbound connection per peer. Vote,
 append, snapshot, and leadership-transfer RPCs reuse the transport session,
 including the SECURE handshake. Request/response exchanges on a connection are
-serialized; a failed exchange discards the connection so a delayed response
+serialized; ordinary log replication can send a window of up to four ordered
+AppendEntries frames before draining their ordered responses. The window starts
+at one, grows after fast successful data exchanges, and shrinks on slow exchanges
+or failures so a larger window cannot prevent progress on a slow link. Additional window
+memory (including copy/encoding allowance) shares a node-wide quota equal to
+`nodeResources.raftReceiveMemoryBytes`, separate from receive reservations.
+Membership migration keeps one frame outstanding. A failed exchange discards the connection so a delayed response
 cannot satisfy a later request. Subsequent work reconnects. Replication requests
 coalesce their target index and heartbeat/read-confirmation work. Peer workers
 are retired after membership removal. Inbound connections serve multiple RPCs.
@@ -3022,6 +3213,18 @@ Leaf control reads have 16 reserved inbound channels. At most 64
 connections may be negotiating a hello; hello payloads are bounded to 107 bytes
 with a separate 64 KiB receive budget. Close interrupts sockets and drains
 workers and handlers.
+AppendEntries acknowledges durable log/commit state before asynchronous state-machine
+application. A dedicated worker per Raft group serializes application and its
+durability barrier; proposal completion still requires durable local application,
+and ReadIndex still waits for its applied boundary. While application or its
+snapshot lock is blocked, at most one further append frame is admitted beyond
+that application's boundary; later new payloads wait, while heartbeats and
+retransmitted prefixes remain admissible. Unchanged log metadata is
+not rewritten, and obsolete request journals are collected on checkpoint changes
+and recovery rather than on every metadata publication.
+Appending to an already published segment syncs its contents without syncing
+unchanged directory entries; new segment/directory names remain synced before
+metadata publication on platforms requiring directory sync.
 
 `raftMaxReceiveMemoryBytes` bounds aggregate Raft frame receive/decode
 reservations across inbound and outbound consensus connections. Raft framing
@@ -3162,6 +3365,37 @@ current-term prefix, and application shares its durability barrier across the
 committed batch. Blob chunks for one payload remain contiguous in the log.
 Internal protocol bulk writes submit bounded groups without promising transactionality.
 
+Raft election/heartbeat timers, proposal batches, compaction checks and forwarding
+cache expiry share a node scheduler across locally hosted data and control groups.
+It uses one timer thread and grows from one to at most eight callback workers;
+idle proposal queues have no periodic polling. Each group retains its own accept,
+application and peer workers, so this does not make total node thread use constant.
+Nonblocking heartbeat dispatch uses the timer lane; election RPCs, worker retirement
+and persistence run on callback workers, so saturated I/O workers cannot hold up
+another group's heartbeat timer.
+Shutdown cancels each group's scheduled callbacks and waits for running callbacks
+before releasing that group's state.
+
+Ordinary append, commit and apply checkpoints release the consensus state mutex
+during file synchronization and atomic metadata publication. Durable-state writers
+remain serialized. Admission and observations can proceed, while replication and
+published progress use only the successfully persisted log/commit/applied prefix.
+Election and administrative persistence retain their serialized path. Storage
+failures still fence the runtime; disk and wire formats are unchanged.
+
+Forwarding caches retain up to eight idle data channels per group (one reserved
+control channel) for two seconds. Idle admission leases are reclaimable across
+groups before active work is rejected. Incoming channels become reclaimable only
+after completing their first request; partial first requests still consume active
+admission. Active requests retain the existing node/group limits.
+
+Range-query open, activation and count requests share a node executor with at
+most eight workers and sixteen queued jobs. Scans request initial remote pages
+concurrently and prefetch one subsequent page per cursor; a separate node quota
+bounds additional lookahead to sixteen one-MiB pages. When admission is unavailable,
+the reader falls back to synchronous delivery. Cursor destruction joins pending
+page work before CLOSE and retains the operation lifetime through that join.
+
 Raft log compaction exports a full state-machine snapshot only after at least
 `raftSnapshot.minLogEntries` committed entries, approximately
 `raftSnapshot.minLogBytes` committed log bytes, or
@@ -3182,6 +3416,8 @@ rollback revisions remain historical records. Heads restore current visibility
 without synthesizing additional public revisions. Non-Raft snapshots keep their
 existing key/value representation. Placement snapshots contain one state record
 followed by STRIPE metadata history and heads when applicable.
+Snapshot frame assembly accounts for chunk sizes incrementally and encodes each
+completed frame once, without repeatedly copying/encoding the growing chunk list.
 
 A received Raft snapshot at or below the local committed index is acknowledged
 without replacing storage, membership, transaction state or retained results.
@@ -3236,6 +3472,12 @@ reports completed consolidations, failures, the monotonic timestamp of the last
 failure, and whether work remains pending. Tombstones remain in the consolidated
 base. Blob-file deletion is pinned until the fixed view has resolved all
 referenced values.
+Memory-only snapshot byte admission measures and charges the captured generations
+under the same all-shard barrier that fixes their contents. Concurrent writes
+during replacement-backend construction cannot bypass `maxPinnedBytes`.
+Capacity waits release the shard locks and remeasure after waking. Failed capture
+releases its lease and generation admission slot; `COMPLETION_FIRST` still permits
+one oversized snapshot when no other snapshot is pinned.
 Retained-history capture pins VersionLog segment files and their captured byte
 boundaries until the lazy history stream is released. Later appends remain outside
 the fixed view, and retention pruning resumes after the pin is released.
@@ -3746,10 +3988,12 @@ One runtime shares memory, spool-byte, and active-large-transfer budgets across
 its server and clients. Exhaustion rejects admission or aborts the affected
 connection instead of waiting while holding other transfer reservations. Existing
 write timeout/ACK policy still determines the caller-visible write outcome.
-Owner-read admission permits only one outstanding wire request per client,
-including after its caller times out. A later read waits within its timeout for
-the abandoned response to drain (or for disconnection), instead of flooding the
-server's bounded read queue and disconnecting unrelated write ACK traffic.
+Owner-read admission permits up to 64 concurrent waiting callers per client.
+Admission, sending and response waits share the caller's total timeout. Each
+request has its own response correlation; timeout removes its waiting state and
+late responses are ignored. Other reads can complete while a slow callback is
+still running. Server executor bounds apply independently to abandoned work,
+and admission rejection does not disconnect unrelated write ACK traffic.
 Queue limits count logical message bytes per replica even though payload storage
 is shared. Standalone server/client factories own budgets unless explicitly given
 a shared budget. WAL-backed history is read from the history provider rather than
@@ -4261,7 +4505,7 @@ Depending on configuration, background work can include:
 - Blob GC,
 - API accept/connection workers,
 - cluster replication manager, endpoints, and disconnected-replica reaper,
-- Raft peer workers and proposal-batch flusher,
+- Raft peer/application workers and a shared node timer/proposal scheduler,
 - STRIPE owner intent recovery/garbage collection.
 
 ### 22.3 Close
@@ -4277,6 +4521,13 @@ Depending on configuration, background work can include:
 7. Stops API/cluster/background components.
 8. Releases storage components.
 9. Rethrows the first captured close failure after best-effort cleanup.
+
+Before releasing any storage dependency, close drains all already queued
+MemTable flush callbacks. This applies with `forceFlushOnClose=false` and after
+a force-flush failure. `MemTable::drainFlushes()` performs that wait without
+rotating active tables and reports a latched flush failure only after the queued
+work has finished. Memory-only maintenance is stopped before its MemTable
+wrapper is destroyed, even when a retained snapshot outlives that wrapper.
 
 STRIPE garbage collection is stopped and joined before cluster transport and
 storage are released. Cluster close detaches endpoint ownership under its
@@ -4526,6 +4777,10 @@ Per-file flags include block Zstd and metadata CRCs. All SST files must checksum
 the block index, key arena, and Bloom filter; files without metadata checksums
 are rejected. Per-block flags include compressed, raw, and prefix-compressed.
 Record flags mirror tombstone and Blob status.
+Before allocating decompression or offset buffers, readers bound block-header
+sizes and record counts against the checksummed index. Zstd frame sizes must
+agree with their declared size when available. Prefix reconstruction is bounded
+by the index's decoded size, which must match the final decoded block.
 
 ### 24.6 Manifest
 
@@ -4734,7 +4989,8 @@ targets including:
 - VersionLog maintenance-tool smoke test,
 - engine recovery smoke test,
 - WAL async failure smoke test,
-- SST snapshot visibility smoke test.
+- SST snapshot visibility smoke test,
+- SST descriptor/metadata/allocation/option resource regression test.
 
 Throughput benchmarks are measurement tools, not correctness specifications.
 Smoke tests cover representative correctness contracts for recovery, async WAL
@@ -4897,7 +5153,16 @@ Raft pipeline tests additionally cover PLAIN and SECURE connection reuse,
 ReadIndex requests without log metadata writes, one-peer outage/reconnect,
 rejection of reads after quorum loss despite earlier successful ACKs, shutdown
 of pending proposals, and concurrent engine inline/Blob/batch writes followed
-by reopen. `--raft-pipeline` selects these tests; `--raft` includes them and the
+by reopen. `--cluster-performance` additionally covers bounded forwarding reuse,
+concurrent batch/peer reads, abandoned-response correlation, buffered spool
+spill/read/append boundaries, asynchronous follower application, and multi-frame
+catch-up with PLAIN/SECURE sessions and reopen. It also checks spaced and parallel
+forwarding reuse, lookahead before consumption, shared scheduling/cancellation,
+idle-admission reclamation and snapshots containing many small chunks.
+`--cluster-small-snapshot` selects the small-chunk snapshot case alone.
+These are loopback regression
+tests, not measurements of deployed LAN/WAN throughput.
+`--raft-pipeline` selects the proposal/ReadIndex tests; `--raft` includes them and the
 existing Raft regression tests.
 
 `--raft-contract` (`akkaradb_raft_contract_test`) checks group-id, group-kind,
@@ -4976,9 +5241,9 @@ also verifies that a Raft node with mismatched retry policy is rejected before R
 processing while the compatible majority remains available, and validates the
 published cluster/peer/request-journal statistics. Snapshot catch-up
 also verifies that read visibility advances over the prefix replaced by a snapshot.
-Repeated owner-read timeouts must preserve the write ACK connection and admit
-only one outstanding read. `--stripe-concurrency` isolates the existing STRIPE
-failure/recovery and concurrent-overwrite regression.
+Repeated owner-read timeouts must preserve the write ACK connection even while
+multiple read callbacks remain blocked. `--stripe-concurrency` isolates the
+existing STRIPE failure/recovery and concurrent-overwrite regression.
 
 `--soak <seed> <rounds>` runs every cluster stress category once per round in a
 seed-shuffled order and prints the seed, round, and scenario before execution. Its

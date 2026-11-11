@@ -115,9 +115,12 @@ void testRpcAdmissionDeadline(bool secure, bool stripe, bool rollback = false) {
     const bool firstStillPending = first.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout;
     release.set_value();
     const bool firstSucceeded = first.get();
-    const bool serialized = !stripe || rollback;
-    AKK_CLUSTER_CHECK(firstEntered && timedOut == serialized && elapsed < std::chrono::milliseconds{500} &&
-        firstStillPending && firstSucceeded);
+    // Reads and ordinary STRIPE controls are multiplexed; rollback is serialized.
+    const bool serialized = rollback;
+    AKK_CLUSTER_CHECK(firstEntered);
+    AKK_CLUSTER_CHECK(timedOut == serialized);
+    AKK_CLUSTER_CHECK(elapsed < std::chrono::milliseconds{500});
+    AKK_CLUSTER_CHECK(firstStillPending && firstSucceeded);
     const unsigned completedCalls = serialized ? 1 : 2;
     AKK_CLUSTER_CHECK(calls.load() == completedCalls && client->connected());
     invoke(1000); // Admission timeout and parallel completion both leave the connection usable.

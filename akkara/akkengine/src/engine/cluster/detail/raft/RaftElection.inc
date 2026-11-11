@@ -29,10 +29,17 @@ Clock::time_point nextElectionDeadline() {
     return Clock::now() + std::chrono::milliseconds(dist(rng));
 }
 
+void resetElectionDeadlineLocked() {
+    electionDeadline_ = nextElectionDeadline();
+    if (timerTask_) { timerTask_->notify(electionDeadline_); }
+}
+
 std::optional<NodeRole> setRole(RaftRole role) {
     const auto old = role_.exchange(role);
     if (old == role) { return std::nullopt; }
     peerReplicationCv_.notify_all();
+    if (timerTask_) { timerTask_->notify(); }
+    if (proposalTask_) { proposalTask_->notify(); }
     return role == RaftRole::LEADER ? NodeRole::PRIMARY : NodeRole::REPLICA;
 }
 
@@ -41,7 +48,7 @@ void notifyRoleChange(std::optional<NodeRole> role) { if (role && callbacks_.rol
 void becomeFollower(uint64_t term) {
     std::optional<NodeRole> roleChange;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         // RPCs run concurrently; an old reply must not demote a newer leader.
         if (!running_ || term <= currentTerm_) { return; }
         const auto hardBackup = captureDurableHardStateLocked();
@@ -54,7 +61,7 @@ void becomeFollower(uint64_t term) {
             stopRuntimeLocked();
             throw;
         }
-        electionDeadline_ = nextElectionDeadline();
+        resetElectionDeadlineLocked();
         roleChange = setRole(RaftRole::FOLLOWER);
     }
     notifyRoleChange(roleChange);
@@ -63,7 +70,7 @@ void becomeFollower(uint64_t term) {
 void becomeLeader(uint64_t term) {
     std::optional<NodeRole> roleChange;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         const auto role = role_.load();
         const auto directSingleNodeElection = role == RaftRole::FOLLOWER && peers_.empty() && term >= currentTerm_;
         if (!running_ || term < currentTerm_ || (!directSingleNodeElection && (currentTerm_ != term || role != RaftRole::CANDIDATE)) || !self_->
@@ -172,9 +179,12 @@ void restoreDurableHardStateLocked(DurableHardState state) noexcept {
 void stopRuntimeLocked() noexcept {
     running_ = false;
     forceElection_ = false;
+    electionScheduled_ = false;
     role_.store(RaftRole::FOLLOWER);
     cv_.notify_all();
     peerReplicationCv_.notify_all();
+    // Shutdown must remain non-throwing even if a wakeup cannot allocate.
+    try { if (proposalTask_) { proposalTask_->notify(); } } catch (...) {}
 }
 
 void observeLeaderLocked(uint64_t term, uint64_t leaderId) noexcept {
@@ -194,37 +204,55 @@ bool observedLeaderLocked(uint64_t term, uint64_t leaderId) const noexcept { ret
 void recordLeaderContactLocked() {
     lastLeaderContact_ = Clock::now();
     ++leaderContactGeneration_;
-    electionDeadline_ = nextElectionDeadline();
+    resetElectionDeadlineLocked();
 }
 
-void timerLoop() {
+void timerStep() {
     try {
-        for (;;) {
-            retirePeerWorkers();
-            std::unique_lock lock{mutex_};
-            if (!running_) { return; }
-            if (role_.load() == RaftRole::LEADER) {
-                lock.unlock();
-                sendHeartbeats();
-                lock.lock();
-                cv_.wait_for(lock, std::chrono::milliseconds{runtimeOptions_.raftHeartbeatIntervalMs}, [&] { return !running_; });
-                continue;
-            }
-            if (!forceElection_ && config_.failover() == FailoverPolicy::NONE) {
-                cv_.wait_for(lock, std::chrono::milliseconds{100});
-                continue;
-            }
-            if (!forceElection_ && Clock::now() < electionDeadline_) {
-                cv_.wait_until(lock, std::min(electionDeadline_, Clock::now() + std::chrono::milliseconds{100}));
-                continue;
-            }
-            lock.unlock();
-            startElection();
+        std::unique_lock lock{mutex_, std::try_to_lock};
+        if (!lock.owns_lock()) {
+            timerTask_->notify(Clock::now() + std::chrono::milliseconds{10});
+            return;
         }
+        if (!running_) { return; }
+        if (role_.load() == RaftRole::LEADER) {
+            if (peerReplication_.empty()) { resetLeaderReplicationState(); }
+            ensurePeerReplicationTargetsLocked();
+            const auto targets = peers_;
+            const auto target = durableLogIndex_;
+            lock.unlock();
+            for (const auto& peer : targets) { scheduleReplication(peer, target, true); }
+            timerTask_->notify(Clock::now() + std::chrono::milliseconds{runtimeOptions_.raftHeartbeatIntervalMs});
+            return;
+        }
+        if (!forceElection_ && config_.failover() == FailoverPolicy::NONE) { return; }
+        if (!forceElection_ && Clock::now() < electionDeadline_) {
+            timerTask_->notify(electionDeadline_);
+            return;
+        }
+        if (!electionScheduled_) { electionScheduled_ = true; maintenanceTask_->notify(); }
     }
     catch (...) {
         std::lock_guard lock{mutex_};
         stopRuntimeLocked();
+    }
+}
+
+void maintenanceStep() {
+    try {
+        retirePeerWorkers();
+        bool election;
+        {
+            auto lock = stateLock();
+            if (!running_) { return; }
+            election = electionScheduled_;
+        }
+        if (election) { startElection(); }
+        auto lock = stateLock();
+        electionScheduled_ = false;
+        if (running_) { timerTask_->notify(); }
+    } catch (...) {
+        auto lock = stateLock(); stopRuntimeLocked();
     }
 }
 
@@ -240,11 +268,11 @@ void startElection() {
     std::optional<std::vector<NodeInfo>> electionOldMembers, electionNewMembers;
     std::optional<std::pair<std::vector<NodeInfo>, std::vector<NodeInfo>>> pendingJoint;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || role_.load() == RaftRole::LEADER) { return; }
         if (!self_->coordinatorEligible() || !isVotingMemberLocked(selfNodeId_)) {
             forceElection_ = false;
-            electionDeadline_ = nextElectionDeadline();
+            resetElectionDeadlineLocked();
             return;
         }
         if (!forceElection_ && (config_.failover() == FailoverPolicy::NONE || Clock::now() < electionDeadline_)) { return; }
@@ -255,7 +283,7 @@ void startElection() {
         contactGeneration = leaderContactGeneration_;
         lastIndex = lastLogIndex();
         lastTerm = lastLogTerm();
-        electionDeadline_ = nextElectionDeadline();
+        resetElectionDeadlineLocked();
         refreshPeersFromMembershipLocked();
         electionPeers = peers_;
         std::erase_if(electionPeers, [this](const NodeInfo& node) { return !isVotingMemberLocked(node.nodeId); });
@@ -271,7 +299,7 @@ void startElection() {
     if (!forced) { granted = collectElectionVotes(electionPeers, RequestVote{term, selfNodeId_, lastIndex, lastTerm}, true); }
 
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         const auto currentPendingJoint = pendingJointMembershipLocked();
         const auto samePendingJoint = pendingJoint.has_value() == currentPendingJoint.has_value() && (!pendingJoint || (sameNodeSet(
             pendingJoint->first,
@@ -291,7 +319,7 @@ void startElection() {
         clearObservedLeaderLocked();
         lastIndex = lastLogIndex();
         lastTerm = lastLogTerm();
-        electionDeadline_ = nextElectionDeadline();
+        resetElectionDeadlineLocked();
         try { persistState(); }
         catch (...) {
             restoreDurableHardStateLocked(hardBackup);
@@ -305,7 +333,7 @@ void startElection() {
 
     bool won = false;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         won = running_ && currentTerm_ == term && role_.load() == RaftRole::CANDIDATE && hasElectionQuorumLocked(granted);
     }
     if (won) { becomeLeader(term); }
@@ -346,7 +374,7 @@ std::vector<uint64_t> collectElectionVotes(const std::vector<NodeInfo>& peers, R
 }
 
 RequestVoteResponse handlePreVote(const RequestVote& request) {
-    std::lock_guard lock{mutex_};
+    auto lock = stateLock();
     const auto recentLeader = lastLeaderContact_ && Clock::now() - *lastLeaderContact_ < std::chrono::milliseconds{baselineElectionTimeoutMs()};
     const auto upToDate = request.lastLogTerm > lastLogTerm() || (request.lastLogTerm == lastLogTerm() && request.lastLogIndex >= lastLogIndex());
     const auto granted = running_ && !applyFailed_.load() && isVotingMemberLocked(selfNodeId_) && isVotingMemberLocked(request.candidateId) && request.term > currentTerm_
@@ -358,7 +386,7 @@ RequestVoteResponse handleRequestVote(const RequestVote& request) {
     std::optional<NodeRole> roleChange;
     RequestVoteResponse response;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || applyFailed_.load() || !isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.candidateId)) {
             return RequestVoteResponse{.term = currentTerm_, .voteGranted = false};
         }
@@ -383,7 +411,7 @@ RequestVoteResponse handleRequestVote(const RequestVote& request) {
         const auto voteBackup = captureDurableHardStateLocked();
         if (granted) {
             votedFor_ = request.candidateId;
-            electionDeadline_ = nextElectionDeadline();
+            resetElectionDeadlineLocked();
             try { persistState(); }
             catch (...) {
                 restoreDurableHardStateLocked(voteBackup);
@@ -401,7 +429,7 @@ TimeoutNowResponse handleTimeoutNow(const TimeoutNow& request) {
     uint64_t responseTerm = 0;
     std::optional<NodeRole> roleChange;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || applyFailed_.load() || request.targetId != selfNodeId_ || !isVotingMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
             return TimeoutNowResponse{.term = currentTerm_, .accepted = false};
         }
@@ -428,6 +456,7 @@ TimeoutNowResponse handleTimeoutNow(const TimeoutNow& request) {
     }
     notifyRoleChange(roleChange);
     cv_.notify_all();
+    if (timerTask_) { timerTask_->notify(); }
     return TimeoutNowResponse{.term = responseTerm, .accepted = true};
 }
 

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 #include "akk/core/record/KeyFingerprint.hpp"
 
@@ -88,6 +89,8 @@ namespace akkaradb::engine::memtable {
 
     ARTMemTable::VersionChain* ARTMemTable::makeChain(const core::OwnedRecord* initial) {
         VersionChain* chain = arenaNew<VersionChain>();
+        chain->history.sequenceOrdered = sequenceOrderedVersions_;
+        if (retainAllVersions_) { chain->history.append(initial, dataArena_, bytes_); }
         chain->ring[0] = initial;
         chain->head = 0;
         chain->count = 1;
@@ -99,7 +102,24 @@ namespace akkaradb::engine::memtable {
         if (previous == nullptr) { return makeChain(record); }
 
         VersionChain* chain = arenaNew<VersionChain>();
+        chain->history.sequenceOrdered = sequenceOrderedVersions_;
+        if (retainAllVersions_) {
+            chain->history.append(record, dataArena_, bytes_, &previous->history);
+            entries_.fetch_add(1, std::memory_order_relaxed);
+            return chain;
+        }
         chain->ring = previous->ring;
+        if (sequenceOrderedVersions_) {
+            uint16_t head = previous->head;
+            uint16_t count = previous->count;
+            const bool grew = detail::insertSequenceOrdered(MAX_VERSIONS_PER_KEY, head, count, record,
+                [&](uint16_t index) { return chain->ring[index]; },
+                [&](uint16_t index, const core::OwnedRecord* value) { chain->ring[index] = value; });
+            chain->head = static_cast<uint8_t>(head);
+            chain->count = static_cast<uint8_t>(count);
+            if (grew) { entries_.fetch_add(1, std::memory_order_relaxed); }
+            return chain;
+        }
         chain->head = static_cast<uint8_t>((previous->head + 1) & (MAX_VERSIONS_PER_KEY - 1));
         chain->count = previous->count < MAX_VERSIONS_PER_KEY ? static_cast<uint8_t>(previous->count + 1) : previous->count;
         chain->ring[chain->head] = record;
@@ -127,6 +147,7 @@ namespace akkaradb::engine::memtable {
 
     bool ARTMemTable::visibleRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
+        if (chain->history.latest.load(std::memory_order_acquire)) { return chain->history.get(snapshotSeq, out); }
 
         const uint8_t head = chain->head;
         const uint8_t count = chain->count;
@@ -419,7 +440,8 @@ namespace akkaradb::engine::memtable {
     ArenaGenerator<RecordView> ARTMemTable::iterateSnapshotRange(
         uint64_t snapshotSeq,
         std::vector<uint8_t> startKey,
-        std::vector<uint8_t> endKey
+        std::vector<uint8_t> endKey,
+        bool allVersions
     ) const {
         const std::span<const uint8_t> start{startKey.data(), startKey.size()};
         const std::span<const uint8_t> end{endKey.data(), endKey.size()};
@@ -450,7 +472,21 @@ namespace akkaradb::engine::memtable {
                 if (!frame.terminalDone) {
                     frame.terminalDone = true;
                     RecordView visible;
-                    if (visibleRecord(node->terminal, snapshotSeq, &visible)) { co_yield visible; }
+                    if (allVersions) {
+                        if (node->terminal) {
+                            const auto* chain = node->terminal;
+                            if (retainAllVersions_) {
+                                for (const auto& record : chain->history.records()) { co_yield record; }
+                            }
+                            else {
+                                for (uint8_t i = 0; i < chain->count; ++i) {
+                                    const auto index = (chain->head + MAX_VERSIONS_PER_KEY - i) & (MAX_VERSIONS_PER_KEY - 1);
+                                    co_yield toView(*chain->ring[index]);
+                                }
+                            }
+                        }
+                    }
+                    else if (visibleRecord(node->terminal, snapshotSeq, &visible)) { co_yield visible; }
                 }
 
                 if (frame.nextChild >= node->childCount) {
@@ -599,6 +635,23 @@ namespace akkaradb::engine::memtable {
                 return iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned));
             }
         );
+    }
+
+    void ARTMemTable::retainAllVersions() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: retention must be configured before writing"); }
+        retainAllVersions_ = true;
+    }
+
+    void ARTMemTable::useSequenceOrder() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: version order must be configured before writing"); }
+        sequenceOrderedVersions_ = true;
+    }
+
+    ArenaGenerator<RecordView> ARTMemTable::flushIterator() const {
+        if (!frozen_.load(std::memory_order_acquire)) { throw std::logic_error("MemTable: flush requires a frozen backend"); }
+        return ArenaGenerator<RecordView>::withOwnedArena(
+            generatorArenaInitialBlockSize_, generatorArenaMaxBlockSize_,
+            [this] { return iterateSnapshotRange(UINT64_MAX, {}, {}, true); });
     }
 
     void ARTMemTable::freeze() { frozen_.store(true, std::memory_order_release); }

@@ -146,14 +146,18 @@ core::ArenaGenerator<OwnedQueryRecord> captureQueryRecords(std::span<const uint8
 static core::ArenaGenerator<OwnedQueryRecord> mergeFixedQueryRecords(std::vector<core::ArenaGenerator<OwnedQueryRecord>> sources) {
     std::vector<core::ArenaGenerator<OwnedQueryRecord>::iterator> positions;
     for (auto& source : sources) { positions.push_back(source.begin()); }
-    for (;;) {
-        size_t selected = positions.size();
-        for (size_t i = 0; i < positions.size(); ++i) {
-            if (positions[i] != std::default_sentinel &&
-                (selected == positions.size() || compareKey(positions[i]->key, positions[selected]->key) < 0)) { selected = i; }
-        }
-        if (selected == positions.size()) { co_return; }
+    const auto later = [&](size_t left, size_t right) {
+        const auto order = compareKey(positions[left]->key, positions[right]->key);
+        return order != 0 ? order > 0 : left > right;
+    };
+    std::priority_queue<size_t, std::vector<size_t>, decltype(later)> ready{later};
+    for (size_t i = 0; i < positions.size(); ++i) {
+        if (positions[i] != std::default_sentinel) { ready.push(i); }
+    }
+    while (!ready.empty()) {
+        const auto selected = ready.top(); ready.pop();
         co_yield *positions[selected];
         ++positions[selected];
+        if (positions[selected] != std::default_sentinel) { ready.push(selected); }
     }
 }

@@ -26,7 +26,7 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
         try { snapshot = callbacks_.exportSnapshot(); }
         catch (const TransactionSnapshotUnavailable&) { return false; }
         if (!snapshot || !snapshot->forEachEntry) { return false; }
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         auto logIndex = compactableLogIndexForSnapshotSeq(snapshot->seq);
         if (!logIndex && lastIncludedIndex_ > 0) { logIndex = lastIncludedIndex_; }
         if (!logIndex || *logIndex > commitIndex_) { return false; }
@@ -63,6 +63,11 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
     };
 
     InstallSnapshot current = makeRequest();
+    const auto baseWire = encodeInstallSnapshot(current);
+    if (baseWire.empty()) { return false; }
+    const auto basePayloadBytes = baseWire.size() - ReplFrameHeader::SIZE;
+    constexpr size_t chunkHeaderBytes = 3 * sizeof(uint64_t) + 3 * sizeof(uint32_t);
+    size_t payloadBytes = basePayloadBytes;
     const auto sendRequest = [&](const InstallSnapshot& request) {
         detail::ReconfigurationDeadline::check();
         return installSnapshot(peer, request, response) && response.term <= term && response.success;
@@ -81,52 +86,29 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
         bool emittedInputChunk = false;
         do {
             const auto remaining = value.size() - chunkOffset;
-            size_t currentChunkSize = std::min(chunkSize, remaining);
-            auto makeChunk = [&](size_t valueBytes) {
-                SnapshotKvChunk chunk;
-                chunk.entryIndex = entryIndex;
-                chunk.valueOffset = valueOffset + chunkOffset;
-                chunk.valueSize = entryValueSize;
-                chunk.valueCrc32c = entryValueCrc32c;
-                if (chunk.valueOffset == 0) { chunk.key = entryKey; }
-                chunk.value.assign(
-                    value.begin() + static_cast<std::ptrdiff_t>(chunkOffset),
-                    value.begin() + static_cast<std::ptrdiff_t>(chunkOffset + valueBytes)
-                );
-                return chunk;
-            };
-            SnapshotKvChunk chunk = makeChunk(currentChunkSize);
-            InstallSnapshot candidate = current;
-            candidate.chunks.push_back(chunk);
-            if (encodeInstallSnapshot(candidate).empty() && !current.chunks.empty()) {
+            const size_t keyBytes = valueOffset + chunkOffset == 0 ? entryKey.size() : 0;
+            const size_t overhead = chunkHeaderBytes + keyBytes;
+            const size_t wanted = std::min(chunkSize, remaining);
+            if (overhead > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE - basePayloadBytes) { return false; }
+            if (!current.chunks.empty() &&
+                overhead + wanted > ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE - payloadBytes) {
                 if (!sendRequest(current)) { return false; }
                 current = makeRequest();
-                candidate = current;
-                candidate.chunks.push_back(chunk);
+                payloadBytes = basePayloadBytes;
             }
-            if (encodeInstallSnapshot(candidate).empty()) {
-                if (currentChunkSize == 0) { return false; }
-                size_t low = 1;
-                size_t high = currentChunkSize;
-                size_t best = 0;
-                while (low <= high) {
-                    const auto mid = low + (high - low) / 2;
-                    chunk = makeChunk(mid);
-                    candidate = current;
-                    candidate.chunks.push_back(chunk);
-                    if (encodeInstallSnapshot(candidate).empty()) { high = mid - 1; }
-                    else {
-                        best = mid;
-                        low = mid + 1;
-                    }
-                }
-                if (best == 0) { return false; }
-                currentChunkSize = best;
-                chunk = makeChunk(currentChunkSize);
-                candidate = current;
-                candidate.chunks.push_back(std::move(chunk));
-            }
-            current = std::move(candidate);
+            const size_t currentChunkSize = std::min(wanted,
+                ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE - payloadBytes - overhead);
+            if (remaining && currentChunkSize == 0) { return false; }
+            SnapshotKvChunk chunk;
+            chunk.entryIndex = entryIndex;
+            chunk.valueOffset = valueOffset + chunkOffset;
+            chunk.valueSize = entryValueSize;
+            chunk.valueCrc32c = entryValueCrc32c;
+            if (keyBytes) { chunk.key = entryKey; }
+            chunk.value.assign(value.begin() + static_cast<std::ptrdiff_t>(chunkOffset),
+                value.begin() + static_cast<std::ptrdiff_t>(chunkOffset + currentChunkSize));
+            current.chunks.push_back(std::move(chunk));
+            payloadBytes += overhead + currentChunkSize;
             chunkOffset += currentChunkSize;
             emittedInputChunk = true;
             emittedEntryChunk = true;
@@ -165,7 +147,7 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
     const auto streamed = snapshot->forEachEntry(snapshotVisitor);
     if (!streamed || entryActive) { return false; }
 
-    size_t resultPageBytes = encodeInstallSnapshot(current).size();
+    size_t resultPageBytes = payloadBytes + ReplFrameHeader::SIZE;
     constexpr size_t resultPageLimit = 64 * 1024;
     if (resultSnapshot && !resultSnapshot->forEach([&](auto key, const detail::DiskResults::Record& stored) {
         if (stored.sequence > logIndexValue) { return true; }
@@ -175,7 +157,7 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
         if (!readRequestRecord(stored.value, offset, record) || offset != stored.value.size() || record.index != stored.sequence) { return false; }
         if (resultPageBytes + 72 > resultPageLimit && (!current.chunks.empty() || !current.results.empty())) {
             if (!sendRequest(current)) { return false; }
-            current = makeRequest(); resultPageBytes = encodeInstallSnapshot(current).size();
+            current = makeRequest(); resultPageBytes = basePayloadBytes + ReplFrameHeader::SIZE;
         }
         current.results.emplace_back(id, record); resultPageBytes += 72; ++snapshotRequests.count;
         snapshotRequests.bytes += detail::DiskResults::recordCharge(24, 48); return true;
@@ -183,7 +165,7 @@ bool installSnapshotStream(const NodeInfo& peer, uint64_t term, InstallSnapshotR
     current.requestState = snapshotRequests;
     current.entryCount = entryIndex;
     current.done = true;
-    if (encodeInstallSnapshot(current).empty()) {
+    if (resultPageBytes > ReplFrameHeader::SIZE + ReplFrameHeader::MAX_RAFT_PAYLOAD_SIZE) {
         auto final = makeRequest();
         final.requestState = std::move(current.requestState);
         final.entryCount = entryIndex;
@@ -224,7 +206,7 @@ bool applySnapshotChunkRequestLocked(const InstallSnapshot& request) {
         }
         catch (...) { return false; }
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             pendingSnapshotInstall_ = PendingSnapshotInstall{};
             pendingSnapshotInstall_.active = true;
         }
@@ -322,7 +304,7 @@ std::optional<InstallSnapshotResponse> validateSnapshotInstallLocked(const Insta
 InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
     std::optional<NodeRole> roleChange;
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (!running_ || applyFailed_.load() || !isReplicationMemberLocked(selfNodeId_) || !isVotingMemberLocked(request.leaderId)) {
             return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
         }
@@ -350,15 +332,15 @@ InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
         std::lock_guard applyLock{applyMutex_};
         if (applyFailed_.load()) { throw std::runtime_error("Raft: snapshot application requires reopen"); }
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (const auto response = validateSnapshotInstallLocked(request)) { return *response; }
         }
         if (!applySnapshotChunkRequestLocked(request)) {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
         }
         if (!request.done) {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             return InstallSnapshotResponse{.term = currentTerm_, .success = true, .lastIncludedIndex = lastIncludedIndex_};
         }
         SnapshotInstallTransaction transaction{
@@ -379,7 +361,7 @@ InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
         }
         if (callbacks_.prepareSnapshot) { callbacks_.prepareSnapshot(request.snapshotSeq, request.entryCount); }
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             // AppendEntries can commit while chunk staging or scratch
             // synchronization runs, even though application is locked.
             if (const auto response = validateSnapshotInstallLocked(request)) { return *response; }
@@ -395,7 +377,7 @@ InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
         if (callbacks_.finishSnapshot) { callbacks_.finishSnapshot(request.snapshotSeq, request.entryCount); }
         if (callbacks_.forceDurable) { callbacks_.forceDurable(); }
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (currentTerm_ != request.term || !isVotingMemberLocked(request.leaderId)) {
                 throw std::runtime_error("Raft: leadership changed during durable snapshot installation; reopen required");
             }
@@ -421,12 +403,12 @@ InstallSnapshotResponse handleInstallSnapshot(const InstallSnapshot& request) {
         {
             std::lock_guard applyLock{applyMutex_};
             {
-                std::lock_guard lock{mutex_};
+                auto lock = stateLock();
                 pendingSnapshotInstall_ = PendingSnapshotInstall{};
             }
             if (snapshotInstallIntentDurable) { failApplication(failure); }
         }
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         return InstallSnapshotResponse{.term = currentTerm_, .success = false, .lastIncludedIndex = lastIncludedIndex_};
     }
 }

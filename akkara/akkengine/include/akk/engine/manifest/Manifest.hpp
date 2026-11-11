@@ -20,6 +20,8 @@
 #include <vector>
 #include <optional>
 
+namespace akkaradb::engine::sst { class SSTManager; }
+
 namespace akkaradb::engine::manifest {
     /**
      * Manifest - Durable, append-only log of storage-engine state changes.
@@ -291,7 +293,11 @@ namespace akkaradb::engine::manifest {
             /** Returns all blob-delete events in replay order. */
             [[nodiscard]] std::vector<BlobDeleteEvent> blobDeletes() const;
 
-            /** Returns all SST blob-reference events in replay order. */
+            /**
+             * Returns the latest reference metadata per tracked SST, sorted by
+             * filename. Includes unsealed outputs awaiting publication; deleted
+             * and compacted-away inputs are discarded. This is not an event log.
+             */
             [[nodiscard]] std::vector<SSTBlobRefsEvent> sstBlobRefs() const;
             // One consistent live-file/reference snapshot; nullopt means a live SST lacks metadata.
             [[nodiscard]] std::optional<std::vector<SSTBlobRefsEvent::Entry>> liveSstBlobRefs() const;
@@ -313,6 +319,9 @@ namespace akkaradb::engine::manifest {
             void close();
 
         private:
+            friend class sst::SSTManager;
+            // Called only after SST recovery validates the complete live set.
+            void discardUnsealedSstBlobRefs();
             explicit Manifest(const std::filesystem::path& path, bool fastMode);
 
             class Impl;

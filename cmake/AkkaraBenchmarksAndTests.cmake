@@ -142,6 +142,10 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_engine_recovery_smoke_test|benchmarks/smoke/engine_recovery_smoke_test.cpp
         akkaradb_wal_async_failure_smoke_test|benchmarks/smoke/wal_async_failure_smoke_test.cpp
         akkaradb_sst_snapshot_visibility_smoke_test|benchmarks/smoke/sst_snapshot_visibility_smoke_test.cpp
+        akkaradb_sst_resources_smoke_test|benchmarks/smoke/sst_resources_smoke_test.cpp
+        akkaradb_sst_memtable_safety_smoke_test|benchmarks/smoke/sst_memtable_safety_smoke_test.cpp
+        akkaradb_sst_sequence_order_smoke_test|benchmarks/smoke/sst_sequence_order_smoke_test.cpp
+        akkaradb_memtable_snapshot_failure_smoke_test|benchmarks/smoke/memtable_snapshot_failure_smoke_test.cpp
 )
 
 foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
@@ -162,6 +166,18 @@ foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endforeach ()
+
+# Exercise the internal record factories without adding shared-library exports.
+target_sources(akkaradb_sst_memtable_safety_smoke_test PRIVATE
+        akkara/akkengine/src/core/record/OwnedRecord.cpp
+)
+
+# Compile the coordinator into the test so allocation failures also reach it
+# when the engine is a Windows DLL. Backends still use the normal library.
+target_sources(akkaradb_memtable_snapshot_failure_smoke_test PRIVATE
+        akkara/akkengine/src/engine/memtable/MemTable.cpp
+)
+target_compile_definitions(akkaradb_memtable_snapshot_failure_smoke_test PRIVATE AKKARADB_STATIC)
 
 add_dependencies(akkaradb_memtable_throughput_benchmark akkaradb_prepare_diskspd)
 add_dependencies(akkaradb_sstable_throughput_benchmark akkaradb_prepare_diskspd)
@@ -226,6 +242,10 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_engine_recovery_smoke_test
         akkaradb_wal_async_failure_smoke_test
         akkaradb_sst_snapshot_visibility_smoke_test
+        akkaradb_sst_resources_smoke_test
+        akkaradb_sst_memtable_safety_smoke_test
+        akkaradb_sst_sequence_order_smoke_test
+        akkaradb_memtable_snapshot_failure_smoke_test
 )
 list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 
@@ -283,6 +303,8 @@ if (AKKARADB_BUILD_TESTS)
     add_test(NAME akkaradb_mirror_recovery_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --mirror-recovery)
     set_tests_properties(akkaradb_mirror_recovery_test PROPERTIES LABELS "cluster;mirror;recovery" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
     add_test(NAME akkaradb_cluster_routing_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --routing)
+    add_test(NAME akkaradb_cluster_performance_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --cluster-performance)
+    set_tests_properties(akkaradb_cluster_performance_test PROPERTIES LABELS "cluster;performance;concurrency" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
     add_test(NAME akkaradb_raft_prevote_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-prevote)
     add_test(NAME akkaradb_raft_contract_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-contract)
     add_test(NAME akkaradb_raft_storage_contract_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-storage-contract)
@@ -430,5 +452,14 @@ if (AKKARADB_BUILD_TESTS)
 endif ()
 
 if (AKKARADB_BUILD_TESTS)
+    add_test(NAME akkaradb_sst_close_flush_test COMMAND $<TARGET_FILE:akkaradb_engine_recovery_smoke_test> --sst-close-flush)
+    add_test(NAME akkaradb_sst_promotion_test COMMAND $<TARGET_FILE:akkaradb_engine_recovery_smoke_test> --sst-promotion)
+    add_test(NAME akkaradb_sst_memtable_frontier_test COMMAND $<TARGET_FILE:akkaradb_engine_recovery_smoke_test> --sst-memtable-frontier)
+    set_tests_properties(akkaradb_sst_close_flush_test akkaradb_sst_promotion_test akkaradb_sst_memtable_frontier_test
+        PROPERTIES TIMEOUT 30 LABELS "sst;concurrency;regression")
+    set_tests_properties(akkaradb_sst_memtable_safety_smoke_test PROPERTIES TIMEOUT 30 LABELS "sst;memtable;regression")
+    set_tests_properties(akkaradb_sst_sequence_order_smoke_test akkaradb_memtable_snapshot_failure_smoke_test
+        PROPERTIES TIMEOUT 30 LABELS "sst;memtable;regression")
     set_tests_properties(akkaradb_transaction_smoke_test PROPERTIES TIMEOUT 180 LABELS "transactions;recovery")
+    set_tests_properties(akkaradb_sst_resources_smoke_test PROPERTIES TIMEOUT 90 LABELS "sst;resources;recovery;regression")
 endif ()

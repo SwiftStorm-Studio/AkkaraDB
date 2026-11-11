@@ -89,17 +89,17 @@ namespace {
         const auto observed = engine->get(bytes(key));
         require(observed.has_value() && *observed == value, "KEY_SEQUENCE write/read path must remain usable");
 
-        // A failed write reserves its sequence before the MemTable rejects the
-        // oversized value. Reads must report that terminal failure, rather
+        // A failed write reserves its sequence before storage validation rejects
+        // the oversized value. Reads must report that terminal failure, rather
         // than waiting forever for the now-unfillable commit prefix.
         const std::vector<uint8_t> oversizedValue(65'536, 0xA5);
         bool writeRejected = false;
         try { engine->put(bytes(key), bytes(oversizedValue)); }
-        catch (const std::runtime_error&) { writeRejected = true; }
+        catch (const std::length_error&) { writeRejected = true; }
         require(writeRejected, "oversized KEY_SEQUENCE write must be rejected");
         bool readRejected = false;
         try { (void)engine->get(bytes(key)); }
-        catch (const std::runtime_error&) { readRejected = true; }
+        catch (const std::length_error&) { readRejected = true; }
         require(readRejected, "KEY_SEQUENCE read must fail after a reserved-sequence write failure");
         engine->close();
 

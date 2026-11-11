@@ -26,6 +26,7 @@
 #include "akk/core/buffer/BufferArena.hpp"
 #include "akk/core/record/OwnedRecord.hpp"
 #include "akk/engine/memtable/IMemTable.hpp"
+#include "akk/engine/memtable/detail/VersionHistory.hpp"
 
 namespace akkaradb::engine::memtable {
     class AKDB_API BPTreeMemTable final : public IMemTable {
@@ -53,13 +54,20 @@ namespace akkaradb::engine::memtable {
             ) override;
             [[nodiscard]] bool get(ByteView key, uint64_t snapshotSeq, RecordView* out) const override;
             [[nodiscard]] ArenaGenerator<RecordView> iterator(ByteView startKey, ByteView endKey, uint64_t snapshotSeq) const override;
+            void retainAllVersions() override;
+            void useSequenceOrder() override;
+            [[nodiscard]] ArenaGenerator<RecordView> flushIterator() const override;
             void freeze() override;
 
             [[nodiscard]] size_t sizeBytes() const override;
             [[nodiscard]] size_t entryCount() const override;
 
         private:
+            bool retainAllVersions_ = false;
+            bool sequenceOrderedVersions_ = false;
+
             struct VersionChain {
+                detail::VersionHistory history;
                 std::atomic<uint64_t> version{0};
                 uint16_t capacity{0};
                 std::atomic<uint16_t> head{0};
@@ -136,13 +144,13 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] static uint16_t findLeafPosition(const Node* leaf, std::span<const uint8_t> key, uint16_t keyCount) noexcept;
             [[nodiscard]] static uint16_t findChildIndex(const Node* internal, std::span<const uint8_t> key) noexcept;
 
-            static void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept;
+            void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries);
             [[nodiscard]] static bool visibleRecord(VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;
             [[nodiscard]] static RecordView toView(const core::OwnedRecord& record) noexcept;
 
             [[nodiscard]] std::optional<SplitResult> insertRecursive(Node* node, const core::OwnedRecord* record);
             [[nodiscard]] Node* descendToCandidateLeaf(std::span<const uint8_t> key) const noexcept;
-            [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshot(uint64_t snapshotSeq) const;
+            [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshot(uint64_t snapshotSeq, bool allVersions = false) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshotRange(
                 uint64_t snapshotSeq,
                 std::vector<uint8_t> startKey,

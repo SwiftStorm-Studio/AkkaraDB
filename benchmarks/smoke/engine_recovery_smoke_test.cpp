@@ -1195,6 +1195,18 @@ namespace {
 int main(int argc, char** argv) {
     akkaradb::test::installMsvcTestErrorHandlers();
     try {
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-close-flush") {
+            runSstCloseFlushRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-memtable-frontier") {
+            runSstMemtableFrontierRegression();
+            return 0;
+        }
+        if (argc == 2 && std::string_view{argv[1]} == "--sst-promotion") {
+            runSstPromotionRegression();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--sst-scan-gc") {
             runSstScanBlobGcRegression();
             return 0;

@@ -57,8 +57,8 @@ namespace akkaradb::engine::sst {
 
         [[nodiscard]] size_t sharedPrefixLen(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept {
             if (a.empty()) { return 0; }
-            const auto mismatch = std::ranges::mismatch(a, b);
-            return static_cast<size_t>(mismatch.in1 - a.begin());
+            const auto [in1, in2] = std::ranges::mismatch(a, b);
+            return static_cast<size_t>(in1 - a.begin());
         }
 
         void writeExact(std::ofstream& out, const void* data, size_t size) {
@@ -68,7 +68,7 @@ namespace akkaradb::engine::sst {
 
         [[nodiscard]] uint32_t nextPow2U32(uint64_t value) noexcept {
             if (value <= 2) { return 2; }
-            if (value > (1ULL << 31)) { return 1u << 31; }
+            if (value > 1ULL << 31) { return 1u << 31; }
             return static_cast<uint32_t>(std::bit_ceil(value));
         }
 
@@ -77,9 +77,11 @@ namespace akkaradb::engine::sst {
             std::vector<uint8_t> bits;
 
             explicit BloomBuild(size_t entries, uint32_t bitsPerKey) {
-                const auto requestedBits = std::ranges::max(uint64_t{512}, static_cast<uint64_t>(entries) * std::ranges::max(1u, bitsPerKey));
+                const auto density = std::ranges::max(1u, bitsPerKey);
+                const auto requestedBits = entries > (uint64_t{1} << 31) / density ? uint64_t{1} << 31 :
+                    std::ranges::max(uint64_t{512}, uint64_t{entries} * density);
                 header.numBits = nextPow2U32(requestedBits);
-                header.numHashes = std::ranges::max(1u, static_cast<uint32_t>(bitsPerKey * 0.69));
+                header.numHashes = std::clamp(static_cast<uint32_t>(density * 0.69), 1u, 30u);
                 header.bitsSize = header.numBits / 8;
                 bits.assign(header.bitsSize, 0);
             }
@@ -142,7 +144,7 @@ namespace akkaradb::engine::sst {
             block.raw.append_range(key);
             block.raw.append_range(value);
             const auto padded = alignUpU64(block.raw.size(), 8);
-            block.raw.resize(static_cast<size_t>(padded), 0);
+            block.raw.resize(padded, 0);
 
             if (block.offsets.size() == 1) {
                 block.firstKey.assign_range(key);
@@ -209,7 +211,7 @@ namespace akkaradb::engine::sst {
                 out.data.append_range(key.subspan(shared));
                 out.data.append_range(std::span{valPtr, hdr->vLen});
                 const auto padded = alignUpU64(out.data.size(), 8);
-                out.data.resize(static_cast<size_t>(padded), 0);
+                out.data.resize(padded, 0);
 
                 prevKey.assign_range(key);
             }
@@ -243,13 +245,17 @@ namespace akkaradb::engine::sst {
         SSTWriter::Result result;
         result.path = path;
 
-        BloomBuild bloom(estimatedRecordCount, options.bloomBitsPerKey);
+        // The producer may underestimate, overestimate, or reuse its buffers.
+        // Retain only one fingerprint per distinct sorted key, then size the
+        // filter from the actual count without replaying input or retaining values.
+        std::vector<uint64_t> keyFingerprints;
+        keyFingerprints.reserve(std::min<size_t>(estimatedRecordCount, 65536));
 
         std::vector<SSTBlockIndexEntryV1> index;
         std::vector<uint8_t> keyArena;
         PendingBlock block;
 
-        auto flushBlock = [&]() {
+        auto flushBlock = [&] {
             if (block.empty()) { return; }
 
             const auto encoded = encodePrefixCompressedBlock(block);
@@ -286,10 +292,10 @@ namespace akkaradb::engine::sst {
             writeExact(out, payload.data(), payload.size());
             writeExact(out, offsetsBytes.data(), offsetsBytes.size());
 
-            const auto next = alignUpU64(static_cast<uint64_t>(out.tellp()), 8);
-            const auto pad = static_cast<size_t>(next - static_cast<uint64_t>(out.tellp()));
+            const auto next = alignUpU64(out.tellp(), 8);
+            const auto pad = next - static_cast<uint64_t>(out.tellp());
             if (pad > 0) {
-                const uint8_t zeros[8]{};
+                constexpr uint8_t zeros[8]{};
                 writeExact(out, zeros, pad);
             }
 
@@ -319,12 +325,13 @@ namespace akkaradb::engine::sst {
         for (const auto& rec : records) {
             // lastKey owns the preceding key even after a streaming producer
             // reuses or destroys its previous record's buffers.
-            if (result.entryCount != 0 && rec.compareKey(result.lastKey) < 0) {
+            const auto keyOrder = result.entryCount == 0 ? 1 : rec.compareKey(result.lastKey);
+            if (keyOrder < 0) {
                 throw std::invalid_argument("SSTWriter::write: records must be sorted by key");
             }
             if (result.entryCount == 0) { result.firstKey.assign_range(rec.key()); }
 
-            bloom.add(rec.keyFp64());
+            if (keyOrder != 0) { keyFingerprints.push_back(rec.keyFp64()); }
             result.minSeq = std::ranges::min(result.minSeq, rec.seq());
             result.maxSeq = std::ranges::max(result.maxSeq, rec.seq());
             result.lastKey.assign_range(rec.key());
@@ -340,6 +347,9 @@ namespace akkaradb::engine::sst {
         }
         if (result.entryCount == 0) { throw std::invalid_argument("SSTWriter::write: records must be non-empty"); }
         flushBlock();
+
+        BloomBuild bloom(keyFingerprints.size(), options.bloomBitsPerKey);
+        for (const auto fingerprint : keyFingerprints) { bloom.add(fingerprint); }
 
         const auto indexOffset = static_cast<uint64_t>(out.tellp());
         for (const auto& entry : index) { writeExact(out, &entry, sizeof(entry)); }

@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogFormat.hpp
+// akkengine/src/engine/vlog/detail/VersionLogFormat.inc
+// Included inside namespace akkaradb::engine::vlog in VersionLog.cpp.
 namespace {
     static constexpr uint32_t AKVLOG_V1_MAGIC = 0x31564B41u; // "AKV1"
     static constexpr uint16_t AKVLOG_V1_VERSION = 0x0001u;

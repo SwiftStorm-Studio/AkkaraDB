@@ -12,13 +12,13 @@
 void acceptLoop(SocketHandle listenSock) {
     while (true) {
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (!running_) { return; }
         }
         SocketHandle client = ::accept(listenSock, nullptr, nullptr);
         if (!socketOk(client)) {
             if (acceptInterrupted()) { continue; }
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (!running_) { return; }
             return;
         }
@@ -83,7 +83,7 @@ void handleClient(SocketHandle client, IncomingChannel& channel) {
         decodeRaftPeerHello(helloFrame.payload, hello)) {
         bool knownNode = false;
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             knownNode = hello.nodeId != selfNodeId_ && (isReplicationMemberLocked(hello.nodeId) ||
                 (runtimeOptions_.raftGroupKind == RaftGroupKind::REQUEST_AUTHORITY && hello.channelKind != RaftChannelKind::CONSENSUS &&
                  std::ranges::contains(requestForwardClients_, hello.nodeId)));
@@ -114,9 +114,10 @@ void handleClient(SocketHandle client, IncomingChannel& channel) {
                                     : controlReceiveBudget_;
     for (;;) {
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             if (!running_) { return; }
         }
+        channel.park(client);
         #ifdef _WIN32
         fd_set readable;
         FD_ZERO(&readable);
@@ -128,6 +129,7 @@ void handleClient(SocketHandle client, IncomingChannel& channel) {
         #endif
         if (ready == 0) { continue; }
         if (ready < 0) { return; }
+        if (!channel.activate()) { return; }
         DecodedFrame frame;
         if (!recvFrame(client, secure.get(), frame, channelBudget)) { return; }
         if ((frame.type == ReplMsgType::FORWARD_REQUEST) == (hello.channelKind == RaftChannelKind::CONSENSUS)) { return; }
@@ -174,7 +176,7 @@ void handleClient(SocketHandle client, IncomingChannel& channel) {
         }
         else if (frame.type == ReplMsgType::FORWARD_REQUEST) {
             {
-                std::lock_guard lock{mutex_};
+                auto lock = stateLock();
                 if (!isReplicationMemberLocked(hello.nodeId) &&
                     !(runtimeOptions_.raftGroupKind == RaftGroupKind::REQUEST_AUTHORITY &&
                       std::ranges::contains(requestForwardClients_, hello.nodeId))) { return; }
@@ -217,6 +219,7 @@ void handleClient(SocketHandle client, IncomingChannel& channel) {
                 wire = encodeForwardResponse(response);
             }
             if (!sendFrame(client, secure.get(), wire)) { return; }
+            channel.completedRequest = true;
         }
         else { return; }
     }

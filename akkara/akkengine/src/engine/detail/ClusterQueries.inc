@@ -45,7 +45,6 @@ std::atomic<uint64_t> querySpoolBytes{0};
 std::mutex querySessionsMu;
 std::map<std::array<uint8_t, 16>, std::shared_ptr<QuerySession>> querySessions;
 std::jthread queryReaper;
-std::unique_ptr<cluster::detail::BoundedExecutor> snapshotQueryExecutor;
 
 void reapQuerySessions() {
     std::vector<std::shared_ptr<QuerySession>> retired;
@@ -609,6 +608,9 @@ struct QueryReader {
     std::vector<uint8_t> page;
     size_t position = 0;
     bool opened = false, streaming = false, eof = false;
+    bool prefetchEnabled = false;
+    std::future<cluster::ForwardResponse> prefetched;
+    std::shared_ptr<void> prefetchLease;
     QueryReader(Impl& impl, uint64_t node, cluster::ForwardRequest request) : engine{&impl}, target{node} {
         const auto response = engine->sendReadQuery(target, std::move(request));
         if (response.value.size() != 32) { throw std::runtime_error("Cluster query: invalid cursor response"); }
@@ -620,6 +622,9 @@ struct QueryReader {
         if ((records == 0) != (total == 0)) { throw std::runtime_error("Cluster query: invalid snapshot length/count"); }
     }
     ~QueryReader() {
+        // NEXT must finish before CLOSE; queued work owns no reader references.
+        if (prefetched.valid()) { prefetched.wait(); }
+        prefetchLease.reset();
         if (!opened) { return; }
         if (target == engine->nodeId) {
             std::shared_ptr<QuerySession> retired;
@@ -640,6 +645,33 @@ struct QueryReader {
         catch (...) {} // Server TTL also reclaims cursors after disconnect/abandonment.
     }
     QueryReader(const QueryReader&) = delete;
+    cluster::ForwardRequest nextPageRequest(uint64_t at) const {
+        cluster::ForwardRequest request; request.deduplicationId.nonce = token;
+        auto& entry = request.entries.emplace_back();
+        entry.value.push_back(static_cast<uint8_t>(QueryAction::NEXT)); pushU64(entry.value, at);
+        return request;
+    }
+    void prefetchNext() {
+        const auto next = offset + page.size() - position;
+        if (!prefetchEnabled || target == engine->nodeId || prefetched.valid() ||
+            (streaming ? eof : next == total)) { return; }
+        const auto budget = engine->opts.cluster.runtime.nodeResourceBudget;
+        auto lease = budget->queryPrefetch->tryReserve(1);
+        if (!lease) { return; }
+        const auto context = cluster::detail::ReconfigurationDeadline::current();
+        auto work = std::make_shared<std::packaged_task<cluster::ForwardResponse()>>(
+            [owner = engine, node = target, request = nextPageRequest(next), lifetime = operationLifetime, context]() mutable {
+                (void)lifetime;
+                cluster::detail::ReconfigurationDeadline scope{context};
+                auto response = owner->sendReadQuery(node, std::move(request));
+                if (response.value.size() > QUERY_PAGE_BYTES + 1) { throw std::runtime_error("Cluster query: oversized prefetched page"); }
+                return response;
+            });
+        auto future = work->get_future();
+        if (budget->queryExecutor()->trySubmit([work] { (*work)(); })) {
+            prefetchLease = std::move(lease); prefetched = std::move(future);
+        }
+    }
     cluster::ForwardResponse control(QueryAction action) {
         cluster::ForwardRequest request; request.deduplicationId.nonce = token;
         request.entries.push_back({{}, {static_cast<uint8_t>(action)}});
@@ -674,16 +706,15 @@ struct QueryReader {
         if (position < page.size()) { return true; }
         if (streaming && eof) { return false; }
         if (!streaming && offset == total) { return false; }
-        cluster::ForwardRequest request; request.deduplicationId.nonce = token;
-        auto& entry = request.entries.emplace_back();
-        entry.value.push_back(static_cast<uint8_t>(QueryAction::NEXT)); pushU64(entry.value, offset);
-        auto response = engine->sendReadQuery(target, std::move(request));
+        auto response = prefetched.valid() ? prefetched.get() : engine->sendReadQuery(target, nextPageRequest(offset));
+        prefetchLease.reset();
         page = std::move(response.value); position = 0;
         if (streaming) {
             if (page.empty() || page.front() > 1 || page.size() > QUERY_PAGE_BYTES + 1) { throw std::runtime_error("Cluster query: malformed streaming page"); }
             eof = page.front() != 0; page.erase(page.begin());
             if (page.empty() && !eof) { throw std::runtime_error("Cluster query: empty unfinished page"); }
         } else if (page.empty() || page.size() > QUERY_PAGE_BYTES || page.size() > total - offset) { throw std::runtime_error("Cluster query: malformed page"); }
+        prefetchNext();
         return !page.empty();
     }
     void read(std::span<uint8_t> output) {
@@ -732,12 +763,7 @@ std::vector<std::unique_ptr<QueryReader>> prepareGlobalQuery(std::span<const uin
         [this] { return placementClosing(); }};
     if (!end.empty() && compareKey(start, end) == 0) { return {}; }
     const auto context = cluster::detail::ReconfigurationDeadline::current();
-    cluster::detail::BoundedExecutor* executor;
-    {
-        std::lock_guard lock{querySessionsMu};
-        if (!snapshotQueryExecutor) { snapshotQueryExecutor = std::make_unique<cluster::detail::BoundedExecutor>(8, 64); }
-        executor = snapshotQueryExecutor.get();
-    }
+    const auto executor = opts.cluster.runtime.nodeResourceBudget->queryExecutor();
     std::optional<cluster::ClusterTransactionId> barrier;
     std::shared_ptr<void> reservation;
     if (opts.cluster.runtime.globalSnapshotConflictPolicy == cluster::GlobalSnapshotConflictPolicy::BLOCK_WRITES) {
@@ -790,19 +816,23 @@ core::ArenaGenerator<AkkEngine::ScanRecordView> clusterScanGenerator(core::Buffe
     (void)operation;
     using Record = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
     std::vector<std::optional<Record>> heads;
+    for (auto& reader : readers) { reader->prefetchEnabled = true; reader->prefetchNext(); }
     for (auto& reader : readers) { heads.push_back(reader->nextRecord()); }
+    const auto later = [&](size_t left, size_t right) {
+        const auto order = compareKey(heads[left]->first, heads[right]->first);
+        return order != 0 ? order > 0 : left > right;
+    };
+    std::priority_queue<size_t, std::vector<size_t>, decltype(later)> ready{later};
+    for (size_t i = 0; i < heads.size(); ++i) { if (heads[i]) { ready.push(i); } }
     std::optional<std::vector<uint8_t>> previous;
-    while (true) {
-        size_t selected = readers.size();
-        for (size_t i = 0; i < heads.size(); ++i) {
-            if (heads[i] && (selected == readers.size() || compareKey(heads[i]->first, heads[selected]->first) < 0)) { selected = i; }
-        }
-        if (selected == readers.size()) { co_return; }
+    while (!ready.empty()) {
+        const auto selected = ready.top(); ready.pop();
         auto& record = *heads[selected];
         if (previous && compareKey(*previous, record.first) >= 0) { throw std::runtime_error("Cluster query: duplicate or unordered public key"); }
         previous = record.first;
         co_yield AkkEngine::ScanRecordView{copySpanToArena(record.first, arena), copySpanToArena(record.second, arena)};
         heads[selected] = readers[selected]->nextRecord();
+        if (heads[selected]) { ready.push(selected); }
     }
 }
 

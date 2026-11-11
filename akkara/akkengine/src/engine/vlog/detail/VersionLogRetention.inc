@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogRetention.hpp
+// akkengine/src/engine/vlog/detail/VersionLogRetention.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 using RetentionStateMap = std::unordered_map<std::string, RetentionBaseState, StringViewHash, std::equal_to<>>;
 
 [[nodiscard]] static std::unordered_set<uint64_t> retentionSegmentIds(const std::vector<SegmentInfo>& segments) {

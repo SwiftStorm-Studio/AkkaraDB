@@ -336,9 +336,7 @@ namespace akkaradb::engine::manifest {
                 append(ManifestRecordType::SST_BLOB_REFS, encodeSstBlobRefs(ts, file, toFramingEntries(entries)));
 
                 std::lock_guard lock{mutex_};
-                auto stored = sortedUniqueEntries(entries);
-                sstBlobRefs_.push_back(SSTBlobRefsEvent{file, stored, ts});
-                sstBlobRefsByFile_[file] = std::move(stored);
+                sstBlobRefsByFile_[file] = SSTBlobRefsEvent{file, sortedUniqueEntries(entries), ts};
             }
 
             void checkpoint(
@@ -357,6 +355,27 @@ namespace akkaradb::engine::manifest {
                 deletedSst_.clear();
 
                 std::erase_if(sstSeals_, [this](const SSTSealEvent& e) { return liveSst_.find(e.file) == liveSst_.end(); });
+            }
+
+            void discardUnsealedSstBlobRefs() {
+                std::lock_guard apiLock{apiMutex_};
+                std::vector<std::string> abandoned;
+                {
+                    std::lock_guard lock{mutex_};
+                    for (const auto& [file, refs] : sstBlobRefsByFile_) {
+                        if (!liveSst_.contains(file)) { abandoned.push_back(file); }
+                    }
+                }
+                if (abandoned.empty()) { return; }
+                for (const auto& file : abandoned) {
+                    append(ManifestRecordType::SST_DELETE, encodeSstDelete(nowUs(), file));
+                }
+                flushPendingForCompact();
+                std::lock_guard lock{mutex_};
+                for (const auto& file : abandoned) {
+                    sstBlobRefsByFile_.erase(file);
+                    deletedSst_.insert(file);
+                }
             }
 
             void compactionStart(int level, const std::vector<std::string>& inputs) {
@@ -383,6 +402,7 @@ namespace akkaradb::engine::manifest {
                 for (const auto& inp : inputs) {
                     liveSst_.erase(inp);
                     deletedSst_.insert(inp);
+                    sstBlobRefsByFile_.erase(inp);
                 }
             }
 
@@ -510,10 +530,10 @@ namespace akkaradb::engine::manifest {
                     blobPuts = blobPuts_;
                     liveBlobs.assign(liveBlobs_.begin(), liveBlobs_.end());
                     deletedBlobs.assign(deletedBlobs_.begin(), deletedBlobs_.end());
-                    for (const auto& file : liveSst_) {
-                        if (const auto it = sstBlobRefsByFile_.find(file); it != sstBlobRefsByFile_.end()) {
-                            sstBlobRefs.push_back(SSTBlobRefsEvent{file, it->second, nowUs()});
-                        }
+                    // Keep unsealed output metadata too: an SST writer may have
+                    // recorded references but not yet sealed/committed its file.
+                    for (const auto& [file, refs] : sstBlobRefsByFile_) {
+                        sstBlobRefs.push_back(refs);
                     }
                 }
 
@@ -677,7 +697,11 @@ namespace akkaradb::engine::manifest {
 
             std::vector<SSTBlobRefsEvent> sstBlobRefs() const {
                 std::lock_guard lock{mutex_};
-                return sstBlobRefs_;
+                std::vector<SSTBlobRefsEvent> refs;
+                refs.reserve(sstBlobRefsByFile_.size());
+                for (const auto& [file, event] : sstBlobRefsByFile_) { refs.push_back(event); }
+                std::ranges::sort(refs, {}, &SSTBlobRefsEvent::file);
+                return refs;
             }
 
             std::optional<std::vector<SSTBlobRefsEvent::Entry>> liveSstBlobRefs() const {
@@ -686,7 +710,7 @@ namespace akkaradb::engine::manifest {
                 for (const auto& file : liveSst_) {
                     const auto found = sstBlobRefsByFile_.find(file);
                     if (found == sstBlobRefsByFile_.end()) { return std::nullopt; }
-                    refs.insert(refs.end(), found->second.begin(), found->second.end());
+                    refs.insert(refs.end(), found->second.entries.begin(), found->second.entries.end());
                 }
                 return refs;
             }
@@ -701,7 +725,7 @@ namespace akkaradb::engine::manifest {
                 for (const auto& file : liveSst_) {
                     const auto it = sstBlobRefsByFile_.find(file);
                     if (it == sstBlobRefsByFile_.end()) { continue; }
-                    for (const auto& entry : it->second) {
+                    for (const auto& entry : it->second.entries) {
                         const std::string key{reinterpret_cast<const char*>(entry.key.data()), entry.key.size()};
                         auto& latest = latestByKey[key];
                         if (entry.seq >= latest.seq) { latest = LatestEntry{entry.seq, entry.blobId}; }
@@ -992,7 +1016,6 @@ namespace akkaradb::engine::manifest {
                     blobDeletes_.clear();
                     liveBlobs_.clear();
                     deletedBlobs_.clear();
-                    sstBlobRefs_.clear();
                     sstBlobRefsByFile_.clear();
                 }
                 stripesWritten_.store(0, std::memory_order_relaxed);
@@ -1127,8 +1150,7 @@ namespace akkaradb::engine::manifest {
                         if (!decodeSstBlobRefs(payload, len, d)) { throw std::runtime_error("Manifest: invalid v1 event payload"); }
                         std::lock_guard lock{mutex_};
                         auto entries = sortedUniqueEntries(toManifestEntries(std::move(d.entries)));
-                        sstBlobRefs_.push_back(SSTBlobRefsEvent{d.name, entries, d.tsUs});
-                        sstBlobRefsByFile_[d.name] = std::move(entries);
+                        sstBlobRefsByFile_[d.name] = SSTBlobRefsEvent{d.name, std::move(entries), d.tsUs};
                         break;
                     }
                     case ManifestRecordType::NODE_JOIN: {
@@ -1211,8 +1233,7 @@ namespace akkaradb::engine::manifest {
             std::vector<BlobDeleteEvent> blobDeletes_;
             std::unordered_set<uint64_t> liveBlobs_;
             std::unordered_set<uint64_t> deletedBlobs_;
-            std::vector<SSTBlobRefsEvent> sstBlobRefs_;
-            std::unordered_map<std::string, std::vector<SSTBlobRefsEvent::Entry>> sstBlobRefsByFile_;
+            std::unordered_map<std::string, SSTBlobRefsEvent> sstBlobRefsByFile_;
 
             // Fast-mode flusher
             std::thread flusherThread_;
@@ -1299,6 +1320,7 @@ namespace akkaradb::engine::manifest {
 
     void Manifest::replay() { impl_->replay(); }
     void Manifest::compact() { impl_->compact(); }
+    void Manifest::discardUnsealedSstBlobRefs() { impl_->discardUnsealedSstBlobRefs(); }
 
     uint64_t Manifest::stripesWritten() const noexcept { return impl_->stripesWritten(); }
 

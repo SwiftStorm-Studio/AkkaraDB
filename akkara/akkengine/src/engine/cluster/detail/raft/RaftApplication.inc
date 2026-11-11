@@ -9,6 +9,29 @@
 
 
 // Included inside RaftConsensusRuntime::Impl.
+void scheduleApplication() {
+    std::unique_lock lock{mutex_};
+    if (durableAppliedIndex_ < durableCommitIndex_) { applicationScheduled_ = true; cv_.notify_all(); }
+}
+
+void applicationLoop() {
+    try {
+        for (;;) {
+            auto lock = stateLock();
+            cv_.wait(lock, [&] { return !running_ || applicationScheduled_; });
+            if (!running_) { return; }
+            applicationScheduled_ = false;
+            lock.unlock();
+            applyCommitted();
+            lock.lock();
+            waitForPersistenceLocked(lock);
+            finishProposalsLocked();
+        }
+    } catch (...) {
+        if (!applyFailed_.load()) { failApplication(std::current_exception()); }
+    }
+}
+
 struct BlobApplyBatch {
     bool complete = false;
     size_t nextEntryOffset = 0;
@@ -81,7 +104,7 @@ BlobApplyBatch applyBlobBatch(const std::vector<RaftLogEntry>& entries, size_t s
 void failApplication(std::exception_ptr failure) {
     applyFailed_.store(true);
     {
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         recordFailure(logIoFailed_ ? ClusterFailureCode::RAFT_PERSISTENCE : ClusterFailureCode::RAFT_APPLY, ClusterHealthState::FAILED);
         stopRuntimeLocked(); finishProposalsLocked(); proposalQueue_.clear();
     }
@@ -89,12 +112,23 @@ void failApplication(std::exception_ptr failure) {
 }
 
 void applyCommitted() {
+    {
+        auto lock = stateLock();
+        if (activeApplications_++ == 0) { applicationBoundary_ = commitIndex_; }
+    }
+    struct ApplicationProgress {
+        Impl& owner;
+        ~ApplicationProgress() {
+            auto lock = owner.stateLock();
+            --owner.activeApplications_; owner.cv_.notify_all();
+        }
+    } progress{*this};
     std::lock_guard applyLock{applyMutex_};
     if (applyFailed_.load()) { throw std::runtime_error("Raft: reopen required after state-machine application failure"); }
     try {
         std::vector<RaftLogEntry> toApply;
         {
-            std::lock_guard lock{mutex_};
+            auto lock = stateLock();
             const auto offset = static_cast<size_t>(std::min<uint64_t>(lastApplied_ - lastIncludedIndex_, log_.size()));
             for (size_t i = offset; i < log_.size() && log_[i].index <= commitIndex_; ++i) { toApply.push_back(log_[i]); }
         }
@@ -104,7 +138,7 @@ void applyCommitted() {
         for (size_t i = 0; i < toApply.size();) {
             const auto& entry = toApply[i];
             if (entry.kind == RaftEntryKind::CONFIG_JOINT || entry.kind == RaftEntryKind::CONFIG_FINAL) {
-                std::lock_guard lock{mutex_};
+                auto lock = stateLock();
                 applyConfigEntryLocked(entry);
                 appliedThrough = entry.index;
                 ++i;
@@ -131,18 +165,18 @@ void applyCommitted() {
             crashAtLogTestPoint("raft.apply.before_durable");
             try { callbacks_.forceDurable(); }
             catch (...) {
-                std::lock_guard lock{mutex_};
+                auto lock = stateLock();
                 stopRuntimeLocked();
                 throw;
             }
         }
         crashAtLogTestPoint("raft.request.after_apply");
-        std::lock_guard lock{mutex_};
+        auto lock = stateLock();
         if (appliedThrough > lastApplied_) {
             const auto backup = captureDurableLogStateLocked(lastLogIndex() + 1);
             lastApplied_ = appliedThrough;
             rebuildRequestResultsLocked(backup.lastApplied);
-            try { persistLog(); }
+            try { persistLog(&lock); }
             catch (...) {
                 restoreDurableLogStateLocked(backup);
                 stopRuntimeLocked();

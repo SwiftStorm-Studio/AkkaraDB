@@ -601,53 +601,37 @@ namespace akkaradb::engine::cluster {
 
             ReadResponse readKey(std::span<const uint8_t> key, uint64_t snapshotSeq, uint32_t timeoutMs, ReadKeySpace keySpace) {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-                std::unique_lock admission{readAdmissionMutex_, std::defer_lock};
-                if (!admission.try_lock_until(deadline)) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
-                std::unique_lock readLock{readMutex_, std::defer_lock};
-                if (!readLock.try_lock_until(deadline)) { throw std::runtime_error("ReplicationClient: owner read state timeout"); }
-                // A caller timeout does not cancel the wire request. Drain its
-                // response before admitting another, without blocking write ACKs.
-                while (pendingReadRequestId_ != 0) {
-                    if (readCv_.wait_until(readLock, deadline) == std::cv_status::timeout && pendingReadRequestId_ != 0) {
-                        throw std::runtime_error("ReplicationClient: previous owner read is still pending");
-                    }
-                }
-                if (std::chrono::steady_clock::now() >= deadline) { throw std::runtime_error("ReplicationClient: owner read admission timeout"); }
-                const auto requestId = nextReadRequestId_++;
-                const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_, keySpace);
-                pendingReadRequestId_ = requestId;
-                pendingReadResponse_.reset();
-                pendingReadFailed_ = false;
-                pendingReadAbandoned_ = false;
-
-                bool sent = false;
+                auto pending = std::make_shared<PendingRead>();
+                uint64_t requestId;
                 {
+                    std::unique_lock lock{readMutex_};
+                    if (!readCv_.wait_until(lock, deadline, [&] { return pendingReads_.size() < 64; }) ||
+                        std::chrono::steady_clock::now() >= deadline) {
+                        throw std::runtime_error("ReplicationClient: owner read admission timeout");
+                    }
+                    if (nextReadRequestId_ == UINT64_MAX) { throw std::runtime_error("ReplicationClient: read ids exhausted"); }
+                    requestId = nextReadRequestId_++;
+                    pendingReads_.emplace(requestId, pending);
+                }
+                const auto erase = [&] {
+                    std::lock_guard lock{readMutex_}; pendingReads_.erase(requestId); readCv_.notify_all();
+                };
+                try {
+                    const auto message = detail::readRequestMessage(requestId, snapshotSeq, key, transferBudget_, keySpace);
                     std::unique_lock socketLock{socketMutex_, std::defer_lock};
-                    if (socketLock.try_lock_until(deadline) && connected() && socket_ != INVALID_SOCKET_HANDLE) {
-                        sent = sendToUntil(socket_, activeSecure_, *message, deadline);
+                    if (!socketLock.try_lock_until(deadline) || !connected() || socket_ == INVALID_SOCKET_HANDLE ||
+                        !sendToUntil(socket_, activeSecure_, *message, deadline)) {
+                        throw std::runtime_error("ReplicationClient: owner read send failed or timed out");
                     }
+                } catch (...) { erase(); throw; }
+                std::unique_lock lock{readMutex_};
+                pending->cv.wait_until(lock, deadline, [&] { return pending->response.has_value() || pending->failed; });
+                pendingReads_.erase(requestId); readCv_.notify_all();
+                if (!pending->response) {
+                    throw std::runtime_error(pending->failed ? "ReplicationClient: owner read connection closed" :
+                        "ReplicationClient: owner read request timeout");
                 }
-                if (!sent) {
-                    pendingReadRequestId_ = 0;
-                    throw std::runtime_error(std::chrono::steady_clock::now() >= deadline
-                        ? "ReplicationClient: owner read send timeout" : "ReplicationClient: owner read request send failed");
-                }
-
-                while (!pendingReadResponse_.has_value() && !pendingReadFailed_) {
-                    if (readCv_.wait_until(readLock, deadline) == std::cv_status::timeout) { break; }
-                }
-                if (!pendingReadResponse_.has_value()) {
-                    if (pendingReadFailed_) {
-                        pendingReadRequestId_ = 0;
-                        throw std::runtime_error("ReplicationClient: owner read connection closed");
-                    }
-                    pendingReadAbandoned_ = true;
-                    throw std::runtime_error("ReplicationClient: owner read request timeout");
-                }
-                ReadResponse response = std::move(*pendingReadResponse_);
-                pendingReadResponse_.reset();
-                pendingReadRequestId_ = 0;
-                return response;
+                return std::move(*pending->response);
             }
 
             ForwardResponse forward(ForwardRequest request) {
@@ -735,10 +719,9 @@ namespace akkaradb::engine::cluster {
         private:
             void completePendingRead(ReadResponse response) {
                 std::lock_guard lock{readMutex_};
-                if (response.requestId == pendingReadRequestId_) {
-                    if (pendingReadAbandoned_) { pendingReadRequestId_ = 0; }
-                    else { pendingReadResponse_ = std::move(response); }
-                    readCv_.notify_all();
+                const auto it = pendingReads_.find(response.requestId);
+                if (it != pendingReads_.end()) {
+                    it->second->response = std::move(response); it->second->cv.notify_one();
                 }
             }
 
@@ -748,9 +731,8 @@ namespace akkaradb::engine::cluster {
                     for (auto& [id, pending] : pendingForwards_) { pending->failed = true; pending->cv.notify_all(); }
                 }
                 std::lock_guard lock{readMutex_};
-                pendingReadFailed_ = true;
-                if (pendingReadAbandoned_) { pendingReadRequestId_ = 0; }
-                readCv_.notify_all();
+                for (auto& [id, pending] : pendingReads_) { pending->failed = true; pending->cv.notify_one(); }
+                pendingReads_.clear(); readCv_.notify_all();
             }
 
             void completePendingStripeControl(StripeControlResponse response) {
@@ -1306,14 +1288,15 @@ namespace akkaradb::engine::cluster {
             std::timed_mutex sendMutex_;
             std::shared_ptr<detail::TransferSession> transferSession_ = std::make_shared<detail::TransferSession>();
 
-            std::timed_mutex readAdmissionMutex_;
-            mutable std::timed_mutex readMutex_;
-            bool pendingReadAbandoned_ = false;
-            std::condition_variable_any readCv_;
+            struct PendingRead {
+                std::condition_variable cv;
+                std::optional<ReadResponse> response;
+                bool failed = false;
+            };
+            std::mutex readMutex_;
+            std::condition_variable readCv_;
             uint64_t nextReadRequestId_ = 1;
-            uint64_t pendingReadRequestId_ = 0;
-            std::optional<ReadResponse> pendingReadResponse_;
-            bool pendingReadFailed_ = false;
+            std::unordered_map<uint64_t, std::shared_ptr<PendingRead>> pendingReads_;
 
             struct PendingStripeControl {
                 std::condition_variable_any cv;

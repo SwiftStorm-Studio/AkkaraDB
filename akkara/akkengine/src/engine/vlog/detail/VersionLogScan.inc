@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogScan.hpp
+// akkengine/src/engine/vlog/detail/VersionLogScan.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 void insertSorted(const std::string& key, VersionEntry ve) {
     auto& versions = residentIndex_[key];
     if (versions.empty() || versions.back().seq <= ve.seq) {

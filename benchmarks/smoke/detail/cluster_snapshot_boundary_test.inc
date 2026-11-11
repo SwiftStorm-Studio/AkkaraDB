@@ -109,7 +109,9 @@ void testRaftSnapshotBoundary(unsigned boundary, bool interrupted) {
         // A matching suffix remains usable, rather than only present on disk.
         AKK_CLUSTER_CHECK(peer.send(snapshotBoundaryAppend(3, 2, 2, 2)));
         response = peer.receiveFrame();
-        AKK_CLUSTER_CHECK(response.payload.at(8) == 1 && runtime->hasState(2, "c", "2"));
+        AKK_CLUSTER_CHECK(response.payload.at(8) == 1);
+        // AppendEntries confirms durable log storage; application has its own worker.
+        AKK_CLUSTER_CHECK(waitUntil([&] { return runtime->hasState(2, "c", "2"); }));
     } else {
         // The replaced prefix cannot be used to commit an old mutation.
         AKK_CLUSTER_CHECK(peer.send(snapshotBoundaryAppend(3, 2, 2, 2)));
@@ -118,7 +120,8 @@ void testRaftSnapshotBoundary(unsigned boundary, bool interrupted) {
         AKK_CLUSTER_CHECK(peer.send(snapshotBoundaryAppend(3, index, boundaryTerm, index + 1,
             {snapshotBoundaryMutation(3, index + 1, 'n', '3')})));
         response = peer.receiveFrame();
-        AKK_CLUSTER_CHECK(response.payload.at(8) == 1 && runtime->hasState(index + 1, "n", "3"));
+        AKK_CLUSTER_CHECK(response.payload.at(8) == 1);
+        AKK_CLUSTER_CHECK(waitUntil([&] { return runtime->hasState(index + 1, "n", "3"); }));
     }
     peer.close(); runtime->runtime->close();
 }

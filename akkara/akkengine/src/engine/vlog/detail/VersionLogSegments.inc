@@ -7,7 +7,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/vlog/detail/VersionLogSegments.hpp
+// akkengine/src/engine/vlog/detail/VersionLogSegments.inc
+// Included inside VersionLog::Impl in VersionLog.cpp.
 void recordActiveIndex(const std::string& key, uint64_t seq, uint64_t offset) {
     if (opts_.segmentBytes == 0) { return; }
     std::unique_lock lock{activeIndexMu_};

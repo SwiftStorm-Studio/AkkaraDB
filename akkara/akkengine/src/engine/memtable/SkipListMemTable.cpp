@@ -81,6 +81,8 @@ namespace akkaradb::engine::memtable {
         const size_t bytes = sizeof(VersionChain) + slotBytes;
         std::byte* mem = dataArena_.allocate(bytes, alignof(VersionChain));
         VersionChain* chain = new(mem) VersionChain{};
+        chain->history.sequenceOrdered = sequenceOrderedVersions_;
+        if (retainAllVersions_) { chain->history.append(initialRecord, dataArena_, bytes_); }
         chain->capacity = maxVersionsPerKey_;
         auto* ring = chain->ring();
         for (uint16_t i = 0; i < maxVersionsPerKey_; ++i) { new(&ring[i]) std::atomic<const core::OwnedRecord*>{nullptr}; }
@@ -155,7 +157,25 @@ namespace akkaradb::engine::memtable {
         return current->nextAt(0).load(std::memory_order_acquire);
     }
 
-    void SkipListMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) noexcept {
+    void SkipListMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) {
+        if (retainAllVersions_) {
+            chain->history.append(record, dataArena_, bytes_);
+            entries.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (sequenceOrderedVersions_) {
+            chain->version.fetch_add(1, std::memory_order_acq_rel);
+            auto head = chain->head.load(std::memory_order_relaxed);
+            auto count = chain->count.load(std::memory_order_relaxed);
+            const bool grew = detail::insertSequenceOrdered(chain->capacity, head, count, record,
+                [&](uint16_t index) { return chain->ring()[index].load(std::memory_order_relaxed); },
+                [&](uint16_t index, const core::OwnedRecord* value) { chain->ring()[index].store(value, std::memory_order_relaxed); });
+            chain->head.store(head, std::memory_order_relaxed);
+            chain->count.store(count, std::memory_order_relaxed);
+            if (grew) { entries.fetch_add(1, std::memory_order_relaxed); }
+            chain->version.fetch_add(1, std::memory_order_release);
+            return;
+        }
         chain->version.fetch_add(1, std::memory_order_acq_rel);
         const uint16_t capacity = chain->capacity;
         const uint16_t prevHead = chain->head.load(std::memory_order_relaxed);
@@ -172,6 +192,7 @@ namespace akkaradb::engine::memtable {
 
     bool SkipListMemTable::visibleRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
+        if (chain->history.latest.load(std::memory_order_acquire)) { return chain->history.get(snapshotSeq, out); }
         for (;;) {
             const uint64_t begin = chain->version.load(std::memory_order_acquire);
             if ((begin & 1ULL) != 0ULL) { continue; }
@@ -204,6 +225,7 @@ namespace akkaradb::engine::memtable {
 
     bool SkipListMemTable::visibleFrozenRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept {
         if (chain == nullptr || out == nullptr) { return false; }
+        if (chain->history.latest.load(std::memory_order_acquire)) { return chain->history.get(snapshotSeq, out); }
         const uint16_t capacity = chain->capacity;
         const uint16_t head = chain->head.load(std::memory_order_acquire);
         const uint16_t count = chain->count.load(std::memory_order_acquire);
@@ -282,14 +304,28 @@ namespace akkaradb::engine::memtable {
                    : visibleRecord(node->versions, snapshotSeq, out);
     }
 
-    ArenaGenerator<RecordView> SkipListMemTable::iterateSnapshot(uint64_t snapshotSeq, bool frozen) const {
+    ArenaGenerator<RecordView> SkipListMemTable::iterateSnapshot(uint64_t snapshotSeq, bool frozen, bool allVersions) const {
         Node* current = head_->nextAt(0).load(std::memory_order_acquire);
         while (current != nullptr) {
             RecordView visible;
             const bool found = frozen
                                    ? visibleFrozenRecord(current->versions, snapshotSeq, &visible)
                                    : visibleRecord(current->versions, snapshotSeq, &visible);
-            if (found) { co_yield visible; }
+            if (allVersions) {
+                const auto* chain = current->versions;
+                if (retainAllVersions_) {
+                    for (const auto& record : chain->history.records()) { co_yield record; }
+                }
+                else {
+                    const auto head = chain->head.load(std::memory_order_relaxed);
+                    const auto count = chain->count.load(std::memory_order_relaxed);
+                    for (uint16_t i = 0; i < count; ++i) {
+                        const auto index = static_cast<uint16_t>((head + chain->capacity - i) % chain->capacity);
+                        co_yield toView(*chain->ring()[index].load(std::memory_order_relaxed));
+                    }
+                }
+            }
+            else if (found) { co_yield visible; }
             current = current->nextAt(0).load(std::memory_order_acquire);
         }
     }
@@ -336,6 +372,23 @@ namespace akkaradb::engine::memtable {
                 return iterateSnapshotRange(snapshotSeq, std::move(startOwned), std::move(endOwned), frozen);
             }
         );
+    }
+
+    void SkipListMemTable::retainAllVersions() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: retention must be configured before writing"); }
+        retainAllVersions_ = true;
+    }
+
+    void SkipListMemTable::useSequenceOrder() {
+        if (entryCount() != 0) { throw std::logic_error("MemTable: version order must be configured before writing"); }
+        sequenceOrderedVersions_ = true;
+    }
+
+    ArenaGenerator<RecordView> SkipListMemTable::flushIterator() const {
+        if (!frozen_.load(std::memory_order_acquire)) { throw std::logic_error("MemTable: flush requires a frozen backend"); }
+        return ArenaGenerator<RecordView>::withOwnedArena(
+            generatorArenaInitialBlockSize_, generatorArenaMaxBlockSize_,
+            [this] { return iterateSnapshot(UINT64_MAX, true, true); });
     }
 
     void SkipListMemTable::freeze() { frozen_.store(true, std::memory_order_release); }
