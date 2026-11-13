@@ -85,7 +85,17 @@ namespace akkaradb::engine::memtable {
             struct Node {
                 std::atomic<uint64_t> version{0};
                 bool isLeaf{true};
+                const bool searchKeysEnabled;
                 std::atomic<uint16_t> keyCount{0};
+
+                // These caches are read/written under treeMutex_, or after freeze.
+                // The experimental unlocked traversal keeps using the atomic record pointers.
+                std::array<uint64_t, MAX_KEYS> searchHeads{};
+                std::array<uint64_t, MAX_KEYS> searchTails{};
+                std::array<uint16_t, MAX_KEYS> searchLengths{};
+                std::array<uint8_t, 16> prefixBytes{};
+                const uint8_t* prefixData{nullptr};
+                uint16_t prefixLength{0};
 
                 std::array<std::atomic<const core::OwnedRecord*>, MAX_KEYS> keys{};
                 std::array<std::atomic<VersionChain*>, MAX_KEYS> chains{};
@@ -93,7 +103,12 @@ namespace akkaradb::engine::memtable {
 
                 std::atomic<Node*> nextLeaf{nullptr};
 
-                explicit Node(bool leaf) noexcept : isLeaf{leaf} {}
+                explicit Node(bool leaf, bool indexKeys) noexcept : isLeaf{leaf}, searchKeysEnabled{indexKeys} {}
+            };
+
+            struct SearchKey {
+                uint64_t head, tail;
+                size_t length;
             };
 
             struct SplitResult {
@@ -140,6 +155,14 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] static int compareRecordKey(const core::OwnedRecord* record, std::span<const uint8_t> key) noexcept;
             [[nodiscard]] static int compareRecordRecord(const core::OwnedRecord* lhs, const core::OwnedRecord* rhs) noexcept;
+            [[nodiscard]] static SearchKey searchKey(std::span<const uint8_t> key) noexcept;
+            [[nodiscard]] static int compareSearchKey(const Node* node, uint16_t position,
+                const SearchKey& search, std::span<const uint8_t> fullKey) noexcept;
+            [[nodiscard]] static uint16_t findPosition(const Node* node, std::span<const uint8_t> key,
+                uint16_t keyCount, bool upperBound) noexcept;
+            static void cacheSearchKey(Node* node, uint16_t position) noexcept;
+            static void insertSearchKey(Node* node, uint16_t position, uint16_t oldCount) noexcept;
+            static void rebuildSearchKeys(Node* node) noexcept;
             [[nodiscard]] static uint16_t findLeafPosition(const Node* leaf, std::span<const uint8_t> key) noexcept;
             [[nodiscard]] static uint16_t findLeafPosition(const Node* leaf, std::span<const uint8_t> key, uint16_t keyCount) noexcept;
             [[nodiscard]] static uint16_t findChildIndex(const Node* internal, std::span<const uint8_t> key) noexcept;

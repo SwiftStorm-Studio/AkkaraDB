@@ -7,5 +7,6 @@
 NUL
 dist
 .bench-tmp
+/benchmark-results/
 scripts
 bin

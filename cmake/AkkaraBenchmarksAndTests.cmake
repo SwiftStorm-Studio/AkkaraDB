@@ -126,10 +126,14 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_arena_smoke_test|benchmarks/smoke/arena_smoke_test.cpp
         akkaradb_memtable_throughput_benchmark|benchmarks/throughput/memtable_throughput_benchmark.cpp
         akkaradb_akkengine_bptree_put_benchmark|benchmarks/throughput/akkengine_bptree_put_benchmark.cpp
+        akkaradb_akkengine_latency_benchmark|benchmarks/throughput/akkengine_latency_benchmark.cpp
+        akkaradb_akkengine_read_scaling_benchmark|benchmarks/throughput/akkengine_read_scaling_benchmark.cpp
+        akkaradb_latency_measurement_smoke_test|benchmarks/smoke/latency_measurement_smoke_test.cpp
         akkaradb_wal_throughput_benchmark|benchmarks/throughput/wal_throughput_benchmark.cpp
         akkaradb_sstable_throughput_benchmark|benchmarks/throughput/sstable_throughput_benchmark.cpp
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
         akkaradb_bptree_mutable_concurrency_stress_test|benchmarks/smoke/bptree_mutable_concurrency_stress_test.cpp
+        akkaradb_bptree_key_search_smoke_test|benchmarks/smoke/bptree_key_search_smoke_test.cpp
         akkaradb_cluster_observability_test|benchmarks/smoke/cluster_observability_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
         akkaradb_memtable_lifecycle_smoke_test|benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
@@ -166,6 +170,33 @@ foreach (AKKARADB_TARGET_SPEC IN LISTS AKKARADB_COMMON_TEST_TARGETS)
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endforeach ()
+
+if (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    add_executable(akkaradb_windows_cpu_sampler benchmarks/tools/windows_cpu_sampler.cpp)
+    target_link_libraries(akkaradb_windows_cpu_sampler PRIVATE dbghelp)
+    set_target_properties(akkaradb_windows_cpu_sampler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif ()
+
+# Keep this benchmark runnable when built alone on Windows.
+if (WIN32 AND BUILD_SHARED_LIBS)
+    add_custom_command(TARGET akkaradb_akkengine_latency_benchmark POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb> $<TARGET_FILE_DIR:akkaradb_akkengine_latency_benchmark>
+    )
+    add_custom_command(TARGET akkaradb_akkengine_read_scaling_benchmark POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb> $<TARGET_FILE_DIR:akkaradb_akkengine_read_scaling_benchmark>
+    )
+endif ()
+if (AKKARADB_BUILD_TESTS)
+    add_test(NAME akkaradb_akkengine_latency_benchmark_smoke
+            COMMAND ${CMAKE_COMMAND}
+            -DBENCHMARK=$<TARGET_FILE:akkaradb_akkengine_latency_benchmark>
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/latency-benchmark-smoke
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/smoke/akkengine_latency_benchmark_smoke.cmake
+    )
+    set_tests_properties(akkaradb_akkengine_latency_benchmark_smoke PROPERTIES TIMEOUT 120 LABELS "benchmark;cli")
+endif ()
 
 # Exercise the internal record factories without adding shared-library exports.
 target_sources(akkaradb_sst_memtable_safety_smoke_test PRIVATE
@@ -227,6 +258,8 @@ if (WIN32 AND BUILD_SHARED_LIBS)
 endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
+        akkaradb_bptree_key_search_smoke_test
+        akkaradb_latency_measurement_smoke_test
         akkaradb_transaction_smoke_test
         akkaradb_arena_smoke_test
         akkaradb_bptree_mutable_concurrency_stress_test
@@ -250,7 +283,7 @@ set(AKKARADB_SMOKE_TEST_TARGETS
 list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 
 if (AKKARADB_BUILD_TESTS)
-    add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS})
+    add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS} akkaradb_akkengine_latency_benchmark)
     if (WIN32 AND BUILD_SHARED_LIBS)
         add_custom_command(TARGET akkaradb POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_TEST_OUTPUT_DIR}"

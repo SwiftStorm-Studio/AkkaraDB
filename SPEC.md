@@ -1070,9 +1070,19 @@ Frozen B+Tree MemTables have no structural writers, so they stream directly
 regardless of `bptreeIteratorMode`. This avoids an extra full-scan materialized
 vector during immutable-table flush.
 
+Locked B+Tree nodes cache up to 16 bytes of each key's suffix in contiguous
+comparison arrays. Each node keeps the common prefix of its sorted keys and
+checks it once before searching the suffixes. Prefixes are recomputed at splits
+and when an insertion shortens them; longer equal suffixes fall back to full
+record-key comparison. The caches use the existing tree lock and frozen-table
+publication rules. They change only the in-memory index layout, with additional
+memory and insertion work; public ordering, snapshot semantics, and persisted
+formats are unchanged.
+
 `BPTreeConcurrencyMode::OPTIMISTIC_UNSAFE` keeps the legacy optimistic reader
 path for experiments. It is not the default because concurrent internal splits
-can expose transient unreachable paths to readers.
+can expose transient unreachable paths to readers. This path does not read or
+maintain the non-atomic comparison caches.
 
 ### 9.3 Lookup Semantics
 

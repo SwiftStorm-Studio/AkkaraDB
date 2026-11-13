@@ -99,6 +99,14 @@ engine->put(bytes("user:1"), bytes("Alice"));
 
 ## Repository Map
 
+For interactive MemTable/SST/VersionLog get/put/scan, historical read, and
+transaction measurements, build `akkaradb_akkengine_latency_benchmark` in Release
+mode. It reports mean ns, ops/s, P50/P90/P99/P99.9 and accepts `t`/`f` switches
+plus an integer iteration count. See the [benchmark guide](benchmarks/throughput/akkengine_latency_benchmark.md).
+
+For reads through one engine shared by multiple threads, use the
+[read scaling benchmark](benchmarks/throughput/akkengine_read_scaling_benchmark.md).
+
 ```text
 akkara/              Native engine, typed API, JNI, and server backends
 benchmarks/          Smoke tests and throughput benchmarks

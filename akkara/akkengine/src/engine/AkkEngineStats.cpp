@@ -7,66 +7,65 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// akkengine/src/engine/detail/AkkStats.inc
-#pragma once
+// akkengine/src/engine/AkkEngineStats.cpp
+#include "detail/AkkEngineImpl.hpp"
 
-// Included at namespace scope after AkkEngine::Impl is complete.
-inline EngineStats AkkEngine::stats() const noexcept {
+namespace akkaradb::engine {
+    EngineStats AkkEngine::Impl::stats() noexcept {
     EngineStats out;
-    if (!impl_) { return out; }
-    Impl::OperationGuard operation{*impl_, false};
+    OperationGuard operation{*this, false};
     if (!operation) { return out; }
 
-    out.currentSeq = impl_->snapshotSeq();
-    out.nodeId = impl_->nodeId;
+    out.currentSeq = snapshotSeq();
+    out.nodeId = nodeId;
     {
-        std::lock_guard lock{impl_->stripeRepairStatsMu};
-        out.stripeReadRepair = impl_->stripeRepairStats;
+        std::lock_guard lock{stripeRepairStatsMu};
+        out.stripeReadRepair = stripeRepairStats;
     }
     {
-        std::lock_guard lock{impl_->stripeRebuildStatsMu};
-        out.stripeRebuild = impl_->stripeRebuildStats;
+        std::lock_guard lock{stripeRebuildStatsMu};
+        out.stripeRebuild = stripeRebuildStats;
     }
 
-    out.putsTotal = impl_->putsTotal.load(std::memory_order_relaxed);
-    out.removesTotal = impl_->removesTotal.load(std::memory_order_relaxed);
-    out.getsTotal = impl_->getsTotal.load(std::memory_order_relaxed);
-    out.getsMemtableHit = impl_->getsMemtableHit.load(std::memory_order_relaxed);
-    out.getsSstHit = impl_->getsSstHit.load(std::memory_order_relaxed);
-    out.getsMiss = impl_->getsMiss.load(std::memory_order_relaxed);
-    out.existsTotal = impl_->existsTotal.load(std::memory_order_relaxed);
-    out.scansTotal = impl_->scansTotal.load(std::memory_order_relaxed);
-    out.blobPutsTotal = impl_->blobPutsTotal.load(std::memory_order_relaxed);
-    out.config.writeAdmission = static_cast<uint32_t>(impl_->opts.runtime.writeAdmission);
-    out.config.writeDurability = static_cast<uint32_t>(impl_->opts.runtime.writeDurability);
-    out.config.writeVisibility = static_cast<uint32_t>(impl_->opts.runtime.writeVisibility);
-    out.config.readVisibility = static_cast<uint32_t>(impl_->opts.runtime.visibility.readVisibility);
-    out.config.sequenceAllocation = static_cast<uint32_t>(impl_->opts.runtime.sequence.allocation);
-    out.config.sequenceThreadLocalRangeSize = impl_->opts.runtime.sequence.threadLocalRangeSize;
-    out.config.commitWindowSize = impl_->commitWindowSize;
-    out.config.memtableBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.memtableFlushBacklog);
-    out.config.maxMemtableImmutableTables = impl_->opts.runtime.backpressure.maxMemtableImmutableTables;
-    out.config.sstBackpressureMode = static_cast<uint32_t>(impl_->opts.runtime.backpressure.sstCompactionBacklog);
-    out.config.maxSstL0Files = impl_->opts.runtime.backpressure.maxSstL0Files;
-    out.config.backpressureWaitMicros = impl_->opts.runtime.backpressure.waitMicros;
-    out.config.backpressureTimeoutMs = impl_->opts.runtime.backpressure.timeoutMs;
-    out.config.memtableFlushMode = static_cast<uint32_t>(impl_->opts.memtable.flushMode);
-    out.config.walExecution = static_cast<uint32_t>(impl_->opts.wal.execution);
-    out.config.walSyncPolicy = static_cast<uint32_t>(impl_->opts.wal.syncPolicy);
-    out.config.walBackpressure = static_cast<uint32_t>(impl_->opts.wal.backpressure);
-    out.config.sstCompactionMode = static_cast<uint32_t>(impl_->opts.sst.compactionMode);
-    out.backpressure.blockedWrites = impl_->backpressureBlockedWrites.load(std::memory_order_relaxed);
-    out.backpressure.rejectedWrites = impl_->backpressureRejectedWrites.load(std::memory_order_relaxed);
-    out.backpressure.timedOutWrites = impl_->backpressureTimedOutWrites.load(std::memory_order_relaxed);
-    out.backpressure.memtableStalls = impl_->backpressureMemtableStalls.load(std::memory_order_relaxed);
-    out.backpressure.sstStalls = impl_->backpressureSstStalls.load(std::memory_order_relaxed);
-    out.backpressure.waitMicrosTotal = impl_->backpressureWaitMicrosTotal.load(std::memory_order_relaxed);
-    out.backpressure.waitMicrosMax = impl_->backpressureWaitMicrosMax.load(std::memory_order_relaxed);
-    out.api.enabled = impl_->opts.components.apiEnabled;
-    if (impl_->apiServer) { out.api = impl_->apiServer->stats(); }
+    out.putsTotal = putsTotal.load(std::memory_order_relaxed);
+    out.removesTotal = removesTotal.load(std::memory_order_relaxed);
+    out.getsTotal = getsTotal.load(std::memory_order_relaxed);
+    out.getsMemtableHit = getsMemtableHit.load(std::memory_order_relaxed);
+    out.getsSstHit = getsSstHit.load(std::memory_order_relaxed);
+    out.getsMiss = getsMiss.load(std::memory_order_relaxed);
+    out.existsTotal = existsTotal.load(std::memory_order_relaxed);
+    out.scansTotal = scansTotal.load(std::memory_order_relaxed);
+    out.blobPutsTotal = blobPutsTotal.load(std::memory_order_relaxed);
+    out.config.writeAdmission = static_cast<uint32_t>(opts.runtime.writeAdmission);
+    out.config.writeDurability = static_cast<uint32_t>(opts.runtime.writeDurability);
+    out.config.writeVisibility = static_cast<uint32_t>(opts.runtime.writeVisibility);
+    out.config.readVisibility = static_cast<uint32_t>(opts.runtime.visibility.readVisibility);
+    out.config.sequenceAllocation = static_cast<uint32_t>(opts.runtime.sequence.allocation);
+    out.config.sequenceThreadLocalRangeSize = opts.runtime.sequence.threadLocalRangeSize;
+    out.config.commitWindowSize = commitWindowSize;
+    out.config.memtableBackpressureMode = static_cast<uint32_t>(opts.runtime.backpressure.memtableFlushBacklog);
+    out.config.maxMemtableImmutableTables = opts.runtime.backpressure.maxMemtableImmutableTables;
+    out.config.sstBackpressureMode = static_cast<uint32_t>(opts.runtime.backpressure.sstCompactionBacklog);
+    out.config.maxSstL0Files = opts.runtime.backpressure.maxSstL0Files;
+    out.config.backpressureWaitMicros = opts.runtime.backpressure.waitMicros;
+    out.config.backpressureTimeoutMs = opts.runtime.backpressure.timeoutMs;
+    out.config.memtableFlushMode = static_cast<uint32_t>(opts.memtable.flushMode);
+    out.config.walExecution = static_cast<uint32_t>(opts.wal.execution);
+    out.config.walSyncPolicy = static_cast<uint32_t>(opts.wal.syncPolicy);
+    out.config.walBackpressure = static_cast<uint32_t>(opts.wal.backpressure);
+    out.config.sstCompactionMode = static_cast<uint32_t>(opts.sst.compactionMode);
+    out.backpressure.blockedWrites = backpressureBlockedWrites.load(std::memory_order_relaxed);
+    out.backpressure.rejectedWrites = backpressureRejectedWrites.load(std::memory_order_relaxed);
+    out.backpressure.timedOutWrites = backpressureTimedOutWrites.load(std::memory_order_relaxed);
+    out.backpressure.memtableStalls = backpressureMemtableStalls.load(std::memory_order_relaxed);
+    out.backpressure.sstStalls = backpressureSstStalls.load(std::memory_order_relaxed);
+    out.backpressure.waitMicrosTotal = backpressureWaitMicrosTotal.load(std::memory_order_relaxed);
+    out.backpressure.waitMicrosMax = backpressureWaitMicrosMax.load(std::memory_order_relaxed);
+    out.api.enabled = opts.components.apiEnabled;
+    if (apiServer) { out.api = apiServer->stats(); }
 
-    if (impl_->memtable) {
-        const auto snap = impl_->memtable->snapshot();
+    if (memtable) {
+        const auto snap = memtable->snapshot();
         out.memtable.shardCount = snap.shardCount;
         out.memtable.thresholdBytesPerShard = snap.thresholdBytesPerShard;
         out.memtable.approxBytes = snap.approxBytes;
@@ -80,9 +79,9 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.memtable.memorySnapshotCompactionPending = snap.memorySnapshotCompactionPending;
     }
 
-    out.wal.enabled = impl_->opts.components.walEnabled;
-    if (impl_->walWriter) {
-        const auto snap = impl_->walWriter->snapshot();
+    out.wal.enabled = opts.components.walEnabled;
+    if (walWriter) {
+        const auto snap = walWriter->snapshot();
         out.wal.shardCount = snap.shardCount;
         out.wal.entriesWritten = snap.entriesWritten;
         out.wal.bytesWritten = snap.bytesWritten;
@@ -96,10 +95,10 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.wal.healthy = snap.healthy;
     }
 
-    out.blob.enabled = impl_->opts.components.blobEnabled && impl_->blobManager != nullptr;
-    out.blob.thresholdBytes = impl_->opts.blob.thresholdBytes;
-    if (impl_->blobManager) {
-        const auto snap = impl_->blobManager->snapshot();
+    out.blob.enabled = opts.components.blobEnabled && blobManager != nullptr;
+    out.blob.thresholdBytes = opts.blob.thresholdBytes;
+    if (blobManager) {
+        const auto snap = blobManager->snapshot();
         out.blob.blobsWritten = snap.blobsWritten;
         out.blob.bytesUncompressed = snap.bytesUncompressed;
         out.blob.bytesOnDisk = snap.bytesOnDisk;
@@ -107,9 +106,9 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.blob.gcCycles = snap.gcCycles;
     }
 
-    out.sst.enabled = impl_->sstManager != nullptr;
-    if (impl_->sstManager) {
-        const auto levels = impl_->sstManager->levelStats();
+    out.sst.enabled = sstManager != nullptr;
+    if (sstManager) {
+        const auto levels = sstManager->levelStats();
         out.sst.levels.reserve(levels.size());
         for (const auto& level : levels) {
             out.sst.levels.push_back(LevelStats{level.level, level.fileCount, level.bytes, level.budgetBytes});
@@ -117,8 +116,8 @@ inline EngineStats AkkEngine::stats() const noexcept {
             out.sst.bytes += level.bytes;
             if (level.level == 0) { out.sst.l0FileCount = level.fileCount; }
         }
-        out.sst.compactionPending = impl_->sstManager->compactionPending();
-        const auto snap = impl_->sstManager->compactionSnapshot();
+        out.sst.compactionPending = sstManager->compactionPending();
+        const auto snap = sstManager->compactionSnapshot();
         out.sst.compactionsCompleted = snap.compactionsCompleted;
         out.sst.filesCompacted = snap.filesCompacted;
         out.sst.bytesCompactedIn = snap.bytesCompactedIn;
@@ -126,43 +125,43 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.sst.compactionFailures = snap.compactionFailures;
     }
 
-    out.manifest.enabled = impl_->manifest != nullptr;
-    if (impl_->manifest) {
-        const auto checkpoint = impl_->manifest->lastCheckpoint();
+    out.manifest.enabled = manifest != nullptr;
+    if (manifest) {
+        const auto checkpoint = manifest->lastCheckpoint();
         out.manifest.hasCheckpoint = checkpoint.has_value();
         if (checkpoint.has_value()) {
             out.manifest.lastCheckpointSeq = checkpoint->lastSeq.value_or(0);
             out.manifest.lastCheckpointStripe = checkpoint->stripe.value_or(0);
         }
-        out.manifest.liveSstCount = impl_->manifest->liveSst().size();
-        out.manifest.deletedSstCount = impl_->manifest->deletedSst().size();
-        out.manifest.sstSealCount = impl_->manifest->sstSeals().size();
-        out.manifest.sstReferencedBlobCount = impl_->manifest->sstReferencedBlobs().size();
-        out.manifest.sstBlobRefsComplete = impl_->manifest->sstBlobRefsComplete();
-        out.manifest.liveBlobCount = impl_->manifest->liveBlobs().size();
-        out.manifest.deletedBlobCount = impl_->manifest->deletedBlobs().size();
-        out.manifest.blobPutCount = impl_->manifest->blobPuts().size();
-        out.manifest.blobDeleteCount = impl_->manifest->blobDeletes().size();
-        if (const auto lease = impl_->manifest->lastPrimaryLease(); lease.has_value()) {
+        out.manifest.liveSstCount = manifest->liveSst().size();
+        out.manifest.deletedSstCount = manifest->deletedSst().size();
+        out.manifest.sstSealCount = manifest->sstSeals().size();
+        out.manifest.sstReferencedBlobCount = manifest->sstReferencedBlobs().size();
+        out.manifest.sstBlobRefsComplete = manifest->sstBlobRefsComplete();
+        out.manifest.liveBlobCount = manifest->liveBlobs().size();
+        out.manifest.deletedBlobCount = manifest->deletedBlobs().size();
+        out.manifest.blobPutCount = manifest->blobPuts().size();
+        out.manifest.blobDeleteCount = manifest->blobDeletes().size();
+        if (const auto lease = manifest->lastPrimaryLease(); lease.has_value()) {
             out.manifest.lastPrimaryLeaseNodeId = lease->nodeId;
             out.manifest.lastPrimaryLeaseUntilUs = lease->leaseUntilUs;
         }
     }
 
-    out.cluster.enabled = impl_->opts.components.clusterEnabled && impl_->clusterRuntime != nullptr;
-    out.cluster.configuredNodeCount = impl_->clusterConfiguredNodeCount;
+    out.cluster.enabled = opts.components.clusterEnabled && clusterRuntime != nullptr;
+    out.cluster.configuredNodeCount = clusterConfiguredNodeCount;
     if (out.cluster.enabled) {
-        out.cluster.clusterId = impl_->clusterConfig.clusterId();
-        out.cluster.replicationMode = static_cast<uint32_t>(impl_->clusterConfig.mode());
-        out.cluster.consistencyMode = static_cast<uint32_t>(impl_->clusterConfig.consistency().mode);
-        out.cluster.transportMode = static_cast<uint32_t>(impl_->opts.cluster.runtime.transportMode);
-        out.cluster.clusterGroupId = impl_->opts.cluster.runtime.clusterGroupId;
-        out.cluster.clusterGroupEpoch = impl_->opts.cluster.runtime.clusterGroupEpoch;
-        const auto configured = impl_->usesPartitionRaft() || impl_->clusterReplicationMode == cluster::ReplicationMode::STRIPE
-                                    ? impl_->currentPlacement().nodes()
-                                    : impl_->clusterConfig.usesDataConsensus()
-                                    ? impl_->clusterRuntime->activeNodes()
-                                    : impl_->clusterConfig.nodes();
+        out.cluster.clusterId = clusterConfig.clusterId();
+        out.cluster.replicationMode = static_cast<uint32_t>(clusterConfig.mode());
+        out.cluster.consistencyMode = static_cast<uint32_t>(clusterConfig.consistency().mode);
+        out.cluster.transportMode = static_cast<uint32_t>(opts.cluster.runtime.transportMode);
+        out.cluster.clusterGroupId = opts.cluster.runtime.clusterGroupId;
+        out.cluster.clusterGroupEpoch = opts.cluster.runtime.clusterGroupEpoch;
+        const auto configured = usesPartitionRaft() || clusterReplicationMode == cluster::ReplicationMode::STRIPE
+                                    ? currentPlacement().nodes()
+                                    : clusterConfig.usesDataConsensus()
+                                    ? clusterRuntime->activeNodes()
+                                    : clusterConfig.nodes();
         out.cluster.configuredNodeCount = static_cast<uint32_t>(configured.size());
         out.cluster.configuredNodes.reserve(configured.size());
         for (const auto& node : configured) {
@@ -179,10 +178,10 @@ inline EngineStats AkkEngine::stats() const noexcept {
             );
         }
     }
-    if (impl_->clusterRuntime) {
+    if (clusterRuntime) {
         {
-            std::lock_guard lock{impl_->distributedRecoveryDiagnosticsMu};
-            const auto& d = impl_->distributedRecoveryDiagnostics;
+            std::lock_guard lock{distributedRecoveryDiagnosticsMu};
+            const auto& d = distributedRecoveryDiagnostics;
             out.cluster.transactionRecoveryFailuresTotal = d.failuresTotal;
             out.cluster.transactionRecoveryConsecutiveFailedPasses = d.consecutiveFailedPasses;
             out.cluster.transactionRecoveryLastFailureAtUs = d.lastFailureAtUs;
@@ -192,14 +191,14 @@ inline EngineStats AkkEngine::stats() const noexcept {
             out.cluster.transactionRecoveryLastError.assign(d.lastError.data(), d.lastErrorSize);
         }
         {
-            std::lock_guard lock{impl_->distributedStateMu};
-            out.cluster.pendingDistributedTransactions = std::ranges::count_if(impl_->distributedState.decisions,
+            std::lock_guard lock{distributedStateMu};
+            out.cluster.pendingDistributedTransactions = std::ranges::count_if(distributedState.decisions,
                 [](const auto& item) { return !item.second.finished; });
         }
-        out.cluster.role = static_cast<uint32_t>(impl_->clusterRuntime->role());
-        out.cluster.activeNodeCount = impl_->clusterRuntime->activeNodes().size();
-        const auto runtime = impl_->clusterRuntime->raftStats();
-        const auto metadataRuntime = impl_->clusterRuntime->stripeMetadataRaftStats();
+        out.cluster.role = static_cast<uint32_t>(clusterRuntime->role());
+        out.cluster.activeNodeCount = clusterRuntime->activeNodes().size();
+        const auto runtime = clusterRuntime->raftStats();
+        const auto metadataRuntime = clusterRuntime->stripeMetadataRaftStats();
         out.cluster.sampledAtUs = runtime.sampledAtUs;
         out.cluster.runtimeStartedAtUs = runtime.runtimeStartedAtUs;
         out.cluster.clusterGroupId = runtime.clusterGroupId;
@@ -226,20 +225,20 @@ inline EngineStats AkkEngine::stats() const noexcept {
             }
         };
         if (metadataRuntime.enabled) { cluster::detail::mergeHealthObservation(out.cluster, metadataRuntime); }
-        if (impl_->usesPartitionRaft()) {
-            const auto placement = impl_->currentPlacement();
-            const auto children = impl_->partitionSnapshot();
-            for (uint16_t index = 0; index < children.size(); ++index) {
+        if (usesPartitionRaft()) {
+            const auto placement = currentPlacement();
+            const auto children = partitionSnapshot();
+            for (size_t index = 0; index < children.size(); ++index) {
                 const auto& child = children[index];
                 // Removed holders retain storage/runtime objects; committed placement defines dependencies.
-                if (!impl_->partitionConfig(placement, index).findById(impl_->nodeId)) {
+                if (!partitionConfig(placement, index).findById(nodeId)) {
                     out.cluster.quorumAvailability = cluster::detail::combineAvailability(out.cluster.quorumAvailability, ClusterOperationAvailability::UNKNOWN);
                     out.cluster.writeAvailability = cluster::detail::combineAvailability(out.cluster.writeAvailability, ClusterOperationAvailability::UNKNOWN);
                     out.cluster.linearizableReadAvailability = cluster::detail::combineAvailability(out.cluster.linearizableReadAvailability, ClusterOperationAvailability::UNKNOWN);
                     continue;
                 }
                 if (child) {
-                    Impl::OperationGuard childOperation{*child->impl_, false};
+                    OperationGuard childOperation{*child->impl_, false};
                     cluster::RaftRuntimeStats observed;
                     if (childOperation) {
                         observed = child->impl_->clusterRuntime->raftStats();
@@ -257,7 +256,7 @@ inline EngineStats AkkEngine::stats() const noexcept {
                 }
             }
         }
-        observeParticipant(out.cluster, *impl_);
+        observeParticipant(out.cluster, *this);
         // Preserve the existing rebuilding signal while service prerequisites remain observable.
         if (out.stripeRebuild.active && out.cluster.health != ClusterHealthState::FAILED &&
             out.cluster.quorumAvailability != ClusterOperationAvailability::UNAVAILABLE &&
@@ -295,7 +294,7 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.cluster.incomingForwardConnections = runtime.incomingForwardConnections;
         out.cluster.incomingControlConnections = runtime.incomingControlConnections;
         out.cluster.forwardReceiveMemoryBytes = runtime.forwardReceiveMemoryBytes;
-        if (impl_->opts.cluster.runtime.nodeResourceBudget) { impl_->opts.cluster.runtime.nodeResourceBudget->observe(out.cluster); }
+        if (opts.cluster.runtime.nodeResourceBudget) { opts.cluster.runtime.nodeResourceBudget->observe(out.cluster); }
         out.cluster.controlReceiveMemoryBytes = runtime.controlReceiveMemoryBytes;
         out.cluster.proposalBatches = runtime.proposalBatches;
         out.cluster.proposalQueueDepth = runtime.proposalQueueDepth;
@@ -348,9 +347,9 @@ inline EngineStats AkkEngine::stats() const noexcept {
         }
     }
 
-    out.vlog.enabled = impl_->versionLog != nullptr;
-    if (impl_->versionLog) {
-        const auto snap = impl_->versionLog->snapshot();
+    out.vlog.enabled = versionLog != nullptr;
+    if (versionLog) {
+        const auto snap = versionLog->snapshot();
         out.vlog.syncMode = snap.syncMode;
         out.vlog.groupN = snap.groupN;
         out.vlog.groupMicros = snap.groupMicros;
@@ -378,4 +377,5 @@ inline EngineStats AkkEngine::stats() const noexcept {
         out.vlog.flushThreadRunning = snap.flushThreadRunning;
     }
     return out;
+}
 }

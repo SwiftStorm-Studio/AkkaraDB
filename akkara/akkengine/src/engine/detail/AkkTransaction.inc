@@ -326,42 +326,7 @@ size_t AkkEngine::Transaction::count(std::span<const uint8_t> start, std::span<c
     for (const auto& unused : scan(arena, start, end)) { (void)unused; ++count; arena.reset(); }
     return count;
 }
-AkkEngine::Transaction AkkEngine::begin(TransactionOptions options) {
-    if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
-    auto operation = std::make_shared<Impl::OperationGuard>(*impl_);
-    if (impl_->opts.components.clusterEnabled) {
-        if (!impl_->distributedTransactionsEnabled() || impl_->opts.cluster.runtime.transactions.participantOnly) { throw std::logic_error("AkkEngine: enable TWO_PHASE_COMMIT on the Cluster root to begin transactions"); }
-        if (options.isolation != TransactionIsolation::SERIALIZABLE && options.isolation != TransactionIsolation::SNAPSHOT_ISOLATION) { throw std::invalid_argument("AkkEngine: invalid transaction isolation"); }
-        cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.transactions.timeoutMs};
-        Impl::DistributedId token{}; crypto::secureRandom(token);
-        for (unsigned i = 0; i < 8; ++i) { token[i] = static_cast<uint8_t>(impl_->nodeId >> (8 * i)); }
-        Impl::DistributedMessage create{.action = Impl::DistributedAction::CREATE, .id = token,
-            .argument = impl_->opts.transactions.maxLifetimeMs};
-        try {
-            (void)impl_->distributedRpc(create);
-            return Transaction{std::make_shared<Transaction::Impl>(*impl_, options.isolation, std::move(operation), token)};
-        } catch (...) {
-            const auto failure = std::current_exception();
-            try { impl_->abortDistributed(token); } catch (...) {}
-            std::rethrow_exception(failure);
-        }
-    }
-    if (impl_->opts.runtime.sequence.allocation != AkkEngineOptions::SequenceAllocationMode::GLOBAL_ATOMIC) {
-        throw std::invalid_argument("AkkEngine: transactions require GLOBAL_ATOMIC sequence allocation");
-    }
-    if (options.isolation != TransactionIsolation::SERIALIZABLE && options.isolation != TransactionIsolation::SNAPSHOT_ISOLATION) {
-        throw std::invalid_argument("AkkEngine: invalid transaction isolation");
-    }
-    impl_->waitForVersionLogRecovery();
-    std::unique_lock admission{impl_->mutationEpochMu};
-    impl_->throwIfBackgroundFailed();
-    if (impl_->transactionHasPersistence() && impl_->opts.paths.transactionDir.empty()) { throw std::invalid_argument("AkkEngine: transaction directory is required for persistent transactions"); }
-    if ((impl_->walWriter && !impl_->opts.runtime.recoverWal) || (impl_->sstManager && !impl_->opts.runtime.recoverSst)) {
-        throw std::invalid_argument("AkkEngine: persistent transactions require storage recovery to remain enabled");
-    }
-    auto snapshot = impl_->captureTransactionReadSnapshot(std::move(operation));
-    return Transaction{std::make_shared<Transaction::Impl>(*impl_, options.isolation, std::move(snapshot))};
-}
+
 void AkkEngine::Transaction::end() {
     if (!impl_) { throw std::logic_error("AkkEngine: moved transaction"); }
     auto& state = *impl_; state.check();
@@ -473,12 +438,4 @@ void AkkEngine::Transaction::end() {
         engine.transactionJournalPending.store(!engine.transactionJournals.empty(), std::memory_order_release);
         state.finish(); std::rethrow_exception(failure);
     }
-}
-
-cluster::ClusterTransactionResult AkkEngine::transactionOutcome(const cluster::ClusterTransactionId& id) {
-    if (!impl_) { throw std::runtime_error("AkkEngine: engine is closed"); }
-    Impl::OperationGuard operation{*impl_};
-    if (!impl_->distributedTransactionsEnabled() || impl_->opts.cluster.runtime.transactions.participantOnly) { throw std::logic_error("AkkEngine: Cluster transactions are disabled"); }
-    cluster::detail::ReconfigurationDeadline budget{impl_->opts.cluster.runtime.transactions.timeoutMs};
-    const auto record = impl_->distributedRecord(id); return {record.status, record.finished};
 }

@@ -11,6 +11,7 @@
 #include "akk/engine/memtable/BPTreeMemTable.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -71,7 +72,7 @@ namespace akkaradb::engine::memtable {
     }
 
     BPTreeMemTable::Node* BPTreeMemTable::makeNode(bool leaf) {
-        Node* node = arenaNew<Node>(leaf);
+        Node* node = arenaNew<Node>(leaf, concurrencyMode_ == BPTreeConcurrencyMode::LOCKED);
         bytes_.fetch_add(sizeof(Node), std::memory_order_relaxed);
         return node;
     }
@@ -123,36 +124,135 @@ namespace akkaradb::engine::memtable {
         return lhs->compareKey(*rhs);
     }
 
+    BPTreeMemTable::SearchKey BPTreeMemTable::searchKey(std::span<const uint8_t> key) noexcept {
+        const auto word = [](std::span<const uint8_t> bytes) {
+            const auto load = []<class T>(const uint8_t* source) {
+                T value;
+                std::memcpy(&value, source, sizeof(T));
+                if constexpr (std::endian::native == std::endian::little) { value = std::byteswap(value); }
+                return value;
+            };
+            if (bytes.size() >= 8) { return load.operator()<uint64_t>(bytes.data()); }
+            if (bytes.size() >= 4) {
+                uint64_t result = uint64_t{load.operator()<uint32_t>(bytes.data())} << 32;
+                // Overlapping fixed-size loads cover 5..7 bytes without reading past the key.
+                if (bytes.size() > 4) {
+                    result |= uint64_t{load.operator()<uint32_t>(bytes.data() + bytes.size() - 4)} << ((8 - bytes.size()) * 8);
+                }
+                return result;
+            }
+            if (bytes.size() >= 2) {
+                uint64_t result = uint64_t{load.operator()<uint16_t>(bytes.data())} << 48;
+                if (bytes.size() == 3) { result |= uint64_t{bytes[2]} << 40; }
+                return result;
+            }
+            return bytes.empty() ? uint64_t{0} : uint64_t{bytes[0]} << 56;
+        };
+        return {word(key.first(std::min<size_t>(8, key.size()))),
+            key.size() > 8 ? word(key.subspan(8, std::min<size_t>(8, key.size() - 8))) : 0, key.size()};
+    }
+
+    int BPTreeMemTable::compareSearchKey(const Node* node, uint16_t position,
+        const SearchKey& search, std::span<const uint8_t> fullKey) noexcept {
+        const uint64_t head = node->searchHeads[position];
+        if (head != search.head) { return head < search.head ? -1 : 1; }
+        const uint64_t tail = node->searchTails[position];
+        if (tail != search.tail) { return tail < search.tail ? -1 : 1; }
+        const size_t length = node->searchLengths[position];
+        if (std::min(length, search.length) > 16) {
+            return compareRecordKey(node->keys[position].load(std::memory_order_relaxed), fullKey);
+        }
+        return length < search.length ? -1 : (length > search.length ? 1 : 0);
+    }
+
+    void BPTreeMemTable::cacheSearchKey(Node* node, uint16_t position) noexcept {
+        const auto key = node->keys[position].load(std::memory_order_relaxed)->key().subspan(node->prefixLength);
+        const auto search = searchKey(key);
+        node->searchHeads[position] = search.head;
+        node->searchTails[position] = search.tail;
+        node->searchLengths[position] = static_cast<uint16_t>(search.length);
+    }
+
+    void BPTreeMemTable::insertSearchKey(Node* node, uint16_t position, uint16_t oldCount) noexcept {
+        if (!node->searchKeysEnabled) { return; }
+        const auto key = node->keys[position].load(std::memory_order_relaxed)->key();
+        // Interior insertions preserve the existing common prefix. Only a new boundary
+        // that shortens it requires repacking all suffixes.
+        if (oldCount == 0 || key.size() < node->prefixLength ||
+            (node->prefixLength != 0 && std::memcmp(node->prefixData, key.data(), node->prefixLength) != 0)) {
+            rebuildSearchKeys(node);
+            return;
+        }
+        std::move_backward(node->searchHeads.begin() + position, node->searchHeads.begin() + oldCount,
+            node->searchHeads.begin() + oldCount + 1);
+        std::move_backward(node->searchTails.begin() + position, node->searchTails.begin() + oldCount,
+            node->searchTails.begin() + oldCount + 1);
+        std::move_backward(node->searchLengths.begin() + position, node->searchLengths.begin() + oldCount,
+            node->searchLengths.begin() + oldCount + 1);
+        cacheSearchKey(node, position);
+    }
+
+    void BPTreeMemTable::rebuildSearchKeys(Node* node) noexcept {
+        if (!node->searchKeysEnabled) { return; }
+        const auto count = node->keyCount.load(std::memory_order_relaxed);
+        if (count == 0) { node->prefixLength = 0; node->prefixData = nullptr; return; }
+        const auto first = node->keys[0].load(std::memory_order_relaxed)->key();
+        const auto last = node->keys[count - 1].load(std::memory_order_relaxed)->key();
+        const size_t limit = std::min(first.size(), last.size());
+        size_t common = 0;
+        while (common < limit && first[common] == last[common]) { ++common; }
+        // Sorted endpoints determine the prefix shared by every key. Record bytes
+        // remain arena-owned for this tree's lifetime, including after version updates.
+        node->prefixLength = static_cast<uint16_t>(common);
+        node->prefixData = first.data();
+        std::copy_n(first.begin(), std::min(common, node->prefixBytes.size()), node->prefixBytes.begin());
+        for (uint16_t i = 0; i < count; ++i) { cacheSearchKey(node, i); }
+    }
+
+    uint16_t BPTreeMemTable::findPosition(const Node* node, std::span<const uint8_t> key,
+        uint16_t keyCount, bool upperBound) noexcept {
+        uint16_t lo = 0, hi = keyCount;
+        if (node->searchKeysEnabled) {
+            const size_t prefixLength = node->prefixLength;
+            if (prefixLength != 0) {
+                const size_t compared = std::min(key.size(), prefixLength);
+                const size_t inlined = std::min(compared, node->prefixBytes.size());
+                int cmp = inlined == 0 ? 0 : std::memcmp(node->prefixBytes.data(), key.data(), inlined);
+                if (cmp == 0 && compared > inlined) {
+                    cmp = std::memcmp(node->prefixData + inlined, key.data() + inlined, compared - inlined);
+                }
+                if (cmp != 0) { return cmp < 0 ? keyCount : 0; }
+                if (key.size() < prefixLength) { return 0; }
+            }
+            const auto search = searchKey(key.subspan(node->prefixLength));
+            while (lo < hi) {
+                const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
+                const int cmp = compareSearchKey(node, mid, search, key);
+                if (cmp < 0 || (upperBound && cmp == 0)) { lo = static_cast<uint16_t>(mid + 1); }
+                else { hi = mid; }
+            }
+        } else {
+            while (lo < hi) {
+                const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
+                const int cmp = compareRecordKey(node->keys[mid].load(std::memory_order_relaxed), key);
+                if (cmp < 0 || (upperBound && cmp == 0)) { lo = static_cast<uint16_t>(mid + 1); }
+                else { hi = mid; }
+            }
+        }
+        return lo;
+    }
+
     uint16_t BPTreeMemTable::findLeafPosition(const Node* leaf, std::span<const uint8_t> key) noexcept {
         const uint16_t keyCount = leaf->keyCount.load(std::memory_order_relaxed);
         return findLeafPosition(leaf, key, keyCount);
     }
 
     uint16_t BPTreeMemTable::findLeafPosition(const Node* leaf, std::span<const uint8_t> key, uint16_t keyCount) noexcept {
-        uint16_t lo = 0;
-        uint16_t hi = keyCount;
-        while (lo < hi) {
-            const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
-            const core::OwnedRecord* pivot = leaf->keys[mid].load(std::memory_order_relaxed);
-            const int cmp = compareRecordKey(pivot, key);
-            if (cmp < 0) { lo = static_cast<uint16_t>(mid + 1); }
-            else { hi = mid; }
-        }
-        return lo;
+        return findPosition(leaf, key, keyCount, false);
     }
 
     uint16_t BPTreeMemTable::findChildIndex(const Node* internal, std::span<const uint8_t> key) noexcept {
-        const uint16_t keyCount = internal->keyCount.load(std::memory_order_relaxed);
-        uint16_t lo = 0;
-        uint16_t hi = keyCount;
-        while (lo < hi) {
-            const uint16_t mid = static_cast<uint16_t>(lo + (hi - lo) / 2);
-            const core::OwnedRecord* pivot = internal->keys[mid].load(std::memory_order_relaxed);
-            const int cmp = compareRecordKey(pivot, key);
-            if (cmp <= 0) { lo = static_cast<uint16_t>(mid + 1); }
-            else { hi = mid; }
-        }
-        return lo;
+        return findPosition(internal, key, internal->keyCount.load(std::memory_order_relaxed), true);
     }
 
     void BPTreeMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) {
@@ -273,6 +373,7 @@ namespace akkaradb::engine::memtable {
                 node->keys[pos].store(record, std::memory_order_release);
                 node->chains[pos].store(chain, std::memory_order_release);
                 node->keyCount.store(static_cast<uint16_t>(keyCount + 1), std::memory_order_release);
+                insertSearchKey(node, pos, keyCount);
                 endWrite(node);
                 return std::nullopt;
             }
@@ -324,6 +425,8 @@ namespace akkaradb::engine::memtable {
                 right->chains[i].store(nullptr, std::memory_order_relaxed);
             }
             right->keyCount.store(rightCount, std::memory_order_release);
+            rebuildSearchKeys(node);
+            rebuildSearchKeys(right);
 
             Node* oldNext = node->nextLeaf.load(std::memory_order_relaxed);
             right->nextLeaf.store(oldNext, std::memory_order_release);
@@ -358,6 +461,7 @@ namespace akkaradb::engine::memtable {
             node->keys[insertPos].store(childSplit->separator, std::memory_order_release);
             node->children[insertPos + 1].store(childSplit->right, std::memory_order_release);
             node->keyCount.store(static_cast<uint16_t>(keyCount + 1), std::memory_order_release);
+            insertSearchKey(node, insertPos, keyCount);
             endWrite(node);
             return std::nullopt;
         }
@@ -410,6 +514,8 @@ namespace akkaradb::engine::memtable {
 
         const core::OwnedRecord* promoted = allKeys[mid];
 
+        rebuildSearchKeys(node);
+        rebuildSearchKeys(right);
         endWrite(node);
 
         SplitResult split;
@@ -464,6 +570,7 @@ namespace akkaradb::engine::memtable {
         newRoot->children[0].store(currentRoot, std::memory_order_relaxed);
         newRoot->children[1].store(split->right, std::memory_order_relaxed);
         newRoot->keyCount.store(1, std::memory_order_relaxed);
+        rebuildSearchKeys(newRoot);
 
         root_.store(newRoot, std::memory_order_release);
         return Status::OK();
