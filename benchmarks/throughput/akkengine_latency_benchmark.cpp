@@ -13,6 +13,7 @@
 #include "akk/engine/memtable/ARTMemTable.hpp"
 #include "akk/engine/memtable/BPTreeMemTable.hpp"
 #include "akk/engine/memtable/SkipListMemTable.hpp"
+#include "akk/engine/sstable/SSTManager.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,7 +32,15 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
     using namespace akkaradb::engine;
@@ -47,6 +56,11 @@ namespace {
         bool wal = false;
         bool vlogSync = false;
         bool readComparison = false;
+        bool storageOnly = false;
+        int flushSamples = 5;
+        int storageCpu = -1;
+        std::string profileOperation;
+        fs::path profileControl;
         int comparisonRounds = 3;
         int iterations = 10'000;
         int warmup = 100;
@@ -119,6 +133,11 @@ namespace {
             else if (name == "--wal") { config.wal = boolean(value, name); }
             else if (name == "--vlog-sync") { config.vlogSync = boolean(value, name); }
             else if (name == "--read-comparison") { config.readComparison = boolean(value, name); }
+            else if (name == "--storage-only") { config.storageOnly = boolean(value, name); }
+            else if (name == "--flush-samples") { config.flushSamples = integer(value, name); }
+            else if (name == "--cpu") { config.storageCpu = integer(value, name, 0); }
+            else if (name == "--profile-operation") { config.profileOperation = value; }
+            else if (name == "--profile-control") { config.profileControl = value; }
             else if (name == "--comparison-rounds") { config.comparisonRounds = integer(value, name); }
             else if (name == "--iterations") { config.iterations = integer(value, name); }
             else if (name == "--warmup") { config.warmup = integer(value, name, 0); }
@@ -144,6 +163,38 @@ namespace {
         if (config.readComparison && (config.sst || config.vlog || config.wal)) {
             throw std::invalid_argument("--read-comparison requires --sst f --vlog f --wal f");
         }
+        if (config.storageOnly && (config.readComparison || config.vlog || config.wal)) {
+            throw std::invalid_argument("--storage-only requires --read-comparison f --vlog f --wal f");
+        }
+        if (config.storageCpu >= 0) {
+            #ifdef _WIN32
+            if (!config.storageOnly || config.storageCpu >= 64) { throw std::invalid_argument("--cpu requires storage mode and CPU 0..63"); }
+            #else
+            throw std::invalid_argument("--cpu is currently supported by the Windows storage benchmark");
+            #endif
+        }
+        if (!config.profileOperation.empty() || !config.profileControl.empty()) {
+            if (!config.storageOnly || config.profileControl.empty()) {
+                throw std::invalid_argument("profiling requires --storage-only t and --profile-control PATH");
+            }
+            const std::array<std::string_view, 10> operations{
+                "get",
+                "get.miss",
+                "scan",
+                "put.insert",
+                "put.update",
+                "remove",
+                "get.sst",
+                "get.miss.sst",
+                "scan.sst",
+                "flush"
+            };
+            if (std::ranges::find(operations, config.profileOperation) == operations.end() || ((config.profileOperation == "flush" || config.profileOperation.
+                ends_with(".sst")) && !config.sst)) { throw std::invalid_argument("invalid --profile-operation (SST operations require SST)"); }
+            #ifndef _WIN32
+            throw std::invalid_argument("the bundled profiling handshake requires Windows");
+            #endif
+        }
         (void)backendFactory(config.backend);
         return config;
     }
@@ -164,6 +215,11 @@ namespace {
             "  --history-depth INT   Initial versions per key, at least 3 (default 8)\n"
             "  --backend skiplist|bptree|art (default skiplist)\n"
             "  --read-comparison t|f  Compare backend/MemTable/engine reads only (default f)\n"
+            "  --storage-only t|f    Direct MemTable [+ SSTManager] operations, no AkkEngine\n"
+            "  --flush-samples INT   Independent SST flush batches in storage mode (default 5)\n"
+            "  --cpu INT             Pin the Windows storage benchmark process to one logical CPU\n"
+            "  --profile-operation NAME  get|get.miss|scan|put.insert|put.update|remove|get.sst|get.miss.sst|scan.sst|flush\n"
+            "  --profile-control PATH  Windows sampler handshake (separate from normal measurements)\n"
             "  --comparison-rounds INT  Rotating-order comparison rounds (default 3)\n"
             "  --csv-dir PATH        Parent for a unique run folder (default benchmark-results)\n"
             "  --isolation serializable|snapshot (default serializable)\n"
@@ -302,7 +358,20 @@ namespace {
             setting("timing_boundary", "operation + result consumption + result disposal");
             setting("started_unix_ns", started);
             setting("backend", config.backend);
-            setting("mode", config.readComparison ? "read_comparison" : "full");
+            setting("mode", config.storageOnly ? "storage_modules" : config.readComparison ? "read_comparison" : "full");
+            setting("profiled", !config.profileOperation.empty());
+            if (config.storageOnly) {
+                setting("storage_contract_version", 2);
+                setting("storage_process_cpu", config.storageCpu);
+                setting("storage_api_auto_flush", "disabled");
+                setting("storage_api_seed_residency", "active_memory");
+                setting("storage_ingest_auto_flush_threshold_bytes", config.sst ? 4 * 1024 * 1024 : 0);
+                setting("storage_sequence_order", "sequence");
+                setting("storage_retained_versions_per_key", 4);
+                setting("storage_compaction", "disabled");
+                setting("storage_flush_samples", config.flushSamples);
+                setting("profile_operation", config.profileOperation);
+            }
             setting("comparison_rounds", config.readComparison ? config.comparisonRounds : 0);
             setting("sst", config.sst);
             setting("vlog", config.vlog);
@@ -355,6 +424,7 @@ namespace {
         }
 
         void stage(std::string_view name) { stage_ = name; }
+        const fs::path& directory() const noexcept { return directory_; }
 
         void fail(std::string_view error) noexcept {
             try {
@@ -379,7 +449,7 @@ namespace {
         void recordSummary(std::string_view name, const Metrics& metrics, uint64_t checksum,
             std::optional<uint64_t> revision) {
             const auto& config = config_;
-            const auto unit = name.starts_with("tx.") ? "transaction" : name == "scan" ? "scan" : "operation";
+            const auto unit = name.starts_with("tx.") ? "transaction" : name.starts_with("scan") ? "scan" : "operation";
             summary_ << csvString(name) << ',' << csvString(unit) << ',' << csvString(config.backend)
                 << ',' << config.sst << ',' << config.vlog << ',' << config.wal << ',' << config.vlogSync
                 << ',' << csvString(config.isolation == TransactionIsolation::SERIALIZABLE ? "serializable" : "snapshot")
@@ -558,7 +628,13 @@ namespace {
         std::cout << "Verification: passed; read comparison complete\n";
     }
 
+    #include "detail/storage_module_benchmark.inc"
+
     void run(const Config& config, CsvReport& report) {
+        if (config.storageOnly) {
+            runStorageModules(config, report);
+            return;
+        }
         TemporaryDirectory directory;
         auto engine = AkkEngine::open(engineOptions(config, directory.path()));
         std::vector<Key> keys;

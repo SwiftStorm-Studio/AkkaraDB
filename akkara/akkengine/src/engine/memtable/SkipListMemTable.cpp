@@ -11,6 +11,7 @@
 #include "akk/engine/memtable/SkipListMemTable.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <new>
@@ -61,6 +62,16 @@ namespace akkaradb::engine::memtable {
         return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
     }
 
+    SkipListMemTable::SearchKey::SearchKey(std::span<const uint8_t> key) noexcept
+        : bytes{key} {
+        const size_t length = std::min(key.size(), sizeof(prefix));
+        if (length != 0) { std::memcpy(prefix.data(), key.data(), length); }
+        if constexpr (std::endian::native == std::endian::little) {
+            prefix[0] = std::byteswap(prefix[0]);
+            prefix[1] = std::byteswap(prefix[1]);
+        }
+    }
+
     uint64_t SkipListMemTable::nextRandom() noexcept {
         uint64_t x = rngState_;
         x ^= x << 13;
@@ -99,6 +110,10 @@ namespace akkaradb::engine::memtable {
         std::byte* mem = dataArena_.allocate(bytes, alignof(Node));
         VersionChain* chain = initialRecord != nullptr ? makeChain(initialRecord) : nullptr;
         Node* node = new(mem) Node{level, initialRecord, chain};
+        if (initialRecord != nullptr) {
+            node->keyLength = initialRecord->hdr.kLen;
+            node->keyPrefix = SearchKey{initialRecord->key()}.prefix;
+        }
         auto* nextSlots = reinterpret_cast<std::atomic<Node*>*>(node + 1);
         for (uint8_t i = 0; i < level; ++i) { new(&nextSlots[i]) std::atomic<Node*>{nullptr}; }
         bytes_.fetch_add(bytes, std::memory_order_relaxed);
@@ -123,19 +138,36 @@ namespace akkaradb::engine::memtable {
         return record;
     }
 
-    int SkipListMemTable::compareNodeKey(const Node* node, std::span<const uint8_t> key) noexcept {
-        return node->keyRecord->compareKey(key);
+    int SkipListMemTable::compareNodeKey(const Node* node, const SearchKey& key) noexcept {
+        for (size_t i = 0; i < node->keyPrefix.size(); ++i) { if (node->keyPrefix[i] != key.prefix[i]) { return node->keyPrefix[i] < key.prefix[i] ? -1 : 1; } }
+        const size_t minLength = std::min(static_cast<size_t>(node->keyLength), key.bytes.size());
+        constexpr size_t cachedBytes = sizeof(node->keyPrefix);
+        if (minLength > cachedBytes) {
+            const int cmp = std::memcmp(node->keyRecord->key().data() + cachedBytes, key.bytes.data() + cachedBytes, minLength - cachedBytes);
+            if (cmp != 0) { return cmp < 0 ? -1 : 1; }
+        }
+        if (node->keyLength < key.bytes.size()) { return -1; }
+        if (node->keyLength > key.bytes.size()) { return 1; }
+        return 0;
     }
 
     SkipListMemTable::Node* SkipListMemTable::findNodeForWrite(
-        std::span<const uint8_t> key,
+        const SearchKey& key,
         std::array<Node*, MAX_LEVEL>& update
     ) noexcept {
         Node* current = head_;
+        Node* bound = nullptr;
         const uint8_t topLevel = currentMaxLevel_.load(std::memory_order_relaxed);
         for (int level = static_cast<int>(topLevel) - 1; level >= 0; --level) {
             Node* next = current->nextAt(static_cast<uint8_t>(level)).load(std::memory_order_relaxed);
-            while (next != nullptr && compareNodeKey(next, key) < 0) {
+            while (next != nullptr && next != bound) {
+                const int cmp = compareNodeKey(next, key);
+                // Existing-key updates do not need insertion predecessors.
+                if (cmp == 0) { return next; }
+                if (cmp > 0) {
+                    bound = next;
+                    break;
+                }
                 current = next;
                 next = current->nextAt(static_cast<uint8_t>(level)).load(std::memory_order_relaxed);
             }
@@ -144,17 +176,25 @@ namespace akkaradb::engine::memtable {
         return current->nextAt(0).load(std::memory_order_relaxed);
     }
 
-    SkipListMemTable::Node* SkipListMemTable::findNodeForRead(std::span<const uint8_t> key) const noexcept {
+    SkipListMemTable::Node* SkipListMemTable::findNodeForRead(const SearchKey& key) const noexcept {
         Node* current = head_;
+        Node* bound = nullptr;
+        Node* next = nullptr;
         const uint8_t topLevel = currentMaxLevel_.load(std::memory_order_acquire);
         for (int level = static_cast<int>(topLevel) - 1; level >= 0; --level) {
-            Node* next = current->nextAt(static_cast<uint8_t>(level)).load(std::memory_order_acquire);
-            while (next != nullptr && compareNodeKey(next, key) < 0) {
+            next = current->nextAt(static_cast<uint8_t>(level)).load(std::memory_order_acquire);
+            while (next != nullptr && next != bound) {
+                const int cmp = compareNodeKey(next, key);
+                if (cmp == 0) { return next; }
+                if (cmp > 0) {
+                    bound = next;
+                    break;
+                }
                 current = next;
                 next = current->nextAt(static_cast<uint8_t>(level)).load(std::memory_order_acquire);
             }
         }
-        return current->nextAt(0).load(std::memory_order_acquire);
+        return next;
     }
 
     void SkipListMemTable::appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries) {
@@ -270,11 +310,12 @@ namespace akkaradb::engine::memtable {
 
         const std::span<const uint8_t> keyU8 = asU8(key);
         const std::span<const uint8_t> valueU8 = asU8(value);
+        const SearchKey searchKey{keyU8};
         std::array<Node*, MAX_LEVEL> update{};
-        Node* candidate = findNodeForWrite(keyU8, update);
+        Node* candidate = findNodeForWrite(searchKey, update);
         const core::OwnedRecord* record = makeRecord(keyU8, valueU8, seq, flags, precomputedFp64, precomputedMk);
 
-        if (candidate != nullptr && compareNodeKey(candidate, keyU8) == 0) {
+        if (candidate != nullptr && compareNodeKey(candidate, searchKey) == 0) {
             appendVersion(candidate->versions, record, entries_);
             return Status::OK();
         }
@@ -287,18 +328,18 @@ namespace akkaradb::engine::memtable {
             Node* next = update[i]->nextAt(i).load(std::memory_order_relaxed);
             node->nextAt(i).store(next, std::memory_order_relaxed);
         }
-        for (int i = static_cast<int>(level) - 1; i >= 0; --i) {
-            const uint8_t index = static_cast<uint8_t>(i);
-            update[index]->nextAt(index).store(node, std::memory_order_release);
-        }
+        // Publish level zero first so an upper-level exact match can return
+        // immediately without exposing a node absent from ordered iteration.
+        for (uint8_t i = 0; i < level; ++i) { update[i]->nextAt(i).store(node, std::memory_order_release); }
         if (level > observedMax) { currentMaxLevel_.store(level, std::memory_order_release); }
         return Status::OK();
     }
 
     bool SkipListMemTable::get(ByteView key, uint64_t snapshotSeq, RecordView* out) const {
         if (out == nullptr) { return false; }
-        const Node* node = findNodeForRead(asU8(key));
-        if (node == nullptr || compareNodeKey(node, asU8(key)) != 0) { return false; }
+        const SearchKey searchKey{asU8(key)};
+        const Node* node = findNodeForRead(searchKey);
+        if (node == nullptr || compareNodeKey(node, searchKey) != 0) { return false; }
         return frozen_.load(std::memory_order_acquire)
                    ? visibleFrozenRecord(node->versions, snapshotSeq, out)
                    : visibleRecord(node->versions, snapshotSeq, out);
@@ -340,9 +381,10 @@ namespace akkaradb::engine::memtable {
         const std::span<const uint8_t> end{endKey.data(), endKey.size()};
         if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
 
-        Node* current = start.empty() ? head_->nextAt(0).load(std::memory_order_acquire) : findNodeForRead(start);
+        const SearchKey lower{start}, upper{end};
+        Node* current = start.empty() ? head_->nextAt(0).load(std::memory_order_acquire) : findNodeForRead(lower);
         while (current != nullptr) {
-            if (!end.empty() && compareNodeKey(current, end) >= 0) { break; }
+            if (!end.empty() && compareNodeKey(current, upper) >= 0) { break; }
             RecordView visible;
             const bool found = frozen
                                    ? visibleFrozenRecord(current->versions, snapshotSeq, &visible)

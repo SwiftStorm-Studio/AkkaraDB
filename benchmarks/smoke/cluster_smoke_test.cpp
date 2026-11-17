@@ -6063,7 +6063,8 @@ namespace {
         options.blob.thresholdBytes = 128;
         options.cluster.config = ClusterConfig{
             {node(1, 21831, 21931)}, ReplicationMode::MIRROR, AckPolicy{},
-            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 2000},
+            // The bulk batch performs 64 durable WAL writes on the local disk.
+            ConsistencyOptions{.mode = ConsistencyMode::RAFT_QUORUM, .ackTimeoutMs = 20000},
         };
         options.cluster.runtime.raftBlobPolicy = RaftBlobPolicy::RAFT_LOG;
         options.cluster.runtime.readMode = ClusterReadMode::OWNER_LINEARIZABLE;
@@ -8746,8 +8747,9 @@ namespace {
 #include "detail/cluster_apply_recovery_test.inc"
 #include "detail/cluster_recovery_fencing_test.inc"
 #include "detail/cluster_reconnect_integrity_test.inc"
+#include "detail/cluster_runtime_regressions_test.inc"
 
-    void testRaftEngineLeadershipTransferApi() {
+void testRaftEngineLeadershipTransferApi() {
         const auto dir = makeTempDir("raft-engine-leader-transfer-api");
         const ClusterConfig cfg{
             {
@@ -9113,6 +9115,10 @@ int main(int argc, char** argv) {
         akkaradb::test::installMsvcTestErrorHandlers();
         enableDeterministicRaftElection();
         AKK_CLUSTER_CHECK(akkaradb_cluster_register());
+        if (argc == 2 && std::string_view{argv[1]} == "--cluster-runtime-regressions") {
+            runClusterRuntimeRegressionTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view{argv[1]} == "--partition-recovery-safety") {
             testPartitionRecoveryProgressSafety(false); testPartitionRecoveryProgressSafety(true); return 0;
         }
@@ -9653,8 +9659,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view{argv[1]} == "--cluster-performance") { runClusterPerformanceTests(); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--cluster-small-snapshot") { testClusterManySmallSnapshotChunks(); return 0; }
         if (argc == 2 && std::string_view{argv[1]} == "--raft-pipeline") {
+            std::fprintf(stderr, "[raft-pipeline] proposal batches and ReadIndex PLAIN\n");
             testRaftPipelinedProposalsAndReadIndex();
+            std::fprintf(stderr, "[raft-pipeline] proposal batches and ReadIndex SECURE\n");
             testRaftPipelinedProposalsAndReadIndex(true);
+            std::fprintf(stderr, "[raft-pipeline] concurrent engine writes\n");
             testRaftConcurrentEngineWrites();
             return 0;
         }

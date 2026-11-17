@@ -131,13 +131,14 @@ namespace akkaradb::engine::sst {
             validateZstdCompressionLevel(options);
         }
 
-        std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> toManifestBlobRefs(
-            const std::vector<SSTWriter::Result::BlobRefEntry>& refs
-        ) {
-            return refs | std::views::transform([](const auto& ref) {
-                const auto& [key, seq, flags, blobId] = ref;
-                return manifest::Manifest::SSTBlobRefsEvent::Entry{key, seq, flags, blobId};
-            }) | std::ranges::to<std::vector>();
+        std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> toManifestBlobRefs(std::vector<SSTWriter::Result::BlobRefEntry> refs) {
+            std::vector<manifest::Manifest::SSTBlobRefsEvent::Entry> entries;
+            entries.reserve(refs.size());
+            for (auto& ref : refs) {
+                auto& [key, seq, flags, blobId] = ref;
+                entries.push_back({std::move(key), seq, flags, blobId});
+            }
+            return entries;
         }
 
         void syncFile(const std::filesystem::path& path) {
@@ -637,7 +638,9 @@ namespace akkaradb::engine::sst {
                     }
                     crashAtTestPoint("sst.flush.after_outputs");
                     for (size_t i = 0; i < outputs.size(); ++i) {
-                        manifest_->sstBlobRefs(outputs[i].filename, toManifestBlobRefs(results[i].blobRefs));
+                        // The following seal/commit is the durability barrier
+                        // for references and publication together.
+                        manifest_->stageSstBlobRefs(outputs[i].filename, toManifestBlobRefs(std::move(results[i].blobRefs)));
                     }
                     crashAtTestPoint("sst.flush.after_manifest_refs");
                     // An uncertain commit must be resolved by replay. Never delete
@@ -975,14 +978,14 @@ namespace akkaradb::engine::sst {
                 wopts.codec = options_.codec;
                 wopts.zstdCompressionLevel = options_.zstdCompressionLevel;
                 wopts.trackBlobReferences = options_.trackBlobReferences;
-                const auto result = SSTWriter::write(tmp, views, wopts);
+                auto result = SSTWriter::write(tmp, views, wopts);
                 crashAtTestPoint("sst.compaction.after_output_tmp_write");
                 durableRename(tmp, path);
                 crashAtTestPoint("sst.compaction.after_output_rename");
                 auto reader = SSTReader::open(path, readerOptions());
                 if (!reader) { throw std::runtime_error("SSTManager: cannot reopen compacted SST"); }
 
-                manifest_->sstBlobRefs(path.filename().string(), toManifestBlobRefs(result.blobRefs));
+                manifest_->sstBlobRefs(path.filename().string(), toManifestBlobRefs(std::move(result.blobRefs)));
 
                 std::vector<Meta> outputs;
                 outputs.push_back(makeMeta(path, path.filename().string(), std::move(reader)));

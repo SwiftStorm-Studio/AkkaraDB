@@ -1096,7 +1096,7 @@ namespace akkaradb::engine::cluster {
                     stripeMetadataRaft_ = &placementAuthority_->consensus();
                 }
                 if (config_.mode() != ReplicationMode::PARTITIONED) {
-                    manager_ = ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions);
+                    manager_ = ClusterManager::create(dbDir, config_, selfNodeId, runtimeOptions_);
                     manager_->setRoleChangeCallback(
                         [this](NodeRole role) {
                             try { manager_->checkHealth(); }

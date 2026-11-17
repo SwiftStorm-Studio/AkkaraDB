@@ -171,7 +171,13 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] static bool visibleRecord(VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;
             [[nodiscard]] static RecordView toView(const core::OwnedRecord& record) noexcept;
 
-            [[nodiscard]] std::optional<SplitResult> insertRecursive(Node* node, const core::OwnedRecord* record);
+            struct InsertPath {
+                Node* node;
+                InsertPath* parent;
+                Node* right = nullptr;
+            };
+
+            [[nodiscard]] std::optional<SplitResult> insertRecursive(Node* node, const core::OwnedRecord* record, InsertPath* parent, Node*& newRoot);
             [[nodiscard]] Node* descendToCandidateLeaf(std::span<const uint8_t> key) const noexcept;
             [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshot(uint64_t snapshotSeq, bool allVersions = false) const;
             [[nodiscard]] ArenaGenerator<RecordView> iterateFrozenSnapshotRange(

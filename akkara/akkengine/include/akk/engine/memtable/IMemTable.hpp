@@ -109,6 +109,8 @@ namespace akkaradb::engine::memtable {
 
             // Frozen input only. Unlike a user scan, persistence must enumerate
             // every retained version, in key order (sequence order is arbitrary).
+            // Application-ordered backends emit each key's versions newest-applied
+            // first so memory-generation compaction can preserve their precedence.
             [[nodiscard]] virtual ArenaGenerator<RecordView> flushIterator() const {
                 return iterator({}, {}, UINT64_MAX);
             }

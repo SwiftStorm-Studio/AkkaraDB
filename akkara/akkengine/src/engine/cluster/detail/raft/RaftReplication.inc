@@ -336,8 +336,9 @@ AppendEntriesResponse handleAppendEntries(const AppendEntries& request) {
 
                 if (earlyResponse && mutatedLogState) { restoreDurableLogStateLocked(backup); }
                 if (!earlyResponse) {
-                    if (request.leaderCommit > commitIndex_) {
-                        commitIndex_ = std::min(request.leaderCommit, acceptedMatchIndex);
+                    const auto nextCommit = std::min(request.leaderCommit, acceptedMatchIndex);
+                    if (nextCommit > commitIndex_) {
+                        commitIndex_ = nextCommit;
                         mutatedLogState = true;
                     }
                     if (mutatedLogState) { persistLog(&lock); }

@@ -40,15 +40,19 @@ namespace akkaradb::engine::memtable {
     namespace {
         // Keep all unpublished versions and the visible baseline while merging
         // memory-only generations. A normal range iterator collapses too early.
-        core::ArenaGenerator<RecordView> retainedFlushRecords(
-            std::vector<std::shared_ptr<const IMemTable>> tables, uint64_t frontier) {
+        core::ArenaGenerator<RecordView> retainedFlushRecords(std::vector<std::shared_ptr<const IMemTable>> tables, uint64_t frontier, bool sequenceOrdered) {
             struct Cursor {
                 core::ArenaGenerator<RecordView> records;
                 core::ArenaGenerator<RecordView>::iterator it;
             };
             std::vector<Cursor> cursors;
             cursors.reserve(tables.size());
-            const auto later = [&](size_t a, size_t b) { return cursors[a].it->compareKey(*cursors[b].it) > 0; };
+            // Sources are newest-generation first. Application-ordered backends
+            // also emit each key's newest-applied version first.
+            const auto later = [&](size_t a, size_t b) {
+                const auto order = cursors[a].it->compareKey(*cursors[b].it);
+                return order != 0 ? order > 0 : a > b;
+            };
             std::priority_queue<size_t, std::vector<size_t>, decltype(later)> heap{later};
             for (const auto& table : tables) {
                 auto rows = table->flushIterator();
@@ -67,16 +71,22 @@ namespace akkaradb::engine::memtable {
                     auto& cursor = cursors[index];
                     const auto record = *cursor.it;
                     if (record.seq() > frontier) { retained.push_back(record); }
-                    else if (!visible || record.seq() > visible->seq()) { visible = record; }
+                    else if (!visible || (sequenceOrdered && record.seq() > visible->seq())) {
+                        visible = record;
+                        if (!sequenceOrdered) { retained.push_back(record); }
+                    }
                     ++cursor.it;
                     if (cursor.it != std::default_sentinel) { heap.push(index); }
                 } while (!heap.empty() && cursors[heap.top()].it->compareKey(key) == 0);
-                if (visible) { retained.push_back(*visible); }
-                // Backends expose the last applied version; install the highest
-                // retained sequence last when rebuilding a compacted generation.
-                std::sort(retained.begin(), retained.end(), [](const auto& a, const auto& b) { return a.seq() < b.seq(); });
-                for (size_t i = 0; i < retained.size(); ++i) {
-                    if (i == 0 || retained[i].seq() != retained[i - 1].seq()) { co_yield retained[i]; }
+                if (sequenceOrdered) {
+                    if (visible) { retained.push_back(*visible); }
+                    std::stable_sort(retained.begin(), retained.end(), [](const auto& a, const auto& b) { return a.seq() < b.seq(); });
+                    for (size_t i = 0; i < retained.size(); ++i) { if (i == 0 || retained[i].seq() != retained[i - 1].seq()) { co_yield retained[i]; } }
+                }
+                else {
+                    // Reapply oldest first so rebuilding does not change which
+                    // version is visible when application and sequence order differ.
+                    for (auto it = retained.rbegin(); it != retained.rend(); ++it) { co_yield *it; }
                 }
             }
         }
@@ -144,6 +154,13 @@ namespace akkaradb::engine::memtable {
             return static_cast<uint32_t>(hash & static_cast<uint64_t>(shardCount - 1));
         }
 
+        [[nodiscard]] uint32_t readShardForKey(std::span<const uint8_t> key, uint32_t shardCount, uint64_t precomputedFp64 = 0) noexcept {
+            // Backend lookups receive the full key and compute any fingerprint they need.
+            // With one shard, the coordinator needs no fingerprint for routing.
+            if (shardCount <= 1) { return 0; }
+            return shardForHash(shardRouteHash(computeFp64(key, precomputedFp64), key.size()), shardCount);
+        }
+
         [[nodiscard]] MemTableFlushMode resolveFlushMode(MemTableFlushMode mode, size_t thresholdBytesPerShard) noexcept {
             if (mode != MemTableFlushMode::AUTO) { return mode; }
             return thresholdBytesPerShard > 0 ? MemTableFlushMode::BYTES_PER_SHARD : MemTableFlushMode::MANUAL_ONLY;
@@ -168,6 +185,7 @@ namespace akkaradb::engine::memtable {
                 std::vector<uint8_t> start,
                 std::vector<uint8_t> end,
                 uint64_t snapshotSeq,
+                bool sequenceOrderedVersions,
                 std::shared_ptr<void> lifetime = {},
                 bool sealedSnapshot = false
             )
@@ -177,8 +195,9 @@ namespace akkaradb::engine::memtable {
                   start_{std::move(start)},
                   end_{std::move(end)},
                   snapshotSeq_{snapshotSeq},
+                  sequenceOrderedVersions_{sequenceOrderedVersions},
                   sealedSnapshot_{sealedSnapshot},
-                  heap_{CursorCompare{&cursors_}} {
+                  heap_{CursorCompare{&cursors_, sequenceOrderedVersions}} {
                 const core::ByteView startView{reinterpret_cast<const std::byte*>(start_.data()), start_.size()};
                 const core::ByteView endView{reinterpret_cast<const std::byte*>(end_.data()), end_.size()};
 
@@ -214,14 +233,23 @@ namespace akkaradb::engine::memtable {
                 std::optional<RecordView> result;
                 for (const auto& table : sources_) {
                     RecordView record;
-                    if (table->get(view, snapshotSeq_, &record) && (!result || record.seq() > result->seq())) { result = record; }
+                    if (table->get(view, snapshotSeq_, &record)) {
+                        if (!sequenceOrderedVersions_) { return record; }
+                        if (!result || record.seq() > result->seq()) { result = record; }
+                    }
                 }
                 return result;
             }
             [[nodiscard]] std::unique_ptr<Impl> fork(const KeyRange& range) const {
                 if (!sealedSnapshot_) { throw std::logic_error("MemTable: iterator fork requires a sealed snapshot"); }
                 return std::make_unique<Impl>(std::vector<std::shared_lock<std::shared_mutex>>{}, sources_,
-                    range.start, range.end, snapshotSeq_, lifetime_, true);
+                    range.start,
+                    range.end,
+                    snapshotSeq_,
+                    sequenceOrderedVersions_,
+                    lifetime_,
+                    true
+                );
             }
 
         private:
@@ -233,13 +261,15 @@ namespace akkaradb::engine::memtable {
 
             struct CursorCompare {
                 const std::vector<SourceCursor>* cursors{nullptr};
+                bool sequenceOrderedVersions = false;
 
                 [[nodiscard]] bool operator()(size_t lhs, size_t rhs) const noexcept {
                     const RecordView& a = (*cursors)[lhs].current;
                     const RecordView& b = (*cursors)[rhs].current;
                     const int keyCmp = a.compareKey(b);
                     if (keyCmp != 0) { return keyCmp > 0; }
-                    return a.seq() < b.seq();
+                    if (sequenceOrderedVersions && a.seq() != b.seq()) { return a.seq() < b.seq(); }
+                    return lhs > rhs;
                 }
             };
 
@@ -259,15 +289,13 @@ namespace akkaradb::engine::memtable {
                 const size_t firstIdx = heap_.top();
                 heap_.pop();
 
-                RecordView best = cursors_[firstIdx].current;
+                const RecordView best = cursors_[firstIdx].current;
                 sameKeyIndices_.push_back(firstIdx);
 
                 while (!heap_.empty()) {
                     const size_t idx = heap_.top();
                     if (cursors_[idx].current.compareKey(best) != 0) { break; }
                     heap_.pop();
-                    const RecordView candidate = cursors_[idx].current;
-                    if (candidate.seq() > best.seq()) { best = candidate; }
                     sameKeyIndices_.push_back(idx);
                 }
 
@@ -285,6 +313,7 @@ namespace akkaradb::engine::memtable {
             std::vector<uint8_t> start_;
             std::vector<uint8_t> end_;
             uint64_t snapshotSeq_ = 0;
+            bool sequenceOrderedVersions_ = false;
             bool sealedSnapshot_ = false;
             std::vector<SourceCursor> cursors_;
             std::priority_queue<size_t, std::vector<size_t>, CursorCompare> heap_;
@@ -295,6 +324,7 @@ namespace akkaradb::engine::memtable {
     struct MemTable::ReadState {
         std::shared_ptr<const IMemTable> active;
         std::vector<std::shared_ptr<const IMemTable>> immutables;
+        bool sequenceOrderedVersions = false;
 
         [[nodiscard]] std::optional<RecordView> get(core::ByteView key, uint64_t snapshotSeq) const {
             std::optional<RecordView> result;
@@ -303,7 +333,10 @@ namespace akkaradb::engine::memtable {
                 if (table && table->get(key, snapshotSeq, &candidate) && (!result || candidate.seq() > result->seq())) { result = candidate; }
             };
             consider(active);
-            for (const auto& immutable : immutables) { consider(immutable); }
+            for (const auto& immutable : immutables) {
+                if (result && !sequenceOrderedVersions) { break; }
+                consider(immutable);
+            }
             return result;
         }
     };
@@ -570,8 +603,7 @@ namespace akkaradb::engine::memtable {
                 if (out == nullptr) { return false; }
 
                 const core::ByteView keyView = toByteView(key);
-                const uint64_t fp64 = computeFp64(key, precomputedFp64);
-                const uint32_t shardIndex = shardForHash(shardRouteHash(fp64, key.size()), shardCount_);
+                const uint32_t shardIndex = readShardForKey(key, shardCount_, precomputedFp64);
                 const auto& shard = *shards_[shardIndex];
 
                 const auto published = shard.published.load(std::memory_order_acquire);
@@ -592,7 +624,7 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] std::optional<PinnedRecord> getPinnedWithSnapshot(
                 std::span<const uint8_t> key, const std::function<uint64_t()>& snapshotSeqProvider) const {
-                const auto index = shardForHash(shardRouteHash(computeFp64(key, 0), key.size()), shardCount_);
+                const auto index = readShardForKey(key, shardCount_);
                 const auto& shard = *shards_[index];
                 const auto source = shard.published.load(std::memory_order_acquire);
                 const uint64_t seq = snapshotSeqProvider();
@@ -641,7 +673,14 @@ namespace akkaradb::engine::memtable {
 
                 const auto snapshotSeq = snapshotSeqProvider();
                 return RangeIterator{
-                    std::make_unique<RangeIterator::Impl>(std::move(scanLocks), std::move(sources), range.start, range.end, snapshotSeq)
+                    std::make_unique<RangeIterator::Impl>(
+                        std::move(scanLocks),
+                        std::move(sources),
+                        range.start,
+                        range.end,
+                        snapshotSeq,
+                        options_.sequenceOrderedVersions
+                    )
                 };
             }
 
@@ -720,7 +759,14 @@ namespace akkaradb::engine::memtable {
                         }
                     }
                     result = std::make_unique<RangeIterator::Impl>(
-                        std::vector<std::shared_lock<std::shared_mutex>>{}, std::move(sources), range.start, range.end, snapshotSeq, std::shared_ptr<void>{}, true
+                        std::vector<std::shared_lock<std::shared_mutex>>{},
+                        std::move(sources),
+                        range.start,
+                        range.end,
+                        snapshotSeq,
+                        options_.sequenceOrderedVersions,
+                        std::shared_ptr<void>{},
+                        true
                     );
                 }
                 catch (...) {
@@ -826,7 +872,10 @@ namespace akkaradb::engine::memtable {
                     snapshotLock.unlock();
                     auto result = std::make_unique<RangeIterator::Impl>(
                         std::vector<std::shared_lock<std::shared_mutex>>{}, std::move(sources), range.start, range.end,
-                        snapshotSeq, std::move(lease), true
+                        snapshotSeq,
+                        options_.sequenceOrderedVersions,
+                        std::move(lease),
+                        true
                     );
                     return RangeIterator{std::move(result)};
                 }
@@ -1044,6 +1093,7 @@ namespace akkaradb::engine::memtable {
                         }
                     }
                     if (capturedSources.size() <= 1) { continue; }
+                    std::reverse(capturedSources.begin(), capturedSources.end());
 
                     auto compacted = makeBackend();
                     if (!compacted) { throw std::invalid_argument("MemTable backend factory returned null"); }
@@ -1057,10 +1107,14 @@ namespace akkaradb::engine::memtable {
                         if (!status.ok()) { throwStatusError("MemTable memory generation compaction", status); }
                     };
                     if (retentionVisibilitySeq_) {
-                        for (const auto& record : retainedFlushRecords(std::move(capturedSources), retentionVisibilitySeq_())) { append(record); }
+                        for (const auto& record : retainedFlushRecords(
+                                 std::move(capturedSources),
+                                 retentionVisibilitySeq_(),
+                                 options_.sequenceOrderedVersions
+                             )) { append(record); }
                     }
                     else {
-                        RangeIterator::Impl merged{{}, std::move(capturedSources), {}, {}, UINT64_MAX};
+                        RangeIterator::Impl merged{{}, std::move(capturedSources), {}, {}, UINT64_MAX, options_.sequenceOrderedVersions};
                         while (merged.hasNext()) { if (const auto record = merged.next()) { append(*record); } }
                     }
                     compacted->freeze();
@@ -1097,10 +1151,10 @@ namespace akkaradb::engine::memtable {
                 }
             }
 
-            [[nodiscard]] static std::shared_ptr<const ReadState> prepareTablesLocked(
-                const Shard& shard, std::shared_ptr<const IMemTable> active) {
+            [[nodiscard]] std::shared_ptr<const ReadState> prepareTablesLocked(const Shard& shard, std::shared_ptr<const IMemTable> active) const {
                 auto published = std::make_shared<Shard::PublishedTables>();
                 published->active = std::move(active);
+                published->sequenceOrderedVersions = options_.sequenceOrderedVersions;
                 published->immutables.reserve(shard.immutables.size());
                 for (auto it = shard.immutables.rbegin(); it != shard.immutables.rend(); ++it) {
                     published->immutables.push_back(std::const_pointer_cast<const IMemTable>(it->table));
@@ -1108,13 +1162,13 @@ namespace akkaradb::engine::memtable {
                 return published;
             }
 
-            static void publishTablesLocked(Shard& shard) {
+            void publishTablesLocked(Shard& shard) const {
                 auto published = prepareTablesLocked(shard, shard.active);
                 shard.immutableCount.store(static_cast<uint32_t>(published->immutables.size()), std::memory_order_release);
                 shard.published.store(std::move(published), std::memory_order_release);
             }
 
-            static void rotateActiveLocked(Shard& shard, std::shared_ptr<IMemTable> replacement) {
+            void rotateActiveLocked(Shard& shard, std::shared_ptr<IMemTable> replacement) {
                 const auto replacementBytes = replacement->sizeBytes();
                 shard.immutables.emplace_back(Shard::Immutable{
                     shard.nextImmutableId, shard.active, shard.activeBytes, shard.activeMinSeq
@@ -1271,7 +1325,7 @@ namespace akkaradb::engine::memtable {
 
     std::optional<MemTable::PinnedRecord> MemTable::ReadSnapshot::getPinned(std::span<const uint8_t> key) const {
         if (shards_.empty()) { return std::nullopt; }
-        const auto index = shardForHash(shardRouteHash(computeFp64(key, 0), key.size()), static_cast<uint32_t>(shards_.size()));
+        const auto index = readShardForKey(key, static_cast<uint32_t>(shards_.size()));
         return Impl::readPinned(shards_[index], key, snapshotSeq_);
     }
 

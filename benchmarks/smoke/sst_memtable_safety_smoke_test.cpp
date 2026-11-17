@@ -163,6 +163,9 @@ int main() {
         testReadSurvivesMemoryCompaction();
         testFlushCallbackSelection();
         for (int backend = 0; backend < 3; ++backend) {
+            for (const bool sequenceOrdered : {false, true}) {
+                for (const bool retainAll : {false, true}) { testGenerationVersionOrder(backend, sequenceOrdered, retainAll); }
+            }
             testMemorySnapshotGrowthAdmission(backend);
             testSequenceOrderedFlush(root / ("sequence-bounded-" + std::to_string(backend)), backend, false);
             testSequenceOrderedFlush(root / ("sequence-retained-" + std::to_string(backend)), backend, true);

@@ -117,8 +117,9 @@ namespace akkaradb::engine::memtable {
             [[nodiscard]] static std::unique_ptr<MemTable> create();
             [[nodiscard]] static std::unique_ptr<MemTable> create(const Options& options);
             // Enables unbounded retention within each generation. Memory-only
-            // compaction retains the newest version <= this monotonic frontier
-            // and every newer version. The provider must be thread-safe and
+            // compaction retains the visible version at this monotonic frontier
+            // under the configured version order and every higher-sequence version.
+            // The provider must be thread-safe and
             // remain valid until this MemTable is destroyed.
             [[nodiscard]] static std::unique_ptr<MemTable> create(
                 const Options& options, std::function<uint64_t()> retentionVisibilitySeq);

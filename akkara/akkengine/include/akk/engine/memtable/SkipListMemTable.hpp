@@ -65,6 +65,13 @@ namespace akkaradb::engine::memtable {
             bool retainAllVersions_ = false;
             bool sequenceOrderedVersions_ = false;
 
+            struct SearchKey {
+                std::span<const uint8_t> bytes;
+                std::array<uint64_t, 2> prefix{};
+
+                explicit SearchKey(std::span<const uint8_t> key) noexcept;
+            };
+
             struct VersionChain {
                 detail::VersionHistory history;
                 std::atomic<uint64_t> version{0};
@@ -83,6 +90,10 @@ namespace akkaradb::engine::memtable {
 
             struct Node {
                 uint8_t level{1};
+                uint16_t keyLength{0};
+                // Immutable, zero-padded, big-endian words allow short keys to
+                // be compared without chasing keyRecord and its payload.
+                std::array<uint64_t, 2> keyPrefix{};
                 const core::OwnedRecord* keyRecord{nullptr};
                 VersionChain* versions{nullptr};
 
@@ -129,9 +140,9 @@ namespace akkaradb::engine::memtable {
                 uint64_t precomputedMk
             );
 
-            [[nodiscard]] static int compareNodeKey(const Node* node, std::span<const uint8_t> key) noexcept;
-            [[nodiscard]] Node* findNodeForWrite(std::span<const uint8_t> key, std::array<Node*, MAX_LEVEL>& update) noexcept;
-            [[nodiscard]] Node* findNodeForRead(std::span<const uint8_t> key) const noexcept;
+            [[nodiscard]] static int compareNodeKey(const Node* node, const SearchKey& key) noexcept;
+            [[nodiscard]] Node* findNodeForWrite(const SearchKey& key, std::array<Node*, MAX_LEVEL>& update) noexcept;
+            [[nodiscard]] Node* findNodeForRead(const SearchKey& key) const noexcept;
 
             void appendVersion(VersionChain* chain, const core::OwnedRecord* record, std::atomic<size_t>& entries);
             [[nodiscard]] static bool visibleRecord(const VersionChain* chain, uint64_t snapshotSeq, RecordView* out) noexcept;

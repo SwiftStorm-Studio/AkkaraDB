@@ -342,35 +342,65 @@ void startElection() {
 std::vector<uint64_t> collectElectionVotes(const std::vector<NodeInfo>& peers, RequestVote request, bool probe) {
     struct Votes {
         std::mutex mutex;
+        std::condition_variable changed;
         std::vector<uint64_t> granted;
+        size_t completed = 0;
+        std::exception_ptr failure;
     };
     auto votes = std::make_shared<Votes>();
     votes->granted.push_back(selfNodeId_);
-    std::vector<std::future<void>> workers;
+    const auto deadline = SocketIoDeadline::cap(detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds{rpcTimeoutMs(500)}));
     for (const auto& peer : peers) {
-        workers.push_back(
-            schedulePeerTask(
-                peer.nodeId,
-                [this, peer, request, probe, votes] {
-                    RequestVoteResponse response;
-                    if (!(probe ? preVote(peer, request, response) : requestVote(peer, request, response))) { return; }
-                    // Probes report actual hard state, not the prospective term.
+        // Tasks retain their result state after quorum is reached. close()
+        // drains peer workers before destroying this runtime.
+        (void)schedulePeerTask(
+            peer.nodeId,
+            [this, peer, request, probe, votes, deadline] {
+                std::exception_ptr failure;
+                try {
+                    const SocketIoDeadline socketDeadline{deadline};
                     const auto actualTerm = probe ? request.term - 1 : request.term;
-                    if (response.term > actualTerm) {
-                        becomeFollower(response.term);
-                        return;
+                    bool current;
+                    {
+                        auto lock = stateLock();
+                        current = running_ && currentTerm_ == actualTerm;
                     }
-                    if (response.voteGranted && (probe || response.term == request.term)) {
-                        std::lock_guard lock{votes->mutex};
-                        votes->granted.push_back(peer.nodeId);
+                    if (current) {
+                        RequestVoteResponse response;
+                        if (probe ? preVote(peer, request, response) : requestVote(peer, request, response)) {
+                            // Late higher-term replies still fence an elected leader.
+                            if (response.term > actualTerm) { becomeFollower(response.term); }
+                            else if (response.voteGranted && (probe || response.term == request.term)) {
+                                std::lock_guard lock{votes->mutex};
+                                votes->granted.push_back(peer.nodeId);
+                            }
+                        }
                     }
                 }
-            )
+                catch (...) {
+                    failure = std::current_exception();
+                    auto lock = stateLock();
+                    stopRuntimeLocked();
+                }
+                {
+                    std::lock_guard lock{votes->mutex};
+                    if (failure && !votes->failure) { votes->failure = failure; }
+                    ++votes->completed;
+                }
+                votes->changed.notify_all();
+            }
         );
     }
-    for (auto& worker : workers) { worker.wait(); }
-    for (auto& worker : workers) { worker.get(); }
-    return std::move(votes->granted);
+    for (;;) {
+        auto state = stateLock();
+        std::unique_lock lock{votes->mutex};
+        if (votes->failure) { std::rethrow_exception(votes->failure); }
+        const auto actualTerm = probe ? request.term - 1 : request.term;
+        if (!running_ || currentTerm_ != actualTerm || hasElectionQuorumLocked(votes->granted) || votes->completed == peers.size() || Clock::now() >=
+            deadline) { return votes->granted; }
+        state.unlock();
+        votes->changed.wait_until(lock, std::min(deadline, Clock::now() + std::chrono::milliseconds{20}));
+    }
 }
 
 RequestVoteResponse handlePreVote(const RequestVote& request) {

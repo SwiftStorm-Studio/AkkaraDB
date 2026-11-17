@@ -96,6 +96,130 @@ summary/sample rows are retained. Abrupt termination may leave no final marker.
 
 ## Operations
 
+### Direct MemTable and MemTable + SST modules (contract v2)
+
+`--storage-only t` uses MemTable/SSTManager directly, excluding AkkEngine, WAL,
+VersionLog, Blob and transactions. Version 2 corrects the first storage-module
+benchmark's unmatched active state and missing end-to-end completion comparison.
+Do not pool v1 and v2 results.
+
+Common rows keep **identical seeded active MemTables** in both configurations.
+Automatic flush is disabled during these API timers. Adding an SST manager does
+not move the seed to disk for these rows. Each pass has a fresh store; warmup writes
+use separate keys, so they do not change the records measured by insert/update/remove.
+Warmup is followed directly by timing, without discarding/reseeding the warmed store.
+
+| Row            | Timed operation / residency                              |
+|----------------|----------------------------------------------------------|
+| `get`          | Active-memory hit with owning value copy and disposal    |
+| `get.miss`     | Active-memory miss                                       |
+| `scan`         | Fully consumed bounded scan over active memory           |
+| `put.insert`   | New-key insertion into the equally seeded active index   |
+| `put.update`   | Append a version to an existing active key in both modes |
+| `remove`       | Tombstone an existing active key in both modes           |
+| `get.sst`      | SST-only warm hit; active MemTable empty (SST mode only) |
+| `get.miss.sst` | SST-only warm miss (SST mode only)                       |
+| `scan.sst`     | SST-only warm bounded scan (SST mode only)               |
+
+The `*.sst` rows deliberately use a different residency and are labeled separately;
+they do not measure the overhead of enabling SST on an identical memory lookup.
+Key/value data and shuffled access order are otherwise shared. Misses use odd
+indexes among seeded even indexes (except the final odd index, just above the range).
+Insertions use precomputed distinct keys above the seeded range. Values consist of
+an 8-byte version and repeated `0x5a` and are highly compressible.
+
+All configurations use one shard, sequence ordering and four retained versions per
+key. SST uses Zstd level 1, 32 KiB blocks, 64 MiB decoded cache, compaction disabled,
+a durable standalone catalog and default Blob-reference metadata tracking.
+Full seed verification warms memory/decoded/OS caches outside timing; this is not
+a cold-disk test. CSV output and post-pass write verification/drains are untimed.
+The common write rows therefore measure **memory application**, not durable writes.
+
+```powershell
+.\akkaradb_akkengine_latency_benchmark.exe --storage-only t --sst f --backend bptree --keys 100000 --iterations 100000 --scan-rows 32 --csv-dir results
+.\akkaradb_akkengine_latency_benchmark.exe --storage-only t --sst t --backend bptree --keys 100000 --iterations 100000 --scan-rows 32 --flush-samples 3 --csv-dir results
+```
+
+`config.csv` includes `storage_contract_version=2` and each operation/pass's memory
+bytes, put/remove counters, flush counters, immutable count and SST file count,
+before and after timing. The runner compares both modes' active-state records and
+rejects mismatches instead of accepting arithmetic-correct CSV as a fair experiment.
+The evidence is saved as `comparison-checks.csv`.
+
+### End-to-end completion and isolated flush
+
+Both modes also produce `batches.csv`:
+
+```text
+sample_index,records,apply_ns,drain_ns,total_ns,completion
+```
+
+Each sample starts **empty**, applies the same shuffled input, then calls
+`forceFlush()`. `total_ns = apply_ns + drain_ns` is measured across the entire
+pipeline. SST mode enables normal 4 MiB automatic flush for this pipeline and waits
+for durable SST/catalog publication; its completion is `durable_sst`. Memory mode
+ends at `memory_applied` and provides no persistence. Both completion meanings are
+explicit; only SST is a durable pipeline. Construction, validation and cleanup are
+outside these timers. There are `--flush-samples` independent batches per run.
+
+SST mode additionally saves `flushes.csv` for a different question: how long it takes
+to persist an already populated, manually held table. Input seeding is excluded;
+rotation, queueing, streaming writing, catalog sync and completion waiting are included.
+Its fields are `sample_index,records,elapsed_ns,ns_per_record`.
+
+### Repeated measurements and sampled function shares
+
+```powershell
+python -B benchmarks/tools/run_storage_module_experiment.py builds/read-scaling/bin results/storage-NEW --keys 100000 --iterations 100000 --scan-rows 32 --repeats 3
+```
+
+Build `akkaradb_akkengine_latency_benchmark` and `akkaradb_windows_cpu_sampler` first.
+Use optimized Release with symbols (`/O2 /Ob2 /DNDEBUG /Z7`, `/DEBUG:FULL /OPT:REF /OPT:ICF`
+for this Windows profiling build). `--no-profiles` measures operation/batch timings
+without Windows profiling; `--backends bptree` narrows the experiment. The output
+directory must be new. On Windows the runner defaults to `--cpu 0`: the entire
+benchmark process (caller and flush workers) is restricted to one logical CPU.
+Use `--cpu N` to select another available CPU. This resource boundary is recorded.
+
+| File                        | Contents                                                                       |
+|-----------------------------|--------------------------------------------------------------------------------|
+| `aggregate.csv`             | Operation/batch means across repeats, min/max, throughput, P50/P99             |
+| `runs.csv`                  | All normal summary rows, with batch completion units                           |
+| `comparison-checks.csv`     | Matched active-state evidence for common operation rows                        |
+| Each normal run             | Config, summary, per-call `samples.csv`, `batches.csv`, optional `flushes.csv` |
+| `function-breakdown.csv`    | Per-operation symbols, exclusive/inclusive sample counts/shares                |
+| Each profile's `functions/` | Raw stacks, symbolized function counts, sampling metadata                      |
+| `metadata.json`             | Commands, machine/workload data, binary/PDB/source hashes, verification        |
+
+Profiling is a separate diagnostic execution. `--profile-operation` selects one row (`flush` selects the persistence callback thread); `--profile-control PATH`
+supplies
+a fresh handshake prefix. A high-resolution waitable timer and start/finish events
+bound external stack sampling to the operation region. Common API profiles do not
+auto-flush. Flush-worker profiles exclude caller rotation/queue/wait time.
+
+Profile iteration count defaults to the normal count. An explicit
+`--profile-iterations` override is recorded and flagged as a different workload;
+`--profile-flush-keys` controls the one diagnostic flush batch. More profile samples
+do not make a mismatched growing index the same experiment.
+
+Function CSV schema v2 intentionally **does not convert samples to nanoseconds**.
+The former exporter multiplied samples from a different run/workload by a normal mean;
+those values were not measured function durations and have been removed. Sampling
+provides bottleneck shares, not per-function clocks or invocation counts. Inclusive
+shares overlap; inlined/folded code may be attributed to a physical enclosing symbol.
+`sparse_profile` marks fewer than 200 total stacks. `normal_workload_matches` records
+whether sizes/contract match; it does not turn diagnostic timing into normal latency.
+
+Regenerate sample shares from retained profiles without rerunning workloads:
+
+```powershell
+python -B benchmarks/tools/summarize_storage_profiles.py results/storage-NEW
+```
+
+`function-breakdown.metadata.json` records exporter/schema/method details. Legacy
+profiles remain usable as diagnostic shares and are marked contract v1, but their
+prior ns estimates and cross-residency overhead comparisons are superseded.
+
 ### Read-path comparison
 
 `--read-comparison t` runs a dedicated memory-only comparison instead of the

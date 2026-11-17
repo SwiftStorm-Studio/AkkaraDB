@@ -373,6 +373,46 @@ namespace {
         throw std::runtime_error(message);
     }
 
+    void testForceSyncSkipsCleanShards() {
+        for (const auto execution : {wal::WalExecutionMode::INLINE, wal::WalExecutionMode::ASYNC}) {
+            const fs::path dir = fs::temp_directory_path() / (execution == wal::WalExecutionMode::INLINE
+                                                                  ? "akkaradb_wal_clean_sync_inline"
+                                                                  : "akkaradb_wal_clean_sync_async");
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+            fs::create_directories(dir);
+            wal::WalOptions options;
+            options.execution = execution;
+            options.syncPolicy = wal::WalSyncPolicy::ON_SYNC_ACK;
+            options.shardCount = 4;
+            const std::vector<uint8_t> key{'k'}, value{'v'};
+            auto writer = wal::WalWriter::create(dir, options);
+            writer->forceSync();
+            require(writer->snapshot().syncsExecuted == 0, "empty shards have no records requiring synchronization");
+            for (uint64_t sequence = 1; sequence <= 2; ++sequence) {
+                writer->append(bytes(key), bytes(value), sequence, 0, sequence, wal::WalAppendAck::ENQUEUED);
+                writer->forceSync();
+                require(writer->snapshot().syncsExecuted == sequence, "forceSync must synchronize only the newly dirty shard");
+                writer->forceSync();
+                require(writer->snapshot().syncsExecuted == sequence, "repeated forceSync must preserve the durable cut without resyncing clean shards");
+                uint64_t recovered = 0;
+                const auto result = wal::WalRecovery::recover({.walDir = dir}, [&](const auto& entry) { recovered = std::max(recovered, entry.seq); });
+                require(result.corruptSegments == 0 && recovered == sequence, "synchronized records must be recoverable while the writer remains open");
+            }
+            writer->close();
+            writer.reset();
+            writer = wal::WalWriter::create(dir, options);
+            writer->forceSync();
+            require(writer->snapshot().syncsExecuted == 0, "reopened checkpointed shards must retain their durable cut");
+            writer->append(bytes(key), bytes(value), 3, 0, 1, wal::WalAppendAck::ENQUEUED);
+            writer->forceSync();
+            require(writer->snapshot().syncsExecuted == 1, "reopened shards must synchronize new writes");
+            writer->close();
+            writer.reset();
+            fs::remove_all(dir, ec);
+        }
+    }
+
     void testEnginePropagatesAsyncWalFailure() {
         const fs::path dir = fs::temp_directory_path() / "akkaradb_engine_wal_async_failure_smoke";
         std::error_code ec;
@@ -424,6 +464,7 @@ int main() {
         testRecoveryChecksPublishedRecordBoundary();
         testLegacyWalRequiresRecreation();
         testWriterTruncatesCorruptTailBeforeAppending();
+        testForceSyncSkipsCleanShards();
         testEnginePropagatesAsyncWalFailure();
         return 0;
     }

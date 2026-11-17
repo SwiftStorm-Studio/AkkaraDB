@@ -344,6 +344,9 @@ namespace akkaradb::engine::wal {
                         if (options_.execution == WalExecutionMode::ASYNC) { drainAsync(); }
 
                         std::lock_guard fileLock{fileMutex_};
+                        // Empty shards contain no records to acknowledge. A checkpoint
+                        // otherwise proves this complete prefix is already synchronized.
+                        if (currentSize_ == WalSegmentHeader::SIZE || checkpointBytes_ == currentSize_) { return; }
                         updateHeaderLocked();
                         flushFile(file_);
                         doFdatasync(file_);

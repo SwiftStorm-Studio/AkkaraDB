@@ -14,6 +14,7 @@
 #include <bit>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,14 @@ namespace akkaradb::engine::sst {
             uint64_t lastMini = 0;
 
             [[nodiscard]] bool empty() const noexcept { return offsets.empty(); }
+
+            void clear() noexcept {
+                raw.clear();
+                offsets.clear();
+                firstKey.clear();
+                lastKey.clear();
+                firstSeq = lastSeq = firstFp = lastFp = firstMini = lastMini = 0;
+            }
         };
 
         [[nodiscard]] uint32_t addKey(std::vector<uint8_t>& arena, std::span<const uint8_t> key) {
@@ -158,19 +167,21 @@ namespace akkaradb::engine::sst {
             block.lastMini = hdr.miniKey;
         }
 
-        [[nodiscard]] std::vector<uint8_t> compressOrRaw(
+        [[nodiscard]] std::span<const uint8_t> compressOrRaw(
             const std::vector<uint8_t>& raw,
             SSTWriter::Codec codec,
             int zstdCompressionLevel,
-            uint32_t& flags
+            uint32_t& flags,
+            ZSTD_CCtx* context,
+            std::vector<uint8_t>& compressed
         ) {
             const auto extraFlags = flags & ~SST_BLOCK_FLAG_RAW;
             flags = extraFlags | SST_BLOCK_FLAG_RAW;
-            if (codec != SSTWriter::Codec::ZSTD || raw.empty()) { return raw; }
+            if (codec != SSTWriter::Codec::ZSTD || raw.empty() || context == nullptr) { return raw; }
 
             const auto bound = ZSTD_compressBound(raw.size());
-            std::vector<uint8_t> compressed(bound);
-            const auto n = ZSTD_compress(compressed.data(), compressed.size(), raw.data(), raw.size(), zstdCompressionLevel);
+            compressed.resize(bound);
+            const auto n = ZSTD_compressCCtx(context, compressed.data(), compressed.size(), raw.data(), raw.size(), zstdCompressionLevel);
             if (ZSTD_isError(n) || n >= raw.size()) { return raw; }
             compressed.resize(n);
             flags = extraFlags | SST_BLOCK_FLAG_COMPRESSED;
@@ -183,13 +194,14 @@ namespace akkaradb::engine::sst {
             uint32_t flags = SST_BLOCK_FLAG_RAW;
         };
 
-        [[nodiscard]] BlockPayload encodePrefixCompressedBlock(const PendingBlock& block) {
-            BlockPayload out;
+        void encodePrefixCompressedBlock(const PendingBlock& block, BlockPayload& out, std::vector<uint8_t>& prevKey) {
+            out.data.clear();
+            out.offsets.clear();
+            prevKey.clear();
             out.flags = SST_BLOCK_FLAG_PREFIX_COMPRESSED;
             out.data.reserve(block.raw.size());
             out.offsets.reserve(block.offsets.size());
 
-            std::vector<uint8_t> prevKey;
             for (const auto off : block.offsets) {
                 if (off + sizeof(core::SSTHdr32) > block.raw.size()) { throw std::runtime_error("SSTWriter: corrupt source block header"); }
                 const auto* hdr = reinterpret_cast<const core::SSTHdr32*>(block.raw.data() + off);
@@ -215,8 +227,6 @@ namespace akkaradb::engine::sst {
 
                 prevKey.assign_range(key);
             }
-
-            return out;
         }
     } // namespace
 
@@ -244,6 +254,7 @@ namespace akkaradb::engine::sst {
 
         SSTWriter::Result result;
         result.path = path;
+        if (options.trackBlobReferences) { result.blobRefs.reserve(std::min<size_t>(estimatedRecordCount, 65536)); }
 
         // The producer may underestimate, overestimate, or reuse its buffers.
         // Retain only one fingerprint per distinct sorted key, then size the
@@ -254,18 +265,24 @@ namespace akkaradb::engine::sst {
         std::vector<SSTBlockIndexEntryV1> index;
         std::vector<uint8_t> keyArena;
         PendingBlock block;
+        BlockPayload encoded;
+        std::vector<uint8_t> previousKey, compressed, offsetsBytes, crcInput;
+        const std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context{
+            options.codec == SSTWriter::Codec::ZSTD ? ZSTD_createCCtx() : nullptr,
+            &ZSTD_freeCCtx
+        };
 
         auto flushBlock = [&] {
             if (block.empty()) { return; }
 
-            const auto encoded = encodePrefixCompressedBlock(block);
+            encodePrefixCompressedBlock(block, encoded, previousKey);
             const auto usePrefixCompressed = !encoded.data.empty() && encoded.data.size() < block.raw.size();
             const auto& rawPayload = usePrefixCompressed ? encoded.data : block.raw;
             const auto& rawOffsets = usePrefixCompressed ? encoded.offsets : block.offsets;
 
             uint32_t blockFlags = usePrefixCompressed ? SST_BLOCK_FLAG_PREFIX_COMPRESSED : 0;
-            const auto payload = compressOrRaw(rawPayload, options.codec, options.zstdCompressionLevel, blockFlags);
-            std::vector<uint8_t> offsetsBytes;
+            const auto payload = compressOrRaw(rawPayload, options.codec, options.zstdCompressionLevel, blockFlags, context.get(), compressed);
+            offsetsBytes.clear();
             offsetsBytes.reserve(rawOffsets.size() * sizeof(uint32_t));
             for (const auto off : rawOffsets) { appendPod(offsetsBytes, off); }
 
@@ -282,7 +299,7 @@ namespace akkaradb::engine::sst {
             bh.firstKeyFp64 = block.firstFp;
             bh.lastKeyFp64 = block.lastFp;
 
-            std::vector<uint8_t> crcInput;
+            crcInput.clear();
             crcInput.reserve(payload.size() + offsetsBytes.size());
             crcInput.append_range(payload);
             crcInput.append_range(offsetsBytes);
@@ -319,7 +336,7 @@ namespace akkaradb::engine::sst {
                 }
             );
 
-            block = PendingBlock{};
+            block.clear();
         };
 
         for (const auto& rec : records) {

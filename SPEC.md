@@ -1029,7 +1029,10 @@ constructing any backend. Point reads and scans select the largest retained
 sequence at or below their visibility cut, consistently before and after flush,
 compaction and restart. Bounded backends retain their highest sequences rather
 than evicting a newer version for a delayed older write. Memory-only engines keep
-application-order behavior unless this option is explicitly enabled. Custom
+application-order behavior unless this option is explicitly enabled. This also
+applies across active and immutable generations, sealed snapshots and memory-only
+compaction: a later-applied lower-sequence update or tombstone must not lose to
+an older generation's higher sequence. Custom
 backends/wrappers used with SST must implement/forward `useSequenceOrder()`;
 unsupported backends fail during initialization before accepting writes.
 
@@ -1037,14 +1040,43 @@ unsupported backends fail during initialization before accepting writes.
 retains all applied versions until persistence or memory-generation compaction.
 An unpublished higher sequence must not evict the currently committed value.
 The `MemTable::create(options, retentionVisibilitySeq)` overload enables this policy for low-level
-callers. Memory-generation compaction keeps the newest sequence at or below
-that monotonic frontier and every newer sequence. This does not provide an
+callers. Memory-generation compaction keeps the visible version at that monotonic
+frontier according to the configured application/sequence order, and every version
+whose sequence is above the frontier. It preserves application order when rebuilding
+an application-ordered generation. This does not provide an
 arbitrary historical-read guarantee after compaction.
 
 Custom `IMemTable` backends used with this policy must implement
 `retainAllVersions()` and `flushIterator()`; wrappers must forward both methods.
+Application-ordered backends emit a key's retained flush versions newest-applied
+first so memory-generation compaction can preserve their ordering.
 Unsupported backends fail during construction, before accepting writes.
 Built-in backends and existing SST/Manifest formats require no migration.
+
+SkipList nodes cache the first 16 key bytes as immutable, zero-padded,
+big-endian comparison words, plus the full key length. Each search prepares its
+query words once; only equal cached prefixes of keys longer than 16 bytes need
+to read the original suffix. Searches reuse the known upper bound across levels
+and return exact matches immediately. Node publication proceeds from level zero
+upwards, so an upper-level hit is already reachable by ordered iteration.
+The existing single-writer/concurrent-reader contract and persisted formats are
+unchanged. On 64-bit builds this cache adds 16 bytes per node, including the head;
+the approximate memory/flush accounting includes those bytes.
+
+ART serializes writes against mutable point readers and freeze. It updates
+unprotected nodes and version chains in place; prefix splits and node-capacity
+growth allocate only the replacement structure. An iterator pins its root when
+first resumed and streams without retaining a tree lock across yields. While
+iterators are active, writes copy protected nodes/chains on the first change in
+each snapshot epoch, preserving the iterator's original records even after
+bounded versions are overwritten. Completing or destroying the iterator releases
+its protection. Frozen iterators need no structural copies.
+ART's byte estimate counts each allocated record, node, chain, prefix and external
+payload once; inline payload is already part of the record. Arena padding, unused
+block capacity and iterator-owned allocations are excluded. Retired arena objects
+remain counted until the generation is destroyed. The corrected estimate can
+delay byte-threshold flushes compared with earlier overcounted values; no
+persisted format or public API changes are involved.
 
 Backend construction options are:
 
@@ -1070,6 +1102,10 @@ Frozen B+Tree MemTables have no structural writers, so they stream directly
 regardless of `bptreeIteratorMode`. This avoids an extra full-scan materialized
 vector during immutable-table flush.
 
+B+Tree insertion reserves all siblings and any new root needed by a split before
+changing existing nodes. An allocation failure leaves existing keys, retained
+versions and ordered flush input intact; the insertion may be retried.
+
 Locked B+Tree nodes cache up to 16 bytes of each key's suffix in contiguous
 comparison arrays. Each node keeps the common prefix of its sorted keys and
 checks it once before searching the suffixes. Prefixes are recomputed at splits
@@ -1092,6 +1128,12 @@ the SST search.
 The call retains its source generations while looking up the record. Its result
 is still borrowed: use `getPinned` to keep the bytes alive after the call when
 flush or memory-generation compaction may run concurrently.
+
+Point reads and `ReadSnapshot::getPinned` select shard zero directly when the
+resolved MemTable has one shard, without computing a routing fingerprint.
+Multiple-shard routing, including precomputed-fingerprint hints, is unchanged.
+Backends still compute any fingerprint needed by their own lookups, and writes
+continue to populate record fingerprints independently of the shard count.
 
 `getInto` and `contains` return:
 
@@ -1195,6 +1237,11 @@ boundaries, not alternate file formats.
 
 `WRITTEN` means the WAL batch has been written/flushed to the operating-system
 file cache. `SYNCED` requires a sync policy capable of issuing storage sync.
+
+`forceSync()` drains asynchronous appends and synchronizes each shard with an
+unpublished record prefix. Empty shards and prefixes already covered by a durable
+checkpoint require no additional sync. New records, including after reopen or
+rotation, must reach the segment and checkpoint before the call completes.
 
 ### 10.3 Async Failure Semantics
 
@@ -1383,6 +1430,14 @@ record with an empty input set. In-memory publication also installs the complete
 set at once. A crash before this commit publishes none of the batch; a crash
 after it recovers every output. Uncertain publication failures retain the files
 for replay. SST and Manifest v1 layouts are unchanged.
+
+Flush stages reference metadata through `Manifest::stageSstBlobRefs()` and uses
+the following seal/commit as the durability barrier for both records. In sync
+mode this avoids a separate reference-record sync; SST file sync, durable rename
+and publication sync remain required before flush returns. The original
+`sstBlobRefs()` operation retains its existing sync-mode durability semantics.
+SSTWriter reuses one Zstd context and block work buffers within each output file;
+compressed/raw block selection, checksums and on-disk layouts are unchanged.
 
 A recovery checkpoint advances
 only through the contiguous publication frontier and below every unflushed
@@ -5157,6 +5212,16 @@ and PLAIN/SECURE one-way partitions followed by catch-up without leader churn.
 It also checks election and linearizable access after a real leader failure and
 explicit leadership transfer. These scenarios are included in default cluster
 smoke; the focused CTest target shares its loopback resource lock.
+
+`akkaradb_cluster_runtime_regressions_test` (`--cluster-runtime-regressions`)
+covers repeated older AppendEntries prefixes during and after application,
+monotonic persisted commit indexes, MIRROR Primary host overrides, and elections
+with a slowly streaming minority peer. PreVote and RequestVote rounds advance
+once their current membership quorum is reached; remaining peer tasks own their
+results until completion and still process higher-term replies. One monotonic
+RPC deadline bounds queue admission, connection setup, and all partial I/O.
+Ordinary vote and heartbeat I/O re-arms socket timeouts with the remaining budget
+without creating a watchdog thread per RPC.
 
 Raft pipeline tests additionally cover PLAIN and SECURE connection reuse,
 128 outstanding proposals, fewer persistence batches than proposals, concurrent

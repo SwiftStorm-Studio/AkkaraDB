@@ -11,6 +11,7 @@
 #include "akk/engine/manifest/ManifestFraming.hpp"
 #include <chrono>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <utility>
 
@@ -48,7 +49,9 @@ namespace akkaradb::engine::manifest {
             void u16(uint16_t v) { integer(v, 2); }
             void u32(uint32_t v) { integer(v, 4); }
             void u64(uint64_t v) { integer(v, 8); }
-            void string(const std::string& value) {
+            void string(const std::string& value) { string(std::span{reinterpret_cast<const uint8_t*>(value.data()), value.size()}); }
+
+            void string(std::span<const uint8_t> value) {
                 const auto n = checkedSize(value.size());
                 u32(n);
                 if (n > UINT32_MAX - bytes.size()) {
@@ -271,6 +274,17 @@ namespace akkaradb::engine::manifest {
     }
     std::vector<uint8_t> encodeSstBlobRefs(uint64_t ts, const std::string& name, const std::vector<SSTBlobRefEntry>& entries) {
         Writer w;
+        size_t size = 16;
+        const auto addSize = [&](size_t bytes) {
+            if (bytes > UINT32_MAX - size) { throw std::length_error("Manifest: payload too large"); }
+            size += bytes;
+        };
+        addSize(name.size());
+        for (const auto& entry : entries) {
+            addSize(21);
+            addSize(entry.key.size());
+        }
+        w.bytes.reserve(size);
         w.u64(ts);
         w.string(name);
         w.u32(checkedSize(entries.size()));
@@ -278,7 +292,7 @@ namespace akkaradb::engine::manifest {
             w.u64(e.seq);
             w.u64(e.blobId.value_or(MANIFEST_ABSENT_U64));
             w.u8(e.flags);
-            w.string(std::string(e.key.begin(), e.key.end()));
+            w.string(std::span{e.key});
         }
         return std::move(w.bytes);
     }

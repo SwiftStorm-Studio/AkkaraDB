@@ -347,7 +347,13 @@ namespace akkaradb::engine::memtable {
         };
     }
 
-    std::optional<BPTreeMemTable::SplitResult> BPTreeMemTable::insertRecursive(Node* node, const core::OwnedRecord* record) {
+    std::optional<BPTreeMemTable::SplitResult> BPTreeMemTable::insertRecursive(
+        Node* node,
+        const core::OwnedRecord* record,
+        InsertPath* parent,
+        Node*& newRoot
+    ) {
+        InsertPath path{node, parent};
         const std::span<const uint8_t> key = record->key();
 
         if (node->isLeaf) {
@@ -362,9 +368,8 @@ namespace akkaradb::engine::memtable {
                 }
             }
 
-            VersionChain* chain = makeChain(record);
-
             if (keyCount < MAX_KEYS) {
+                VersionChain* chain = makeChain(record);
                 beginWrite(node);
                 for (uint16_t i = keyCount; i > pos; --i) {
                     node->keys[i].store(node->keys[i - 1].load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -377,6 +382,14 @@ namespace akkaradb::engine::memtable {
                 endWrite(node);
                 return std::nullopt;
             }
+
+            // Reserve every sibling and possible new root before changing the
+            // leaf. No allocation may fail while propagating its split upward.
+            for (auto* pending = &path; pending && pending->node->keyCount.load(std::memory_order_relaxed) == MAX_KEYS; pending = pending->parent) {
+                pending->right = makeNode(pending->node->isLeaf);
+                if (!pending->parent) { newRoot = makeNode(false); }
+            }
+            VersionChain* chain = makeChain(record);
 
             std::array<const core::OwnedRecord*, MAX_KEYS + 1> allKeys{};
             std::array<VersionChain*, MAX_KEYS + 1> allChains{};
@@ -398,7 +411,7 @@ namespace akkaradb::engine::memtable {
                 ++wi;
             }
 
-            Node* right = makeNode(true);
+            Node* right = path.right;
 
             const uint16_t total = static_cast<uint16_t>(MAX_KEYS + 1);
             const uint16_t leftCount = static_cast<uint16_t>(total / 2);
@@ -444,7 +457,7 @@ namespace akkaradb::engine::memtable {
         Node* child = node->children[childIndex].load(std::memory_order_relaxed);
         if (child == nullptr) { return std::nullopt; }
 
-        std::optional<SplitResult> childSplit = insertRecursive(child, record);
+        std::optional<SplitResult> childSplit = insertRecursive(child, record, &path, newRoot);
         if (!childSplit.has_value()) { return std::nullopt; }
 
         const uint16_t keyCount = node->keyCount.load(std::memory_order_relaxed);
@@ -485,7 +498,7 @@ namespace akkaradb::engine::memtable {
         const uint16_t totalKeys = static_cast<uint16_t>(MAX_KEYS + 1);
         const uint16_t mid = static_cast<uint16_t>(totalKeys / 2);
 
-        Node* right = makeNode(false);
+        Node* right = path.right;
 
         beginWrite(node);
 
@@ -562,10 +575,10 @@ namespace akkaradb::engine::memtable {
         const core::OwnedRecord* record = makeRecord(keyU8, valueU8, seq, flags, precomputedFp64, precomputedMk);
 
         Node* currentRoot = root_.load(std::memory_order_acquire);
-        std::optional<SplitResult> split = insertRecursive(currentRoot, record);
+        Node* newRoot = nullptr;
+        std::optional<SplitResult> split = insertRecursive(currentRoot, record, nullptr, newRoot);
         if (!split.has_value()) { return Status::OK(); }
 
-        Node* newRoot = makeNode(false);
         newRoot->keys[0].store(split->separator, std::memory_order_relaxed);
         newRoot->children[0].store(currentRoot, std::memory_order_relaxed);
         newRoot->children[1].store(split->right, std::memory_order_relaxed);

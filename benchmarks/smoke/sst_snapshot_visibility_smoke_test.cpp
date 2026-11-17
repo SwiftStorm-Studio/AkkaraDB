@@ -563,6 +563,50 @@ namespace {
         fs::remove_all(dir, ec);
     }
 
+    void testReusableWriterBuffers() {
+        namespace fs = std::filesystem;
+        namespace sst = akkaradb::engine::sst;
+        const auto dir = fs::current_path() / ".bench-tmp" / "sst_reused_buffers";
+        std::error_code error;
+        fs::remove_all(dir, error);
+        fs::create_directories(dir);
+        std::vector<std::vector<uint8_t>> keys, values;
+        std::vector<akkaradb::core::RecordView> records;
+        keys.reserve(256);
+        values.reserve(256);
+        records.reserve(256);
+        uint64_t random = 0xB10C5EED;
+        for (size_t i = 0; i < 256; ++i) {
+            keys.emplace_back(16, 0);
+            keys.back()[0] = 'k';
+            keys.back()[15] = static_cast<uint8_t>(i);
+            values.emplace_back(i % 17 == 0 ? 20000 : 1000, 'v');
+            if (i % 16 >= 8) {
+                for (auto& byte : values.back()) {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    byte = static_cast<uint8_t>(random);
+                }
+            }
+            records.push_back(record(keys.back(), values.back(), i + 1));
+        }
+        for (const auto codec : {sst::SSTWriter::Codec::NONE, sst::SSTWriter::Codec::ZSTD}) {
+            sst::SSTWriter::Options options;
+            options.codec = codec;
+            options.blockSize = 4096;
+            const auto path = dir / (codec == sst::SSTWriter::Codec::NONE ? "raw.aksst" : "zstd.aksst");
+            const auto written = sst::SSTWriter::write(path, records, options);
+            require(written.entryCount == records.size(), "reused buffers lost records");
+            auto reader = sst::SSTReader::open(path);
+            require(reader != nullptr, "reused buffers produced unreadable metadata");
+            for (size_t i = 0; i < keys.size(); ++i) {
+                const auto found = reader->get(bytes(keys[i]));
+                require(found && found->seq == i + 1 && found->value == values[i], "reused buffers corrupted a block boundary");
+            }
+        }
+    }
+
     void testZstdCompressionLevel() {
         namespace fs = std::filesystem;
         namespace sst = akkaradb::engine::sst;
@@ -834,6 +878,56 @@ namespace {
 #endif
     }
 
+    int runStagedReferencesChild(const std::string& mode, const std::string& point, const std::filesystem::path& dir) {
+        namespace mf = akkaradb::engine::manifest;
+        using Entry = mf::Manifest::SSTBlobRefsEvent::Entry;
+        auto manifest = mf::Manifest::create(dir / "state.akmf", mode == "fast");
+        manifest->stageSstBlobRefs("A.aksst", {Entry{{'b'}, 3, 2, 7}, Entry{{'a'}, 2, 0, std::nullopt}, Entry{{'a'}, 1, 2, 8}, Entry{{'b'}, 3, 2, 7}});
+        manifest->stageSstBlobRefs("B.aksst", {Entry{{'c'}, 4, 2, 9}, Entry{{'d'}, 5, 0, std::nullopt}});
+        require(manifest->liveSst().empty(), "staging references published an SST");
+        if (point == "compact-seal") { manifest->compact(); }
+        if (point == "seal" || point == "compact-seal") { manifest->sstSeal(0, "A.aksst", 3, std::nullopt, std::nullopt); }
+        else if (point == "commit") { manifest->compactionCommit({"A.aksst", "B.aksst"}, {}); }
+        else { require(point == "staged", "unknown staged-reference boundary"); }
+        std::_Exit(86);
+    }
+
+    void testStagedReferencesCrashRecovery(const std::filesystem::path& executable) {
+        namespace fs = std::filesystem;
+        namespace mf = akkaradb::engine::manifest;
+        const auto root = fs::current_path() / ".bench-tmp" / "manifest_staged_refs";
+        std::error_code error;
+        fs::remove_all(root, error);
+        fs::create_directories(root);
+        for (const std::string mode : {"sync", "fast"}) {
+            for (const std::string point : {"staged", "seal", "compact-seal", "commit"}) {
+                const auto dir = root / (mode + "-" + point);
+                fs::create_directories(dir);
+                const auto args = "\"" + executable.string() + "\" --manifest-staged-ref-child " + mode + " " + point + " \"" + dir.string() + "\"";
+                #ifdef _WIN32
+                require(std::system(("\"" + args + "\"").c_str()) == 86, "staged-reference child did not reach its boundary");
+                #else
+                require(std::system(args.c_str()) == (86 << 8), "staged-reference child did not reach its boundary");
+                #endif
+                auto manifest = mf::Manifest::create(dir / "state.akmf");
+                const bool single = point == "seal" || point == "compact-seal";
+                const auto expectedFiles = point == "staged" ? 0u : single ? 1u : 2u;
+                require(manifest->liveSst().size() == expectedFiles, "staged-reference publication did not survive process exit");
+                require(manifest->sstBlobRefsComplete(), "durable publication lost staged metadata");
+                const auto expectedBlobs = point == "staged" ? std::vector<uint64_t>{} : single ? std::vector<uint64_t>{7} : std::vector<uint64_t>{7, 9};
+                require(manifest->sstReferencedBlobs() == expectedBlobs, "staged metadata lost overwrite or Blob visibility");
+                if (expectedFiles != 0) {
+                    const auto refs = manifest->sstBlobRefs();
+                    const auto a = std::ranges::find_if(refs, [](const auto& ref) { return ref.file == "A.aksst"; });
+                    require(
+                        a != refs.end() && a->entries.size() == 3 && a->entries[0].seq == 1 && a->entries[1].seq == 2,
+                        "staged metadata lost sorting or duplicate removal"
+                    );
+                }
+            }
+        }
+    }
+
     int runSstLifecycleCrashChild(const std::string& mode, const std::string& point, const std::filesystem::path& dir) {
         namespace sst = akkaradb::engine::sst; namespace mf = akkaradb::engine::manifest;
         std::unique_ptr<mf::Manifest> manifest;
@@ -878,8 +972,11 @@ namespace {
         std::error_code ec; fs::remove_all(root, ec); fs::create_directories(root);
         const std::vector<uint8_t> a{'a'}, b{'b'}, c{'c'}, d{'d'}, old{'o'}, newer{'n'}, kept{'c'}, added{'d'}, empty;
         for (const std::string mode : {"standalone", "fast"}) {
-            for (const std::string point : {"sst.flush.after_rename", "sst.flush.after_manifest_seal",
-                "sst.compaction.after_output_tmp_write", "sst.compaction.after_output_rename", "sst.compaction.after_manifest_commit",
+            for (const std::string point : {
+                     "sst.flush.after_rename",
+                     "sst.flush.after_manifest_refs",
+                     "sst.flush.after_manifest_seal",
+                     "sst.compaction.after_output_tmp_write", "sst.compaction.after_output_rename", "sst.compaction.after_manifest_commit",
                 "sst.compaction.after_first_input_delete", "sst.compaction.after_input_delete"}) {
                 const auto dir = root / (mode + "-" + point); fs::create_directories(dir);
                 const std::string args = "\"" + executable.string() + "\" --sst-lifecycle-crash-child " + mode + " " + point + " \"" + dir.string() + "\"";
@@ -896,7 +993,7 @@ namespace {
                     require(l0 == 2, "partial-deletion fixture must delete one of the three L0 inputs");
                 }
                 const bool flushOnly = point.starts_with("sst.flush.");
-                const bool sealed = point != "sst.flush.after_rename";
+                const bool sealed = point == "sst.flush.after_manifest_seal";
                 const bool committed = point == "sst.compaction.after_manifest_commit" || point.ends_with("input_delete");
                 sst::SSTManager::Options options; options.maxLevels = 2; options.compactionMode = sst::SSTCompactionMode::DISABLED;
                 for (int pass = 0; pass < 2; ++pass) {
@@ -1401,6 +1498,7 @@ int main(int argc, char** argv) {
             runManifestRotationSyncChild(std::filesystem::path{argv[2]}, true);
             throw std::runtime_error("rotation child did not reach the sync boundary");
         }
+        if (argc == 5 && std::string_view{argv[1]} == "--manifest-staged-ref-child") { return runStagedReferencesChild(argv[2], argv[3], argv[4]); }
         if (argc == 5 && std::string{argv[1]} == "--sst-lifecycle-crash-child") {
             return runSstLifecycleCrashChild(argv[2], argv[3], std::filesystem::path{argv[4]});
         }
@@ -1490,12 +1588,14 @@ int main(int argc, char** argv) {
         testManifestRecoveryPrunesCompactionArtifacts();
         testManifestCompactPreservesReplayState();
         testZstdCompressionLevel();
+        testReusableWriterBuffers();
         testL0RecoveryUsesNumericFileOrder();
         testSstCorruptionDetection();
         testOutOfOrderSstVersions();
         testLateFlushAgainstCompactedVersions();
         testMissingSstCatalogFailsClosed();
         testSstLifecycleCrashRecovery(fs::absolute(fs::path{argv[0]}));
+        testStagedReferencesCrashRecovery(fs::absolute(fs::path{argv[0]}));
         testManifestV1LargeRecords();
         testLargeSstCompactionRoundTrip();
         testManifestV1LongKeysAndVersionRejection();

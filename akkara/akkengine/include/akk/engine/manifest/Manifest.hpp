@@ -35,8 +35,8 @@ namespace akkaradb::engine::manifest {
      * Thread-safety: All public methods are thread-safe.
      *
      * Modes:
-     *   - Sync mode (fastMode=false): Every write is followed by fdatasync.
-     *     Suitable for correctness-critical paths.
+     *   - Sync mode (fastMode=false): Mutations sync before returning, except
+     *     stageSstBlobRefs(), whose following seal/commit is the barrier.
      *   - Fast mode (fastMode=true): Writes are batched by a background
      *     flusher thread and fsynced periodically.  Lower latency but
      *     relaxed durability for other events. SST seal, compaction commit
@@ -208,6 +208,15 @@ namespace akkaradb::engine::manifest {
 
             /** Records the complete key/version/blob-reference set contained in one SST file. */
             void sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries);
+
+            /**
+             * Stages reference metadata before SST publication. Unlike
+             * sstBlobRefs(), this is not a durability barrier in sync mode.
+             * A subsequent sstSeal() or compactionCommit() durably saves both
+             * records before publishing the file. Unsealed metadata is ignored
+             * by live-reference lookup and discarded during SST recovery.
+             */
+            void stageSstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries);
 
             /**
              * Records a truncation marker (informational).

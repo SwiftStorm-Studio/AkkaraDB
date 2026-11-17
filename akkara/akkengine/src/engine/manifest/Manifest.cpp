@@ -330,10 +330,14 @@ namespace akkaradb::engine::manifest {
                 deletedSst_.erase(file);
             }
 
-            void sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) {
+            void sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) { recordSstBlobRefs(file, entries, true); }
+
+            void stageSstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) { recordSstBlobRefs(file, entries, false); }
+
+            void recordSstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries, bool synchronize) {
                 std::lock_guard apiLock{apiMutex_};
                 const uint64_t ts = nowUs();
-                append(ManifestRecordType::SST_BLOB_REFS, encodeSstBlobRefs(ts, file, toFramingEntries(entries)));
+                append(ManifestRecordType::SST_BLOB_REFS, encodeSstBlobRefs(ts, file, toFramingEntries(entries)), synchronize);
 
                 std::lock_guard lock{mutex_};
                 sstBlobRefsByFile_[file] = SSTBlobRefsEvent{file, sortedUniqueEntries(entries), ts};
@@ -768,15 +772,12 @@ namespace akkaradb::engine::manifest {
             }
 
             static std::vector<SSTBlobRefsEvent::Entry> sortedUniqueEntries(std::vector<SSTBlobRefsEvent::Entry> entries) {
-                std::sort(
-                    entries.begin(),
-                    entries.end(),
-                    [](const auto& lhs, const auto& rhs) {
-                        if (lhs.key != rhs.key) { return lhs.key < rhs.key; }
-                        if (lhs.seq != rhs.seq) { return lhs.seq < rhs.seq; }
-                        return lhs.blobId.value_or(0) < rhs.blobId.value_or(0);
-                    }
-                );
+                const auto less = [](const auto& lhs, const auto& rhs) {
+                    if (lhs.key != rhs.key) { return lhs.key < rhs.key; }
+                    if (lhs.seq != rhs.seq) { return lhs.seq < rhs.seq; }
+                    return lhs.blobId.value_or(0) < rhs.blobId.value_or(0);
+                };
+                if (!std::is_sorted(entries.begin(), entries.end(), less)) { std::sort(entries.begin(), entries.end(), less); }
                 entries.erase(
                     std::unique(
                         entries.begin(),
@@ -912,7 +913,7 @@ namespace akkaradb::engine::manifest {
                 return payload;
             }
 
-            void append(ManifestRecordType type, std::vector<uint8_t> payload) {
+            void append(ManifestRecordType type, std::vector<uint8_t> payload, bool synchronize = true) {
                 payload = buildRecord(type, std::move(payload));
                 std::lock_guard lock{rotationMutex_};
                 if (!ownershipLock_) { throw std::runtime_error("Manifest: already closed"); }
@@ -930,7 +931,7 @@ namespace akkaradb::engine::manifest {
                     try {
                         checkRotation();
                         fileHandle_.write(payload.data(), payload.size());
-                        fileHandle_.fsyncData();
+                        if (synchronize) { fileHandle_.fsyncData(); }
                         currentFileSize_ += payload.size();
                     }
                     catch (...) {
@@ -1303,6 +1304,8 @@ namespace akkaradb::engine::manifest {
     void Manifest::sstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) {
         impl_->sstBlobRefs(file, entries);
     }
+
+    void Manifest::stageSstBlobRefs(const std::string& file, const std::vector<SSTBlobRefsEvent::Entry>& entries) { impl_->stageSstBlobRefs(file, entries); }
 
     void Manifest::truncate(const std::optional<std::string>& reason) { impl_->truncate(reason); }
 

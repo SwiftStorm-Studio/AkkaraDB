@@ -315,3 +315,73 @@ void testReadSurvivesMemoryCompaction() {
     reader.join();
     waitFor([&] { return gate->destroyed.load(); });
 }
+
+void testGenerationVersionOrder(int backend, bool sequenceOrdered, bool retainAll) {
+    auto options = optionsFor(backend);
+    options.sequenceOrderedVersions = sequenceOrdered;
+    auto memory = retainAll ? mt::MemTable::create(options, [] { return uint64_t{10}; }) : mt::MemTable::create(options);
+    memory->put(bytes("key"), bytes("old"), 20);
+    memory->put(bytes("tombstone"), bytes("old"), 20);
+    auto first = memory->sealAndPinMemoryIterator({}, UINT64_MAX, true, 0, 8);
+    memory->put(bytes("key"), bytes("new"), 10);
+    memory->remove(bytes("tombstone"), 10);
+
+    const auto checkRecord = [&](const RecordView& row, bool deletion) {
+        require(row.seq() == (sequenceOrdered ? 20 : 10), "generation merge changed version precedence");
+        require(row.isTombstone() == (deletion && !sequenceOrdered), "generation merge resurrected a deletion");
+        if (!row.isTombstone()) { require(row.valueString() == (sequenceOrdered ? "old" : "new"), "generation merge returned the wrong value"); }
+    };
+    const auto checkScan = [&](mt::MemTable::RangeIterator rows) {
+        for (const bool deletion : {false, true}) {
+            require(rows.hasNext(), "generation merge lost a scan row");
+            const auto row = rows.next();
+            require(row && row->keyString() == (deletion ? "tombstone" : "key"), "generation merge changed key order");
+            checkRecord(*row, deletion);
+        }
+        require(!rows.hasNext(), "generation merge duplicated a scan row");
+    };
+    const auto checkLiveReads = [&] {
+        const auto read = memory->readSnapshot([] { return UINT64_MAX; });
+        for (const bool deletion : {false, true}) {
+            const auto key = bytes(deletion ? "tombstone" : "key");
+            const auto pinned = memory->getPinned(key, UINT64_MAX);
+            require(pinned.has_value(), "generation merge lost a point read");
+            checkRecord(pinned->view, deletion);
+            RecordView borrowed;
+            require(memory->get(key, UINT64_MAX, &borrowed), "generation merge lost a borrowed point read");
+            checkRecord(borrowed, deletion);
+            const auto captured = read.getPinned(key);
+            require(captured.has_value(), "generation merge lost a captured point read");
+            checkRecord(captured->view, deletion);
+            const auto sampled = memory->getPinnedWithSnapshot(key, [] { return UINT64_MAX; });
+            require(sampled.has_value(), "generation merge lost a sampled point read");
+            checkRecord(sampled->view, deletion);
+            const bool live = sequenceOrdered || !deletion;
+            require(memory->contains(key, UINT64_MAX) == std::optional<bool>{live}, "contains used different version precedence");
+            std::vector<uint8_t> value{'x'};
+            require(memory->getInto(key, UINT64_MAX, value) == std::optional<bool>{live}, "getInto used different version precedence");
+            require(std::string(value.begin(), value.end()) == (live ? (sequenceOrdered ? "old" : "new") : "x"), "getInto changed the wrong value buffer");
+        }
+        checkScan(memory->iterator({}, UINT64_MAX));
+        checkScan(memory->iteratorWithSnapshot({}, [] { return UINT64_MAX; }));
+        checkScan(memory->pinnedIterator({}, [] { return UINT64_MAX; }));
+    };
+    checkLiveReads();
+    require(first->get(bytes("key"))->valueString() == "old", "later writes changed an older sealed snapshot");
+    auto second = memory->sealAndPinMemoryIterator({}, UINT64_MAX, true, 0, 8);
+    for (const bool deletion : {false, true}) {
+        const auto row = second->get(bytes(deletion ? "tombstone" : "key"));
+        require(row.has_value(), "sealed snapshot lost a generation");
+        checkRecord(*row, deletion);
+    }
+    checkScan(second->fork({}));
+    checkScan(std::move(*second));
+    first.reset();
+    second.reset();
+    waitFor([&] { return memory->snapshot().memorySnapshotCompactionsCompleted != 0 && !memory->snapshot().memorySnapshotCompactionPending; });
+    checkLiveReads();
+    if (retainAll) {
+        const auto visible = memory->getPinned(bytes("tombstone"), 10);
+        require(visible && visible->view.isTombstone(), "compaction lost the publication frontier's deletion");
+    }
+}

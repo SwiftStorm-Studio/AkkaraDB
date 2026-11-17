@@ -131,7 +131,8 @@ bool exchangeRpc(
     const std::vector<std::vector<uint8_t>>* pipeline = nullptr,
     std::vector<AppendEntriesResponse>* appendResponses = nullptr
 ) {
-    const auto deadline = detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds(timeoutMs));
+    const auto deadline = SocketIoDeadline::cap(detail::ReconfigurationDeadline::cap(Clock::now() + std::chrono::milliseconds(timeoutMs)));
+    if (Clock::now() >= deadline) { return false; }
     auto worker = forwardRequest ? std::make_shared<PeerWorker>() : peerWorker(peer.nodeId);
     struct ForwardChannelGuard {
         Impl* owner = nullptr;
@@ -223,6 +224,9 @@ bool exchangeRpc(
     }
     std::unique_lock ioLock{worker->ioMutex, std::defer_lock};
     if (!ioLock.try_lock_until(deadline)) { return false; }
+    // Re-arm each blocking I/O with the remaining shared budget. This also
+    // bounds ordinary votes/heartbeats without a watchdog thread per RPC.
+    const SocketIoDeadline socketDeadline{deadline};
     std::unique_ptr<detail::ForwardDeadline> forwardDeadline;
     if (submitted || pipeline || detail::ReconfigurationDeadline::current().deadline != Clock::time_point::max()) {
         forwardDeadline = std::make_unique<detail::ForwardDeadline>(

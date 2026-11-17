@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 #include "akk/core/record/KeyFingerprint.hpp"
@@ -57,6 +58,25 @@ namespace akkaradb::engine::memtable {
           generatorArenaInitialBlockSize_{generatorArenaInitialBlockSize},
           generatorArenaMaxBlockSize_{generatorArenaMaxBlockSize} { (void)backendOptions; }
 
+    ARTMemTable::SnapshotPin::SnapshotPin(const ARTMemTable& table)
+        : owner{table}, root{nullptr}, registered{false} {
+        std::unique_lock lock{owner.treeMutex_};
+        if (!owner.frozen_.load(std::memory_order_acquire)) {
+            if (owner.writeEpoch_ == UINT64_MAX) { throw std::overflow_error("ART snapshot epoch exhausted"); }
+            ++owner.writeEpoch_;
+            ++owner.activeSnapshots_;
+            registered = true;
+        }
+        root = owner.root_.load(std::memory_order_acquire);
+    }
+
+    ARTMemTable::SnapshotPin::~SnapshotPin() {
+        if (registered) {
+            std::unique_lock lock{owner.treeMutex_};
+            --owner.activeSnapshots_;
+        }
+    }
+
     std::span<const uint8_t> ARTMemTable::asU8(ByteView view) noexcept {
         return {reinterpret_cast<const uint8_t*>(view.data()), view.size()};
     }
@@ -89,42 +109,49 @@ namespace akkaradb::engine::memtable {
 
     ARTMemTable::VersionChain* ARTMemTable::makeChain(const core::OwnedRecord* initial) {
         VersionChain* chain = arenaNew<VersionChain>();
+        chain->epoch = writeEpoch_;
         chain->history.sequenceOrdered = sequenceOrderedVersions_;
         if (retainAllVersions_) { chain->history.append(initial, dataArena_, bytes_); }
         chain->ring[0] = initial;
         chain->head = 0;
         chain->count = 1;
-        entries_.fetch_add(1, std::memory_order_relaxed);
         return chain;
     }
 
-    ARTMemTable::VersionChain* ARTMemTable::appendChain(const VersionChain* previous, const core::OwnedRecord* record) {
-        if (previous == nullptr) { return makeChain(record); }
-
-        VersionChain* chain = arenaNew<VersionChain>();
-        chain->history.sequenceOrdered = sequenceOrderedVersions_;
+    ARTMemTable::VersionChain* ARTMemTable::appendChain(VersionChain* previous, const core::OwnedRecord* record, bool& grew) {
+        VersionChain* chain = previous;
+        if (activeSnapshots_ != 0 && previous->epoch != writeEpoch_) {
+            chain = arenaNew<VersionChain>();
+            chain->epoch = writeEpoch_;
+            chain->history.sequenceOrdered = sequenceOrderedVersions_;
+            chain->ring = previous->ring;
+            chain->head = previous->head;
+            chain->count = previous->count;
+        }
         if (retainAllVersions_) {
             chain->history.append(record, dataArena_, bytes_, &previous->history);
-            entries_.fetch_add(1, std::memory_order_relaxed);
+            grew = true;
             return chain;
         }
-        chain->ring = previous->ring;
         if (sequenceOrderedVersions_) {
             uint16_t head = previous->head;
             uint16_t count = previous->count;
-            const bool grew = detail::insertSequenceOrdered(MAX_VERSIONS_PER_KEY, head, count, record,
+            grew = detail::insertSequenceOrdered(
+                MAX_VERSIONS_PER_KEY,
+                head,
+                count,
+                record,
                 [&](uint16_t index) { return chain->ring[index]; },
                 [&](uint16_t index, const core::OwnedRecord* value) { chain->ring[index] = value; });
             chain->head = static_cast<uint8_t>(head);
             chain->count = static_cast<uint8_t>(count);
-            if (grew) { entries_.fetch_add(1, std::memory_order_relaxed); }
             return chain;
         }
+        grew = previous->count < MAX_VERSIONS_PER_KEY;
         chain->head = static_cast<uint8_t>((previous->head + 1) & (MAX_VERSIONS_PER_KEY - 1));
         chain->count = previous->count < MAX_VERSIONS_PER_KEY ? static_cast<uint8_t>(previous->count + 1) : previous->count;
         chain->ring[chain->head] = record;
 
-        if (previous->count < MAX_VERSIONS_PER_KEY) { entries_.fetch_add(1, std::memory_order_relaxed); }
         return chain;
     }
 
@@ -141,7 +168,8 @@ namespace akkaradb::engine::memtable {
 
         core::OwnedRecord* record = arenaNew<core::OwnedRecord>();
         core::OwnedRecord::createInplace(*record, key, value, seq, flags, dataArena_, fp64, mini);
-        bytes_.fetch_add(sizeof(core::OwnedRecord) + key.size() + value.size(), std::memory_order_relaxed);
+        // arenaNew already counts the record, including its inline payload.
+        if (record->data.isArena()) { bytes_.fetch_add(key.size() + value.size(), std::memory_order_relaxed); }
         return record;
     }
 
@@ -233,6 +261,91 @@ namespace akkaradb::engine::memtable {
         return nullptr;
     }
 
+    void ARTMemTable::replaceChild(NodeBase* node, uint8_t edge, NodeBase* child) noexcept {
+        switch (node->kind) {
+            case NodeBase::Kind::NODE4: {
+                auto* n = static_cast<Node4*>(node);
+                for (uint16_t i = 0; i < n->childCount; ++i) {
+                    if (n->keys[i] == edge) {
+                        n->children[i] = child;
+                        return;
+                    }
+                }
+                return;
+            }
+            case NodeBase::Kind::NODE16: {
+                auto* n = static_cast<Node16*>(node);
+                for (uint16_t i = 0; i < n->childCount; ++i) {
+                    if (n->keys[i] == edge) {
+                        n->children[i] = child;
+                        return;
+                    }
+                }
+                return;
+            }
+            case NodeBase::Kind::NODE48: {
+                auto* n = static_cast<Node48*>(node);
+                n->children[n->childIndex[edge]] = child;
+                return;
+            }
+            case NodeBase::Kind::NODE256: static_cast<Node256*>(node)->children[edge] = child;
+                return;
+        }
+    }
+
+    ARTMemTable::NodeBase* ARTMemTable::addChild(NodeBase* node, uint8_t edge, NodeBase* child) {
+        const size_t count = node->childCount;
+        if ((node->kind == NodeBase::Kind::NODE4 && count == 4) || (node->kind == NodeBase::Kind::NODE16 && count == 16) || (node->kind ==
+            NodeBase::Kind::NODE48 && count == 48)) {
+            ChildVec children;
+            exportChildren(node, children);
+            insertChildSorted(children, edge, child);
+            return buildNode({node->prefix, node->prefixLen}, node->terminal, children);
+        }
+
+        const auto insert = [count, edge, child](auto& keys, auto& children) {
+            size_t pos = count;
+            while (pos != 0 && keys[pos - 1] > edge) {
+                keys[pos] = keys[pos - 1];
+                children[pos] = children[pos - 1];
+                --pos;
+            }
+            keys[pos] = edge;
+            children[pos] = child;
+        };
+        switch (node->kind) {
+            case NodeBase::Kind::NODE4: {
+                auto* n = static_cast<Node4*>(node);
+                insert(n->keys, n->children);
+                break;
+            }
+            case NodeBase::Kind::NODE16: {
+                auto* n = static_cast<Node16*>(node);
+                insert(n->keys, n->children);
+                break;
+            }
+            case NodeBase::Kind::NODE48: {
+                auto* n = static_cast<Node48*>(node);
+                insert(n->orderedKeys, n->children);
+                for (size_t i = 0; i <= count; ++i) { n->childIndex[n->orderedKeys[i]] = static_cast<uint8_t>(i); }
+                break;
+            }
+            case NodeBase::Kind::NODE256: {
+                auto* n = static_cast<Node256*>(node);
+                size_t pos = count;
+                while (pos != 0 && n->orderedKeys[pos - 1] > edge) {
+                    n->orderedKeys[pos] = n->orderedKeys[pos - 1];
+                    --pos;
+                }
+                n->orderedKeys[pos] = edge;
+                n->children[edge] = child;
+                break;
+            }
+        }
+        ++node->childCount;
+        return node;
+    }
+
     bool ARTMemTable::childAt(const NodeBase* node, uint16_t index, uint8_t* edge, const NodeBase** child) noexcept {
         if (node == nullptr || edge == nullptr || child == nullptr || index >= node->childCount) { return false; }
 
@@ -273,6 +386,7 @@ namespace akkaradb::engine::memtable {
 
         if (n <= 4) {
             Node4* node = arenaNew<Node4>(prefixPtr, pfxLen, terminal);
+            node->epoch = writeEpoch_;
             node->childCount = static_cast<uint16_t>(n);
             for (size_t i = 0; i < n; ++i) {
                 node->keys[i] = children[i].first;
@@ -282,6 +396,7 @@ namespace akkaradb::engine::memtable {
         }
         if (n <= 16) {
             Node16* node = arenaNew<Node16>(prefixPtr, pfxLen, terminal);
+            node->epoch = writeEpoch_;
             node->childCount = static_cast<uint16_t>(n);
             for (size_t i = 0; i < n; ++i) {
                 node->keys[i] = children[i].first;
@@ -291,6 +406,7 @@ namespace akkaradb::engine::memtable {
         }
         if (n <= 48) {
             Node48* node = arenaNew<Node48>(prefixPtr, pfxLen, terminal);
+            node->epoch = writeEpoch_;
             node->childCount = static_cast<uint16_t>(n);
             node->childIndex.fill(0xFF);
             for (size_t i = 0; i < n; ++i) {
@@ -302,6 +418,7 @@ namespace akkaradb::engine::memtable {
         }
 
         Node256* node = arenaNew<Node256>(prefixPtr, pfxLen, terminal);
+        node->epoch = writeEpoch_;
         node->childCount = static_cast<uint16_t>(n);
         for (size_t i = 0; i < n; ++i) {
             const uint8_t k = children[i].first;
@@ -318,23 +435,21 @@ namespace akkaradb::engine::memtable {
         return buildNode(suffix, chain, empty);
     }
 
-    ARTMemTable::NodeBase* ARTMemTable::cloneWith(
-        const NodeBase* node,
-        std::span<const uint8_t> prefix,
-        VersionChain* terminal,
-        const ChildVec& children
-    ) {
-        (void)node;
-        return buildNode(prefix, terminal, children);
+    ARTMemTable::NodeBase* ARTMemTable::writableNode(NodeBase* node) {
+        if (activeSnapshots_ == 0 || node->epoch == writeEpoch_) { return node; }
+        ChildVec children;
+        exportChildren(node, children);
+        return buildNode({node->prefix, node->prefixLen}, node->terminal, children);
     }
 
     ARTMemTable::InsertResult ARTMemTable::insertRecursive(
-        const NodeBase* node,
+        NodeBase* node,
         std::span<const uint8_t> key,
         size_t depth,
         const core::OwnedRecord* record
     ) {
-        if (node == nullptr) { return {buildLeaf(key.subspan(depth), record), true, true}; }
+        if (node == nullptr) { return {buildLeaf(key.subspan(depth), record), true}; }
+        node = writableNode(node);
 
         const std::span<const uint8_t> nodePrefix = node->prefixLen == 0
                                                         ? std::span<const uint8_t>{}
@@ -343,11 +458,7 @@ namespace akkaradb::engine::memtable {
 
         const size_t matched = commonPrefix(nodePrefix, remaining);
         if (matched < nodePrefix.size()) {
-            ChildVec originalChildren;
-            exportChildren(node, originalChildren);
-
             const uint8_t existingEdge = nodePrefix[matched];
-            NodeBase* existingChild = cloneWith(node, nodePrefix.subspan(matched + 1), node->terminal, originalChildren);
 
             ChildVec splitChildren;
             splitChildren.reserve(2);
@@ -359,58 +470,40 @@ namespace akkaradb::engine::memtable {
                 NodeBase* newChild = buildLeaf(remaining.subspan(matched + 1), record);
                 if (newEdge < existingEdge) {
                     splitChildren.emplace_back(newEdge, newChild);
-                    splitChildren.emplace_back(existingEdge, existingChild);
+                    splitChildren.emplace_back(existingEdge, node);
                 }
                 else {
-                    splitChildren.emplace_back(existingEdge, existingChild);
+                    splitChildren.emplace_back(existingEdge, node);
                     splitChildren.emplace_back(newEdge, newChild);
                 }
             }
-            if (matched == remaining.size()) { splitChildren.emplace_back(existingEdge, existingChild); }
+            if (matched == remaining.size()) { splitChildren.emplace_back(existingEdge, node); }
 
             NodeBase* parent = buildNode(nodePrefix.first(matched), newTerminal, splitChildren);
-            return {parent, true, true};
+            // All potentially throwing allocations precede the structural edit.
+            node->prefix += matched + 1;
+            node->prefixLen = static_cast<uint16_t>(nodePrefix.size() - matched - 1);
+            return {parent, true};
         }
 
         depth += nodePrefix.size();
         if (depth == key.size()) {
             if (node->terminal != nullptr) {
-                VersionChain* terminal = appendChain(node->terminal, record);
-                ChildVec children;
-                exportChildren(node, children);
-                NodeBase* updated = cloneWith(node, nodePrefix, terminal, children);
-                return {updated, true, false};
+                bool grew = false;
+                node->terminal = appendChain(node->terminal, record, grew);
+                return {node, grew};
             }
-            VersionChain* terminal = makeChain(record);
-            ChildVec children;
-            exportChildren(node, children);
-            NodeBase* updated = cloneWith(node, nodePrefix, terminal, children);
-            return {updated, true, true};
+            node->terminal = makeChain(record);
+            return {node, true};
         }
 
         const uint8_t edge = key[depth];
         NodeBase* child = findChild(node, edge);
-        if (child == nullptr) {
-            ChildVec children;
-            exportChildren(node, children);
-            insertChildSorted(children, edge, buildLeaf(key.subspan(depth + 1), record));
-            NodeBase* updated = cloneWith(node, nodePrefix, node->terminal, children);
-            return {updated, true, true};
-        }
+        if (child == nullptr) { return {addChild(node, edge, buildLeaf(key.subspan(depth + 1), record)), true}; }
 
         InsertResult childResult = insertRecursive(child, key, depth + 1, record);
-        if (!childResult.treeChanged) { return {const_cast<NodeBase*>(node), false, childResult.insertedNewKey}; }
-
-        ChildVec children;
-        exportChildren(node, children);
-        for (auto& entry : children) {
-            if (entry.first == edge) {
-                entry.second = childResult.node;
-                break;
-            }
-        }
-        NodeBase* updated = cloneWith(node, nodePrefix, node->terminal, children);
-        return {updated, true, childResult.insertedNewKey};
+        replaceChild(node, edge, childResult.node);
+        return {node, childResult.entryAdded};
     }
 
     bool ARTMemTable::getFromRoot(const NodeBase* root, std::span<const uint8_t> key, uint64_t snapshotSeq, RecordView* out) const {
@@ -447,7 +540,8 @@ namespace akkaradb::engine::memtable {
         const std::span<const uint8_t> end{endKey.data(), endKey.size()};
         if (!start.empty() && !end.empty() && compareKeyBytes(start, end) >= 0) { co_return; }
 
-        const NodeBase* root = root_.load(std::memory_order_acquire);
+        const SnapshotPin snapshot{*this};
+        const NodeBase* root = snapshot.root;
         if (root == nullptr) { co_return; }
 
         if (start.empty() && end.empty()) {
@@ -601,6 +695,7 @@ namespace akkaradb::engine::memtable {
     }
 
     Status ARTMemTable::put(ByteView key, ByteView value, uint64_t seq, uint8_t flags, uint64_t precomputedFp64, uint64_t precomputedMk) {
+        std::unique_lock lock{treeMutex_};
         if (frozen_.load(std::memory_order_acquire)) { return Status::Error(Status::Code::INVALID_ARGUMENT, "memtable is frozen"); }
         if (key.size() > std::numeric_limits<uint16_t>::max() || value.size() > std::numeric_limits<uint16_t>::max()) {
             return Status::Error(Status::Code::INVALID_ARGUMENT, "key/value too large for MemHdr16");
@@ -612,11 +707,14 @@ namespace akkaradb::engine::memtable {
 
         NodeBase* root = root_.load(std::memory_order_acquire);
         InsertResult result = insertRecursive(root, keyU8, 0, record);
-        if (result.treeChanged) { root_.store(result.node, std::memory_order_release); }
+        root_.store(result.node, std::memory_order_release);
+        if (result.entryAdded) { entries_.fetch_add(1, std::memory_order_relaxed); }
         return Status::OK();
     }
 
     bool ARTMemTable::get(ByteView key, uint64_t snapshotSeq, RecordView* out) const {
+        std::shared_lock lock{treeMutex_, std::defer_lock};
+        if (!frozen_.load(std::memory_order_acquire)) { lock.lock(); }
         const std::span<const uint8_t> keyU8 = asU8(key);
         const NodeBase* root = root_.load(std::memory_order_acquire);
         return getFromRoot(root, keyU8, snapshotSeq, out);
@@ -638,11 +736,13 @@ namespace akkaradb::engine::memtable {
     }
 
     void ARTMemTable::retainAllVersions() {
+        std::unique_lock lock{treeMutex_};
         if (entryCount() != 0) { throw std::logic_error("MemTable: retention must be configured before writing"); }
         retainAllVersions_ = true;
     }
 
     void ARTMemTable::useSequenceOrder() {
+        std::unique_lock lock{treeMutex_};
         if (entryCount() != 0) { throw std::logic_error("MemTable: version order must be configured before writing"); }
         sequenceOrderedVersions_ = true;
     }
@@ -654,7 +754,10 @@ namespace akkaradb::engine::memtable {
             [this] { return iterateSnapshotRange(UINT64_MAX, {}, {}, true); });
     }
 
-    void ARTMemTable::freeze() { frozen_.store(true, std::memory_order_release); }
+    void ARTMemTable::freeze() {
+        std::unique_lock lock{treeMutex_};
+        frozen_.store(true, std::memory_order_release);
+    }
 
     size_t ARTMemTable::sizeBytes() const { return bytes_.load(std::memory_order_acquire); }
 

@@ -9,6 +9,35 @@
 
 
 // Included inside the anonymous namespace in RaftConsensusRuntime.cpp.
+class SocketIoDeadline {
+    static inline thread_local Clock::time_point current_ = Clock::time_point::max();
+    Clock::time_point previous_;
+
+    public:
+        explicit SocketIoDeadline(Clock::time_point deadline) : previous_{current_} { current_ = cap(deadline); }
+        ~SocketIoDeadline() { current_ = previous_; }
+        static Clock::time_point cap(Clock::time_point deadline) { return std::min(current_, deadline); }
+
+        static bool prepare(SocketHandle socket, int option) {
+            if (current_ == Clock::time_point::max()) { return true; }
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(current_ - Clock::now()).count();
+            if (remaining <= 0) { return false; }
+            const auto milliseconds = std::min<int64_t>(remaining, std::numeric_limits<int>::max());
+            #ifdef _WIN32
+            const auto timeout = static_cast<DWORD>(milliseconds); return ::setsockopt(
+                socket,
+                SOL_SOCKET,
+                option,
+                reinterpret_cast<const char*>(&timeout),
+                sizeof(timeout)
+            ) == 0;
+            #else
+            const timeval timeout{static_cast<time_t>(milliseconds / 1000), static_cast<suseconds_t>((milliseconds % 1000) * 1000)};
+            return ::setsockopt(socket, SOL_SOCKET, option, &timeout, sizeof(timeout)) == 0;
+            #endif
+        }
+};
+
 void configureNoSigPipe(SocketHandle s) noexcept {
     #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
     int enabled = 1; (void)::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
@@ -20,6 +49,7 @@ void configureNoSigPipe(SocketHandle s) noexcept {
 bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
     size_t sent = 0;
     while (sent < size) {
+        if (!SocketIoDeadline::prepare(s, SO_SNDTIMEO)) { return false; }
         #ifdef _WIN32
         const auto rc = ::send(s, reinterpret_cast<const char*>(data + sent), static_cast<int>(size - sent), 0);
         if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }
@@ -39,6 +69,7 @@ bool sendAll(SocketHandle s, const uint8_t* data, size_t size) {
 bool recvAll(SocketHandle s, uint8_t* data, size_t size) {
     size_t got = 0;
     while (got < size) {
+        if (!SocketIoDeadline::prepare(s, SO_RCVTIMEO)) { return false; }
         #ifdef _WIN32
         const auto rc = ::recv(s, reinterpret_cast<char*>(data + got), static_cast<int>(size - got), 0);
         if (rc < 0 && ::WSAGetLastError() == WSAEINTR) { continue; }

@@ -53,8 +53,9 @@ namespace {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 6) {
-            std::cerr << "Usage: windows_cpu_sampler PID TID CONTROL_PREFIX OUTPUT_DIR SYMBOL_DIR\n";
+        const bool activeWindow = argc == 7 && std::string{argv[6]} == "--active-window";
+        if (argc != 6 && !activeWindow) {
+            std::cerr << "Usage: windows_cpu_sampler PID TID CONTROL_PREFIX OUTPUT_DIR SYMBOL_DIR [--active-window]\n";
             return 2;
         }
         const DWORD pid = std::stoul(argv[1]), tid = std::stoul(argv[2]);
@@ -65,6 +66,17 @@ int main(int argc, char** argv) {
         if (!process.value || !thread.value || GetProcessIdOfThread(thread.value) != pid) {
             throw std::runtime_error("could not open the selected process/thread");
         }
+        const auto eventName = L"Local\\AkkStorageProfile-" + std::to_wstring(pid) + L"-" + std::to_wstring(tid);
+        const Handle started{activeWindow ? OpenEventW(SYNCHRONIZE, FALSE, (eventName + L"-started").c_str()) : nullptr};
+        const Handle finished{activeWindow ? OpenEventW(SYNCHRONIZE, FALSE, (eventName + L"-finished").c_str()) : nullptr};
+        if (activeWindow && (!started.value || !finished.value)) { throw std::runtime_error("profile window events are unavailable"); }
+        // sleep_for(1ms) can round up to the system timer period. Prefer a
+        // high-resolution waitable timer without changing process-wide timer policy.
+        HANDLE timerHandle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        const bool highResolutionTimer = timerHandle != nullptr;
+        if (!timerHandle) { timerHandle = CreateWaitableTimerW(nullptr, FALSE, nullptr); }
+        const Handle timer{timerHandle};
+        if (!timer.value) { throw std::runtime_error("could not create sampling timer"); }
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
         if (!SymInitialize(process.value, argv[5], TRUE)) { throw std::runtime_error("SymInitialize failed"); }
         Symbols symbols{process.value};
@@ -83,9 +95,23 @@ int main(int argc, char** argv) {
         go << "attached\n";
         go.close();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
-        while (!std::filesystem::exists(control.string() + ".done") && WaitForSingleObject(process.value, 0) == WAIT_TIMEOUT) {
+        const auto stopped = [&] {
+            return WaitForSingleObject(process.value, 0) != WAIT_TIMEOUT || (activeWindow
+                                                                                 ? WaitForSingleObject(finished.value, 0) == WAIT_OBJECT_0
+                                                                                 : std::filesystem::exists(control.string() + ".done"));
+        };
+        while (activeWindow && WaitForSingleObject(started.value, 0) != WAIT_OBJECT_0 && !stopped()) {
+            if (std::chrono::steady_clock::now() > deadline) { throw std::runtime_error("profile window did not start"); }
+            (void)WaitForSingleObject(started.value, 10);
+        }
+        while (!stopped()) {
             if (std::chrono::steady_clock::now() > deadline) { throw std::runtime_error("sampling exceeded five minutes"); }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            LARGE_INTEGER due{};
+            due.QuadPart = -10'000; // Relative 1ms, in 100ns units.
+            if (!SetWaitableTimer(timer.value, &due, 0, nullptr, nullptr, FALSE) || WaitForSingleObject(timer.value, 1000) != WAIT_OBJECT_0) {
+                throw std::runtime_error("sampling timer failed");
+            }
+            if (stopped()) { break; }
             std::vector<DWORD64> stack;
             stack.reserve(48);
             const auto paused = std::chrono::steady_clock::now();
@@ -143,8 +169,8 @@ int main(int argc, char** argv) {
                 << 100.0 * count.first / stacks.size() << ',' << 100.0 * count.second / stacks.size() << '\n';
         }
         metadata << "method=external SuspendThread/GetThreadContext/StackWalk64 wall-clock stack sampling\n"
-            << "pid=" << pid << "\ntid=" << tid << "\nsamples=" << stacks.size() << "\nfailed_samples=" << failures
-            << "\ntarget_pause_ns=" << pauseNs << "\nrequested_sleep_ms=1\n"
+            << "pid=" << pid << "\ntid=" << tid << "\nsamples=" << stacks.size() << "\nfailed_samples=" << failures << "\nactive_window_events=" << activeWindow
+            << "\nhigh_resolution_timer=" << highResolutionTimer << "\ntarget_pause_ns=" << pauseNs << "\nrequested_sleep_ms=1\n"
             << "This is an intrusive diagnostic run, not a throughput measurement.\n"
             << "Samples can include off-CPU waits; percentages are wall-clock observations, not hardware CPU counters.\n"
             << "Optimized/inlined functions can be attributed to their enclosing symbol.\n";

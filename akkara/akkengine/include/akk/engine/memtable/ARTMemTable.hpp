@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -62,6 +63,7 @@ namespace akkaradb::engine::memtable {
 
             struct VersionChain {
                 detail::VersionHistory history;
+                uint64_t epoch{0};
                 uint8_t head{0};
                 uint8_t count{0};
                 std::array<const core::OwnedRecord*, MAX_VERSIONS_PER_KEY> ring{};
@@ -79,6 +81,7 @@ namespace akkaradb::engine::memtable {
                 uint16_t prefixLen{0};
                 const uint8_t* prefix{nullptr};
                 VersionChain* terminal{nullptr};
+                uint64_t epoch{0};
 
                 NodeBase(Kind k, uint16_t count, const uint8_t* pfx, uint16_t pfxLen, VersionChain* term) noexcept
                     : kind{k}, childCount{count}, prefixLen{pfxLen}, prefix{pfx}, terminal{term} {}
@@ -117,8 +120,21 @@ namespace akkaradb::engine::memtable {
 
             struct InsertResult {
                 NodeBase* node{nullptr};
-                bool treeChanged{false};
-                bool insertedNewKey{false};
+                bool entryAdded{false};
+            };
+
+            // Iterators pin an immutable root without holding a lock across a
+            // yield. Writes copy a protected node only on its first change in
+            // the current epoch; with no iterators, all updates are in place.
+            struct SnapshotPin {
+                const ARTMemTable& owner;
+                const NodeBase* root;
+                bool registered;
+
+                explicit SnapshotPin(const ARTMemTable& table);
+                ~SnapshotPin();
+                SnapshotPin(const SnapshotPin&) = delete;
+                SnapshotPin& operator=(const SnapshotPin&) = delete;
             };
 
             using ChildEntry = std::pair<uint8_t, NodeBase*>;
@@ -127,6 +143,10 @@ namespace akkaradb::engine::memtable {
             core::BufferArena dataArena_;
             size_t generatorArenaInitialBlockSize_{64 * 1024};
             size_t generatorArenaMaxBlockSize_{2 * 1024 * 1024};
+
+            mutable std::shared_mutex treeMutex_;
+            mutable uint64_t writeEpoch_{0};
+            mutable size_t activeSnapshots_{0};
 
             std::atomic<NodeBase*> root_{nullptr};
             std::atomic<bool> frozen_{false};
@@ -146,7 +166,7 @@ namespace akkaradb::engine::memtable {
 
             [[nodiscard]] const uint8_t* copyPrefix(std::span<const uint8_t> prefix);
             [[nodiscard]] VersionChain* makeChain(const core::OwnedRecord* initial);
-            [[nodiscard]] VersionChain* appendChain(const VersionChain* previous, const core::OwnedRecord* record);
+            [[nodiscard]] VersionChain* appendChain(VersionChain* previous, const core::OwnedRecord* record, bool& grew);
             [[nodiscard]] core::OwnedRecord* makeRecord(
                 std::span<const uint8_t> key,
                 std::span<const uint8_t> value,
@@ -162,21 +182,18 @@ namespace akkaradb::engine::memtable {
             static void exportChildren(const NodeBase* node, ChildVec& out);
             static void insertChildSorted(ChildVec& children, uint8_t edge, NodeBase* child);
             [[nodiscard]] static NodeBase* findChild(const NodeBase* node, uint8_t key) noexcept;
+            static void replaceChild(NodeBase* node, uint8_t edge, NodeBase* child) noexcept;
+            [[nodiscard]] NodeBase* addChild(NodeBase* node, uint8_t edge, NodeBase* child);
             [[nodiscard]] static bool childAt(const NodeBase* node, uint16_t index, uint8_t* edge, const NodeBase** child) noexcept;
             template <typename Fn>
             static void forEachChild(const NodeBase* node, Fn&& fn);
 
             [[nodiscard]] NodeBase* buildNode(std::span<const uint8_t> prefix, VersionChain* terminal, const ChildVec& children);
             [[nodiscard]] NodeBase* buildLeaf(std::span<const uint8_t> suffix, const core::OwnedRecord* record);
-            [[nodiscard]] NodeBase* cloneWith(
-                const NodeBase* node,
-                std::span<const uint8_t> prefix,
-                VersionChain* terminal,
-                const ChildVec& children
-            );
+            [[nodiscard]] NodeBase* writableNode(NodeBase* node);
 
             [[nodiscard]] InsertResult insertRecursive(
-                const NodeBase* node,
+                NodeBase* node,
                 std::span<const uint8_t> key,
                 size_t depth,
                 const core::OwnedRecord* record

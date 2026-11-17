@@ -134,10 +134,14 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_sstable_bloom_negative_lookup_benchmark|benchmarks/throughput/sstable_bloom_negative_lookup_benchmark.cpp
         akkaradb_bptree_mutable_concurrency_stress_test|benchmarks/smoke/bptree_mutable_concurrency_stress_test.cpp
         akkaradb_bptree_key_search_smoke_test|benchmarks/smoke/bptree_key_search_smoke_test.cpp
+        akkaradb_bptree_insertion_failure_smoke_test|benchmarks/smoke/bptree_insertion_failure_smoke_test.cpp
+        akkaradb_art_memtable_regression_test|benchmarks/smoke/art_memtable_regression_test.cpp
+        akkaradb_skiplist_key_search_smoke_test|benchmarks/smoke/skiplist_key_search_smoke_test.cpp
         akkaradb_cluster_observability_test|benchmarks/smoke/cluster_observability_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
         akkaradb_memtable_lifecycle_smoke_test|benchmarks/smoke/memtable_lifecycle_smoke_test.cpp
         akkaradb_parallel_memtable_visibility_smoke_test|benchmarks/smoke/parallel_memtable_visibility_smoke_test.cpp
+        akkaradb_memtable_read_routing_smoke_test|benchmarks/smoke/memtable_read_routing_smoke_test.cpp
         akkaradb_query_planner_smoke_test|benchmarks/smoke/query_planner_smoke_test.cpp
         akkaradb_version_log_admission_visibility_smoke_test|benchmarks/smoke/version_log_admission_visibility_smoke_test.cpp
         akkaradb_version_log_fault_injection_smoke_test|benchmarks/smoke/version_log_fault_injection_smoke_test.cpp
@@ -210,6 +214,24 @@ target_sources(akkaradb_memtable_snapshot_failure_smoke_test PRIVATE
 )
 target_compile_definitions(akkaradb_memtable_snapshot_failure_smoke_test PRIVATE AKKARADB_STATIC)
 
+# Keep arena allocation in this executable so failure injection reaches splits
+# even when the engine is built as a Windows DLL.
+target_sources(akkaradb_bptree_insertion_failure_smoke_test PRIVATE
+        akkara/akkengine/src/engine/memtable/BPTreeMemTable.cpp
+        akkara/akkengine/src/core/buffer/BufferArena.cpp
+        akkara/akkengine/src/core/record/OwnedRecord.cpp
+        akkara/akkengine/src/core/record/KeyFingerprint.cpp
+)
+target_compile_definitions(akkaradb_bptree_insertion_failure_smoke_test PRIVATE AKKARADB_STATIC)
+
+target_sources(akkaradb_art_memtable_regression_test PRIVATE
+        akkara/akkengine/src/engine/memtable/ARTMemTable.cpp
+        akkara/akkengine/src/core/buffer/BufferArena.cpp
+        akkara/akkengine/src/core/record/OwnedRecord.cpp
+        akkara/akkengine/src/core/record/KeyFingerprint.cpp
+)
+target_compile_definitions(akkaradb_art_memtable_regression_test PRIVATE AKKARADB_STATIC)
+
 add_dependencies(akkaradb_memtable_throughput_benchmark akkaradb_prepare_diskspd)
 add_dependencies(akkaradb_sstable_throughput_benchmark akkaradb_prepare_diskspd)
 
@@ -259,6 +281,9 @@ endif()
 
 set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_bptree_key_search_smoke_test
+        akkaradb_bptree_insertion_failure_smoke_test
+        akkaradb_art_memtable_regression_test
+        akkaradb_skiplist_key_search_smoke_test
         akkaradb_latency_measurement_smoke_test
         akkaradb_transaction_smoke_test
         akkaradb_arena_smoke_test
@@ -267,6 +292,7 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_cluster_smoke_test
         akkaradb_memtable_lifecycle_smoke_test
         akkaradb_parallel_memtable_visibility_smoke_test
+        akkaradb_memtable_read_routing_smoke_test
         akkaradb_query_planner_smoke_test
         akkaradb_version_log_admission_visibility_smoke_test
         akkaradb_version_log_fault_injection_smoke_test
@@ -366,6 +392,8 @@ if (AKKARADB_BUILD_TESTS)
     set_tests_properties(akkaradb_raft_sequence_gap_test akkaradb_cluster_read_apply_order_test
             PROPERTIES LABELS "cluster;raft;transactions;regression" TIMEOUT 90 RESOURCE_LOCK akkaradb_cluster_loopback)
     add_test(NAME akkaradb_cluster_integrity_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --cluster-integrity)
+    add_test(NAME akkaradb_cluster_runtime_regressions_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --cluster-runtime-regressions)
+    set_tests_properties(akkaradb_cluster_runtime_regressions_test PROPERTIES LABELS "cluster;raft;replication;regression" TIMEOUT 60 RESOURCE_LOCK akkaradb_cluster_loopback)
     add_test(NAME akkaradb_raft_state_recovery_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --raft-state-recovery)
     add_test(NAME akkaradb_stripe_state_recovery_test COMMAND $<TARGET_FILE:akkaradb_cluster_smoke_test> --stripe-state-recovery)
     set_tests_properties(akkaradb_stripe_state_recovery_test PROPERTIES LABELS "cluster;stripe;recovery;regression" TIMEOUT 180 RESOURCE_LOCK akkaradb_cluster_loopback)
@@ -492,6 +520,9 @@ if (AKKARADB_BUILD_TESTS)
         PROPERTIES TIMEOUT 30 LABELS "sst;concurrency;regression")
     set_tests_properties(akkaradb_sst_memtable_safety_smoke_test PROPERTIES TIMEOUT 30 LABELS "sst;memtable;regression")
     set_tests_properties(akkaradb_sst_sequence_order_smoke_test akkaradb_memtable_snapshot_failure_smoke_test
+            akkaradb_bptree_insertion_failure_smoke_test
+            akkaradb_art_memtable_regression_test
+            akkaradb_skiplist_key_search_smoke_test
         PROPERTIES TIMEOUT 30 LABELS "sst;memtable;regression")
     set_tests_properties(akkaradb_transaction_smoke_test PROPERTIES TIMEOUT 180 LABELS "transactions;recovery")
     set_tests_properties(akkaradb_sst_resources_smoke_test PROPERTIES TIMEOUT 90 LABELS "sst;resources;recovery;regression")
