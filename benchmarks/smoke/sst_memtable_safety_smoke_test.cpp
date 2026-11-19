@@ -1,5 +1,6 @@
 #include "TestErrorHandlers.hpp"
 #include "akk/engine/memtable/ARTMemTable.hpp"
+#include "akk/engine/memtable/WormholeMemTable.hpp"
 #include "akk/engine/memtable/BPTreeMemTable.hpp"
 #include "akk/engine/memtable/MemTable.hpp"
 #include "akk/engine/memtable/SkipListMemTable.hpp"
@@ -47,6 +48,7 @@ namespace {
         options.backendFactory = [backend]() -> std::unique_ptr<mt::IMemTable> {
             if (backend == 0) { return std::make_unique<mt::SkipListMemTable>(); }
             if (backend == 1) { return std::make_unique<mt::BPTreeMemTable>(); }
+            if (backend == 3) { return std::make_unique<mt::WormholeMemTable>(); }
             return std::make_unique<mt::ARTMemTable>();
         };
         return options;
@@ -162,7 +164,7 @@ int main() {
         testOwnedRecordSstLookup(root / "owned-record");
         testReadSurvivesMemoryCompaction();
         testFlushCallbackSelection();
-        for (int backend = 0; backend < 3; ++backend) {
+        for (int backend = 0; backend < 4; ++backend) {
             for (const bool sequenceOrdered : {false, true}) {
                 for (const bool retainAll : {false, true}) { testGenerationVersionOrder(backend, sequenceOrdered, retainAll); }
             }

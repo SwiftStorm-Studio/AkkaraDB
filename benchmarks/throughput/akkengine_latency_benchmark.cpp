@@ -11,6 +11,7 @@
 #include "LatencyMeasurement.hpp"
 #include "akk/engine/AkkEngine.hpp"
 #include "akk/engine/memtable/ARTMemTable.hpp"
+#include "akk/engine/memtable/WormholeMemTable.hpp"
 #include "akk/engine/memtable/BPTreeMemTable.hpp"
 #include "akk/engine/memtable/SkipListMemTable.hpp"
 #include "akk/engine/sstable/SSTManager.hpp"
@@ -77,7 +78,8 @@ namespace {
         if (backend == "skiplist") { return [] { return std::make_unique<memtable::SkipListMemTable>(); }; }
         if (backend == "bptree") { return [] { return std::make_unique<memtable::BPTreeMemTable>(); }; }
         if (backend == "art") { return [] { return std::make_unique<memtable::ARTMemTable>(); }; }
-        throw std::invalid_argument("--backend must be skiplist, bptree, or art");
+        if (backend == "wormhole") { return [] { return std::make_unique<memtable::WormholeMemTable>(); }; }
+        throw std::invalid_argument("--backend must be skiplist, bptree, art, or wormhole");
     }
 
     int integer(std::string_view text, std::string_view name, int minimum = 1) {
@@ -113,7 +115,7 @@ namespace {
                 config.sst = boolean(prompt("SST [t/f]: "), "SST");
                 config.vlog = boolean(prompt("vLog [t/f]: "), "vLog");
             }
-            const auto backend = prompt("MemTable backend [skiplist/bptree/art, Enter=skiplist]: ");
+            const auto backend = prompt("MemTable backend [skiplist/bptree/art/wormhole, Enter=skiplist]: ");
             if (!backend.empty()) { config.backend = backend; }
             config.iterations = integer(prompt("Iterations per operation per pass [int > 0]: "), "iterations");
         }
@@ -213,7 +215,7 @@ namespace {
             "  --value-bytes INT     Value size, at least 8 (default 128)\n"
             "  --scan-rows INT       Rows consumed per scan, <= keys (default min(128, keys))\n"
             "  --history-depth INT   Initial versions per key, at least 3 (default 8)\n"
-            "  --backend skiplist|bptree|art (default skiplist)\n"
+            "  --backend skiplist|bptree|art|wormhole (default skiplist; wormhole is experimental)\n"
             "  --read-comparison t|f  Compare backend/MemTable/engine reads only (default f)\n"
             "  --storage-only t|f    Direct MemTable [+ SSTManager] operations, no AkkEngine\n"
             "  --flush-samples INT   Independent SST flush batches in storage mode (default 5)\n"

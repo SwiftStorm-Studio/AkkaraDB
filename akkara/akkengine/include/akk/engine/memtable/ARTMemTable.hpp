@@ -185,6 +185,7 @@ namespace akkaradb::engine::memtable {
             static void replaceChild(NodeBase* node, uint8_t edge, NodeBase* child) noexcept;
             [[nodiscard]] NodeBase* addChild(NodeBase* node, uint8_t edge, NodeBase* child);
             [[nodiscard]] static bool childAt(const NodeBase* node, uint16_t index, uint8_t* edge, const NodeBase** child) noexcept;
+            [[nodiscard]] static uint16_t lowerBoundChild(const NodeBase* node, uint8_t edge) noexcept;
             template <typename Fn>
             static void forEachChild(const NodeBase* node, Fn&& fn);
 

@@ -1071,12 +1071,52 @@ iterators are active, writes copy protected nodes/chains on the first change in
 each snapshot epoch, preserving the iterator's original records even after
 bounded versions are overwritten. Completing or destroying the iterator releases
 its protection. Frozen iterators need no structural copies.
+Bounded ART iterators seek into the ordered child edges with a lower-bound
+search. They compare compressed prefixes only along paths that still match a
+range bound; interior subtrees stream without reconstructing full key paths.
+The lower bound remains inclusive and the upper bound exclusive, including
+when a bound ends inside a compressed prefix or is absent from the tree.
 ART's byte estimate counts each allocated record, node, chain, prefix and external
 payload once; inline payload is already part of the record. Arena padding, unused
 block capacity and iterator-owned allocations are excluded. Retired arena objects
 remain counted until the generation is destroyed. The corrected estimate can
 delay byte-threshold flushes compared with earlier overcounted values; no
 persisted format or public API changes are involved.
+
+An experimental `WormholeMemTable` is available through the same backend factory.
+It routes through a tagged hash directory of shortened anchor prefixes into
+linked 128-key leaves. Anchors use the shortest prefix of a split's right minimum
+that exceeds its left maximum; explicit terminal entries allow arbitrary binary
+anchors to prefix one another. The directory checks eight 16-bit tags per group
+(SSE2 where available, scalar otherwise) and stores full-width pointers separately.
+Longest-prefix probes optimistically trust tags, validate the final prefix, and
+retry with full comparisons on collisions. Group linear probing also terminates
+for identical full hashes. Incremental prefix hashing needs no per-lookup array.
+Transient prefix and leaf-tag hashes use raw incremental CRC32C plus length/mixing.
+Backend construction selects x86 SSE4.2 after CPU detection, with an identical
+portable fallback. Persisted record fingerprints and SST checksums are unchanged.
+Leaf point operations use a tag-sorted array with speculative positioning and
+complete key checks. Dirty batches of 16 become sorted runs; writes merge only
+equal-sized tail runs totaling at most 64 entries. Scans/splits/freeze consolidate
+remaining adjacent runs, smallest combined pair first, using fixed scratch storage.
+This avoids rewriting the large sorted prefix for each insertion batch.
+Per-key Entry objects own the history/ring metadata directly, with bounded rings
+allocated immediately afterward. No separate version-header pointer/allocation is
+needed. Immutable record objects are never relocated when leaves or rings change.
+Writes and mutable snapshot collection take an exclusive backend lock; point
+reads take a shared lock. Mutable scans capture their requested visible range
+before yielding without a lock. The first 32 rows and bounds of up to 32 bytes
+are owned inside the coroutine; larger inputs spill to dynamic storage. The
+iterator arena defaults to 4 KiB initially, retaining explicit size arguments.
+Freeze completes pending sorts before publishing
+immutability, and frozen flush iterators stream every retained version. Metadata
+and directory capacity for a split are prepared before allocation-free publication;
+failed arena allocations remain accounted until generation destruction. The byte
+estimate counts arena objects/payload and directory array capacity once, excluding
+arena padding, unused arena blocks, allocator overhead and iterator buffers.
+The prototype has no physical deletion/merge, QSBR/RCU or
+packed pointers. It is opt-in and does not change the default backend, existing
+APIs or stored formats.
 
 Backend construction options are:
 

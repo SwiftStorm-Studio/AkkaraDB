@@ -125,6 +125,7 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_transaction_smoke_test|benchmarks/smoke/transaction_smoke_test.cpp
         akkaradb_arena_smoke_test|benchmarks/smoke/arena_smoke_test.cpp
         akkaradb_memtable_throughput_benchmark|benchmarks/throughput/memtable_throughput_benchmark.cpp
+        akkaradb_memtable_scaling_benchmark|benchmarks/throughput/memtable_scaling_benchmark.cpp
         akkaradb_akkengine_bptree_put_benchmark|benchmarks/throughput/akkengine_bptree_put_benchmark.cpp
         akkaradb_akkengine_latency_benchmark|benchmarks/throughput/akkengine_latency_benchmark.cpp
         akkaradb_akkengine_read_scaling_benchmark|benchmarks/throughput/akkengine_read_scaling_benchmark.cpp
@@ -136,6 +137,7 @@ set(AKKARADB_COMMON_TEST_TARGETS
         akkaradb_bptree_key_search_smoke_test|benchmarks/smoke/bptree_key_search_smoke_test.cpp
         akkaradb_bptree_insertion_failure_smoke_test|benchmarks/smoke/bptree_insertion_failure_smoke_test.cpp
         akkaradb_art_memtable_regression_test|benchmarks/smoke/art_memtable_regression_test.cpp
+        akkaradb_wormhole_memtable_smoke_test|benchmarks/smoke/wormhole_memtable_smoke_test.cpp
         akkaradb_skiplist_key_search_smoke_test|benchmarks/smoke/skiplist_key_search_smoke_test.cpp
         akkaradb_cluster_observability_test|benchmarks/smoke/cluster_observability_test.cpp
         akkaradb_cluster_smoke_test|benchmarks/smoke/cluster_smoke_test.cpp
@@ -191,8 +193,21 @@ if (WIN32 AND BUILD_SHARED_LIBS)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:akkaradb> $<TARGET_FILE_DIR:akkaradb_akkengine_read_scaling_benchmark>
     )
+    add_custom_command(TARGET akkaradb_memtable_scaling_benchmark POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:akkaradb> $<TARGET_FILE_DIR:akkaradb_memtable_scaling_benchmark>
+    )
 endif ()
 if (AKKARADB_BUILD_TESTS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(NAME akkaradb_memtable_scaling_benchmark_smoke
+                COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/smoke/memtable_scaling_benchmark_smoke.py
+                $<TARGET_FILE:akkaradb_memtable_scaling_benchmark>
+                ${CMAKE_CURRENT_BINARY_DIR}/memtable-scaling-smoke)
+        set_tests_properties(akkaradb_memtable_scaling_benchmark_smoke PROPERTIES TIMEOUT 120 LABELS "benchmark;cli")
+    endif ()
     add_test(NAME akkaradb_akkengine_latency_benchmark_smoke
             COMMAND ${CMAKE_COMMAND}
             -DBENCHMARK=$<TARGET_FILE:akkaradb_akkengine_latency_benchmark>
@@ -231,6 +246,14 @@ target_sources(akkaradb_art_memtable_regression_test PRIVATE
         akkara/akkengine/src/core/record/KeyFingerprint.cpp
 )
 target_compile_definitions(akkaradb_art_memtable_regression_test PRIVATE AKKARADB_STATIC)
+
+target_sources(akkaradb_wormhole_memtable_smoke_test PRIVATE
+        akkara/akkengine/src/engine/memtable/WormholeMemTable.cpp
+        akkara/akkengine/src/core/buffer/BufferArena.cpp
+        akkara/akkengine/src/core/record/OwnedRecord.cpp
+        akkara/akkengine/src/core/record/KeyFingerprint.cpp
+)
+target_compile_definitions(akkaradb_wormhole_memtable_smoke_test PRIVATE AKKARADB_STATIC)
 
 add_dependencies(akkaradb_memtable_throughput_benchmark akkaradb_prepare_diskspd)
 add_dependencies(akkaradb_sstable_throughput_benchmark akkaradb_prepare_diskspd)
@@ -283,6 +306,7 @@ set(AKKARADB_SMOKE_TEST_TARGETS
         akkaradb_bptree_key_search_smoke_test
         akkaradb_bptree_insertion_failure_smoke_test
         akkaradb_art_memtable_regression_test
+        akkaradb_wormhole_memtable_smoke_test
         akkaradb_skiplist_key_search_smoke_test
         akkaradb_latency_measurement_smoke_test
         akkaradb_transaction_smoke_test
@@ -309,7 +333,8 @@ set(AKKARADB_SMOKE_TEST_TARGETS
 list(APPEND AKKARADB_SMOKE_TEST_TARGETS ${AKKARADB_API_SMOKE_TEST_TARGETS})
 
 if (AKKARADB_BUILD_TESTS)
-    add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS} akkaradb_akkengine_latency_benchmark)
+    add_custom_target(akkaradb_tests DEPENDS ${AKKARADB_SMOKE_TEST_TARGETS}
+            akkaradb_akkengine_latency_benchmark akkaradb_memtable_scaling_benchmark)
     if (WIN32 AND BUILD_SHARED_LIBS)
         add_custom_command(TARGET akkaradb POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${AKKARADB_TEST_OUTPUT_DIR}"
@@ -522,6 +547,7 @@ if (AKKARADB_BUILD_TESTS)
     set_tests_properties(akkaradb_sst_sequence_order_smoke_test akkaradb_memtable_snapshot_failure_smoke_test
             akkaradb_bptree_insertion_failure_smoke_test
             akkaradb_art_memtable_regression_test
+            akkaradb_wormhole_memtable_smoke_test
             akkaradb_skiplist_key_search_smoke_test
         PROPERTIES TIMEOUT 30 LABELS "sst;memtable;regression")
     set_tests_properties(akkaradb_transaction_smoke_test PROPERTIES TIMEOUT 180 LABELS "transactions;recovery")

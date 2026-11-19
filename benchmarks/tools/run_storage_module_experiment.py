@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--flush-samples", type=int, default=5)
     parser.add_argument("--profile-iterations", type=int)
     parser.add_argument("--profile-flush-keys", type=int, default=500000)
-    parser.add_argument("--backends", nargs="+", choices=("skiplist", "bptree", "art"), default=["skiplist", "bptree", "art"])
+    parser.add_argument("--backends", nargs="+", choices=("skiplist", "bptree", "art", "wormhole"), default=["skiplist", "bptree", "art"])
     parser.add_argument("--cpu", type=int, default=0 if os.name == "nt" else None)
     parser.add_argument("--no-profiles", action="store_true")
     args = parser.parse_args()
@@ -146,6 +146,7 @@ def main():
                source_root / "benchmarks/throughput/akkengine_latency_benchmark.cpp",
                source_root / "benchmarks/throughput/detail/storage_module_benchmark.inc",
                *sorted((source_root / "akkara/akkengine/src/engine/memtable").glob("*.cpp")),
+               *sorted((source_root / "akkara/akkengine/include/akk/engine/memtable").rglob("*.hpp")),
                *sorted((source_root / "akkara/akkengine/src/engine/sstable").glob("*.cpp"))]
     metadata["source_sha256"] = {str(p.relative_to(source_root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
     for file in (exe, sampler, *bin_dir.glob("akkaradb-native-*.dll"), *bin_dir.glob("*.pdb")):

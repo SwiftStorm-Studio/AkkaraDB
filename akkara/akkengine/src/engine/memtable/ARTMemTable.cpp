@@ -18,34 +18,6 @@
 
 #include "akk/core/record/KeyFingerprint.hpp"
 
-namespace {
-    size_t commonPrefixLen(std::span<const uint8_t> a, std::span<const uint8_t> b) noexcept {
-        const size_t n = std::min(a.size(), b.size());
-        size_t i = 0;
-        while (i < n && a[i] == b[i]) { ++i; }
-        return i;
-    }
-
-    bool subtreeAllLessThan(std::span<const uint8_t> subtreePrefix, std::span<const uint8_t> bound) noexcept {
-        if (bound.empty()) { return false; }
-
-        const size_t cp = commonPrefixLen(subtreePrefix, bound);
-        const size_t minLen = std::min(subtreePrefix.size(), bound.size());
-        if (cp == minLen) { return false; }
-        return subtreePrefix[cp] < bound[cp];
-    }
-
-    bool subtreeAllGe(std::span<const uint8_t> subtreePrefix, std::span<const uint8_t> bound) noexcept {
-        if (bound.empty()) { return false; }
-
-        const size_t cp = commonPrefixLen(subtreePrefix, bound);
-        const size_t minLen = std::min(subtreePrefix.size(), bound.size());
-        if (cp < minLen) { return subtreePrefix[cp] > bound[cp]; }
-        if (bound.size() <= subtreePrefix.size()) { return true; }
-        return false;
-    }
-} // namespace
-
 namespace akkaradb::engine::memtable {
     ARTMemTable::ARTMemTable(
         size_t dataArenaInitialBlockSize,
@@ -379,6 +351,17 @@ namespace akkaradb::engine::memtable {
         return false;
     }
 
+    uint16_t ARTMemTable::lowerBoundChild(const NodeBase* node, uint8_t edge) noexcept {
+        std::span<const uint8_t> edges;
+        switch (node->kind) {
+            case NodeBase::Kind::NODE4: edges = {static_cast<const Node4*>(node)->keys.data(), node->childCount}; break;
+            case NodeBase::Kind::NODE16: edges = {static_cast<const Node16*>(node)->keys.data(), node->childCount}; break;
+            case NodeBase::Kind::NODE48: edges = {static_cast<const Node48*>(node)->orderedKeys.data(), node->childCount}; break;
+            case NodeBase::Kind::NODE256: edges = {static_cast<const Node256*>(node)->orderedKeys.data(), node->childCount}; break;
+        }
+        return static_cast<uint16_t>(std::lower_bound(edges.begin(), edges.end(), edge) - edges.begin());
+    }
+
     ARTMemTable::NodeBase* ARTMemTable::buildNode(std::span<const uint8_t> prefix, VersionChain* terminal, const ChildVec& children) {
         const uint8_t* prefixPtr = copyPrefix(prefix);
         const uint16_t pfxLen = static_cast<uint16_t>(prefix.size());
@@ -620,65 +603,56 @@ namespace akkaradb::engine::memtable {
 
         struct ScanFrame {
             const NodeBase* node{nullptr};
+            size_t depth{0};
             uint16_t nextChild{0};
-            size_t restoreLen{0};
             bool entered{false};
             bool terminalDone{false};
+            bool lowerBound{false};
+            bool upperBound{false};
         };
 
         std::vector<ScanFrame> stack;
         stack.reserve(64);
-        std::vector<uint8_t> path;
-        path.reserve(128);
-        stack.push_back({root, 0, 0, false, false});
+        stack.push_back({root, 0, 0, false, false, !start.empty(), !end.empty()});
 
-        bool stop = false;
-        while (!stack.empty() && !stop) {
+        while (!stack.empty()) {
             ScanFrame& frame = stack.back();
             const NodeBase* node = frame.node;
-            if (node == nullptr) {
-                path.resize(frame.restoreLen);
-                stack.pop_back();
-                continue;
-            }
 
             if (!frame.entered) {
                 frame.entered = true;
-                if (node->prefixLen > 0) {
-                    const size_t oldSize = path.size();
-                    path.resize(oldSize + node->prefixLen);
-                    std::memcpy(path.data() + oldSize, node->prefix, node->prefixLen);
+                // Active bounds share the entire ancestor path. Compare only
+                // this compressed prefix; interior subtrees need no key rebuild.
+                if (frame.lowerBound) {
+                    const auto remaining = start.subspan(frame.depth);
+                    const size_t length = std::min(static_cast<size_t>(node->prefixLen), remaining.size());
+                    const int cmp = length == 0 ? 0 : std::memcmp(node->prefix, remaining.data(), length);
+                    if (cmp < 0) {
+                        stack.pop_back();
+                        continue;
+                    }
+                    if (cmp > 0 || node->prefixLen >= remaining.size()) { frame.lowerBound = false; }
                 }
-
-                const std::span<const uint8_t> subtreePrefix{path.data(), path.size()};
-                if (!start.empty() && subtreeAllLessThan(subtreePrefix, start)) {
-                    path.resize(frame.restoreLen);
-                    stack.pop_back();
-                    continue;
+                if (frame.upperBound) {
+                    const auto remaining = end.subspan(frame.depth);
+                    const size_t length = std::min(static_cast<size_t>(node->prefixLen), remaining.size());
+                    const int cmp = length == 0 ? 0 : std::memcmp(node->prefix, remaining.data(), length);
+                    if (cmp > 0 || (cmp == 0 && node->prefixLen >= remaining.size())) { co_return; }
+                    if (cmp < 0) { frame.upperBound = false; }
                 }
-                if (!end.empty() && subtreeAllGe(subtreePrefix, end)) {
-                    stop = true;
-                    continue;
-                }
+                frame.depth += node->prefixLen;
+                // A remaining lower bound strictly extends this node's key.
+                frame.terminalDone = frame.lowerBound;
+                frame.nextChild = frame.lowerBound ? lowerBoundChild(node, start[frame.depth]) : 0;
             }
 
             if (!frame.terminalDone) {
                 frame.terminalDone = true;
                 RecordView visible;
-                if (visibleRecord(node->terminal, snapshotSeq, &visible)) {
-                    if (!start.empty() && visible.compareKey(start) < 0) {
-                        // Skip keys below lower bound.
-                    }
-                    else if (!end.empty() && visible.compareKey(end) >= 0) {
-                        stop = true;
-                        continue;
-                    }
-                    else { co_yield visible; }
-                }
+                if (visibleRecord(node->terminal, snapshotSeq, &visible)) { co_yield visible; }
             }
 
             if (frame.nextChild >= node->childCount) {
-                path.resize(frame.restoreLen);
                 stack.pop_back();
                 continue;
             }
@@ -688,9 +662,10 @@ namespace akkaradb::engine::memtable {
             const uint16_t idx = frame.nextChild++;
             if (!childAt(node, idx, &edge, &child) || child == nullptr) { continue; }
 
-            const size_t parentPathLen = path.size();
-            path.push_back(edge);
-            stack.push_back({child, 0, parentPathLen, false, false});
+            if (frame.upperBound && edge > end[frame.depth]) { co_return; }
+            const bool lowerBound = frame.lowerBound && edge == start[frame.depth];
+            const bool upperBound = frame.upperBound && edge == end[frame.depth];
+            stack.push_back({child, frame.depth + 1, 0, false, false, lowerBound, upperBound});
         }
     }
 

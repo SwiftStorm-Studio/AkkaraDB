@@ -62,7 +62,7 @@ namespace akkaradb::engine::memtable {
         // MATERIALIZE_BATCHED_UNPINNED mode.
         size_t bptreeIteratorBatchSize = 1024;
         // Number of recent same-key versions retained inside a mutable MemTable
-        // backend. SkipList and BPTree honor this option; ART currently keeps
+        // backend. SkipList, BPTree and experimental Wormhole honor this option; ART keeps
         // its backend-local default.
         size_t maxVersionsPerKey = 4;
     };
@@ -83,6 +83,7 @@ namespace akkaradb::engine::memtable {
      * - Skip List
      * - BPTree
      * - ART
+     * - Wormhole (experimental)
      * - Red-Black Tree
      *
      * Design constraints:

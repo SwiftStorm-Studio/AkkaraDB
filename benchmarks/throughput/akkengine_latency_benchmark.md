@@ -52,10 +52,24 @@ transactions update those existing records rather than inserting new keys.
 
 ## MemTable backend and CSV output
 
-`--backend skiplist|bptree|art` selects the actual MemTable implementation used
+`--backend skiplist|bptree|art|wormhole` selects the actual MemTable implementation used
 for writes, snapshots, rotation, and in-memory compaction. The default is
 `skiplist`, preserving the previous engine default. Interactive mode also asks
 for the backend; press Enter to accept `skiplist`.
+
+`wormhole` is an experimental native C++ backend with hashed anchor prefixes and
+128-key leaves, tag-based point searches, lazy key-order sorting and shortened
+anchors. It uses backend-wide reader/writer locking and captures mutable scan
+results before yielding. This is an independent implementation, with full-width
+pointers and exact validation of optimistic metadata tag matches.
+See [the prototype notes](../../docs/research/wormhole-memtable-prototype.md).
+The storage experiment runner accepts `--backends wormhole art`; its default
+backend set remains `skiplist bptree art`.
+
+For key counts up to 10 million, variable key lengths and scan-length sweeps,
+see [the MemTable scaling benchmark](memtable_scaling_benchmark.md). It uses a
+separately documented read-only contract without repeatedly rebuilding each
+large dataset for every operation.
 
 Every run saves CSV files under a new, unique folder inside `benchmark-results`
 in the working directory. `--csv-dir PATH` selects a different parent. The full

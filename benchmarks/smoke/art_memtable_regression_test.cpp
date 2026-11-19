@@ -15,6 +15,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -114,6 +115,10 @@ namespace {
         }
         auto firstRows = tree.iterator({}, {}, UINT64_MAX);
         auto firstCursor = firstRows.begin();
+        auto boundedRows = tree.iterator(bytes("prefix-"), bytes("prefix-z"), UINT64_MAX);
+        auto boundedCursor = boundedRows.begin();
+        Expected boundedFirst = first;
+        boundedFirst.erase("");
         Expected second = first;
         for (size_t i = 0; i < 256; ++i) {
             put(tree, key(i), 2);
@@ -137,9 +142,11 @@ namespace {
         }
         put(tree, key(64), 10);
         checkCursor(firstCursor, first);
+        checkCursor(boundedCursor, boundedFirst);
         // Completion/abandonment must release protection; future updates then
         // allocate only a record (plus one history link in unbounded mode).
         firstRows = {};
+        boundedRows = {};
         {
             auto abandoned = tree.iterator(bytes("prefix-"), bytes("z"), UINT64_MAX);
             require(abandoned.begin() != std::default_sentinel, "ART bounded scan is empty");
@@ -223,6 +230,75 @@ namespace {
         }
     }
 
+    void verifyRangeBounds(bool retainAll, bool sequenceOrdered) {
+        ARTMemTable tree;
+        if (retainAll) { tree.retainAllVersions(); }
+        if (sequenceOrdered) { tree.useSequenceOrder(); }
+        std::map<std::string, bool> expected;
+        for (const auto& k : {std::string{}, std::string{"\0", 1}, std::string{"\0\xff", 2},
+                              std::string{"\xff", 1}, std::string{"\xff\0", 2},
+                              std::string{"pre"}, std::string{"prefix"}}) {
+            expected.emplace(k, false);
+        }
+        // Exercise every node capacity, gaps between edges, terminals that are
+        // prefixes of other keys, and compressed prefixes crossing a bound.
+        for (size_t fanout : {1, 4, 5, 16, 17, 48, 49, 256}) {
+            const std::string prefix = "branches/" + std::to_string(fanout) + "/";
+            expected.emplace(prefix, false);
+            for (size_t i = 0; i < fanout; ++i) {
+                const std::string base = prefix + static_cast<char>((i * 251) % 256);
+                expected.emplace(base, i % 7 == 0);
+                expected.emplace(base + std::string{"\0tail", 5}, false);
+                expected.emplace(base + std::string{"\xfftail", 5}, true);
+            }
+        }
+        for (size_t size : {64, 128, 256, 1024}) {
+            expected.emplace(std::string(size, 'x') + "a", false);
+            expected.emplace(std::string(size, 'x') + "z", true);
+        }
+        for (size_t size = 1; size <= 96; ++size) { expected.emplace(std::string(size, 'd'), false); }
+        std::vector<std::string> bounds;
+        for (const auto& [k, tombstone] : expected) {
+            put(tree, k, 1);
+            require(tree.put(bytes(k), bytes("new"), 5, tombstone ? RecordView::FLAG_TOMBSTONE : 0).ok(), "ART version put failed");
+            bounds.push_back(k);
+            bounds.push_back(k + static_cast<char>(0x7f));
+            bounds.push_back(k.substr(0, k.size() / 2));
+        }
+        bounds.emplace_back(1, static_cast<char>(0xff));
+        bounds.emplace_back(2, static_cast<char>(0xff));
+        const auto check = [&](const std::string& start, const std::string& end, uint64_t snapshotSeq) {
+            auto records = tree.iterator(bytes(start), bytes(end), snapshotSeq);
+            auto cursor = records.begin();
+            for (const auto& [k, tombstone] : expected) {
+                if (snapshotSeq < 1 || (!start.empty() && k < start) || (!end.empty() && k >= end)) { continue; }
+                require(cursor != std::default_sentinel, "ART bounded iterator ended early");
+                const uint64_t seq = snapshotSeq < 5 ? 1 : 5;
+                require(cursor->keyString() == k && cursor->seq() == seq, "ART bounded iterator returned the wrong key/version");
+                require(cursor->isTombstone() == (seq == 5 && tombstone), "ART bounded iterator lost tombstone state");
+                ++cursor;
+            }
+            require(cursor == std::default_sentinel, "ART bounded iterator crossed a bound");
+        };
+        for (bool frozen : {false, true}) {
+            if (frozen) { tree.freeze(); }
+            check({}, {}, 0);
+            check({}, {}, 1);
+            check({}, {}, UINT64_MAX);
+            for (const auto& [k, tombstone] : expected) {
+                check(k, k, UINT64_MAX);
+                check(k, k + std::string{"\xff", 1}, 1);
+                check(k + std::string{"\0", 1}, k + std::string{"\xff", 1}, 5);
+            }
+            std::mt19937 random{0xA47B0A1D};
+            for (size_t i = 0; i < 600; ++i) {
+                const auto& start = bounds[random() % bounds.size()];
+                const auto& end = bounds[random() % bounds.size()];
+                for (uint64_t seq : {uint64_t{0}, uint64_t{1}, uint64_t{4}, uint64_t{5}, UINT64_MAX}) { check(start, end, seq); }
+            }
+        }
+    }
+
     void verifyConcurrentReaders() {
         constexpr uint64_t count = 2048;
         ARTMemTable tree;
@@ -294,6 +370,7 @@ int main() {
     try {
         verifyAllocationGrowth();
         for (bool retainAll : {false, true}) { for (bool sequenceOrdered : {false, true}) { verifySnapshots(retainAll, sequenceOrdered); } }
+        for (bool retainAll : {false, true}) { for (bool sequenceOrdered : {false, true}) { verifyRangeBounds(retainAll, sequenceOrdered); } }
         verifyAllocationFailures();
         verifyConcurrentReaders();
         std::puts("ART memtable regression: passed");
